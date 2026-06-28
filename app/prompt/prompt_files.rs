@@ -5,7 +5,7 @@ use foco_mcp::McpToolDefinition;
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolDefinition};
 use foco_store::config::{
     DEFAULT_SYSTEM_PROMPT_NAME, IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME,
-    PromptSettings,
+    PromptSettings, REVIEW_SYSTEM_PROMPT_NAME,
 };
 use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
 
@@ -13,7 +13,7 @@ use crate::{
     AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
     http::settings::{
         SystemPromptSummary, default_image_generation_system_prompt,
-        default_plan_mode_system_prompt,
+        default_plan_mode_system_prompt, default_review_system_prompt,
     },
     neutral_text_message, xml_cdata_section, xml_text_escape,
 };
@@ -41,6 +41,9 @@ pub(crate) fn active_system_prompt(
     }
     if name == PLAN_MODE_SYSTEM_PROMPT_NAME {
         return Ok(default_plan_mode_system_prompt());
+    }
+    if name == REVIEW_SYSTEM_PROMPT_NAME {
+        return Ok(default_review_system_prompt());
     }
 
     Err(ApiError::bad_request(format!(

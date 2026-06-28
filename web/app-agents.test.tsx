@@ -7,6 +7,7 @@ import {
   agentTeamSnapshot,
   appTestState,
   defaultComposerPlaceholder,
+  defaultReviewSystemPrompt,
   enqueueChatStreamEvent,
   jsonResponse,
   mockFetch,
@@ -32,18 +33,18 @@ function stubDefaultAgentComposerDefaults() {
     ],
   };
   const definitionsWithDefaultAgent = {
-    agentDefinitions: [
-      {
-        ...agentDefinitionFixtures.agentDefinitions[0],
-        id: "agent-definition-default",
-        modelId: "gpt-alt",
-        modelOptions: { maxOutputTokens: null, thinkingLevel: "high" },
-        name: "Default agent",
-        providerId: "anthropic",
-      },
-      ...agentDefinitionFixtures.agentDefinitions,
-    ],
+    agentDefinitions: agentDefinitionFixtures.agentDefinitions.map((definition) =>
+      definition.id === "agent-definition-default"
+        ? {
+          ...definition,
+          modelId: "gpt-alt",
+          modelOptions: { maxOutputTokens: null, thinkingLevel: "high" },
+          providerId: "anthropic",
+        }
+        : definition,
+    ),
     defaultRolePrompts: {
+      ...agentDefinitionFixtures.defaultRolePrompts,
       "agent-definition-default": "Default built-in prompt.",
     },
   };
@@ -202,6 +203,9 @@ describe("app agents verification surfaces", () => {
     expect(
       screen.queryByRole("button", { name: "Delete agent Default agent" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Delete agent Review" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete agent Coordinator" })).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Edit agent Default agent" }));
@@ -216,6 +220,20 @@ describe("app agents verification surfaces", () => {
     );
 
     expect(promptContent).toHaveValue("Default built-in prompt.");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit agent Review" }));
+    const reviewDialog = screen.getByRole("dialog", { name: "Edit agent" });
+    const reviewPromptContent = within(reviewDialog).getByLabelText("Agent role prompt");
+    await userEvent.clear(reviewPromptContent);
+    await userEvent.type(reviewPromptContent, "Custom review agent role.");
+    await userEvent.click(
+      within(reviewDialog).getByRole("button", {
+        name: "Restore default Agent role prompt",
+      }),
+    );
+
+    expect(reviewPromptContent).toHaveValue(defaultReviewSystemPrompt);
   });
 
   it("edits the image generation agent without embedding an image model in the role prompt", async () => {
@@ -582,7 +600,7 @@ describe("app agents verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    const teamToggle = await screen.findByRole("button", { name: "Team mode" });
+    const teamToggle = await screen.findByRole("button", { name: "Plan mode" });
     expect(teamToggle).toHaveAttribute("aria-pressed", "false");
 
     await userEvent.type(
@@ -604,14 +622,14 @@ describe("app agents verification surfaces", () => {
     });
   });
 
-  it("queues the first message with Team tools enabled from the composer", async () => {
+  it("queues a Plan mode first message from the composer", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    const teamToggle = await screen.findByRole("button", { name: "Team mode" });
-    expect(teamToggle).toHaveAttribute("aria-pressed", "false");
-    await userEvent.click(teamToggle);
-    expect(teamToggle).toHaveAttribute("aria-pressed", "true");
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
 
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
@@ -627,7 +645,8 @@ describe("app agents verification surfaces", () => {
       const [, init] = queueCall!;
       expect(JSON.parse(init?.body as string)).toMatchObject({
         message: "coordinate this",
-        teamModeEnabled: true,
+        sessionMode: "plan",
+        teamModeEnabled: false,
       });
     });
   });
@@ -654,8 +673,7 @@ describe("app agents verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    const teamToggle = await screen.findByRole("button", { name: "Team mode" });
-    expect(teamToggle).toHaveAttribute("aria-pressed", "true");
+    await screen.findByRole("button", { name: "Plan mode" });
 
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),

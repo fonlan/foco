@@ -5,6 +5,7 @@ import type { SettingsSection } from "../api/types";
 export const DEFAULT_SYSTEM_PROMPT_NAME = "Default";
 export const IMAGE_AGENT_SYSTEM_PROMPT_NAME = "Image Generation";
 export const PLAN_MODE_SYSTEM_PROMPT_NAME = "Plan Mode";
+export const REVIEW_SYSTEM_PROMPT_NAME = "Review";
 export const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 export const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
 export const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 5;

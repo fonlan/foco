@@ -24,6 +24,7 @@ const AGENT_EXECUTION_WORKSPACE_MODES: AgentExecutionWorkspaceMode[] = [
   "isolated_worktree",
 ];
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
+const REVIEW_AGENT_DEFINITION_ID = "agent-definition-review";
 const IMAGE_AGENT_DEFINITION_ID = "agent-definition-image-gen";
 
 type AgentDefinitionDraft = {
@@ -693,7 +694,11 @@ function emptyAgentDefinitionDraft(
 }
 
 function isBuiltinAgentDefinition(id: string) {
-  return id === DEFAULT_AGENT_DEFINITION_ID || id === IMAGE_AGENT_DEFINITION_ID;
+  return (
+    id === DEFAULT_AGENT_DEFINITION_ID ||
+    id === REVIEW_AGENT_DEFINITION_ID ||
+    id === IMAGE_AGENT_DEFINITION_ID
+  );
 }
 
 function modelOutputsText(model: ConfiguredModelSummary) {

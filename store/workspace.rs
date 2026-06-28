@@ -1187,6 +1187,14 @@ impl WorkspaceDatabase {
         Ok(PlanListPage { plans, total_count })
     }
 
+    pub fn delete_plan(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM plans WHERE id = ?1", params![id.trim()])
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(changed > 0)
+    }
+
     pub fn update_plan(
         &mut self,
         plan_id: &str,

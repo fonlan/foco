@@ -114,6 +114,7 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingTodoGraph,
   isLoadingWorkspaceSpec,
   isLoadingWorkspaceFiles,
+  onDeletePlan,
   onForgetContextMemory,
   onGenerateGitCommitMessage,
   onGenerateWorkspaceSpec,
@@ -124,6 +125,7 @@ const ContextPanel = memo(function ContextPanel({
   onPlanAction,
   onPlanAutoRunToggle,
   onPlanPhaseRetry,
+  onOpenPlanPhaseChat,
   onReloadWorkspaceSpec,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
@@ -178,6 +180,7 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingTodoGraph: boolean;
   isLoadingWorkspaceSpec: boolean;
   isLoadingWorkspaceFiles: boolean;
+  onDeletePlan: (planId: string) => void;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onGenerateGitCommitMessage: () => void;
   onGenerateWorkspaceSpec: () => void;
@@ -193,6 +196,7 @@ const ContextPanel = memo(function ContextPanel({
     agentTaskId: string,
     implementationChatId: string | null,
   ) => void;
+  onOpenPlanPhaseChat: (chatId: string) => void;
   onReloadWorkspaceSpec: () => void;
   onRefreshDiff: () => void;
   onRefreshWorkspaceFiles: () => void;
@@ -275,6 +279,8 @@ const ContextPanel = memo(function ContextPanel({
             isLoading={isLoadingPlans}
             onAction={onPlanAction}
             onAutoRunToggle={onPlanAutoRunToggle}
+            onDeletePlan={onDeletePlan}
+            onOpenPhaseChat={onOpenPlanPhaseChat}
             onPhaseRetry={onPlanPhaseRetry}
             operationKey={planOperationKey}
             plans={plans}
@@ -641,6 +647,8 @@ function ContextPlanTab({
   isLoading,
   onAction,
   onAutoRunToggle,
+  onDeletePlan,
+  onOpenPhaseChat,
   onPhaseRetry,
   operationKey,
   plans,
@@ -652,6 +660,8 @@ function ContextPlanTab({
   isLoading: boolean;
   onAction: (planId: string, action: string) => void;
   onAutoRunToggle: (enabled: boolean) => void;
+  onDeletePlan: (planId: string) => void;
+  onOpenPhaseChat: (chatId: string) => void;
   onPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -762,23 +772,39 @@ function ContextPlanTab({
                         </span>
                       ) : null}
                     </div>
-                    {action ? (
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {action ? (
+                        <button
+                          aria-label={t(planActionLabel(action))}
+                          className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          disabled={operationKey !== null}
+                          onClick={() => onAction(plan.id, action)}
+                          title={t(planActionLabel(action))}
+                          type="button"
+                        >
+                          {operationKey === actionKey ? (
+                            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                          ) : (
+                            <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                          )}
+                          {t(planActionLabel(action))}
+                        </button>
+                      ) : null}
                       <button
-                        aria-label={t(planActionLabel(action))}
-                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        aria-label={t("Delete plan")}
+                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                         disabled={operationKey !== null}
-                        onClick={() => onAction(plan.id, action)}
-                        title={t(planActionLabel(action))}
+                        onClick={() => onDeletePlan(plan.id)}
+                        title={t("Delete plan")}
                         type="button"
                       >
-                        {operationKey === actionKey ? (
+                        {operationKey === `delete:${plan.id}` ? (
                           <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
                         ) : (
-                          <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                          <Trash2 aria-hidden="true" className="size-3.5" />
                         )}
-                        {t(planActionLabel(action))}
                       </button>
-                    ) : null}
+                    </div>
                   </div>
                   <h3 className="break-words text-sm font-semibold text-stone-950">
                     {plan.title}
@@ -797,6 +823,7 @@ function ContextPlanTab({
                       const retryOperationKey = phase.agentTaskId
                         ? planPhaseRetryOperationKey(phase.agentTaskId)
                         : null;
+                      const implementationChatId = phase.implementationChatId;
 
                       return (
                         <section
@@ -841,6 +868,17 @@ function ContextPlanTab({
                               <span className={planPhaseStatusClass(phase.status)}>
                                 {t(planPhaseStatusLabel(phase.status))}
                               </span>
+                              {implementationChatId ? (
+                                <button
+                                  aria-label={t("Open implementation chat")}
+                                  className="inline-flex size-7 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                  onClick={() => onOpenPhaseChat(implementationChatId)}
+                                  title={t("Open implementation chat")}
+                                  type="button"
+                                >
+                                  <MessageSquare aria-hidden="true" className="size-3.5" />
+                                </button>
+                              ) : null}
                               {canRetryPhase ? (
                                 <button
                                   aria-label={t("Retry plan phase")}

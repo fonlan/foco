@@ -22,6 +22,7 @@ import {
   mockFetch,
   pendingMemory,
   defaultPlanModeSystemPrompt,
+  defaultReviewSystemPrompt,
   renderApp,
   resetAppTestEnvironment,
   secondaryWorkspace,
@@ -911,9 +912,8 @@ describe("app-settings verification surfaces", () => {
     expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
     await userEvent.clear(systemPromptInput);
     await userEvent.type(systemPromptInput, "Custom system prompt.");
-    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Review");
-    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
-    expect(screen.getAllByText("Review").length).toBeGreaterThan(0);
+    await userEvent.click(screen.getByRole("button", { name: "Review" }));
+    await userEvent.clear(screen.getByLabelText("System prompt"));
     await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
     await userEvent.type(
       screen.getByLabelText("Prompt file path"),
@@ -940,8 +940,8 @@ describe("app-settings verification surfaces", () => {
                 name: "Plan Mode",
               },
               {
-                name: "Review",
                 content: "Review as senior engineer.",
+                name: "Review",
               },
             ],
           }),
@@ -961,14 +961,15 @@ describe("app-settings verification surfaces", () => {
     const defaultPromptButton = screen.getByRole("button", { name: "Default" });
     expect(defaultPromptButton).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Plan Mode" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Image Generation" })).not.toBeInTheDocument();
     const restoreButtons = screen.getAllByRole("button", {
       name: "Restore default system prompt",
     });
-    expect(restoreButtons).toHaveLength(2);
+    expect(restoreButtons).toHaveLength(3);
   });
 
-  it("renames user system prompts before saving prompt settings", async () => {
+  it("keeps built-in Review fixed while renaming user system prompts", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -976,16 +977,20 @@ describe("app-settings verification surfaces", () => {
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
 
-    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Review");
-    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
     expect(
       screen.queryByRole("button", { name: "Rename system prompt Default" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Rename system prompt Plan Mode" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Rename system prompt Review" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Reviewer Draft");
+    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
     const renameButton = screen.getByRole("button", {
-      name: "Rename system prompt Review",
+      name: "Rename system prompt Reviewer Draft",
     });
     expect(renameButton).toBeInTheDocument();
 
@@ -1014,6 +1019,10 @@ describe("app-settings verification surfaces", () => {
               {
                 content: defaultPlanModeSystemPrompt,
                 name: "Plan Mode",
+              },
+              {
+                content: defaultReviewSystemPrompt,
+                name: "Review",
               },
               {
                 name: "Reviewer",
@@ -1060,6 +1069,10 @@ describe("app-settings verification surfaces", () => {
               {
                 content: defaultPlanModeSystemPrompt,
                 name: "Plan Mode",
+              },
+              {
+                content: defaultReviewSystemPrompt,
+                name: "Review",
               },
             ],
           }),

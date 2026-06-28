@@ -1232,6 +1232,7 @@ export type PromptSettingsSummary = {
   defaultSystemPrompt: string;
   defaultImageGenerationSystemPrompt?: string | null;
   defaultPlanModeSystemPrompt?: string | null;
+  defaultReviewSystemPrompt?: string | null;
   systemPrompts?: SystemPromptSummary[];
   files: string[];
   extraText: string;

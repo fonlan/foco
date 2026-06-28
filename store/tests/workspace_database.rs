@@ -269,6 +269,51 @@ fn workspace_spec_content_update_rejects_stale_revision() {
 }
 
 #[test]
+fn delete_plan_removes_plan_graph_and_reports_missing() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-delete",
+            title: "Delete plan",
+            overview: "Remove the full plan graph.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-phase-delete",
+                title: "Phase one",
+                summary: "Delete cascades to this phase.",
+                steps: vec![NewPlanStep {
+                    id: "plan-step-delete",
+                    title: "Step one",
+                    detail: "Delete cascades to this step.",
+                    acceptance: vec!["row is removed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    assert!(database.delete_plan(" plan-delete ").expect("delete plan"));
+    assert!(
+        !database
+            .delete_plan("plan-delete")
+            .expect("delete missing plan")
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    for table in ["plans", "plan_phases", "plan_steps"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count rows");
+        assert_eq!(count, 0, "{table} should be empty after deleting the plan");
+    }
+}
+
+#[test]
 fn plan_completed_steps_remain_active_until_user_marks_complete() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

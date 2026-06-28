@@ -26,6 +26,8 @@ export const defaultComposerPlaceholder = "Ask Foco anything about Default...";
 export const sideProjectComposerPlaceholder = "Ask Foco anything about Side project...";
 export const defaultPlanModeSystemPrompt =
   "You are Foco Plan Mode, a planning partner for software work.";
+export const defaultReviewSystemPrompt =
+  "You are Foco's built-in code review agent.";
 
 export function chatSummary(
   id: string,
@@ -211,6 +213,7 @@ export const settings = {
   prompts: {
     defaultSystemPrompt: "You are Foco, a local coding agent.",
     defaultPlanModeSystemPrompt,
+    defaultReviewSystemPrompt,
     extraText: "",
     files: [],
     systemPrompt: null,
@@ -222,6 +225,10 @@ export const settings = {
       {
         content: defaultPlanModeSystemPrompt,
         name: "Plan Mode",
+      },
+      {
+        content: defaultReviewSystemPrompt,
+        name: "Review",
       },
     ],
   },
@@ -370,6 +377,28 @@ export const agentDefinitions = {
   agentDefinitions: [
     {
       allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
+      allowedTools: ["read_file", "find_files", "search_text"],
+      description: "Built-in default agent for chat and Team coordination.",
+      id: "agent-definition-default",
+      maxInstances: 1,
+      modelId: "gpt-test",
+      modelOptions: { maxOutputTokens: null, thinkingLevel: null },
+      name: "Default agent",
+      permissions: {
+        allowedAgentDefinitionIds: [
+          "agent-definition-review",
+          "agent-definition-coordinator",
+          "agent-definition-worker",
+        ],
+        canCreateInstances: true,
+        canDelegate: true,
+      },
+      providerId: "openai",
+      revision: 1,
+      systemPrompt: "Default built-in prompt.",
+    },
+    {
+      allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
       allowedTools: ["read_file", "send_message", "delegate_task"],
       description: "Coordinates the Agent team.",
       id: "agent-definition-coordinator",
@@ -385,6 +414,24 @@ export const agentDefinitions = {
       providerId: "openai",
       revision: 1,
       systemPrompt: "Coordinate the team.",
+    },
+    {
+      allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
+      allowedTools: ["read_file", "find_files", "search_text"],
+      description: "Built-in agent for focused code review and verification.",
+      id: "agent-definition-review",
+      maxInstances: 1,
+      modelId: "gpt-test",
+      modelOptions: { maxOutputTokens: null, thinkingLevel: null },
+      name: "Review",
+      permissions: {
+        allowedAgentDefinitionIds: [],
+        canCreateInstances: false,
+        canDelegate: false,
+      },
+      providerId: "openai",
+      revision: 1,
+      systemPrompt: defaultReviewSystemPrompt,
     },
     {
       allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
@@ -405,7 +452,18 @@ export const agentDefinitions = {
       systemPrompt: "Do focused implementation work.",
     },
   ],
+  defaultRolePrompts: {
+    "agent-definition-default": "Default built-in prompt.",
+    "agent-definition-review": defaultReviewSystemPrompt,
+  },
 };
+
+const coordinatorAgentDefinition = agentDefinitions.agentDefinitions.find(
+  (definition) => definition.id === "agent-definition-coordinator",
+)!;
+const workerAgentDefinition = agentDefinitions.agentDefinitions.find(
+  (definition) => definition.id === "agent-definition-worker",
+)!;
 
 export const agentTeamSnapshot = {
   dependencies: [],
@@ -429,7 +487,7 @@ export const agentTeamSnapshot = {
       definitionId: "agent-definition-coordinator",
       definitionRevision: 1,
       definitionSnapshot: {
-        ...agentDefinitions.agentDefinitions[0],
+        ...coordinatorAgentDefinition,
         systemPrompt: undefined,
       },
       executionRootPath: "C:\\Users\\fonla\\.foco\\workspace",
@@ -451,7 +509,7 @@ export const agentTeamSnapshot = {
       definitionId: "agent-definition-worker",
       definitionRevision: 1,
       definitionSnapshot: {
-        ...agentDefinitions.agentDefinitions[1],
+        ...workerAgentDefinition,
         systemPrompt: undefined,
       },
       executionRootPath:
@@ -2357,6 +2415,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       prompts: {
         defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
         defaultPlanModeSystemPrompt: settings.prompts.defaultPlanModeSystemPrompt,
+        defaultReviewSystemPrompt: settings.prompts.defaultReviewSystemPrompt,
         extraText: body.extraText ?? "Keep replies concise.",
         files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
         systemPrompt: null,

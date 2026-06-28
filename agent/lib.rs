@@ -2799,6 +2799,64 @@ mod tests {
     }
 
     #[test]
+    fn read_only_tools_share_one_unbounded_parallel_group() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-read-file".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "agent/lib.rs" }),
+            },
+            PendingToolCall {
+                id: "call-find-files".to_string(),
+                name: FIND_FILES_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "." }),
+            },
+            PendingToolCall {
+                id: "call-search-text".to_string(),
+                name: SEARCH_TEXT_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "needle", "path": "." }),
+            },
+            PendingToolCall {
+                id: "call-graph-explore".to_string(),
+                name: GRAPH_EXPLORE_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "plan_tool_execution" }),
+            },
+            PendingToolCall {
+                id: "call-get-todo-graph".to_string(),
+                name: GET_TODO_GRAPH_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-get-plans".to_string(),
+                name: GET_PLANS_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-memory-search".to_string(),
+                name: MEMORY_SEARCH_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "needle", "scope": "workspace" }),
+            },
+            PendingToolCall {
+                id: "call-web-fetch".to_string(),
+                name: WEB_FETCH_TOOL_NAME.to_string(),
+                arguments: json!({ "url": "https://example.com" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                }]
+            }
+        );
+    }
+
+    #[test]
     fn plans_multiple_web_fetch_calls_in_one_parallel_group() {
         let calls = vec![
             PendingToolCall {

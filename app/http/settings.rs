@@ -16,7 +16,10 @@ use foco_providers::{
     test_provider_connection,
 };
 use foco_store::{
-    config::{IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PlanSettings, PromptSettings, SpecSettings},
+    config::{
+        IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PlanSettings, PromptSettings,
+        REVIEW_SYSTEM_PROMPT_NAME, SpecSettings,
+    },
     model_metadata::{
         MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
         write_model_metadata_cache,
@@ -26,9 +29,15 @@ use foco_store::{
 use crate::*;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
+pub(crate) const REVIEW_AGENT_DEFINITION_ID: &str = "agent-definition-review";
 pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
 pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's default coding agent.</identity>\n<instructions>Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.</instructions>\n</agent_definition_prompt>";
+const REVIEW_AGENT_SYSTEM_PROMPT: &str = r#"<agent_definition_prompt>
+<identity>You are Foco's built-in code review agent.</identity>
+<instructions>Review code changes with a bug-finding mindset. Prioritize correctness, regressions, security, data loss risks, and missing tests. Present findings first, ordered by severity with concrete file and line references. If no issues are found, say so clearly and mention residual test gaps or risks.</instructions>
+<boundaries>Do not edit files or broaden into implementation work unless the user explicitly asks. Keep summaries brief and secondary to findings.</boundaries>
+</agent_definition_prompt>"#;
 const IMAGE_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's image generation agent.</identity>\n<instructions>Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.</instructions>\n<tool_defaults>Use image_gen with model &quot;gpt-image-2&quot; unless the user explicitly asks for another configured image model.</tool_defaults>\n</agent_definition_prompt>";
 const PLAN_MODE_SYSTEM_PROMPT: &str = r#"<agent_definition_prompt>
 <identity>You are Foco Plan Mode, a planning partner for software work.</identity>
@@ -400,6 +409,7 @@ pub(crate) struct PromptSettingsSummary {
     pub(crate) default_system_prompt: String,
     pub(crate) default_image_generation_system_prompt: Option<String>,
     pub(crate) default_plan_mode_system_prompt: String,
+    pub(crate) default_review_system_prompt: String,
     pub(crate) system_prompts: Vec<SystemPromptSummary>,
     pub(crate) files: Vec<String>,
     pub(crate) extra_text: String,
@@ -620,6 +630,10 @@ pub(crate) fn default_plan_mode_system_prompt() -> String {
     PLAN_MODE_SYSTEM_PROMPT.to_string()
 }
 
+pub(crate) fn default_review_system_prompt() -> String {
+    REVIEW_AGENT_SYSTEM_PROMPT.to_string()
+}
+
 pub(crate) async fn settings(
     State(state): State<AppState>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
@@ -668,6 +682,11 @@ fn default_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
         .map_err(|error| ApiError::internal(error.message().to_string()))
 }
 
+fn review_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
+    AgentDefinitionId::new(REVIEW_AGENT_DEFINITION_ID)
+        .map_err(|error| ApiError::internal(error.message().to_string()))
+}
+
 fn image_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
     AgentDefinitionId::new(IMAGE_AGENT_DEFINITION_ID)
         .map_err(|error| ApiError::internal(error.message().to_string()))
@@ -679,6 +698,60 @@ pub(crate) fn default_image_agent_system_prompt_for_config(
     let image_id = image_agent_definition_id()?;
     Ok(image_agent_definition_for_config(config, image_id)
         .map(|definition| definition.system_prompt))
+}
+
+fn ensure_review_agent_definition(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+    let review_id = review_agent_definition_id()?;
+    let Some(mut definition) = review_agent_definition_for_config(config, review_id.clone())?
+    else {
+        return Ok(false);
+    };
+
+    if let Some(stored_index) = config
+        .agent_definitions
+        .iter()
+        .position(|definition| definition.id == review_id)
+    {
+        let stored = &config.agent_definitions[stored_index];
+        definition.provider_id = stored.provider_id.clone();
+        definition.model_id = stored.model_id.clone();
+        definition.model_options = stored.model_options.clone();
+        definition.system_prompt = stored.system_prompt.clone();
+        definition.allowed_tools = stored.allowed_tools.clone();
+        definition.allowed_execution_workspace_modes =
+            stored.allowed_execution_workspace_modes.clone();
+        definition.permissions = stored.permissions.clone();
+        definition.revision = stored.revision;
+        let stored = &mut config.agent_definitions[stored_index];
+        if stored != &definition {
+            *stored = definition;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    } else {
+        config.agent_definitions.push(definition);
+        Ok(true)
+    }
+}
+
+fn refresh_review_agent_system_prompt(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+    let review_id = review_agent_definition_id()?;
+    let system_prompt =
+        crate::prompt::active_system_prompt(&config.prompts, REVIEW_SYSTEM_PROMPT_NAME)?;
+    let Some(definition) = config
+        .agent_definitions
+        .iter_mut()
+        .find(|definition| definition.id == review_id)
+    else {
+        return Ok(false);
+    };
+
+    if definition.system_prompt == system_prompt {
+        return Ok(false);
+    }
+    definition.system_prompt = system_prompt;
+    Ok(true)
 }
 
 fn ensure_image_agent_definition(config: &mut GlobalConfig) -> Result<bool, ApiError> {
@@ -762,7 +835,10 @@ fn image_agent_runner_selection_valid(
 }
 
 fn refresh_builtin_agent_definitions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
-    let mut changed = ensure_image_agent_definition(config)?;
+    let mut changed = ensure_review_agent_definition(config)?;
+    if ensure_image_agent_definition(config)? {
+        changed = true;
+    }
     if refresh_default_agent_permissions(config)? {
         changed = true;
     }
@@ -806,6 +882,55 @@ fn default_agent_allowed_definition_ids(
         .filter(|definition| definition.id != *default_id)
         .map(|definition| definition.id.clone())
         .collect()
+}
+
+fn review_agent_definition_for_config(
+    config: &GlobalConfig,
+    id: AgentDefinitionId,
+) -> Result<Option<AgentDefinitionSettings>, ApiError> {
+    let Some(model) = default_agent_runner_model(config) else {
+        return Ok(None);
+    };
+    let Some(provider_id) = model.active_provider_id.clone() else {
+        return Ok(None);
+    };
+    let allowed_tools = [
+        foco_tools::READ_FILE_TOOL,
+        foco_tools::FIND_FILES_TOOL,
+        foco_tools::SEARCH_TEXT_TOOL,
+        foco_tools::WEB_FETCH_TOOL,
+        foco_tools::RUN_COMMAND_TOOL,
+        foco_tools::GRAPH_FIND_SYMBOLS_TOOL,
+        foco_tools::GRAPH_FIND_CALLERS_TOOL,
+        foco_tools::GRAPH_FIND_CALLEES_TOOL,
+        foco_tools::GRAPH_FIND_REFERENCES_TOOL,
+        foco_tools::GRAPH_RELATED_FILES_TOOL,
+        foco_tools::GRAPH_EXPLORE_TOOL,
+        foco_tools::ASK_QUESTION_TOOL,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let system_prompt =
+        crate::prompt::active_system_prompt(&config.prompts, REVIEW_SYSTEM_PROMPT_NAME)?;
+
+    Ok(Some(AgentDefinitionSettings {
+        id,
+        revision: AGENT_DEFINITION_INITIAL_REVISION,
+        name: "Review".to_string(),
+        description: "Built-in agent for focused code review and verification.".to_string(),
+        provider_id,
+        model_id: model.id.clone(),
+        model_options: AgentModelOptions {
+            thinking_level: model.thinking_level.clone(),
+            max_output_tokens: None,
+        },
+        system_prompt,
+        allowed_tools,
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    }))
 }
 
 fn image_agent_definition_for_config(
@@ -972,8 +1097,9 @@ pub(crate) async fn delete_agent_definition(
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
     let default_id = default_agent_definition_id()?;
+    let review_id = review_agent_definition_id()?;
     let image_id = image_agent_definition_id()?;
-    if request.id == default_id || request.id == image_id {
+    if request.id == default_id || request.id == review_id || request.id == image_id {
         return Err(ApiError::bad_request(format!(
             "built-in agent definition '{}' cannot be deleted",
             request.id
@@ -1089,6 +1215,13 @@ fn default_agent_role_prompts(config: &GlobalConfig) -> BTreeMap<AgentDefinition
     let mut prompts = BTreeMap::new();
     if let Ok(default_id) = default_agent_definition_id() {
         prompts.insert(default_id, DEFAULT_AGENT_SYSTEM_PROMPT.to_string());
+    }
+    if let Ok(review_id) = review_agent_definition_id() {
+        if let Ok(prompt) =
+            crate::prompt::active_system_prompt(&config.prompts, REVIEW_SYSTEM_PROMPT_NAME)
+        {
+            prompts.insert(review_id, prompt);
+        }
     }
     if let Ok(image_id) = image_agent_definition_id() {
         if let Some(definition) = image_agent_definition_for_config(config, image_id.clone()) {
@@ -1326,6 +1459,7 @@ pub(crate) async fn save_prompt_settings(
         extra_text: request.extra_text.trim().to_string(),
     };
     refresh_builtin_agent_definitions(&mut config)?;
+    refresh_review_agent_system_prompt(&mut config)?;
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;

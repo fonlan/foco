@@ -87,6 +87,12 @@ pub(crate) struct PlanResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DeletePlanResponse {
+    deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PlanSummary {
     id: String,
     title: String,
@@ -288,6 +294,27 @@ pub(crate) async fn update_plan(
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),
     }))
+}
+
+pub(crate) async fn delete_plan(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, plan_id)): AxumPath<(String, String)>,
+) -> Result<Json<DeletePlanResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let deleted = database
+        .delete_plan(&plan_id)
+        .map_err(ApiError::from_workspace_error)?;
+    if !deleted {
+        return Err(ApiError::bad_request(format!(
+            "plan was not found: {}",
+            plan_id.trim()
+        )));
+    }
+
+    Ok(Json(DeletePlanResponse { deleted }))
 }
 
 pub(crate) async fn plan_action(

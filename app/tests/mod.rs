@@ -17,7 +17,7 @@ use foco_providers::OPENAI_CHAT_KIND;
 use foco_store::{
     config::{
         DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME, PromptSettings,
-        WebSearchSettings,
+        REVIEW_SYSTEM_PROMPT_NAME, WebSearchSettings,
     },
     memory::{
         MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
@@ -1971,8 +1971,10 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
         .0;
     let default_definition_id =
         AgentDefinitionId::new("agent-definition-default").expect("default definition id");
+    let review_definition_id =
+        AgentDefinitionId::new("agent-definition-review").expect("review definition id");
 
-    assert_eq!(listed.agent_definitions.len(), 1);
+    assert_eq!(listed.agent_definitions.len(), 2);
     let default_definition = &listed.agent_definitions[0];
     assert_eq!(default_definition.id, default_definition_id);
     assert_eq!(default_definition.name, "Default agent");
@@ -1980,11 +1982,23 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
     assert_eq!(default_definition.model_id, "model");
     assert!(default_definition.permissions.can_create_instances);
     assert!(default_definition.permissions.can_delegate);
+    assert_eq!(
+        default_definition.permissions.allowed_agent_definition_ids,
+        vec![review_definition_id.clone()]
+    );
+
+    let review_definition = &listed.agent_definitions[1];
+    assert_eq!(review_definition.id, review_definition_id);
+    assert_eq!(review_definition.name, REVIEW_SYSTEM_PROMPT_NAME);
+    assert_eq!(review_definition.provider_id, "provider");
+    assert_eq!(review_definition.model_id, "model");
+    assert!(!review_definition.permissions.can_create_instances);
+    assert!(!review_definition.permissions.can_delegate);
+    assert_eq!(review_definition.max_instances, 1);
     assert!(
-        default_definition
-            .permissions
-            .allowed_agent_definition_ids
-            .is_empty()
+        review_definition
+            .system_prompt
+            .contains("code review agent")
     );
     assert!(
         listed
@@ -2011,11 +2025,67 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
             .contains("built-in agent definition")
     );
 
+    let delete_review_error = match crate::http::settings::delete_agent_definition(
+        State(state.clone()),
+        Json(DeleteAgentDefinitionRequest {
+            id: review_definition_id,
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("built-in review agent deletion should fail"),
+    };
+    assert_eq!(delete_review_error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        delete_review_error
+            .message
+            .contains("built-in agent definition")
+    );
+
     let listed_again = crate::http::settings::agent_definitions(State(state))
         .await
         .expect("list agent definitions again")
         .0;
-    assert_eq!(listed_again.agent_definitions.len(), 1);
+    assert_eq!(listed_again.agent_definitions.len(), 2);
+}
+
+#[tokio::test]
+async fn review_agent_uses_custom_review_system_prompt() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir);
+    config.prompts.system_prompts = vec![
+        SystemPromptSettings {
+            name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            content: "Default prompt.".to_string(),
+        },
+        SystemPromptSettings {
+            name: REVIEW_SYSTEM_PROMPT_NAME.to_string(),
+            content: "Custom review prompt.".to_string(),
+        },
+    ];
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let listed = crate::http::settings::agent_definitions(State(state))
+        .await
+        .expect("list agent definitions")
+        .0;
+    let review_definition_id =
+        AgentDefinitionId::new("agent-definition-review").expect("review definition id");
+
+    let review_definition = listed
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == review_definition_id)
+        .expect("review definition");
+    assert_eq!(review_definition.system_prompt, "Custom review prompt.");
+    assert_eq!(
+        listed.default_role_prompts.get(&review_definition_id),
+        Some(&"Custom review prompt.".to_string())
+    );
 }
 
 #[tokio::test]

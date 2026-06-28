@@ -7,10 +7,10 @@ use foco_store::{
     config::{
         DEFAULT_SYSTEM_PROMPT_NAME, GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig,
         ModelSettings, PLAN_MERGE_AUTOMATION_DIRECT_AUTO, PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
-        PLAN_MODE_SYSTEM_PROMPT_NAME, ProviderSettings, SUPPORTED_API_PROXY_TYPES,
-        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
-        WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings,
-        WorkspaceCommonCommand, WorkspaceConfig,
+        PLAN_MODE_SYSTEM_PROMPT_NAME, ProviderSettings, REVIEW_SYSTEM_PROMPT_NAME,
+        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
+        WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
     },
     workspace::WorkspaceDatabase,
 };
@@ -26,7 +26,7 @@ use crate::http::settings::{
     SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary, WebSearchProviderSummary,
     WebSearchSettingsSummary, WebServerSettingsSummary, WorkspaceCommonCommandSummary,
     default_image_agent_system_prompt_for_config, default_plan_mode_system_prompt,
-    known_agent_tool_names,
+    default_review_system_prompt, known_agent_tool_names,
 };
 use crate::*;
 
@@ -170,6 +170,7 @@ pub(crate) async fn settings_response(
                 config,
             )?,
             default_plan_mode_system_prompt: default_plan_mode_system_prompt(),
+            default_review_system_prompt: default_review_system_prompt(),
             system_prompts: settings_system_prompt_summaries(config, &default_system_prompt)?,
             files: config
                 .prompts
@@ -269,6 +270,29 @@ fn settings_system_prompt_summaries(
             SystemPromptSummary {
                 name: PLAN_MODE_SYSTEM_PROMPT_NAME.to_string(),
                 content: default_plan_mode_system_prompt(),
+            },
+        );
+    }
+    if !summaries
+        .iter()
+        .any(|prompt| prompt.name == REVIEW_SYSTEM_PROMPT_NAME)
+    {
+        let insert_at = summaries
+            .iter()
+            .position(|prompt| prompt.name == PLAN_MODE_SYSTEM_PROMPT_NAME)
+            .map(|index| index + 1)
+            .or_else(|| {
+                summaries
+                    .iter()
+                    .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(summaries.len());
+        summaries.insert(
+            insert_at,
+            SystemPromptSummary {
+                name: REVIEW_SYSTEM_PROMPT_NAME.to_string(),
+                content: default_review_system_prompt(),
             },
         );
     }

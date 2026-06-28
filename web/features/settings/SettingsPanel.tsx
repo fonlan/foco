@@ -132,6 +132,7 @@ import {
   IMAGE_AGENT_SYSTEM_PROMPT_NAME,
   PLAN_MODE_SYSTEM_PROMPT_NAME,
   MEMORY_KIND_OPTIONS,
+  REVIEW_SYSTEM_PROMPT_NAME,
   SAVED_PASSWORD_MASK,
 } from "../../app/constants";
 import { errorMessage, requestJson } from "../../shared/api-client";
@@ -1995,6 +1996,9 @@ export function SettingsPanel({
     }
     if (name === PLAN_MODE_SYSTEM_PROMPT_NAME) {
       return settings.prompts.defaultPlanModeSystemPrompt ?? null;
+    }
+    if (name === REVIEW_SYSTEM_PROMPT_NAME) {
+      return settings.prompts.defaultReviewSystemPrompt ?? null;
     }
     return null;
   }
@@ -10703,11 +10707,35 @@ function normalizedSystemPromptSummaries(
     });
   }
 
+  if (
+    prompts.defaultReviewSystemPrompt &&
+    !normalizedPrompts.some((prompt) => prompt.name === REVIEW_SYSTEM_PROMPT_NAME)
+  ) {
+    const planModeIndex = normalizedPrompts.findIndex(
+      (prompt) => prompt.name === PLAN_MODE_SYSTEM_PROMPT_NAME,
+    );
+    const defaultIndex = normalizedPrompts.findIndex(
+      (prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME,
+    );
+    normalizedPrompts.splice(
+      Math.max(planModeIndex >= 0 ? planModeIndex + 1 : defaultIndex + 1, 0),
+      0,
+      {
+        name: REVIEW_SYSTEM_PROMPT_NAME,
+        content: prompts.defaultReviewSystemPrompt,
+      },
+    );
+  }
+
   return normalizedPrompts;
 }
 
 function isSystemPromptFixed(name: string): boolean {
-  return name === DEFAULT_SYSTEM_PROMPT_NAME || name === PLAN_MODE_SYSTEM_PROMPT_NAME;
+  return (
+    name === DEFAULT_SYSTEM_PROMPT_NAME ||
+    name === PLAN_MODE_SYSTEM_PROMPT_NAME ||
+    name === REVIEW_SYSTEM_PROMPT_NAME
+  );
 }
 
 function emptyMemorySettingsForm(): MemorySettingsFormState {

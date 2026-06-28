@@ -254,7 +254,7 @@ pub(crate) fn app_router(state: AppState) -> Router {
         )
         .route(
             "/api/workspaces/{workspace_id}/plans/{plan_id}",
-            patch(crate::http::plans::update_plan),
+            patch(crate::http::plans::update_plan).delete(crate::http::plans::delete_plan),
         )
         .route(
             "/api/workspaces/{workspace_id}/plans/{plan_id}/action",

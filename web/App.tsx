@@ -1652,6 +1652,34 @@ export function App() {
     [loadActivePlans, refreshWorkspaces],
   );
 
+  const deletePlan = useCallback(
+    async (workspaceId: string, planId: string) => {
+      if (!window.confirm(t("Delete plan confirmation"))) {
+        return;
+      }
+
+      const operationKey = `delete:${planId}`;
+      setPlanOperationKey(operationKey);
+      setActivePlansError(null);
+
+      try {
+        await requestJson<{ deleted: boolean }>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}`,
+          { method: "DELETE" },
+        );
+        await loadActivePlans(workspaceId);
+        await refreshWorkspaces();
+      } catch (requestError) {
+        setActivePlansError(errorMessage(requestError));
+      } finally {
+        setPlanOperationKey((current) =>
+          current === operationKey ? null : current,
+        );
+      }
+    },
+    [loadActivePlans, refreshWorkspaces, t],
+  );
+
   // ponytail: poll a queued spec job until it settles, then reload spec content.
   // Ceiling: fixed backoff schedule (~165s total); upgrade path is an SSE/job push.
   const pollWorkspaceSpecJobUntilSettled = useCallback(
@@ -8843,6 +8871,18 @@ export function App() {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanAction(workspaceId, planId, action);
+                  }
+                }}
+                onDeletePlan={(planId) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    void deletePlan(workspaceId, planId);
+                  }
+                }}
+                onOpenPlanPhaseChat={(chatId) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    selectWorkspaceChat(workspaceId, chatId);
                   }
                 }}
                 onPlanPhaseRetry={(planId, phaseId, agentTaskId, implementationChatId) => {

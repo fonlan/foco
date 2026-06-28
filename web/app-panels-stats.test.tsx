@@ -355,6 +355,201 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("opens an existing implementation chat from a plan phase", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T06:00:00Z";
+    const implementationChat = chatSummary(
+      "plan-chat-open",
+      "Existing implementation chat",
+      timestamp,
+      timestamp,
+    );
+    const plan = {
+      activePhaseId: null,
+      completedAt: null,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-open-chat",
+      overview: "Open the phase implementation transcript.",
+      pauseRequestedAt: null,
+      phases: [
+        {
+          agentTaskId: "agent-task-open",
+          agentTeamId: "agent-team-open",
+          commitId: null,
+          completedAt: null,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "plan-phase-open",
+          implementationChatId: "plan-chat-open",
+          mergeAttemptCount: 0,
+          planId: "plan-open-chat",
+          sequence: 0,
+          startedAt: timestamp,
+          status: "running",
+          steps: [],
+          summary: "Existing chat is available.",
+          title: "Open chat phase",
+          updatedAt: timestamp,
+        },
+      ],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "running",
+      title: "Open implementation chat plan",
+      updatedAt: timestamp,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = new URL(url, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces") {
+        return jsonResponse({
+          activeWorkspaceId: workspace.id,
+          workspaces: [
+            { ...workspace, chats: [implementationChat, ...workspace.chats] },
+            secondaryWorkspace,
+          ],
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [plan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chats/plan-chat-open/messages") {
+        return jsonResponse({
+          activeRun: null,
+          chat: {
+            id: "plan-chat-open",
+            kind: null,
+            readOnly: false,
+            title: "Existing implementation chat",
+          },
+          messages: [
+            {
+              content: "Existing implementation transcript.",
+              createdAt: timestamp,
+              extractedMemories: [],
+              id: "plan-open-message-user",
+              memoriesUsed: [],
+              metrics: null,
+              parts: [{ text: "Existing implementation transcript.", type: "text" }],
+              reasoning: null,
+              role: "user",
+              specUpdates: [],
+              toolCalls: [],
+            },
+          ],
+          pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Open implementation chat plan")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Open implementation chat" }));
+
+    expect(await screen.findByText("Existing implementation transcript.")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-1/chats/plan-chat-open/messages?limit=100",
+      expect.any(Object),
+    );
+  });
+
+  it("confirms plan deletion and skips the request when cancelled", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T06:15:00Z";
+    const confirmSpy = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    let deleted = false;
+    const plan = {
+      activePhaseId: null,
+      completedAt: null,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-delete-ui",
+      overview: "Delete this plan from the active list.",
+      pauseRequestedAt: null,
+      phases: [],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "ready",
+      title: "Delete me from plan panel",
+      updatedAt: timestamp,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = new URL(url, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: deleted ? [] : [plan],
+          totalCount: deleted ? 0 : 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/plan-delete-ui") {
+        deleted = true;
+        return jsonResponse({ deleted: true });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Delete me from plan panel")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Delete plan" }));
+    expect(confirmSpy).toHaveBeenCalledWith("Delete plan confirmation");
+    expect(
+      fetchMock.mock.calls.filter(([input, init]) => {
+        const path = new URL(String(input), "http://127.0.0.1").pathname;
+        return path === "/api/workspaces/workspace-1/plans/plan-delete-ui" && init?.method === "DELETE";
+      }),
+    ).toHaveLength(0);
+    expect(screen.getByText("Delete me from plan panel")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Delete plan" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(([input, init]) => {
+          const path = new URL(String(input), "http://127.0.0.1").pathname;
+          return path === "/api/workspaces/workspace-1/plans/plan-delete-ui" && init?.method === "DELETE";
+        }),
+      ).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Delete me from plan panel")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+  });
+
   it("restarts a failed plan phase through the plan action", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";
