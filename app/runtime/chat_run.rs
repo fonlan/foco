@@ -211,6 +211,7 @@ pub(crate) fn agent_run_event_kind(event: &ChatSseEvent) -> AgentRunEventKind {
         | ChatSseEvent::GuidanceApplied { .. }
         | ChatSseEvent::GitDiffRefresh { .. }
         | ChatSseEvent::TodoGraphRefresh { .. }
+        | ChatSseEvent::PlanRefresh { .. }
         | ChatSseEvent::AgentTeamRefresh { .. }
         | ChatSseEvent::MemoryExtractionComplete { .. }
         | ChatSseEvent::MemoryResolved { .. }

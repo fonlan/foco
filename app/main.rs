@@ -1770,6 +1770,9 @@ enum ChatSseEvent {
         workspace_id: String,
         chat_id: String,
     },
+    PlanRefresh {
+        workspace_id: String,
+    },
     AgentTeamRefresh {
         workspace_id: String,
         chat_id: String,
@@ -3733,6 +3736,13 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 yield event;
                             }
+                            if tool_results_affect_plans(&next_executed_tool_calls) {
+                                let event = ChatSseEvent::PlanRefresh {
+                                    workspace_id: self.workspace_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
                             if let Some(event) = agent_team_refresh_event_for_tool_results(
                                 &self,
                                 &next_executed_tool_calls,
@@ -5337,6 +5347,16 @@ fn tool_results_affect_todo_graph(tool_results: &[ExecutedToolCall]) -> bool {
     })
 }
 
+fn tool_results_affect_plans(tool_results: &[ExecutedToolCall]) -> bool {
+    tool_results.iter().any(|tool_result| {
+        !tool_result.is_error
+            && matches!(
+                tool_result.name.as_str(),
+                CREATE_PLAN_TOOL | UPDATE_PLAN_TOOL | UPDATE_PLAN_STEP_TOOL
+            )
+    })
+}
+
 fn agent_team_refresh_event_for_context(
     context: &PreparedChatContext,
     reason: &str,
@@ -5694,6 +5714,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::GuidanceApplied { .. } => "guidance_applied",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
+        ChatSseEvent::PlanRefresh { .. } => "plan_refresh",
         ChatSseEvent::AgentTeamRefresh { .. } => "agent_team_refresh",
         ChatSseEvent::MemoryExtractionComplete { .. } => "memory_extraction_complete",
         ChatSseEvent::MemoryResolved { .. } => "memory_resolved",
