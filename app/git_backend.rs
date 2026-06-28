@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
@@ -533,6 +533,124 @@ pub(super) fn merge_agent_worktree(
     })
 }
 
+pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
+    workspace_path: &Path,
+    worktree_path: &Path,
+    base_revision: &str,
+) -> Result<Option<String>, ApiError> {
+    let worktree_path = validate_agent_worktree_path(workspace_path, worktree_path)?;
+    let shared_repo = open_repo(workspace_path)?;
+    let worktree_repo = open_repo(&worktree_path)?;
+    let shared_head = shared_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("shared workspace has unborn HEAD: {source}"))
+        })?
+        .detach();
+    if shared_head.to_string() != base_revision {
+        return Err(ApiError::bad_request(format!(
+            "shared workspace HEAD '{shared_head}' does not match Agent worktree base revision '{base_revision}'"
+        )));
+    }
+    if !status_entries_for_repo(workspace_path, &shared_repo)?.is_empty() {
+        return Err(ApiError::bad_request(
+            "cannot merge Agent worktree while shared workspace has uncommitted changes",
+        ));
+    }
+    if !status_entries_for_repo(&worktree_path, &worktree_repo)?.is_empty() {
+        return Err(ApiError::bad_request(
+            "cannot merge Agent worktree with uncommitted changes",
+        ));
+    }
+
+    let worktree_head = worktree_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
+        })?
+        .detach();
+    if worktree_head.to_string() == base_revision {
+        return Ok(None);
+    }
+    let current_branch = shared_repo
+        .head_name()
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD: {source}")))?
+        .map(|name| name.shorten().to_string())
+        .ok_or_else(|| ApiError::bad_request("cannot fast-forward detached shared workspace"))?;
+    let target_commit = worktree_repo.find_commit(worktree_head).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree HEAD commit: {source}"
+        ))
+    })?;
+    let tree_id = target_commit.tree_id().map_err(|source| {
+        ApiError::internal(format!("failed to read Agent worktree HEAD tree: {source}"))
+    })?;
+    let mut target_index = shared_repo
+        .index_from_tree(&tree_id.detach())
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to build Agent worktree merge index: {source}"
+            ))
+        })?;
+
+    remove_tracked_files_missing_from_target(&shared_repo, &target_index)?;
+    checkout_index(&shared_repo, &mut target_index)?;
+    write_index(target_index)?;
+    shared_repo
+        .reference(
+            branch_ref_name(&current_branch).as_str(),
+            worktree_head,
+            PreviousValue::Any,
+            "merge: Fast-forward Foco Agent worktree",
+        )
+        .map_err(|source| {
+            ApiError::bad_request(format!("failed to fast-forward shared workspace: {source}"))
+        })?;
+
+    Ok(Some(worktree_head.to_string()))
+}
+
+pub(super) fn agent_worktree_committed_diff(
+    workspace_path: &Path,
+    worktree_path: &Path,
+    base_revision: &str,
+) -> Result<String, ApiError> {
+    let worktree_path = validate_agent_worktree_path(workspace_path, worktree_path)?;
+    let worktree_repo = open_repo(&worktree_path)?;
+    let base_id = gix::ObjectId::from_hex(base_revision.as_bytes()).map_err(|source| {
+        ApiError::bad_request(format!("invalid Agent worktree base revision: {source}"))
+    })?;
+    let base_commit = worktree_repo.find_commit(base_id).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree base commit: {source}"
+        ))
+    })?;
+    let head_id = worktree_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
+        })?
+        .detach();
+    let head_commit = worktree_repo.find_commit(head_id).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree HEAD commit: {source}"
+        ))
+    })?;
+    let base_tree_id = base_commit.tree_id().map_err(|source| {
+        ApiError::internal(format!("failed to read Agent worktree base tree: {source}"))
+    })?;
+    let head_tree_id = head_commit.tree_id().map_err(|source| {
+        ApiError::internal(format!("failed to read Agent worktree HEAD tree: {source}"))
+    })?;
+    let base_tree = worktree_repo
+        .find_tree(base_tree_id.detach())
+        .map_err(|source| ApiError::internal(format!("failed to read base tree: {source}")))?;
+    let head_tree = worktree_repo
+        .find_tree(head_tree_id.detach())
+        .map_err(|source| ApiError::internal(format!("failed to read HEAD tree: {source}")))?;
+    diff_trees_text(&worktree_repo, &base_tree, &head_tree)
+}
+
 pub(super) fn validate_agent_worktree_path(
     workspace_path: &Path,
     worktree_path: &Path,
@@ -727,6 +845,44 @@ fn unstaged_diff_text(
     }
 
     Ok(diff)
+}
+
+fn diff_trees_text(
+    repo: &gix::Repository,
+    old_tree: &gix::Tree<'_>,
+    new_tree: &gix::Tree<'_>,
+) -> Result<String, ApiError> {
+    let old_index = repo.index_from_tree(&old_tree.id).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to build git index from base tree: {source}"
+        ))
+    })?;
+    let new_index = repo.index_from_tree(&new_tree.id).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to build git index from HEAD tree: {source}"
+        ))
+    })?;
+    let paths = index_paths(&old_index)
+        .into_iter()
+        .chain(index_paths(&new_index))
+        .collect::<BTreeSet<_>>();
+    let mut diff = String::new();
+
+    for path in paths {
+        let old = blob_from_tree(repo, old_tree, &path)?;
+        let new = blob_from_tree(repo, new_tree, &path)?;
+        append_file_diff(&mut diff, &path, old.as_deref(), new.as_deref())?;
+    }
+
+    Ok(diff)
+}
+
+fn index_paths(index: &gix::index::File) -> BTreeSet<String> {
+    index
+        .entries()
+        .iter()
+        .map(|entry| entry.path(index).to_str_lossy().into_owned())
+        .collect()
 }
 
 fn append_file_diff(
@@ -1083,6 +1239,71 @@ fn phase12_agent_worktrees_isolate_delete_and_merge_changes() {
         validate_agent_worktree_path(workspace_path, workspace_path).is_err(),
         "managed deletion must reject paths outside Foco agent worktrees"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn plan_worktree_fast_forward_merges_committed_phase_history() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    fs::write(workspace_path.join(".gitignore"), ".foco/\n").expect("ignore Foco internals");
+    stage_git_file(workspace_path, "README.md").expect("stage base file");
+    stage_git_file(workspace_path, ".gitignore").expect("stage ignore file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-plan-test").expect("worktree");
+    fs::write(worktree.root_path.join("phase-1.txt"), "phase 1\n").expect("phase 1 file");
+    stage_git_file(&worktree.root_path, "phase-1.txt").expect("stage phase 1");
+    let first_commit =
+        commit_staged_changes(&worktree.root_path, "phase 1".to_string()).expect("phase 1 commit");
+    fs::write(worktree.root_path.join("phase-2.txt"), "phase 2\n").expect("phase 2 file");
+    stage_git_file(&worktree.root_path, "phase-2.txt").expect("stage phase 2");
+    let second_commit =
+        commit_staged_changes(&worktree.root_path, "phase 2".to_string()).expect("phase 2 commit");
+    assert_ne!(first_commit, second_commit);
+    let source_diff =
+        agent_worktree_committed_diff(workspace_path, &worktree.root_path, &worktree.base_revision)
+            .expect("committed diff");
+    assert!(source_diff.contains("phase-1.txt"));
+    assert!(source_diff.contains("phase-2.txt"));
+
+    let merged = fast_forward_shared_workspace_to_agent_worktree(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect("fast-forward merge");
+    assert_eq!(merged.as_deref(), Some(second_commit.as_str()));
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("phase-1.txt")).expect("phase 1 merged"),
+        "phase 1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("phase-2.txt")).expect("phase 2 merged"),
+        "phase 2\n"
+    );
+    assert!(
+        git_diff_response(workspace_path, None)
+            .expect("shared diff")
+            .status
+            .trim()
+            .is_empty()
+    );
+    delete_agent_worktree(workspace_path, &worktree.root_path, false).expect("delete worktree");
+    assert!(!worktree.root_path.exists());
 }
 fn remove_tracked_files_missing_from_target(
     repo: &gix::Repository,

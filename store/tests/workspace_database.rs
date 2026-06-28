@@ -5025,6 +5025,18 @@ fn phase12_persists_isolated_agent_instance_worktree_metadata() {
         .update_agent_instance_worktree_status(&instance_id, "archived")
         .expect("archive worktree");
     assert_eq!(updated.worktree_status.as_deref(), Some("archived"));
+
+    let shared = database
+        .switch_agent_instance_to_shared_workspace(&instance_id)
+        .expect("switch to shared workspace");
+    assert_eq!(
+        shared.execution_workspace_mode,
+        AgentExecutionWorkspaceMode::Shared
+    );
+    assert!(shared.execution_root_path.is_none());
+    assert!(shared.worktree_base_revision.is_none());
+    assert!(shared.worktree_branch.is_none());
+    assert!(shared.worktree_status.is_none());
 }
 
 #[test]

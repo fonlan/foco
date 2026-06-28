@@ -5263,6 +5263,44 @@ impl WorkspaceDatabase {
         })
     }
 
+    pub fn switch_agent_instance_to_shared_workspace(
+        &mut self,
+        instance_id: &AgentInstanceId,
+    ) -> Result<AgentInstanceRecord, WorkspaceDatabaseError> {
+        let instance = self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found"),
+            }
+        })?;
+        if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::Shared {
+            return Ok(instance);
+        }
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE agent_instances
+                 SET execution_workspace_mode = 'shared',
+                     execution_root_path = NULL,
+                     worktree_base_revision = NULL,
+                     worktree_branch = NULL,
+                     worktree_status = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1 AND execution_workspace_mode = 'isolated_worktree'",
+                params![instance_id.as_str(), now_timestamp()],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' workspace mode was not updated"),
+            });
+        }
+        self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found after mode update"),
+            }
+        })
+    }
+
     pub fn delete_agent_instance(
         &mut self,
         instance_id: &AgentInstanceId,

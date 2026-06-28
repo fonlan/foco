@@ -163,6 +163,7 @@ function ChatPanelComponent({
   skills,
   queuedMessageIds,
   thinkingLevels,
+  worktreeBranch,
   workspaces,
   workspaceId,
 }: {
@@ -224,6 +225,7 @@ function ChatPanelComponent({
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
+  worktreeBranch: string | null;
   workspaces: WorkspaceSummary[];
   workspaceId: string | null;
 }) {
@@ -918,10 +920,10 @@ function ChatPanelComponent({
                 selectedValue={selectedThinkingLevel}
               />
               <BranchSelector
-                branches={gitBranches?.branches ?? []}
-                currentBranch={selectedGitBranch}
-                disabled={isSendingMessage || isLoadingBranches}
-                isGitRepository={gitBranches?.isGitRepository ?? false}
+                branches={worktreeBranch ? [worktreeBranch] : gitBranches?.branches ?? []}
+                currentBranch={worktreeBranch ?? selectedGitBranch}
+                disabled={isSendingMessage || isLoadingBranches || worktreeBranch !== null}
+                isGitRepository={worktreeBranch !== null || (gitBranches?.isGitRepository ?? false)}
                 isLoading={isLoadingBranches}
                 onChange={onBranchChange}
               />

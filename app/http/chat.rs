@@ -22,7 +22,7 @@ use foco_store::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::git_backend::{create_agent_worktree, delete_agent_worktree};
+use crate::git_backend::{AgentWorktreeInfo, create_agent_worktree, delete_agent_worktree};
 use crate::*;
 
 type BoxedChatEventStream =
@@ -357,6 +357,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     pub(crate) agent_definition_id: Option<String>,
     pub(crate) coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode,
+    pub(crate) coordinator_worktree: Option<AgentWorktreeInfo>,
     pub(crate) correlation_id: Option<String>,
     pub(crate) origin: QueuedChatMessageOrigin,
 }
@@ -395,6 +396,7 @@ pub(crate) async fn queue_chat_message(
             attachments: request.attachments,
             agent_definition_id: None,
             coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
             correlation_id: None,
             origin: QueuedChatMessageOrigin::User,
         },
@@ -435,6 +437,7 @@ pub(crate) async fn queue_chat_message_internal(
         attachments,
         agent_definition_id,
         coordinator_execution_workspace_mode,
+        coordinator_worktree,
         correlation_id,
         origin,
     } = input;
@@ -572,13 +575,26 @@ pub(crate) async fn queue_chat_message_internal(
         validate_agent_snapshot_for_workspace(&config, workspace, &definition)?;
         let team_id = foco_agent::AgentTeamId::new(unique_id("agent-team"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
-        let instance_id = foco_agent::AgentInstanceId::new(unique_id("agent-instance"))
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let instance_id =
+            foco_agent::AgentInstanceId::new(coordinator_instance_id_for_chat(&origin, &chat_id))
+                .map_err(|error| ApiError::internal(error.to_string()))?;
         let coordinator_worktree = match coordinator_execution_workspace_mode {
-            foco_agent::AgentExecutionWorkspaceMode::Shared => None,
-            foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree => Some(
-                create_agent_worktree(&workspace.path, instance_id.as_str())?,
-            ),
+            foco_agent::AgentExecutionWorkspaceMode::Shared => {
+                if coordinator_worktree.is_some() {
+                    return Err(ApiError::bad_request(
+                        "shared Coordinator cannot reuse an isolated worktree",
+                    ));
+                }
+                None
+            }
+            foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree => match coordinator_worktree
+            {
+                Some(worktree) => Some(worktree),
+                None => Some(create_agent_worktree(
+                    &workspace.path,
+                    instance_id.as_str(),
+                )?),
+            },
         };
         let coordinator_worktree_root = coordinator_worktree
             .as_ref()
@@ -774,6 +790,15 @@ async fn default_agent_allowed_tools(
     tools.sort();
     tools.dedup();
     Ok(tools)
+}
+
+fn coordinator_instance_id_for_chat(origin: &QueuedChatMessageOrigin, chat_id: &str) -> String {
+    if matches!(origin, QueuedChatMessageOrigin::PlanPhase { .. }) {
+        if let Some(suffix) = chat_id.strip_prefix("chat-") {
+            return format!("agent-instance-{suffix}");
+        }
+    }
+    unique_id("agent-instance")
 }
 
 fn resume_chat_coordinator_for_new_message(

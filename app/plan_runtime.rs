@@ -1,6 +1,11 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
-use foco_agent::{AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId, AgentTaskStatus};
+use foco_agent::{
+    AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId, AgentTaskStatus, AgentTeamId,
+};
 use foco_store::{
     config::{
         GlobalConfig, ModelSettings, PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
@@ -13,7 +18,11 @@ use foco_store::{
 use serde_json::Value;
 
 use crate::{
-    git_backend::{commit_staged_changes, git_diff_response, merge_agent_worktree, stage_git_file},
+    git_backend::{
+        AgentWorktreeInfo, agent_worktree_committed_diff, commit_staged_changes,
+        delete_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
+        merge_agent_worktree, stage_git_file,
+    },
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
     *,
 };
@@ -101,23 +110,9 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
 
     match task.status {
         AgentTaskStatus::Completed => {
-            let commit_id = match merge_and_commit_plan_phase(workspace, &phase, &instance) {
+            let commit_id = match commit_plan_phase_to_worktree(&phase, &instance) {
                 Ok(commit_id) => commit_id,
                 Err(error) => {
-                    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-                        .map_err(ApiError::from_workspace_error)?;
-                    let plan = database
-                        .plan(&phase.plan_id)
-                        .map_err(ApiError::from_workspace_error)?
-                        .ok_or_else(|| {
-                            ApiError::internal(format!("plan '{}' was not found", phase.plan_id))
-                        })?;
-                    drop(database);
-                    if dispatch_plan_merge(state, workspace, &plan, &phase, &instance, &error)
-                        .await?
-                    {
-                        return Ok(());
-                    }
                     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                         .map_err(ApiError::from_workspace_error)?;
                     database
@@ -206,6 +201,10 @@ async fn sync_plan_merge_task(
                     )
                     .map_err(ApiError::from_workspace_error)?
             };
+            if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree {
+                delete_instance_worktree(workspace, instance, true)?;
+            }
+            delete_plan_worktrees(workspace, &plan, true)?;
             continue_plan_if_ready(state, workspace, plan).await?;
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
@@ -229,16 +228,7 @@ async fn dispatch_plan_merge(
     source_instance: &AgentInstanceRecord,
     merge_error: &ApiError,
 ) -> Result<bool, ApiError> {
-    let root_path = source_instance
-        .execution_root_path
-        .as_deref()
-        .ok_or_else(|| {
-            ApiError::internal(format!(
-                "plan phase '{}' Coordinator is missing execution root",
-                phase.id
-            ))
-        })?;
-    let source_diff = match plan_phase_source_diff(root_path) {
+    let source_diff = match plan_phase_source_diff(workspace, source_instance) {
         Ok(source_diff) => source_diff,
         Err(_) => return Ok(false),
     };
@@ -280,6 +270,7 @@ async fn dispatch_plan_merge(
             attachments: Vec::new(),
             agent_definition_id: None,
             coordinator_execution_workspace_mode: execution_mode,
+            coordinator_worktree: None,
             correlation_id: Some(plan_merge_correlation_id(&plan.id, &phase.id)?),
             origin: QueuedChatMessageOrigin::PlanMerge {
                 plan_id: plan.id.clone(),
@@ -326,8 +317,14 @@ async fn continue_plan_if_ready(
     workspace: &WorkspaceConfig,
     plan: PlanRecord,
 ) -> Result<(), ApiError> {
-    if plan.status == "ready" {
-        let _ = transition_plan_action(state, &workspace.id, &plan.id, "resume").await?;
+    match plan.status.as_str() {
+        "ready" => {
+            let _ = transition_plan_action(state, &workspace.id, &plan.id, "resume").await?;
+        }
+        "implemented" => {
+            finalize_plan_worktree(state, workspace, &plan).await?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -360,6 +357,12 @@ async fn dispatch_plan_phase(
 
     let config = config_snapshot(state)?;
     let selection = plan_runner_model_selection(&config)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let coordinator_worktree = {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        plan_worktree_info(&database, &plan)?
+    };
     let queued = match queue_chat_message_internal(
         state,
         workspace_id,
@@ -376,6 +379,7 @@ async fn dispatch_plan_phase(
             attachments: Vec::new(),
             agent_definition_id: None,
             coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+            coordinator_worktree,
             correlation_id: None,
             origin: QueuedChatMessageOrigin::PlanPhase {
                 plan_id: plan.id.clone(),
@@ -387,7 +391,6 @@ async fn dispatch_plan_phase(
     {
         Ok(queued) => queued,
         Err(error) => {
-            let workspace = workspace_by_id(&config, workspace_id)?;
             let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                 .map_err(ApiError::from_workspace_error)?;
             database
@@ -405,7 +408,6 @@ async fn dispatch_plan_phase(
         .agent_task_id
         .as_ref()
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
-    let workspace = workspace_by_id(&config, workspace_id)?;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let plan = database
@@ -413,6 +415,80 @@ async fn dispatch_plan_phase(
         .map_err(ApiError::from_workspace_error)?;
     state.agent_scheduler.wake()?;
     Ok(plan)
+}
+
+async fn finalize_plan_worktree(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    plan: &PlanRecord,
+) -> Result<(), ApiError> {
+    let (phase, instance) = {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let Some(source) = plan_worktree_source(&database, plan)? else {
+            return Ok(());
+        };
+        source
+    };
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan '{}' worktree Coordinator is missing execution root",
+            plan.id
+        ))
+    })?;
+    let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan '{}' worktree Coordinator is missing base revision",
+            plan.id
+        ))
+    })?;
+    match fast_forward_shared_workspace_to_agent_worktree(
+        &workspace.path,
+        Path::new(root_path),
+        base_revision,
+    ) {
+        Ok(_) => delete_plan_worktrees(workspace, plan, true),
+        Err(error) => {
+            if dispatch_plan_merge(state, workspace, plan, &phase, &instance, &error).await? {
+                Ok(())
+            } else {
+                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn commit_plan_phase_to_worktree(
+    phase: &PlanPhaseRecord,
+    instance: &AgentInstanceRecord,
+) -> Result<Option<String>, ApiError> {
+    if instance.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
+        return Err(ApiError::internal(format!(
+            "plan phase '{}' did not run in an isolated worktree",
+            phase.id
+        )));
+    }
+    if instance.status != AgentInstanceStatus::Idle {
+        return Err(ApiError::internal(format!(
+            "plan phase '{}' Coordinator is not idle after task completion",
+            phase.id
+        )));
+    }
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan phase '{}' Coordinator is missing execution root",
+            phase.id
+        ))
+    })?;
+    commit_workspace_changes(
+        Path::new(root_path),
+        format!("plan: implement {}", phase.title.trim()),
+    )
 }
 
 fn merge_and_commit_plan_phase(
@@ -468,6 +544,159 @@ fn merge_and_commit_plan_phase(
     Ok(Some(commit_id))
 }
 
+fn commit_workspace_changes(
+    workspace_path: &Path,
+    message: String,
+) -> Result<Option<String>, ApiError> {
+    let diff = git_diff_response(workspace_path, None)?;
+    let changed_paths = diff
+        .files
+        .iter()
+        .chain(diff.staged_files.iter())
+        .map(|file| file.path.trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if changed_paths.is_empty() {
+        return Ok(None);
+    }
+    for path in &changed_paths {
+        stage_git_file(workspace_path, path)?;
+    }
+    let staged = git_diff_response(workspace_path, None)?;
+    if staged.staged_files.is_empty() {
+        return Ok(None);
+    }
+    commit_staged_changes(workspace_path, message).map(Some)
+}
+
+fn plan_worktree_info(
+    database: &WorkspaceDatabase,
+    plan: &PlanRecord,
+) -> Result<Option<AgentWorktreeInfo>, ApiError> {
+    let Some((_, instance)) = plan_worktree_source(database, plan)? else {
+        return Ok(None);
+    };
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan '{}' worktree Coordinator is missing execution root",
+            plan.id
+        ))
+    })?;
+    let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan '{}' worktree Coordinator is missing base revision",
+            plan.id
+        ))
+    })?;
+    let branch = instance.worktree_branch.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "plan '{}' worktree Coordinator is missing branch",
+            plan.id
+        ))
+    })?;
+    Ok(Some(AgentWorktreeInfo {
+        root_path: PathBuf::from(root_path),
+        base_revision: base_revision.to_string(),
+        branch: branch.to_string(),
+    }))
+}
+
+fn plan_worktree_source(
+    database: &WorkspaceDatabase,
+    plan: &PlanRecord,
+) -> Result<Option<(PlanPhaseRecord, AgentInstanceRecord)>, ApiError> {
+    for phase in plan.phases.iter().rev() {
+        let Some(instance) = plan_phase_coordinator_instance(database, phase)? else {
+            continue;
+        };
+        if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+            && instance.worktree_status.as_deref() != Some("deleted")
+        {
+            return Ok(Some((phase.clone(), instance)));
+        }
+    }
+    Ok(None)
+}
+
+fn plan_worktree_instances(
+    database: &WorkspaceDatabase,
+    plan: &PlanRecord,
+) -> Result<Vec<AgentInstanceRecord>, ApiError> {
+    let mut seen = BTreeSet::new();
+    let mut instances = Vec::new();
+    for phase in &plan.phases {
+        let Some(instance) = plan_phase_coordinator_instance(database, phase)? else {
+            continue;
+        };
+        if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+            && seen.insert(instance.id.to_string())
+        {
+            instances.push(instance);
+        }
+    }
+    Ok(instances)
+}
+
+fn plan_phase_coordinator_instance(
+    database: &WorkspaceDatabase,
+    phase: &PlanPhaseRecord,
+) -> Result<Option<AgentInstanceRecord>, ApiError> {
+    let Some(team_id) = phase.agent_team_id.as_deref() else {
+        return Ok(None);
+    };
+    let team_id = AgentTeamId::new(team_id.to_string())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let Some(team) = database
+        .agent_team(&team_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(None);
+    };
+    database
+        .agent_instance(&team.coordinator_instance_id)
+        .map_err(ApiError::from_workspace_error)
+}
+
+fn delete_plan_worktrees(
+    workspace: &WorkspaceConfig,
+    plan: &PlanRecord,
+    allow_changes: bool,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let instances = plan_worktree_instances(&database, plan)?;
+    let mut deleted_roots = BTreeSet::new();
+    for instance in instances {
+        if let Some(root_path) = instance.execution_root_path.as_deref() {
+            if deleted_roots.insert(root_path.to_string()) {
+                delete_agent_worktree(&workspace.path, Path::new(root_path), allow_changes)?;
+            }
+        }
+        database
+            .switch_agent_instance_to_shared_workspace(&instance.id)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
+}
+
+fn delete_instance_worktree(
+    workspace: &WorkspaceConfig,
+    instance: &AgentInstanceRecord,
+    allow_changes: bool,
+) -> Result<(), ApiError> {
+    let Some(root_path) = instance.execution_root_path.as_deref() else {
+        return Ok(());
+    };
+    delete_agent_worktree(&workspace.path, Path::new(root_path), allow_changes)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .switch_agent_instance_to_shared_workspace(&instance.id)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
 fn plan_runner_model_selection(
     config: &GlobalConfig,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
@@ -508,7 +737,7 @@ fn model_outputs_text(model: &ModelSettings) -> bool {
 
 fn plan_phase_prompt(plan: &PlanRecord, phase: &PlanPhaseRecord) -> String {
     let mut message = format!(
-        "Implement this plan phase in the isolated worktree. Do not create a git commit; Foco will merge and commit after the phase completes.\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}",
+        "Implement this plan phase in the plan's isolated worktree. Do not create a git commit; Foco will commit this phase in the worktree after the phase completes, and later phases will continue from that commit. Foco merges the worktree back to the shared workspace only after all phases complete.\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}",
         plan.title,
         plan.overview,
         phase.sequence + 1,
@@ -601,10 +830,28 @@ fn plan_merge_target_for_task(task: &AgentTaskRecord) -> Result<Option<PlanMerge
     }))
 }
 
-fn plan_phase_source_diff(root_path: &str) -> Result<String, ApiError> {
+fn plan_phase_source_diff(
+    workspace: &WorkspaceConfig,
+    instance: &AgentInstanceRecord,
+) -> Result<String, ApiError> {
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "Agent instance '{}' is missing execution root",
+            instance.id
+        ))
+    })?;
     let diff = git_diff_response(Path::new(root_path), None)?;
+    let committed_diff = instance
+        .worktree_base_revision
+        .as_deref()
+        .map(|base_revision| {
+            agent_worktree_committed_diff(&workspace.path, Path::new(root_path), base_revision)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let source = format!(
-        "Git status:\n{}\n\nUnstaged diff:\n{}\n\nStaged diff:\n{}",
+        "Committed diff from plan worktree base to HEAD:\n{}\n\nGit status:\n{}\n\nUnstaged diff:\n{}\n\nStaged diff:\n{}",
+        committed_diff.trim_end(),
         diff.status.trim_end(),
         diff.diff.trim_end(),
         diff.staged_diff.trim_end()
@@ -653,30 +900,10 @@ fn commit_direct_plan_merge(
     workspace: &WorkspaceConfig,
     phase: &PlanPhaseRecord,
 ) -> Result<Option<String>, ApiError> {
-    let diff = git_diff_response(&workspace.path, None)?;
-    let changed_paths = diff
-        .files
-        .iter()
-        .chain(diff.staged_files.iter())
-        .map(|file| file.path.trim())
-        .filter(|path| !path.is_empty())
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if changed_paths.is_empty() {
-        return Ok(None);
-    }
-    for path in &changed_paths {
-        stage_git_file(&workspace.path, path)?;
-    }
-    let staged = git_diff_response(&workspace.path, None)?;
-    if staged.staged_files.is_empty() {
-        return Ok(None);
-    }
-    commit_staged_changes(
+    commit_workspace_changes(
         &workspace.path,
         format!("plan: resolve merge for {}", phase.title.trim()),
     )
-    .map(Some)
 }
 
 fn truncate_for_prompt(value: &str, max_bytes: usize) -> String {

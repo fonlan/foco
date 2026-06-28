@@ -7584,6 +7584,17 @@ export function App() {
     handleWithdrawQueuedMessage,
   );
   const providersForChatPanel = settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
+  const activeChatCoordinatorInstance =
+    agentTeamSnapshot?.team.chatId === activeChatId
+      ? agentTeamSnapshot.instances.find(
+          (instance) => instance.id === agentTeamSnapshot.team.coordinatorInstanceId,
+        ) ?? null
+      : null;
+  const activeChatWorktreeBranch =
+    activeChatCoordinatorInstance?.executionWorkspaceMode === "isolated_worktree" &&
+    activeChatCoordinatorInstance.worktreeStatus !== "deleted"
+      ? activeChatCoordinatorInstance.worktreeBranch
+      : null;
   const refreshAgentPanelForContextPanel = useStableCallback(async () => {
     if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
       await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
@@ -8443,6 +8454,7 @@ export function App() {
                   queuedRunCount={queuedRunRequests.length}
                   queuedMessageIds={queuedMessageIds}
                   selectedGitBranch={selectedGitBranch}
+                  worktreeBranch={activeChatWorktreeBranch}
                   selectedModelId={selectedModelId}
                   selectedProviderId={selectedProviderId}
                   selectedSkillIds={selectedSkillIds}

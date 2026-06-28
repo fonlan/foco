@@ -5387,6 +5387,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
             attachments: Vec::new(),
             agent_definition_id: None,
             coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
             correlation_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
                 task_id: "scheduled-task-test".to_string(),
