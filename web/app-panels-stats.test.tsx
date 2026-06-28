@@ -9,6 +9,7 @@ import {
   aiStatisticsDetail,
   appTestState,
   changeInput,
+  chatSummary,
   defaultComposerPlaceholder,
   type Deferred,
   chatMemory,
@@ -166,6 +167,193 @@ describe("app-panels-stats verification surfaces", () => {
       expect(screen.queryByText("connected")).not.toBeInTheDocument();
     });
   }, 10000);
+
+  it("expands plan phases and opens the implementation chat after start", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T04:30:00Z";
+    const phaseStep = {
+      acceptance: ["Start queues a team chat."],
+      checkedAt: null,
+      createdAt: timestamp,
+      detail: "The workspace chat list shows the created implementation session.",
+      id: "plan-step-1",
+      phaseId: "plan-phase-1",
+      planId: "plan-1",
+      sequence: 0,
+      status: "pending",
+      title: "Wire start action",
+      updatedAt: timestamp,
+    };
+    const pendingPhase = {
+      agentTaskId: null,
+      agentTeamId: null,
+      commitId: null,
+      completedAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-phase-1",
+      implementationChatId: null,
+      mergeAttemptCount: 0,
+      planId: "plan-1",
+      sequence: 0,
+      startedAt: null,
+      status: "pending",
+      steps: [phaseStep],
+      summary: "Use the existing chat runtime.",
+      title: "Phase 1",
+      updatedAt: timestamp,
+    };
+    const readyPlan = {
+      activePhaseId: null,
+      completedAt: null,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-1",
+      overview: "Run the implementation through normal visible chats.",
+      pauseRequestedAt: null,
+      phases: [pendingPhase],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "ready",
+      title: "Build plan runner UI",
+      updatedAt: timestamp,
+    };
+    const runningPlan = {
+      ...readyPlan,
+      activePhaseId: "plan-phase-1",
+      phases: [
+        {
+          ...pendingPhase,
+          agentTaskId: "agent-task-plan-1",
+          agentTeamId: "agent-team-plan-1",
+          implementationChatId: "plan-chat-1",
+          startedAt: timestamp,
+          status: "running",
+        },
+      ],
+      status: "running",
+    };
+    let didStartPlan = false;
+    const planChat = chatSummary(
+      "plan-chat-1",
+      "Plan phase implementation",
+      timestamp,
+      timestamp,
+      { additions: 0, deletions: 0 },
+      {
+        chatId: "plan-chat-1",
+        lastSequence: 0,
+        runId: "agent-task-plan-1",
+        workspaceId: "workspace-1",
+      },
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces") {
+        return jsonResponse({
+          activeWorkspaceId: workspace.id,
+          workspaces: [
+            {
+              ...workspace,
+              chats: didStartPlan ? [planChat, ...workspace.chats] : workspace.chats,
+            },
+            secondaryWorkspace,
+          ],
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        const plan = didStartPlan ? runningPlan : readyPlan;
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [plan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/plan-1/action") {
+        didStartPlan = true;
+        return jsonResponse({ plan: runningPlan });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chats/plan-chat-1/messages") {
+        return jsonResponse({
+          activeRun: {
+            chatId: "plan-chat-1",
+            lastSequence: 0,
+            runId: "agent-task-plan-1",
+            workspaceId: "workspace-1",
+          },
+          chat: {
+            id: "plan-chat-1",
+            kind: null,
+            readOnly: false,
+            title: "Plan phase implementation",
+          },
+          messages: [
+            {
+              content: "Plan phase implementation request.",
+              createdAt: timestamp,
+              extractedMemories: [],
+              id: "plan-message-user",
+              memoriesUsed: [],
+              metrics: null,
+              parts: [{ text: "Plan phase implementation request.", type: "text" }],
+              reasoning: null,
+              role: "user",
+              specUpdates: [],
+              toolCalls: [],
+            },
+          ],
+          pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Build plan runner UI")).toBeInTheDocument();
+    expect(screen.queryByText("Wire start action")).not.toBeInTheDocument();
+
+    const phaseButton = (await screen.findByText("Phase 1")).closest("button");
+    if (!phaseButton) {
+      throw new Error("Expected phase row button");
+    }
+    await user.click(phaseButton);
+
+    expect(await screen.findByText("Wire start action")).toBeInTheDocument();
+    expect(screen.getByText("Start queues a team chat.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Start" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/plans/plan-1/action",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    expect(
+      await within(workspaceList).findByText("Plan phase implementation"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("Plan phase implementation request."),
+    ).toBeInTheDocument();
+  });
 
   async function openSpecPanel() {
     renderApp();

@@ -1482,7 +1482,7 @@ export function App() {
       setActivePlansError(null);
 
       try {
-        await requestJson<PlanResponse>(
+        const response = await requestJson<PlanResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
           {
             body: JSON.stringify({ action }),
@@ -1490,7 +1490,19 @@ export function App() {
             method: "POST",
           },
         );
-        await loadActivePlans(workspaceId);
+        const plansResponse = await loadActivePlans(workspaceId);
+        await refreshWorkspaces();
+        const plan =
+          plansResponse?.plans.find((candidate) => candidate.id === planId) ??
+          response.plan;
+        const implementationChatId =
+          action === "start" || action === "resume"
+            ? plan.phases.find((phase) => phase.id === plan.activePhaseId)
+              ?.implementationChatId ?? null
+            : null;
+        if (implementationChatId) {
+          selectWorkspaceChat(workspaceId, implementationChatId);
+        }
       } catch (requestError) {
         setActivePlansError(errorMessage(requestError));
       } finally {
@@ -1499,7 +1511,7 @@ export function App() {
         );
       }
     },
-    [loadActivePlans],
+    [loadActivePlans, refreshWorkspaces],
   );
 
   // ponytail: poll a queued spec job until it settles, then reload spec content.

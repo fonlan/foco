@@ -371,7 +371,7 @@ async fn dispatch_plan_phase(
             skill_ids: None,
             session_mode: None,
             message: plan_phase_prompt(&plan, phase),
-            team_mode_enabled: false,
+            team_mode_enabled: true,
             defer_start: true,
             attachments: Vec::new(),
             agent_definition_id: None,

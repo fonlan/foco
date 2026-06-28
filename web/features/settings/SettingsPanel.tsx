@@ -2268,7 +2268,7 @@ export function SettingsPanel({
     setPlanHistoryError(null);
 
     try {
-      await requestJson<PlanResponse>(
+      const response = await requestJson<PlanResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/plans/${encodeURIComponent(planId)}/action`,
         {
           body: JSON.stringify({ action }),
@@ -2277,6 +2277,16 @@ export function SettingsPanel({
         },
       );
       await loadPlanHistory();
+      await onWorkspacesChange();
+      const implementationChatId =
+        action === "start" || action === "resume"
+          ? response.plan.phases.find(
+            (phase) => phase.id === response.plan.activePhaseId,
+          )?.implementationChatId ?? null
+          : null;
+      if (implementationChatId) {
+        onOpenChat(activeWorkspaceId, implementationChatId);
+      }
     } catch (requestError) {
       setPlanHistoryError(errorMessage(requestError));
     } finally {

@@ -626,6 +626,9 @@ function ContextPlanTab({
   plans: Plan[];
 }) {
   const { language, t } = useI18n();
+  const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   if (isLoading && plans.length === 0) {
     return (
@@ -717,33 +720,78 @@ function ContextPlanTab({
                 })}
               </small>
               <div className="mt-3 space-y-2">
-                {plan.phases.map((phase) => (
-                  <section
-                    className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
-                    key={phase.id}
-                  >
-                    <div className="flex min-w-0 items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="truncate text-xs font-semibold text-stone-900">
-                          {phase.title}
-                        </div>
-                        {phase.summary ? (
-                          <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
-                            {phase.summary}
+                {plan.phases.map((phase) => {
+                  const phaseKey = `${plan.id}:${phase.id}`;
+                  const isExpanded = expandedPhaseKeys.has(phaseKey);
+
+                  return (
+                    <section
+                      className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
+                      key={phase.id}
+                    >
+                      <button
+                        aria-expanded={isExpanded}
+                        className="flex w-full min-w-0 items-start justify-between gap-2 text-left"
+                        onClick={() => {
+                          setExpandedPhaseKeys((current) => {
+                            const next = new Set(current);
+                            if (next.has(phaseKey)) {
+                              next.delete(phaseKey);
+                            } else {
+                              next.add(phaseKey);
+                            }
+                            return next;
+                          });
+                        }}
+                        type="button"
+                      >
+                        <div className="flex min-w-0 items-start gap-2">
+                          <ChevronRight
+                            aria-hidden="true"
+                            className={`mt-0.5 size-3.5 shrink-0 text-stone-500 transition-transform ${
+                              isExpanded ? "rotate-90" : ""
+                            }`}
+                          />
+                          <div className="min-w-0">
+                            <div className="truncate text-xs font-semibold text-stone-900">
+                              {phase.title}
+                            </div>
+                            {phase.summary ? (
+                              <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
+                                {phase.summary}
+                              </div>
+                            ) : null}
                           </div>
-                        ) : null}
-                      </div>
-                      <span className={planPhaseStatusClass(phase.status)}>
-                        {t(planPhaseStatusLabel(phase.status))}
-                      </span>
-                    </div>
-                    <div className="mt-2 space-y-1.5">
-                      {phase.steps.map((step) => (
-                        <PlanStepRow key={step.id} step={step} />
-                      ))}
-                    </div>
-                  </section>
-                ))}
+                        </div>
+                        <span className={planPhaseStatusClass(phase.status)}>
+                          {t(planPhaseStatusLabel(phase.status))}
+                        </span>
+                      </button>
+                      {isExpanded ? (
+                        <div className="mt-2 space-y-2 pl-5">
+                          {phase.errorMessage ? (
+                            <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
+                              {phase.errorMessage}
+                            </div>
+                          ) : null}
+                          {phase.implementationChatId ? (
+                            <div className="flex min-w-0 items-center gap-1.5 text-xs text-stone-500">
+                              <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
+                              <span className="truncate">
+                                {t("Implementation chat")}: {phase.implementationChatId}
+                              </span>
+                            </div>
+                          ) : null}
+                          <div className="space-y-1.5">
+                            {phase.steps.map((step) => (
+                              <PlanStepRow key={step.id} step={step} />
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </section>
+                  );
+                })}
               </div>
             </article>
           );
@@ -785,7 +833,14 @@ function PlanStepRow({ step }: { step: PlanStep }) {
           ) : null}
         </div>
         {step.detail ? (
-          <div className="mt-0.5 line-clamp-2 text-stone-500">{step.detail}</div>
+          <div className="mt-0.5 whitespace-pre-wrap text-stone-500">{step.detail}</div>
+        ) : null}
+        {step.acceptance.length ? (
+          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-stone-500">
+            {step.acceptance.map((acceptance) => (
+              <li key={acceptance}>{acceptance}</li>
+            ))}
+          </ul>
         ) : null}
       </div>
     </div>
