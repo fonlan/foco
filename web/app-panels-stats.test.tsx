@@ -355,6 +355,118 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("retries a failed plan phase through the bound agent task", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T05:00:00Z";
+    const failedStep = {
+      acceptance: ["Retry uses the original Agent task."],
+      checkedAt: null,
+      createdAt: timestamp,
+      detail: "The Plan runner should see the same task complete after retry.",
+      id: "plan-step-failed",
+      phaseId: "plan-phase-failed",
+      planId: "plan-failed",
+      sequence: 0,
+      status: "failed",
+      title: "Recover failed phase",
+      updatedAt: timestamp,
+    };
+    const failedPhase = {
+      agentTaskId: "agent-task-failed",
+      agentTeamId: "agent-team-failed",
+      commitId: null,
+      completedAt: timestamp,
+      createdAt: timestamp,
+      errorMessage: "provider rate limited",
+      id: "plan-phase-failed",
+      implementationChatId: null,
+      mergeAttemptCount: 0,
+      planId: "plan-failed",
+      sequence: 0,
+      startedAt: timestamp,
+      status: "failed",
+      steps: [failedStep],
+      summary: "The model request failed.",
+      title: "Failed phase",
+      updatedAt: timestamp,
+    };
+    const failedPlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: "provider rate limited",
+      id: "plan-failed",
+      overview: "Expose an explicit phase retry control.",
+      pauseRequestedAt: null,
+      phases: [failedPhase],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "failed",
+      title: "Retry failed plan phase",
+      updatedAt: timestamp,
+    };
+    const retriedPlan = {
+      ...failedPlan,
+      activePhaseId: "plan-phase-failed",
+      completedAt: null,
+      errorMessage: null,
+      phases: [
+        {
+          ...failedPhase,
+          completedAt: null,
+          errorMessage: null,
+          status: "running",
+        },
+      ],
+      status: "running",
+    };
+    let didRetry = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [didRetry ? retriedPlan : failedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/agent-tasks/agent-task-failed/action") {
+        didRetry = true;
+        return jsonResponse(agentTeamSnapshot);
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Retry failed plan phase")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry plan phase" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/agent-tasks/agent-task-failed/action",
+        expect.objectContaining({
+          body: JSON.stringify({ action: "retry" }),
+          method: "POST",
+        }),
+      );
+    });
+    expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0);
+  });
+
   it("marks implemented plans as merged in the plan panel", async () => {
     const timestamp = "2026-06-28T04:45:00Z";
     const completedStep = {

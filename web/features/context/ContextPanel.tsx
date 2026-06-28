@@ -47,6 +47,7 @@ import type {
   GitStatusFileSummary,
   MemoryFactRecord,
   Plan,
+  PlanPhase,
   PlanStatus,
   PlanStep,
   TaskStatus,
@@ -118,6 +119,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitFileOperation,
   onMemoryPageChange,
   onPlanAction,
+  onPlanPhaseRetry,
   onReloadWorkspaceSpec,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
@@ -177,6 +179,12 @@ const ContextPanel = memo(function ContextPanel({
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onPlanAction: (planId: string, action: string) => void;
+  onPlanPhaseRetry: (
+    planId: string,
+    phaseId: string,
+    agentTaskId: string,
+    implementationChatId: string | null,
+  ) => void;
   onReloadWorkspaceSpec: () => void;
   onRefreshDiff: () => void;
   onRefreshWorkspaceFiles: () => void;
@@ -255,6 +263,7 @@ const ContextPanel = memo(function ContextPanel({
             error={planError}
             isLoading={isLoadingPlans}
             onAction={onPlanAction}
+            onPhaseRetry={onPlanPhaseRetry}
             operationKey={planOperationKey}
             plans={plans}
           />
@@ -616,12 +625,19 @@ function ContextPlanTab({
   error,
   isLoading,
   onAction,
+  onPhaseRetry,
   operationKey,
   plans,
 }: {
   error: string | null;
   isLoading: boolean;
   onAction: (planId: string, action: string) => void;
+  onPhaseRetry: (
+    planId: string,
+    phaseId: string,
+    agentTaskId: string,
+    implementationChatId: string | null,
+  ) => void;
   operationKey: string | null;
   plans: Plan[];
 }) {
@@ -733,29 +749,33 @@ function ContextPlanTab({
                 {plan.phases.map((phase) => {
                   const phaseKey = `${plan.id}:${phase.id}`;
                   const isExpanded = expandedPhaseKeys.has(phaseKey);
+                  const canRetryPhase = isRetryablePlanPhase(phase);
+                  const retryOperationKey = phase.agentTaskId
+                    ? planPhaseRetryOperationKey(phase.agentTaskId)
+                    : null;
 
                   return (
                     <section
                       className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
                       key={phase.id}
                     >
-                      <button
-                        aria-expanded={isExpanded}
-                        className="flex w-full min-w-0 items-start justify-between gap-2 text-left"
-                        onClick={() => {
-                          setExpandedPhaseKeys((current) => {
-                            const next = new Set(current);
-                            if (next.has(phaseKey)) {
-                              next.delete(phaseKey);
-                            } else {
-                              next.add(phaseKey);
-                            }
-                            return next;
-                          });
-                        }}
-                        type="button"
-                      >
-                        <div className="flex min-w-0 items-start gap-2">
+                      <div className="flex min-w-0 items-start justify-between gap-2">
+                        <button
+                          aria-expanded={isExpanded}
+                          className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                          onClick={() => {
+                            setExpandedPhaseKeys((current) => {
+                              const next = new Set(current);
+                              if (next.has(phaseKey)) {
+                                next.delete(phaseKey);
+                              } else {
+                                next.add(phaseKey);
+                              }
+                              return next;
+                            });
+                          }}
+                          type="button"
+                        >
                           <ChevronRight
                             aria-hidden="true"
                             className={`mt-0.5 size-3.5 shrink-0 text-stone-500 transition-transform ${
@@ -772,11 +792,40 @@ function ContextPlanTab({
                               </div>
                             ) : null}
                           </div>
+                        </button>
+                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                          <span className={planPhaseStatusClass(phase.status)}>
+                            {t(planPhaseStatusLabel(phase.status))}
+                          </span>
+                          {canRetryPhase ? (
+                            <button
+                              aria-label={t("Retry plan phase")}
+                              className="inline-flex h-7 items-center justify-center gap-1 rounded-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              disabled={operationKey !== null}
+                              onClick={() => {
+                                if (!phase.agentTaskId) {
+                                  return;
+                                }
+                                onPhaseRetry(
+                                  plan.id,
+                                  phase.id,
+                                  phase.agentTaskId,
+                                  phase.implementationChatId,
+                                );
+                              }}
+                              title={t("Retry plan phase")}
+                              type="button"
+                            >
+                              {operationKey === retryOperationKey ? (
+                                <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                              ) : (
+                                <RefreshCw aria-hidden="true" className="size-3.5" />
+                              )}
+                              {t("Retry phase")}
+                            </button>
+                          ) : null}
                         </div>
-                        <span className={planPhaseStatusClass(phase.status)}>
-                          {t(planPhaseStatusLabel(phase.status))}
-                        </span>
-                      </button>
+                      </div>
                       {isExpanded ? (
                         <div className="mt-2 space-y-2 pl-5">
                           {phase.errorMessage ? (
@@ -2148,6 +2197,17 @@ function primaryPlanAction(status: PlanStatus) {
     return "pause";
   }
   return null;
+}
+
+function isRetryablePlanPhase(phase: PlanPhase) {
+  return (
+    Boolean(phase.agentTaskId) &&
+    (phase.status === "failed" || phase.status === "running")
+  );
+}
+
+function planPhaseRetryOperationKey(agentTaskId: string) {
+  return `retry-phase:${agentTaskId}`;
 }
 
 function planActionLabel(action: string) {

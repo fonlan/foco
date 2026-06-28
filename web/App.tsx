@@ -1553,6 +1553,41 @@ export function App() {
     [loadActivePlans, refreshWorkspaces],
   );
 
+  const runPlanPhaseRetry = useCallback(
+    async (
+      workspaceId: string,
+      agentTaskId: string,
+      implementationChatId: string | null,
+    ) => {
+      const operationKey = `retry-phase:${agentTaskId}`;
+      setPlanOperationKey(operationKey);
+      setActivePlansError(null);
+
+      try {
+        await requestJson<unknown>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/agent-tasks/${encodeURIComponent(agentTaskId)}/action`,
+          {
+            body: JSON.stringify({ action: "retry" }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        await loadActivePlans(workspaceId);
+        await refreshWorkspaces();
+        if (implementationChatId) {
+          selectWorkspaceChat(workspaceId, implementationChatId);
+        }
+      } catch (requestError) {
+        setActivePlansError(errorMessage(requestError));
+      } finally {
+        setPlanOperationKey((current) =>
+          current === operationKey ? null : current,
+        );
+      }
+    },
+    [loadActivePlans, refreshWorkspaces],
+  );
+
   // ponytail: poll a queued spec job until it settles, then reload spec content.
   // Ceiling: fixed backoff schedule (~165s total); upgrade path is an SSE/job push.
   const pollWorkspaceSpecJobUntilSettled = useCallback(
@@ -8631,6 +8666,16 @@ export function App() {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanAction(workspaceId, planId, action);
+                  }
+                }}
+                onPlanPhaseRetry={(_planId, _phaseId, agentTaskId, implementationChatId) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    void runPlanPhaseRetry(
+                      workspaceId,
+                      agentTaskId,
+                      implementationChatId,
+                    );
                   }
                 }}
                 onReloadWorkspaceSpec={handleReloadWorkspaceSpecForContextPanel}
