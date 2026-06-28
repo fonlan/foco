@@ -26,3 +26,42 @@ export function chatItemClass(active: boolean) {
       : "border-transparent text-stone-600 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
+
+export function moveItemId(
+  itemIds: string[],
+  sourceItemId: string,
+  targetItemId: string,
+) {
+  const sourceIndex = itemIds.indexOf(sourceItemId);
+  const targetIndex = itemIds.indexOf(targetItemId);
+
+  if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
+    return itemIds;
+  }
+
+  const next = [...itemIds];
+  const [source] = next.splice(sourceIndex, 1);
+  next.splice(targetIndex, 0, source);
+
+  return next;
+}
+
+export function sameStringList(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+export function reorderWorkspacesByIds<T extends { id: string }>(
+  workspaces: T[],
+  workspaceIds: string[],
+) {
+  if (sameStringList(workspaces.map((workspace) => workspace.id), workspaceIds)) {
+    return workspaces;
+  }
+
+  const workspacesById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+  const next = workspaceIds
+    .map((workspaceId) => workspacesById.get(workspaceId))
+    .filter((workspace): workspace is T => Boolean(workspace));
+
+  return next.length === workspaces.length ? next : workspaces;
+}

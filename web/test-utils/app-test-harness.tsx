@@ -3,6 +3,7 @@ import { vi } from "vitest";
 
 import type {
   ConfiguredModelSummary,
+  ConfiguredWorkspaceSummary,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../api/types";
@@ -1652,12 +1653,15 @@ export const appTestState: {
   chatQueueCounter: number;
   scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]>;
   scheduledTasksResponse: typeof scheduledTasks;
-  settingsResponse: typeof settings;
+  settingsResponse: Omit<typeof settings, "workspaces"> & {
+    workspaces: ConfiguredWorkspaceSummary[];
+  };
   workspaceSpecResponse: typeof workspaceSpec;
   workspaceSpecSaveConflict: boolean;
   workspaceSpecGenerateCompletes: boolean;
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
+  lastWorkspaceOrderRequest: string[] | null;
 } = {
   activeChatStreamController: null,
   chatStreamControllers: new Map<string, ReadableStreamDefaultController<Uint8Array>>(),
@@ -1672,8 +1676,65 @@ export const appTestState: {
   workspaceSpecGenerateCompletes: false,
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
+  lastWorkspaceOrderRequest: null,
 };
+function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspaceSummary {
+  const workspaceSummary = item as ConfiguredWorkspaceSummary & { chats?: unknown[] };
 
+  return {
+    commonCommands: workspaceSummary.commonCommands ?? [],
+    id: workspaceSummary.id,
+    isDefault: workspaceSummary.isDefault ?? workspaceSummary.id === workspace.id,
+    logoUrl: workspaceSummary.logoUrl ?? null,
+    name: workspaceSummary.name,
+    path: workspaceSummary.path,
+    pinned: Boolean(workspaceSummary.pinned),
+    terminalShell: workspaceSummary.terminalShell ?? "powershell",
+  };
+}
+
+function settingsWorkspacesFromWorkspaceResponse() {
+  return appTestState.workspaceResponseWorkspaces.map(workspaceSettingsSummaryFromWorkspace);
+}
+
+function reorderUnknownWorkspacesByIds<T>(items: T[], itemIds: string[]) {
+  const itemsById = new Map(
+    items.map((item) => [(item as { id: string }).id, item]),
+  );
+  const next = itemIds
+    .map((itemId) => itemsById.get(itemId))
+    .filter((item): item is T => Boolean(item));
+
+  return next.length === items.length ? next : items;
+}
+
+function workspaceOrderSettings(workspaceIds: string[]) {
+  appTestState.lastWorkspaceOrderRequest = workspaceIds;
+  appTestState.workspaceResponseWorkspaces = reorderUnknownWorkspacesByIds(
+    appTestState.workspaceResponseWorkspaces,
+    workspaceIds,
+  );
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    workspaces: settingsWorkspacesFromWorkspaceResponse(),
+  };
+
+  return appTestState.settingsResponse;
+}
+
+function saveManualWorkspaceSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as Partial<ConfiguredWorkspaceSummary>;
+  appTestState.workspaceResponseWorkspaces = appTestState.workspaceResponseWorkspaces.map((item) => {
+    const current = item as Record<string, unknown>;
+    return current.id === body.id ? { ...current, ...body } : current;
+  });
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    workspaces: settingsWorkspacesFromWorkspaceResponse(),
+  };
+
+  return appTestState.settingsResponse;
+}
 export function savedGeneralSettings(init?: RequestInit) {
   const body =
     typeof init?.body === "string"
@@ -1745,6 +1806,7 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceSpecGenerateCompletes = false;
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
+  appTestState.lastWorkspaceOrderRequest = null;
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-foco-theme");
@@ -2383,8 +2445,13 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
-  if (path === "/api/workspaces/manual" || path === "/api/workspaces/order") {
-    return jsonResponse(savedSettings.workspace);
+  if (path === "/api/workspaces/manual") {
+    return jsonResponse(saveManualWorkspaceSettings(init));
+  }
+
+  if (path === "/api/workspaces/order") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { workspaceIds?: string[] };
+    return jsonResponse(workspaceOrderSettings(body.workspaceIds ?? []));
   }
 
   if (path === "/api/workspaces/workspace-1/logo") {

@@ -32,6 +32,7 @@ import {
 import {
   CSSProperties,
   ChangeEvent as ReactChangeEvent,
+  DragEvent as ReactDragEvent,
   FormEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -186,7 +187,15 @@ const ApiStatsPanel = lazy(() =>
   })),
 );
 import { WorkspaceIcon } from "./features/workspaces/WorkspaceIcon";
-import { chatItemClass, workspaceItemClass, workspaceMenuClass, workspaceNameFromPath } from "./features/workspaces/workspace-helpers";
+import {
+  chatItemClass,
+  moveItemId,
+  reorderWorkspacesByIds,
+  sameStringList,
+  workspaceItemClass,
+  workspaceMenuClass,
+  workspaceNameFromPath,
+} from "./features/workspaces/workspace-helpers";
 import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
@@ -347,6 +356,12 @@ export function App() {
   const [expandedWorkspaceId, setExpandedWorkspaceId] = useState<string | null>(
     null,
   );
+  const [draggedWorkspaceId, setDraggedWorkspaceId] = useState<string | null>(
+    null,
+  );
+  const [workspaceOrderPreview, setWorkspaceOrderPreview] = useState<
+    string[] | null
+  >(null);
   const [workspaceChatVisibleCounts, setWorkspaceChatVisibleCounts] = useState<
     Record<string, number>
   >({});
@@ -612,7 +627,13 @@ export function App() {
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
   const workspaceChatLongPressTimeoutRef = useRef<number | null>(null);
   const suppressNextWorkspaceChatClickRef = useRef(false);
-
+  const displayedWorkspaces = useMemo(
+    () =>
+      workspaceOrderPreview
+        ? reorderWorkspacesByIds(workspaces, workspaceOrderPreview)
+        : workspaces,
+    [workspaceOrderPreview, workspaces],
+  );
   const activeWorkspace = useMemo(
     () =>
       workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
@@ -7286,6 +7307,90 @@ export function App() {
     }));
   }
 
+  async function saveWorkspaceOrder(
+    workspaceIds: string[],
+    previousWorkspaces: WorkspaceSummary[],
+  ) {
+    setError(null);
+    setWorkspaces((current) => reorderWorkspacesByIds(current, workspaceIds));
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/workspaces/order", {
+        body: JSON.stringify({ workspaceIds }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      setWorkspaces((current) =>
+        reorderWorkspacesByIds(
+          current,
+          data.workspaces.map((workspace) => workspace.id),
+        ),
+      );
+    } catch (requestError) {
+      setWorkspaces(previousWorkspaces);
+      setError(errorMessage(requestError));
+    }
+  }
+
+  function handleWorkspaceDragStart(
+    event: ReactDragEvent<HTMLDivElement>,
+    workspaceId: string,
+  ) {
+    setDraggedWorkspaceId(workspaceId);
+    setWorkspaceOrderPreview(workspaces.map((workspace) => workspace.id));
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", workspaceId);
+  }
+
+  function handleWorkspaceDragOver(
+    event: ReactDragEvent<HTMLDivElement>,
+    targetWorkspaceId: string,
+  ) {
+    const sourceWorkspaceId = draggedWorkspaceId;
+    if (!sourceWorkspaceId || sourceWorkspaceId === targetWorkspaceId) {
+      return;
+    }
+
+    const sourceWorkspace = workspaces.find(
+      (workspace) => workspace.id === sourceWorkspaceId,
+    );
+    const targetWorkspace = workspaces.find(
+      (workspace) => workspace.id === targetWorkspaceId,
+    );
+    if (!sourceWorkspace || !targetWorkspace || sourceWorkspace.pinned !== targetWorkspace.pinned) {
+      return;
+    }
+
+    event.preventDefault();
+    const workspaceIds = moveItemId(
+      workspaceOrderPreview ?? workspaces.map((workspace) => workspace.id),
+      sourceWorkspaceId,
+      targetWorkspaceId,
+    );
+    setWorkspaceOrderPreview(workspaceIds);
+  }
+
+  async function handleWorkspaceDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+
+    const workspaceIds = workspaceOrderPreview;
+    const previousWorkspaces = workspaces;
+    setDraggedWorkspaceId(null);
+    setWorkspaceOrderPreview(null);
+
+    if (!workspaceIds || sameStringList(workspaceIds, previousWorkspaces.map((workspace) => workspace.id))) {
+      return;
+    }
+
+    await saveWorkspaceOrder(workspaceIds, previousWorkspaces);
+  }
+
+  function handleWorkspaceDragEnd() {
+    setDraggedWorkspaceId(null);
+    setWorkspaceOrderPreview(null);
+  }
+
   function openWorkspaceDialog() {
     setWorkspaceName("");
     setWorkspacePath("");
@@ -7790,8 +7895,8 @@ export function App() {
                   aria-label={t("Workspace list")}
                   className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3"
                 >
-                  {workspaces.length ? (
-                    workspaces.map((workspace) => {
+                  {displayedWorkspaces.length ? (
+                    displayedWorkspaces.map((workspace) => {
                       const isExpanded = expandedWorkspaceId === workspace.id;
                       const isActive = workspace.id === activeWorkspace?.id;
                       const selectedChatIndex =
@@ -7850,7 +7955,19 @@ export function App() {
                       );
 
                       return (
-                        <div className="mb-1.5" key={workspace.id}>
+                        <div
+                          className={`mb-1.5 ${draggedWorkspaceId === workspace.id ? "opacity-80" : ""}`}
+                          draggable
+                          key={workspace.id}
+                          onDragEnd={handleWorkspaceDragEnd}
+                          onDragOver={(event) =>
+                            handleWorkspaceDragOver(event, workspace.id)
+                          }
+                          onDragStart={(event) =>
+                            handleWorkspaceDragStart(event, workspace.id)
+                          }
+                          onDrop={(event) => void handleWorkspaceDrop(event)}
+                        >
                           <div className={workspaceMenuClass(isActive)}>
                             <button
                               aria-expanded={isExpanded}

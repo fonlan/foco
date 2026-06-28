@@ -138,7 +138,11 @@ import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
-import { workspaceNameFromPath } from "../workspaces/workspace-helpers";
+import {
+  moveItemId,
+  sameStringList,
+  workspaceNameFromPath,
+} from "../workspaces/workspace-helpers";
 
 type ProviderModelListState = {
   message: string | null;
@@ -11322,25 +11326,6 @@ function nextMcpServerId(
   return `${base}-${index}`;
 }
 
-function moveItemId(
-  itemIds: string[],
-  sourceItemId: string,
-  targetItemId: string,
-) {
-  const sourceIndex = itemIds.indexOf(sourceItemId);
-  const targetIndex = itemIds.indexOf(targetItemId);
-
-  if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
-    return itemIds;
-  }
-
-  const next = [...itemIds];
-  const [source] = next.splice(sourceIndex, 1);
-  next.splice(targetIndex, 0, source);
-
-  return next;
-}
-
 function groupedWorkspaceIds(workspaces: ConfiguredWorkspaceSummary[]) {
   return [
     ...workspaces
@@ -11362,9 +11347,6 @@ function terminalShellLabel(
   );
 }
 
-function sameStringList(left: string[], right: string[]) {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
 
 function slugId(value: string) {
   return value
