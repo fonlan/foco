@@ -10878,10 +10878,15 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
     assert!(!tool_names.contains(CREATE_TODO_GRAPH_TOOL));
     assert!(!tool_names.contains(UPDATE_TODO_GRAPH_TOOL));
     assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+    let plan_mode_prompt = default_plan_mode_system_prompt();
     assert_eq!(
         context.provider_request.messages[0].content,
-        default_plan_mode_system_prompt()
+        plan_mode_prompt
     );
+    assert!(plan_mode_prompt.starts_with("<agent_definition_prompt>"));
+    assert!(plan_mode_prompt.ends_with("</agent_definition_prompt>"));
+    assert!(plan_mode_prompt.contains("Plan Mode is for planning only, not implementation"));
+    assert!(plan_mode_prompt.contains("call create_plan"));
     assert_eq!(PLAN_MODE_SYSTEM_PROMPT_NAME, "Plan Mode");
     assert!(
         !context.provider_request.messages[0]
