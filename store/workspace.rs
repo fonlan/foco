@@ -38,31 +38,32 @@ pub use workspace_records::{
     ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
     LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, MessageRoleCountRecord,
-    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
-    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
-    NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanListFilter, PlanListPage, PlanPatch, PlanPhaseRecord, PlanRecord, PlanStepPatch,
-    PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRollupFilters, MessageRecord,
+    MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
+    NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
+    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
+    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
+    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection,
+    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+    NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListPage, PlanPatch, PlanPhaseRecord,
+    PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
+    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
+    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    Migration,
+    MIGRATION_022, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 21;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 22;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -113,6 +114,11 @@ const PLAN_SELECT_SQL: &str = "SELECT id, title, overview, status, sort_order,
        completed_by_user_at, error_message, shared_merge_commit_id, created_at, updated_at
  FROM plans
  WHERE id = ?1";
+
+const LLM_REQUEST_ROLLUP_UNKNOWN_WORKSPACE: &str = "__foco_unknown_workspace__";
+const LLM_REQUEST_ROLLUP_UNKNOWN_BUCKET: &str = "__foco_unknown_date__";
+const LLM_REQUEST_ROLLUP_UNKNOWN_PROVIDER: &str = "__foco_unknown_provider__";
+const LLM_REQUEST_ROLLUP_UNKNOWN_MODEL: &str = "__foco_unknown_model__";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -198,6 +204,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 21,
         sql: MIGRATION_021,
+    },
+    Migration {
+        version: 22,
+        sql: MIGRATION_022,
     },
 ];
 
@@ -3565,8 +3575,13 @@ impl WorkspaceDatabase {
             redact_optional_audit_json(request.request_body_json, "request_body_json")?;
         let response_body_json =
             redact_optional_audit_json(request.response_body_json, "response_body_json")?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        transaction
             .execute(
                 "INSERT INTO llm_requests
                     (
@@ -3605,7 +3620,31 @@ impl WorkspaceDatabase {
                     response_body_json
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        apply_llm_request_usage_rollup_delta(
+            &transaction,
+            &database_path,
+            llm_request_usage_rollup_delta(
+                LlmRequestUsageRollupSource {
+                    workspace_id: Some(request.workspace_id),
+                    provider_id: request.provider_id,
+                    model_id: request.model_id,
+                    request_started_at: request.request_started_at,
+                    final_state: request.final_state,
+                    input_tokens: request.input_tokens,
+                    output_tokens: request.output_tokens,
+                    cache_read_tokens: request.cache_read_tokens,
+                    cache_write_tokens: request.cache_write_tokens,
+                    total_latency_ms: request.total_latency_ms,
+                },
+                1,
+            ),
+        )?;
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -3625,9 +3664,16 @@ impl WorkspaceDatabase {
         let cache_ratio = calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)?;
         let response_body_json =
             redact_optional_audit_json(outcome.response_body_json, "response_body_json")?;
-
-        let updated = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let old_request = select_llm_request_record(&transaction, id)
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
+
+        let updated = transaction
             .execute(
                 "UPDATE llm_requests
                  SET first_token_at = ?2,
@@ -3659,13 +3705,88 @@ impl WorkspaceDatabase {
                     response_body_json
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         if updated == 0 {
             return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
         }
 
+        apply_llm_request_usage_rollup_delta(
+            &transaction,
+            &database_path,
+            llm_request_usage_rollup_delta(llm_request_record_rollup_source(&old_request), -1),
+        )?;
+        apply_llm_request_usage_rollup_delta(
+            &transaction,
+            &database_path,
+            llm_request_usage_rollup_delta(
+                LlmRequestUsageRollupSource {
+                    workspace_id: old_request.workspace_id.as_deref(),
+                    provider_id: old_request.provider_id.as_str(),
+                    model_id: old_request.model_id.as_str(),
+                    request_started_at: old_request.request_started_at.as_str(),
+                    final_state: outcome.final_state,
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                    cache_read_tokens: outcome.cache_read_tokens,
+                    cache_write_tokens: outcome.cache_write_tokens,
+                    total_latency_ms: outcome.total_latency_ms,
+                },
+                1,
+            ),
+        )?;
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
         Ok(())
+    }
+
+    pub fn rebuild_llm_request_usage_rollups(&mut self) -> Result<(), WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .execute("DELETE FROM llm_request_usage_rollups", [])
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        insert_llm_request_usage_rollup_rebuild_rows(&transaction, &database_path, None)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
+    }
+
+    pub fn rebuild_llm_request_usage_rollups_for_workspace(
+        &mut self,
+        workspace_id: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let rollup_workspace_id = normalize_llm_request_rollup_dimension(
+            Some(workspace_id),
+            LLM_REQUEST_ROLLUP_UNKNOWN_WORKSPACE,
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .execute(
+                "DELETE FROM llm_request_usage_rollups WHERE workspace_id = ?1",
+                params![rollup_workspace_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        insert_llm_request_usage_rollup_rebuild_rows(
+            &transaction,
+            &database_path,
+            Some(workspace_id),
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
     }
 
     pub fn llm_request(
@@ -4098,7 +4219,7 @@ impl WorkspaceDatabase {
         );
         let mut query_params = Vec::new();
         append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
-        query.push_str(" GROUP BY model_id");
+        query.push_str(" GROUP BY model_id ORDER BY model_id");
         let mut statement = self
             .connection
             .prepare(&query)
@@ -4132,7 +4253,7 @@ impl WorkspaceDatabase {
         );
         let mut query_params = Vec::new();
         append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
-        query.push_str(" GROUP BY provider_id");
+        query.push_str(" GROUP BY provider_id ORDER BY provider_id");
         let mut statement = self
             .connection
             .prepare(&query)
@@ -4153,6 +4274,141 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn llm_request_usage_rollup_summary(
+        &self,
+        filters: LlmRequestUsageRollupFilters<'_>,
+    ) -> Result<LlmRequestAuditSummaryRow, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                COALESCE(SUM(request_count), 0),
+                COALESCE(SUM(failed_count), 0),
+                COALESCE(SUM(total_input_tokens), 0),
+                COALESCE(SUM(total_output_tokens), 0),
+                COALESCE(SUM(total_cache_read_tokens), 0),
+                COALESCE(SUM(total_cache_write_tokens), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(latency_count), 0),
+                COALESCE(SUM(latency_sum), 0)
+             FROM llm_request_usage_rollups",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_usage_rollup_where_clause(&mut query, &mut query_params, filters);
+
+        self.connection
+            .query_row(&query, params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditSummaryRow {
+                    total_requests: row.get(0)?,
+                    failed_requests: row.get(1)?,
+                    total_input_tokens: row.get(2)?,
+                    total_output_tokens: row.get(3)?,
+                    total_cache_read_tokens: row.get(4)?,
+                    total_cache_write_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                    latency_count: row.get(7)?,
+                    latency_sum: row.get(8)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn llm_request_usage_rollup_trend_breakdown(
+        &self,
+        filters: LlmRequestUsageRollupFilters<'_>,
+    ) -> Result<Vec<LlmRequestAuditTrendPoint>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                bucket_date,
+                COALESCE(SUM(request_count), 0),
+                COALESCE(SUM(total_tokens), 0)
+             FROM llm_request_usage_rollups",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_usage_rollup_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY bucket_date ORDER BY bucket_date DESC");
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditTrendPoint {
+                    bucket: row.get(0)?,
+                    request_count: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn llm_request_usage_rollup_model_breakdown(
+        &self,
+        filters: LlmRequestUsageRollupFilters<'_>,
+    ) -> Result<Vec<LlmRequestAuditModelBreakdown>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                model_id,
+                COALESCE(SUM(request_count), 0),
+                COALESCE(SUM(total_tokens), 0)
+             FROM llm_request_usage_rollups",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_usage_rollup_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY model_id ORDER BY model_id");
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditModelBreakdown {
+                    model_id: row.get(0)?,
+                    request_count: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn llm_request_usage_rollup_provider_breakdown(
+        &self,
+        filters: LlmRequestUsageRollupFilters<'_>,
+    ) -> Result<Vec<LlmRequestAuditProviderBreakdown>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                provider_id,
+                COALESCE(SUM(request_count), 0),
+                COALESCE(SUM(success_count), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(latency_count), 0),
+                COALESCE(SUM(latency_sum), 0)
+             FROM llm_request_usage_rollups",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_usage_rollup_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY provider_id ORDER BY provider_id");
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditProviderBreakdown {
+                    provider_id: row.get(0)?,
+                    request_count: row.get(1)?,
+                    success_count: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    latency_count: row.get(4)?,
+                    latency_sum: row.get(5)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
     pub fn scheduled_task_usage_summary(
         &self,
         task_id: &str,
@@ -9730,6 +9986,330 @@ fn normalize_new_todo_graph_tasks_without_validation(
     Ok(normalized)
 }
 
+struct LlmRequestUsageRollupSource<'a> {
+    workspace_id: Option<&'a str>,
+    provider_id: &'a str,
+    model_id: &'a str,
+    request_started_at: &'a str,
+    final_state: &'a str,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    total_latency_ms: Option<i64>,
+}
+
+struct LlmRequestUsageRollupDelta {
+    workspace_id: String,
+    bucket_date: String,
+    provider_id: String,
+    model_id: String,
+    final_state: String,
+    request_count: i64,
+    success_count: i64,
+    failed_count: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    total_tokens: i64,
+    latency_count: i64,
+    latency_sum: i64,
+}
+
+fn select_llm_request_record(
+    transaction: &Transaction<'_>,
+    id: &str,
+) -> rusqlite::Result<Option<LlmRequestRecord>> {
+    transaction
+        .query_row(
+            "SELECT
+                id, workspace_id, chat_id, agent_team_id, agent_instance_id,
+                agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
+                first_token_at, completed_at, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, cache_ratio,
+                first_token_latency_ms, total_latency_ms, status_code, final_state,
+                request_body_json, response_body_json
+             FROM llm_requests
+             WHERE id = ?1",
+            params![id],
+            llm_request_record_from_row,
+        )
+        .optional()
+}
+
+fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestRecord> {
+    Ok(LlmRequestRecord {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        chat_id: row.get(2)?,
+        agent_team_id: optional_agent_id_from_row(row, 3)?,
+        agent_instance_id: optional_agent_id_from_row(row, 4)?,
+        agent_task_id: optional_agent_id_from_row(row, 5)?,
+        agent_attempt_id: optional_agent_id_from_row(row, 6)?,
+        provider_id: row.get(7)?,
+        model_id: row.get(8)?,
+        request_started_at: row.get(9)?,
+        first_token_at: row.get(10)?,
+        completed_at: row.get(11)?,
+        input_tokens: row.get(12)?,
+        output_tokens: row.get(13)?,
+        cache_read_tokens: row.get(14)?,
+        cache_write_tokens: row.get(15)?,
+        cache_ratio: row.get(16)?,
+        first_token_latency_ms: row.get(17)?,
+        total_latency_ms: row.get(18)?,
+        status_code: row.get(19)?,
+        final_state: row.get(20)?,
+        request_body_json: row.get(21)?,
+        response_body_json: row.get(22)?,
+    })
+}
+
+fn llm_request_record_rollup_source(request: &LlmRequestRecord) -> LlmRequestUsageRollupSource<'_> {
+    LlmRequestUsageRollupSource {
+        workspace_id: request.workspace_id.as_deref(),
+        provider_id: request.provider_id.as_str(),
+        model_id: request.model_id.as_str(),
+        request_started_at: request.request_started_at.as_str(),
+        final_state: request.final_state.as_str(),
+        input_tokens: request.input_tokens,
+        output_tokens: request.output_tokens,
+        cache_read_tokens: request.cache_read_tokens,
+        cache_write_tokens: request.cache_write_tokens,
+        total_latency_ms: request.total_latency_ms,
+    }
+}
+
+fn llm_request_usage_rollup_delta(
+    source: LlmRequestUsageRollupSource<'_>,
+    sign: i64,
+) -> Option<LlmRequestUsageRollupDelta> {
+    if source.final_state == "running" {
+        return None;
+    }
+
+    let input_tokens = source.input_tokens.unwrap_or(0);
+    let output_tokens = source.output_tokens.unwrap_or(0);
+    let latency_sum = source.total_latency_ms.unwrap_or(0);
+    Some(LlmRequestUsageRollupDelta {
+        workspace_id: normalize_llm_request_rollup_dimension(
+            source.workspace_id,
+            LLM_REQUEST_ROLLUP_UNKNOWN_WORKSPACE,
+        ),
+        bucket_date: normalized_llm_request_rollup_bucket(source.request_started_at),
+        provider_id: normalize_llm_request_rollup_dimension(
+            Some(source.provider_id),
+            LLM_REQUEST_ROLLUP_UNKNOWN_PROVIDER,
+        ),
+        model_id: normalize_llm_request_rollup_dimension(
+            Some(source.model_id),
+            LLM_REQUEST_ROLLUP_UNKNOWN_MODEL,
+        ),
+        final_state: source.final_state.to_string(),
+        request_count: sign,
+        success_count: if matches!(source.final_state, "succeeded" | "completed") {
+            sign
+        } else {
+            0
+        },
+        failed_count: if matches!(source.final_state, "succeeded" | "completed") {
+            0
+        } else {
+            sign
+        },
+        total_input_tokens: sign * input_tokens,
+        total_output_tokens: sign * output_tokens,
+        total_cache_read_tokens: sign * source.cache_read_tokens.unwrap_or(0),
+        total_cache_write_tokens: sign * source.cache_write_tokens.unwrap_or(0),
+        total_tokens: sign * (input_tokens + output_tokens),
+        latency_count: if source.total_latency_ms.is_some() {
+            sign
+        } else {
+            0
+        },
+        latency_sum: sign * latency_sum,
+    })
+}
+
+fn apply_llm_request_usage_rollup_delta(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    delta: Option<LlmRequestUsageRollupDelta>,
+) -> Result<(), WorkspaceDatabaseError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+
+    if delta.request_count < 0 {
+        transaction
+            .execute(
+                "UPDATE llm_request_usage_rollups
+                 SET request_count = request_count + ?6,
+                     success_count = success_count + ?7,
+                     failed_count = failed_count + ?8,
+                     total_input_tokens = total_input_tokens + ?9,
+                     total_output_tokens = total_output_tokens + ?10,
+                     total_cache_read_tokens = total_cache_read_tokens + ?11,
+                     total_cache_write_tokens = total_cache_write_tokens + ?12,
+                     total_tokens = total_tokens + ?13,
+                     latency_count = latency_count + ?14,
+                     latency_sum = latency_sum + ?15
+                 WHERE workspace_id = ?1
+                   AND bucket_date = ?2
+                   AND provider_id = ?3
+                   AND model_id = ?4
+                   AND final_state = ?5",
+                params![
+                    delta.workspace_id.as_str(),
+                    delta.bucket_date.as_str(),
+                    delta.provider_id.as_str(),
+                    delta.model_id.as_str(),
+                    delta.final_state.as_str(),
+                    delta.request_count,
+                    delta.success_count,
+                    delta.failed_count,
+                    delta.total_input_tokens,
+                    delta.total_output_tokens,
+                    delta.total_cache_read_tokens,
+                    delta.total_cache_write_tokens,
+                    delta.total_tokens,
+                    delta.latency_count,
+                    delta.latency_sum,
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM llm_request_usage_rollups
+                 WHERE workspace_id = ?1
+                   AND bucket_date = ?2
+                   AND provider_id = ?3
+                   AND model_id = ?4
+                   AND final_state = ?5
+                   AND request_count = 0",
+                params![
+                    delta.workspace_id.as_str(),
+                    delta.bucket_date.as_str(),
+                    delta.provider_id.as_str(),
+                    delta.model_id.as_str(),
+                    delta.final_state.as_str(),
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        return Ok(());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO llm_request_usage_rollups (
+                workspace_id, bucket_date, provider_id, model_id, final_state,
+                request_count, success_count, failed_count,
+                total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                total_tokens, latency_count, latency_sum
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(workspace_id, bucket_date, provider_id, model_id, final_state)
+             DO UPDATE SET
+                request_count = request_count + excluded.request_count,
+                success_count = success_count + excluded.success_count,
+                failed_count = failed_count + excluded.failed_count,
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_write_tokens = total_cache_write_tokens + excluded.total_cache_write_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                latency_count = latency_count + excluded.latency_count,
+                latency_sum = latency_sum + excluded.latency_sum",
+            params![
+                delta.workspace_id.as_str(),
+                delta.bucket_date.as_str(),
+                delta.provider_id.as_str(),
+                delta.model_id.as_str(),
+                delta.final_state.as_str(),
+                delta.request_count,
+                delta.success_count,
+                delta.failed_count,
+                delta.total_input_tokens,
+                delta.total_output_tokens,
+                delta.total_cache_read_tokens,
+                delta.total_cache_write_tokens,
+                delta.total_tokens,
+                delta.latency_count,
+                delta.latency_sum,
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(())
+}
+
+fn insert_llm_request_usage_rollup_rebuild_rows(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    workspace_id: Option<&str>,
+) -> Result<(), WorkspaceDatabaseError> {
+    let mut query = String::from(
+        "INSERT INTO llm_request_usage_rollups (
+            workspace_id, bucket_date, provider_id, model_id, final_state,
+            request_count, success_count, failed_count,
+            total_input_tokens, total_output_tokens,
+            total_cache_read_tokens, total_cache_write_tokens,
+            total_tokens, latency_count, latency_sum
+         )
+         SELECT
+            COALESCE(NULLIF(workspace_id, ''), '__foco_unknown_workspace__'),
+            COALESCE(NULLIF(SUBSTR(request_started_at, 1, 10), ''), '__foco_unknown_date__'),
+            COALESCE(NULLIF(provider_id, ''), '__foco_unknown_provider__'),
+            COALESCE(NULLIF(model_id, ''), '__foco_unknown_model__'),
+            final_state,
+            COUNT(*),
+            COUNT(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 END),
+            COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+            COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+            COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+            COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+            COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+            COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+            COUNT(total_latency_ms),
+            COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+         FROM llm_requests
+         WHERE final_state != 'running'",
+    );
+    let mut query_params = Vec::new();
+    if let Some(workspace_id) = workspace_id {
+        query.push_str(" AND workspace_id = ?");
+        query_params.push(SqlValue::Text(workspace_id.to_string()));
+    }
+    query.push_str(" GROUP BY 1, 2, 3, 4, 5");
+
+    transaction
+        .execute(&query, params_from_iter(query_params))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(())
+}
+
+fn normalize_llm_request_rollup_dimension(value: Option<&str>, unknown: &str) -> String {
+    value
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or(unknown)
+        .to_string()
+}
+
+fn normalized_llm_request_rollup_bucket(request_started_at: &str) -> String {
+    let bucket = request_started_at
+        .get(..10)
+        .unwrap_or(request_started_at)
+        .trim();
+    if bucket.is_empty() {
+        LLM_REQUEST_ROLLUP_UNKNOWN_BUCKET.to_string()
+    } else {
+        bucket.to_string()
+    }
+}
+
 fn required_todo_graph_text(field: &str, value: String) -> Result<String, WorkspaceDatabaseError> {
     let value = value.trim().to_string();
 
@@ -10019,6 +10599,38 @@ fn append_llm_request_audit_where_clause(
     }
 }
 
+fn append_llm_request_usage_rollup_where_clause(
+    query: &mut String,
+    query_params: &mut Vec<SqlValue>,
+    filters: LlmRequestUsageRollupFilters<'_>,
+) {
+    let mut has_where = false;
+    let mut push_condition = |condition: &str, value: &str| {
+        query.push_str(if has_where { " AND " } else { " WHERE " });
+        query.push_str(condition);
+        query_params.push(SqlValue::Text(value.to_string()));
+        has_where = true;
+    };
+
+    if let Some(value) = filters.workspace_id {
+        push_condition("workspace_id = ?", value);
+    }
+    if let Some(value) = filters.provider_id {
+        push_condition("provider_id = ?", value);
+    }
+    if let Some(value) = filters.model_id {
+        push_condition("model_id = ?", value);
+    }
+    if let Some(value) = filters.final_state {
+        push_condition("final_state = ?", value);
+    }
+    if let Some(value) = filters.bucket_after {
+        push_condition("bucket_date >= ?", value);
+    }
+    if let Some(value) = filters.bucket_before {
+        push_condition("bucket_date <= ?", value);
+    }
+}
 fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> WorkspaceDatabaseError {
     WorkspaceDatabaseError::Sqlite {
         path: database_path.to_path_buf(),

@@ -1027,6 +1027,60 @@ pub(crate) const MIGRATION_021: &str = r#"
 ALTER TABLE plans ADD COLUMN shared_merge_commit_id TEXT;
 "#;
 
+pub(crate) const MIGRATION_022: &str = r#"
+CREATE TABLE llm_request_usage_rollups (
+    workspace_id TEXT NOT NULL CHECK (length(workspace_id) > 0),
+    bucket_date TEXT NOT NULL CHECK (length(bucket_date) > 0),
+    provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+    model_id TEXT NOT NULL CHECK (length(model_id) > 0),
+    final_state TEXT NOT NULL CHECK (length(final_state) > 0),
+    request_count INTEGER NOT NULL CHECK (request_count >= 0),
+    success_count INTEGER NOT NULL CHECK (success_count >= 0),
+    failed_count INTEGER NOT NULL CHECK (failed_count >= 0),
+    total_input_tokens INTEGER NOT NULL CHECK (total_input_tokens >= 0),
+    total_output_tokens INTEGER NOT NULL CHECK (total_output_tokens >= 0),
+    total_cache_read_tokens INTEGER NOT NULL CHECK (total_cache_read_tokens >= 0),
+    total_cache_write_tokens INTEGER NOT NULL CHECK (total_cache_write_tokens >= 0),
+    total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+    latency_count INTEGER NOT NULL CHECK (latency_count >= 0),
+    latency_sum INTEGER NOT NULL CHECK (latency_sum >= 0),
+    PRIMARY KEY (workspace_id, bucket_date, provider_id, model_id, final_state)
+);
+
+CREATE INDEX llm_request_usage_rollups_bucket_idx
+ON llm_request_usage_rollups (bucket_date);
+
+CREATE INDEX llm_request_usage_rollups_provider_model_idx
+ON llm_request_usage_rollups (provider_id, model_id);
+
+INSERT INTO llm_request_usage_rollups (
+    workspace_id, bucket_date, provider_id, model_id, final_state,
+    request_count, success_count, failed_count,
+    total_input_tokens, total_output_tokens,
+    total_cache_read_tokens, total_cache_write_tokens,
+    total_tokens, latency_count, latency_sum
+)
+SELECT
+    COALESCE(NULLIF(workspace_id, ''), '__foco_unknown_workspace__'),
+    COALESCE(NULLIF(SUBSTR(request_started_at, 1, 10), ''), '__foco_unknown_date__'),
+    COALESCE(NULLIF(provider_id, ''), '__foco_unknown_provider__'),
+    COALESCE(NULLIF(model_id, ''), '__foco_unknown_model__'),
+    final_state,
+    COUNT(*),
+    COUNT(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 END),
+    COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+    COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+    COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+    COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+    COUNT(total_latency_ms),
+    COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+FROM llm_requests
+WHERE final_state != 'running'
+GROUP BY 1, 2, 3, 4, 5;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

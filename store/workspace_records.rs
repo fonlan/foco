@@ -790,7 +790,17 @@ pub struct LlmRequestAuditFilters<'a> {
     pub offset: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LlmRequestUsageRollupFilters<'a> {
+    pub workspace_id: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub final_state: Option<&'a str>,
+    pub bucket_after: Option<&'a str>,
+    pub bucket_before: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
 pub struct LlmRequestAuditRow {
     pub id: String,
     pub workspace_id: Option<String>,

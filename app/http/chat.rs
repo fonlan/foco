@@ -15,8 +15,8 @@ use foco_store::{
     memory::MemoryDatabase,
     workspace::{
         LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
-        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, TodoGraphFilter, WorkspaceDatabase,
-        workspace_database_path,
+        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestUsageRollupFilters,
+        TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1357,96 +1357,48 @@ fn load_ai_statistics_response(
             offset: Some(0),
         };
 
-        let summary_started_at = Instant::now();
+        let count_started_at = Instant::now();
         tracing::info!(
             workspace_id = %workspace.id,
-            "AI statistics summary query started"
+            "AI statistics count query started"
         );
-        let workspace_summary = database
-            .llm_request_audit_summary(audit_filters)
+        let workspace_request_count = database
+            .llm_request_audit_count(audit_filters)
             .map_err(ApiError::from_workspace_error)?;
         tracing::info!(
             workspace_id = %workspace.id,
-            request_count = workspace_summary.total_requests,
-            elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
-            "AI statistics summary query completed"
+            request_count = workspace_request_count,
+            elapsed_ms = count_started_at.elapsed().as_millis() as u64,
+            "AI statistics count query completed"
         );
-        let workspace_request_count = workspace_summary.total_requests;
         total_count += workspace_request_count;
         if workspace_request_count > 0 {
-            merge_llm_request_audit_summary(&mut merged_summary, &workspace_summary);
-            let trend_started_at = Instant::now();
+            let aggregate_started_at = Instant::now();
+            let aggregate_source = if ai_statistics_can_use_rollup(&filters) {
+                "rollup"
+            } else {
+                "llm_requests"
+            };
             tracing::info!(
                 workspace_id = %workspace.id,
-                "AI statistics trend query started"
+                aggregate_source,
+                "AI statistics aggregate queries started"
             );
-            let trend = database
-                .llm_request_audit_trend_breakdown(audit_filters)
-                .map_err(ApiError::from_workspace_error)?;
+            merge_ai_statistics_aggregates(
+                &database,
+                &filters,
+                audit_filters,
+                &mut merged_summary,
+                &mut merged_trend,
+                &mut merged_models,
+                &mut merged_providers,
+            )?;
             tracing::info!(
                 workspace_id = %workspace.id,
-                trend_points = trend.len(),
-                elapsed_ms = trend_started_at.elapsed().as_millis() as u64,
-                "AI statistics trend query completed"
+                aggregate_source,
+                elapsed_ms = aggregate_started_at.elapsed().as_millis() as u64,
+                "AI statistics aggregate queries completed"
             );
-            for point in trend {
-                merged_trend
-                    .entry(point.bucket.clone())
-                    .and_modify(|entry| {
-                        entry.request_count += point.request_count;
-                        entry.total_tokens += point.total_tokens;
-                    })
-                    .or_insert(point);
-            }
-            let model_started_at = Instant::now();
-            tracing::info!(
-                workspace_id = %workspace.id,
-                "AI statistics model breakdown query started"
-            );
-            let model_rows = database
-                .llm_request_audit_model_breakdown(audit_filters)
-                .map_err(ApiError::from_workspace_error)?;
-            tracing::info!(
-                workspace_id = %workspace.id,
-                model_count = model_rows.len(),
-                elapsed_ms = model_started_at.elapsed().as_millis() as u64,
-                "AI statistics model breakdown query completed"
-            );
-            for row in model_rows {
-                merged_models
-                    .entry(row.model_id.clone())
-                    .and_modify(|entry| {
-                        entry.request_count += row.request_count;
-                        entry.total_tokens += row.total_tokens;
-                    })
-                    .or_insert(row);
-            }
-            let provider_started_at = Instant::now();
-            tracing::info!(
-                workspace_id = %workspace.id,
-                "AI statistics provider breakdown query started"
-            );
-            let provider_rows = database
-                .llm_request_audit_provider_breakdown(audit_filters)
-                .map_err(ApiError::from_workspace_error)?;
-            tracing::info!(
-                workspace_id = %workspace.id,
-                provider_count = provider_rows.len(),
-                elapsed_ms = provider_started_at.elapsed().as_millis() as u64,
-                "AI statistics provider breakdown query completed"
-            );
-            for row in provider_rows {
-                merged_providers
-                    .entry(row.provider_id.clone())
-                    .and_modify(|entry| {
-                        entry.request_count += row.request_count;
-                        entry.success_count += row.success_count;
-                        entry.total_tokens += row.total_tokens;
-                        entry.latency_count += row.latency_count;
-                        entry.latency_sum += row.latency_sum;
-                    })
-                    .or_insert(row);
-            }
             let rows_started_at = Instant::now();
             tracing::info!(
                 workspace_id = %workspace.id,
@@ -1536,6 +1488,163 @@ fn load_ai_statistics_response(
         total_count,
         total_pages,
     })
+}
+
+fn merge_ai_statistics_aggregates(
+    database: &WorkspaceDatabase,
+    filters: &NormalizedAiStatisticsFilters,
+    audit_filters: LlmRequestAuditFilters<'_>,
+    merged_summary: &mut Option<LlmRequestAuditSummaryRow>,
+    merged_trend: &mut BTreeMap<String, LlmRequestAuditTrendPoint>,
+    merged_models: &mut BTreeMap<String, LlmRequestAuditModelBreakdown>,
+    merged_providers: &mut BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+) -> Result<(), ApiError> {
+    if ai_statistics_can_use_rollup(filters) {
+        let rollup_filters = LlmRequestUsageRollupFilters {
+            workspace_id: None,
+            provider_id: filters.provider_id.as_deref(),
+            model_id: filters.model_id.as_deref(),
+            final_state: filters.status.as_deref(),
+            bucket_after: None,
+            bucket_before: None,
+        };
+        let summary = database
+            .llm_request_usage_rollup_summary(rollup_filters)
+            .map_err(ApiError::from_workspace_error)?;
+        merge_llm_request_audit_summary(merged_summary, &summary);
+        merge_llm_request_audit_trend(
+            merged_trend,
+            database
+                .llm_request_usage_rollup_trend_breakdown(rollup_filters)
+                .map_err(ApiError::from_workspace_error)?,
+        );
+        merge_llm_request_audit_models(
+            merged_models,
+            database
+                .llm_request_usage_rollup_model_breakdown(rollup_filters)
+                .map_err(ApiError::from_workspace_error)?,
+        );
+        merge_llm_request_audit_providers(
+            merged_providers,
+            database
+                .llm_request_usage_rollup_provider_breakdown(rollup_filters)
+                .map_err(ApiError::from_workspace_error)?,
+        );
+
+        if filters.status.is_none() {
+            let running_filters = LlmRequestAuditFilters {
+                final_state: Some("running"),
+                ..audit_filters
+            };
+            merge_ai_statistics_audit_aggregates(
+                database,
+                running_filters,
+                merged_summary,
+                merged_trend,
+                merged_models,
+                merged_providers,
+            )?;
+        }
+        return Ok(());
+    }
+
+    merge_ai_statistics_audit_aggregates(
+        database,
+        audit_filters,
+        merged_summary,
+        merged_trend,
+        merged_models,
+        merged_providers,
+    )
+}
+
+fn ai_statistics_can_use_rollup(filters: &NormalizedAiStatisticsFilters) -> bool {
+    // ponytail: rollup is date-bucketed and has no chat_id; exact chat/time filters stay on facts.
+    filters.chat_id.is_none()
+        && filters.started_after.is_none()
+        && filters.started_before.is_none()
+        && !matches!(filters.status.as_deref(), Some("running"))
+}
+
+fn merge_ai_statistics_audit_aggregates(
+    database: &WorkspaceDatabase,
+    filters: LlmRequestAuditFilters<'_>,
+    merged_summary: &mut Option<LlmRequestAuditSummaryRow>,
+    merged_trend: &mut BTreeMap<String, LlmRequestAuditTrendPoint>,
+    merged_models: &mut BTreeMap<String, LlmRequestAuditModelBreakdown>,
+    merged_providers: &mut BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+) -> Result<(), ApiError> {
+    let summary = database
+        .llm_request_audit_summary(filters)
+        .map_err(ApiError::from_workspace_error)?;
+    merge_llm_request_audit_summary(merged_summary, &summary);
+    merge_llm_request_audit_trend(
+        merged_trend,
+        database
+            .llm_request_audit_trend_breakdown(filters)
+            .map_err(ApiError::from_workspace_error)?,
+    );
+    merge_llm_request_audit_models(
+        merged_models,
+        database
+            .llm_request_audit_model_breakdown(filters)
+            .map_err(ApiError::from_workspace_error)?,
+    );
+    merge_llm_request_audit_providers(
+        merged_providers,
+        database
+            .llm_request_audit_provider_breakdown(filters)
+            .map_err(ApiError::from_workspace_error)?,
+    );
+    Ok(())
+}
+
+fn merge_llm_request_audit_trend(
+    target: &mut BTreeMap<String, LlmRequestAuditTrendPoint>,
+    rows: Vec<LlmRequestAuditTrendPoint>,
+) {
+    for point in rows {
+        target
+            .entry(point.bucket.clone())
+            .and_modify(|entry| {
+                entry.request_count += point.request_count;
+                entry.total_tokens += point.total_tokens;
+            })
+            .or_insert(point);
+    }
+}
+
+fn merge_llm_request_audit_models(
+    target: &mut BTreeMap<String, LlmRequestAuditModelBreakdown>,
+    rows: Vec<LlmRequestAuditModelBreakdown>,
+) {
+    for row in rows {
+        target
+            .entry(row.model_id.clone())
+            .and_modify(|entry| {
+                entry.request_count += row.request_count;
+                entry.total_tokens += row.total_tokens;
+            })
+            .or_insert(row);
+    }
+}
+
+fn merge_llm_request_audit_providers(
+    target: &mut BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+    rows: Vec<LlmRequestAuditProviderBreakdown>,
+) {
+    for row in rows {
+        target
+            .entry(row.provider_id.clone())
+            .and_modify(|entry| {
+                entry.request_count += row.request_count;
+                entry.success_count += row.success_count;
+                entry.total_tokens += row.total_tokens;
+                entry.latency_count += row.latency_count;
+                entry.latency_sum += row.latency_sum;
+            })
+            .or_insert(row);
+    }
 }
 
 pub(crate) async fn ai_statistics_detail(

@@ -14,21 +14,22 @@ use foco_store::{
         WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
     },
     workspace::{
-        AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord, NewAgentContextEntry,
-        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
-        NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
-        NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-        PlanListFilter, PlanStepPatch, ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
+        AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord,
+        LlmRequestUsageRollupFilters, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
+        NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
+        NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
+        NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
+        NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent,
+        NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
+        NewWorkspaceSpecJob, PlanListFilter, PlanStepPatch, ScheduledTaskDueRunClaim,
+        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -57,6 +58,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "tool_results",
         "terminal_sessions",
         "llm_requests",
+        "llm_request_usage_rollups",
         "llm_request_events",
         "context_compression_snapshots",
         "code_graph_files",
@@ -3818,6 +3820,287 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("filtered audit count"),
         1
     );
+}
+#[test]
+fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebuild() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "rollup-request-1",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-rollup",
+            request_started_at: "2026-06-03T10:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("running llm request insert");
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let rollup_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM llm_request_usage_rollups",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rollup count");
+    assert_eq!(rollup_count, 0);
+
+    database
+        .update_llm_request_outcome(
+            "rollup-request-1",
+            UpdateLlmRequestOutcome {
+                first_token_at: Some("2026-06-03T10:00:00.050Z"),
+                completed_at: Some("2026-06-03T10:00:00.120Z"),
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                cache_read_tokens: Some(2),
+                cache_write_tokens: Some(1),
+                first_token_latency_ms: Some(50),
+                total_latency_ms: Some(120),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: None,
+            },
+        )
+        .expect("final llm request update");
+
+    database
+        .update_llm_request_outcome(
+            "rollup-request-1",
+            UpdateLlmRequestOutcome {
+                first_token_at: Some("2026-06-03T10:00:00.050Z"),
+                completed_at: Some("2026-06-03T10:00:00.150Z"),
+                input_tokens: Some(15),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(3),
+                cache_write_tokens: Some(2),
+                first_token_latency_ms: Some(50),
+                total_latency_ms: Some(150),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: None,
+            },
+        )
+        .expect("final llm request token correction");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "rollup-request-2",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "anthropic",
+            model_id: "claude-rollup",
+            request_started_at: "2026-06-04T10:00:00.000Z",
+            first_token_at: None,
+            completed_at: Some("2026-06-04T10:00:00.200Z"),
+            input_tokens: Some(3),
+            output_tokens: Some(7),
+            cache_read_tokens: None,
+            cache_write_tokens: Some(5),
+            first_token_latency_ms: None,
+            total_latency_ms: Some(200),
+            status_code: Some(500),
+            final_state: "failed",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("failed llm request insert");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "rollup-request-running",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-rollup",
+            request_started_at: "2026-06-05T10:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(100),
+            output_tokens: Some(100),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("second running llm request insert");
+
+    let corrected_rollup: (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT request_count, success_count, failed_count,
+                    total_tokens, latency_count, latency_sum
+             FROM llm_request_usage_rollups
+             WHERE workspace_id = 'workspace-1'
+               AND bucket_date = '2026-06-03'
+               AND provider_id = 'openai'
+               AND model_id = 'gpt-rollup'
+               AND final_state = 'succeeded'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("corrected rollup row");
+    assert_eq!(corrected_rollup, (1, 1, 0, 20, 1, 150));
+
+    database
+        .rebuild_llm_request_usage_rollups()
+        .expect("rollup rebuild");
+
+    let rollup_filters = LlmRequestUsageRollupFilters {
+        workspace_id: Some("workspace-1"),
+        ..LlmRequestUsageRollupFilters::default()
+    };
+    let rollup_summary = database
+        .llm_request_usage_rollup_summary(rollup_filters)
+        .expect("rollup summary");
+    let direct_summary: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                    COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                    COUNT(total_latency_ms),
+                    COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+             FROM llm_requests
+             WHERE workspace_id = 'workspace-1' AND final_state != 'running'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .expect("direct summary");
+    assert_eq!(
+        (
+            rollup_summary.total_requests,
+            rollup_summary.failed_requests,
+            rollup_summary.total_input_tokens,
+            rollup_summary.total_output_tokens,
+            rollup_summary.total_cache_read_tokens,
+            rollup_summary.total_cache_write_tokens,
+            rollup_summary.total_tokens,
+            rollup_summary.latency_count,
+            rollup_summary.latency_sum,
+        ),
+        direct_summary
+    );
+
+    let rollup_trend: Vec<_> = database
+        .llm_request_usage_rollup_trend_breakdown(rollup_filters)
+        .expect("rollup trend")
+        .into_iter()
+        .map(|row| (row.bucket, row.request_count, row.total_tokens))
+        .collect();
+    let mut statement = connection
+        .prepare(
+            "SELECT SUBSTR(request_started_at, 1, 10), COUNT(*),
+                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+             FROM llm_requests
+             WHERE workspace_id = 'workspace-1' AND final_state != 'running'
+             GROUP BY 1 ORDER BY 1 DESC",
+        )
+        .expect("direct trend statement");
+    let direct_trend: Vec<(String, i64, i64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("direct trend query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("direct trend rows");
+    assert_eq!(rollup_trend, direct_trend);
+
+    let rollup_providers: Vec<_> = database
+        .llm_request_usage_rollup_provider_breakdown(rollup_filters)
+        .expect("rollup provider breakdown")
+        .into_iter()
+        .map(|row| {
+            (
+                row.provider_id,
+                row.request_count,
+                row.success_count,
+                row.total_tokens,
+                row.latency_count,
+                row.latency_sum,
+            )
+        })
+        .collect();
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_id,
+                    COUNT(*),
+                    COUNT(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 END),
+                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
+                    COUNT(total_latency_ms),
+                    SUM(COALESCE(total_latency_ms, 0))
+             FROM llm_requests
+             WHERE workspace_id = 'workspace-1' AND final_state != 'running'
+             GROUP BY provider_id ORDER BY provider_id",
+        )
+        .expect("direct provider statement");
+    let direct_providers: Vec<(String, i64, i64, i64, i64, i64)> = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("direct provider query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("direct provider rows");
+    assert_eq!(rollup_providers, direct_providers);
 }
 
 #[test]
