@@ -882,7 +882,7 @@ function ContextPlanTab({
                               {canRetryPhase ? (
                                 <button
                                   aria-label={t("Retry plan phase")}
-                                  className="inline-flex h-7 items-center justify-center gap-1 rounded-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  className="inline-flex size-7 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                                   disabled={operationKey !== null}
                                   onClick={() => {
                                     if (!phase.agentTaskId) {
@@ -903,7 +903,6 @@ function ContextPlanTab({
                                   ) : (
                                     <RefreshCw aria-hidden="true" className="size-3.5" />
                                   )}
-                                  {t("Retry phase")}
                                 </button>
                               ) : null}
                             </div>
