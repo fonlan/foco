@@ -57,6 +57,7 @@ function assertTargetNotRunning(profile) {
     "$target = [IO.Path]::GetFullPath($env:FOCO_BUILD_TARGET_EXE)",
     "$running = Get-Process foco -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [IO.Path]::GetFullPath($_.Path) -eq $target }",
     "if ($running) { exit 1 }",
+    "exit 0",
   ].join("; ");
 
   const result = spawnSync(
