@@ -486,6 +486,7 @@ pub struct PlanRecord {
     pub completed_at: Option<String>,
     pub completed_by_user_at: Option<String>,
     pub error_message: Option<String>,
+    pub shared_merge_commit_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub phases: Vec<PlanPhaseRecord>,

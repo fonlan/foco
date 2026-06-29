@@ -16,6 +16,7 @@ function plan(id: string, status: Plan["status"]): Plan {
     completedAt: null,
     completedByUserAt: null,
     errorMessage: null,
+    sharedMergeCommitId: null,
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-01T00:00:00Z",
     phases: [],

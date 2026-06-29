@@ -661,6 +661,81 @@ fn plan_phase_run_completion_advances_until_pause() {
 }
 
 #[test]
+fn phase_commit_does_not_mark_plan_shared_merged() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-shared-merge-marker",
+            title: "Shared merge marker",
+            overview: "Track shared merge separately from phase commits.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-shared-merge-marker-phase-1",
+                title: "Phase one",
+                summary: "Produces an isolated commit.",
+                steps: vec![NewPlanStep {
+                    id: "plan-shared-merge-marker-step-1",
+                    title: "Do work",
+                    detail: "Complete the phase.",
+                    acceptance: vec!["phase committed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-shared-merge-marker", "start")
+        .expect("start phase");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-plan-shared-merge-marker",
+        "plan-shared-merge-marker",
+    );
+    let task_id = AgentTaskId::new("agent-task-plan-shared-merge-marker").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            "plan-shared-merge-marker",
+            "plan-shared-merge-marker-phase-1",
+            "chat-plan-shared-merge-marker",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase");
+
+    let completed = database
+        .complete_plan_phase_run(&task_id, Some("phase-commit"))
+        .expect("complete phase")
+        .expect("completed plan");
+    assert_eq!(completed.status, "implemented");
+    assert_eq!(
+        completed.phases[0].commit_id.as_deref(),
+        Some("phase-commit")
+    );
+    assert!(completed.shared_merge_commit_id.is_none());
+
+    let merged = database
+        .record_plan_shared_merge_commit("plan-shared-merge-marker", "shared-commit")
+        .expect("record shared merge");
+    assert_eq!(
+        merged.shared_merge_commit_id.as_deref(),
+        Some("shared-commit")
+    );
+}
+
+#[test]
 fn starting_failed_plan_phase_clears_previous_agent_run() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

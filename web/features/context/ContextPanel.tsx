@@ -2309,21 +2309,7 @@ function planActionLabel(action: string) {
 }
 
 function planMergedIntoSharedWorkspace(plan: Plan) {
-  if (
-    plan.status !== "implemented" ||
-    plan.phases.length === 0 ||
-    !plan.phases.every(
-      (phase) => phase.status === "completed" && phase.implementationChatId,
-    )
-  ) {
-    return null;
-  }
-
-  const commitId = [...plan.phases]
-    .reverse()
-    .find((phase) => phase.commitId?.trim())
-    ?.commitId?.trim();
-
+  const commitId = plan.sharedMergeCommitId?.trim();
   return commitId ? commitId.slice(0, 7) : null;
 }
 

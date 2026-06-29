@@ -322,6 +322,15 @@ pub(super) fn commit_staged_changes(
     Ok(commit_id)
 }
 
+pub(super) fn shared_workspace_head_commit_id(workspace_path: &Path) -> Result<String, ApiError> {
+    let repo = open_repo(workspace_path)?;
+    repo.head_id()
+        .map(|id| id.detach().to_string())
+        .map_err(|source| {
+            ApiError::bad_request(format!("shared workspace has unborn HEAD: {source}"))
+        })
+}
+
 pub(super) fn create_agent_worktree(
     workspace_path: &Path,
     instance_id: &str,

@@ -55,13 +55,14 @@ pub use workspace_records::{
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, Migration,
+    MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 20;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 21;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -105,11 +106,11 @@ const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
   )"#;
 const PLAN_SELECT_BASE_SQL: &str = "SELECT id, title, overview, status, sort_order,
        source_chat_id, active_phase_id, pause_requested_at, completed_at,
-       completed_by_user_at, error_message, created_at, updated_at
+       completed_by_user_at, error_message, shared_merge_commit_id, created_at, updated_at
  FROM plans";
 const PLAN_SELECT_SQL: &str = "SELECT id, title, overview, status, sort_order,
        source_chat_id, active_phase_id, pause_requested_at, completed_at,
-       completed_by_user_at, error_message, created_at, updated_at
+       completed_by_user_at, error_message, shared_merge_commit_id, created_at, updated_at
  FROM plans
  WHERE id = ?1";
 
@@ -193,6 +194,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 20,
         sql: MIGRATION_020,
+    },
+    Migration {
+        version: 21,
+        sql: MIGRATION_021,
     },
 ];
 
@@ -1379,6 +1384,36 @@ impl WorkspaceDatabase {
         self.plan(plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after completion: {}", plan_id.trim()),
+            })
+    }
+
+    pub fn record_plan_shared_merge_commit(
+        &mut self,
+        plan_id: &str,
+        commit_id: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let commit_id = commit_id.trim();
+        if commit_id.is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "shared merge commit id cannot be empty".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET shared_merge_commit_id = ?2,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan_id.trim(), commit_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan was not found after shared merge update: {}",
+                    plan_id.trim()
+                ),
             })
     }
 
@@ -9252,8 +9287,9 @@ fn plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
         completed_at: row.get(8)?,
         completed_by_user_at: row.get(9)?,
         error_message: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        shared_merge_commit_id: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
         phases: Vec::new(),
     })
 }

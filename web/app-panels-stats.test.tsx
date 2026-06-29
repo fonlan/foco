@@ -211,6 +211,7 @@ describe("app-panels-stats verification surfaces", () => {
       completedByUserAt: null,
       createdAt: timestamp,
       errorMessage: null,
+      sharedMergeCommitId: null,
       id: "plan-1",
       overview: "Run the implementation through normal visible chats.",
       pauseRequestedAt: null,
@@ -372,6 +373,7 @@ describe("app-panels-stats verification surfaces", () => {
       completedByUserAt: null,
       createdAt: timestamp,
       errorMessage: null,
+      sharedMergeCommitId: null,
       id: "plan-open-chat",
       overview: "Open the phase implementation transcript.",
       pauseRequestedAt: null,
@@ -487,6 +489,7 @@ describe("app-panels-stats verification surfaces", () => {
       completedByUserAt: null,
       createdAt: timestamp,
       errorMessage: null,
+      sharedMergeCommitId: null,
       id: "plan-delete-ui",
       overview: "Delete this plan from the active list.",
       pauseRequestedAt: null,
@@ -593,6 +596,7 @@ describe("app-panels-stats verification surfaces", () => {
       completedByUserAt: null,
       createdAt: timestamp,
       errorMessage: "provider rate limited",
+      sharedMergeCommitId: null,
       id: "plan-failed",
       overview: "Expose an explicit phase retry control.",
       pauseRequestedAt: null,
@@ -811,6 +815,7 @@ describe("app-panels-stats verification surfaces", () => {
         completedByUserAt: status === "completed" ? timestamp : null,
         createdAt: timestamp,
         errorMessage: null,
+        sharedMergeCommitId: null,
         id,
         overview: `${title} overview`,
         pauseRequestedAt: null,
@@ -1039,6 +1044,7 @@ describe("app-panels-stats verification surfaces", () => {
       completedByUserAt: null,
       createdAt: timestamp,
       errorMessage: null,
+      sharedMergeCommitId: "fedcba987654321",
       id: "plan-merged",
       overview: "Every phase has completed its implementation chat.",
       pauseRequestedAt: null,
@@ -1095,28 +1101,29 @@ describe("app-panels-stats verification surfaces", () => {
       title: "Merged implementation plan",
       updatedAt: timestamp,
     };
-    const noCommitImplementedPlan = {
+    const phaseCommitOnlyImplementedPlan = {
       ...implementedPlan,
-      id: "plan-implemented-no-commit",
+      id: "plan-implemented-phase-commit-only",
       phases: implementedPlan.phases.map((phase) => ({
         ...phase,
-        commitId: phase.sequence === 0 ? "   " : null,
-        id: `${phase.id}-no-commit`,
-        planId: "plan-implemented-no-commit",
+        id: `${phase.id}-phase-commit-only`,
+        planId: "plan-implemented-phase-commit-only",
         steps: phase.steps.map((step) => ({
           ...step,
-          id: `${step.id}-no-commit`,
-          phaseId: `${phase.id}-no-commit`,
-          planId: "plan-implemented-no-commit",
+          id: `${step.id}-phase-commit-only`,
+          phaseId: `${phase.id}-phase-commit-only`,
+          planId: "plan-implemented-phase-commit-only",
         })),
       })),
-      title: "Implemented plan without commit",
+      sharedMergeCommitId: null,
+      title: "Implemented plan with phase commit only",
     };
     const statusColorPlans = [
       {
         ...implementedPlan,
         completedByUserAt: timestamp,
         id: "plan-color-completed",
+        sharedMergeCommitId: null,
         phases: [
           {
             ...implementedPlan.phases[0],
@@ -1134,6 +1141,7 @@ describe("app-panels-stats verification surfaces", () => {
         ...implementedPlan,
         completedAt: null,
         id: "plan-color-failed",
+        sharedMergeCommitId: null,
         phases: [
           {
             ...implementedPlan.phases[0],
@@ -1152,6 +1160,7 @@ describe("app-panels-stats verification surfaces", () => {
         ...implementedPlan,
         completedAt: null,
         id: "plan-color-cancelled",
+        sharedMergeCommitId: null,
         phases: [
           {
             ...implementedPlan.phases[0],
@@ -1170,6 +1179,7 @@ describe("app-panels-stats verification surfaces", () => {
         ...implementedPlan,
         completedAt: null,
         id: "plan-color-ready",
+        sharedMergeCommitId: null,
         phases: [
           {
             ...implementedPlan.phases[0],
@@ -1195,7 +1205,7 @@ describe("app-panels-stats verification surfaces", () => {
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [implementedPlan, noCommitImplementedPlan, ...statusColorPlans],
+          plans: [implementedPlan, phaseCommitOnlyImplementedPlan, ...statusColorPlans],
           totalCount: 6,
           totalPages: 1,
         });
@@ -1211,19 +1221,19 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Plan" }));
 
     expect(await screen.findByText("Merged implementation plan")).toBeInTheDocument();
-    const mergedCommitBadge = screen.getByText("abc1234");
+    const mergedCommitBadge = screen.getByText("fedcba9");
     expect(mergedCommitBadge).toHaveAttribute(
       "title",
       "Merged into shared workspace",
     );
     expect(screen.queryByText("Merged")).not.toBeInTheDocument();
 
-    const noCommitPlanCard = screen
-      .getByText("Implemented plan without commit")
+    const phaseCommitOnlyPlanCard = screen
+      .getByText("Implemented plan with phase commit only")
       .closest("article");
-    expect(noCommitPlanCard).not.toBeNull();
+    expect(phaseCommitOnlyPlanCard).not.toBeNull();
     expect(
-      within(noCommitPlanCard as HTMLElement).queryByTitle(
+      within(phaseCommitOnlyPlanCard as HTMLElement).queryByTitle(
         "Merged into shared workspace",
       ),
     ).not.toBeInTheDocument();

@@ -1023,6 +1023,10 @@ CREATE INDEX plan_steps_plan_idx ON plan_steps (plan_id);
 CREATE INDEX plan_steps_phase_sequence_idx ON plan_steps (phase_id, sequence);
 "#;
 
+pub(crate) const MIGRATION_021: &str = r#"
+ALTER TABLE plans ADD COLUMN shared_merge_commit_id TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

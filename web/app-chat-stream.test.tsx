@@ -60,6 +60,7 @@ function activePlan(id: string, title: string) {
     completedByUserAt: null,
     createdAt: timestamp,
     errorMessage: null,
+    sharedMergeCommitId: null,
     id,
     overview: "Refresh the plan panel.",
     pauseRequestedAt: null,

@@ -211,6 +211,7 @@ export type Plan = {
   completedAt: string | null;
   completedByUserAt: string | null;
   errorMessage: string | null;
+  sharedMergeCommitId: string | null;
   createdAt: string;
   updatedAt: string;
   phases: PlanPhase[];

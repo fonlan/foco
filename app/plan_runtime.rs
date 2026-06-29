@@ -21,7 +21,7 @@ use crate::{
     git_backend::{
         AgentWorktreeInfo, agent_worktree_committed_diff, commit_staged_changes,
         delete_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
-        merge_agent_worktree, stage_git_file,
+        merge_agent_worktree, shared_workspace_head_commit_id, stage_git_file,
     },
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
     *,
@@ -190,6 +190,10 @@ async fn sync_plan_merge_task(
                     return Ok(());
                 }
             };
+            let shared_merge_commit_id = match commit_id.as_deref() {
+                Some(commit_id) => commit_id.to_string(),
+                None => shared_workspace_head_commit_id(&workspace.path)?,
+            };
             let plan = {
                 let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                     .map_err(ApiError::from_workspace_error)?;
@@ -199,6 +203,9 @@ async fn sync_plan_merge_task(
                         &target.phase_id,
                         commit_id.as_deref(),
                     )
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .record_plan_shared_merge_commit(&target.plan_id, &shared_merge_commit_id)
                     .map_err(ApiError::from_workspace_error)?
             };
             if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree {
@@ -468,7 +475,15 @@ async fn finalize_plan_worktree(
         Path::new(root_path),
         base_revision,
     ) {
-        Ok(_) => delete_plan_worktrees(workspace, plan, true),
+        Ok(_) => {
+            let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace.path)?;
+            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
+                .map_err(ApiError::from_workspace_error)?;
+            delete_plan_worktrees(workspace, plan, true)
+        }
         Err(error) => {
             if dispatch_plan_merge(state, workspace, plan, &phase, &instance, &error).await? {
                 Ok(())

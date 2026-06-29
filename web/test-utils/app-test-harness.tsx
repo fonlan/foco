@@ -1302,6 +1302,7 @@ export const planFixture: Plan = {
   completedByUserAt: null,
   createdAt: "2026-06-05T10:00:00Z",
   errorMessage: null,
+  sharedMergeCommitId: null,
   id: "plan-1",
   overview: "Implement a focused settings regression.",
   pauseRequestedAt: null,
