@@ -222,6 +222,24 @@ impl McpRegistry {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn insert_test_server_tools(
+        &self,
+        definition: McpServerDefinition,
+        tools: Vec<McpToolDefinition>,
+    ) {
+        let mut servers = self.servers.lock().await;
+        servers.insert(
+            definition.id.clone(),
+            McpServerRuntime {
+                definition,
+                service: None,
+                tools,
+                error: None,
+            },
+        );
+    }
+
     pub async fn stop_all(&self) -> Result<(), McpError> {
         let keys = {
             let servers = self.servers.lock().await;
@@ -271,7 +289,7 @@ impl McpRegistry {
             let servers = self.servers.lock().await;
             servers
                 .get(&key)
-                .map(|runtime| runtime.service.is_some() && runtime.error.is_none())
+                .map(runtime_satisfies_sync)
                 .unwrap_or(false)
         };
 
@@ -337,6 +355,17 @@ impl McpRegistry {
 
         Ok(())
     }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn runtime_satisfies_sync(runtime: &McpServerRuntime) -> bool {
+    runtime.service.is_some() && runtime.error.is_none()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn runtime_satisfies_sync(runtime: &McpServerRuntime) -> bool {
+    // ponytail: test-support uses static tool definitions; use a real service when testing execution.
+    (runtime.service.is_some() || !runtime.tools.is_empty()) && runtime.error.is_none()
 }
 
 pub fn encode_mcp_tool_name(server_id: &str, tool_name: &str) -> Result<String, McpError> {

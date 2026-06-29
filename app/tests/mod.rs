@@ -11047,7 +11047,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
 }
 
 #[tokio::test]
-async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
+async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mcp_tools() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-plan-mode-tools-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-plan-mode-tools-profile-test"));
 
@@ -11066,7 +11066,40 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
         },
     ];
     config.models[0].system_prompt_name = "Review".to_string();
+    config.mcp.servers.push(McpServerConfig {
+        id: "docs".to_string(),
+        name: "Docs".to_string(),
+        enabled: true,
+        transport: "stdio".to_string(),
+        command: Some("test-mcp-server".to_string()),
+        args: Vec::new(),
+        url: None,
+    });
+    let mcp_tool_name = "mcp__docs__search";
     let state = test_app_state(config.clone(), profile_dir.clone());
+    let mcp_server = config.mcp.servers[0]
+        .to_definition()
+        .expect("mcp server definition");
+    state
+        .mcp_registry
+        .insert_test_server_tools(
+            mcp_server,
+            vec![McpToolDefinition {
+                name: mcp_tool_name.to_string(),
+                server_id: "docs".to_string(),
+                server_name: "Docs".to_string(),
+                original_name: "search".to_string(),
+                description: "Search docs.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            }],
+        )
+        .await;
     let context = prepare_prompt_context(
         &state,
         &config,
@@ -11102,6 +11135,7 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
     assert!(tool_names.contains(UPDATE_PLAN_TOOL));
     assert!(tool_names.contains(UPDATE_PLAN_STEP_TOOL));
     assert!(tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
+    assert!(tool_names.contains(mcp_tool_name));
     assert!(!tool_names.contains(WRITE_FILE_TOOL));
     assert!(!tool_names.contains(EDIT_FILE_TOOL));
     assert!(!tool_names.contains(RUN_COMMAND_TOOL));
@@ -11135,6 +11169,11 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
         available_tools_message
             .content
             .contains(&format!(r#"<tool name="{CREATE_PLAN_TOOL}">"#))
+    );
+    assert!(
+        available_tools_message
+            .content
+            .contains(&format!(r#"<tool name="{mcp_tool_name}">"#))
     );
     assert!(
         !available_tools_message
