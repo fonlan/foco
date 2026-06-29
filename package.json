@@ -12,6 +12,7 @@
     "test:backend:calm": "cargo test --workspace -j 2 -- --test-threads=2",
     "test:release-smoke:windows": "node scripts/smoke-release-windows.mjs",
     "typecheck": "npm run typecheck -w web",
-    "build:release": "npm run build -w web && cargo build --release -p foco-app"
+    "build:release": "node scripts/build-release.mjs",
+    "build:dist": "node scripts/build-release.mjs --dist"
   }
 }
