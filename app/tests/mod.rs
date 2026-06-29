@@ -31,7 +31,7 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
+    GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
     ToolCancellationToken, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
 };
 use futures_util::StreamExt;
@@ -583,6 +583,48 @@ async fn tool_resource_registry_allows_read_during_workspace_mutation_lease() {
     )
     .await
     .expect("read-only file lock should not wait on workspace mutation lease");
+}
+
+#[tokio::test]
+async fn tool_resource_registry_scopes_project_spec_locks() {
+    let registry = ToolResourceLockRegistry::default();
+    let spec_write_lease = registry
+        .acquire(
+            "workspace-1",
+            vec![ToolResourceLock {
+                resource: ToolResource::ProjectSpec,
+                access: ToolResourceAccess::Write,
+            }],
+        )
+        .await;
+    let waiting_registry = registry.clone();
+    let waiter = tokio::spawn(async move {
+        let _read_lease = waiting_registry
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::ProjectSpec,
+                    access: ToolResourceAccess::Read,
+                }],
+            )
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!waiter.is_finished());
+
+    let _mutation_lease = tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.acquire("workspace-1", vec![test_workspace_mutation_lock()]),
+    )
+    .await
+    .expect("project spec lock should not wait on workspace mutation lease");
+
+    drop(spec_write_lease);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("project spec read lock should be released")
+        .expect("project spec read waiter should not panic");
 }
 
 #[tokio::test]
@@ -1173,8 +1215,8 @@ fn read_only_tool_progress_detector_warns_once_and_continues_varied_exploration(
 
     let warning = detector.check(&[test_neutral_tool_call(
         "call-warning",
-        SEARCH_TEXT_TOOL,
-        json!({ "query": "needle", "path": "." }),
+        READ_SPEC_TOOL,
+        json!({}),
     )]);
     assert!(matches!(warning, ReadOnlyToolProgressAction::Warn(_)));
 

@@ -876,6 +876,8 @@ const CREATE_PLAN_TOOL_NAME: &str = "create_plan";
 const GET_PLANS_TOOL_NAME: &str = "get_plans";
 const UPDATE_PLAN_TOOL_NAME: &str = "update_plan";
 const UPDATE_PLAN_STEP_TOOL_NAME: &str = "update_plan_step";
+const READ_SPEC_TOOL_NAME: &str = "read_spec";
+const UPDATE_SPEC_TOOL_NAME: &str = "update_spec";
 const AGENT_LIST_TOOL_NAME: &str = "agent_list";
 const AGENT_GET_TASK_TOOL_NAME: &str = "agent_get_task";
 const AGENT_SEND_MESSAGE_TOOL_NAME: &str = "agent_send_message";
@@ -973,6 +975,7 @@ pub enum ToolResource {
     File(String),
     TodoGraph,
     Plan,
+    ProjectSpec,
     Memory(String),
     ExternalTool(String),
 }
@@ -1548,6 +1551,14 @@ pub fn tool_resource_locks(
             resource: ToolResource::Plan,
             access: ToolResourceAccess::Read,
         }],
+        READ_SPEC_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::ProjectSpec,
+            access: ToolResourceAccess::Read,
+        }],
+        UPDATE_SPEC_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::ProjectSpec,
+            access: ToolResourceAccess::Write,
+        }],
         AGENT_LIST_TOOL_NAME
         | AGENT_GET_TASK_TOOL_NAME
         | AGENT_SEND_MESSAGE_TOOL_NAME
@@ -1615,6 +1626,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | GRAPH_EXPLORE_TOOL_NAME
         | GET_TODO_GRAPH_TOOL_NAME
         | GET_PLANS_TOOL_NAME
+        | READ_SPEC_TOOL_NAME
         | MEMORY_SEARCH_TOOL_NAME
         | WEB_SEARCH_TOOL_NAME
         | WEB_FETCH_TOOL_NAME
@@ -1635,6 +1647,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | CREATE_PLAN_TOOL_NAME
         | UPDATE_PLAN_TOOL_NAME
         | UPDATE_PLAN_STEP_TOOL_NAME
+        | UPDATE_SPEC_TOOL_NAME
         | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
         RUN_COMMAND_TOOL_NAME => ToolEffect::ExternalOrUnknown,
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => ToolEffect::ExternalOrUnknown,
@@ -1835,6 +1848,7 @@ fn resources_overlap(first: &ToolResource, second: &ToolResource) -> bool {
         (ToolResource::File(first), ToolResource::File(second)) => first == second,
         (ToolResource::TodoGraph, ToolResource::TodoGraph) => true,
         (ToolResource::Plan, ToolResource::Plan) => true,
+        (ToolResource::ProjectSpec, ToolResource::ProjectSpec) => true,
         (ToolResource::Memory(first), ToolResource::Memory(second)) => {
             first == second || first == "all" || second == "all"
         }
@@ -1955,6 +1969,7 @@ impl fmt::Display for ToolResource {
             Self::File(path) => write!(formatter, "file '{path}'"),
             Self::TodoGraph => write!(formatter, "current chat todo graph"),
             Self::Plan => write!(formatter, "workspace plans"),
+            Self::ProjectSpec => write!(formatter, "project spec"),
             Self::Memory(scope) => write!(formatter, "memory scope '{scope}'"),
             Self::ExternalTool(tool_name) => write!(formatter, "external tool '{tool_name}'"),
         }
@@ -2056,12 +2071,17 @@ mod tests {
         assert_eq!(tool_effect(READ_FILE_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(tool_effect(GRAPH_EXPLORE_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(tool_effect(WEB_FETCH_TOOL_NAME), ToolEffect::ReadOnly);
+        assert_eq!(tool_effect(READ_SPEC_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(
             tool_effect(WRITE_FILE_TOOL_NAME),
             ToolEffect::WorkspaceMutation
         );
         assert_eq!(
             tool_effect(EDIT_FILE_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
+            tool_effect(UPDATE_SPEC_TOOL_NAME),
             ToolEffect::WorkspaceMutation
         );
         assert_eq!(
@@ -2119,6 +2139,78 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn project_spec_tool_locks_are_scoped_to_project_spec() {
+        let read_spec_locks = tool_resource_locks(&test_tool_call(READ_SPEC_TOOL_NAME, json!({})))
+            .expect("read spec locks");
+        assert_eq!(
+            read_spec_locks,
+            vec![ToolResourceLock {
+                resource: ToolResource::ProjectSpec,
+                access: ToolResourceAccess::Read,
+            }]
+        );
+        assert!(
+            !read_spec_locks
+                .iter()
+                .any(|lock| lock.resource == ToolResource::WorkspaceMutationLease)
+        );
+
+        let update_spec_locks =
+            tool_resource_locks(&test_tool_call(UPDATE_SPEC_TOOL_NAME, json!({})))
+                .expect("update spec locks");
+        assert_eq!(
+            update_spec_locks,
+            vec![ToolResourceLock {
+                resource: ToolResource::ProjectSpec,
+                access: ToolResourceAccess::Write,
+            }]
+        );
+        assert!(
+            !update_spec_locks
+                .iter()
+                .any(|lock| lock.resource == ToolResource::WorkspaceMutationLease)
+        );
+
+        let second_update_spec_locks =
+            tool_resource_locks(&test_tool_call(UPDATE_SPEC_TOOL_NAME, json!({})))
+                .expect("second update spec locks");
+        let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))
+            .expect("command locks");
+        let plan_locks = tool_resource_locks(&test_tool_call(CREATE_PLAN_TOOL_NAME, json!({})))
+            .expect("plan locks");
+        let file_locks = tool_resource_locks(&test_tool_call(
+            WRITE_FILE_TOOL_NAME,
+            json!({ "path": "src/lib.rs" }),
+        ))
+        .expect("file locks");
+
+        assert!(update_spec_locks.iter().any(|update_lock| {
+            read_spec_locks
+                .iter()
+                .any(|read_lock| tool_resource_locks_conflict(update_lock, read_lock))
+        }));
+        assert!(update_spec_locks.iter().any(|update_lock| {
+            second_update_spec_locks.iter().any(|second_update_lock| {
+                tool_resource_locks_conflict(update_lock, second_update_lock)
+            })
+        }));
+        assert!(!update_spec_locks.iter().any(|update_lock| {
+            command_locks
+                .iter()
+                .any(|command_lock| tool_resource_locks_conflict(update_lock, command_lock))
+        }));
+        assert!(!update_spec_locks.iter().any(|update_lock| {
+            plan_locks
+                .iter()
+                .any(|plan_lock| tool_resource_locks_conflict(update_lock, plan_lock))
+        }));
+        assert!(!update_spec_locks.iter().any(|update_lock| {
+            file_locks
+                .iter()
+                .any(|file_lock| tool_resource_locks_conflict(update_lock, file_lock))
+        }));
+    }
     #[test]
     fn plan_tool_locks_do_not_conflict_with_running_command_lock() {
         let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))
@@ -2888,6 +2980,64 @@ mod tests {
                     mode: ToolExecutionMode::Parallel,
                     call_indices: vec![0, 1],
                 }]
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_turn_project_spec_read_write_conflicts() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-read".to_string(),
+                name: READ_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-update".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::ProjectSpec,
+                first_call_id: "call-read".to_string(),
+                first_access: ToolResourceAccess::Read,
+                second_call_id: "call-update".to_string(),
+                second_access: ToolResourceAccess::Write,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_turn_project_spec_write_write_conflicts() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-update-a".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-update-b".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::ProjectSpec,
+                first_call_id: "call-update-a".to_string(),
+                first_access: ToolResourceAccess::Write,
+                second_call_id: "call-update-b".to_string(),
+                second_access: ToolResourceAccess::Write,
             }
         );
     }
