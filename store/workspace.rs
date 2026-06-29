@@ -6941,6 +6941,7 @@ impl WorkspaceDatabase {
                             SELECT 1 FROM agent_tasks AS earlier_workspace_task
                             WHERE earlier_workspace_task.rowid < task.rowid
                               AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
+                              AND COALESCE(json_extract(earlier_workspace_task.input_json, '$.sessionMode'), '') <> 'plan'
                         )
                    )
                    AND (
@@ -7032,6 +7033,7 @@ impl WorkspaceDatabase {
                             SELECT 1 FROM agent_tasks AS earlier_workspace_task
                             WHERE earlier_workspace_task.rowid < task.rowid
                               AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
+                              AND COALESCE(json_extract(earlier_workspace_task.input_json, '$.sessionMode'), '') <> 'plan'
                         )
                    )
                    AND (

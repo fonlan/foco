@@ -5085,6 +5085,65 @@ fn deferred_workspace_agent_task_waits_for_earlier_active_task() {
 }
 
 #[test]
+fn deferred_workspace_agent_task_ignores_earlier_plan_session_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (plan_team_id, plan_instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-defer-plan", "defer-plan");
+    let (deferred_team_id, deferred_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-defer-after-plan",
+        "defer-after-plan",
+    );
+    let plan_task = AgentTaskId::new("agent-task-defer-plan").expect("task id");
+    let deferred_task = AgentTaskId::new("agent-task-defer-after-plan").expect("task id");
+
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &plan_task,
+            team_id: &plan_team_id,
+            owner_instance_id: &plan_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"sessionMode":"plan"}"#,
+        })
+        .expect("plan enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &deferred_task,
+            team_id: &deferred_team_id,
+            owner_instance_id: &deferred_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"deferUntilWorkspaceIdle":true}"#,
+        })
+        .expect("deferred enqueue");
+
+    database
+        .claim_runnable_agent_task(
+            &plan_team_id,
+            &plan_task,
+            &AgentAttemptId::new("agent-attempt-defer-plan").expect("attempt id"),
+        )
+        .expect("claim plan task")
+        .expect("plan task claimed");
+
+    let runnable = database.runnable_agent_tasks(10).expect("runnable");
+    assert!(
+        runnable.iter().any(|task| task.id == deferred_task),
+        "deferred task should be runnable while an earlier Plan Mode task is active"
+    );
+    database
+        .claim_runnable_agent_task(
+            &deferred_team_id,
+            &deferred_task,
+            &AgentAttemptId::new("agent-attempt-defer-after-plan").expect("attempt id"),
+        )
+        .expect("claim deferred task")
+        .expect("deferred task claimed");
+}
+
+#[test]
 fn agent_team_max_concurrent_runs_blocks_second_instance_claim() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
