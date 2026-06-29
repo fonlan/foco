@@ -1127,7 +1127,7 @@ fn apply_request_overrides(
                 headers.push((name, header_value.to_string()));
             }
             REQUEST_OVERRIDE_TARGET_BODY => {
-                body.insert(name, value);
+                insert_nested_body_override(&mut body, &name, value)?;
             }
             _ => unreachable!("request override target was validated"),
         }
@@ -1142,6 +1142,43 @@ fn apply_request_overrides(
     }
 
     Ok(options)
+}
+
+fn insert_nested_body_override(
+    body: &mut Map<String, Value>,
+    name: &str,
+    value: Value,
+) -> Result<(), ProviderConfigError> {
+    let mut parts = name.split('.').peekable();
+    let mut current = body;
+
+    while let Some(raw_part) = parts.next() {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(ProviderConfigError::InvalidRequest(format!(
+                "body request override path '{name}' must not contain empty segments"
+            )));
+        }
+
+        if parts.peek().is_none() {
+            current.insert(part.to_string(), value);
+            return Ok(());
+        }
+
+        let entry = current
+            .entry(part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(next) = entry else {
+            return Err(ProviderConfigError::InvalidRequest(format!(
+                "body request override path '{name}' conflicts with non-object segment '{part}'"
+            )));
+        };
+        current = next;
+    }
+
+    Err(ProviderConfigError::InvalidRequest(
+        "body request override path must not be empty".to_string(),
+    ))
 }
 
 fn normalize_stream_event(
@@ -1485,6 +1522,57 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
         }
+    }
+
+    #[test]
+    fn inserts_nested_body_request_override() {
+        let mut body = Map::new();
+
+        insert_nested_body_override(
+            &mut body,
+            "text.verbosity",
+            Value::String("low".to_string()),
+        )
+        .expect("nested body override");
+
+        assert_eq!(
+            Value::Object(body),
+            serde_json::json!({ "text": { "verbosity": "low" } })
+        );
+    }
+
+    #[test]
+    fn rejects_empty_body_request_override_path_segment() {
+        let mut body = Map::new();
+
+        let error = insert_nested_body_override(
+            &mut body,
+            "text..verbosity",
+            Value::String("low".to_string()),
+        )
+        .expect_err("empty path segment should fail");
+
+        assert!(error.to_string().contains("empty segments"));
+    }
+
+    #[test]
+    fn rejects_nested_body_request_override_conflict() {
+        let mut body = Map::new();
+
+        insert_nested_body_override(&mut body, "text", Value::String("x".to_string()))
+            .expect("top-level body override");
+        let error = insert_nested_body_override(
+            &mut body,
+            "text.verbosity",
+            Value::String("low".to_string()),
+        )
+        .expect_err("non-object path segment should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with non-object segment")
+        );
     }
 
     #[test]
