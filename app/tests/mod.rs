@@ -94,6 +94,42 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
     }
 }
 
+#[test]
+fn plan_mode_missing_plan_update_requires_successful_plan_tool_result() {
+    let read_file_result = ExecutedToolCall {
+        id: "call-1".to_string(),
+        name: READ_FILE_TOOL.to_string(),
+        input: json!({ "path": "README.md" }),
+        output: json!({ "content": "hello" }),
+        is_error: false,
+        started_at: "2026-06-29T08:00:00Z".to_string(),
+        completed_at: "2026-06-29T08:00:01Z".to_string(),
+    };
+    let failed_create_plan_result = ExecutedToolCall {
+        name: CREATE_PLAN_TOOL.to_string(),
+        is_error: true,
+        ..read_file_result.clone()
+    };
+    let successful_update_plan_result = ExecutedToolCall {
+        name: UPDATE_PLAN_TOOL.to_string(),
+        is_error: false,
+        ..read_file_result.clone()
+    };
+
+    assert!(plan_mode_missing_plan_update_message(Some("plan"), &[]).is_some());
+    assert!(
+        plan_mode_missing_plan_update_message(Some("plan"), &[read_file_result.clone()]).is_some()
+    );
+    assert!(
+        plan_mode_missing_plan_update_message(Some("plan"), &[failed_create_plan_result]).is_some()
+    );
+    assert!(plan_mode_missing_plan_update_message(Some("chat"), &[read_file_result]).is_none());
+    assert!(
+        plan_mode_missing_plan_update_message(Some("plan"), &[successful_update_plan_result])
+            .is_none()
+    );
+}
+
 fn test_provider_kind() -> foco_providers::ProviderKind {
     foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
         .expect("responses provider kind")

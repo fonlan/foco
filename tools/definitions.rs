@@ -716,7 +716,7 @@ fn create_plan_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["id", "title", "overview", "status", "sourceChatId", "phases", "timeoutMs"]
+            "required": ["id", "title", "overview", "phases"]
         }),
         strict: true,
     }
@@ -1081,4 +1081,26 @@ fn todo_graph_task_schema_with_depth(depth: usize) -> Value {
         },
         "required": ["id", "title", "status", "dependsOn", "acceptance", "summary", "createdAt", "updatedAt", "subtasks"]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_plan_schema_requires_only_core_plan_fields() {
+        let definition = create_plan_definition();
+        let required = definition.input_schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|value| value.as_str().expect("required string"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(required, vec!["id", "title", "overview", "phases"]);
+        assert_eq!(
+            definition.input_schema["additionalProperties"],
+            serde_json::Value::Bool(false)
+        );
+    }
 }
