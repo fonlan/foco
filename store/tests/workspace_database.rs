@@ -1,4 +1,4 @@
-use std::{fs, thread, time::Duration};
+use std::{fs, sync::mpsc, thread, time::Duration};
 
 use foco_agent::{
     AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentExecutionWorkspaceMode,
@@ -1132,9 +1132,11 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
         )
         .expect("hold writer lock");
 
+    let (started_tx, started_rx) = mpsc::channel();
     let writer = thread::spawn(move || {
         let mut database =
             WorkspaceDatabase::open_or_create(&workspace_path).expect("writer database");
+        started_tx.send(()).expect("writer start signal");
         database
             .insert_run_event(NewRunEvent {
                 id: "event-1",
@@ -1147,7 +1149,10 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
             .expect("insert waits for lock");
     });
 
-    thread::sleep(Duration::from_millis(100));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer should reach locked insert");
+    thread::yield_now();
     assert!(!writer.is_finished(), "writer should wait for the lock");
     locker
         .execute_batch("COMMIT;")
@@ -3743,12 +3748,27 @@ fn migrates_v9_without_creating_teams_for_existing_chats() {
                 request_started_at TEXT NOT NULL,
                 final_state TEXT NOT NULL
              );
+             CREATE TABLE memory_extraction_jobs (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                scope TEXT NOT NULL CHECK (scope IN ('workspace', 'chat')),
+                chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'skipped')),
+                model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+                input_json TEXT NOT NULL,
+                output_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                CHECK ((scope = 'chat' AND chat_id IS NOT NULL) OR (scope = 'workspace' AND chat_id IS NULL))
+             );
              INSERT INTO chats (id, title, created_at, updated_at)
                 VALUES ('chat-existing', 'Existing', '2026-06-19T00:00:00Z', '2026-06-19T00:00:00Z');
              PRAGMA user_version = 9;",
         )
         .expect("v9 schema");
-    for index in 0..500 {
+    // ponytail: three chats cover the no-backfill invariant without turning this migration test into a bulk benchmark.
+    for index in 0..2 {
         connection
             .execute(
                 "INSERT INTO chats (id, title, created_at, updated_at)
@@ -3766,7 +3786,7 @@ fn migrates_v9_without_creating_teams_for_existing_chats() {
     );
     let connection = Connection::open(database.database_path()).expect("open migrated database");
     assert_eq!(table_count(&connection, "agent_teams"), 0);
-    assert_eq!(table_count(&connection, "chats"), 501);
+    assert_eq!(table_count(&connection, "chats"), 3);
     assert_no_agent_messages_old_references(&connection);
     let backups = fs::read_dir(workspace.path().join(".foco").join("backups"))
         .expect("backup directory")

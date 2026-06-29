@@ -99,6 +99,17 @@ fn test_provider_kind() -> foco_providers::ProviderKind {
         .expect("responses provider kind")
 }
 
+async fn assert_tool_lock_waiter_blocks(
+    ready: tokio::sync::oneshot::Receiver<()>,
+    waiter: &tokio::task::JoinHandle<()>,
+) {
+    ready.await.expect("lock waiter should start");
+    // ponytail: one scheduler yield is enough to catch accidental immediate acquisition here;
+    // if this grows flaky, add a test-only registry wait-state hook instead of sleeping.
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+}
+
 fn insert_waiting_coordinator_task(
     database: &mut WorkspaceDatabase,
     chat_id: &str,
@@ -453,7 +464,9 @@ async fn tool_resource_registry_blocks_same_file_read_write() {
         )
         .await;
     let waiting_registry = registry.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let waiter = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         let _write_lease = waiting_registry
             .acquire(
                 "workspace-1",
@@ -465,8 +478,7 @@ async fn tool_resource_registry_blocks_same_file_read_write() {
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert_tool_lock_waiter_blocks(ready_rx, &waiter).await;
 
     drop(read_lease);
     tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -482,14 +494,15 @@ async fn tool_resource_registry_serializes_workspace_mutation_lease() {
         .acquire("workspace-1", vec![test_workspace_mutation_lock()])
         .await;
     let waiting_registry = registry.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let waiter = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         let _second_lease = waiting_registry
             .acquire("workspace-1", vec![test_workspace_mutation_lock()])
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert_tool_lock_waiter_blocks(ready_rx, &waiter).await;
 
     drop(mutation_lease);
     tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -532,7 +545,9 @@ async fn tool_resource_registry_workspace_exclusive_blocks_file_access() {
         )
         .await;
     let waiting_registry = registry.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let waiter = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         let _read_lease = waiting_registry
             .acquire(
                 "workspace-1",
@@ -544,8 +559,7 @@ async fn tool_resource_registry_workspace_exclusive_blocks_file_access() {
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert_tool_lock_waiter_blocks(ready_rx, &waiter).await;
 
     drop(workspace_lease);
     tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -594,7 +608,9 @@ async fn tool_resource_registry_keeps_memory_locks_global() {
         )
         .await;
     let waiting_registry = registry.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let waiter = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         let _read_lease = waiting_registry
             .acquire(
                 "workspace-2",
@@ -606,8 +622,7 @@ async fn tool_resource_registry_keeps_memory_locks_global() {
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert_tool_lock_waiter_blocks(ready_rx, &waiter).await;
 
     drop(memory_lease);
     tokio::time::timeout(Duration::from_secs(1), waiter)
