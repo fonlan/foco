@@ -4988,6 +4988,38 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
                 .expect("enqueue");
         }
         database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-reconcile",
+                title: "Reconcile plan",
+                overview: "Keep plan phase state in sync with Agent startup reconciliation.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "plan-phase-reconcile",
+                    title: "Reconcile phase",
+                    summary: "Interrupted Agent task should fail the phase.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "plan-step-reconcile",
+                        title: "Run interrupted task",
+                        detail: "The task is interrupted during startup reconciliation.",
+                        acceptance: vec!["phase failed".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-reconcile", "start")
+            .expect("start plan");
+        database
+            .attach_plan_phase_run(
+                "plan-reconcile",
+                "plan-phase-reconcile",
+                "chat-reconcile",
+                &team_id,
+                &active_task,
+            )
+            .expect("attach plan phase");
+        database
             .claim_runnable_agent_task(&team_id, &active_task, &attempt_id)
             .expect("claim")
             .expect("claimed");
@@ -5026,6 +5058,20 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
             .expect("attempts")[0]
             .status,
         foco_agent::AgentAttemptStatus::Interrupted
+    );
+    let plan = database
+        .plan("plan-reconcile")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "failed");
+    assert_eq!(plan.phases[0].status, "failed");
+    assert_eq!(plan.phases[0].steps[0].status, "failed");
+    assert!(
+        plan.phases[0]
+            .error_message
+            .as_deref()
+            .expect("phase error")
+            .contains("backend restarted")
     );
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

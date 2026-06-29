@@ -756,6 +756,93 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
 }
 
 #[test]
+fn interrupted_agent_task_reconciliation_fails_stale_running_plan_phase() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-stale-interrupted-phase",
+            title: "Stale interrupted phase",
+            overview: "Startup reconciliation should repair a stale running phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-stale-interrupted-phase-1",
+                title: "Phase one",
+                summary: "The Agent task was interrupted before phase sync.",
+                steps: vec![NewPlanStep {
+                    id: "plan-stale-interrupted-step-1",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["phase failed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-stale-interrupted-phase", "start")
+        .expect("start phase");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-stale-interrupted", "stale-interrupted");
+    let task_id = AgentTaskId::new("agent-task-stale-interrupted").expect("task id");
+    let attempt_id = AgentAttemptId::new("agent-attempt-stale-interrupted").expect("attempt id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            "plan-stale-interrupted-phase",
+            "plan-stale-interrupted-phase-1",
+            "chat-stale-interrupted",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Interrupt,
+            result_json: None,
+            error_json: Some(r#"{"message":"backend restarted"}"#),
+            interruption_reason: Some("backend restarted"),
+        })
+        .expect("interrupt task");
+    let stale = database
+        .plan("plan-stale-interrupted-phase")
+        .expect("stale plan")
+        .expect("stale plan");
+    assert_eq!(stale.status, "running");
+    assert_eq!(stale.phases[0].status, "running");
+
+    let repaired = database
+        .fail_running_plan_phases_for_interrupted_agent_tasks("backend restarted")
+        .expect("repair stale phase");
+    assert_eq!(repaired, 1);
+    let failed = database
+        .plan("plan-stale-interrupted-phase")
+        .expect("failed plan")
+        .expect("failed plan");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].steps[0].status, "failed");
+}
+
+#[test]
 fn plan_phase_merge_attempt_can_begin_once() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

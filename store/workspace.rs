@@ -1654,6 +1654,33 @@ impl WorkspaceDatabase {
         self.fail_plan_phase_record(phase, error_message).map(Some)
     }
 
+    pub fn fail_running_plan_phases_for_interrupted_agent_tasks(
+        &mut self,
+        error_message: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let task_ids = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT DISTINCT task.id
+                     FROM plan_phases AS phase
+                     JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                     WHERE phase.status = 'running'
+                       AND task.status = 'interrupted'",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| agent_id_from_row::<AgentTaskId>(row, 0))
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+        let count = task_ids.len();
+        for task_id in task_ids {
+            self.fail_plan_phase_run(&task_id, error_message)?;
+        }
+        Ok(count)
+    }
+
     pub fn fail_plan_phase_by_id(
         &mut self,
         plan_id: &str,

@@ -228,11 +228,17 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 Some(&record.attempt.id),
                 json!({ "reason": RESTART_INTERRUPTION_REASON }),
             )?;
+            database
+                .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
+                .map_err(ApiError::from_workspace_error)?;
             crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
                 &workspace.path,
                 &record.task.id,
             )?;
         }
+        database
+            .fail_running_plan_phases_for_interrupted_agent_tasks(RESTART_INTERRUPTION_REASON)
+            .map_err(ApiError::from_workspace_error)?;
         for instance in database
             .isolated_agent_instances()
             .map_err(ApiError::from_workspace_error)?
