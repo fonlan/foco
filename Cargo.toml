@@ -17,7 +17,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 async-stream = "0.3.6"
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 foco-agent = { path = "agent" }
