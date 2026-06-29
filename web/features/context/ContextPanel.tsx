@@ -744,6 +744,7 @@ function ContextPlanTab({
   const runningPlan = plans.find((plan) => plan.status === "running") ?? null;
   const runningPlanId = runningPlan?.id ?? null;
   const runningPlanArticleRef = useRef<HTMLElement | null>(null);
+  const planListPanelRef = useRef<HTMLDivElement | null>(null);
   const lastScrolledRunningPlanId = useRef<string | null>(null);
 
   useEffect(() => {
@@ -757,13 +758,27 @@ function ContextPlanTab({
       return;
     }
 
-    const runningPlanArticle = runningPlanArticleRef.current;
-    if (!runningPlanArticle) {
-      return;
-    }
+    const animationFrameId = window.requestAnimationFrame(() => {
+      const planListPanel = planListPanelRef.current;
+      const runningPlanArticle = runningPlanArticleRef.current;
+      if (!planListPanel || !runningPlanArticle) {
+        return;
+      }
 
-    runningPlanArticle.scrollIntoView({ block: "center", inline: "nearest" });
-    lastScrolledRunningPlanId.current = runningPlanId;
+      const containerRect = planListPanel.getBoundingClientRect();
+      const articleRect = runningPlanArticle.getBoundingClientRect();
+      // ponytail: one-shot centering for the plain list; switch to the virtual list API if this panel virtualizes.
+      planListPanel.scrollTop = Math.max(
+        0,
+        planListPanel.scrollTop +
+          articleRect.top -
+          containerRect.top -
+          (planListPanel.clientHeight - articleRect.height) / 2,
+      );
+      lastScrolledRunningPlanId.current = runningPlanId;
+    });
+
+    return () => window.cancelAnimationFrame(animationFrameId);
   }, [runningPlanId, showWorktreeAudit]);
 
   useEffect(() => {
@@ -872,7 +887,7 @@ function ContextPlanTab({
           recoveryNote={worktreeAudit?.recoveryNote ?? null}
         />
       ) : (
-        <div className="context-list-panel panel-scroll">
+        <div className="context-list-panel panel-scroll" ref={planListPanelRef}>
         {isLoading && plans.length === 0 ? (
           <div className="context-empty-state">
             <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />

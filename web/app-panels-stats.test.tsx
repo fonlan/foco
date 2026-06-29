@@ -927,6 +927,33 @@ describe("app-panels-stats verification surfaces", () => {
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
+    const rect = (top: number, height: number) => ({
+      bottom: top + height,
+      height,
+      left: 0,
+      right: 320,
+      top,
+      width: 320,
+      x: 0,
+      y: top,
+      toJSON: () => ({}),
+    }) as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("context-list-panel") ? 200 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains("context-list-panel")) {
+        return rect(0, 200);
+      }
+      if (this.textContent?.includes("Ready scroll decoy")) {
+        return rect(0, 100);
+      }
+      if (this.textContent?.includes("Running scroll target")) {
+        return rect(500, 100);
+      }
+      return rect(0, 0);
+    });
+
     renderApp();
 
     const planTab = await screen.findByRole("tab", { name: "Plan" });
@@ -935,27 +962,20 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(planTab);
 
-    expect(await screen.findByText("Running scroll target")).toBeInTheDocument();
+    const runningTitle = await screen.findByText("Running scroll target");
+    const planListPanel = runningTitle.closest(".context-list-panel") as HTMLElement | null;
+    expect(planListPanel).not.toBeNull();
     await waitFor(() => {
-      expect(
-        scrollIntoView.mock.contexts.some(
-          (context) =>
-            context instanceof HTMLElement &&
-            context.textContent?.includes("Running scroll target"),
-        ),
-      ).toBe(true);
+      expect(planListPanel?.scrollTop).toBe(450);
     });
+    expect(screen.getByText("Ready scroll decoy")).toBeInTheDocument();
     expect(
       scrollIntoView.mock.contexts.some(
         (context) =>
           context instanceof HTMLElement &&
-          context.textContent?.includes("Ready scroll decoy"),
+          context.textContent?.includes("Running scroll target"),
       ),
     ).toBe(false);
-    expect(scrollIntoView).toHaveBeenCalledWith({
-      block: "center",
-      inline: "nearest",
-    });
   });
 
   it("toggles the plan worktree audit view back to the plan list", async () => {
