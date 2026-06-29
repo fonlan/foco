@@ -1574,6 +1574,16 @@ pub(crate) struct GitBranchesResponse {
     pub(crate) is_git_repository: bool,
     pub(crate) current_branch: Option<String>,
     pub(crate) branches: Vec<String>,
+    pub(crate) worktrees: Vec<GitWorktreeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GitWorktreeSummary {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) is_current: bool,
 }
 
 #[derive(Serialize)]

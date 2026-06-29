@@ -75,6 +75,14 @@ export type GitBranchesResponse = {
   isGitRepository: boolean;
   currentBranch: string | null;
   branches: string[];
+  worktrees: GitWorktreeSummary[];
+};
+
+export type GitWorktreeSummary = {
+  name: string;
+  path: string;
+  branch: string | null;
+  isCurrent: boolean;
 };
 
 export type WorkspaceFileTreeNode = {

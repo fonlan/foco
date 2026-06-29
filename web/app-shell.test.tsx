@@ -899,6 +899,76 @@ describe("app-shell verification surfaces", () => {
     expect(branchDetails).not.toHaveAttribute("open");
   });
 
+  it("refreshes git branches and worktrees when opening the branch menu", async () => {
+    const user = userEvent.setup();
+    appTestState.workspaceGitBranchesResponses = [
+      {
+        branches: ["main"],
+        currentBranch: "main",
+        isGitRepository: true,
+        worktrees: [
+          {
+            branch: "main",
+            isCurrent: true,
+            name: "workspace",
+            path: "C:/Users/fonla/.foco/workspace",
+          },
+        ],
+      },
+      {
+        branches: ["feature/live-worktree", "main"],
+        currentBranch: "main",
+        isGitRepository: true,
+        worktrees: [
+          {
+            branch: "main",
+            isCurrent: true,
+            name: "workspace",
+            path: "C:/Users/fonla/.foco/workspace",
+          },
+          {
+            branch: "feature/live-worktree",
+            isCurrent: false,
+            name: "agent-worktree",
+            path: "C:/Users/fonla/.foco/workspace/.foco/agent-worktrees/agent-worktree",
+          },
+        ],
+      },
+    ];
+    const { container } = renderApp();
+
+    await screen.findByPlaceholderText(defaultComposerPlaceholder);
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([input]) =>
+            String(input).includes("/api/workspaces/workspace-1/git/branches"),
+          ),
+      ).toHaveLength(1),
+    );
+
+    const branchDetails = container.querySelector<HTMLDetailsElement>(
+      ".composer-branch-select",
+    );
+    const branchSummary = branchDetails?.querySelector("summary");
+    expect(branchSummary).toBeTruthy();
+
+    await user.click(branchSummary as HTMLElement);
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([input]) =>
+            String(input).includes("/api/workspaces/workspace-1/git/branches"),
+          ),
+      ).toHaveLength(2),
+    );
+    expect((await screen.findAllByText("feature/live-worktree")).length).toBeGreaterThan(0);
+    expect(await screen.findByText("agent-worktree")).toBeInTheDocument();
+  });
+
   it("keeps Shift+Enter in the composer as a newline", async () => {
     const fetchMock = vi.mocked(fetch);
     const user = userEvent.setup();

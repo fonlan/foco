@@ -15,6 +15,7 @@ use gix::{
 
 use super::{
     ApiError, GitBranchesResponse, GitDiffResponse, GitStatusFileSummary, GitStatusResponse,
+    GitWorktreeSummary,
 };
 
 const AGENT_WORKTREE_ROOT_DIR: &str = "agent-worktrees";
@@ -142,6 +143,7 @@ pub(super) fn git_branches_response(
         .head_name()
         .map_err(|source| ApiError::internal(format!("failed to read git HEAD: {source}")))?
         .map(|name| name.shorten().to_string());
+    let current_worktree_path = repo.workdir().map(canonical_path).transpose()?;
     let mut branches = repo
         .references()
         .map_err(|source| ApiError::internal(format!("failed to read git references: {source}")))?
@@ -161,7 +163,120 @@ pub(super) fn git_branches_response(
         is_git_repository: true,
         current_branch,
         branches,
+        worktrees: git_worktrees(&repo, current_worktree_path.as_deref())?,
     })
+}
+
+fn git_worktrees(
+    repo: &gix::Repository,
+    current_worktree_path: Option<&Path>,
+) -> Result<Vec<GitWorktreeSummary>, ApiError> {
+    let main_path = repo.common_dir().parent().map(canonical_path).transpose()?;
+    let mut worktrees = Vec::new();
+    if let Some(path) = main_path {
+        worktrees.push(GitWorktreeSummary {
+            name: worktree_display_name(&path),
+            path: path_to_slash_string(&path),
+            branch: read_worktree_branch(&repo.common_dir().join("HEAD"))?,
+            is_current: current_worktree_path == Some(path.as_path()),
+        });
+    }
+
+    let linked_root = repo.common_dir().join("worktrees");
+    match fs::read_dir(&linked_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|source| {
+                    ApiError::internal(format!("failed to read git worktree metadata: {source}"))
+                })?;
+                let metadata_path = entry.path();
+                if !entry
+                    .file_type()
+                    .map_err(|source| {
+                        ApiError::internal(format!(
+                            "failed to read git worktree metadata: {source}"
+                        ))
+                    })?
+                    .is_dir()
+                {
+                    continue;
+                }
+                let Some(path) = read_linked_worktree_path(&metadata_path)? else {
+                    continue;
+                };
+                worktrees.push(GitWorktreeSummary {
+                    name: worktree_display_name(&path),
+                    path: path_to_slash_string(&path),
+                    branch: read_worktree_branch(&metadata_path.join("HEAD"))?,
+                    is_current: current_worktree_path == Some(path.as_path()),
+                });
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ApiError::internal(format!(
+                "failed to read git worktrees: {source}"
+            )));
+        }
+    }
+
+    worktrees.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(worktrees)
+}
+
+fn read_linked_worktree_path(metadata_path: &Path) -> Result<Option<PathBuf>, ApiError> {
+    let gitdir = metadata_path.join("gitdir");
+    let text = match fs::read_to_string(&gitdir) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ApiError::internal(format!(
+                "failed to read git worktree path: {source}"
+            )));
+        }
+    };
+    let dot_git = {
+        let path = PathBuf::from(text.trim());
+        if path.is_absolute() {
+            path
+        } else {
+            metadata_path.join(path)
+        }
+    };
+    let Some(worktree_path) = dot_git.parent() else {
+        return Ok(None);
+    };
+    match worktree_path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ApiError::internal(format!(
+            "failed to resolve git worktree path: {source}"
+        ))),
+    }
+}
+
+fn read_worktree_branch(head_path: &Path) -> Result<Option<String>, ApiError> {
+    let text = fs::read_to_string(head_path).map_err(|source| {
+        ApiError::internal(format!("failed to read git worktree HEAD: {source}"))
+    })?;
+    let head = text.trim();
+    Ok(head
+        .strip_prefix("ref: refs/heads/")
+        .map(|branch| branch.to_string()))
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf, ApiError> {
+    path.canonicalize().map_err(|source| {
+        ApiError::internal(format!("failed to resolve git worktree path: {source}"))
+    })
+}
+
+fn worktree_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub(super) fn switch_git_branch(workspace_path: &Path, name: String) -> Result<(), ApiError> {
@@ -1258,6 +1373,24 @@ fn phase12_agent_worktrees_isolate_delete_and_merge_changes() {
         create_agent_worktree(workspace_path, "agent-instance-test-a").expect("first worktree");
     let second =
         create_agent_worktree(workspace_path, "agent-instance-test-b").expect("second worktree");
+    let branch_response = git_branches_response(workspace_path).expect("branch response");
+    assert!(branch_response.branches.contains(&first.branch));
+    assert!(branch_response.branches.contains(&second.branch));
+    assert!(
+        branch_response.worktrees.iter().any(
+            |worktree| worktree.is_current && worktree.branch == branch_response.current_branch
+        ),
+        "main worktree should be marked current"
+    );
+    assert!(
+        branch_response.worktrees.iter().any(|worktree| {
+            worktree.path
+                == path_to_slash_string(&first.root_path.canonicalize().expect("first path"))
+                && worktree.branch.as_deref() == Some(first.branch.as_str())
+                && !worktree.is_current
+        }),
+        "linked Agent worktree should be listed"
+    );
     assert_ne!(first.root_path, second.root_path);
     fs::write(first.root_path.join("first.txt"), "first\n").expect("first change");
     fs::write(second.root_path.join("second.txt"), "second\n").expect("second change");

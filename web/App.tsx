@@ -679,6 +679,8 @@ export function App() {
     new Map(),
   );
   const todoGraphRequestIdRef = useRef(0);
+  const gitBranchesRequestRef = useRef<AbortController | null>(null);
+  const gitBranchesRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
   const selectedProviderIdRef = useRef("");
   const selectedThinkingLevelRef = useRef("");
@@ -2043,21 +2045,44 @@ export function App() {
   );
 
   const loadGitBranches = useCallback(async (workspaceId: string) => {
+    gitBranchesRequestRef.current?.abort();
+    const requestId = gitBranchesRequestIdRef.current + 1;
+    gitBranchesRequestIdRef.current = requestId;
+    const abortController = new AbortController();
+    gitBranchesRequestRef.current = abortController;
     setIsLoadingBranches(true);
     setBranchError(null);
 
     try {
       const data = await requestJson<GitBranchesResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/git/branches`,
+        { signal: abortController.signal },
       );
+      if (
+        abortController.signal.aborted ||
+        gitBranchesRequestIdRef.current !== requestId
+      ) {
+        return;
+      }
       setGitBranches(data);
       setSelectedGitBranch(data.currentBranch ?? "");
     } catch (requestError) {
+      if (abortController.signal.aborted) {
+        return;
+      }
+      if (gitBranchesRequestIdRef.current !== requestId) {
+        return;
+      }
       setGitBranches(null);
       setSelectedGitBranch("");
       setBranchError(errorMessage(requestError));
     } finally {
-      setIsLoadingBranches(false);
+      if (gitBranchesRequestRef.current === abortController) {
+        gitBranchesRequestRef.current = null;
+      }
+      if (gitBranchesRequestIdRef.current === requestId) {
+        setIsLoadingBranches(false);
+      }
     }
   }, []);
 
@@ -2384,13 +2409,22 @@ export function App() {
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
+      gitBranchesRequestRef.current?.abort();
+      gitBranchesRequestRef.current = null;
+      gitBranchesRequestIdRef.current += 1;
       setGitBranches(null);
       setSelectedGitBranch("");
+      setIsLoadingBranches(false);
       setBranchError(null);
       return;
     }
 
     void loadGitBranches(activeWorkspace.id);
+    return () => {
+      gitBranchesRequestRef.current?.abort();
+      gitBranchesRequestRef.current = null;
+      gitBranchesRequestIdRef.current += 1;
+    };
   }, [activeWorkspace?.id, loadGitBranches]);
 
   useEffect(() => {
@@ -9068,6 +9102,11 @@ export function App() {
                   overviewRenderer={chatOverviewRenderer}
                   onAddPastedImageAttachments={handleAddPastedImageAttachmentsForChatPanel}
                   onBranchChange={handleBranchChangeForChatPanel}
+                  onBranchMenuOpen={() => {
+                    if (activeWorkspace?.id) {
+                      void loadGitBranches(activeWorkspace.id);
+                    }
+                  }}
                   onDraftMessageChange={setDraftMessage}
                   onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
                   onLoadMoreMessages={() => {

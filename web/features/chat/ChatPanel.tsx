@@ -52,6 +52,7 @@ import type {
   ConfiguredSkillSummary,
   ContextUsageResponse,
   GitBranchesResponse,
+  GitWorktreeSummary,
   JsonValue,
   SettingsResponse,
   ShellMessage,
@@ -136,6 +137,7 @@ function ChatPanelComponent({
   onAddPastedImageAttachments,
   overviewRenderer,
   onBranchChange,
+  onBranchMenuOpen,
   onCancelRun,
   onDraftMessageChange,
   onGuideActiveRun,
@@ -195,6 +197,7 @@ function ChatPanelComponent({
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
   onBranchChange: (value: string) => void;
+  onBranchMenuOpen: () => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onGuideActiveRun: () => void;
@@ -922,10 +925,13 @@ function ChatPanelComponent({
               <BranchSelector
                 branches={worktreeBranch ? [worktreeBranch] : gitBranches?.branches ?? []}
                 currentBranch={worktreeBranch ?? selectedGitBranch}
-                disabled={isSendingMessage || isLoadingBranches || worktreeBranch !== null}
+                currentWorktreeBranch={worktreeBranch}
+                disabled={isSendingMessage || worktreeBranch !== null}
                 isGitRepository={worktreeBranch !== null || (gitBranches?.isGitRepository ?? false)}
                 isLoading={isLoadingBranches}
                 onChange={onBranchChange}
+                onOpen={onBranchMenuOpen}
+                worktrees={gitBranches?.worktrees ?? []}
               />
               {canRetryRun ? (
                 <button
@@ -1494,20 +1500,29 @@ function ComposerSelectMenu({
 function BranchSelector({
   branches,
   currentBranch,
+  currentWorktreeBranch,
   disabled,
   isGitRepository,
   isLoading,
   onChange,
+  onOpen,
+  worktrees,
 }: {
   branches: string[];
   currentBranch: string;
+  currentWorktreeBranch: string | null;
   disabled: boolean;
   isGitRepository: boolean;
   isLoading: boolean;
   onChange: (value: string) => void;
+  onOpen: () => void;
+  worktrees: GitWorktreeSummary[];
 }) {
   const { t } = useI18n();
   const detailsRef = useCloseDetailsOnOutsidePointerDown();
+  const displayedWorktrees = currentWorktreeBranch
+    ? ensureCurrentWorktree(worktrees, currentWorktreeBranch)
+    : worktrees;
   if (!isGitRepository) {
     return (
       <div
@@ -1528,10 +1543,16 @@ function BranchSelector({
   return (
     <details
       className="composer-branch-select group relative max-w-full rounded-lg"
+      onToggle={(event) => {
+        if (event.currentTarget.open) {
+          onOpen();
+        }
+      }}
       ref={detailsRef}
     >
       <summary
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+        aria-disabled={disabled}
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "text-stone-500" : "text-stone-900 hover:border-stone-300"
           }`}
         title={t("Git branch")}
       >
@@ -1545,16 +1566,20 @@ function BranchSelector({
           <ChevronDown aria-hidden="true" className="size-3.5" />
         )}
       </summary>
-      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
-        <div className="panel-scroll max-h-52 overflow-y-auto py-1">
+      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+        <div className="panel-scroll max-h-64 overflow-y-auto py-1">
+          <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase text-stone-400">
+            {t("Git branches")}
+          </div>
           {branches.length ? (
             branches.map((branch) => (
               <button
                 aria-label={t("Switch to branch {name}", { name: branch })}
-                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${branch === currentBranch
+                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent ${branch === currentBranch
                     ? "font-semibold text-teal-900"
                     : "text-stone-700"
                   }`}
+                disabled={disabled}
                 key={branch}
                 onClick={(event) => handleSelect(branch, event)}
                 type="button"
@@ -1571,11 +1596,42 @@ function BranchSelector({
               {t("No branches")}
             </div>
           )}
+          <div className="mt-1 border-t border-stone-100 px-3 pb-1 pt-2 text-[11px] font-semibold uppercase text-stone-400">
+            {t("Git worktrees")}
+          </div>
+          {displayedWorktrees.length ? (
+            displayedWorktrees.map((worktree) => (
+              <div
+                className={`flex min-h-11 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm ${worktree.isCurrent
+                    ? "font-semibold text-teal-900"
+                    : "text-stone-700"
+                  }`}
+                key={worktree.path}
+                title={worktree.path}
+              >
+                <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{worktree.name}</span>
+                  <span className="block truncate text-xs font-normal text-stone-500">
+                    {worktree.branch ?? t("Detached HEAD")}
+                  </span>
+                </span>
+                {worktree.isCurrent ? (
+                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                ) : null}
+              </div>
+            ))
+          ) : (
+            <div className="px-3 py-3 text-sm text-stone-500">
+              {t("No worktrees")}
+            </div>
+          )}
         </div>
         <div className="border-t border-stone-100 bg-white p-1.5">
           <button
             aria-label={t("Create git branch")}
-            className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-sm font-semibold text-teal-800 hover:bg-teal-50"
+            className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-sm font-semibold text-teal-800 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent"
+            disabled={disabled}
             onClick={(event) => handleSelect(CREATE_BRANCH_OPTION_VALUE, event)}
             type="button"
           >
@@ -1586,6 +1642,25 @@ function BranchSelector({
       </div>
     </details>
   );
+}
+
+function ensureCurrentWorktree(
+  worktrees: GitWorktreeSummary[],
+  branch: string,
+): GitWorktreeSummary[] {
+  const existingCurrent = worktrees.find((worktree) => worktree.isCurrent);
+  if (existingCurrent) {
+    return worktrees;
+  }
+  return [
+    {
+      branch,
+      isCurrent: true,
+      name: branch,
+      path: "",
+    },
+    ...worktrees,
+  ];
 }
 
 function useCloseDetailsOnOutsidePointerDown() {

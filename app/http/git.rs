@@ -137,6 +137,7 @@ pub(crate) async fn git_branches(
             is_git_repository: false,
             current_branch: None,
             branches: Vec::new(),
+            worktrees: Vec::new(),
         }));
     }
 

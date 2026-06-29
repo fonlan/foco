@@ -4,6 +4,7 @@ import { vi } from "vitest";
 import type {
   ConfiguredModelSummary,
   ConfiguredWorkspaceSummary,
+  GitBranchesResponse,
   Plan,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
@@ -1777,6 +1778,7 @@ export const appTestState: {
   workspaceSpecResponse: typeof workspaceSpec;
   workspaceSpecSaveConflict: boolean;
   workspaceSpecGenerateCompletes: boolean;
+  workspaceGitBranchesResponses: GitBranchesResponse[];
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
@@ -1793,6 +1795,7 @@ export const appTestState: {
   workspaceSpecResponse: clonedWorkspaceSpec(),
   workspaceSpecSaveConflict: false,
   workspaceSpecGenerateCompletes: false,
+  workspaceGitBranchesResponses: [],
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
@@ -1949,6 +1952,7 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
   appTestState.workspaceSpecSaveConflict = false;
   appTestState.workspaceSpecGenerateCompletes = false;
+  appTestState.workspaceGitBranchesResponses = [];
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
@@ -2717,11 +2721,21 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/workspace-1/git/branches") {
-    return jsonResponse({
-      branches: ["main"],
-      currentBranch: "main",
-      isGitRepository: true,
-    });
+    return jsonResponse(
+      appTestState.workspaceGitBranchesResponses.shift() ?? {
+        branches: ["main"],
+        currentBranch: "main",
+        isGitRepository: true,
+        worktrees: [
+          {
+            branch: "main",
+            isCurrent: true,
+            name: "workspace",
+            path: "C:/Users/fonla/.foco/workspace",
+          },
+        ],
+      },
+    );
   }
 
   if (path === "/api/workspaces/workspace-1/git/diff") {
