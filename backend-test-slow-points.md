@@ -23,6 +23,47 @@ target in about 1m18s. Later runs were warm-build runs, with Cargo reporting
 about 0.3s to 0.6s before test execution. Treat the cold compile separately from
 test execution.
 
+## Phase 4 verification
+
+Phase 4 reran the affected backend tests on Windows in the isolated worktree with
+a warm build:
+
+```powershell
+cargo test -p foco-app tool_resource_registry -- --test-threads=1
+cargo test -p foco-store workspace_connections_wait_for_concurrent_writer_lock -- --test-threads=1
+cargo test -p foco-store migrates_v9_without_creating_teams_for_existing_chats -- --test-threads=1
+cargo test -p foco-store --test workspace_database -- --test-threads=2
+npm.cmd run test:backend:calm
+```
+
+Results:
+
+| Command | Result | Wall time | Notes |
+| --- | --- | ---: | --- |
+| `cargo test -p foco-app tool_resource_registry -- --test-threads=1` | passed | 2.05s | Covers the app lock tests changed to event-driven waiter signaling. |
+| `cargo test -p foco-store workspace_connections_wait_for_concurrent_writer_lock -- --test-threads=1` | passed | 0.64s | Covers the writer-lock test changed away from a fixed 100ms sleep. |
+| `cargo test -p foco-store migrates_v9_without_creating_teams_for_existing_chats -- --test-threads=1` | passed | 0.69s | Covers the reduced v9 chat fixture and repaired historical schema path. |
+| `cargo test -p foco-store --test workspace_database -- --test-threads=2` | passed | 5.99s | Previously this target failed in both default and single-thread runs. |
+| `npm.cmd run test:backend:calm` | failed | 17.00s | `foco-app` reached 264 passed / 1 failed; failure was Windows error 32 while removing a temp workspace directory. |
+
+Comparison with Phase 2: `workspace_database` moved from failing at 6.00s default
+parallel / 10.94s single-thread to passing at 5.99s with two test threads. The
+targeted tests touched by Phase 3 all pass. A full backend calm run is still not
+fully verified because one `foco-app` test can hit a Windows file-handle cleanup
+race under the larger suite; the same failing test passed alone in 1.04s with one
+test thread.
+
+Recommended local backend commands:
+
+- Use `cargo test --workspace` when you want the default Rust harness concurrency,
+  usually as a final local check.
+- Use `npm.cmd run test:backend` for normal backend iteration with Cargo jobs and
+  Rust test threads capped at 4.
+- Use `npm.cmd run test:backend:calm` for a lower-load pass capped at 2 when you
+  want the machine to stay responsive. If it fails on Windows error 32 while
+  deleting a temp workspace, rerun the named failing test directly before treating
+  it as a product regression.
+
 ## Test binary timing
 
 Sorted by observed warm execution time:

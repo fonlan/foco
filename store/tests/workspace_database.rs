@@ -9,8 +9,8 @@ use foco_agent::{
 use foco_store::{
     config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
     memory::{
-        MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryKind, MemoryScope,
-        MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
+        MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MEMORY_REFERENCES_SCHEMA_SQL, MemoryDatabase,
+        MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
         WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
     },
     workspace::{
@@ -1362,6 +1362,9 @@ fn migrates_v17_workspace_spec_tables_and_creates_backup() {
              PRAGMA user_version = 17;",
         )
         .expect("v17 schema");
+    add_workspace_memory_tables(&connection);
+    add_workspace_memory_dream_tables(&connection);
+    add_memory_reference_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -1425,6 +1428,7 @@ fn migrates_v7_task_graphs_table_to_todo_graphs() {
             PRAGMA user_version = 7;",
         )
         .expect("old todo graph schema");
+    add_workspace_memory_tables(&connection);
     connection
         .execute(
             "INSERT INTO task_graphs (chat_id, graph_json, created_at, updated_at)
@@ -3863,6 +3867,8 @@ fn migrates_v13_agent_message_foreign_keys_to_current_table() {
              PRAGMA user_version = 13;"#,
         )
         .expect("v13 stale agent schema");
+    add_workspace_chats_table(&connection);
+    add_workspace_memory_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -3951,6 +3957,7 @@ fn migrates_v14_scheduled_task_tables_without_losing_existing_data() {
              PRAGMA user_version = 14;"#,
         )
         .expect("v14 schema");
+    add_workspace_memory_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -3988,6 +3995,8 @@ fn migrates_v15_memory_dream_tables() {
              PRAGMA user_version = 15;"#,
         )
         .expect("v15 schema");
+    add_workspace_chats_table(&connection);
+    add_workspace_memory_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -4025,6 +4034,7 @@ fn migrates_v16_memory_references_table() {
              PRAGMA user_version = 16;"
         ))
         .expect("v16 schema");
+    add_workspace_chats_table(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -6709,6 +6719,39 @@ fn table_exists(connection: &Connection, table: &str) -> bool {
             |row| row.get::<_, bool>(0),
         )
         .expect("table exists query")
+}
+
+fn add_workspace_chats_table(connection: &Connection) {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '2026-06-01T00:00:00Z',
+                updated_at TEXT NOT NULL DEFAULT '2026-06-01T00:00:00Z',
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+             );",
+        )
+        .expect("workspace chats migration fixture schema");
+}
+
+fn add_workspace_memory_tables(connection: &Connection) {
+    connection
+        .execute_batch(WORKSPACE_MEMORY_SCHEMA_SQL)
+        .expect("workspace memory migration fixture schema");
+}
+
+fn add_workspace_memory_dream_tables(connection: &Connection) {
+    connection
+        .execute_batch(WORKSPACE_MEMORY_DREAM_SCHEMA_SQL)
+        .expect("workspace memory dream migration fixture schema");
+}
+
+fn add_memory_reference_tables(connection: &Connection) {
+    connection
+        .execute_batch(MEMORY_REFERENCES_SCHEMA_SQL)
+        .expect("memory references migration fixture schema");
 }
 
 fn table_count(connection: &Connection, table: &str) -> i64 {

@@ -122,7 +122,7 @@ npm run test -w web
 npm run typecheck -w web
 ```
 
-`npm run test:backend` caps Cargo jobs and Rust test threads at 4 for a lower-load local backend test run. Use `npm run test:backend:calm` to cap both at 2 when you want the machine to stay more responsive.
+Use `cargo test --workspace` when you want the default Rust harness concurrency, such as a final local backend check before handing off changes. `npm run test:backend` caps Cargo jobs and Rust test threads at 4 for a steadier iterative backend run. Use `npm run test:backend:calm` to cap both at 2 when you want the machine to stay more responsive during longer local test passes.
 
 ### Release Build
 

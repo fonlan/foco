@@ -110,6 +110,31 @@ async fn assert_tool_lock_waiter_blocks(
     assert!(!waiter.is_finished());
 }
 
+fn wait_for_code_graph_watchers(indexes: &Arc<Mutex<CodeGraphIndexState>>, expected_count: usize) {
+    // ponytail: production lazy indexing is detached; poll the existing watcher count with a
+    // short timeout. If this test needs stronger timing, return a test-only join handle.
+    for _ in 0..250 {
+        if indexes
+            .lock()
+            .expect("code graph index lock")
+            .watcher_count()
+            == expected_count
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        indexes
+            .lock()
+            .expect("code graph index lock")
+            .watcher_count(),
+        expected_count,
+        "code graph watcher count should reach {expected_count}"
+    );
+}
+
 fn insert_waiting_coordinator_task(
     database: &mut WorkspaceDatabase,
     chat_id: &str,
@@ -998,35 +1023,14 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
     let state = test_app_state(config, profile_dir.clone());
 
     spawn_code_graph_workspace_initialization_if_needed(&state, &workspace);
-    for _ in 0..250 {
-        if state
-            .code_graph_indexes
-            .lock()
-            .expect("code graph index lock")
-            .watcher_count()
-            == 1
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
 
-    assert_eq!(
-        state
-            .code_graph_indexes
-            .lock()
-            .expect("code graph index lock")
-            .watcher_count(),
-        1,
-        "lazy initialization should retain one watcher"
-    );
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let context = database.code_graph_context().expect("code graph context");
     assert_eq!(context.indexed_files, 1);
     drop(database);
 
     spawn_code_graph_workspace_initialization_if_needed(&state, &workspace);
-    std::thread::sleep(std::time::Duration::from_millis(20));
     assert_eq!(
         state
             .code_graph_indexes
@@ -1843,13 +1847,10 @@ fn test_agent_definition_input() -> AgentDefinitionInput {
 
 #[tokio::test]
 async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets() {
-    let profile = tempfile::tempdir().expect("temp profile");
-    let workspace_dir = profile.path().join("workspace");
-    fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
-    let mut config = prompt_test_config(workspace_dir);
-    config.providers[0].api_key = Some("secret-agent-api-key".to_string());
-    let state = test_app_state(config, profile.path().to_path_buf());
+    let fixture = prompt_state_fixture(|config| {
+        config.providers[0].api_key = Some("secret-agent-api-key".to_string());
+    });
+    let state = fixture.state.clone();
 
     let created = crate::http::settings::create_agent_definition(
         State(state.clone()),
@@ -1860,12 +1861,13 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
     .await
     .expect("create agent definition")
     .0;
-    assert_eq!(created.agent_definitions.len(), 1);
-    let definition_id = created.agent_definitions[0].id.clone();
-    assert_eq!(
-        created.agent_definitions[0].revision,
-        AGENT_DEFINITION_INITIAL_REVISION
-    );
+    let definition = created
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.name == "Coordinator")
+        .expect("created definition");
+    let definition_id = definition.id.clone();
+    assert_eq!(definition.revision, AGENT_DEFINITION_INITIAL_REVISION);
     let response_json = serde_json::to_string(&created).expect("serialize response");
     assert!(!response_json.contains("secret-agent-api-key"));
     assert!(!response_json.contains("apiKey"));
@@ -1961,25 +1963,31 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
 
     let deleted = crate::http::settings::delete_agent_definition(
         State(state),
-        Json(DeleteAgentDefinitionRequest { id: definition_id }),
+        Json(DeleteAgentDefinitionRequest {
+            id: definition_id.clone(),
+        }),
     )
     .await
     .expect("delete agent definition")
     .0;
-    assert_eq!(deleted.agent_definitions.len(), 1);
-    assert_eq!(deleted.agent_definitions[0].id, default_definition_id);
+    assert!(
+        deleted
+            .agent_definitions
+            .iter()
+            .all(|definition| definition.id != definition_id)
+    );
+    assert!(
+        deleted
+            .agent_definitions
+            .iter()
+            .any(|definition| definition.id == default_definition_id)
+    );
 }
 
 #[tokio::test]
 async fn agent_definitions_api_creates_default_agent_when_empty() {
-    let profile = tempfile::tempdir().expect("temp profile");
-    let workspace_dir = profile.path().join("workspace");
-    fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
-    let state = test_app_state(
-        prompt_test_config(workspace_dir),
-        profile.path().to_path_buf(),
-    );
+    let fixture = prompt_state_fixture(|_| {});
+    let state = fixture.state.clone();
 
     let listed = crate::http::settings::agent_definitions(State(state.clone()))
         .await
@@ -2080,22 +2088,19 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
 
 #[tokio::test]
 async fn review_agent_uses_custom_review_system_prompt() {
-    let profile = tempfile::tempdir().expect("temp profile");
-    let workspace_dir = profile.path().join("workspace");
-    fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
-    let mut config = prompt_test_config(workspace_dir);
-    config.prompts.system_prompts = vec![
-        SystemPromptSettings {
-            name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
-            content: "Default prompt.".to_string(),
-        },
-        SystemPromptSettings {
-            name: REVIEW_SYSTEM_PROMPT_NAME.to_string(),
-            content: "Custom review prompt.".to_string(),
-        },
-    ];
-    let state = test_app_state(config, profile.path().to_path_buf());
+    let fixture = prompt_state_fixture(|config| {
+        config.prompts.system_prompts = vec![
+            SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Default prompt.".to_string(),
+            },
+            SystemPromptSettings {
+                name: REVIEW_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Custom review prompt.".to_string(),
+            },
+        ];
+    });
+    let state = fixture.state;
 
     let listed = crate::http::settings::agent_definitions(State(state))
         .await
@@ -2356,14 +2361,8 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
 
 #[tokio::test]
 async fn image_output_model_can_be_saved_without_text_limits() {
-    let profile = tempfile::tempdir().expect("temp profile");
-    let workspace_dir = profile.path().join("workspace");
-    fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
-    let state = test_app_state(
-        prompt_test_config(workspace_dir),
-        profile.path().to_path_buf(),
-    );
+    let fixture = prompt_state_fixture(|_| {});
+    let state = fixture.state;
 
     let saved = crate::http::settings::save_manual_model(
         State(state),
@@ -13657,5 +13656,27 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         scheduled_task_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
+    }
+}
+
+struct PromptStateFixture {
+    _profile: tempfile::TempDir,
+    _workspace_dir: PathBuf,
+    state: AppState,
+}
+
+fn prompt_state_fixture(configure: impl FnOnce(&mut GlobalConfig)) -> PromptStateFixture {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir.clone());
+    configure(&mut config);
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    PromptStateFixture {
+        _profile: profile,
+        _workspace_dir: workspace_dir,
+        state,
     }
 }

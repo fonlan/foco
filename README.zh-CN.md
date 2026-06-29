@@ -122,7 +122,7 @@ npm run test -w web
 npm run typecheck -w web
 ```
 
-`npm run test:backend` 会把 Cargo jobs 和 Rust 测试线程数限制为 4，用于低负载的本地后端测试。需要让机器更空闲时，可以使用 `npm run test:backend:calm`，它会把两者都限制为 2。
+需要默认 Rust 测试并发时，例如交付改动前的最终本地后端检查，使用 `cargo test --workspace`。`npm run test:backend` 会把 Cargo jobs 和 Rust 测试线程数限制为 4，适合更稳定的后端迭代测试。需要让机器在较长测试期间更空闲时，使用 `npm run test:backend:calm`，它会把两者都限制为 2。
 
 ### Release 构建
 
