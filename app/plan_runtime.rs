@@ -1054,6 +1054,91 @@ mod tests {
         );
     }
 
+    fn plan_record_for_prompt(phase: PlanPhaseRecord) -> PlanRecord {
+        PlanRecord {
+            id: "plan-prompt-test".to_string(),
+            title: "Prompt plan".to_string(),
+            overview: "Prompt overview.".to_string(),
+            status: "running".to_string(),
+            sort_order: 1,
+            source_chat_id: None,
+            active_phase_id: Some(phase.id.clone()),
+            pause_requested_at: None,
+            completed_at: None,
+            completed_by_user_at: None,
+            error_message: None,
+            shared_merge_commit_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            phases: vec![phase],
+        }
+    }
+
+    fn phase_record_for_prompt() -> PlanPhaseRecord {
+        PlanPhaseRecord {
+            id: "phase-prompt-test".to_string(),
+            plan_id: "plan-prompt-test".to_string(),
+            sequence: 1,
+            title: "Prompt phase".to_string(),
+            summary: "Prompt phase summary.".to_string(),
+            status: "running".to_string(),
+            implementation_chat_id: None,
+            agent_team_id: None,
+            agent_task_id: None,
+            commit_id: None,
+            merge_attempt_count: 0,
+            error_message: None,
+            started_at: None,
+            completed_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plan_phase_prompt_renders_previous_phase_conclusions() {
+        let phase = phase_record_for_prompt();
+        let plan = plan_record_for_prompt(phase.clone());
+
+        let prompt = plan_phase_prompt(
+            &plan,
+            &phase,
+            Some("Phase 1: Discovery\nImplementation summary"),
+        );
+
+        assert!(
+            prompt.contains(
+                "Previous phase conclusions:\nPhase 1: Discovery\nImplementation summary"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_phase_prompt_omits_empty_previous_phase_conclusions() {
+        let phase = phase_record_for_prompt();
+        let plan = plan_record_for_prompt(phase.clone());
+
+        let prompt_without_conclusions = plan_phase_prompt(&plan, &phase, None);
+        let prompt_with_empty_conclusions = plan_phase_prompt(&plan, &phase, Some("   "));
+
+        assert!(!prompt_without_conclusions.contains("Previous phase conclusions:"));
+        assert!(!prompt_with_empty_conclusions.contains("Previous phase conclusions:"));
+    }
+
+    #[test]
+    fn plan_phase_prompt_keeps_truncated_previous_phase_conclusions_notice() {
+        let phase = phase_record_for_prompt();
+        let plan = plan_record_for_prompt(phase.clone());
+        let long_conclusions = "x".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS + 1);
+        let truncated_conclusions = truncate_previous_phase_conclusions(&long_conclusions);
+
+        let prompt = plan_phase_prompt(&plan, &phase, Some(&truncated_conclusions));
+
+        assert!(prompt.contains("Previous phase conclusions:\n"));
+        assert!(prompt.contains("[truncated to 12000 chars for the phase prompt]"));
+    }
+
     #[test]
     fn previous_plan_phase_conclusions_use_last_non_empty_assistant_message() {
         let workspace = tempfile::tempdir().expect("workspace");
