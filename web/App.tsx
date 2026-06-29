@@ -595,6 +595,7 @@ export function App() {
     "generate" | "save" | "settings" | null
   >(null);
   const [activePlans, setActivePlans] = useState<Plan[]>([]);
+  const [hasLoadedActivePlans, setHasLoadedActivePlans] = useState(false);
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
@@ -1541,6 +1542,7 @@ export function App() {
         return null;
       }
       setActivePlans(data.plans);
+      setHasLoadedActivePlans(true);
       return data;
     } catch (requestError) {
       setActivePlans([]);
@@ -2133,6 +2135,7 @@ export function App() {
   useEffect(() => {
     if (!activeWorkspace?.id) {
       setActivePlans([]);
+      setHasLoadedActivePlans(false);
       setActivePlansError(null);
       setIsLoadingActivePlans(false);
       return;
@@ -2167,6 +2170,7 @@ export function App() {
 
   useEffect(() => {
     setActivePlans([]);
+    setHasLoadedActivePlans(false);
     setActivePlansError(null);
     setPlanOperationKey(null);
     setIsPlanAutoRunDispatching(false);
@@ -2185,6 +2189,9 @@ export function App() {
       return;
     }
     if (isPlanAutoRunDispatching || planOperationKey) {
+      return;
+    }
+    if (!hasLoadedActivePlans) {
       return;
     }
     if (activePlans.some(isAutoRunPlanInFlight)) {
@@ -2215,6 +2222,7 @@ export function App() {
   }, [
     activePlans,
     activeWorkspace?.id,
+    hasLoadedActivePlans,
     isPlanAutoRunDispatching,
     isPlanAutoRunEnabled,
     planOperationKey,

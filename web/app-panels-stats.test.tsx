@@ -25,6 +25,7 @@ import {
   mermaidMock,
   mockFetch,
   pendingMemory,
+  planFixture,
   renderApp,
   resetAppTestEnvironment,
   secondaryWorkspace,
@@ -735,6 +736,17 @@ describe("app-panels-stats verification surfaces", () => {
 
   it("persists the auto-run checkbox preference", async () => {
     const user = userEvent.setup();
+    const runningPlan = {
+      ...planFixture,
+      activePhaseId: "phase-1",
+      phases: [
+        {
+          ...planFixture.phases[0],
+          status: "running",
+        },
+      ],
+      status: "running",
+    };
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const path = url.startsWith("http://127.0.0.1")
@@ -745,8 +757,8 @@ describe("app-panels-stats verification surfaces", () => {
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [],
-          totalCount: 0,
+          plans: [runningPlan],
+          totalCount: 1,
           totalPages: 1,
         });
       }
@@ -783,18 +795,20 @@ describe("app-panels-stats verification surfaces", () => {
     const makePlan = (
       id: string,
       title: string,
-      status: "ready" | "running" | "implemented",
+      status: "ready" | "running" | "implemented" | "completed" | "cancelled",
       sortOrder: number,
     ) => {
       const phaseId = `${id}-phase-1`;
       const stepId = `${id}-step-1`;
       const isRunning = status === "running";
-      const isImplemented = status === "implemented";
+      const isCompleted = status === "implemented" || status === "completed";
+      const isCancelled = status === "cancelled";
+      const isTerminal = isCompleted || isCancelled;
 
       return {
         activePhaseId: isRunning ? phaseId : null,
-        completedAt: isImplemented ? timestamp : null,
-        completedByUserAt: null,
+        completedAt: isCompleted ? timestamp : null,
+        completedByUserAt: status === "completed" ? timestamp : null,
         createdAt: timestamp,
         errorMessage: null,
         id,
@@ -804,8 +818,8 @@ describe("app-panels-stats verification surfaces", () => {
           {
             agentTaskId: isRunning ? `${id}-task-1` : null,
             agentTeamId: isRunning ? `${id}-team-1` : null,
-            commitId: isImplemented ? `${id}-commit-1` : null,
-            completedAt: isImplemented ? timestamp : null,
+            commitId: status === "implemented" ? `${id}-commit-1` : null,
+            completedAt: isTerminal ? timestamp : null,
             createdAt: timestamp,
             errorMessage: null,
             id: phaseId,
@@ -813,23 +827,29 @@ describe("app-panels-stats verification surfaces", () => {
             mergeAttemptCount: 0,
             planId: id,
             sequence: 0,
-            startedAt: isRunning || isImplemented ? timestamp : null,
+            startedAt: isRunning || isTerminal ? timestamp : null,
             status: isRunning
               ? "running"
-              : isImplemented
+              : isCompleted
                 ? "completed"
-                : "pending",
+                : isCancelled
+                  ? "cancelled"
+                  : "pending",
             steps: [
               {
                 acceptance: [`${title} acceptance`],
-                checkedAt: isImplemented ? timestamp : null,
+                checkedAt: isCompleted ? timestamp : null,
                 createdAt: timestamp,
                 detail: `${title} detail`,
                 id: stepId,
                 phaseId,
                 planId: id,
                 sequence: 0,
-                status: isImplemented ? "completed" : "pending",
+                status: isCompleted
+                  ? "completed"
+                  : isCancelled
+                    ? "cancelled"
+                    : "pending",
                 title: `${title} step`,
                 updatedAt: timestamp,
               },
@@ -874,6 +894,11 @@ describe("app-panels-stats verification surfaces", () => {
         makePlan("plan-1", "First ready plan", "implemented", 0),
         makePlan("plan-2", "Second ready plan", "implemented", 1),
         makePlan("plan-3", "Third added plan", "running", 2),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "implemented", 0),
+        makePlan("plan-2", "Second ready plan", "completed", 1),
+        makePlan("plan-3", "Third added plan", "cancelled", 2),
       ],
     ];
     let planStage = 0;
@@ -980,6 +1005,17 @@ describe("app-panels-stats verification surfaces", () => {
         { action: { action: "start" }, planId: "plan-3" },
       ]);
     });
+
+    planStage = 6;
+    await waitForAutoRunRefresh();
+    await waitFor(() => {
+      expect(autoRunCheckbox).not.toBeChecked();
+    });
+    expect(actionCallSummary()).toEqual([
+      { action: { action: "start" }, planId: "plan-1" },
+      { action: { action: "start" }, planId: "plan-2" },
+      { action: { action: "start" }, planId: "plan-3" },
+    ]);
   }, 30000);
 
   it("marks implemented plans as merged in the plan panel", async () => {
