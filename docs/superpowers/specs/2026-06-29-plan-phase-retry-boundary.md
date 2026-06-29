@@ -110,3 +110,41 @@ Content-Type: application/json
 - store 单测：失败 phase retry 后旧 attempt 保持 `failed`，新 attempt sequence +1，phase 当前字段指向新 task。
 - runtime 单测或轻量集成：override provider/model/thinking 进入 `QueueChatMessageInput`，但不修改 `GlobalConfig`。
 - 前端单测：failed phase 显示默认重试和换模型重试入口，running phase 不显示换模型重试。
+
+## Phase 4 验证收口
+
+本阶段不再扩功能，只复核失败 phase 默认重试、换模型重试、成功收敛、再次失败和历史保留这些路径是否有最小自动化覆盖。
+
+已知实现变更文件：
+
+- `store/workspace_schema.rs`、`store/workspace.rs`、`store/workspace_records.rs`、`store/tests/workspace_database.rs`
+- `app/plan_runtime.rs`、`app/http/plans.rs`、`app/http/router.rs`
+- `web/App.tsx`、`web/api/types.ts`、`web/features/context/ContextPanel.tsx`、`web/shared/i18n.ts`、`web/test-utils/app-test-harness.tsx`、`web/app-panels-stats.test.tsx`
+- `docs/superpowers/specs/2026-06-29-plan-phase-retry-boundary.md`
+
+已验证覆盖：
+
+- 默认重试：`app-panels-stats.test.tsx` 覆盖失败 phase 主按钮走兼容 `plan action start` 后进入 running，并最终显示 implemented。
+- 换模型重试：`app-panels-stats.test.tsx` 覆盖菜单入口、弹窗选择 provider/thinking level，并向 phase retry API 发送本次 override。
+- 重试成功：前端 retry 测试模拟 failed -> running -> implemented 状态流转。
+- 重试再次失败与历史保留：`plan_phase_attempt_history_survives_retry_and_second_failure` 覆盖旧 failed attempt 不被覆盖、第二次 failed 仍保留错误，并允许后续 model override retry 新建 attempt。
+- 不污染全局配置：`retry_model_selection_applies_per_attempt_override` 覆盖 override 只进入本次 selection；`retry_model_selection_reuses_last_attempt_by_default` 覆盖默认 retry 复用最近 attempt 配置。
+
+已知限制：
+
+- 不支持批量应用本次模型选择到后续 phase。
+- 不支持长按入口；入口是 split button 菜单。
+- 不做自动 provider fallback。
+- 旧版本中已经被覆盖掉的失败 phase 历史无法通过 migration 恢复，只能从本功能上线后的 `plan_phase_attempts` 开始保留。
+
+验证命令：
+
+```text
+cargo fmt
+cargo test -p foco-store plan_phase_attempt_history_survives_retry_and_second_failure
+cargo test -p foco-store starting_failed_plan_phase_clears_previous_agent_run
+cargo test -p foco-app retry_model_selection
+npm.cmd --prefix web run typecheck
+npm.cmd --prefix web run test -- app-panels-stats.test.tsx -t "failed plan phase|phase retry"
+git diff --check
+```
