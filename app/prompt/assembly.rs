@@ -586,6 +586,7 @@ pub(crate) async fn prepare_prompt_context(
         message_source_sequences,
         message_context_sources,
         active_tool_start_index,
+        session_mode,
         raw_message,
         message,
         attachments,

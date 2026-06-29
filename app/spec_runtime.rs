@@ -185,6 +185,9 @@ pub(crate) fn queue_workspace_spec_update_job(
     if final_state != "succeeded" || !context.agent_primary_chat_output {
         return Ok(());
     }
+    if context.session_mode.as_deref() == Some("plan") {
+        return Ok(());
+    }
     if !context.global_config.spec.auto_enabled {
         return Ok(());
     }

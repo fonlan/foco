@@ -322,6 +322,7 @@ fn test_prepared_chat_context(
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: test_provider_kind(),
@@ -6352,6 +6353,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: test_provider_kind(),
@@ -7137,6 +7139,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: test_provider_kind(),
@@ -7478,6 +7481,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: test_provider_kind(),
@@ -8371,6 +8375,28 @@ fn workspace_spec_successful_primary_turn_queues_update_job() {
             .as_str()
             .unwrap()
             .contains("Existing spec")
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_plan_session_does_not_queue_update_job() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-plan-noqueue-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, true);
+    let mut context = workspace_spec_update_test_context(workspace_dir.clone());
+    context.session_mode = Some("plan".to_string());
+
+    queue_workspace_spec_update_job(&context, "succeeded").expect("skip plan spec update");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    assert!(
+        database
+            .workspace_spec_jobs(10)
+            .expect("workspace spec jobs")
+            .is_empty()
     );
 
     drop(database);
