@@ -291,14 +291,33 @@ async fn dispatch_plan_merge(
             return Err(error);
         }
     };
-    if queued.agent_task_id.is_none() {
-        let message = "plan merge queue did not create an Agent task";
+    let (team_id, task_id) = match (queued.agent_team_id.as_ref(), queued.agent_task_id.as_ref()) {
+        (Some(team_id), Some(task_id)) => (team_id, task_id),
+        (None, _) => {
+            let error = ApiError::internal("plan merge queue did not create an Agent team");
+            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+                .map_err(ApiError::from_workspace_error)?;
+            return Err(error);
+        }
+        (_, None) => {
+            let error = ApiError::internal("plan merge queue did not create an Agent task");
+            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+                .map_err(ApiError::from_workspace_error)?;
+            return Err(error);
+        }
+    };
+    {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         database
-            .fail_plan_phase_by_id(&plan.id, &phase.id, message)
+            .attach_plan_phase_merge_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
             .map_err(ApiError::from_workspace_error)?;
-        return Err(ApiError::internal(message));
     }
     if source_instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
         && source_instance.worktree_status.as_deref() == Some("active")

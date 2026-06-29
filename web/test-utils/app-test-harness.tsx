@@ -4,6 +4,7 @@ import { vi } from "vitest";
 import type {
   ConfiguredModelSummary,
   ConfiguredWorkspaceSummary,
+  Plan,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../api/types";
@@ -199,6 +200,12 @@ export const settings = {
       { label: "Model matching", value: "llm" },
     ],
     retentionDays: null,
+  },
+  plan: {
+    mergeAutomationMode: "isolated_auto_once",
+    mergeAutomationModes: [
+      { label: "Isolated worktree, auto-merge once", value: "isolated_auto_once" },
+    ],
   },
   spec: {
     autoEnabled: true,
@@ -1289,6 +1296,57 @@ export const todoGraph = {
   updatedAt: "2026-06-05T10:05:00Z",
 };
 
+export const planFixture: Plan = {
+  activePhaseId: "phase-1",
+  completedAt: null,
+  completedByUserAt: null,
+  createdAt: "2026-06-05T10:00:00Z",
+  errorMessage: null,
+  id: "plan-1",
+  overview: "Implement a focused settings regression.",
+  pauseRequestedAt: null,
+  phases: [
+    {
+      agentTaskId: null,
+      agentTeamId: null,
+      commitId: null,
+      completedAt: null,
+      createdAt: "2026-06-05T10:00:00Z",
+      errorMessage: null,
+      id: "phase-1",
+      implementationChatId: null,
+      mergeAttemptCount: 0,
+      planId: "plan-1",
+      sequence: 0,
+      startedAt: null,
+      status: "ready",
+      steps: [
+        {
+          acceptance: ["Plan history renders"],
+          checkedAt: null,
+          createdAt: "2026-06-05T10:00:00Z",
+          detail: "Use the settings page.",
+          id: "step-1",
+          phaseId: "phase-1",
+          planId: "plan-1",
+          sequence: 0,
+          status: "pending",
+          title: "Open settings",
+          updatedAt: "2026-06-05T10:00:00Z",
+        },
+      ],
+      summary: "Single phase fixture.",
+      title: "Implement UI",
+      updatedAt: "2026-06-05T10:00:00Z",
+    },
+  ],
+  sortOrder: 0,
+  sourceChatId: null,
+  status: "ready",
+  title: "Settings plan fixture",
+  updatedAt: "2026-06-05T10:05:00Z",
+};
+
 export const contextUsage = {
   availableMessageTokens: 110960,
   compressionTriggerPercent: 80,
@@ -1922,6 +1980,29 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse({
       activeWorkspaceId: workspace.id,
       workspaces: appTestState.workspaceResponseWorkspaces,
+    });
+  }
+
+  const plansMatch = path.match(/^\/api\/workspaces\/([^/]+)\/plans$/);
+  if (plansMatch) {
+    const workspaceId = decodeURIComponent(plansMatch[1] ?? "");
+    const page = Math.max(1, Number(requestUrl.searchParams.get("page")) || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number(requestUrl.searchParams.get("pageSize")) || 20),
+    );
+    const status = requestUrl.searchParams.get("status");
+    const plans =
+      status && status !== planFixture.status
+        ? []
+        : [{ ...planFixture, id: `${workspaceId}-plan-1` }];
+
+    return jsonResponse({
+      page,
+      pageSize,
+      plans,
+      totalCount: plans.length,
+      totalPages: plans.length ? 1 : 0,
     });
   }
 

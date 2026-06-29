@@ -1434,6 +1434,86 @@ impl WorkspaceDatabase {
             })
     }
 
+    pub fn attach_plan_phase_merge_run(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        implementation_chat_id: &str,
+        agent_team_id: &AgentTeamId,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{}' cannot attach merge while {}",
+                    plan.id, plan.status
+                ),
+            });
+        }
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ),
+            })?;
+        if phase.merge_attempt_count <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' has no merge attempt", phase.id),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'running',
+                     implementation_chat_id = ?3,
+                     agent_team_id = ?4,
+                     agent_task_id = ?5,
+                     commit_id = NULL,
+                     completed_at = NULL,
+                     updated_at = ?6
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    plan.id.as_str(),
+                    phase.id.as_str(),
+                    implementation_chat_id.trim(),
+                    agent_team_id.as_str(),
+                    agent_task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'running',
+                     active_phase_id = ?2,
+                     completed_at = NULL,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan.id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan was not found after merge phase attach: {}",
+                    plan_id.trim()
+                ),
+            })
+    }
+
     pub fn plan_phase_for_agent_task(
         &self,
         agent_task_id: &AgentTaskId,

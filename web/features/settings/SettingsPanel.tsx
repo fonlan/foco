@@ -366,6 +366,7 @@ export function SettingsPanel({
   const [planHistoryPage, setPlanHistoryPage] = useState(1);
   const [planHistoryPageSize, setPlanHistoryPageSize] = useState(20);
   const [planHistoryStatus, setPlanHistoryStatus] = useState("");
+  const [planHistoryWorkspaceId, setPlanHistoryWorkspaceId] = useState("");
   const [planHistoryTotalCount, setPlanHistoryTotalCount] = useState(0);
   const [planHistoryTotalPages, setPlanHistoryTotalPages] = useState(0);
   const [memorySettingsForm, setMemorySettingsForm] =
@@ -563,9 +564,12 @@ export function SettingsPanel({
     null;
   const selectedMemory =
     memories.find((memory) => memory.id === selectedMemoryId) ?? null;
+  const effectivePlanHistoryWorkspaceId =
+    planHistoryWorkspaceId || activeWorkspaceId || "";
   const planWorkspace =
-    settings?.workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
-    null;
+    settings?.workspaces.find(
+      (workspace) => workspace.id === effectivePlanHistoryWorkspaceId,
+    ) ?? null;
   const memoryPaginationItems = auditPaginationItems(
     memoryListMeta.page,
     memoryListMeta.totalPages,
@@ -1096,7 +1100,7 @@ export function SettingsPanel({
   }, []);
 
   const loadPlanHistory = useCallback(async () => {
-    if (!activeWorkspaceId) {
+    if (!effectivePlanHistoryWorkspaceId) {
       setPlanHistory([]);
       setPlanHistoryTotalCount(0);
       setPlanHistoryTotalPages(0);
@@ -1117,7 +1121,7 @@ export function SettingsPanel({
         params.set("status", planHistoryStatus);
       }
       const data = await requestJson<PlansResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/plans?${params.toString()}`,
+        `/api/workspaces/${encodeURIComponent(effectivePlanHistoryWorkspaceId)}/plans?${params.toString()}`,
       );
       if (data.totalPages > 0 && data.page > data.totalPages) {
         setPlanHistoryPage(data.totalPages);
@@ -1136,7 +1140,12 @@ export function SettingsPanel({
     } finally {
       setIsLoadingPlanHistory(false);
     }
-  }, [activeWorkspaceId, planHistoryPage, planHistoryPageSize, planHistoryStatus]);
+  }, [
+    effectivePlanHistoryWorkspaceId,
+    planHistoryPage,
+    planHistoryPageSize,
+    planHistoryStatus,
+  ]);
 
   function closeMemoryDreamDetailDialog() {
     setMemoryDreamDetailJobId(null);
@@ -2270,7 +2279,7 @@ export function SettingsPanel({
   }
 
   async function runPlanHistoryAction(planId: string, action: string) {
-    if (!activeWorkspaceId) {
+    if (!effectivePlanHistoryWorkspaceId) {
       setPlanHistoryError(t("Select a workspace first."));
       return;
     }
@@ -2281,7 +2290,7 @@ export function SettingsPanel({
 
     try {
       const response = await requestJson<PlanResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/plans/${encodeURIComponent(planId)}/action`,
+        `/api/workspaces/${encodeURIComponent(effectivePlanHistoryWorkspaceId)}/plans/${encodeURIComponent(planId)}/action`,
         {
           body: JSON.stringify({ action }),
           headers: { "Content-Type": "application/json" },
@@ -2297,7 +2306,7 @@ export function SettingsPanel({
           )?.implementationChatId ?? null
           : null;
       if (implementationChatId) {
-        onOpenChat(activeWorkspaceId, implementationChatId);
+        onOpenChat(effectivePlanHistoryWorkspaceId, implementationChatId);
       }
     } catch (requestError) {
       setPlanHistoryError(errorMessage(requestError));
@@ -5128,7 +5137,7 @@ export function SettingsPanel({
                   <button
                     aria-label={t("Refresh plan history")}
                     className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                    disabled={isLoadingPlanHistory || !activeWorkspaceId}
+                    disabled={isLoadingPlanHistory || !effectivePlanHistoryWorkspaceId}
                     onClick={() => void loadPlanHistory()}
                     title={t("Refresh plan history")}
                     type="button"
@@ -5141,7 +5150,27 @@ export function SettingsPanel({
                   </button>
                 </div>
 
-                <div className="grid gap-3 border-b border-stone-200 px-4 py-3 md:grid-cols-[minmax(0,1fr)_10rem]">
+                <div className="grid gap-3 border-b border-stone-200 px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Workspace")}
+                    </span>
+                    <select
+                      aria-label={t("Workspace")}
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) => {
+                        setPlanHistoryPage(1);
+                        setPlanHistoryWorkspaceId(event.target.value);
+                      }}
+                      value={effectivePlanHistoryWorkspaceId}
+                    >
+                      {workspaces.map((workspace) => (
+                        <option key={workspace.id} value={workspace.id}>
+                          {workspace.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                       {t("Plan status")}
@@ -5172,17 +5201,6 @@ export function SettingsPanel({
                       ))}
                     </select>
                   </label>
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                      {t("Page size")}
-                    </span>
-                    <input
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      inputMode="numeric"
-                      onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
-                      value={planHistoryPageSize}
-                    />
-                  </label>
                 </div>
 
                 {planHistoryError ? (
@@ -5192,7 +5210,7 @@ export function SettingsPanel({
                 ) : null}
 
                 <div className="divide-y divide-stone-100">
-                  {!activeWorkspaceId ? (
+                  {!effectivePlanHistoryWorkspaceId ? (
                     <div className="px-4 py-6 text-sm text-stone-500">
                       {t("No workspace selected")}
                     </div>
@@ -5276,66 +5294,79 @@ export function SettingsPanel({
                       })
                       : t("No plans")}
                   </div>
-                  <nav
-                    aria-label={t("Plan history pagination")}
-                    className="flex flex-wrap items-center gap-1.5"
-                  >
-                    <button
-                      aria-label={t("Previous page")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                      disabled={isLoadingPlanHistory || planHistoryPage <= 1}
-                      onClick={() => goToPlanHistoryPage(planHistoryPage - 1)}
-                      title={t("Previous page")}
-                      type="button"
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
+                    <label className="block w-full sm:w-32">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Page size")}
+                      </span>
+                      <input
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        inputMode="numeric"
+                        onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
+                        value={planHistoryPageSize}
+                      />
+                    </label>
+                    <nav
+                      aria-label={t("Plan history pagination")}
+                      className="flex flex-wrap items-center gap-1.5"
                     >
-                      <ChevronLeft aria-hidden="true" className="size-4" />
-                    </button>
-                    {planHistoryPaginationItems.map((item, index) =>
-                      item === "ellipsis" ? (
-                        <span
-                          aria-hidden="true"
-                          className="inline-flex size-9 items-center justify-center text-stone-400"
-                          key={`plan-history-ellipsis-${index}`}
-                        >
-                          ...
-                        </span>
-                      ) : (
-                        <button
-                          aria-current={item === planHistoryPage ? "page" : undefined}
-                          aria-label={t("Go to page {page}", {
-                            page: formatNumber(item, language),
-                          })}
-                          className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === planHistoryPage
-                              ? "border-teal-700 bg-teal-700 text-white"
-                              : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                            }`}
-                          disabled={isLoadingPlanHistory}
-                          key={item}
-                          onClick={() => goToPlanHistoryPage(item)}
-                          title={t("Go to page {page}", {
-                            page: formatNumber(item, language),
-                          })}
-                          type="button"
-                        >
-                          {formatNumber(item, language)}
-                        </button>
-                      ),
-                    )}
-                    <button
-                      aria-label={t("Next page")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                      disabled={
-                        isLoadingPlanHistory ||
-                        planHistoryTotalPages === 0 ||
-                        planHistoryPage >= planHistoryTotalPages
-                      }
-                      onClick={() => goToPlanHistoryPage(planHistoryPage + 1)}
-                      title={t("Next page")}
-                      type="button"
-                    >
-                      <ChevronRight aria-hidden="true" className="size-4" />
-                    </button>
-                  </nav>
+                      <button
+                        aria-label={t("Previous page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={isLoadingPlanHistory || planHistoryPage <= 1}
+                        onClick={() => goToPlanHistoryPage(planHistoryPage - 1)}
+                        title={t("Previous page")}
+                        type="button"
+                      >
+                        <ChevronLeft aria-hidden="true" className="size-4" />
+                      </button>
+                      {planHistoryPaginationItems.map((item, index) =>
+                        item === "ellipsis" ? (
+                          <span
+                            aria-hidden="true"
+                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            key={`plan-history-ellipsis-${index}`}
+                          >
+                            ...
+                          </span>
+                        ) : (
+                          <button
+                            aria-current={item === planHistoryPage ? "page" : undefined}
+                            aria-label={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === planHistoryPage
+                                ? "border-teal-700 bg-teal-700 text-white"
+                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              }`}
+                            disabled={isLoadingPlanHistory}
+                            key={item}
+                            onClick={() => goToPlanHistoryPage(item)}
+                            title={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            type="button"
+                          >
+                            {formatNumber(item, language)}
+                          </button>
+                        ),
+                      )}
+                      <button
+                        aria-label={t("Next page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={
+                          isLoadingPlanHistory ||
+                          planHistoryTotalPages === 0 ||
+                          planHistoryPage >= planHistoryTotalPages
+                        }
+                        onClick={() => goToPlanHistoryPage(planHistoryPage + 1)}
+                        title={t("Next page")}
+                        type="button"
+                      >
+                        <ChevronRight aria-hidden="true" className="size-4" />
+                      </button>
+                    </nav>
+                  </div>
                 </div>
               </section>
             </section>

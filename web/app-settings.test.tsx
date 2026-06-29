@@ -95,6 +95,70 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
+  it("filters plan history by selected workspace", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        settings.workspaces[0],
+        {
+          commonCommands: secondaryWorkspace.commonCommands,
+          id: secondaryWorkspace.id,
+          isDefault: false,
+          logoUrl: secondaryWorkspace.logoUrl,
+          name: secondaryWorkspace.name,
+          path: secondaryWorkspace.path,
+          pinned: secondaryWorkspace.pinned,
+          terminalShell: secondaryWorkspace.terminalShell,
+        },
+      ],
+    };
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Plan settings" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).startsWith("/api/workspaces/workspace-1/plans?"),
+        ),
+      ).toBe(true),
+    );
+
+    const planHistorySection = (await screen.findByRole("heading", {
+      name: "Plan history",
+    })).closest("section");
+    expect(planHistorySection).not.toBeNull();
+    const pageSizeControl = within(planHistorySection as HTMLElement).getByLabelText("Page size");
+    const pagination = within(planHistorySection as HTMLElement).getByRole("navigation", {
+      name: "Plan history pagination",
+    });
+    expect(
+      pageSizeControl.compareDocumentPosition(pagination) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
+    await userEvent.selectOptions(
+      within(planHistorySection as HTMLElement).getByLabelText("Workspace"),
+      secondaryWorkspace.id,
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).startsWith("/api/workspaces/workspace-2/plans?"),
+        ),
+      ).toBe(true),
+    );
+    expect(
+      within(planHistorySection as HTMLElement).getByText("Side project", {
+        selector: "p",
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("localizes the Spec settings surface", async () => {
     const zhSettings = {
       ...settings,

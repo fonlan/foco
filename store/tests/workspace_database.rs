@@ -813,6 +813,134 @@ fn plan_phase_merge_attempt_can_begin_once() {
 }
 
 #[test]
+fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-merge-running",
+            title: "Plan merge running",
+            overview: "A failed fast-forward should keep the plan in flight.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-merge-running-phase",
+                title: "Phase one",
+                summary: "Needs merge automation.",
+                steps: vec![NewPlanStep {
+                    id: "plan-merge-running-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["merge retry attached".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-merge-running", "start")
+        .expect("start plan");
+    let (phase_team_id, phase_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-merge-running-phase",
+        "merge-running-phase",
+    );
+    let phase_task_id = AgentTaskId::new("agent-task-merge-running-phase").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &phase_task_id,
+            team_id: &phase_team_id,
+            owner_instance_id: &phase_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue phase task");
+    database
+        .attach_plan_phase_run(
+            "plan-merge-running",
+            "plan-merge-running-phase",
+            "chat-merge-running-phase",
+            &phase_team_id,
+            &phase_task_id,
+        )
+        .expect("attach phase task");
+    let implemented = database
+        .complete_plan_phase_run(&phase_task_id, Some("worktree-commit"))
+        .expect("complete phase")
+        .expect("plan");
+    assert_eq!(implemented.status, "implemented");
+    assert_eq!(implemented.phases[0].status, "completed");
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-running",
+                "plan-merge-running-phase",
+                "shared workspace HEAD changed",
+            )
+            .expect("record merge attempt")
+    );
+    let (merge_team_id, merge_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-merge-running-merge",
+        "merge-running-merge",
+    );
+    let merge_task_id = AgentTaskId::new("agent-task-merge-running-merge").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &merge_task_id,
+            team_id: &merge_team_id,
+            owner_instance_id: &merge_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue merge task");
+    let running = database
+        .attach_plan_phase_merge_run(
+            "plan-merge-running",
+            "plan-merge-running-phase",
+            "chat-merge-running-merge",
+            &merge_team_id,
+            &merge_task_id,
+        )
+        .expect("attach merge task");
+    assert_eq!(running.status, "running");
+    assert_eq!(
+        running.active_phase_id.as_deref(),
+        Some("plan-merge-running-phase")
+    );
+    assert_eq!(running.phases[0].status, "running");
+    assert_eq!(
+        running.phases[0].implementation_chat_id.as_deref(),
+        Some("chat-merge-running-merge")
+    );
+    assert_eq!(
+        running.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-merge-running-merge")
+    );
+    assert!(running.phases[0].commit_id.is_none());
+
+    let completed = database
+        .complete_plan_phase_by_id(
+            "plan-merge-running",
+            "plan-merge-running-phase",
+            Some("shared-merge-commit"),
+        )
+        .expect("complete merge phase");
+    assert_eq!(completed.status, "implemented");
+    assert!(completed.active_phase_id.is_none());
+    assert_eq!(completed.phases[0].status, "completed");
+    assert_eq!(
+        completed.phases[0].commit_id.as_deref(),
+        Some("shared-merge-commit")
+    );
+    assert!(completed.phases[0].error_message.is_none());
+}
+
+#[test]
 fn workspace_spec_jobs_redact_audit_json_fields() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
