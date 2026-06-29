@@ -3,7 +3,7 @@ use std::{path::Path, time::Duration};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use foco_store::{
     config::GlobalConfig,
-    workspace::{WorkspaceDatabase, WorkspaceDatabaseSpaceStats},
+    workspace::{WorkspaceDatabase, WorkspaceDatabaseSpaceStats, prune_workspace_database_backups},
 };
 use tokio::sync::watch;
 
@@ -67,6 +67,7 @@ async fn run_api_audit_cleanup_in_background(config: GlobalConfig) {
         Ok(Ok(summary)) => {
             tracing::info!(
                 pruned_count = summary.pruned_count,
+                pruned_backup_count = summary.pruned_backup_count,
                 vacuumed_workspace_count = summary.vacuumed_workspace_count,
                 vacuum_reclaimed_bytes = summary.vacuum_reclaimed_bytes,
                 "API audit cleanup completed"
@@ -84,6 +85,7 @@ async fn run_api_audit_cleanup_in_background(config: GlobalConfig) {
 #[derive(Default)]
 struct ApiAuditCleanupSummary {
     pruned_count: i64,
+    pruned_backup_count: usize,
     vacuumed_workspace_count: usize,
     vacuum_reclaimed_bytes: u64,
 }
@@ -135,6 +137,27 @@ fn prune_api_audit_details_for_config(
                     workspace_path = %workspace.path.display(),
                     error = %error.message,
                     "workspace database compaction skipped"
+                );
+            }
+        }
+        match prune_workspace_database_backups(&workspace.path) {
+            Ok(deleted) => {
+                summary.pruned_backup_count = summary.pruned_backup_count.saturating_add(deleted);
+                if deleted > 0 {
+                    tracing::info!(
+                        workspace_id = %workspace.id,
+                        workspace_path = %workspace.path.display(),
+                        deleted,
+                        "pruned workspace database backups"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    error = %error,
+                    "workspace database backup pruning skipped"
                 );
             }
         }

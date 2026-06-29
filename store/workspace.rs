@@ -3,10 +3,10 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{NaiveDateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
     AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentTaskId,
@@ -60,6 +60,7 @@ use workspace_schema::{
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
+pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
 pub const WORKSPACE_SCHEMA_VERSION: u32 = 20;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
@@ -227,6 +228,79 @@ pub fn workspace_foco_dir(workspace_path: impl AsRef<Path>) -> PathBuf {
 
 pub fn workspace_database_path(workspace_path: impl AsRef<Path>) -> PathBuf {
     workspace_foco_dir(workspace_path).join(WORKSPACE_DATABASE_FILE)
+}
+
+pub fn prune_workspace_database_backups(
+    workspace_path: &Path,
+) -> Result<usize, WorkspaceDatabaseError> {
+    let backup_dir = workspace_foco_dir(workspace_path).join("backups");
+    if !backup_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut backups = Vec::new();
+    for entry in fs::read_dir(&backup_dir).map_err(|source| WorkspaceDatabaseError::Io {
+        path: backup_dir.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| WorkspaceDatabaseError::Io {
+            path: backup_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| WorkspaceDatabaseError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if !file_type.is_file() || !is_workspace_database_backup_file(&path) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        backups.push((workspace_backup_sort_key(&path, modified), path));
+    }
+
+    if backups.len() <= WORKSPACE_BACKUP_RETAIN_COUNT {
+        return Ok(0);
+    }
+
+    backups.sort_by(|(left, _), (right, _)| right.cmp(left));
+    let mut deleted = 0usize;
+    // ponytail: fixed-count retention is enough for now; wire this constant into config if users need policy control.
+    for (_, path) in backups.into_iter().skip(WORKSPACE_BACKUP_RETAIN_COUNT) {
+        fs::remove_file(&path).map_err(|source| WorkspaceDatabaseError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        deleted = deleted.saturating_add(1);
+    }
+
+    Ok(deleted)
+}
+
+fn is_workspace_database_backup_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    file_name.starts_with("foco-v") && file_name.ends_with(".sqlite")
+}
+
+fn workspace_backup_sort_key(path: &Path, modified: SystemTime) -> SystemTime {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|stem| stem.rsplit_once('-').map(|(_, timestamp)| timestamp))
+        .and_then(parse_workspace_backup_timestamp)
+        .unwrap_or(modified)
+}
+
+fn parse_workspace_backup_timestamp(value: &str) -> Option<SystemTime> {
+    NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S%fZ")
+        .ok()
+        .map(|timestamp| timestamp.and_utc().into())
 }
 
 pub struct WorkspaceDatabase {
@@ -10021,6 +10095,17 @@ fn create_migration_backup(
             path: database_path.to_path_buf(),
             source,
         })?;
+
+    if let Some(workspace_path) = parent.parent()
+        && let Err(error) = prune_workspace_database_backups(workspace_path)
+    {
+        tracing::warn!(
+            workspace_path = %workspace_path.display(),
+            backup_dir = %backup_dir.display(),
+            error = %error,
+            "workspace database backup pruning skipped"
+        );
+    }
 
     Ok(())
 }

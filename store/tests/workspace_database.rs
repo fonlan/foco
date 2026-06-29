@@ -28,7 +28,7 @@ use foco_store::{
         WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
         WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
         WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, workspace_database_path,
+        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -1340,6 +1340,52 @@ fn backs_up_existing_database_before_migration() {
         .expect("backup entries");
     assert_eq!(backups.len(), 1);
     assert!(backups[0].path().is_file());
+}
+
+#[test]
+fn prunes_old_workspace_database_backups() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let backup_dir = workspace.path().join(".foco").join("backups");
+    fs::create_dir_all(&backup_dir).expect("backup directory");
+
+    for timestamp in [
+        "20260101T000000000000000Z",
+        "20260102T000000000000000Z",
+        "20260103T000000000000000Z",
+        "20260104T000000000000000Z",
+        "20260105T000000000000000Z",
+    ] {
+        fs::write(
+            backup_dir.join(format!("foco-v1-{timestamp}.sqlite")),
+            b"backup",
+        )
+        .expect("backup file");
+    }
+    fs::write(backup_dir.join("notes.txt"), b"keep").expect("non-backup file");
+
+    let deleted = prune_workspace_database_backups(workspace.path()).expect("prune backups");
+
+    assert_eq!(deleted, 2);
+    let mut remaining = fs::read_dir(&backup_dir)
+        .expect("backup entries")
+        .map(|entry| {
+            entry
+                .expect("backup entry")
+                .file_name()
+                .into_string()
+                .expect("utf8 filename")
+        })
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![
+            "foco-v1-20260103T000000000000000Z.sqlite".to_string(),
+            "foco-v1-20260104T000000000000000Z.sqlite".to_string(),
+            "foco-v1-20260105T000000000000000Z.sqlite".to_string(),
+            "notes.txt".to_string(),
+        ]
+    );
 }
 
 #[test]
