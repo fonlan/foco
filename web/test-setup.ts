@@ -95,6 +95,19 @@ class MockClipboardItem implements ClipboardItem {
   }
 }
 
+class MockWorker extends EventTarget {
+  onerror: ((this: Worker, ev: ErrorEvent) => unknown) | null = null;
+  onmessage: ((this: Worker, ev: MessageEvent) => unknown) | null = null;
+  onmessageerror: ((this: Worker, ev: MessageEvent) => unknown) | null = null;
+
+  constructor(_scriptURL: string | URL) {
+    super();
+  }
+
+  postMessage() {}
+  terminate() {}
+}
+
 Object.defineProperty(window.HTMLElement.prototype, "scrollIntoView", {
   configurable: true,
   value: vi.fn(),
@@ -128,6 +141,17 @@ Object.defineProperty(window, "WebSocket", {
 Object.defineProperty(window, "ClipboardItem", {
   configurable: true,
   value: MockClipboardItem,
+});
+
+// ponytail: enough for Monaco diagnostics startup; upgrade when tests assert worker messaging.
+Object.defineProperty(window, "Worker", {
+  configurable: true,
+  value: MockWorker,
+});
+
+Object.defineProperty(globalThis, "Worker", {
+  configurable: true,
+  value: MockWorker,
 });
 
 Object.defineProperty(globalThis, "ClipboardItem", {
