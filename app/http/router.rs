@@ -273,6 +273,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::plans::plan_action),
         )
         .route(
+            "/api/workspaces/{workspace_id}/plans/{plan_id}/phases/{phase_id}/retry",
+            post(crate::http::plans::retry_plan_phase),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/plans/{plan_id}/steps/{step_id}/action",
             post(crate::http::plans::plan_step_action),
         )

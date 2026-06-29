@@ -9,11 +9,11 @@ use foco_agent::{
 use foco_store::{
     config::{
         GlobalConfig, ModelSettings, PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
-        PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE, WorkspaceConfig,
+        PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE, SUPPORTED_AGENT_THINKING_LEVELS, WorkspaceConfig,
     },
     workspace::{
-        AgentInstanceRecord, AgentTaskRecord, PlanPhaseRecord, PlanRecord, WorkspaceDatabase,
-        WorkspaceDatabaseError,
+        AgentInstanceRecord, AgentTaskRecord, PlanPhaseAttemptTrigger, PlanPhaseRecord, PlanRecord,
+        WorkspaceDatabase, WorkspaceDatabaseError,
     },
 };
 use serde_json::Value;
@@ -33,10 +33,37 @@ const PLAN_MERGE_DIFF_MAX_CHARS: usize = 60_000;
 // ponytail: fixed char cap keeps phase prompts bounded for now; ceiling is rough prompt sizing, upgrade to token-aware summaries if long plans need it.
 const PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS: usize = 12_000;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PlanRunnerModelSelection {
     model_id: String,
     provider_id: String,
     thinking_level: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlanPhaseRetryRequest {
+    pub(crate) provider_id: Option<String>,
+    pub(crate) model_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+}
+
+impl PlanPhaseRetryRequest {
+    fn has_override(&self) -> bool {
+        self.provider_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .thinking_level
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,7 +99,69 @@ pub(crate) async fn transition_plan_action(
             .transition_plan(plan_id, action)
             .map_err(ApiError::from_workspace_error)?
     };
-    dispatch_plan_phase(state, &workspace.id, plan).await
+    dispatch_plan_phase(state, &workspace.id, plan, None).await
+}
+
+pub(crate) async fn retry_plan_phase(
+    state: &AppState,
+    workspace_id: &str,
+    plan_id: &str,
+    phase_id: &str,
+    request: PlanPhaseRetryRequest,
+) -> Result<PlanRecord, ApiError> {
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?.clone();
+    let (attempt_id, plan, selection) = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let plan = database
+            .plan(plan_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("plan was not found: {}", plan_id.trim()))
+            })?;
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ))
+            })?;
+        if phase.status != "failed" {
+            return Err(ApiError::bad_request(format!(
+                "plan phase '{}' is not failed",
+                phase.id
+            )));
+        }
+        let selection = plan_retry_model_selection(&config, phase, &request)?;
+        let has_override = request.has_override();
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan.id,
+                &phase.id,
+                if has_override {
+                    PlanPhaseAttemptTrigger::ModelOverrideRetry
+                } else {
+                    PlanPhaseAttemptTrigger::Retry
+                },
+                Some(selection.provider_id.as_str()),
+                Some(selection.model_id.as_str()),
+                selection.thinking_level.as_deref(),
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        let plan = database
+            .plan(&plan.id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!("plan was not found after retry: {plan_id}"))
+            })?;
+        (attempt.id, plan, selection)
+    };
+    dispatch_plan_phase(state, &workspace.id, plan, Some((attempt_id, selection))).await
 }
 
 pub(crate) async fn sync_plan_phase_for_agent_task(
@@ -363,6 +452,7 @@ async fn dispatch_plan_phase(
     state: &AppState,
     workspace_id: &str,
     plan: PlanRecord,
+    attempt: Option<(String, PlanRunnerModelSelection)>,
 ) -> Result<PlanRecord, ApiError> {
     if plan.status == "implemented" || plan.active_phase_id.is_none() {
         return Ok(plan);
@@ -386,7 +476,41 @@ async fn dispatch_plan_phase(
     }
 
     let config = config_snapshot(state)?;
-    let selection = plan_runner_model_selection(&config)?;
+    let (attempt_id, selection) = match attempt {
+        Some((attempt_id, selection)) => (Some(attempt_id), selection),
+        None => {
+            let is_retry = phase.attempts.iter().any(|attempt| {
+                matches!(
+                    attempt.status.as_str(),
+                    "failed" | "cancelled" | "interrupted"
+                )
+            });
+            let request = PlanPhaseRetryRequest::default();
+            let selection = if is_retry {
+                plan_retry_model_selection(&config, phase, &request)?
+            } else {
+                plan_runner_model_selection(&config)?
+            };
+            let workspace = workspace_by_id(&config, workspace_id)?;
+            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            let attempt = database
+                .begin_plan_phase_attempt(
+                    &plan.id,
+                    &phase.id,
+                    if is_retry {
+                        PlanPhaseAttemptTrigger::Retry
+                    } else {
+                        PlanPhaseAttemptTrigger::Initial
+                    },
+                    Some(selection.provider_id.as_str()),
+                    Some(selection.model_id.as_str()),
+                    selection.thinking_level.as_deref(),
+                )
+                .map_err(ApiError::from_workspace_error)?;
+            (Some(attempt.id), selection)
+        }
+    };
     let workspace = workspace_by_id(&config, workspace_id)?;
     let (coordinator_worktree, previous_conclusions) = {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
@@ -445,9 +569,15 @@ async fn dispatch_plan_phase(
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let plan = database
-        .attach_plan_phase_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
-        .map_err(ApiError::from_workspace_error)?;
+    let plan = if let Some(attempt_id) = attempt_id.as_deref() {
+        database
+            .attach_plan_phase_attempt_run(attempt_id, &queued.chat_id, team_id, task_id)
+            .map_err(ApiError::from_workspace_error)?
+    } else {
+        database
+            .attach_plan_phase_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
+            .map_err(ApiError::from_workspace_error)?
+    };
     state.agent_scheduler.wake()?;
     Ok(plan)
 }
@@ -770,6 +900,119 @@ fn plan_runner_model_selection(
     ))
 }
 
+fn plan_retry_model_selection(
+    config: &GlobalConfig,
+    phase: &PlanPhaseRecord,
+    request: &PlanPhaseRetryRequest,
+) -> Result<PlanRunnerModelSelection, ApiError> {
+    let requested_provider_id = trimmed_non_empty(request.provider_id.as_deref());
+    let requested_model_id = trimmed_non_empty(request.model_id.as_deref());
+    if requested_provider_id.is_some() != requested_model_id.is_some() {
+        return Err(ApiError::bad_request(
+            "plan phase retry providerId and modelId must be provided together",
+        ));
+    }
+
+    let base = match (requested_provider_id, requested_model_id) {
+        (Some(provider_id), Some(model_id)) => {
+            validate_plan_model_selection(config, provider_id, model_id)?
+        }
+        _ => phase
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| {
+                Some((
+                    attempt.provider_id.as_deref()?,
+                    attempt.model_id.as_deref()?,
+                ))
+            })
+            .map(|(provider_id, model_id)| {
+                validate_plan_model_selection(config, provider_id, model_id)
+            })
+            .transpose()?
+            .unwrap_or(plan_runner_model_selection(config)?),
+    };
+
+    let thinking_level = match trimmed_non_empty(request.thinking_level.as_deref()) {
+        Some(thinking_level) => {
+            validate_plan_thinking_level(thinking_level)?;
+            Some(thinking_level.to_string())
+        }
+        None if request.has_override() => base.thinking_level,
+        None => phase
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.thinking_level.clone())
+            .or(base.thinking_level),
+    };
+
+    Ok(PlanRunnerModelSelection {
+        thinking_level,
+        ..base
+    })
+}
+
+fn validate_plan_model_selection(
+    config: &GlobalConfig,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<PlanRunnerModelSelection, ApiError> {
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("provider was not found: {provider_id}")))?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "provider '{provider_id}' is disabled"
+        )));
+    }
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "model '{model_id}' is disabled"
+        )));
+    }
+    if !model_outputs_text(model) {
+        return Err(ApiError::bad_request(format!(
+            "model '{model_id}' does not support text output"
+        )));
+    }
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "model '{model_id}' is not available from provider '{provider_id}'"
+        )));
+    }
+    Ok(PlanRunnerModelSelection {
+        model_id: model.id.clone(),
+        provider_id: provider.id.clone(),
+        thinking_level: model.thinking_level.clone(),
+    })
+}
+
+fn validate_plan_thinking_level(thinking_level: &str) -> Result<(), ApiError> {
+    if SUPPORTED_AGENT_THINKING_LEVELS.contains(&thinking_level) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "thinkingLevel must be one of: {}",
+            SUPPORTED_AGENT_THINKING_LEVELS.join(", ")
+        )))
+    }
+}
+
+fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn model_outputs_text(model: &ModelSettings) -> bool {
     model.output_modalities.is_empty()
         || model
@@ -1045,6 +1288,10 @@ fn agent_task_error_message(task: &AgentTaskRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foco_store::{
+        config::{ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, ModelLimits, ProviderSettings},
+        workspace::PlanPhaseAttemptRecord,
+    };
 
     #[test]
     fn plan_phase_chat_title_uses_plan_and_phase_titles() {
@@ -1052,6 +1299,55 @@ mod tests {
             plan_phase_chat_title("Build plan runner UI", "Wire start action"),
             "Build plan runner UI - Wire start action"
         );
+    }
+
+    #[test]
+    fn retry_model_selection_reuses_last_attempt_by_default() {
+        let config = retry_selection_config();
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-b",
+            "model-b",
+            Some("high"),
+        ));
+
+        let selection =
+            plan_retry_model_selection(&config, &phase, &PlanPhaseRetryRequest::default())
+                .expect("selection");
+
+        assert_eq!(selection.provider_id, "provider-b");
+        assert_eq!(selection.model_id, "model-b");
+        assert_eq!(selection.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn retry_model_selection_applies_per_attempt_override() {
+        let config = retry_selection_config();
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-a",
+            "model-a",
+            Some("low"),
+        ));
+
+        let selection = plan_retry_model_selection(
+            &config,
+            &phase,
+            &PlanPhaseRetryRequest {
+                provider_id: Some("provider-b".to_string()),
+                model_id: Some("model-b".to_string()),
+                thinking_level: Some("xhigh".to_string()),
+            },
+        )
+        .expect("selection");
+
+        assert_eq!(selection.provider_id, "provider-b");
+        assert_eq!(selection.model_id, "model-b");
+        assert_eq!(selection.thinking_level.as_deref(), Some("xhigh"));
     }
 
     fn plan_record_for_prompt(phase: PlanPhaseRecord) -> PlanRecord {
@@ -1093,7 +1389,101 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             steps: Vec::new(),
+            attempts: Vec::new(),
         }
+    }
+
+    fn attempt_record_for_selection(
+        sequence: i64,
+        provider_id: &str,
+        model_id: &str,
+        thinking_level: Option<&str>,
+    ) -> PlanPhaseAttemptRecord {
+        PlanPhaseAttemptRecord {
+            id: format!("plan-phase-attempt-test-{sequence}"),
+            plan_id: "plan-prompt-test".to_string(),
+            phase_id: "phase-prompt-test".to_string(),
+            sequence,
+            trigger: "retry".to_string(),
+            status: "failed".to_string(),
+            provider_id: Some(provider_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            thinking_level: thinking_level.map(str::to_string),
+            implementation_chat_id: None,
+            agent_team_id: None,
+            agent_task_id: None,
+            commit_id: None,
+            error_message: Some("failed".to_string()),
+            started_at: None,
+            completed_at: Some("2026-01-01T00:01:00Z".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:01:00Z".to_string(),
+        }
+    }
+
+    fn retry_selection_config() -> GlobalConfig {
+        let mut config = GlobalConfig::first_run(PathBuf::from("/tmp/foco-plan-retry-test"));
+        config.providers.push(ProviderSettings {
+            id: "provider-a".to_string(),
+            name: "Provider A".to_string(),
+            kind: "openai_chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.providers.push(ProviderSettings {
+            id: "provider-b".to_string(),
+            name: "Provider B".to_string(),
+            kind: "openai_chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model-a".to_string(),
+            display_name: "Model A".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-a".to_string()],
+            active_provider_id: Some("provider-a".to_string()),
+            thinking_level: Some("low".to_string()),
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        });
+        config.models.push(ModelSettings {
+            id: "model-b".to_string(),
+            display_name: "Model B".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-b".to_string()],
+            active_provider_id: Some("provider-b".to_string()),
+            thinking_level: Some("medium".to_string()),
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        });
+        config
     }
 
     #[test]

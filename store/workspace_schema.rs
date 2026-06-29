@@ -1081,6 +1081,66 @@ WHERE final_state != 'running'
 GROUP BY 1, 2, 3, 4, 5;
 "#;
 
+pub(crate) const MIGRATION_023: &str = r#"
+CREATE TABLE plan_phase_attempts (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'plan-phase-attempt-*'),
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    phase_id TEXT NOT NULL REFERENCES plan_phases(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    trigger TEXT NOT NULL CHECK (trigger IN ('initial', 'retry', 'model_override_retry', 'merge_auto')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted')),
+    provider_id TEXT CHECK (provider_id IS NULL OR length(provider_id) > 0),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    thinking_level TEXT CHECK (thinking_level IS NULL OR length(thinking_level) > 0),
+    implementation_chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    commit_id TEXT,
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (phase_id, sequence)
+);
+
+CREATE INDEX plan_phase_attempts_plan_phase_sequence_idx
+ON plan_phase_attempts (plan_id, phase_id, sequence);
+
+CREATE INDEX plan_phase_attempts_agent_task_idx
+ON plan_phase_attempts (agent_task_id);
+
+INSERT INTO plan_phase_attempts (
+    id, plan_id, phase_id, sequence, trigger, status,
+    implementation_chat_id, agent_team_id, agent_task_id, commit_id,
+    error_message, started_at, completed_at, created_at, updated_at
+)
+SELECT
+    'plan-phase-attempt-backfill-' || id,
+    plan_id,
+    id,
+    0,
+    'initial',
+    CASE status
+        WHEN 'completed' THEN 'completed'
+        WHEN 'failed' THEN 'failed'
+        WHEN 'cancelled' THEN 'cancelled'
+        WHEN 'running' THEN 'running'
+        ELSE 'queued'
+    END,
+    implementation_chat_id,
+    agent_team_id,
+    agent_task_id,
+    commit_id,
+    error_message,
+    started_at,
+    completed_at,
+    created_at,
+    updated_at
+FROM plan_phases
+WHERE agent_task_id IS NOT NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

@@ -45,25 +45,25 @@ pub use workspace_records::{
     NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
     NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection,
     NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListPage, PlanPatch, PlanPhaseRecord,
-    PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
-    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
-    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
-    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListPage, PlanPatch,
+    PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, Migration,
+    MIGRATION_022, MIGRATION_023, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 22;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 23;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -209,6 +209,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 22,
         sql: MIGRATION_022,
     },
+    Migration {
+        version: 23,
+        sql: MIGRATION_023,
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,6 +325,48 @@ fn parse_workspace_backup_timestamp(value: &str) -> Option<SystemTime> {
 pub struct WorkspaceDatabase {
     database_path: PathBuf,
     connection: Connection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanPhaseAttemptTrigger {
+    Initial,
+    Retry,
+    ModelOverrideRetry,
+    MergeAuto,
+}
+
+impl PlanPhaseAttemptTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Retry => "retry",
+            Self::ModelOverrideRetry => "model_override_retry",
+            Self::MergeAuto => "merge_auto",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanPhaseAttemptStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl PlanPhaseAttemptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 // ponytail: Phase 0 only codifies Project Spec behavior; storage, HTTP, prompt wiring, and UI land later.
@@ -1552,6 +1598,377 @@ impl WorkspaceDatabase {
         self.refresh_plan_status_from_steps(plan_id)
     }
 
+    pub fn begin_plan_phase_attempt(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        trigger: PlanPhaseAttemptTrigger,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+        thinking_level: Option<&str>,
+    ) -> Result<PlanPhaseAttemptRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' cannot retry while {}", plan.id, plan.status),
+            });
+        }
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ),
+            })?;
+        if (phase.status != "failed" && phase.agent_task_id.is_some())
+            || self.phase_has_active_attempt(&phase.id)?
+        {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' already has an active attempt", phase.id),
+            });
+        }
+        if matches!(
+            trigger,
+            PlanPhaseAttemptTrigger::Retry | PlanPhaseAttemptTrigger::ModelOverrideRetry
+        ) && phase.status != "failed"
+        {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' is not failed", phase.id),
+            });
+        }
+
+        let sequence = self.next_plan_phase_attempt_sequence(&phase.id)?;
+        let attempt_id = format!("plan-phase-attempt-{}-{sequence}", phase.id.trim());
+        let now = now_timestamp();
+        let provider_id = normalized_optional_text(provider_id);
+        let model_id = normalized_optional_text(model_id);
+        let thinking_level = normalized_optional_text(thinking_level);
+        self.connection
+            .execute(
+                "INSERT INTO plan_phase_attempts (
+                    id, plan_id, phase_id, sequence, trigger, status,
+                    provider_id, model_id, thinking_level, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    attempt_id.as_str(),
+                    plan.id.as_str(),
+                    phase.id.as_str(),
+                    sequence,
+                    trigger.as_str(),
+                    provider_id,
+                    model_id,
+                    thinking_level,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'pending',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM plan_phases
+                       WHERE plan_id = ?1 AND id = ?2 AND status = 'failed'
+                   )",
+                params![plan.id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'running',
+                     implementation_chat_id = NULL,
+                     agent_team_id = NULL,
+                     agent_task_id = NULL,
+                     commit_id = NULL,
+                     merge_attempt_count = CASE WHEN status = 'failed' THEN 0 ELSE merge_attempt_count END,
+                     error_message = NULL,
+                     started_at = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(started_at, ?3) END,
+                     completed_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![plan.id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'running',
+                     active_phase_id = ?2,
+                     pause_requested_at = NULL,
+                     completed_at = NULL,
+                     completed_by_user_at = NULL,
+                     error_message = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan.id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.plan_phase_attempt(&attempt_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase attempt was not found after insert: {attempt_id}"),
+            })
+    }
+
+    pub fn attach_plan_phase_attempt_run(
+        &mut self,
+        attempt_id: &str,
+        implementation_chat_id: &str,
+        agent_team_id: &AgentTeamId,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let attempt = self.plan_phase_attempt(attempt_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase attempt was not found: {}", attempt_id.trim()),
+            }
+        })?;
+        if !matches!(attempt.status.as_str(), "queued" | "running") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase attempt '{}' cannot attach while {}",
+                    attempt.id, attempt.status
+                ),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'running',
+                     implementation_chat_id = ?2,
+                     agent_team_id = ?3,
+                     agent_task_id = ?4,
+                     started_at = COALESCE(started_at, ?5),
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![
+                    attempt.id.as_str(),
+                    implementation_chat_id.trim(),
+                    agent_team_id.as_str(),
+                    agent_task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.attach_plan_phase_run_fields(
+            &attempt.plan_id,
+            &attempt.phase_id,
+            implementation_chat_id,
+            agent_team_id,
+            agent_task_id,
+        )
+    }
+
+    pub fn plan_phase_attempts_for_phase(
+        &self,
+        phase_id: &str,
+    ) -> Result<Vec<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        self.plan_phase_attempts_for_phase_inner(phase_id)
+    }
+
+    fn attach_plan_phase_run_fields(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        implementation_chat_id: &str,
+        agent_team_id: &AgentTeamId,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET implementation_chat_id = ?3,
+                     agent_team_id = ?4,
+                     agent_task_id = ?5,
+                     error_message = NULL,
+                     updated_at = ?6
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    plan_id.trim(),
+                    phase_id.trim(),
+                    implementation_chat_id.trim(),
+                    agent_team_id.as_str(),
+                    agent_task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after phase attach: {}", plan_id.trim()),
+            })
+    }
+
+    fn next_plan_phase_attempt_sequence(
+        &self,
+        phase_id: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1",
+                params![phase_id.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    fn phase_has_active_attempt(&self, phase_id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1 AND status IN ('queued', 'running')",
+                params![phase_id.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(count > 0)
+    }
+
+    fn plan_phase_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, plan_id, phase_id, sequence, trigger, status,
+                        provider_id, model_id, thinking_level,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        commit_id, error_message, started_at, completed_at,
+                        created_at, updated_at
+                 FROM plan_phase_attempts
+                 WHERE id = ?1",
+                params![attempt_id.trim()],
+                plan_phase_attempt_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    fn plan_phase_attempts_for_phase_inner(
+        &self,
+        phase_id: &str,
+    ) -> Result<Vec<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, plan_id, phase_id, sequence, trigger, status,
+                        provider_id, model_id, thinking_level,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        commit_id, error_message, started_at, completed_at,
+                        created_at, updated_at
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![phase_id.trim()], plan_phase_attempt_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    fn update_attempt_for_task(
+        &mut self,
+        agent_task_id: &AgentTaskId,
+        status: PlanPhaseAttemptStatus,
+        commit_id: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = ?2,
+                     commit_id = COALESCE(?3, commit_id),
+                     error_message = ?4,
+                     completed_at = CASE WHEN ?2 IN ('completed', 'failed', 'cancelled', 'interrupted') THEN COALESCE(completed_at, ?5) ELSE completed_at END,
+                     updated_at = ?5
+                 WHERE agent_task_id = ?1",
+                params![
+                    agent_task_id.as_str(),
+                    status.as_str(),
+                    commit_id.map(str::trim).filter(|value| !value.is_empty()),
+                    error_message.map(str::trim).filter(|value| !value.is_empty()),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
+    }
+
+    fn update_latest_active_attempt_for_phase(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        status: PlanPhaseAttemptStatus,
+        error_message: Option<&str>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = ?3,
+                     error_message = ?4,
+                     completed_at = CASE WHEN ?3 IN ('completed', 'failed', 'cancelled', 'interrupted') THEN COALESCE(completed_at, ?5) ELSE completed_at END,
+                     updated_at = ?5
+                 WHERE id = (
+                     SELECT id FROM plan_phase_attempts
+                     WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('queued', 'running')
+                     ORDER BY sequence DESC
+                     LIMIT 1
+                 )",
+                params![
+                    plan_id.trim(),
+                    phase_id.trim(),
+                    status.as_str(),
+                    error_message.map(str::trim).filter(|value| !value.is_empty()),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
+    }
+
+    fn agent_task_attempt_terminal_status(
+        &self,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<PlanPhaseAttemptStatus, WorkspaceDatabaseError> {
+        let status = self
+            .connection
+            .query_row(
+                "SELECT status FROM agent_tasks WHERE id = ?1",
+                params![agent_task_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(match status.as_deref() {
+            Some("cancelled") => PlanPhaseAttemptStatus::Cancelled,
+            Some("interrupted") => PlanPhaseAttemptStatus::Interrupted,
+            _ => PlanPhaseAttemptStatus::Failed,
+        })
+    }
+
     pub fn attach_plan_phase_run(
         &mut self,
         plan_id: &str,
@@ -1714,6 +2131,7 @@ impl WorkspaceDatabase {
             return Ok(None);
         };
         phase.steps = self.plan_steps_for_phase(&phase.id)?;
+        phase.attempts = self.plan_phase_attempts_for_phase_inner(&phase.id)?;
         Ok(Some(phase))
     }
 
@@ -1747,6 +2165,12 @@ impl WorkspaceDatabase {
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
+        self.update_attempt_for_task(
+            agent_task_id,
+            PlanPhaseAttemptStatus::Completed,
+            commit_id,
+            None,
+        )?;
         self.complete_plan_phase_record(phase, commit_id).map(Some)
     }
 
@@ -1757,6 +2181,12 @@ impl WorkspaceDatabase {
         commit_id: Option<&str>,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        self.update_latest_active_attempt_for_phase(
+            plan_id,
+            phase_id,
+            PlanPhaseAttemptStatus::Completed,
+            None,
+        )?;
         self.complete_plan_phase_record(phase, commit_id)
     }
 
@@ -1829,6 +2259,8 @@ impl WorkspaceDatabase {
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
+        let attempt_status = self.agent_task_attempt_terminal_status(agent_task_id)?;
+        self.update_attempt_for_task(agent_task_id, attempt_status, None, Some(error_message))?;
         self.fail_plan_phase_record(phase, error_message).map(Some)
     }
 
@@ -1866,6 +2298,12 @@ impl WorkspaceDatabase {
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        self.update_latest_active_attempt_for_phase(
+            plan_id,
+            phase_id,
+            PlanPhaseAttemptStatus::Failed,
+            Some(error_message),
+        )?;
         self.fail_plan_phase_record(phase, error_message)
     }
 
@@ -2116,6 +2554,16 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         self.connection
             .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'cancelled',
+                     completed_at = COALESCE(completed_at, ?2),
+                     updated_at = ?2
+                 WHERE plan_id = ?1 AND status IN ('queued', 'running')",
+                params![plan_id.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
                 "UPDATE plan_steps
                  SET status = 'cancelled',
                      checked_at = NULL,
@@ -2310,6 +2758,7 @@ impl WorkspaceDatabase {
         let mut phases = collect_rows(rows, &self.database_path)?;
         for phase in &mut phases {
             phase.steps = self.plan_steps_for_phase(&phase.id)?;
+            phase.attempts = self.plan_phase_attempts_for_phase_inner(&phase.id)?;
         }
 
         Ok(phases)
@@ -9628,6 +10077,32 @@ fn plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanPhaseRec
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
         steps: Vec::new(),
+        attempts: Vec::new(),
+    })
+}
+
+fn plan_phase_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PlanPhaseAttemptRecord> {
+    Ok(PlanPhaseAttemptRecord {
+        id: row.get(0)?,
+        plan_id: row.get(1)?,
+        phase_id: row.get(2)?,
+        sequence: row.get(3)?,
+        trigger: row.get(4)?,
+        status: row.get(5)?,
+        provider_id: row.get(6)?,
+        model_id: row.get(7)?,
+        thinking_level: row.get(8)?,
+        implementation_chat_id: row.get(9)?,
+        agent_team_id: row.get(10)?,
+        agent_task_id: row.get(11)?,
+        commit_id: row.get(12)?,
+        error_message: row.get(13)?,
+        started_at: row.get(14)?,
+        completed_at: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -9650,6 +10125,13 @@ fn plan_step_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStepRecor
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
+}
+
+fn normalized_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn validate_plan_view(view: &str) -> Result<(), WorkspaceDatabaseError> {

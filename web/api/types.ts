@@ -179,6 +179,27 @@ export type PlanStep = {
   updatedAt: string;
 };
 
+export type PlanPhaseAttempt = {
+  id: string;
+  planId: string;
+  phaseId: string;
+  sequence: number;
+  trigger: string;
+  status: string;
+  providerId: string | null;
+  modelId: string | null;
+  thinkingLevel: string | null;
+  implementationChatId: string | null;
+  agentTeamId: string | null;
+  agentTaskId: string | null;
+  commitId: string | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type PlanPhase = {
   id: string;
   planId: string;
@@ -197,6 +218,7 @@ export type PlanPhase = {
   createdAt: string;
   updatedAt: string;
   steps: PlanStep[];
+  attempts: PlanPhaseAttempt[];
 };
 
 export type Plan = {

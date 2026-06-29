@@ -532,6 +532,30 @@ pub struct PlanPhaseRecord {
     pub created_at: String,
     pub updated_at: String,
     pub steps: Vec<PlanStepRecord>,
+    pub attempts: Vec<PlanPhaseAttemptRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPhaseAttemptRecord {
+    pub id: String,
+    pub plan_id: String,
+    pub phase_id: String,
+    pub sequence: i64,
+    pub trigger: String,
+    pub status: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub thinking_level: Option<String>,
+    pub implementation_chat_id: Option<String>,
+    pub agent_team_id: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub commit_id: Option<String>,
+    pub error_message: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

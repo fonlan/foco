@@ -3,8 +3,9 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
 };
 use foco_store::workspace::{
-    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, WorkspaceDatabase,
+    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanPhaseAttemptRecord,
+    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
+    WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +73,14 @@ pub(crate) struct UpdatePlanRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PlanActionRequest {
     action: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PlanPhaseRetryHttpRequest {
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    thinking_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +189,30 @@ pub(crate) struct PlanPhaseSummary {
     created_at: String,
     updated_at: String,
     steps: Vec<PlanStepSummary>,
+    attempts: Vec<PlanPhaseAttemptSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanPhaseAttemptSummary {
+    id: String,
+    plan_id: String,
+    phase_id: String,
+    sequence: i64,
+    trigger: String,
+    status: String,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    thinking_level: Option<String>,
+    implementation_chat_id: Option<String>,
+    agent_team_id: Option<String>,
+    agent_task_id: Option<String>,
+    commit_id: Option<String>,
+    error_message: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +494,30 @@ pub(crate) async fn plan_action(
     }))
 }
 
+pub(crate) async fn retry_plan_phase(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, plan_id, phase_id)): AxumPath<(String, String, String)>,
+    request: Option<Json<PlanPhaseRetryHttpRequest>>,
+) -> Result<Json<PlanResponse>, ApiError> {
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let plan = crate::plan_runtime::retry_plan_phase(
+        &state,
+        &workspace_id,
+        &plan_id,
+        &phase_id,
+        crate::plan_runtime::PlanPhaseRetryRequest {
+            provider_id: request.provider_id,
+            model_id: request.model_id,
+            thinking_level: request.thinking_level,
+        },
+    )
+    .await?;
+
+    Ok(Json(PlanResponse {
+        plan: plan_summary(plan),
+    }))
+}
+
 pub(crate) async fn plan_step_action(
     State(state): State<AppState>,
     AxumPath((workspace_id, plan_id, step_id)): AxumPath<(String, String, String)>,
@@ -619,6 +676,34 @@ fn plan_phase_summary(phase: PlanPhaseRecord) -> PlanPhaseSummary {
         created_at: phase.created_at,
         updated_at: phase.updated_at,
         steps: phase.steps.into_iter().map(plan_step_summary).collect(),
+        attempts: phase
+            .attempts
+            .into_iter()
+            .map(plan_phase_attempt_summary)
+            .collect(),
+    }
+}
+
+fn plan_phase_attempt_summary(attempt: PlanPhaseAttemptRecord) -> PlanPhaseAttemptSummary {
+    PlanPhaseAttemptSummary {
+        id: attempt.id,
+        plan_id: attempt.plan_id,
+        phase_id: attempt.phase_id,
+        sequence: attempt.sequence,
+        trigger: attempt.trigger,
+        status: attempt.status,
+        provider_id: attempt.provider_id,
+        model_id: attempt.model_id,
+        thinking_level: attempt.thinking_level,
+        implementation_chat_id: attempt.implementation_chat_id,
+        agent_team_id: attempt.agent_team_id,
+        agent_task_id: attempt.agent_task_id,
+        commit_id: attempt.commit_id,
+        error_message: attempt.error_message,
+        started_at: attempt.started_at,
+        completed_at: attempt.completed_at,
+        created_at: attempt.created_at,
+        updated_at: attempt.updated_at,
     }
 }
 

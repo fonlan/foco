@@ -21,9 +21,9 @@ use foco_store::{
         NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
         NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent,
         NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
-        NewWorkspaceSpecJob, PlanListFilter, PlanStepPatch, ScheduledTaskDueRunClaim,
-        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        NewWorkspaceSpecJob, PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch,
+        ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
         WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
@@ -830,6 +830,163 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
     assert!(phase.completed_at.is_none());
     assert_eq!(phase.steps[0].status, "pending");
     assert!(phase.steps[0].checked_at.is_none());
+}
+
+#[test]
+fn plan_phase_attempt_history_survives_retry_and_second_failure() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-attempt-history",
+            title: "Attempt history",
+            overview: "Keep failed attempts.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-attempt-history-phase-1",
+                title: "Phase one",
+                summary: "Retry me.",
+                steps: vec![NewPlanStep {
+                    id: "plan-attempt-history-step-1",
+                    title: "Do work",
+                    detail: "Complete change.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    database
+        .transition_plan("plan-attempt-history", "start")
+        .expect("start phase");
+    let first_attempt = database
+        .begin_plan_phase_attempt(
+            "plan-attempt-history",
+            "plan-attempt-history-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-a"),
+            Some("model-a"),
+            Some("low"),
+        )
+        .expect("begin first attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-plan-attempt-history-1",
+        "plan-attempt-history-1",
+    );
+    let first_task_id = AgentTaskId::new("agent-task-plan-attempt-history-1").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue first task");
+    database
+        .attach_plan_phase_attempt_run(
+            &first_attempt.id,
+            "chat-plan-attempt-history-1",
+            &team_id,
+            &first_task_id,
+        )
+        .expect("attach first attempt");
+    database
+        .fail_plan_phase_run(&first_task_id, "provider failed")
+        .expect("fail first attempt");
+
+    assert!(
+        database
+            .begin_plan_phase_attempt(
+                "plan-attempt-history",
+                "plan-attempt-history-phase-1",
+                PlanPhaseAttemptTrigger::Retry,
+                Some("provider-a"),
+                Some("model-a"),
+                Some("low"),
+            )
+            .is_ok(),
+        "failed phase can retry"
+    );
+    assert!(
+        database
+            .begin_plan_phase_attempt(
+                "plan-attempt-history",
+                "plan-attempt-history-phase-1",
+                PlanPhaseAttemptTrigger::Retry,
+                Some("provider-a"),
+                Some("model-a"),
+                Some("low"),
+            )
+            .is_err(),
+        "active retry is protected from duplicate dispatch"
+    );
+    let retry_attempt = database
+        .plan_phase_attempts_for_phase("plan-attempt-history-phase-1")
+        .expect("attempts")
+        .into_iter()
+        .find(|attempt| attempt.sequence == 1)
+        .expect("retry attempt");
+    assert_eq!(retry_attempt.trigger, "retry");
+    assert_eq!(retry_attempt.provider_id.as_deref(), Some("provider-a"));
+    assert_eq!(retry_attempt.model_id.as_deref(), Some("model-a"));
+    assert_eq!(retry_attempt.thinking_level.as_deref(), Some("low"));
+
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-plan-attempt-history-2",
+        "plan-attempt-history-2",
+    );
+    let second_task_id = AgentTaskId::new("agent-task-plan-attempt-history-2").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &second_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue second task");
+    database
+        .attach_plan_phase_attempt_run(
+            &retry_attempt.id,
+            "chat-plan-attempt-history-2",
+            &team_id,
+            &second_task_id,
+        )
+        .expect("attach retry attempt");
+    database
+        .fail_plan_phase_run(&second_task_id, "still failed")
+        .expect("fail retry attempt");
+
+    let attempts = database
+        .plan_phase_attempts_for_phase("plan-attempt-history-phase-1")
+        .expect("attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].error_message.as_deref(),
+        Some("provider failed")
+    );
+    assert_eq!(attempts[1].status, "failed");
+    assert_eq!(attempts[1].error_message.as_deref(), Some("still failed"));
+    assert!(
+        database
+            .begin_plan_phase_attempt(
+                "plan-attempt-history",
+                "plan-attempt-history-phase-1",
+                PlanPhaseAttemptTrigger::ModelOverrideRetry,
+                Some("provider-b"),
+                Some("model-b"),
+                Some("high"),
+            )
+            .is_ok(),
+        "failed retry can be retried again with override config"
+    );
 }
 
 #[test]
