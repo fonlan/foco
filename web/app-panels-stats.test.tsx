@@ -1010,7 +1010,7 @@ describe("app-panels-stats verification surfaces", () => {
         {
           agentTaskId: "agent-task-merged-1",
           agentTeamId: "agent-team-merged-1",
-          commitId: "abc1234",
+          commitId: "1111111aaa2222",
           completedAt: timestamp,
           createdAt: timestamp,
           errorMessage: null,
@@ -1029,7 +1029,7 @@ describe("app-panels-stats verification surfaces", () => {
         {
           agentTaskId: "agent-task-merged-2",
           agentTeamId: "agent-team-merged-2",
-          commitId: null,
+          commitId: "abc1234def5678",
           completedAt: timestamp,
           createdAt: timestamp,
           errorMessage: null,
@@ -1058,6 +1058,23 @@ describe("app-panels-stats verification surfaces", () => {
       status: "implemented",
       title: "Merged implementation plan",
       updatedAt: timestamp,
+    };
+    const noCommitImplementedPlan = {
+      ...implementedPlan,
+      id: "plan-implemented-no-commit",
+      phases: implementedPlan.phases.map((phase) => ({
+        ...phase,
+        commitId: phase.sequence === 0 ? "   " : null,
+        id: `${phase.id}-no-commit`,
+        planId: "plan-implemented-no-commit",
+        steps: phase.steps.map((step) => ({
+          ...step,
+          id: `${step.id}-no-commit`,
+          phaseId: `${phase.id}-no-commit`,
+          planId: "plan-implemented-no-commit",
+        })),
+      })),
+      title: "Implemented plan without commit",
     };
     const statusColorPlans = [
       {
@@ -1142,8 +1159,8 @@ describe("app-panels-stats verification surfaces", () => {
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [implementedPlan, ...statusColorPlans],
-          totalCount: 5,
+          plans: [implementedPlan, noCommitImplementedPlan, ...statusColorPlans],
+          totalCount: 6,
           totalPages: 1,
         });
       }
@@ -1158,10 +1175,22 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Plan" }));
 
     expect(await screen.findByText("Merged implementation plan")).toBeInTheDocument();
-    expect(screen.getByText("Merged")).toHaveAttribute(
+    const mergedCommitBadge = screen.getByText("abc1234");
+    expect(mergedCommitBadge).toHaveAttribute(
       "title",
       "Merged into shared workspace",
     );
+    expect(screen.queryByText("Merged")).not.toBeInTheDocument();
+
+    const noCommitPlanCard = screen
+      .getByText("Implemented plan without commit")
+      .closest("article");
+    expect(noCommitPlanCard).not.toBeNull();
+    expect(
+      within(noCommitPlanCard as HTMLElement).queryByTitle(
+        "Merged into shared workspace",
+      ),
+    ).not.toBeInTheDocument();
 
     function expectPlanStatusTone(
       planTitle: string,

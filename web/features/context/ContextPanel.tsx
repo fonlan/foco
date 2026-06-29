@@ -750,7 +750,7 @@ function ContextPlanTab({
               );
               const action = primaryPlanAction(plan.status);
               const actionKey = action ? `${action}:${plan.id}` : null;
-              const isMergedIntoSharedWorkspace = planMergedIntoSharedWorkspace(plan);
+              const mergedCommitId = planMergedIntoSharedWorkspace(plan);
 
               return (
                 <article className="context-memory-item" key={plan.id}>
@@ -762,13 +762,13 @@ function ContextPlanTab({
                       <span className="context-memory-kind">
                         {completedSteps}/{totalSteps}
                       </span>
-                      {isMergedIntoSharedWorkspace ? (
+                      {mergedCommitId ? (
                         <span
                           className="context-memory-pin inline-flex items-center gap-1"
                           title={t("Merged into shared workspace")}
                         >
                           <CheckCircle2 aria-hidden="true" className="size-3" />
-                          {t("Merged")}
+                          {mergedCommitId}
                         </span>
                       ) : null}
                     </div>
@@ -2310,13 +2310,22 @@ function planActionLabel(action: string) {
 }
 
 function planMergedIntoSharedWorkspace(plan: Plan) {
-  return (
-    plan.status === "implemented" &&
-    plan.phases.length > 0 &&
-    plan.phases.every(
+  if (
+    plan.status !== "implemented" ||
+    plan.phases.length === 0 ||
+    !plan.phases.every(
       (phase) => phase.status === "completed" && phase.implementationChatId,
     )
-  );
+  ) {
+    return null;
+  }
+
+  const commitId = [...plan.phases]
+    .reverse()
+    .find((phase) => phase.commitId?.trim())
+    ?.commitId?.trim();
+
+  return commitId ? commitId.slice(0, 7) : null;
 }
 
 function planStatusLabel(status: string) {
