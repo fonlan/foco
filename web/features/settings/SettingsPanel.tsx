@@ -8797,7 +8797,7 @@ export function SettingsPanel({
                           </button>
                         </div>
                         <p className="mt-2 text-xs leading-5 text-stone-500">
-                          {t("Override top-level request headers or body fields for this provider.")}
+                          {t("Override request headers or body field paths for this provider.")}
                         </p>
                         <div className="mt-3 space-y-3">
                           {providerForm.requestOverrides.length ? (
@@ -8829,7 +8829,7 @@ export function SettingsPanel({
                                     onChange={(value) =>
                                       updateProviderRequestOverride(overrideIndex, { name: value })
                                     }
-                                    placeholder={overrideRule.target === "header" ? "User-Agent" : "model"}
+                                    placeholder={overrideRule.target === "header" ? "User-Agent" : "text.verbosity"}
                                     value={overrideRule.name}
                                   />
                                   <label className="block">
