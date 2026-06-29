@@ -3289,41 +3289,6 @@ impl PreparedChatContext {
                                     events.push(captured_event(&event));
                                     yield event;
                                 }
-                                if let Some(message) = plan_mode_missing_plan_update_message(
-                                    self.session_mode.as_deref(),
-                                    &executed_tool_calls,
-                                ) {
-                                    let event = ChatSseEvent::Error {
-                                        message: message.to_string(),
-                                    };
-                                    events.push(captured_event(&event));
-                                    let outcome = failed_chat_audit_outcome(
-                                        &self,
-                                        started_at,
-                                        &mut events,
-                                        message,
-                                        None,
-                                    )
-                                    .await;
-
-                                    if let Err(persist_error) = persist_chat_result(
-                                        &self,
-                                        &request_started_at,
-                                        outcome,
-                                        &events,
-                                        None,
-                                        None,
-                                        &executed_tool_calls,
-                                    ) {
-                                        yield ChatSseEvent::Error {
-                                            message: persist_error.message,
-                                        };
-                                    } else {
-                                        yield event;
-                                    }
-
-                                    return;
-                                }
                                 let captured_complete = captured_event(&complete_event);
                                 events.push(captured_complete.clone());
                                 let completed_at = utc_timestamp();
@@ -5394,20 +5359,6 @@ fn tool_results_affect_plans(tool_results: &[ExecutedToolCall]) -> bool {
                 CREATE_PLAN_TOOL | UPDATE_PLAN_TOOL | UPDATE_PLAN_STEP_TOOL
             )
     })
-}
-
-fn plan_mode_missing_plan_update_message(
-    session_mode: Option<&str>,
-    tool_results: &[ExecutedToolCall],
-) -> Option<&'static str> {
-    if session_mode == Some("plan") && !tool_results_affect_plans(tool_results) {
-        // ponytail: trust only successful built-in plan tool results; add external MCP plan tools here if they become authoritative.
-        Some(
-            "Plan Mode cannot finish successfully until it creates or updates a workspace Plan. Continue the session and call create_plan or update_plan before finishing.",
-        )
-    } else {
-        None
-    }
 }
 
 fn agent_team_refresh_event_for_context(

@@ -95,7 +95,7 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
 }
 
 #[test]
-fn plan_mode_missing_plan_update_requires_successful_plan_tool_result() {
+fn tool_results_affect_plans_requires_successful_plan_tool_result() {
     let read_file_result = ExecutedToolCall {
         id: "call-1".to_string(),
         name: READ_FILE_TOOL.to_string(),
@@ -116,18 +116,10 @@ fn plan_mode_missing_plan_update_requires_successful_plan_tool_result() {
         ..read_file_result.clone()
     };
 
-    assert!(plan_mode_missing_plan_update_message(Some("plan"), &[]).is_some());
-    assert!(
-        plan_mode_missing_plan_update_message(Some("plan"), &[read_file_result.clone()]).is_some()
-    );
-    assert!(
-        plan_mode_missing_plan_update_message(Some("plan"), &[failed_create_plan_result]).is_some()
-    );
-    assert!(plan_mode_missing_plan_update_message(Some("chat"), &[read_file_result]).is_none());
-    assert!(
-        plan_mode_missing_plan_update_message(Some("plan"), &[successful_update_plan_result])
-            .is_none()
-    );
+    assert!(!tool_results_affect_plans(&[]));
+    assert!(!tool_results_affect_plans(&[read_file_result]));
+    assert!(!tool_results_affect_plans(&[failed_create_plan_result]));
+    assert!(tool_results_affect_plans(&[successful_update_plan_result]));
 }
 
 fn test_provider_kind() -> foco_providers::ProviderKind {
