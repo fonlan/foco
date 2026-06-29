@@ -1776,13 +1776,6 @@ function ContextStatsTab({
               emptyLabel={t("No context usage yet.")}
               valueFormatter={(value) => formatNumber(value, language)}
             />
-            <ContextStatsRows
-              emptyLabel={t("No context usage yet.")}
-              rows={contextChart.map((item) => ({
-                label: item.label,
-                value: formatNumber(item.value, language),
-              }))}
-            />
           </>
         ) : (
           <div className="context-empty-inline">{t("Context usage unavailable.")}</div>

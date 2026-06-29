@@ -2083,6 +2083,42 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBe(false);
   });
 
+  it("shows context usage only once in the stats context mix", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(await screen.findByText("Tool run"));
+    await user.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+
+    await user.click(await screen.findByRole("tab", { name: "Stats" }));
+
+    const contextMix = screen.getByText("Context mix").parentElement!;
+    expect(await within(contextMix).findByText("71,000 / 110,960")).toBeInTheDocument();
+    expect(contextMix.querySelector(".context-mini-chart-bars")).not.toBeNull();
+    expect(contextMix.querySelector(".context-stats-rows")).toBeNull();
+    expect(within(contextMix).getAllByText("History")).toHaveLength(1);
+    expect(within(contextMix).getAllByText("Current user")).toHaveLength(1);
+    expect(within(contextMix).getAllByText("32,000")).toHaveLength(1);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("updates active chat code change statistics from git diff refresh events", async () => {
     const user = userEvent.setup();
     window.history.replaceState(null, "", "/workspace-1/chat-1");
