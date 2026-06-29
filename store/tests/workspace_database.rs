@@ -1100,6 +1100,174 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
         Some("shared-merge-commit")
     );
     assert!(completed.phases[0].error_message.is_none());
+    assert!(completed.shared_merge_commit_id.is_none());
+
+    let merged = database
+        .record_plan_shared_merge_commit("plan-merge-running", "shared-head-commit")
+        .expect("record shared merge commit");
+    assert_eq!(merged.status, "implemented");
+    assert_eq!(
+        merged.shared_merge_commit_id.as_deref(),
+        Some("shared-head-commit")
+    );
+}
+
+#[test]
+fn plan_phase_merge_run_failure_marks_plan_failed_without_shared_merge_commit() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let merge_task_id = attach_test_plan_merge_run(
+        &mut database,
+        "plan-merge-failed",
+        "plan-merge-failed-phase",
+        "merge-failed",
+    );
+    let failed = database
+        .fail_plan_phase_run(&merge_task_id, "merge task failed")
+        .expect("fail merge task")
+        .expect("plan");
+
+    assert_eq!(failed.status, "failed");
+    assert!(failed.active_phase_id.is_none());
+    assert_eq!(failed.error_message.as_deref(), Some("merge task failed"));
+    assert!(failed.shared_merge_commit_id.is_none());
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(
+        failed.phases[0].error_message.as_deref(),
+        Some("merge task failed")
+    );
+    assert!(failed.phases[0].commit_id.is_none());
+}
+
+#[test]
+fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_merge_commit() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let merge_task_id = attach_test_plan_merge_run(
+        &mut database,
+        "plan-merge-cancelled",
+        "plan-merge-cancelled-phase",
+        "merge-cancelled",
+    );
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &AgentTeamId::new("agent-team-merge-cancelled-merge").expect("merge team id"),
+            task_id: &merge_task_id,
+            expected_status: AgentTaskStatus::Queued,
+            transition: AgentTaskTransition::Cancel,
+            result_json: None,
+            error_json: Some(r#"{"message":"merge task cancelled"}"#),
+            interruption_reason: None,
+        })
+        .expect("cancel merge task");
+    let cancelled = database
+        .fail_plan_phase_run(&merge_task_id, "merge task cancelled")
+        .expect("fail cancelled merge task")
+        .expect("plan");
+    assert_eq!(cancelled.status, "failed");
+    assert!(cancelled.shared_merge_commit_id.is_none());
+    assert_eq!(cancelled.phases[0].status, "failed");
+    assert_eq!(
+        cancelled.phases[0].error_message.as_deref(),
+        Some("merge task cancelled")
+    );
+
+    let merge_task_id = attach_test_plan_merge_run(
+        &mut database,
+        "plan-merge-interrupted",
+        "plan-merge-interrupted-phase",
+        "merge-interrupted",
+    );
+    let merge_team_id = AgentTeamId::new("agent-team-merge-interrupted-merge").expect("team id");
+    database
+        .claim_runnable_agent_task(
+            &merge_team_id,
+            &merge_task_id,
+            &AgentAttemptId::new("agent-attempt-merge-interrupted").expect("attempt id"),
+        )
+        .expect("claim merge task")
+        .expect("claimed merge task");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &merge_team_id,
+            task_id: &merge_task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Interrupt,
+            result_json: None,
+            error_json: Some(r#"{"message":"merge task interrupted"}"#),
+            interruption_reason: Some("backend stopped"),
+        })
+        .expect("interrupt merge task");
+    let interrupted = database
+        .fail_plan_phase_run(&merge_task_id, "merge task interrupted")
+        .expect("fail interrupted merge task")
+        .expect("plan");
+    assert_eq!(interrupted.status, "failed");
+    assert!(interrupted.shared_merge_commit_id.is_none());
+    assert_eq!(interrupted.phases[0].status, "failed");
+    assert_eq!(
+        interrupted.phases[0].error_message.as_deref(),
+        Some("merge task interrupted")
+    );
+}
+
+#[test]
+fn fast_forward_failure_without_merge_dispatch_marks_failed_and_archive_preserves_error() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-archive-failed-merge",
+            title: "Archive failed merge",
+            overview: "Completed means user archive, not shared merge.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-archive-failed-merge-phase",
+                title: "Phase one",
+                summary: "Fails during merge.",
+                steps: vec![NewPlanStep {
+                    id: "plan-archive-failed-merge-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["failure remains visible".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-archive-failed-merge", "start")
+        .expect("start plan");
+    let failed = database
+        .fail_plan_phase_by_id(
+            "plan-archive-failed-merge",
+            "plan-archive-failed-merge-phase",
+            "fast-forward failed and merge task was not dispatched",
+        )
+        .expect("fail phase");
+    assert_eq!(failed.status, "failed");
+    assert!(failed.shared_merge_commit_id.is_none());
+
+    let archived = database
+        .transition_plan("plan-archive-failed-merge", "mark_complete")
+        .expect("archive failed plan");
+    assert_eq!(archived.status, "completed");
+    assert!(archived.completed_by_user_at.is_some());
+    assert_eq!(
+        archived.error_message.as_deref(),
+        Some("fast-forward failed and merge task was not dispatched")
+    );
+    assert_eq!(
+        archived.phases[0].error_message.as_deref(),
+        Some("fast-forward failed and merge task was not dispatched")
+    );
+    assert!(archived.shared_merge_commit_id.is_none());
 }
 
 #[test]
@@ -6693,6 +6861,102 @@ fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
     assert_eq!(request.agent_instance_id, None);
     assert_eq!(request.agent_task_id, None);
     assert_eq!(request.agent_attempt_id, None);
+}
+
+fn attach_test_plan_merge_run(
+    database: &mut WorkspaceDatabase,
+    plan_id: &str,
+    phase_id: &str,
+    suffix: &str,
+) -> AgentTaskId {
+    database
+        .create_plan(NewPlan {
+            id: plan_id,
+            title: "Plan merge state",
+            overview: "A failed fast-forward should leave an auditable state.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: phase_id,
+                title: "Phase one",
+                summary: "Needs merge automation.",
+                steps: vec![NewPlanStep {
+                    id: &format!("{phase_id}-step"),
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["merge state is correct".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan(plan_id, "start")
+        .expect("start plan");
+
+    let (phase_team_id, phase_instance_id) = create_test_agent_team(
+        database,
+        &format!("chat-{suffix}-phase"),
+        &format!("{suffix}-phase"),
+    );
+    let phase_task_id = AgentTaskId::new(format!("agent-task-{suffix}-phase")).expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &phase_task_id,
+            team_id: &phase_team_id,
+            owner_instance_id: &phase_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue phase task");
+    database
+        .attach_plan_phase_run(
+            plan_id,
+            phase_id,
+            &format!("chat-{suffix}-phase"),
+            &phase_team_id,
+            &phase_task_id,
+        )
+        .expect("attach phase task");
+    database
+        .complete_plan_phase_run(&phase_task_id, Some("worktree-commit"))
+        .expect("complete phase")
+        .expect("plan");
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(plan_id, phase_id, "shared workspace HEAD changed")
+            .expect("record merge attempt")
+    );
+
+    let (merge_team_id, merge_instance_id) = create_test_agent_team(
+        database,
+        &format!("chat-{suffix}-merge"),
+        &format!("{suffix}-merge"),
+    );
+    let merge_task_id = AgentTaskId::new(format!("agent-task-{suffix}-merge")).expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &merge_task_id,
+            team_id: &merge_team_id,
+            owner_instance_id: &merge_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue merge task");
+    let running = database
+        .attach_plan_phase_merge_run(
+            plan_id,
+            phase_id,
+            &format!("chat-{suffix}-merge"),
+            &merge_team_id,
+            &merge_task_id,
+        )
+        .expect("attach merge task");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.phases[0].status, "running");
+    assert!(running.shared_merge_commit_id.is_none());
+    merge_task_id
 }
 
 fn create_test_agent_team(
