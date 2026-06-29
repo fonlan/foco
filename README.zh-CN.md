@@ -116,10 +116,13 @@ npm test
 常用的局部命令：
 
 ```bash
+npm run test:backend
 cargo test --workspace
 npm run test -w web
 npm run typecheck -w web
 ```
+
+`npm run test:backend` 会把 Cargo jobs 和 Rust 测试线程数限制为 4，用于低负载的本地后端测试。需要让机器更空闲时，可以使用 `npm run test:backend:calm`，它会把两者都限制为 2。
 
 ### Release 构建
 

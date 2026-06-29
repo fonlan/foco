@@ -116,10 +116,13 @@ This runs the Rust workspace tests, frontend Vitest suite, and TypeScript typech
 Useful focused commands:
 
 ```bash
+npm run test:backend
 cargo test --workspace
 npm run test -w web
 npm run typecheck -w web
 ```
+
+`npm run test:backend` caps Cargo jobs and Rust test threads at 4 for a lower-load local backend test run. Use `npm run test:backend:calm` to cap both at 2 when you want the machine to stay more responsive.
 
 ### Release Build
 
