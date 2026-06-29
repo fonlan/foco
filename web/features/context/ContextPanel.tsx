@@ -709,7 +709,12 @@ function ContextPlanTab({
     }
   };
 
-  const openWorktreeAudit = () => {
+  const toggleWorktreeAudit = () => {
+    if (showWorktreeAudit) {
+      setShowWorktreeAudit(false);
+      return;
+    }
+
     setShowWorktreeAudit(true);
     void refreshWorktreeAudit();
   };
@@ -756,13 +761,7 @@ function ContextPlanTab({
           aria-label={t("Audit plan worktrees")}
           className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
           disabled={isLoadingWorktreeAudit}
-          onClick={() => {
-            if (showWorktreeAudit) {
-              void refreshWorktreeAudit();
-            } else {
-              openWorktreeAudit();
-            }
-          }}
+          onClick={toggleWorktreeAudit}
           title={t("Audit plan worktrees")}
           type="button"
         >
@@ -785,9 +784,8 @@ function ContextPlanTab({
           operationKey={operationKey}
           recoveryNote={worktreeAudit?.recoveryNote ?? null}
         />
-      ) : null}
-
-      <div className="context-list-panel panel-scroll">
+      ) : (
+        <div className="context-list-panel panel-scroll">
         {isLoading && plans.length === 0 ? (
           <div className="context-empty-state">
             <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
@@ -1020,7 +1018,8 @@ function ContextPlanTab({
             })}
           </div>
         ) : null}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1045,7 +1044,7 @@ function PlanWorktreeAuditPanel({
   const { t } = useI18n();
 
   return (
-    <div className="border-b border-stone-200 bg-stone-50/80 px-3 py-3">
+    <div className="panel-scroll flex min-h-0 flex-1 flex-col overflow-y-auto border-b border-stone-200 bg-stone-50/80 px-3 py-3">
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="min-w-0">
           <h3 className="truncate text-xs font-semibold text-stone-900">
@@ -1081,7 +1080,7 @@ function PlanWorktreeAuditPanel({
         </div>
       ) : null}
       {items.length > 0 ? (
-        <div className="space-y-2">
+        <div className="min-h-0 space-y-2">
           {items.map((item) => {
             const cleanupKey = `cleanup-worktree:${item.agentInstanceId}`;
             const isCleanupBusy = operationKey === cleanupKey;
