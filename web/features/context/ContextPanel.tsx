@@ -26,11 +26,13 @@ import {
   Sparkles,
   Trash2,
   Undo2,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import {
   memo,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ComponentProps,
@@ -43,6 +45,8 @@ import {
 import type {
   AppLanguageId,
   ChatStatisticsResponse,
+  ConfiguredModelSummary,
+  ConfiguredProviderSummary,
   ContextMemoryState,
   ContextUsageResponse,
   GitDiffResponse,
@@ -78,6 +82,12 @@ import { useI18n } from "../../shared/i18n";
 export type ContextPanelTab = "todo" | "plan" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
 
 type PanelNumberSetter = (value: SetStateAction<number>) => void;
+
+export type PlanPhaseRetryOverride = {
+  modelId: string;
+  providerId: string;
+  thinkingLevel: string | null;
+};
 
 export function ResponsiveContextPanelIcon({
   className,
@@ -132,6 +142,7 @@ const ContextPanel = memo(function ContextPanel({
   onPlanAutoRunToggle,
   onPlanPhaseRetry,
   onOpenPlanPhaseChat,
+  onPlanPhaseRetryWithOverride,
   onReloadWorkspaceSpec,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
@@ -146,7 +157,10 @@ const ContextPanel = memo(function ContextPanel({
   onWorkspaceSpecSettingsChange,
   selectedPath,
   selectedSkillPrefix,
+  availableModels,
   plans,
+  providers,
+  thinkingLevels,
   planError,
   planOperationKey,
   todoGraph,
@@ -204,6 +218,13 @@ const ContextPanel = memo(function ContextPanel({
     agentTaskId: string,
     implementationChatId: string | null,
   ) => void;
+  onPlanPhaseRetryWithOverride: (
+    planId: string,
+    phaseId: string,
+    agentTaskId: string,
+    implementationChatId: string | null,
+    override: PlanPhaseRetryOverride,
+  ) => void;
   onOpenPlanPhaseChat: (chatId: string) => void;
   onReloadWorkspaceSpec: () => void;
   onRefreshDiff: () => void;
@@ -219,7 +240,10 @@ const ContextPanel = memo(function ContextPanel({
   onWorkspaceSpecSettingsChange: (enabled: boolean, injectEnabled: boolean) => void;
   selectedPath: string | null;
   selectedSkillPrefix: SelectedSkillPrefixResolver;
+  availableModels: ConfiguredModelSummary[];
   plans: Plan[];
+  providers: ConfiguredProviderSummary[];
+  thinkingLevels: { label: string; value: string }[];
   planError: string | null;
   planOperationKey: string | null;
   todoGraph: TodoGraphResponse | null;
@@ -292,8 +316,12 @@ const ContextPanel = memo(function ContextPanel({
             onLoadWorktreeAudit={onLoadPlanWorktreeAudit}
             onOpenPhaseChat={onOpenPlanPhaseChat}
             onPhaseRetry={onPlanPhaseRetry}
+            onPhaseRetryWithOverride={onPlanPhaseRetryWithOverride}
             operationKey={planOperationKey}
+            availableModels={availableModels}
             plans={plans}
+            providers={providers}
+            thinkingLevels={thinkingLevels}
           />
         ) : null}
 
@@ -662,8 +690,12 @@ function ContextPlanTab({
   onLoadWorktreeAudit,
   onOpenPhaseChat,
   onPhaseRetry,
+  onPhaseRetryWithOverride,
   operationKey,
+  availableModels,
   plans,
+  providers,
+  thinkingLevels,
 }: {
   autoRunBusy: boolean;
   autoRunEnabled: boolean;
@@ -682,8 +714,18 @@ function ContextPlanTab({
     agentTaskId: string,
     implementationChatId: string | null,
   ) => void;
+  onPhaseRetryWithOverride: (
+    planId: string,
+    phaseId: string,
+    agentTaskId: string,
+    implementationChatId: string | null,
+    override: PlanPhaseRetryOverride,
+  ) => void;
   operationKey: string | null;
+  availableModels: ConfiguredModelSummary[];
   plans: Plan[];
+  providers: ConfiguredProviderSummary[];
+  thinkingLevels: { label: string; value: string }[];
 }) {
   const { language, t } = useI18n();
   const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
@@ -693,6 +735,11 @@ function ContextPlanTab({
   const [worktreeAuditError, setWorktreeAuditError] = useState<string | null>(null);
   const [isLoadingWorktreeAudit, setIsLoadingWorktreeAudit] = useState(false);
   const [showWorktreeAudit, setShowWorktreeAudit] = useState(false);
+  const [retryMenuPhaseKey, setRetryMenuPhaseKey] = useState<string | null>(null);
+  const [overrideRetryPhase, setOverrideRetryPhase] = useState<{
+    plan: Plan;
+    phase: PlanPhase;
+  } | null>(null);
   const showAutoRunBusy = autoRunEnabled && autoRunBusy;
   const runningPlan = plans.find((plan) => plan.status === "running") ?? null;
   const runningPlanId = runningPlan?.id ?? null;
@@ -718,6 +765,20 @@ function ContextPlanTab({
     runningPlanArticle.scrollIntoView({ block: "center", inline: "nearest" });
     lastScrolledRunningPlanId.current = runningPlanId;
   }, [runningPlanId, showWorktreeAudit]);
+
+  useEffect(() => {
+    if (!retryMenuPhaseKey) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setRetryMenuPhaseKey(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [retryMenuPhaseKey]);
 
   const refreshWorktreeAudit = async () => {
     setIsLoadingWorktreeAudit(true);
@@ -933,6 +994,8 @@ function ContextPlanTab({
                       const retryOperationKey = phase.agentTaskId
                         ? planPhaseRetryOperationKey(phase.agentTaskId)
                         : null;
+                      const isRetrying = operationKey === retryOperationKey;
+                      const isRetryMenuOpen = retryMenuPhaseKey === phaseKey;
                       const implementationChatId = phase.implementationChatId;
 
                       return (
@@ -990,30 +1053,71 @@ function ContextPlanTab({
                                 </button>
                               ) : null}
                               {canRetryPhase ? (
-                                <button
-                                  aria-label={t("Retry plan phase")}
-                                  className="inline-flex size-7 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                                  disabled={operationKey !== null}
-                                  onClick={() => {
-                                    if (!phase.agentTaskId) {
-                                      return;
-                                    }
-                                    onPhaseRetry(
-                                      plan.id,
-                                      phase.id,
-                                      phase.agentTaskId,
-                                      phase.implementationChatId,
-                                    );
-                                  }}
-                                  title={t("Retry plan phase")}
-                                  type="button"
-                                >
-                                  {operationKey === retryOperationKey ? (
-                                    <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                                  ) : (
-                                    <RefreshCw aria-hidden="true" className="size-3.5" />
-                                  )}
-                                </button>
+                                <div className="relative inline-flex h-7 shrink-0 rounded-md shadow-sm">
+                                  <button
+                                    aria-label={t("Retry plan phase")}
+                                    className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    disabled={operationKey !== null}
+                                    onClick={() => {
+                                      if (!phase.agentTaskId) {
+                                        return;
+                                      }
+                                      setRetryMenuPhaseKey(null);
+                                      onPhaseRetry(
+                                        plan.id,
+                                        phase.id,
+                                        phase.agentTaskId,
+                                        phase.implementationChatId,
+                                      );
+                                    }}
+                                    title={isRetrying ? t("Retrying phase...") : t("Retry plan phase")}
+                                    type="button"
+                                  >
+                                    {isRetrying ? (
+                                      <LoaderCircle aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+                                    ) : (
+                                      <RefreshCw aria-hidden="true" className="size-3.5 shrink-0" />
+                                    )}
+                                    <span className="truncate">
+                                      {isRetrying ? t("Retrying...") : t("Retry")}
+                                    </span>
+                                  </button>
+                                  <button
+                                    aria-expanded={isRetryMenuOpen}
+                                    aria-haspopup="menu"
+                                    aria-label={t("Retry phase options")}
+                                    className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    disabled={operationKey !== null}
+                                    onClick={() => {
+                                      setRetryMenuPhaseKey((current) =>
+                                        current === phaseKey ? null : phaseKey,
+                                      );
+                                    }}
+                                    title={t("Retry phase options")}
+                                    type="button"
+                                  >
+                                    <ChevronDown aria-hidden="true" className="size-3.5" />
+                                  </button>
+                                  {isRetryMenuOpen ? (
+                                    <div
+                                      className="absolute right-0 top-8 z-20 min-w-40 rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg"
+                                      role="menu"
+                                    >
+                                      <button
+                                        className="flex w-full items-center gap-2 px-3 py-2 text-left font-medium text-stone-700 hover:bg-stone-50"
+                                        onClick={() => {
+                                          setRetryMenuPhaseKey(null);
+                                          setOverrideRetryPhase({ plan, phase });
+                                        }}
+                                        role="menuitem"
+                                        type="button"
+                                      >
+                                        <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+                                        <span className="truncate">{t("Retry with another model...")}</span>
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                </div>
                               ) : null}
                             </div>
                           </div>
@@ -1050,8 +1154,316 @@ function ContextPlanTab({
         ) : null}
         </div>
       )}
+      {overrideRetryPhase ? (
+        <PlanPhaseRetryDialog
+          availableModels={availableModels}
+          isSubmitting={operationKey !== null}
+          onClose={() => setOverrideRetryPhase(null)}
+          onSubmit={(override) => {
+            const phase = overrideRetryPhase.phase;
+            if (!phase.agentTaskId) {
+              return;
+            }
+            onPhaseRetryWithOverride(
+              overrideRetryPhase.plan.id,
+              phase.id,
+              phase.agentTaskId,
+              phase.implementationChatId,
+              override,
+            );
+            setOverrideRetryPhase(null);
+          }}
+          phase={overrideRetryPhase.phase}
+          providers={providers}
+          thinkingLevels={thinkingLevels}
+        />
+      ) : null}
     </div>
   );
+}
+
+function PlanPhaseRetryDialog({
+  availableModels,
+  isSubmitting,
+  onClose,
+  onSubmit,
+  phase,
+  providers,
+  thinkingLevels,
+}: {
+  availableModels: ConfiguredModelSummary[];
+  isSubmitting: boolean;
+  onClose: () => void;
+  onSubmit: (override: PlanPhaseRetryOverride) => void;
+  phase: PlanPhase;
+  providers: ConfiguredProviderSummary[];
+  thinkingLevels: { label: string; value: string }[];
+}) {
+  const { t } = useI18n();
+  const selectableModels = useMemo(
+    () => availableModels.filter((model) => model.enabled && model.canEnable),
+    [availableModels],
+  );
+  const [modelId, setModelId] = useState(() =>
+    defaultPlanPhaseRetryModelId(phase, selectableModels),
+  );
+  const selectedModel =
+    selectableModels.find((model) => model.id === modelId) ?? null;
+  const providerOptions = selectedModel
+    ? selectedModel.providerIds.filter((providerId) =>
+        providers.some((provider) => provider.id === providerId && provider.enabled),
+      )
+    : [];
+  const [providerId, setProviderId] = useState(() =>
+    defaultPlanPhaseRetryProviderId(phase, selectedModel, providers),
+  );
+  const supportsThinking = Boolean(selectedModel?.supportsThinking && thinkingLevels.length > 0);
+  const [thinkingLevel, setThinkingLevel] = useState(() =>
+    supportsThinking ? selectedModel?.thinkingLevel ?? "" : "",
+  );
+  const [formError, setFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const nextModel = selectableModels.find((model) => model.id === modelId) ?? null;
+    if (!nextModel) {
+      const fallbackModelId = defaultPlanPhaseRetryModelId(phase, selectableModels);
+      setModelId(fallbackModelId);
+      return;
+    }
+
+    const enabledProviderIds = nextModel.providerIds.filter((id) =>
+      providers.some((provider) => provider.id === id && provider.enabled),
+    );
+    if (!enabledProviderIds.includes(providerId)) {
+      setProviderId(nextModel.activeProviderId && enabledProviderIds.includes(nextModel.activeProviderId)
+        ? nextModel.activeProviderId
+        : enabledProviderIds[0] ?? "");
+    }
+    if (!nextModel.supportsThinking) {
+      setThinkingLevel("");
+    }
+  }, [modelId, phase, providerId, providers, selectableModels]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  const submitRetry = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!modelId || !providerId) {
+      setFormError(t("Select an enabled model before retrying."));
+      return;
+    }
+    onSubmit({
+      modelId,
+      providerId,
+      thinkingLevel: supportsThinking && thinkingLevel ? thinkingLevel : null,
+    });
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="plan-phase-retry-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-md overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="min-w-0">
+            <h2
+              className="truncate text-base font-semibold text-stone-950"
+              id="plan-phase-retry-dialog-title"
+            >
+              {t("Retry with another model")}
+            </h2>
+            <p className="truncate text-xs text-stone-500">{phase.title}</p>
+          </div>
+          <button
+            aria-label={t("Close retry dialog")}
+            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title={t("Close")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+        <form className="space-y-4 px-4 py-4" onSubmit={submitRetry}>
+          <PlanRetrySelect
+            autoFocus
+            disabled={isSubmitting || selectableModels.length === 0}
+            label={t("Model")}
+            onChange={(value) => {
+              const nextModel = selectableModels.find((model) => model.id === value) ?? null;
+              setModelId(value);
+              setFormError(null);
+              setProviderId(defaultPlanPhaseRetryProviderId(phase, nextModel, providers));
+              setThinkingLevel(nextModel?.supportsThinking ? nextModel.thinkingLevel ?? "" : "");
+            }}
+            value={modelId}
+          >
+            <option value="">{t("Select model")}</option>
+            {selectableModels.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.displayName}
+              </option>
+            ))}
+          </PlanRetrySelect>
+          <PlanRetrySelect
+            disabled={isSubmitting || providerOptions.length === 0}
+            label={t("Provider")}
+            onChange={(value) => {
+              setProviderId(value);
+              setFormError(null);
+            }}
+            value={providerId}
+          >
+            <option value="">{t("Select provider")}</option>
+            {providerOptions.map((id) => (
+              <option key={id} value={id}>
+                {providerDisplayName(id, providers)}
+              </option>
+            ))}
+          </PlanRetrySelect>
+          {supportsThinking ? (
+            <PlanRetrySelect
+              disabled={isSubmitting}
+              label={t("Thinking level")}
+              onChange={setThinkingLevel}
+              value={thinkingLevel}
+            >
+              <option value="">{t("Model default")}</option>
+              {thinkingLevels.map((level) => (
+                <option key={level.value} value={level.value}>
+                  {t(level.label)}
+                </option>
+              ))}
+            </PlanRetrySelect>
+          ) : null}
+          <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+            {t("Scope: this retry only")}
+          </div>
+          {formError ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {formError}
+            </div>
+          ) : null}
+          <div className="flex flex-wrap justify-end gap-2">
+            <button
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              onClick={onClose}
+              type="button"
+            >
+              {t("Cancel")}
+            </button>
+            <button
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-teal-700 bg-teal-700 px-3 text-xs font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-200 disabled:text-stone-500"
+              disabled={isSubmitting || !modelId || !providerId}
+              type="submit"
+            >
+              {isSubmitting ? (
+                <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw aria-hidden="true" className="size-3.5" />
+              )}
+              {isSubmitting ? t("Retrying...") : t("Retry")}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function PlanRetrySelect({
+  autoFocus,
+  children,
+  disabled,
+  label,
+  onChange,
+  value,
+}: {
+  autoFocus?: boolean;
+  children: ReactNode;
+  disabled?: boolean;
+  label: string;
+  onChange: (value: string) => void;
+  value: string;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+        {label}
+      </span>
+      <select
+        autoFocus={autoFocus}
+        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        value={value}
+      >
+        {children}
+      </select>
+    </label>
+  );
+}
+
+function defaultPlanPhaseRetryModelId(
+  phase: PlanPhase,
+  models: ConfiguredModelSummary[],
+) {
+  const lastModelId = [...phase.attempts]
+    .reverse()
+    .find((attempt) => attempt.modelId)?.modelId;
+  if (lastModelId && models.some((model) => model.id === lastModelId)) {
+    return lastModelId;
+  }
+  return models[0]?.id ?? "";
+}
+
+function defaultPlanPhaseRetryProviderId(
+  phase: PlanPhase,
+  model: ConfiguredModelSummary | null,
+  providers: ConfiguredProviderSummary[],
+) {
+  if (!model) {
+    return "";
+  }
+  const enabledProviderIds = model.providerIds.filter((id) =>
+    providers.some((provider) => provider.id === id && provider.enabled),
+  );
+  const lastProviderId = [...phase.attempts]
+    .reverse()
+    .find((attempt) => attempt.providerId)?.providerId;
+  if (lastProviderId && enabledProviderIds.includes(lastProviderId)) {
+    return lastProviderId;
+  }
+  return model.activeProviderId && enabledProviderIds.includes(model.activeProviderId)
+    ? model.activeProviderId
+    : enabledProviderIds[0] ?? "";
+}
+
+function providerDisplayName(
+  providerId: string,
+  providers: ConfiguredProviderSummary[],
+) {
+  return providers.find((provider) => provider.id === providerId)?.name ?? providerId;
 }
 
 function PlanWorktreeAuditPanel({
@@ -2509,10 +2921,7 @@ function primaryPlanAction(status: PlanStatus) {
 }
 
 function isRetryablePlanPhase(phase: PlanPhase) {
-  return (
-    Boolean(phase.agentTaskId) &&
-    (phase.status === "failed" || phase.status === "running")
-  );
+  return Boolean(phase.agentTaskId) && phase.status === "failed";
 }
 
 function planPhaseRetryOperationKey(agentTaskId: string) {

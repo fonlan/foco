@@ -574,6 +574,28 @@ describe("app-panels-stats verification surfaces", () => {
     const failedPhase = {
       agentTaskId: "agent-task-failed",
       agentTeamId: "agent-team-failed",
+      attempts: [
+        {
+          agentTaskId: "agent-task-failed",
+          agentTeamId: "agent-team-failed",
+          commitId: null,
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: "provider rate limited",
+          id: "plan-phase-attempt-failed",
+          implementationChatId: null,
+          modelId: "gpt-test",
+          phaseId: "plan-phase-failed",
+          planId: "plan-failed",
+          providerId: "openai",
+          sequence: 0,
+          startedAt: timestamp,
+          status: "failed",
+          thinkingLevel: null,
+          trigger: "start",
+          updatedAt: timestamp,
+        },
+      ],
       commitId: null,
       completedAt: timestamp,
       createdAt: timestamp,
@@ -702,6 +724,127 @@ describe("app-panels-stats verification surfaces", () => {
       },
       { timeout: 5000 },
     );
+  });
+
+
+  it("opens phase retry model override dialog", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T05:00:00Z";
+    const failedPhase = {
+      agentTaskId: "agent-task-failed",
+      agentTeamId: "agent-team-failed",
+      attempts: [
+        {
+          agentTaskId: "agent-task-failed",
+          agentTeamId: "agent-team-failed",
+          commitId: null,
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: "provider rate limited",
+          id: "plan-phase-attempt-failed",
+          implementationChatId: null,
+          modelId: "gpt-test",
+          phaseId: "plan-phase-failed",
+          planId: "plan-failed",
+          providerId: "openai",
+          sequence: 0,
+          startedAt: timestamp,
+          status: "failed",
+          thinkingLevel: null,
+          trigger: "start",
+          updatedAt: timestamp,
+        },
+      ],
+      commitId: null,
+      completedAt: timestamp,
+      createdAt: timestamp,
+      errorMessage: "provider rate limited",
+      id: "plan-phase-failed",
+      implementationChatId: null,
+      mergeAttemptCount: 0,
+      planId: "plan-failed",
+      sequence: 0,
+      startedAt: timestamp,
+      status: "failed",
+      steps: [],
+      summary: "The model request failed.",
+      title: "Failed phase",
+      updatedAt: timestamp,
+    };
+    const failedPlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: "provider rate limited",
+      sharedMergeCommitId: null,
+      id: "plan-failed",
+      overview: "Expose an explicit phase retry control.",
+      pauseRequestedAt: null,
+      phases: [failedPhase],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "failed",
+      title: "Retry failed plan phase",
+      updatedAt: timestamp,
+    };
+    const retriedPlan = {
+      ...failedPlan,
+      activePhaseId: "plan-phase-failed",
+      completedAt: null,
+      errorMessage: null,
+      phases: [{ ...failedPhase, status: "running", errorMessage: null }],
+      status: "running",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [failedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry") {
+        return jsonResponse({ plan: retriedPlan });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    await user.click(screen.getByRole("button", { name: "Retry phase options" }));
+    await user.click(screen.getByRole("menuitem", { name: "Retry with another model..." }));
+
+    expect(screen.getByRole("dialog", { name: "Retry with another model" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Provider"), "anthropic");
+    await user.selectOptions(screen.getByLabelText("Thinking level"), "high");
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry",
+        expect.objectContaining({
+          body: JSON.stringify({
+            modelId: "gpt-test",
+            providerId: "anthropic",
+            thinkingLevel: "high",
+          }),
+          method: "POST",
+        }),
+      );
+    });
   });
 
 

@@ -233,6 +233,7 @@ import {
   ContextPanelSidebar,
   ResponsiveContextPanelIcon,
   type ContextPanelTab,
+  type PlanPhaseRetryOverride,
 } from "./features/context/ContextPanel";
 import { AgentTranscriptPanel } from "./features/agents/AgentTranscriptPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
@@ -1653,6 +1654,7 @@ export function App() {
       phaseId: string,
       agentTaskId: string,
       implementationChatId: string | null,
+      override?: PlanPhaseRetryOverride,
     ) => {
       const operationKey = `retry-phase:${agentTaskId}`;
       const refreshTarget = { agentTaskId, phaseId, planId, workspaceId };
@@ -1661,9 +1663,21 @@ export function App() {
 
       try {
         const response = await requestJson<PlanResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
+          override
+            ? `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/phases/${encodeURIComponent(phaseId)}/retry`
+            : `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
           {
-            body: JSON.stringify({ action: "start" }),
+            body: JSON.stringify(
+              override
+                ? {
+                    modelId: override.modelId,
+                    providerId: override.providerId,
+                    ...(override.thinkingLevel
+                      ? { thinkingLevel: override.thinkingLevel }
+                      : {}),
+                  }
+                : { action: "start" },
+            ),
             headers: { "Content-Type": "application/json" },
             method: "POST",
           },
@@ -9180,6 +9194,19 @@ export function App() {
                     );
                   }
                 }}
+                onPlanPhaseRetryWithOverride={(planId, phaseId, agentTaskId, implementationChatId, override) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    void runPlanPhaseRetry(
+                      workspaceId,
+                      planId,
+                      phaseId,
+                      agentTaskId,
+                      implementationChatId,
+                      override,
+                    );
+                  }
+                }}
                 onReloadWorkspaceSpec={handleReloadWorkspaceSpecForContextPanel}
                 onSaveWorkspaceSpec={handleSaveWorkspaceSpecForContextPanel}
                 onGenerateWorkspaceSpec={handleGenerateWorkspaceSpecForContextPanel}
@@ -9195,7 +9222,10 @@ export function App() {
                 setWidth={setDiffPanelWidth}
                 onResizeStart={() => setIsResizingDiffPanel(true)}
                 todoGraph={todoGraph}
+                availableModels={availableModels}
                 plans={activePlans}
+                providers={providersForChatPanel}
+                thinkingLevels={thinkingLevels}
                 planError={activePlansError}
                 planOperationKey={planOperationKey}
                 workspaceSpec={workspaceSpec}

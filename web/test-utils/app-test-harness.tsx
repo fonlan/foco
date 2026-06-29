@@ -1310,6 +1310,7 @@ export const planFixture: Plan = {
     {
       agentTaskId: null,
       agentTeamId: null,
+      attempts: [],
       commitId: null,
       completedAt: null,
       createdAt: "2026-06-05T10:00:00Z",
