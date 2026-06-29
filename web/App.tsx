@@ -523,6 +523,7 @@ export function App() {
   const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<Record<string, string>>({});
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
   const [isPlanModeEnabled, setIsPlanModeEnabled] = useState(false);
+  const planModeByChatKeyRef = useRef<Record<string, boolean>>({});
   const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
   const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
@@ -3522,6 +3523,19 @@ export function App() {
     activeWorkspaceIdRef.current = workspaceId;
     activeChatIdRef.current = chatId;
     activeChatKeyRef.current = chatId ? chatRunKey(workspaceId, chatId) : null;
+    restorePlanModeForChatKey(activeChatKeyRef.current);
+  }
+
+  function restorePlanModeForChatKey(chatKey: string | null) {
+    setIsPlanModeEnabled(chatKey ? planModeByChatKeyRef.current[chatKey] === true : false);
+  }
+
+  function rememberPlanModeForChatKey(chatKey: string, value: boolean) {
+    planModeByChatKeyRef.current[chatKey] = value;
+  }
+
+  function bindRequestPlanModeToChatKey(request: RetryRunRequest, chatKey: string) {
+    rememberPlanModeForChatKey(chatKey, request.sessionMode === "plan");
   }
 
   function workspaceHasRunningOrStartingRun(workspaceId: string) {
@@ -3595,6 +3609,7 @@ export function App() {
     activeWorkspaceIdRef.current = run.workspaceId;
     activeChatIdRef.current = run.chatId;
     activeChatKeyRef.current = run.chatKey;
+    restorePlanModeForChatKey(run.chatKey);
     openChatTab(run.workspaceId, run.chatId);
     setMessages(cachedMessages);
     setSelectedDiffPath(null);
@@ -5295,6 +5310,10 @@ export function App() {
 
   function handlePlanModeEnabledChange(value: boolean) {
     setIsPlanModeEnabled(value);
+    const chatKey = activeChatKeyRef.current;
+    if (chatKey) {
+      rememberPlanModeForChatKey(chatKey, value);
+    }
     if (value) {
       setIsTeamModeEnabled(false);
     }
@@ -5420,9 +5439,8 @@ export function App() {
       });
       openPendingChatTab(request.workspaceId, queued.chatId, queued.chatTitle);
       setExpandedWorkspaceId(request.workspaceId);
-      activeWorkspaceIdRef.current = request.workspaceId;
-      activeChatIdRef.current = queued.chatId;
-      activeChatKeyRef.current = chatKey;
+      bindRequestPlanModeToChatKey(request, chatKey);
+      setActiveWorkspaceChatRefs(request.workspaceId, queued.chatId);
       setSelectedDiffPath(null);
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
@@ -6847,9 +6865,8 @@ export function App() {
         });
         openPendingChatTab(request.workspaceId, queued.chatId, queued.chatTitle);
         setExpandedWorkspaceId(request.workspaceId);
-        activeWorkspaceIdRef.current = request.workspaceId;
-        activeChatIdRef.current = queued.chatId;
-        activeChatKeyRef.current = queuedChatKey;
+        bindRequestPlanModeToChatKey(request, queuedChatKey);
+        setActiveWorkspaceChatRefs(request.workspaceId, queued.chatId);
         setSelectedDiffPath(null);
         setViewMode("chat");
         setIsMobileWorkspaceOpen(false);

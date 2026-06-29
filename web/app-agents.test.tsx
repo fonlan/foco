@@ -651,6 +651,32 @@ describe("app agents verification surfaces", () => {
     });
   });
 
+  it("restores Plan mode per chat tab", async () => {
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await userEvent.click(within(workspaceList).getByText("Tool run"));
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
+
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(within(workspaceList).getByText("Second chat"));
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    await userEvent.click(within(workspaceList).getByText("Tool run"));
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
   it("uses the configured Team mode default for a new composer", async () => {
     vi.stubGlobal(
       "fetch",
