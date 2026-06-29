@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { PLAN_AUTO_RUN_ENABLED_STORAGE_KEY } from "./app/constants";
 import {
   activeMemory,
   agentTeamSnapshot,
@@ -730,6 +731,50 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Run every active plan in order")).toBeInTheDocument();
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+  });
+
+  it("persists the auto-run checkbox preference", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [],
+          totalCount: 0,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.localStorage.setItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY, "true");
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    const autoRunCheckbox = await screen.findByRole("checkbox", {
+      name: /Auto run plans/,
+    });
+
+    expect(autoRunCheckbox).toBeChecked();
+
+    await user.click(autoRunCheckbox);
+    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBe(
+      "false",
+    );
+
+    await user.click(autoRunCheckbox);
+    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBe(
+      "true",
+    );
   });
 
   it("auto-runs active plans in order while waiting for running plans", async () => {

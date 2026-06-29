@@ -146,6 +146,7 @@ import {
   type GitDiffSection,
 } from "./features/git/diff-parser";
 import {
+  PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
   chartColor,
   CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
   CONTEXT_PANEL_DEFAULT_WIDTH,
@@ -597,7 +598,9 @@ export function App() {
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
-  const [isPlanAutoRunEnabled, setIsPlanAutoRunEnabled] = useState(false);
+  const [isPlanAutoRunEnabled, setIsPlanAutoRunEnabled] = useState(
+    () => window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY) === "true",
+  );
   const [isPlanAutoRunDispatching, setIsPlanAutoRunDispatching] =
     useState(false);
   const [pendingPlanPhaseRetryRefresh, setPendingPlanPhaseRetryRefresh] =
@@ -2166,10 +2169,16 @@ export function App() {
     setActivePlans([]);
     setActivePlansError(null);
     setPlanOperationKey(null);
-    setIsPlanAutoRunEnabled(false);
     setIsPlanAutoRunDispatching(false);
     setPendingPlanPhaseRetryRefresh(null);
   }, [activeWorkspace?.id]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
+      isPlanAutoRunEnabled ? "true" : "false",
+    );
+  }, [isPlanAutoRunEnabled]);
 
   useEffect(() => {
     if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
