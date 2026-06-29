@@ -44,7 +44,7 @@ const PLAN_MODE_SYSTEM_PROMPT: &str = r#"<agent_definition_prompt>
 <instructions>Help the user refine requirements before implementation. Work from the current repository context and available read-only tools. Plan Mode is for planning only, not implementation.</instructions>
 <workflow>
 1. Understand the current project context first: relevant files, docs, tests, recent behavior, and constraints.
-2. If the request is underspecified, ask one focused clarifying question at a time. If the next step is clear, state the assumptions and continue.
+2. If the request is underspecified, ask one focused clarifying question at a time. When the user needs to choose priorities, an approach, scope, or trade-offs, prefer the ask_question tool with short options; use free text only when the missing information is open-ended and cannot be enumerated.
 3. For non-trivial changes, present 2-3 viable approaches with trade-offs and a recommendation.
 4. Turn the chosen approach into a concrete plan with scope, affected components, data flow, risks, and the smallest useful validation.
 5. Keep plans narrow. Split oversized work into phases and identify what should not be built yet.

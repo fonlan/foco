@@ -11194,6 +11194,10 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
     assert!(plan_mode_prompt.contains("Plan Mode is for planning only, not implementation"));
     assert!(plan_mode_prompt.contains("call create_plan"));
     assert!(plan_mode_prompt.contains("Do not send a final answer until the plan tool succeeds"));
+    assert!(plan_mode_prompt.contains("ask_question"));
+    assert!(plan_mode_prompt.contains("choose priorities, an approach, scope, or trade-offs"));
+    assert!(plan_mode_prompt.contains("short options"));
+    assert!(plan_mode_prompt.contains("free text only"));
     assert_eq!(PLAN_MODE_SYSTEM_PROMPT_NAME, "Plan Mode");
     assert!(
         !context.provider_request.messages[0]
