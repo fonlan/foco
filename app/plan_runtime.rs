@@ -13,6 +13,7 @@ use foco_store::{
     },
     workspace::{
         AgentInstanceRecord, AgentTaskRecord, PlanPhaseRecord, PlanRecord, WorkspaceDatabase,
+        WorkspaceDatabaseError,
     },
 };
 use serde_json::Value;
@@ -29,6 +30,8 @@ use crate::{
 
 const PLAN_MERGE_CORRELATION_PREFIX: &str = "plan_merge:";
 const PLAN_MERGE_DIFF_MAX_CHARS: usize = 60_000;
+// ponytail: fixed char cap keeps phase prompts bounded for now; ceiling is rough prompt sizing, upgrade to token-aware summaries if long plans need it.
+const PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS: usize = 12_000;
 
 struct PlanRunnerModelSelection {
     model_id: String,
@@ -385,10 +388,14 @@ async fn dispatch_plan_phase(
     let config = config_snapshot(state)?;
     let selection = plan_runner_model_selection(&config)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
-    let coordinator_worktree = {
+    let (coordinator_worktree, previous_conclusions) = {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
-        plan_worktree_info(&database, &plan)?
+        (
+            plan_worktree_info(&database, &plan)?,
+            previous_plan_phase_conclusions(&database, &plan, phase)
+                .map_err(ApiError::from_workspace_error)?,
+        )
     };
     let queued = match queue_chat_message_internal(
         state,
@@ -401,7 +408,7 @@ async fn dispatch_plan_phase(
             thinking_level: selection.thinking_level,
             skill_ids: None,
             session_mode: None,
-            message: plan_phase_prompt(&plan, phase),
+            message: plan_phase_prompt(&plan, phase, previous_conclusions.as_deref()),
             team_mode_enabled: true,
             defer_start: true,
             attachments: Vec::new(),
@@ -770,12 +777,67 @@ fn model_outputs_text(model: &ModelSettings) -> bool {
             .iter()
             .any(|modality| modality == "text")
 }
-
 fn plan_phase_chat_title(plan_title: &str, phase_title: &str) -> String {
     format!("{plan_title} - {phase_title}")
 }
 
-fn plan_phase_prompt(plan: &PlanRecord, phase: &PlanPhaseRecord) -> String {
+fn previous_plan_phase_conclusions(
+    database: &WorkspaceDatabase,
+    plan: &PlanRecord,
+    phase: &PlanPhaseRecord,
+) -> Result<Option<String>, WorkspaceDatabaseError> {
+    let mut conclusions = String::new();
+    for previous_phase in plan.phases.iter().filter(|previous_phase| {
+        previous_phase.sequence < phase.sequence && previous_phase.status == "completed"
+    }) {
+        let Some(chat_id) = previous_phase.implementation_chat_id.as_deref() else {
+            continue;
+        };
+        let Some(content) = database
+            .messages_for_chat(chat_id)?
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant" && !message.content.trim().is_empty())
+            .map(|message| message.content.trim().to_string())
+        else {
+            continue;
+        };
+        if !conclusions.is_empty() {
+            conclusions.push_str("\n\n");
+        }
+        conclusions.push_str(&format!(
+            "Phase {}: {}\n{}",
+            previous_phase.sequence + 1,
+            previous_phase.title.trim(),
+            content
+        ));
+    }
+
+    if conclusions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(truncate_previous_phase_conclusions(&conclusions)))
+    }
+}
+
+fn truncate_previous_phase_conclusions(value: &str) -> String {
+    if value.chars().count() <= PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS {
+        return value.to_string();
+    }
+    let truncated: String = value
+        .chars()
+        .take(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)
+        .collect();
+    format!(
+        "{truncated}\n\n[truncated to {PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS} chars for the phase prompt]"
+    )
+}
+
+fn plan_phase_prompt(
+    plan: &PlanRecord,
+    phase: &PlanPhaseRecord,
+    previous_conclusions: Option<&str>,
+) -> String {
     let mut message = format!(
         "Implement this plan phase in the plan's isolated worktree. Do not create a git commit; Foco will commit this phase in the worktree after the phase completes, and later phases will continue from that commit. Foco merges the worktree back to the shared workspace only after all phases complete.\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}",
         plan.title,
@@ -800,6 +862,13 @@ fn plan_phase_prompt(plan: &PlanRecord, phase: &PlanPhaseRecord) -> String {
                 }
             }
         }
+    }
+    if let Some(previous_conclusions) = previous_conclusions
+        .map(str::trim)
+        .filter(|previous_conclusions| !previous_conclusions.is_empty())
+    {
+        message.push_str("\n\nPrevious phase conclusions:\n");
+        message.push_str(previous_conclusions);
     }
     message.push_str("\n\nWhen the phase is implemented, run the smallest relevant checks and finish with a concise summary.");
     message
@@ -983,6 +1052,74 @@ mod tests {
             plan_phase_chat_title("Build plan runner UI", "Wire start action"),
             "Build plan runner UI - Wire start action"
         );
+    }
+
+    #[test]
+    fn previous_plan_phase_conclusions_use_last_non_empty_assistant_message() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let mut plan = database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-previous-conclusions",
+                title: "Carry phase context",
+                overview: "Keep later phases informed.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    foco_store::workspace::NewPlanPhase {
+                        id: "phase-one",
+                        title: "Phase One",
+                        summary: "First phase.",
+                        steps: Vec::new(),
+                    },
+                    foco_store::workspace::NewPlanPhase {
+                        id: "phase-two",
+                        title: "Phase Two",
+                        summary: "Second phase.",
+                        steps: Vec::new(),
+                    },
+                ],
+            })
+            .expect("plan");
+        database
+            .insert_chat("chat-phase-one", "Phase one")
+            .expect("chat");
+        for (id, role, content, sequence) in [
+            ("msg-old", "assistant", "old summary", 1),
+            ("msg-empty", "assistant", "   ", 2),
+            ("msg-user", "user", "thanks", 3),
+            ("msg-final", "assistant", "  final summary  ", 4),
+        ] {
+            database
+                .insert_message(foco_store::workspace::NewMessage {
+                    id,
+                    chat_id: "chat-phase-one",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: None,
+                })
+                .expect("message");
+        }
+        plan.phases[0].status = "completed".to_string();
+        plan.phases[0].implementation_chat_id = Some("chat-phase-one".to_string());
+
+        let conclusions = previous_plan_phase_conclusions(&database, &plan, &plan.phases[1])
+            .expect("conclusions")
+            .expect("some conclusions");
+        assert_eq!(conclusions, "Phase 1: Phase One\nfinal summary");
+
+        let prompt = plan_phase_prompt(&plan, &plan.phases[1], Some(&conclusions));
+        assert!(prompt.contains("Previous phase conclusions:\nPhase 1: Phase One\nfinal summary"));
+    }
+
+    #[test]
+    fn previous_plan_phase_conclusions_truncate_on_char_boundary() {
+        let long = "é".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS + 1);
+        let truncated = truncate_previous_phase_conclusions(&long);
+
+        assert!(truncated.contains("[truncated to 12000 chars for the phase prompt]"));
+        assert!(truncated.starts_with(&"é".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)));
     }
 
     fn task_with_input(input_json: &str) -> AgentTaskRecord {
