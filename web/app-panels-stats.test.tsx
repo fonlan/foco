@@ -941,6 +941,122 @@ describe("app-panels-stats verification surfaces", () => {
     );
   });
 
+  it("refreshes running plan phases while the visible plan panel is open", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T06:00:00Z";
+    const phase1 = {
+      ...planFixture.phases[0],
+      agentTaskId: "task-phase-1",
+      agentTeamId: "team-phase-1",
+      startedAt: timestamp,
+      status: "running",
+      title: "Phase 1",
+      updatedAt: timestamp,
+    };
+    const phase2 = {
+      ...planFixture.phases[0],
+      agentTaskId: null,
+      agentTeamId: null,
+      id: "phase-2",
+      planId: planFixture.id,
+      sequence: 1,
+      startedAt: null,
+      status: "pending",
+      steps: planFixture.phases[0].steps.map((step) => ({
+        ...step,
+        id: "step-2",
+        phaseId: "phase-2",
+        status: "pending",
+        title: "Open next settings view",
+      })),
+      title: "Phase 2",
+      updatedAt: timestamp,
+    };
+    const runningPhase1Plan = {
+      ...planFixture,
+      activePhaseId: "phase-1",
+      phases: [phase1, phase2],
+      status: "running",
+      title: "Plan panel polling regression",
+      updatedAt: timestamp,
+    };
+    const runningPhase2Plan = {
+      ...runningPhase1Plan,
+      activePhaseId: "phase-2",
+      phases: [
+        {
+          ...phase1,
+          completedAt: timestamp,
+          commitId: "abc1234",
+          status: "completed",
+          steps: phase1.steps.map((step) => ({
+            ...step,
+            checkedAt: timestamp,
+            status: "completed",
+          })),
+        },
+        {
+          ...phase2,
+          agentTaskId: "task-phase-2",
+          agentTeamId: "team-phase-2",
+          startedAt: timestamp,
+          status: "running",
+        },
+      ],
+    };
+    let planStage = 0;
+    const waitForPlanPoll = () =>
+      act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 3100));
+      });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        const plan = planStage === 0 ? runningPhase1Plan : runningPhase2Plan;
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [plan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(
+      await screen.findByRole("checkbox", { name: /Auto run plans/ }),
+    ).not.toBeChecked();
+    expect(await screen.findByText("Plan panel polling regression")).toBeInTheDocument();
+    const phase1Section = screen.getByText("Phase 1").closest("section");
+    if (!phase1Section) {
+      throw new Error("Expected phase 1 section");
+    }
+    expect(within(phase1Section).getByText("Running")).toBeInTheDocument();
+
+    planStage = 1;
+    await waitForPlanPoll();
+
+    await waitFor(() => {
+      const updatedPhase1Section = screen.getByText("Phase 1").closest("section");
+      const updatedPhase2Section = screen.getByText("Phase 2").closest("section");
+      if (!updatedPhase1Section || !updatedPhase2Section) {
+        throw new Error("Expected refreshed phase sections");
+      }
+      expect(within(updatedPhase1Section).getByText("Completed")).toBeInTheDocument();
+      expect(within(updatedPhase2Section).getByText("Running")).toBeInTheDocument();
+    });
+  });
+
   it("auto-runs active plans in order while waiting for running plans", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";

@@ -2304,13 +2304,19 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
+    const shouldRefreshRunningPlans =
+      isPlanAutoRunEnabled ||
+      (isContextPanelOpen && contextPanelTab === "plan");
+
+    if (!shouldRefreshRunningPlans || !activeWorkspace?.id) {
       return;
     }
     if (!activePlans.some(isAutoRunPlanInFlight)) {
       return;
     }
 
+    // ponytail: visible Plan panel polling is a fallback for backend phase
+    // advancement; upgrade path is a backend plan subscription.
     const intervalId = window.setInterval(() => {
       void loadActivePlans(activeWorkspace.id);
     }, PLAN_AUTO_RUN_REFRESH_MS);
@@ -2319,6 +2325,8 @@ export function App() {
   }, [
     activePlans,
     activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
     isPlanAutoRunEnabled,
     loadActivePlans,
   ]);
