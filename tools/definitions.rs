@@ -716,7 +716,7 @@ fn create_plan_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["id", "title", "overview", "phases"]
+            "required": ["id", "title", "overview", "status", "sourceChatId", "phases", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1088,7 +1088,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_plan_schema_requires_only_core_plan_fields() {
+    fn create_plan_schema_requires_every_property() {
         let definition = create_plan_definition();
         let required = definition.input_schema["required"]
             .as_array()
@@ -1097,7 +1097,18 @@ mod tests {
             .map(|value| value.as_str().expect("required string"))
             .collect::<Vec<_>>();
 
-        assert_eq!(required, vec!["id", "title", "overview", "phases"]);
+        assert_eq!(
+            required,
+            vec![
+                "id",
+                "title",
+                "overview",
+                "status",
+                "sourceChatId",
+                "phases",
+                "timeoutMs"
+            ]
+        );
         assert_eq!(
             definition.input_schema["additionalProperties"],
             serde_json::Value::Bool(false)
