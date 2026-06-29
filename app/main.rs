@@ -5951,6 +5951,10 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     fn from_config_error(error: foco_store::config::ConfigError) -> Self {
         Self::internal(error.to_string())
     }

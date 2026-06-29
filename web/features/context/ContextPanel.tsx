@@ -50,6 +50,8 @@ import type {
   PlanPhase,
   PlanStatus,
   PlanStep,
+  PlanWorktreeAuditItem,
+  PlanWorktreeAuditResponse,
   TaskStatus,
   TodoGraphResponse,
   TodoGraphTask,
@@ -115,6 +117,8 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingWorkspaceSpec,
   isLoadingWorkspaceFiles,
   onDeletePlan,
+  onLoadPlanWorktreeAudit,
+  onCleanupPlanWorktree,
   onForgetContextMemory,
   onGenerateGitCommitMessage,
   onGenerateWorkspaceSpec,
@@ -181,6 +185,8 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingWorkspaceSpec: boolean;
   isLoadingWorkspaceFiles: boolean;
   onDeletePlan: (planId: string) => void;
+  onLoadPlanWorktreeAudit: () => Promise<PlanWorktreeAuditResponse>;
+  onCleanupPlanWorktree: (agentInstanceId: string) => Promise<void>;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onGenerateGitCommitMessage: () => void;
   onGenerateWorkspaceSpec: () => void;
@@ -279,7 +285,9 @@ const ContextPanel = memo(function ContextPanel({
             isLoading={isLoadingPlans}
             onAction={onPlanAction}
             onAutoRunToggle={onPlanAutoRunToggle}
+            onCleanupWorktree={onCleanupPlanWorktree}
             onDeletePlan={onDeletePlan}
+            onLoadWorktreeAudit={onLoadPlanWorktreeAudit}
             onOpenPhaseChat={onOpenPlanPhaseChat}
             onPhaseRetry={onPlanPhaseRetry}
             operationKey={planOperationKey}
@@ -647,7 +655,9 @@ function ContextPlanTab({
   isLoading,
   onAction,
   onAutoRunToggle,
+  onCleanupWorktree,
   onDeletePlan,
+  onLoadWorktreeAudit,
   onOpenPhaseChat,
   onPhaseRetry,
   operationKey,
@@ -660,7 +670,9 @@ function ContextPlanTab({
   isLoading: boolean;
   onAction: (planId: string, action: string) => void;
   onAutoRunToggle: (enabled: boolean) => void;
+  onCleanupWorktree: (agentInstanceId: string) => Promise<void>;
   onDeletePlan: (planId: string) => void;
+  onLoadWorktreeAudit: () => Promise<PlanWorktreeAuditResponse>;
   onOpenPhaseChat: (chatId: string) => void;
   onPhaseRetry: (
     planId: string,
@@ -675,7 +687,44 @@ function ContextPlanTab({
   const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [worktreeAudit, setWorktreeAudit] = useState<PlanWorktreeAuditResponse | null>(null);
+  const [worktreeAuditError, setWorktreeAuditError] = useState<string | null>(null);
+  const [isLoadingWorktreeAudit, setIsLoadingWorktreeAudit] = useState(false);
+  const [showWorktreeAudit, setShowWorktreeAudit] = useState(false);
   const showAutoRunBusy = autoRunEnabled && autoRunBusy;
+
+  const refreshWorktreeAudit = async () => {
+    setIsLoadingWorktreeAudit(true);
+    setWorktreeAuditError(null);
+    try {
+      const response = await onLoadWorktreeAudit();
+      setWorktreeAudit(response);
+      return response;
+    } catch (auditError) {
+      const message = auditError instanceof Error ? auditError.message : String(auditError);
+      setWorktreeAuditError(message);
+      return null;
+    } finally {
+      setIsLoadingWorktreeAudit(false);
+    }
+  };
+
+  const openWorktreeAudit = () => {
+    setShowWorktreeAudit(true);
+    void refreshWorktreeAudit();
+  };
+
+  const cleanupWorktree = async (item: PlanWorktreeAuditItem) => {
+    const commit = item.headCommitShort ?? item.commitId?.slice(0, 7) ?? t("unknown commit");
+    if (!window.confirm(t("Clean up plan worktree confirmation", {
+      commit,
+      path: item.worktreePath,
+    }))) {
+      return;
+    }
+    await onCleanupWorktree(item.agentInstanceId);
+    await refreshWorktreeAudit();
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -703,7 +752,40 @@ function ContextPlanTab({
             {t("Auto running")}
           </span>
         ) : null}
+        <button
+          aria-label={t("Audit plan worktrees")}
+          className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          disabled={isLoadingWorktreeAudit}
+          onClick={() => {
+            if (showWorktreeAudit) {
+              void refreshWorktreeAudit();
+            } else {
+              openWorktreeAudit();
+            }
+          }}
+          title={t("Audit plan worktrees")}
+          type="button"
+        >
+          {isLoadingWorktreeAudit ? (
+            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+          ) : (
+            <Eye aria-hidden="true" className="size-3.5" />
+          )}
+          {t("Audit")}
+        </button>
       </div>
+
+      {showWorktreeAudit ? (
+        <PlanWorktreeAuditPanel
+          error={worktreeAuditError}
+          isLoading={isLoadingWorktreeAudit}
+          items={worktreeAudit?.items ?? []}
+          onCleanup={cleanupWorktree}
+          onRefresh={refreshWorktreeAudit}
+          operationKey={operationKey}
+          recoveryNote={worktreeAudit?.recoveryNote ?? null}
+        />
+      ) : null}
 
       <div className="context-list-panel panel-scroll">
         {isLoading && plans.length === 0 ? (
@@ -939,6 +1021,128 @@ function ContextPlanTab({
           </div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+function PlanWorktreeAuditPanel({
+  error,
+  isLoading,
+  items,
+  onCleanup,
+  onRefresh,
+  operationKey,
+  recoveryNote,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  items: PlanWorktreeAuditItem[];
+  onCleanup: (item: PlanWorktreeAuditItem) => void | Promise<void>;
+  onRefresh: () => void | Promise<PlanWorktreeAuditResponse | null>;
+  operationKey: string | null;
+  recoveryNote: string | null;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="border-b border-stone-200 bg-stone-50/80 px-3 py-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="truncate text-xs font-semibold text-stone-900">
+            {t("Legacy worktrees")}
+          </h3>
+          <p className="line-clamp-2 text-xs text-stone-500">
+            {recoveryNote ?? t("Unmerged implemented plans need manual cherry-pick, merge, or rerun.")}
+          </p>
+        </div>
+        <button
+          aria-label={t("Refresh audit")}
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          disabled={isLoading}
+          onClick={() => void onRefresh()}
+          title={t("Refresh audit")}
+          type="button"
+        >
+          {isLoading ? (
+            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+          ) : (
+            <RefreshCw aria-hidden="true" className="size-3.5" />
+          )}
+        </button>
+      </div>
+      {error ? (
+        <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
+          {error}
+        </div>
+      ) : null}
+      {!error && !isLoading && items.length === 0 ? (
+        <div className="rounded-md border border-stone-200 bg-white px-2 py-1.5 text-xs text-stone-500">
+          {t("No legacy worktrees found")}
+        </div>
+      ) : null}
+      {items.length > 0 ? (
+        <div className="space-y-2">
+          {items.map((item) => {
+            const cleanupKey = `cleanup-worktree:${item.agentInstanceId}`;
+            const isCleanupBusy = operationKey === cleanupKey;
+            return (
+              <div
+                className="rounded-lg border border-stone-200 bg-white px-2.5 py-2 text-xs text-stone-600 shadow-sm"
+                key={`${item.planId}:${item.phaseId}:${item.agentInstanceId}`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className={planStatusClass(item.planStatus as PlanStatus)}>
+                        {item.planStatus}
+                      </span>
+                      <span className={planPhaseStatusClass(item.phaseStatus)}>
+                        {item.phaseStatus}
+                      </span>
+                      {item.headCommitShort ? (
+                        <span className="context-memory-kind">{item.headCommitShort}</span>
+                      ) : null}
+                    </div>
+                    <div className="break-all font-mono text-[11px] text-stone-700">
+                      {item.planId} / {item.phaseId}
+                    </div>
+                    <div className="break-all font-mono text-[11px] text-stone-500">
+                      {item.worktreePath}
+                    </div>
+                    <div className="break-all text-[11px] text-stone-500">
+                      {t("Base")}: {item.baseRevision ?? t("unknown")} | {t("Ref")}: {item.refName ?? item.branch ?? t("unknown")}
+                    </div>
+                    {item.implementationChatId || item.agentTaskId ? (
+                      <div className="break-all text-[11px] text-stone-500">
+                        {item.implementationChatId ?? t("No implementation chat")} · {item.agentTaskId ?? t("No agent task")}
+                      </div>
+                    ) : null}
+                    {item.errorMessage ? (
+                      <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] text-rose-700">
+                        {item.errorMessage}
+                      </div>
+                    ) : null}
+                  </div>
+                  <button
+                    aria-label={t("Clean up worktree")}
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                    disabled={!item.cleanupAllowed || operationKey !== null}
+                    onClick={() => void onCleanup(item)}
+                    title={item.cleanupAllowed ? t("Clean up worktree") : t("Cleanup unavailable while plan or phase is running")}
+                    type="button"
+                  >
+                    {isCleanupBusy ? (
+                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 aria-hidden="true" className="size-3.5" />
+                    )}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }

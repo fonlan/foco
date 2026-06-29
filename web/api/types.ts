@@ -229,6 +229,37 @@ export type PlanResponse = {
   plan: Plan;
 };
 
+export type PlanWorktreeAuditItem = {
+  planId: string;
+  planStatus: string;
+  phaseId: string;
+  phaseStatus: string;
+  implementationChatId: string | null;
+  agentTaskId: string | null;
+  agentTaskStatus: string | null;
+  agentInstanceId: string;
+  worktreePath: string;
+  baseRevision: string | null;
+  branch: string | null;
+  refName: string | null;
+  worktreeStatus: string | null;
+  commitId: string | null;
+  headCommitId: string | null;
+  headCommitShort: string | null;
+  errorMessage: string | null;
+  cleanupAllowed: boolean;
+};
+
+export type PlanWorktreeAuditResponse = {
+  items: PlanWorktreeAuditItem[];
+  recoveryNote: string;
+};
+
+export type PlanWorktreeCleanupResponse = {
+  deleted: boolean;
+  item: PlanWorktreeAuditItem;
+};
+
 // JSON types
 
 export type JsonValue =

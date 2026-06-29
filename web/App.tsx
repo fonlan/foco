@@ -109,6 +109,7 @@ import type {
   OpenChatTab,
   Plan,
   PlanResponse,
+  PlanWorktreeAuditResponse,
   PlansResponse,
   PendingDeleteChat,
   QueueChatMessageResponse,
@@ -1683,6 +1684,41 @@ export function App() {
       }
     },
     [loadActivePlans, refreshWorkspaces, t],
+  );
+
+  const loadPlanWorktreeAudit = useCallback(async (workspaceId: string) => {
+    return requestJson<PlanWorktreeAuditResponse>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/worktrees/audit`,
+    );
+  }, []);
+
+  const cleanupPlanWorktree = useCallback(
+    async (workspaceId: string, agentInstanceId: string) => {
+      const operationKey = `cleanup-worktree:${agentInstanceId}`;
+      setPlanOperationKey(operationKey);
+      setActivePlansError(null);
+
+      try {
+        await requestJson(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/worktrees/cleanup`,
+          {
+            body: JSON.stringify({ agentInstanceId, confirm: true }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        await loadActivePlans(workspaceId);
+        await refreshWorkspaces();
+      } catch (requestError) {
+        setActivePlansError(errorMessage(requestError));
+        throw requestError;
+      } finally {
+        setPlanOperationKey((current) =>
+          current === operationKey ? null : current,
+        );
+      }
+    },
+    [loadActivePlans, refreshWorkspaces],
   );
 
   // ponytail: poll a queued spec job until it settles, then reload spec content.
@@ -8898,6 +8934,20 @@ export function App() {
                   if (workspaceId) {
                     void deletePlan(workspaceId, planId);
                   }
+                }}
+                onLoadPlanWorktreeAudit={() => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (!workspaceId) {
+                    return Promise.resolve({ items: [], recoveryNote: "" });
+                  }
+                  return loadPlanWorktreeAudit(workspaceId);
+                }}
+                onCleanupPlanWorktree={(agentInstanceId) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (!workspaceId) {
+                    return Promise.resolve();
+                  }
+                  return cleanupPlanWorktree(workspaceId, agentInstanceId);
                 }}
                 onOpenPlanPhaseChat={(chatId) => {
                   const workspaceId = activeWorkspace?.id;

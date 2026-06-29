@@ -46,11 +46,11 @@ pub use workspace_records::{
     NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
     NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
     PlanListFilter, PlanListPage, PlanPatch, PlanPhaseRecord, PlanRecord, PlanStepPatch,
-    PlanStepRecord, PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim,
-    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
-    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -1264,6 +1264,65 @@ impl WorkspaceDatabase {
         }
 
         Ok(PlanListPage { plans, total_count })
+    }
+
+    pub fn plan_worktree_audit(
+        &self,
+    ) -> Result<Vec<PlanWorktreeAuditRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT plans.id, plans.status, phases.id, phases.status,
+                        phases.implementation_chat_id, phases.agent_task_id,
+                        tasks.status, instances.id, instances.execution_root_path,
+                        instances.worktree_base_revision, instances.worktree_branch,
+                        instances.worktree_status, plans.error_message,
+                        phases.error_message, tasks.error_json, phases.commit_id
+                 FROM plans
+                 INNER JOIN plan_phases AS phases ON phases.plan_id = plans.id
+                 INNER JOIN agent_teams AS teams ON teams.id = phases.agent_team_id
+                 INNER JOIN agent_instances AS instances
+                    ON instances.id = teams.coordinator_instance_id
+                 LEFT JOIN agent_tasks AS tasks ON tasks.id = phases.agent_task_id
+                 WHERE plans.shared_merge_commit_id IS NULL
+                   AND instances.execution_workspace_mode = 'isolated_worktree'
+                   AND instances.execution_root_path IS NOT NULL
+                   AND instances.worktree_status IN ('active', 'kept')
+                 ORDER BY plans.updated_at DESC, phases.sequence ASC, plans.id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                let agent_instance_id: String = row.get(7)?;
+                Ok(PlanWorktreeAuditRecord {
+                    plan_id: row.get(0)?,
+                    plan_status: row.get(1)?,
+                    phase_id: row.get(2)?,
+                    phase_status: row.get(3)?,
+                    implementation_chat_id: row.get(4)?,
+                    agent_task_id: row.get(5)?,
+                    agent_task_status: row.get::<_, Option<String>>(6)?,
+                    agent_instance_id: AgentInstanceId::new(agent_instance_id).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    worktree_path: row.get(8)?,
+                    base_revision: row.get(9)?,
+                    branch: row.get(10)?,
+                    worktree_status: row.get(11)?,
+                    plan_error_message: row.get(12)?,
+                    phase_error_message: row.get(13)?,
+                    task_error_message: row.get(14)?,
+                    commit_id: row.get(15)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
     }
 
     pub fn delete_plan(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {

@@ -253,6 +253,14 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::plans::plans).post(crate::http::plans::create_plan),
         )
         .route(
+            "/api/workspaces/{workspace_id}/plans/worktrees/audit",
+            get(crate::http::plans::plan_worktree_audit),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/plans/worktrees/cleanup",
+            post(crate::http::plans::cleanup_plan_worktree),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/plans/{plan_id}",
             patch(crate::http::plans::update_plan).delete(crate::http::plans::delete_plan),
         )

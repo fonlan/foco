@@ -472,6 +472,26 @@ pub struct PlanListPage {
     pub total_count: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanWorktreeAuditRecord {
+    pub plan_id: String,
+    pub plan_status: String,
+    pub phase_id: String,
+    pub phase_status: String,
+    pub implementation_chat_id: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub agent_task_status: Option<String>,
+    pub agent_instance_id: AgentInstanceId,
+    pub worktree_path: String,
+    pub base_revision: Option<String>,
+    pub branch: Option<String>,
+    pub worktree_status: Option<String>,
+    pub plan_error_message: Option<String>,
+    pub phase_error_message: Option<String>,
+    pub task_error_message: Option<String>,
+    pub commit_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanRecord {

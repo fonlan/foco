@@ -4,11 +4,16 @@ use axum::{
 };
 use foco_store::workspace::{
     NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, WorkspaceDatabase,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::Path;
 
-use crate::*;
+use crate::{
+    git_backend::{agent_worktree_head_commit, delete_agent_worktree},
+    *,
+};
 
 const DEFAULT_ACTIVE_PLAN_LIMIT: i64 = 50;
 const DEFAULT_PLAN_PAGE_SIZE: i64 = 20;
@@ -69,6 +74,13 @@ pub(crate) struct PlanActionRequest {
     action: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CleanupPlanWorktreeRequest {
+    agent_instance_id: String,
+    confirm: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PlansResponse {
@@ -89,6 +101,43 @@ pub(crate) struct PlanResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeletePlanResponse {
     deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanWorktreeAuditResponse {
+    items: Vec<PlanWorktreeAuditItem>,
+    recovery_note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanWorktreeCleanupResponse {
+    deleted: bool,
+    item: PlanWorktreeAuditItem,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanWorktreeAuditItem {
+    plan_id: String,
+    plan_status: String,
+    phase_id: String,
+    phase_status: String,
+    implementation_chat_id: Option<String>,
+    agent_task_id: Option<String>,
+    agent_task_status: Option<String>,
+    agent_instance_id: String,
+    worktree_path: String,
+    base_revision: Option<String>,
+    branch: Option<String>,
+    ref_name: Option<String>,
+    worktree_status: Option<String>,
+    commit_id: Option<String>,
+    head_commit_id: Option<String>,
+    head_commit_short: Option<String>,
+    error_message: Option<String>,
+    cleanup_allowed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +367,82 @@ pub(crate) async fn delete_plan(
     Ok(Json(DeletePlanResponse { deleted }))
 }
 
+pub(crate) async fn plan_worktree_audit(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<PlanWorktreeAuditResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let records = database
+        .plan_worktree_audit()
+        .map_err(ApiError::from_workspace_error)?;
+    let items = records.into_iter().map(plan_worktree_audit_item).collect();
+
+    Ok(Json(PlanWorktreeAuditResponse {
+        items,
+        recovery_note: PLAN_WORKTREE_RECOVERY_NOTE,
+    }))
+}
+
+pub(crate) async fn cleanup_plan_worktree(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<CleanupPlanWorktreeRequest>,
+) -> Result<Json<PlanWorktreeCleanupResponse>, ApiError> {
+    if !request.confirm {
+        return Err(ApiError::bad_request(
+            "plan worktree cleanup requires confirm=true",
+        ));
+    }
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let instance_id = request.agent_instance_id.trim();
+    let record = database
+        .plan_worktree_audit()
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .find(|item| item.agent_instance_id.as_str() == instance_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "plan worktree audit item was not found: {instance_id}"
+            ))
+        })?;
+    let item = plan_worktree_audit_item(record.clone());
+    if !item.cleanup_allowed {
+        return Err(ApiError::bad_request(
+            "plan worktree audit item is not eligible for cleanup",
+        ));
+    }
+    let instance = database
+        .agent_instance(&record.agent_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent instance was not found: {instance_id}"))
+        })?;
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::bad_request("Agent instance no longer has an isolated worktree")
+    })?;
+    if root_path != record.worktree_path {
+        return Err(ApiError::bad_request(
+            "Agent worktree audit record is stale; refresh before cleanup",
+        ));
+    }
+
+    delete_agent_worktree(&workspace.path, Path::new(root_path), true)?;
+    database
+        .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
+        .map_err(ApiError::from_workspace_error)?;
+
+    Ok(Json(PlanWorktreeCleanupResponse {
+        deleted: true,
+        item,
+    }))
+}
+
 pub(crate) async fn plan_action(
     State(state): State<AppState>,
     AxumPath((workspace_id, plan_id)): AxumPath<(String, String)>,
@@ -387,6 +512,72 @@ struct CreateStepStorage {
     title: String,
     detail: String,
     acceptance: Vec<String>,
+}
+
+const PLAN_WORKTREE_RECOVERY_NOTE: &str = "Plans without sharedMergeCommitId were not merged into the shared workspace. Historical implemented/completed plans in this state need manual cherry-pick/merge from the listed worktree branch or a rerun; Foco does not auto cherry-pick historical commits.";
+
+fn plan_worktree_audit_item(record: PlanWorktreeAuditRecord) -> PlanWorktreeAuditItem {
+    let (head_commit_id, head_error) = agent_worktree_head_commit(Path::new(&record.worktree_path))
+        .map(|commit| (Some(commit), None))
+        .unwrap_or_else(|error| (None, Some(error.message().to_string())));
+    let head_commit_short = head_commit_id.as_deref().map(short_commit_id);
+    let cleanup_allowed = !matches!(record.plan_status.as_str(), "running")
+        && !matches!(record.phase_status.as_str(), "running");
+
+    PlanWorktreeAuditItem {
+        plan_id: record.plan_id,
+        plan_status: record.plan_status,
+        phase_id: record.phase_id,
+        phase_status: record.phase_status,
+        implementation_chat_id: record.implementation_chat_id,
+        agent_task_id: record.agent_task_id,
+        agent_task_status: record.agent_task_status,
+        agent_instance_id: record.agent_instance_id.to_string(),
+        worktree_path: record.worktree_path,
+        base_revision: record.base_revision,
+        ref_name: record.branch.as_deref().map(branch_ref_name),
+        branch: record.branch,
+        worktree_status: record.worktree_status,
+        commit_id: record.commit_id,
+        head_commit_id,
+        head_commit_short,
+        error_message: first_non_empty([
+            record.plan_error_message,
+            record.phase_error_message,
+            record.task_error_message.and_then(task_error_message),
+            head_error,
+        ]),
+        cleanup_allowed,
+    }
+}
+
+fn task_error_message(error_json: String) -> Option<String> {
+    serde_json::from_str::<Value>(&error_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| Some(error_json))
+}
+
+fn first_non_empty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+fn short_commit_id(commit_id: &str) -> String {
+    commit_id.chars().take(7).collect()
+}
+
+fn branch_ref_name(branch: &str) -> String {
+    format!("refs/heads/{branch}")
 }
 
 fn plan_summary(plan: PlanRecord) -> PlanSummary {

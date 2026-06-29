@@ -455,6 +455,12 @@ pub(super) fn delete_agent_worktree(
         ));
     }
     let git_dir = repo.git_dir().to_path_buf();
+    let branch_ref = repo
+        .head_name()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to read Agent worktree HEAD: {source}"))
+        })?
+        .map(|name| name.to_string());
     remove_worktree_path(&worktree_path)?;
     if git_dir.exists() {
         fs::remove_dir_all(&git_dir).map_err(|source| {
@@ -463,7 +469,36 @@ pub(super) fn delete_agent_worktree(
             ))
         })?;
     }
+    if let Some(ref_name) = branch_ref
+        .as_deref()
+        .filter(|name| name.starts_with("refs/heads/foco/agent-worktrees/"))
+    {
+        delete_agent_worktree_branch(workspace_path, ref_name)?;
+    }
     Ok(())
+}
+
+pub(super) fn agent_worktree_head_commit(worktree_path: &Path) -> Result<String, ApiError> {
+    let repo = open_repo(worktree_path)?;
+    let head = repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
+        })?
+        .detach();
+    Ok(head.to_string())
+}
+
+fn delete_agent_worktree_branch(workspace_path: &Path, ref_name: &str) -> Result<(), ApiError> {
+    let repo = open_repo(workspace_path)?;
+    match repo.find_reference(ref_name) {
+        Ok(reference) => reference.delete().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to delete Agent worktree branch '{ref_name}': {source}"
+            ))
+        }),
+        Err(_) => Ok(()),
+    }
 }
 
 pub(super) fn merge_agent_worktree(

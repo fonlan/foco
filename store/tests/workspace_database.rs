@@ -5823,6 +5823,103 @@ fn phase12_persists_isolated_agent_instance_worktree_metadata() {
 }
 
 #[test]
+fn plan_worktree_audit_lists_unmerged_isolated_plan_worktrees() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let plan_id = "plan-worktree-audit";
+    let phase_id = "plan-worktree-audit-phase";
+
+    database
+        .create_plan(NewPlan {
+            id: plan_id,
+            title: "Audit legacy worktree",
+            overview: "Find unmerged isolated plan worktrees.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: phase_id,
+                title: "Phase one",
+                summary: "Creates a worktree commit.",
+                steps: vec![NewPlanStep {
+                    id: "plan-worktree-audit-step",
+                    title: "Do work",
+                    detail: "Finish the implementation.",
+                    acceptance: vec!["audit finds it".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan(plan_id, "start")
+        .expect("start plan");
+
+    let root_path = workspace
+        .path()
+        .join(".foco")
+        .join("agent-worktrees")
+        .join("agent-instance-plan-worktree-audit")
+        .display()
+        .to_string();
+    let (team_id, instance_id) = create_test_isolated_agent_team(
+        &mut database,
+        "chat-plan-worktree-audit",
+        "plan-worktree-audit",
+        &root_path,
+    );
+    let task_id = AgentTaskId::new("agent-task-plan-worktree-audit").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            plan_id,
+            phase_id,
+            "chat-plan-worktree-audit",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase run");
+    database
+        .complete_plan_phase_run(&task_id, Some("0123456789abcdef0123456789abcdef01234567"))
+        .expect("complete phase")
+        .expect("completed plan");
+
+    let audit = database.plan_worktree_audit().expect("worktree audit");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].plan_id, plan_id);
+    assert_eq!(audit[0].phase_id, phase_id);
+    assert_eq!(
+        audit[0].implementation_chat_id.as_deref(),
+        Some("chat-plan-worktree-audit")
+    );
+    assert_eq!(audit[0].agent_task_id.as_deref(), Some(task_id.as_str()));
+    assert_eq!(audit[0].agent_instance_id, instance_id);
+    assert_eq!(audit[0].worktree_status.as_deref(), Some("active"));
+    assert_eq!(audit[0].base_revision.as_deref(), Some("base-revision"));
+    assert_eq!(
+        audit[0].branch.as_deref(),
+        Some("foco/agent-worktrees/agent-instance-plan-worktree-audit")
+    );
+
+    database
+        .record_plan_shared_merge_commit(plan_id, "fedcba9876543210fedcba9876543210fedcba98")
+        .expect("record shared merge");
+    assert!(
+        database
+            .plan_worktree_audit()
+            .expect("audit after merge")
+            .is_empty()
+    );
+}
+
+#[test]
 fn phase12_rejects_worktree_status_update_for_shared_instance() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -6998,6 +7095,37 @@ fn create_test_agent_team(
             max_concurrent_runs: 1,
         })
         .expect("agent team create");
+    (team_id, instance_id)
+}
+
+fn create_test_isolated_agent_team(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    suffix: &str,
+    root_path: &str,
+) -> (AgentTeamId, AgentInstanceId) {
+    database
+        .insert_chat(chat_id, &format!("Agent team {suffix}"))
+        .expect("chat insert");
+    let team_id = AgentTeamId::new(format!("agent-team-{suffix}")).expect("team id");
+    let instance_id =
+        AgentInstanceId::new(format!("agent-instance-{suffix}")).expect("instance id");
+    let definition = phase8_agent_definition(suffix, 1, 1);
+    let branch = format!("foco/agent-worktrees/{instance_id}");
+    database
+        .create_agent_team(NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+            coordinator_execution_root_path: Some(root_path),
+            coordinator_worktree_base_revision: Some("base-revision"),
+            coordinator_worktree_branch: Some(&branch),
+            coordinator_worktree_status: Some("active"),
+            max_concurrent_runs: 1,
+        })
+        .expect("isolated agent team create");
     (team_id, instance_id)
 }
 
