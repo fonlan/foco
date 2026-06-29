@@ -1778,6 +1778,7 @@ export const appTestState: {
   workspaceSpecGenerateCompletes: boolean;
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
+  workspaceChatSearchResponseWorkspaces: unknown[] | null;
   lastWorkspaceOrderRequest: string[] | null;
 } = {
   activeChatStreamController: null,
@@ -1793,6 +1794,7 @@ export const appTestState: {
   workspaceSpecGenerateCompletes: false,
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
+  workspaceChatSearchResponseWorkspaces: null,
   lastWorkspaceOrderRequest: null,
 };
 function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspaceSummary {
@@ -1812,6 +1814,31 @@ function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspa
 
 function settingsWorkspacesFromWorkspaceResponse() {
   return appTestState.workspaceResponseWorkspaces.map(workspaceSettingsSummaryFromWorkspace);
+}
+
+function workspaceChatSearchWorkspaces(query: string) {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+
+  if (normalizedQuery.length === 0) {
+    return [];
+  }
+
+  const source =
+    appTestState.workspaceChatSearchResponseWorkspaces ??
+    appTestState.workspaceResponseWorkspaces;
+
+  return source
+    .map((item) => {
+      const workspaceSummary = item as { chats?: unknown[] };
+      const chats = (workspaceSummary.chats ?? []).filter((chat) =>
+        String((chat as { title?: unknown }).title ?? "")
+          .toLocaleLowerCase()
+          .includes(normalizedQuery),
+      );
+
+      return chats.length > 0 ? { ...(item as object), chats } : null;
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
 }
 
 function reorderUnknownWorkspacesByIds<T>(items: T[], itemIds: string[]) {
@@ -1923,6 +1950,7 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceSpecGenerateCompletes = false;
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
+  appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.lastWorkspaceOrderRequest = null;
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
@@ -2004,6 +2032,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       plans,
       totalCount: plans.length,
       totalPages: plans.length ? 1 : 0,
+    });
+  }
+
+  if (path === "/api/workspaces/search-chats") {
+    return jsonResponse({
+      activeWorkspaceId: workspace.id,
+      workspaces: workspaceChatSearchWorkspaces(
+        requestUrl.searchParams.get("query") ?? "",
+      ),
     });
   }
 

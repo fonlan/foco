@@ -61,6 +61,12 @@ pub(crate) struct WorkspaceOrderRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceChatSearchQuery {
+    query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceFileRequest {
     path: String,
 }
@@ -386,6 +392,73 @@ pub(crate) async fn workspaces(
         "workspaces API request completed"
     );
     Ok(response)
+}
+
+pub(crate) async fn search_workspace_chats(
+    State(state): State<AppState>,
+    Query(query): Query<WorkspaceChatSearchQuery>,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let needle = query.query.trim().to_lowercase();
+
+    if needle.is_empty() {
+        return Ok(Json(WorkspacesResponse {
+            active_workspace_id: config.app.active_workspace_id,
+            workspaces: Vec::new(),
+        }));
+    }
+
+    let mut workspaces = Vec::new();
+
+    for workspace in &config.workspaces {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let matched_chats = database
+            .chats()
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .filter(|chat| chat.title.to_lowercase().contains(&needle))
+            .collect::<Vec<_>>();
+
+        if matched_chats.is_empty() {
+            continue;
+        }
+
+        let code_change_stats_by_chat = database
+            .chat_code_change_stats()
+            .map_err(ApiError::from_workspace_error)?;
+        let chats = matched_chats
+            .into_iter()
+            .map(|chat| {
+                let active_run = state
+                    .active_chat_runs
+                    .active_run_for_chat(&workspace.id, &chat.id)?;
+                let code_change_stats = code_change_stats_by_chat
+                    .get(&chat.id)
+                    .cloned()
+                    .unwrap_or_default();
+                chat_summary(&mut database, chat, code_change_stats, active_run)
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+
+        workspaces.push(WorkspaceSummary {
+            id: workspace.id.clone(),
+            name: workspace.name.clone(),
+            path: display_path(&workspace.path),
+            logo_url: workspace_logo_url(workspace)?,
+            pinned: workspace.pinned,
+            terminal_shell: workspace.terminal_shell.clone(),
+            common_commands: settings_runtime::workspace_common_command_summaries(
+                &workspace.common_commands,
+            ),
+            chats,
+        });
+    }
+
+    Ok(Json(WorkspacesResponse {
+        active_workspace_id: config.app.active_workspace_id,
+        workspaces,
+    }))
 }
 
 pub(crate) async fn add_workspace(

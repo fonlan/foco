@@ -738,6 +738,77 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
+  it("toggles the plan worktree audit view back to the plan list", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [],
+          totalCount: 0,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/worktrees/audit") {
+        return jsonResponse({
+          items: [
+            {
+              agentInstanceId: "agent-instance-audit",
+              agentTaskId: "agent-task-audit",
+              agentTaskStatus: "completed",
+              baseRevision: "main",
+              branch: "foco/plan-audit",
+              cleanupAllowed: true,
+              commitId: "abcdef1234567890",
+              errorMessage: null,
+              headCommitId: "abcdef1234567890",
+              headCommitShort: "abcdef1",
+              implementationChatId: "chat-audit",
+              phaseId: "phase-audit",
+              phaseStatus: "completed",
+              planId: "plan-audit",
+              planStatus: "implemented",
+              refName: "refs/heads/foco/plan-audit",
+              worktreePath: "C:\\work\\foco\\.worktrees\\plan-audit",
+              worktreeStatus: "kept",
+            },
+          ],
+          recoveryNote: "Recover manually.",
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("No active plans for this workspace.")).toBeInTheDocument();
+
+    const auditButton = screen.getByRole("button", { name: "Audit plan worktrees" });
+    await user.click(auditButton);
+
+    expect(await screen.findByText("Legacy worktrees")).toBeInTheDocument();
+    expect(screen.getByText("plan-audit / phase-audit")).toBeInTheDocument();
+    expect(screen.queryByText("No active plans for this workspace.")).not.toBeInTheDocument();
+
+    await user.click(auditButton);
+
+    await waitFor(() => {
+      expect(screen.queryByText("Legacy worktrees")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+  });
+
   it("persists the auto-run checkbox preference", async () => {
     const user = userEvent.setup();
     const runningPlan = {

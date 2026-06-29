@@ -1353,22 +1353,22 @@ struct ImportClaudeHooksResponse {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkspacesResponse {
-    active_workspace_id: String,
-    workspaces: Vec<WorkspaceSummary>,
+pub(crate) struct WorkspacesResponse {
+    pub(crate) active_workspace_id: String,
+    pub(crate) workspaces: Vec<WorkspaceSummary>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkspaceSummary {
-    id: String,
-    name: String,
-    path: String,
-    logo_url: Option<String>,
-    pinned: bool,
-    terminal_shell: String,
-    common_commands: Vec<WorkspaceCommonCommandSummary>,
-    chats: Vec<ChatSummary>,
+pub(crate) struct WorkspaceSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) logo_url: Option<String>,
+    pub(crate) pinned: bool,
+    pub(crate) terminal_shell: String,
+    pub(crate) common_commands: Vec<WorkspaceCommonCommandSummary>,
+    pub(crate) chats: Vec<ChatSummary>,
 }
 
 #[derive(Serialize)]
@@ -6022,7 +6022,7 @@ fn workspace_logo_request_bytes(request: &WorkspaceLogoRequest) -> Result<Vec<u8
     Ok(bytes)
 }
 
-fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
+pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
     Ok(workspace_logo_file(&workspace.path)?
         .map(|logo| format!("/api/workspaces/{}/logo?v={}", workspace.id, logo.version)))
 }
@@ -9925,7 +9925,7 @@ fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
     path
 }
 
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     normalize_windows_verbatim_path(path.to_path_buf())
         .display()
         .to_string()
