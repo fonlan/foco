@@ -1065,6 +1065,26 @@ export function App() {
     [],
   );
 
+  useEffect(() => {
+    if (!canUseApp) {
+      return undefined;
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        recoverActiveChatStreams("visible");
+      }
+    };
+    const handleOnline = () => recoverActiveChatStreams("online");
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [canUseApp]);
+
   const loadAuthStatus = useCallback(async () => {
     setIsCheckingAuth(true);
     setError(null);
@@ -3140,6 +3160,55 @@ export function App() {
 
       return { ...current, [chatKey]: runInfo };
     });
+  }
+
+  function activeRunSummaryFromInfo(
+    runInfo: ActiveRunInfo,
+  ): ActiveChatRunSummary | null {
+    if (!runInfo.chatId || !runInfo.runId) {
+      return null;
+    }
+
+    return {
+      acceptingGuidance: runInfo.acceptingGuidance,
+      chatId: runInfo.chatId,
+      lastSequence: runInfo.lastSequence ?? null,
+      runId: runInfo.runId,
+      workspaceId: runInfo.workspaceId,
+    };
+  }
+
+  function recoverActiveChatStreams(reason: "online" | "visible") {
+    for (const runInfo of Object.values(activeRunInfoByChatKeyRef.current)) {
+      if (
+        !runningChatKeysRef.current.has(runInfo.chatKey) ||
+        activeRunAbortByChatKeyRef.current.has(runInfo.chatKey)
+      ) {
+        continue;
+      }
+
+      const activeRun = activeRunSummaryFromInfo(runInfo);
+      if (activeRun) {
+        console.debug("[chat-stream] recovering active run stream", {
+          chatId: activeRun.chatId,
+          lastSequence: activeRun.lastSequence,
+          reason,
+          runId: activeRun.runId,
+          workspaceId: activeRun.workspaceId,
+        });
+        void subscribeActiveChatRun(activeRun, true);
+        continue;
+      }
+
+      if (runInfo.chatId) {
+        console.debug("[chat-stream] refreshing running chat after recovery trigger", {
+          chatId: runInfo.chatId,
+          reason,
+          workspaceId: runInfo.workspaceId,
+        });
+        void loadChatMessages(runInfo.workspaceId, runInfo.chatId);
+      }
+    }
   }
 
   function clearWorkspaceChatActiveRun(workspaceId: string, chatId: string) {
@@ -6163,9 +6232,21 @@ export function App() {
       );
       if (!response.ok) {
         if (isReconnect && (response.status === 400 || response.status === 404)) {
+          console.debug("[chat-stream] active run stream missing during reconnect; refreshing messages", {
+            chatId: activeRun.chatId,
+            runId: activeRun.runId,
+            status: response.status,
+            workspaceId: activeRun.workspaceId,
+          });
           await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
           return;
         }
+        console.debug("[chat-stream] active run stream returned backend error", {
+          chatId: activeRun.chatId,
+          runId: activeRun.runId,
+          status: response.status,
+          workspaceId: activeRun.workspaceId,
+        });
         throw new Error(await responseErrorMessage(response));
       }
 
@@ -6616,6 +6697,12 @@ export function App() {
         }
 
         if (streamEvent.type === "error") {
+          console.debug("[chat-stream] active run stream emitted backend error event", {
+            chatId: activeRun.chatId,
+            message: streamEvent.message,
+            runId: activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          });
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
           streamHadError = true;
@@ -6643,8 +6730,26 @@ export function App() {
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
       if (isStreamIdleError(requestError)) {
+        console.debug("[chat-stream] active run stream idle timeout; reconnecting", {
+          chatId: activeRun.chatId,
+          lastSequence: lastSequenceForState(),
+          runId: activeRun.runId,
+          workspaceId: activeRun.workspaceId,
+        });
         shouldReconnect = true;
-      } else if (!wasCancelled) {
+      } else if (wasCancelled) {
+        console.debug("[chat-stream] active run stream cancelled", {
+          chatId: activeRun.chatId,
+          runId: activeRun.runId,
+          workspaceId: activeRun.workspaceId,
+        });
+      } else {
+        console.debug("[chat-stream] active run stream failed", {
+          chatId: activeRun.chatId,
+          message: errorMessage(requestError),
+          runId: activeRun.runId,
+          workspaceId: activeRun.workspaceId,
+        });
         setChatRunFailed(chatKey, true);
         setError(errorMessage(requestError));
       }

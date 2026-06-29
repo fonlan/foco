@@ -3108,6 +3108,64 @@ describe("app-chat-stream verification surfaces", () => {
         .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
     }
   });
+
+  it("does not duplicate active run subscriptions on recovery events while the stream is alive", async () => {
+    let runStreamRequests = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          messages: [
+            chatMessages.messages[0],
+            {
+              ...chatMessages.messages[1],
+              id: "message-assistant-stream",
+              status: "streaming",
+            },
+          ],
+          activeRun: {
+            acceptingGuidance: true,
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
+        runStreamRequests += 1;
+        return chatStreamResponse("chat-1");
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() => expect(runStreamRequests).toBe(1));
+
+    await act(async () => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "visible",
+      });
+      fireEvent(document, new Event("visibilitychange"));
+      window.dispatchEvent(new Event("online"));
+      await Promise.resolve();
+    });
+
+    expect(runStreamRequests).toBe(1);
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
   it("reattaches to an active run when loading chat messages", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
