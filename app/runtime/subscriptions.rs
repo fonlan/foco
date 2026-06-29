@@ -656,9 +656,10 @@ pub(crate) fn chat_run_subscription_stream(
         for event in subscription.replay {
             if event.sequence > last_sequence {
                 last_sequence = event.sequence;
+                yield Ok(sse_event_frame(&event));
             }
-            yield Ok(sse_event_payload(&event.payload_json));
         }
+
 
         if *subscription.completed_rx.borrow() {
             yield Ok(sse_event(&ChatSseEvent::StreamEnd));
@@ -672,7 +673,7 @@ pub(crate) fn chat_run_subscription_stream(
                         while let Ok(event) = subscription.event_rx.try_recv() {
                             if event.sequence > last_sequence {
                                 last_sequence = event.sequence;
-                                yield Ok(sse_event_payload(&event.payload_json));
+                                yield Ok(sse_event_frame(&event));
                             }
                         }
                         yield Ok(sse_event(&ChatSseEvent::StreamEnd));
@@ -684,7 +685,7 @@ pub(crate) fn chat_run_subscription_stream(
                         Ok(event) => {
                             if event.sequence > last_sequence {
                                 last_sequence = event.sequence;
-                                yield Ok(sse_event_payload(&event.payload_json));
+                                yield Ok(sse_event_frame(&event));
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -699,5 +700,54 @@ pub(crate) fn chat_run_subscription_stream(
                 }
             }
         }
+    }
+}
+
+fn sse_event_frame(event: &ChatRunEventFrame) -> Event {
+    sse_event_payload(&event.payload_json).id(event.sequence.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::to_bytes,
+        response::{IntoResponse, Sse},
+    };
+    use tokio::sync::{broadcast, watch};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_replays_after_sequence_with_sse_ids() {
+        let (_event_tx, event_rx) = broadcast::channel(1);
+        let (_completed_tx, completed_rx) = watch::channel(true);
+        let subscription = ActiveChatRunSubscription {
+            replay: vec![
+                ChatRunEventFrame {
+                    sequence: 1,
+                    event_type: "textDelta".to_string(),
+                    payload_json: r#"{"type":"textDelta","delta":"old"}"#.to_string(),
+                },
+                ChatRunEventFrame {
+                    sequence: 2,
+                    event_type: "textDelta".to_string(),
+                    payload_json: r#"{"type":"textDelta","delta":"new"}"#.to_string(),
+                },
+            ],
+            event_rx,
+            completed_rx,
+            after_sequence: 1,
+        };
+
+        let body = Sse::new(chat_run_subscription_stream(subscription))
+            .into_response()
+            .into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        assert!(!text.contains("id: 1"));
+        assert!(!text.contains("old"));
+        assert!(text.contains("id: 2"));
+        assert!(text.contains("new"));
     }
 }

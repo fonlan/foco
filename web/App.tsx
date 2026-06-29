@@ -5930,12 +5930,15 @@ export function App() {
     }
   }
 
-  async function subscribeActiveChatRun(activeRun: ActiveChatRunSummary) {
+  async function subscribeActiveChatRun(
+    activeRun: ActiveChatRunSummary,
+    isReconnect = false,
+  ) {
     const chatKey = chatRunKey(activeRun.workspaceId, activeRun.chatId);
     const existingAbortController = activeRunAbortByChatKeyRef.current.get(chatKey);
     if (existingAbortController) {
       const existingRunId = activeRunInfoByChatKeyRef.current[chatKey]?.runId;
-      if (existingRunId === activeRun.runId) {
+      if (existingRunId === activeRun.runId && !isReconnect) {
         return;
       }
       existingAbortController.abort();
@@ -6114,33 +6117,61 @@ export function App() {
       return eventAssistantMessageId ?? currentAssistantMessageId;
     };
 
+    let lastProcessedSequence = activeRun.lastSequence ?? -1;
+    const lastSequenceForState = () =>
+      lastProcessedSequence >= 0 ? lastProcessedSequence : null;
+    const activeRunWithCurrentSequence = (): ActiveChatRunSummary => ({
+      ...activeRun,
+      lastSequence: lastSequenceForState(),
+    });
+    const updateLastProcessedSequence = (sequence: number | null) => {
+      if (sequence === null || sequence <= lastProcessedSequence) {
+        return;
+      }
+      lastProcessedSequence = sequence;
+      const currentRunInfo = activeRunInfoByChatKeyRef.current[chatKey];
+      if (currentRunInfo?.runId === activeRun.runId) {
+        setActiveRunInfoForChatKey(chatKey, {
+          ...currentRunInfo,
+          lastSequence: sequence,
+        });
+      }
+    };
+
     setChatRunning(chatKey, true);
     setChatRunFailed(chatKey, false);
     setActiveRunInfoForChatKey(chatKey, {
       acceptingGuidance: activeRun.acceptingGuidance,
       chatId: activeRun.chatId,
       chatKey,
-      lastSequence: activeRun.lastSequence,
+      lastSequence: lastSequenceForState(),
       runId: activeRun.runId,
       workspaceId: activeRun.workspaceId,
     });
     activeRunAbortByChatKeyRef.current.set(chatKey, abortController);
+    let shouldReconnect = false;
 
     try {
+      const afterSequence = lastProcessedSequence;
       const response = await fetch(
-        `/api/workspaces/${encodeURIComponent(activeRun.workspaceId)}/chat/runs/${encodeURIComponent(activeRun.runId)}/stream?afterSequence=-1`,
+        `/api/workspaces/${encodeURIComponent(activeRun.workspaceId)}/chat/runs/${encodeURIComponent(activeRun.runId)}/stream?afterSequence=${encodeURIComponent(String(afterSequence))}`,
         {
           cache: "no-store",
           credentials: "same-origin",
           signal: abortController.signal,
         },
       );
-
       if (!response.ok) {
+        if (isReconnect && (response.status === 400 || response.status === 404)) {
+          await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
+          return;
+        }
         throw new Error(await responseErrorMessage(response));
       }
 
-      await readChatStream(response, (streamEvent) => {
+      await readChatStream(response, (streamEvent, meta) => {
+        const eventSequence = meta.id === null ? null : Number(meta.id);
+        updateLastProcessedSequence(Number.isFinite(eventSequence) ? eventSequence : null);
         if (streamEvent.type !== "textDelta") {
           textDeltaBuffer.flush();
         }
@@ -6180,7 +6211,7 @@ export function App() {
             acceptingGuidance: true,
             chatId: streamEvent.chatId,
             chatKey,
-            lastSequence: activeRun.lastSequence,
+            lastSequence: lastSequenceForState(),
             runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
@@ -6255,7 +6286,7 @@ export function App() {
             acceptingGuidance: true,
             chatId: activeRun.chatId,
             chatKey,
-            lastSequence: activeRun.lastSequence,
+            lastSequence: lastSequenceForState(),
             runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
@@ -6602,7 +6633,7 @@ export function App() {
             ),
           );
         }
-      });
+      }, { signal: abortController.signal });
 
       await refreshWorkspaces();
     } catch (requestError) {
@@ -6611,7 +6642,9 @@ export function App() {
       stopLiveReasoningDuration();
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
-      if (!wasCancelled) {
+      if (isStreamIdleError(requestError)) {
+        shouldReconnect = true;
+      } else if (!wasCancelled) {
         setChatRunFailed(chatKey, true);
         setError(errorMessage(requestError));
       }
@@ -6621,9 +6654,22 @@ export function App() {
       stopLiveReasoningDuration();
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
-        setChatRunning(chatKey, false);
-        setActiveRunInfoForChatKey(chatKey, null);
-        clearLiveChatStatistics(chatKey);
+        if (shouldReconnect) {
+          setChatRunning(chatKey, true);
+          setActiveRunInfoForChatKey(chatKey, {
+            acceptingGuidance: activeRun.acceptingGuidance,
+            chatId: activeRun.chatId,
+            chatKey,
+            lastSequence: lastSequenceForState(),
+            runId: activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          });
+          void subscribeActiveChatRun(activeRunWithCurrentSequence(), true);
+        } else {
+          setChatRunning(chatKey, false);
+          setActiveRunInfoForChatKey(chatKey, null);
+          clearLiveChatStatistics(chatKey);
+        }
       }
       if (!streamHadError) {
         setPendingQuestion(null);
@@ -11982,9 +12028,36 @@ function localUiId(prefix: string) {
   return `${prefix}-${localRandomId()}`;
 }
 
+const CHAT_STREAM_IDLE_TIMEOUT_MS = 35_000;
+
+type ChatStreamFrameMeta = {
+  id: string | null;
+};
+
+class StreamIdleError extends Error {
+  constructor(timeoutMs: number) {
+    super(`chat stream was idle for ${timeoutMs}ms`);
+    this.name = "StreamIdleError";
+  }
+}
+
+function isStreamIdleError(error: unknown) {
+  return error instanceof StreamIdleError;
+}
+
+function chatStreamIdleTimeoutMs() {
+  const configured = (globalThis as {
+    __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: unknown;
+  }).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
+  return typeof configured === "number" && configured > 0
+    ? configured
+    : CHAT_STREAM_IDLE_TIMEOUT_MS;
+}
+
 async function readChatStream(
   response: Response,
-  onEvent: (event: ChatStreamEvent) => void,
+  onEvent: (event: ChatStreamEvent, meta: ChatStreamFrameMeta) => void,
+  options: { idleTimeoutMs?: number; signal?: AbortSignal } = {},
 ) {
   if (!response.body) {
     throw new Error("chat stream response has no body");
@@ -11992,17 +12065,23 @@ async function readChatStream(
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
+  // ponytail: fixed threshold; if backend keep-alive becomes configurable, derive this from server capabilities.
+  const idleTimeoutMs = options.idleTimeoutMs ?? chatStreamIdleTimeoutMs();
   let buffer = "";
   let shouldStopReading = false;
-  const handleEvent = (event: ChatStreamEvent) => {
-    onEvent(event);
+  const handleEvent = (event: ChatStreamEvent, meta: ChatStreamFrameMeta) => {
+    onEvent(event, meta);
     if (event.type === "streamEnd") {
       shouldStopReading = true;
     }
   };
 
   while (!shouldStopReading) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunkWithIdleTimeout(
+      reader,
+      idleTimeoutMs,
+      options.signal,
+    );
 
     if (done) {
       break;
@@ -12021,17 +12100,54 @@ async function readChatStream(
   readSseFrames(`${buffer}\n\n`, handleEvent);
 }
 
+function readStreamChunkWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleTimeoutMs: number,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let abortListener: (() => void) | null = null;
+  const readPromise = reader.read();
+  const idlePromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new StreamIdleError(idleTimeoutMs));
+      void reader.cancel();
+    }, idleTimeoutMs);
+    abortListener = () => {
+      reject(new DOMException("The operation was aborted.", "AbortError"));
+    };
+    signal?.addEventListener("abort", abortListener, { once: true });
+  });
+
+  return Promise.race([readPromise, idlePromise]).finally(() => {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+    if (abortListener) {
+      signal?.removeEventListener("abort", abortListener);
+    }
+  });
+}
+
 function readSseFrames(
   buffer: string,
-  onEvent: (event: ChatStreamEvent) => void,
+  onEvent: (event: ChatStreamEvent, meta: ChatStreamFrameMeta) => void,
 ) {
   const normalized = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const frames = normalized.split("\n\n");
   const remaining = frames.pop() ?? "";
 
   for (const frame of frames) {
-    const data = frame
-      .split("\n")
+    const lines = frame.split("\n");
+    const id = lines
+      .filter((line) => line.startsWith("id:"))
+      .map((line) => line.slice(3).trimStart())
+      .at(-1) ?? null;
+    const data = lines
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trimStart())
       .join("\n");
@@ -12048,7 +12164,7 @@ function readSseFrames(
       );
     }
 
-    onEvent(event);
+    onEvent(event, { id });
   }
 
   return remaining;

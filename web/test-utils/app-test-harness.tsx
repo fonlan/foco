@@ -2938,14 +2938,19 @@ export function enqueueChatStreamEvent(value: unknown) {
   );
 }
 
-export function enqueueChatStreamEventForRun(runId: string, value: unknown) {
+export function enqueueChatStreamEventForRun(
+  runId: string,
+  value: unknown,
+  options: { id?: number | string } = {},
+) {
   const controller = appTestState.chatStreamControllers.get(runId);
   if (!controller) {
     throw new Error(`chat stream is not active: ${runId}`);
   }
 
   const encoder = new TextEncoder();
-  controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+  const idLine = options.id === undefined ? "" : `id: ${options.id}\n`;
+  controller.enqueue(encoder.encode(`${idLine}data: ${JSON.stringify(value)}\n\n`));
 }
 
 export function jsonResponse(value: unknown, init?: ResponseInit) {
