@@ -5295,12 +5295,10 @@ export function SettingsPanel({
                       : t("No plans")}
                   </div>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
-                    <label className="block w-full sm:w-32">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                        {t("Page size")}
-                      </span>
+                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-stone-500 sm:w-auto">
+                      <span>{t("Page size")}</span>
                       <input
-                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                         inputMode="numeric"
                         onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
                         value={planHistoryPageSize}
