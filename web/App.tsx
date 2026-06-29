@@ -8498,7 +8498,7 @@ export function App() {
                   <div className="flex shrink-0 items-center gap-1.5">
                     <button
                       aria-label={t("Refresh workspaces")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                       disabled={isLoading}
                       onClick={() => void refreshWorkspaces()}
                       title={t("Refresh workspaces")}
@@ -8506,18 +8506,18 @@ export function App() {
                     >
                       <RefreshCw
                         aria-hidden="true"
-                        className={`size-4 ${isLoading ? "animate-spin" : ""}`}
+                        className={`size-3.5 ${isLoading ? "animate-spin" : ""}`}
                       />
                     </button>
                     <button
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                       onClick={() => setWorkspaceChatSearchOpen((current) => !current)}
                       title={t("Search chats")}
                       type="button"
                     >
-                      <Search aria-hidden="true" className="size-4" />
+                      <Search aria-hidden="true" className="size-3.5" />
                     </button>
                     <button
                       aria-label={t("Close")}
@@ -8533,25 +8533,26 @@ export function App() {
 
                 {workspaceChatSearchOpen ? (
                   <div className="border-b border-stone-200/80 px-3 py-2">
-                    <div className="flex items-center gap-2">
+                    <div className="relative">
                       <input
                         aria-label={t("Search chats")}
-                        className="h-9 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="workspace-chat-search-input h-9 w-full rounded-lg border border-stone-300 bg-white px-3 pr-8 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                         onChange={(event) => setWorkspaceChatSearchQuery(event.target.value)}
                         placeholder={t("Search chats placeholder")}
                         type="search"
                         value={workspaceChatSearchQuery}
                       />
-                      <button
-                        aria-label={t("Clear search")}
-                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-500 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-300"
-                        disabled={workspaceChatSearchQuery.length === 0}
-                        onClick={() => setWorkspaceChatSearchQuery("")}
-                        title={t("Clear search")}
-                        type="button"
-                      >
-                        <X aria-hidden="true" className="size-4" />
-                      </button>
+                      {workspaceChatSearchQuery.length ? (
+                        <button
+                          aria-label={t("Clear search")}
+                          className="absolute right-2 top-1/2 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+                          onClick={() => setWorkspaceChatSearchQuery("")}
+                          title={t("Clear search")}
+                          type="button"
+                        >
+                          <X aria-hidden="true" className="size-3.5" />
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 ) : null}

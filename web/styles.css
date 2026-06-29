@@ -63,6 +63,10 @@ summary {
   touch-action: manipulation;
 }
 
+.workspace-chat-search-input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
 :where(
   button.app-error-toast-close,
   button.audit-json-copy-button,
