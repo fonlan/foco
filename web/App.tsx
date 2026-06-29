@@ -2193,6 +2193,9 @@ export function App() {
 
     const nextPlanAction = nextAutoRunnablePlan(activePlans);
     if (!nextPlanAction) {
+      // ponytail: this is only the current active view queue; active plans pageSize=50.
+      // Upgrade path: move queue exhaustion detection into a backend persisted runner.
+      setIsPlanAutoRunEnabled(false);
       return;
     }
 
