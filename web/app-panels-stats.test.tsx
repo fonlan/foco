@@ -738,6 +738,83 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
+  it("scrolls the running plan into view when the Plan tab opens", async () => {
+    const readyPlan = {
+      ...planFixture,
+      activePhaseId: null,
+      id: "plan-ready-scroll",
+      sortOrder: 0,
+      status: "ready" as const,
+      title: "Ready scroll decoy",
+    };
+    const runningPlan = {
+      ...planFixture,
+      activePhaseId: "phase-running-scroll",
+      id: "plan-running-scroll",
+      phases: [
+        {
+          ...planFixture.phases[0],
+          id: "phase-running-scroll",
+          planId: "plan-running-scroll",
+          status: "running" as const,
+        },
+      ],
+      sortOrder: 1,
+      status: "running" as const,
+      title: "Running scroll target",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [readyPlan, runningPlan],
+          totalCount: 2,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    const planTab = await screen.findByRole("tab", { name: "Plan" });
+    const scrollIntoView = vi.mocked(HTMLElement.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+
+    await userEvent.click(planTab);
+
+    expect(await screen.findByText("Running scroll target")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        scrollIntoView.mock.contexts.some(
+          (context) =>
+            context instanceof HTMLElement &&
+            context.textContent?.includes("Running scroll target"),
+        ),
+      ).toBe(true);
+    });
+    expect(
+      scrollIntoView.mock.contexts.some(
+        (context) =>
+          context instanceof HTMLElement &&
+          context.textContent?.includes("Ready scroll decoy"),
+      ),
+    ).toBe(false);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: "center",
+      inline: "nearest",
+    });
+  });
+
   it("toggles the plan worktree audit view back to the plan list", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

@@ -30,6 +30,8 @@ import {
 } from "lucide-react";
 import {
   memo,
+  useEffect,
+  useRef,
   useState,
   type ComponentProps,
   type FormEvent,
@@ -692,6 +694,30 @@ function ContextPlanTab({
   const [isLoadingWorktreeAudit, setIsLoadingWorktreeAudit] = useState(false);
   const [showWorktreeAudit, setShowWorktreeAudit] = useState(false);
   const showAutoRunBusy = autoRunEnabled && autoRunBusy;
+  const runningPlan = plans.find((plan) => plan.status === "running") ?? null;
+  const runningPlanId = runningPlan?.id ?? null;
+  const runningPlanArticleRef = useRef<HTMLElement | null>(null);
+  const lastScrolledRunningPlanId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (showWorktreeAudit || !runningPlanId) {
+      if (!runningPlanId) {
+        lastScrolledRunningPlanId.current = null;
+      }
+      return;
+    }
+    if (lastScrolledRunningPlanId.current === runningPlanId) {
+      return;
+    }
+
+    const runningPlanArticle = runningPlanArticleRef.current;
+    if (!runningPlanArticle) {
+      return;
+    }
+
+    runningPlanArticle.scrollIntoView({ block: "center", inline: "nearest" });
+    lastScrolledRunningPlanId.current = runningPlanId;
+  }, [runningPlanId, showWorktreeAudit]);
 
   const refreshWorktreeAudit = async () => {
     setIsLoadingWorktreeAudit(true);
@@ -833,7 +859,11 @@ function ContextPlanTab({
               const mergedCommitId = planMergedIntoSharedWorkspace(plan);
 
               return (
-                <article className="context-memory-item" key={plan.id}>
+                <article
+                  className="context-memory-item"
+                  key={plan.id}
+                  ref={plan.id === runningPlanId ? runningPlanArticleRef : undefined}
+                >
                   <div className="context-memory-item-header">
                     <div className="context-memory-badges">
                       <span className={planStatusClass(plan.status)}>
