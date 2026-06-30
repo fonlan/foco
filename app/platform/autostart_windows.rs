@@ -1,7 +1,12 @@
 #[cfg(any(windows, target_os = "macos"))]
 use std::env;
+#[cfg(any(windows, test))]
+use std::path::Path;
 
 use crate::ApiError;
+
+#[cfg(any(windows, test))]
+use crate::AUTO_START_COMMAND;
 
 #[cfg(windows)]
 use crate::normalize_windows_verbatim_path;
@@ -38,7 +43,7 @@ pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
             ))
         })?;
         let exe_path = normalize_windows_verbatim_path(exe_path);
-        set_auto_start_registry_value(&format!("\"{}\"", exe_path.display()))
+        set_auto_start_registry_value(&windows_auto_start_command(&exe_path))
     } else {
         remove_auto_start_registry_value()
     }
@@ -62,6 +67,11 @@ pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_auto_start_command(exe_path: &Path) -> String {
+    format!("\"{}\" {AUTO_START_COMMAND}", exe_path.display())
 }
 
 #[cfg(target_os = "macos")]
@@ -393,7 +403,16 @@ fn wide_bytes(value: &[u16]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::macos_launch_agent_plist;
+    use std::path::Path;
+
+    use super::{macos_launch_agent_plist, windows_auto_start_command};
+
+    #[test]
+    fn windows_auto_start_command_includes_internal_flag() {
+        let command = windows_auto_start_command(Path::new(r"C:\Program Files\Foco\foco.exe"));
+
+        assert_eq!(command, r#""C:\Program Files\Foco\foco.exe" --auto-start"#);
+    }
 
     #[test]
     fn macos_launch_agent_plist_contains_required_keys() {

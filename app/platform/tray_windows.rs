@@ -19,7 +19,7 @@ use crate::platform::tray::{
 #[cfg(all(windows, not(debug_assertions)))]
 use crate::runtime::ActiveChatRunRegistry;
 #[cfg(all(windows, not(debug_assertions)))]
-use crate::{AppResult, local_addr, logging, run_server_until_shutdown};
+use crate::{AUTO_START_COMMAND, AppResult, local_addr, logging, run_server_until_shutdown};
 
 #[cfg(all(windows, not(debug_assertions)))]
 // Stable tray menu item id for opening the browser UI from the Windows tray icon.
@@ -62,6 +62,9 @@ impl TrayMenuUpdateNotifier {
 
 #[cfg(all(windows, not(debug_assertions)))]
 pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
+    let started_from_auto_start = std::env::args()
+        .skip(1)
+        .any(|arg| arg == AUTO_START_COMMAND);
     let loaded_config = load_or_create_global_config()?;
     // Initialise logging on the main thread BEFORE spawning the server so
     // that any tray-loop error is captured in the daily log file. The
@@ -89,6 +92,7 @@ pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
                 .expect("failed to build Foco HTTP runtime");
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
                 Some(shutdown_rx),
+                !started_from_auto_start,
                 tray_menu_update_notifier,
                 runtime_active_chat_runs,
             )) {

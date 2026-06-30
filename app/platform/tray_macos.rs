@@ -44,6 +44,7 @@ fn run_macos_menu_bar_entrypoint_blocking() -> AppResult<()> {
                 .expect("failed to build Foco HTTP runtime");
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
                 Some(shutdown_rx),
+                false,
                 runtime_active_chat_runs,
             )) {
                 tracing::error!(%error, "Foco server failed");

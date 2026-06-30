@@ -344,6 +344,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 // Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
+pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -428,7 +429,7 @@ async fn run_entrypoint() -> AppResult<()> {
 
     #[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
     {
-        run_server_until_shutdown(None, ActiveChatRunRegistry::default()).await
+        run_server_until_shutdown(None, false, ActiveChatRunRegistry::default()).await
     }
 }
 
@@ -537,9 +538,11 @@ fn memory_dream_latest_usage() -> String {
 
 async fn run_server_until_shutdown(
     shutdown_rx: Option<watch::Receiver<bool>>,
+    open_browser_on_startup: bool,
     #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
     active_chat_runs: ActiveChatRunRegistry,
 ) -> AppResult<()> {
+    let _ = open_browser_on_startup;
     let startup_started_at = Instant::now();
     let load_config_started_at = Instant::now();
     let loaded_config = load_or_create_global_config()?;
@@ -697,7 +700,7 @@ async fn run_server_until_shutdown(
     #[cfg(all(windows, not(debug_assertions)))]
     {
         crate::platform::tray::open_foco_ui_if_listener_bound(
-            true,
+            open_browser_on_startup,
             addr,
             crate::platform::tray::open_foco_ui,
         );
