@@ -578,6 +578,8 @@ pub(super) fn delete_agent_worktree(
             ApiError::internal(format!("failed to read Agent worktree HEAD: {source}"))
         })?
         .map(|name| name.to_string());
+    drop(repo);
+
     remove_worktree_path(&worktree_path)?;
     if git_dir.exists() {
         fs::remove_dir_all(&git_dir).map_err(|source| {
