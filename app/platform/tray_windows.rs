@@ -1,6 +1,3 @@
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-use std::net::{IpAddr, SocketAddr};
-
 #[cfg(all(windows, not(debug_assertions)))]
 use std::{
     sync::{
@@ -10,13 +7,15 @@ use std::{
     time::Duration,
 };
 
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-use foco_store::config::SUPPORTED_APP_LANGUAGES;
 #[cfg(all(windows, not(debug_assertions)))]
 use foco_store::config::load_or_create_global_config;
 #[cfg(all(windows, not(debug_assertions)))]
 use tokio::sync::watch;
 
+#[cfg(all(windows, not(debug_assertions)))]
+use crate::platform::tray::{
+    TrayMenuLabels, foco_ui_url_for_listen_addr, open_foco_ui, tray_menu_labels,
+};
 #[cfg(all(windows, not(debug_assertions)))]
 use crate::runtime::ActiveChatRunRegistry;
 #[cfg(all(windows, not(debug_assertions)))]
@@ -28,13 +27,6 @@ const TRAY_OPEN_ITEM_ID: &str = "foco-open-ui";
 #[cfg(all(windows, not(debug_assertions)))]
 // Stable tray menu item id for quitting the Windows tray application.
 const TRAY_QUIT_ITEM_ID: &str = "foco-quit";
-
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TrayMenuLabels {
-    pub(crate) open: &'static str,
-    pub(crate) quit: &'static str,
-}
 
 #[cfg(all(windows, not(debug_assertions)))]
 #[derive(Clone)]
@@ -342,60 +334,4 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(all(windows, not(debug_assertions)))]
 fn foco_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
     tray_icon::Icon::from_resource(1, Some((32, 32)))
-}
-
-#[cfg(all(windows, not(debug_assertions)))]
-pub(crate) fn open_foco_ui(ui_url: &str) {
-    if let Err(error) = webbrowser::open(ui_url) {
-        tracing::warn!(%ui_url, error = %error, "failed to open Foco web UI");
-    }
-}
-
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-pub(crate) fn tray_menu_labels(language: &str) -> Result<TrayMenuLabels, String> {
-    match language {
-        "zh-CN" => Ok(TrayMenuLabels {
-            open: "打开 Foco",
-            quit: "退出 Foco",
-        }),
-        "en" => Ok(TrayMenuLabels {
-            open: "Open Foco",
-            quit: "Quit Foco",
-        }),
-        _ => Err(format!(
-            "app language '{language}' is unsupported; expected one of {}",
-            SUPPORTED_APP_LANGUAGES.join(", ")
-        )),
-    }
-}
-
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-pub(crate) fn browser_addr_for_listen_addr(addr: SocketAddr) -> SocketAddr {
-    let host = match addr.ip() {
-        IpAddr::V4(ip) if ip.octets() == [0, 0, 0, 0] => IpAddr::from([127, 0, 0, 1]),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]),
-        ip => ip,
-    };
-
-    SocketAddr::from((host, addr.port()))
-}
-
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-fn foco_ui_url_for_listen_addr(addr: SocketAddr) -> String {
-    format!("http://{}", browser_addr_for_listen_addr(addr))
-}
-
-#[cfg(any(test, all(windows, not(debug_assertions))))]
-pub(crate) fn open_foco_ui_if_listener_bound(
-    listener_bound: bool,
-    addr: SocketAddr,
-    open_ui: impl FnOnce(&str),
-) -> bool {
-    if !listener_bound {
-        return false;
-    }
-
-    let ui_url = foco_ui_url_for_listen_addr(addr);
-    open_ui(&ui_url);
-    true
 }

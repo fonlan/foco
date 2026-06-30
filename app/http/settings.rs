@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-#[cfg(all(windows, not(debug_assertions)))]
-use crate::platform::tray_windows::tray_menu_labels;
+#[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
+use crate::platform::tray::tray_menu_labels;
 use crate::runtime::spawn_api_audit_cleanup_once;
 use axum::{
     Json,
@@ -1468,14 +1468,14 @@ pub(crate) async fn save_prompt_settings(
     settings_response(&state, &config).await
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
 fn validate_tray_menu_language(language: &str) -> Result<(), ApiError> {
     tray_menu_labels(language)
         .map(|_| ())
         .map_err(ApiError::internal)
 }
 
-#[cfg(any(not(windows), debug_assertions))]
+#[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
 fn validate_tray_menu_language(_language: &str) -> Result<(), ApiError> {
     Ok(())
 }

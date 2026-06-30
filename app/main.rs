@@ -168,7 +168,7 @@ pub(crate) use hooks_support::{
     hook_run_summary_row, hooks_settings_response, import_claude_hook_config,
 };
 #[cfg(test)]
-pub(crate) use platform::tray_windows::{
+pub(crate) use platform::tray::{
     TrayMenuLabels, browser_addr_for_listen_addr, open_foco_ui_if_listener_bound, tray_menu_labels,
 };
 #[cfg(test)]
@@ -418,12 +418,12 @@ async fn run_entrypoint() -> AppResult<()> {
         return Ok(());
     }
 
-    #[cfg(all(windows, not(debug_assertions)))]
+    #[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
     {
-        return crate::platform::tray_windows::run_windows_tray_entrypoint();
+        return crate::platform::tray::run_platform_tray_entrypoint().await;
     }
 
-    #[cfg(any(not(windows), debug_assertions))]
+    #[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
     {
         run_server_until_shutdown(None, ActiveChatRunRegistry::default()).await
     }
@@ -693,10 +693,10 @@ async fn run_server_until_shutdown(
     );
     #[cfg(all(windows, not(debug_assertions)))]
     {
-        crate::platform::tray_windows::open_foco_ui_if_listener_bound(
+        crate::platform::tray::open_foco_ui_if_listener_bound(
             true,
             addr,
-            crate::platform::tray_windows::open_foco_ui,
+            crate::platform::tray::open_foco_ui,
         );
     }
     let _code_graph_index_thread =
