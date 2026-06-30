@@ -1340,10 +1340,16 @@ impl WorkspaceDatabase {
                  INNER JOIN agent_instances AS instances
                     ON instances.id = teams.coordinator_instance_id
                  LEFT JOIN agent_tasks AS tasks ON tasks.id = phases.agent_task_id
-                 WHERE plans.shared_merge_commit_id IS NULL
-                   AND instances.execution_workspace_mode = 'isolated_worktree'
+                 WHERE instances.execution_workspace_mode = 'isolated_worktree'
                    AND instances.execution_root_path IS NOT NULL
                    AND instances.worktree_status IN ('active', 'kept')
+                   AND (
+                        plans.shared_merge_commit_id IS NULL
+                        OR (
+                            plans.status IN ('implemented', 'completed', 'failed', 'cancelled')
+                            AND phases.status IN ('completed', 'failed', 'cancelled')
+                        )
+                   )
                  ORDER BY plans.updated_at DESC, phases.sequence ASC, plans.id ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;

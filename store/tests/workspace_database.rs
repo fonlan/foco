@@ -6497,10 +6497,17 @@ fn plan_worktree_audit_lists_unmerged_isolated_plan_worktrees() {
     database
         .record_plan_shared_merge_commit(plan_id, "fedcba9876543210fedcba9876543210fedcba98")
         .expect("record shared merge");
+    let merged_audit = database.plan_worktree_audit().expect("audit after merge");
+    assert_eq!(merged_audit.len(), 1);
+    assert_eq!(merged_audit[0].agent_instance_id, instance_id);
+
+    database
+        .update_agent_instance_worktree_status(&instance_id, "deleted")
+        .expect("mark worktree deleted");
     assert!(
         database
             .plan_worktree_audit()
-            .expect("audit after merge")
+            .expect("audit after worktree delete")
             .is_empty()
     );
 }
