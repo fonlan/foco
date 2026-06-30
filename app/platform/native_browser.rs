@@ -385,7 +385,8 @@ enum MacosNativePickerSelection {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn dispatch_get_main_queue() -> *mut c_void;
+    #[link_name = "_dispatch_main_q"]
+    static DISPATCH_MAIN_Q: u8;
     fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
@@ -393,7 +394,7 @@ unsafe extern "C" {
 fn schedule_macos_native_picker_dispatch() {
     unsafe {
         dispatch_async_f(
-            dispatch_get_main_queue(),
+            ptr::addr_of!(DISPATCH_MAIN_Q).cast::<c_void>().cast_mut(),
             ptr::null_mut(),
             drain_macos_native_picker_requests,
         );

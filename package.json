@@ -11,9 +11,12 @@
     "test:backend": "cargo test --workspace -j 4 -- --test-threads=4",
     "test:backend:calm": "cargo test --workspace -j 2 -- --test-threads=2",
     "test:release-smoke:windows": "node scripts/smoke-release-windows.mjs",
+    "test:release-smoke:macos": "node scripts/smoke-release-macos.mjs",
     "check:release:macos": "npm run build -w web && cargo check --release -p foco-app --target aarch64-apple-darwin",
     "typecheck": "npm run typecheck -w web",
     "build:release": "node scripts/build-release.mjs",
-    "build:dist": "node scripts/build-release.mjs --dist"
+    "build:dist": "node scripts/build-release.mjs --dist",
+    "build:macos-app": "node scripts/package-macos.mjs",
+    "build:macos-dmg": "node scripts/package-macos.mjs --dmg"
   }
 }

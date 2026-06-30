@@ -10,6 +10,7 @@ CODE_SPLIT_PHASE_0_BASELINE.md
 .codex/
 openspec/
 target/
+dist/
 node_modules/
 web/dist/
 *.tsbuildinfo
