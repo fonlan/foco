@@ -11,7 +11,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export default defineConfig({
   plugins: [react(), tailwindcss(), focoIconPlugin(), backendReloadPlugin()],
   build: {
-    chunkSizeWarningLimit: 600,
+    chunkSizeWarningLimit: 7_000,
     rolldownOptions: {
       output: {
         codeSplitting: {

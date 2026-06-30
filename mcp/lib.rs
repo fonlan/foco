@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::Path,
-    process::Stdio,
     time::Duration,
 };
 
@@ -492,7 +491,7 @@ fn start_stdio_transport(
     // writes to stderr. Piping stderr keeps `CREATE_NO_WINDOW` effective and lets
     // us surface the server's own diagnostics in the log.
     let (transport, stderr) = TokioChildProcess::builder(command)
-        .stderr(Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
     if let Some(stderr) = stderr {
         drain_child_stderr(stderr);

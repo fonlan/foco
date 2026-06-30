@@ -64,6 +64,7 @@ pub(crate) fn foco_ui_url_for_listen_addr(addr: SocketAddr) -> String {
     format!("http://{}", browser_addr_for_listen_addr(addr))
 }
 
+#[cfg(any(test, all(windows, not(debug_assertions))))]
 pub(crate) fn open_foco_ui_if_listener_bound(
     listener_bound: bool,
     addr: SocketAddr,

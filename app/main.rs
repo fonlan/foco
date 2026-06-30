@@ -344,6 +344,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 // Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
+#[cfg(any(windows, test))]
 pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);

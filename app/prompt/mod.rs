@@ -17,7 +17,7 @@ pub(crate) use compression::{
     serialize_provider_request, snapshot_covered_sequences,
 };
 pub(crate) use environment::environment_context_message;
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub(crate) use environment::is_wsl_environment;
 pub(crate) use prompt_files::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
