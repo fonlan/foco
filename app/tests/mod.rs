@@ -964,6 +964,9 @@ fn tray_menu_labels_follow_app_language() {
         tray_menu_labels("en").expect("English tray labels"),
         TrayMenuLabels {
             open: "Open Foco",
+            open_logs: "Open Logs",
+            open_config_folder: "Open Config Folder",
+            about: "About Foco",
             quit: "Quit Foco",
         }
     );
@@ -971,6 +974,9 @@ fn tray_menu_labels_follow_app_language() {
         tray_menu_labels("zh-CN").expect("Chinese tray labels"),
         TrayMenuLabels {
             open: "打开 Foco",
+            open_logs: "打开日志",
+            open_config_folder: "打开配置文件夹",
+            about: "关于 Foco",
             quit: "退出 Foco",
         }
     );

@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
+    ffi::c_void,
     fs,
     net::SocketAddr,
     path::PathBuf,
+    ptr,
+    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use std::process::{Command, Stdio};
 
 use axum::{
@@ -29,6 +32,12 @@ use crate::prompt::is_wsl_environment;
 
 const NATIVE_BROWSER_AUTHORIZATION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const NATIVE_BROWSER_PROBE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#0f766e"/></svg>"##;
+
+#[cfg(target_os = "macos")]
+static MACOS_NATIVE_PICKER_TX: OnceLock<mpsc::Sender<MacosNativePickerRequest>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static MACOS_NATIVE_PICKER_RX: OnceLock<Mutex<mpsc::Receiver<MacosNativePickerRequest>>> =
+    OnceLock::new();
 
 pub(crate) async fn native_browser_probe(
     State(state): State<AppState>,
@@ -307,111 +316,175 @@ fn native_select_directory_windows() -> Result<Option<String>, ApiError> {
 
 #[cfg(target_os = "macos")]
 fn native_select_directory_macos() -> Result<Option<String>, ApiError> {
-    let script = r#"
-const app = Application.currentApplication();
-app.includeStandardAdditions = true;
-try {
-  const folder = app.chooseFolder({ withPrompt: "Choose workspace path" });
-  JSON.stringify(folder.toString());
-} catch (error) {
-  if (error.errorNumber === -128) {
-    "null";
-  } else {
-    throw error;
-  }
-}
-"#;
-
-    let stdout = run_macos_picker_script(script, "native directory picker")?;
-    parse_macos_directory_picker_output(&stdout)
+    match run_macos_native_picker(MacosNativePickerKind::Directory)? {
+        MacosNativePickerSelection::Directory(path) => Ok(path),
+        MacosNativePickerSelection::Files(_) => Err(ApiError::internal(
+            "native directory picker returned file picker results",
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn native_select_files_macos() -> Result<Vec<String>, ApiError> {
-    let script = r#"
-const app = Application.currentApplication();
-app.includeStandardAdditions = true;
-try {
-  const selected = app.chooseFile({
-    withPrompt: "Choose attachments",
-    multipleSelectionsAllowed: true
-  });
-  const files = Array.isArray(selected) ? selected : [selected];
-  JSON.stringify(files.map(file => file.toString()));
-} catch (error) {
-  if (error.errorNumber === -128) {
-    "[]";
-  } else {
-    throw error;
-  }
-}
-"#;
-
-    let stdout = run_macos_picker_script(script, "native file picker")?;
-    parse_macos_file_picker_output(&stdout)
+    match run_macos_native_picker(MacosNativePickerKind::Files)? {
+        MacosNativePickerSelection::Files(paths) => Ok(paths),
+        MacosNativePickerSelection::Directory(_) => Err(ApiError::internal(
+            "native file picker returned directory picker results",
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn run_macos_picker_script(script: &str, picker_name: &str) -> Result<String, ApiError> {
-    // ponytail: osascript/JXA gives native dialogs without adding AppKit glue; ceiling is
-    // richer filters and sandbox-specific behavior, which should move to NSOpenPanel later.
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-l", "JavaScript", "-e", script])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| {
-            ApiError::internal(format!("failed to launch {picker_name}: {source}"))
-        })?;
+pub(crate) fn install_macos_native_picker_dispatcher() {
+    if MACOS_NATIVE_PICKER_TX.get().is_some() {
+        return;
+    }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(ApiError::internal(format!(
-            "{picker_name} failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
+    let (tx, rx) = mpsc::channel();
+    let _ = MACOS_NATIVE_PICKER_TX.set(tx);
+    let _ = MACOS_NATIVE_PICKER_RX.set(Mutex::new(rx));
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_native_picker(
+    kind: MacosNativePickerKind,
+) -> Result<MacosNativePickerSelection, ApiError> {
+    let sender = MACOS_NATIVE_PICKER_TX
+        .get()
+        .ok_or_else(|| ApiError::internal("native macOS picker dispatcher is not available"))?;
+    let (response_tx, response_rx) = mpsc::channel();
+    sender
+        .send(MacosNativePickerRequest { kind, response_tx })
+        .map_err(|_| ApiError::internal("native macOS picker dispatcher is closed"))?;
+    schedule_macos_native_picker_dispatch();
+
+    response_rx
+        .recv()
+        .map_err(|_| ApiError::internal("native macOS picker response channel is closed"))?
+        .map_err(ApiError::internal)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum MacosNativePickerKind {
+    Directory,
+    Files,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosNativePickerRequest {
+    kind: MacosNativePickerKind,
+    response_tx: mpsc::Sender<Result<MacosNativePickerSelection, String>>,
+}
+
+#[cfg(target_os = "macos")]
+enum MacosNativePickerSelection {
+    Directory(Option<String>),
+    Files(Vec<String>),
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn dispatch_get_main_queue() -> *mut c_void;
+    fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_macos_native_picker_dispatch() {
+    unsafe {
+        dispatch_async_f(
+            dispatch_get_main_queue(),
+            ptr::null_mut(),
+            drain_macos_native_picker_requests,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn drain_macos_native_picker_requests(_: *mut c_void) {
+    let Some(receiver) = MACOS_NATIVE_PICKER_RX.get() else {
+        return;
+    };
+
+    loop {
+        let request = match receiver.lock() {
+            Ok(receiver) => match receiver.try_recv() {
+                Ok(request) => request,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            },
+            Err(_) => break,
+        };
+        let result = run_macos_open_panel(request.kind);
+        let _ = request.response_tx.send(result);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_open_panel(kind: MacosNativePickerKind) -> Result<MacosNativePickerSelection, String> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+    use objc2_foundation::NSString;
+
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| "native macOS picker must run on the main thread".to_string())?;
+    let panel = NSOpenPanel::openPanel(mtm);
+    match kind {
+        MacosNativePickerKind::Directory => {
+            panel.setTitle(Some(&NSString::from_str("Choose workspace path")));
+            panel.setPrompt(Some(&NSString::from_str("Select")));
+            panel.setCanChooseFiles(false);
+            panel.setCanChooseDirectories(true);
+            panel.setAllowsMultipleSelection(false);
+        }
+        MacosNativePickerKind::Files => {
+            panel.setTitle(Some(&NSString::from_str("Choose attachments")));
+            panel.setPrompt(Some(&NSString::from_str("Select")));
+            panel.setCanChooseFiles(true);
+            panel.setCanChooseDirectories(false);
+            panel.setAllowsMultipleSelection(true);
+        }
+    }
+
+    if panel.runModal() != NSModalResponseOK {
+        return Ok(match kind {
+            MacosNativePickerKind::Directory => MacosNativePickerSelection::Directory(None),
+            MacosNativePickerKind::Files => MacosNativePickerSelection::Files(Vec::new()),
+        });
+    }
+
+    let paths = macos_open_panel_paths(&panel)?;
+    match kind {
+        MacosNativePickerKind::Directory => {
+            let path = paths
+                .into_iter()
+                .next()
+                .ok_or_else(|| "native directory picker returned no path".to_string())?;
+            if path.trim().is_empty() {
+                return Err("native directory picker returned an empty path".to_string());
             }
-        )));
+            Ok(MacosNativePickerSelection::Directory(Some(path)))
+        }
+        MacosNativePickerKind::Files => {
+            if paths.iter().any(|path| path.trim().is_empty()) {
+                return Err("native file picker returned an empty path".to_string());
+            }
+            Ok(MacosNativePickerSelection::Files(paths))
+        }
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(any(test, target_os = "macos"))]
-fn parse_macos_directory_picker_output(stdout: &str) -> Result<Option<String>, ApiError> {
-    let stdout = stdout.trim();
-    if stdout.is_empty() || stdout == "null" {
-        return Ok(None);
+#[cfg(target_os = "macos")]
+fn macos_open_panel_paths(panel: &objc2_app_kit::NSOpenPanel) -> Result<Vec<String>, String> {
+    let urls = panel.URLs();
+    let mut paths = Vec::with_capacity(urls.count());
+    for index in 0..urls.count() {
+        let url = urls.objectAtIndex(index);
+        let path = url
+            .path()
+            .ok_or_else(|| "native picker returned a URL without a filesystem path".to_string())?;
+        paths.push(path.to_string());
     }
-
-    let path = serde_json::from_str::<String>(stdout).map_err(|source| {
-        ApiError::internal(format!(
-            "native directory picker returned invalid JSON: {source}"
-        ))
-    })?;
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return Err(ApiError::internal(
-            "native directory picker returned an empty path",
-        ));
-    }
-
-    Ok(Some(path))
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn parse_macos_file_picker_output(stdout: &str) -> Result<Vec<String>, ApiError> {
-    let stdout = stdout.trim();
-    if stdout.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let paths = serde_json::from_str::<Vec<String>>(stdout).map_err(|source| {
-        ApiError::internal(format!(
-            "native file picker returned invalid JSON: {source}"
-        ))
-    })?;
 
     Ok(paths)
 }
@@ -824,50 +897,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn macos_directory_picker_output_parses_json_string_and_cancel() {
-        assert_eq!(
-            parse_macos_directory_picker_output(r#""/Users/alice/Workspace""#)
-                .expect("directory path parses"),
-            Some("/Users/alice/Workspace".to_string())
-        );
-        assert_eq!(
-            parse_macos_directory_picker_output("null").expect("null is cancel"),
-            None
-        );
-        assert_eq!(
-            parse_macos_directory_picker_output("   ").expect("empty is cancel"),
-            None
-        );
-    }
-
-    #[test]
-    fn macos_file_picker_output_parses_json_array_and_cancel() {
-        assert_eq!(
-            parse_macos_file_picker_output(r#"["/tmp/a file.txt","/tmp/b.png"]"#)
-                .expect("file paths parse"),
-            vec!["/tmp/a file.txt".to_string(), "/tmp/b.png".to_string()]
-        );
-        assert!(
-            parse_macos_file_picker_output("[]")
-                .expect("empty array is cancel")
-                .is_empty()
-        );
-        assert!(
-            parse_macos_file_picker_output("   ")
-                .expect("empty stdout is cancel")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn macos_picker_output_rejects_invalid_json() {
-        assert!(parse_macos_directory_picker_output("/tmp/not-json").is_err());
-        assert!(parse_macos_file_picker_output(r#"{"path":"/tmp/a"}"#).is_err());
-    }
-
-    #[test]
     fn selected_file_paths_keep_existing_empty_path_validation() {
-        let paths = parse_macos_file_picker_output(r#"[""]"#).expect("json paths parse");
-        assert!(native_selected_files_from_paths(paths).is_err());
+        assert!(native_selected_files_from_paths(vec!["".to_string()]).is_err());
     }
 }

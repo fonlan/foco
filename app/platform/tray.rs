@@ -5,6 +5,9 @@ use foco_store::config::SUPPORTED_APP_LANGUAGES;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TrayMenuLabels {
     pub(crate) open: &'static str,
+    pub(crate) open_logs: &'static str,
+    pub(crate) open_config_folder: &'static str,
+    pub(crate) about: &'static str,
     pub(crate) quit: &'static str,
 }
 #[cfg(all(windows, not(debug_assertions)))]
@@ -28,10 +31,16 @@ pub(crate) fn tray_menu_labels(language: &str) -> Result<TrayMenuLabels, String>
     match language {
         "zh-CN" => Ok(TrayMenuLabels {
             open: "打开 Foco",
+            open_logs: "打开日志",
+            open_config_folder: "打开配置文件夹",
+            about: "关于 Foco",
             quit: "退出 Foco",
         }),
         "en" => Ok(TrayMenuLabels {
             open: "Open Foco",
+            open_logs: "Open Logs",
+            open_config_folder: "Open Config Folder",
+            about: "About Foco",
             quit: "Quit Foco",
         }),
         _ => Err(format!(

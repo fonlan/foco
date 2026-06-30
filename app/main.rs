@@ -424,6 +424,9 @@ async fn run_entrypoint() -> AppResult<()> {
 
     #[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
     {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos_environment::apply_macos_gui_environment();
+
         return crate::platform::tray::run_platform_tray_entrypoint().await;
     }
 
