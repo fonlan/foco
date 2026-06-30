@@ -31,7 +31,7 @@ pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_LLM_REQUEST_RETRY_COUNT: u32 = 3;
 pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
 pub const DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS: u32 = 3;
-pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
+pub const DEFAULT_TERMINAL_SHELL: &str = default_terminal_shell_for_current_platform();
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
 pub const WEB_SEARCH_PROVIDER_TAVILY: &str = "tavily";
@@ -1392,8 +1392,26 @@ fn default_skill_scope() -> String {
     SKILL_SCOPE_GLOBAL.to_string()
 }
 
+pub const fn default_terminal_shell_for_current_platform() -> &'static str {
+    if cfg!(windows) {
+        "powershell"
+    } else if cfg!(target_os = "macos") {
+        "zsh"
+    } else {
+        "bash"
+    }
+}
+
+pub fn default_terminal_shell_for_platform(platform: &str) -> &'static str {
+    match platform.as_bytes() {
+        b"windows" => "powershell",
+        b"macos" => "zsh",
+        _ => "bash",
+    }
+}
+
 fn default_terminal_shell() -> String {
-    DEFAULT_TERMINAL_SHELL.to_string()
+    default_terminal_shell_for_current_platform().to_string()
 }
 
 fn validate_skill_scope(config_path: Option<&Path>, scope: &str) -> Result<(), ConfigError> {
@@ -2533,6 +2551,14 @@ fn invalid_config<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_terminal_shell_matches_platform_family() {
+        assert_eq!(default_terminal_shell_for_platform("windows"), "powershell");
+        assert_eq!(default_terminal_shell_for_platform("macos"), "zsh");
+        assert_eq!(default_terminal_shell_for_platform("linux"), "bash");
+        assert_eq!(default_terminal_shell_for_platform("freebsd"), "bash");
+    }
 
     #[test]
     fn user_profile_env_matches_platform() {

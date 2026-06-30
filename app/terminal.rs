@@ -361,7 +361,7 @@ fn spawn_terminal(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|source| format!("failed to create Windows PTY: {source}"))?;
+        .map_err(|source| format!("failed to create PTY: {source}"))?;
     let mut command = terminal_command(terminal_shell)?;
     let shell_cwd = shell_path(cwd);
 

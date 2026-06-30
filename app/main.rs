@@ -32,16 +32,19 @@ use foco_providers::{
     OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestOverride,
     normalized_proxy_url, parse_provider_kind, stream_chat,
 };
+#[cfg(test)]
+use foco_store::config::DEFAULT_TERMINAL_SHELL;
 use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
-        ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL,
-        FocoPaths, GlobalConfig, HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
-        ModelLimits, ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES,
-        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
-        SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings, WebServerSettings,
-        WorkspaceCommonCommand, WorkspaceConfig, default_agent_execution_workspace_modes,
-        load_global_config, load_or_create_global_config, save_global_config,
+        ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
+        HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
+        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
+        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
+        WorkspaceConfig, default_agent_execution_workspace_modes,
+        default_terminal_shell_for_current_platform, load_global_config,
+        load_or_create_global_config, save_global_config,
         validate_agent_definition_tool_references,
     },
     memory::{

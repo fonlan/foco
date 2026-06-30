@@ -724,3 +724,18 @@ fn model_outputs_text(model: &ModelSettings) -> bool {
             .iter()
             .any(|modality| modality == "text")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_shell_summaries_include_supported_shells() {
+        let shells = terminal_shell_summaries()
+            .into_iter()
+            .map(|summary| summary.shell)
+            .collect::<Vec<_>>();
+
+        assert_eq!(shells, vec!["powershell", "cmd", "bash", "zsh"]);
+    }
+}

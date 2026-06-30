@@ -63,18 +63,22 @@ fn detected_shell() -> Result<DetectedShell, ApiError> {
     let shell = non_empty_string(shell.trim()).ok_or_else(|| {
         ApiError::bad_request("SHELL environment variable is empty; cannot detect shell type")
     })?;
-    let kind = Path::new(&shell)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .and_then(non_empty_string)
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("failed to detect shell type from SHELL={shell}"))
-        })?;
+    let kind = shell_kind_from_executable(&shell)?;
 
     Ok(DetectedShell {
         kind,
         executable: shell,
     })
+}
+
+fn shell_kind_from_executable(shell: &str) -> Result<String, ApiError> {
+    Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(non_empty_string)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("failed to detect shell type from SHELL={shell}"))
+        })
 }
 
 pub(crate) fn is_wsl_environment() -> bool {
@@ -89,4 +93,14 @@ pub(crate) fn is_wsl_environment() -> bool {
     fs::read_to_string("/proc/version")
         .map(|version| version.to_ascii_lowercase().contains("microsoft"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_kind_from_macos_zsh_path_reports_zsh() {
+        assert_eq!(shell_kind_from_executable("/bin/zsh").unwrap(), "zsh");
+    }
 }
