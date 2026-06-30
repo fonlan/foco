@@ -1047,7 +1047,7 @@ fn previous_plan_phase_conclusions(
     plan: &PlanRecord,
     phase: &PlanPhaseRecord,
 ) -> Result<Option<String>, WorkspaceDatabaseError> {
-    let mut conclusions = String::new();
+    let mut conclusion_blocks = Vec::new();
     for previous_phase in plan.phases.iter().filter(|previous_phase| {
         previous_phase.sequence < phase.sequence && previous_phase.status == "completed"
     }) {
@@ -1063,10 +1063,7 @@ fn previous_plan_phase_conclusions(
         else {
             continue;
         };
-        if !conclusions.is_empty() {
-            conclusions.push_str("\n\n");
-        }
-        conclusions.push_str(&format!(
+        conclusion_blocks.push(format!(
             "Phase {}: {}\n{}",
             previous_phase.sequence + 1,
             previous_phase.title.trim(),
@@ -1074,23 +1071,55 @@ fn previous_plan_phase_conclusions(
         ));
     }
 
-    if conclusions.is_empty() {
+    if conclusion_blocks.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(truncate_previous_phase_conclusions(&conclusions)))
+        Ok(Some(truncate_previous_phase_conclusions(
+            &conclusion_blocks,
+        )))
     }
 }
 
-fn truncate_previous_phase_conclusions(value: &str) -> String {
-    if value.chars().count() <= PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS {
-        return value.to_string();
+fn truncate_previous_phase_conclusions(blocks: &[String]) -> String {
+    let full_chars = blocks
+        .iter()
+        .map(|block| block.chars().count())
+        .sum::<usize>()
+        + blocks.len().saturating_sub(1) * 2;
+    if full_chars <= PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS {
+        return blocks.join("\n\n");
     }
-    let truncated: String = value
-        .chars()
-        .take(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)
-        .collect();
+
+    let mut best_start = blocks.len();
+    for start in (0..blocks.len()).rev() {
+        let omitted_count = start;
+        let notice = previous_phase_conclusions_omission_notice(omitted_count);
+        let suffix = blocks[start..].join("\n\n");
+        let candidate_chars = notice.chars().count() + 2 + suffix.chars().count();
+        if candidate_chars <= PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS {
+            best_start = start;
+        } else {
+            break;
+        }
+    }
+
+    let omitted_count = best_start;
+    let notice = previous_phase_conclusions_omission_notice(omitted_count);
+    if best_start == blocks.len() {
+        notice
+    } else {
+        format!("{notice}\n\n{}", blocks[best_start..].join("\n\n"))
+    }
+}
+
+fn previous_phase_conclusions_omission_notice(omitted_count: usize) -> String {
+    let noun = if omitted_count == 1 {
+        "conclusion"
+    } else {
+        "conclusions"
+    };
     format!(
-        "{truncated}\n\n[truncated to {PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS} chars for the phase prompt]"
+        "[{omitted_count} previous phase {noun} omitted because the phase prompt context limit is {PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS} chars]"
     )
 }
 
@@ -1530,16 +1559,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_phase_prompt_keeps_truncated_previous_phase_conclusions_notice() {
+    fn plan_phase_prompt_keeps_previous_phase_conclusions_omission_notice() {
         let phase = phase_record_for_prompt();
         let plan = plan_record_for_prompt(phase.clone());
-        let long_conclusions = "x".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS + 1);
-        let truncated_conclusions = truncate_previous_phase_conclusions(&long_conclusions);
+        let long_conclusions = format!(
+            "Phase 1: Discovery\n{}",
+            "x".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)
+        );
+        let truncated_conclusions = truncate_previous_phase_conclusions(&[long_conclusions]);
 
         let prompt = plan_phase_prompt(&plan, &phase, Some(&truncated_conclusions));
 
         assert!(prompt.contains("Previous phase conclusions:\n"));
-        assert!(prompt.contains("[truncated to 12000 chars for the phase prompt]"));
+        assert!(prompt.contains(
+            "[1 previous phase conclusion omitted because the phase prompt context limit is 12000 chars]"
+        ));
     }
 
     #[test]
@@ -1602,12 +1636,35 @@ mod tests {
     }
 
     #[test]
-    fn previous_plan_phase_conclusions_truncate_on_char_boundary() {
-        let long = "é".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS + 1);
-        let truncated = truncate_previous_phase_conclusions(&long);
+    fn previous_plan_phase_conclusions_keeps_recent_complete_blocks() {
+        let old_block = format!(
+            "Phase 1: Old\n{}",
+            "a".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS - 40)
+        );
+        let recent_block = "Phase 2: Recent\nlatest summary".to_string();
+        let truncated = truncate_previous_phase_conclusions(&[old_block, recent_block.clone()]);
 
-        assert!(truncated.contains("[truncated to 12000 chars for the phase prompt]"));
-        assert!(truncated.starts_with(&"é".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)));
+        assert!(truncated.contains(
+            "[1 previous phase conclusion omitted because the phase prompt context limit is 12000 chars]"
+        ));
+        assert!(!truncated.contains("Phase 1: Old"));
+        assert!(truncated.ends_with(&recent_block));
+    }
+
+    #[test]
+    fn previous_plan_phase_conclusions_omits_oversized_recent_block() {
+        let oversized = format!(
+            "Phase 1: Oversized\n{}éEND",
+            "é".repeat(PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS)
+        );
+        let truncated = truncate_previous_phase_conclusions(&[oversized]);
+
+        assert_eq!(
+            truncated,
+            "[1 previous phase conclusion omitted because the phase prompt context limit is 12000 chars]"
+        );
+        assert!(!truncated.contains("Phase 1: Oversized"));
+        assert!(!truncated.contains("é"));
     }
 
     fn task_with_input(input_json: &str) -> AgentTaskRecord {
