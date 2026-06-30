@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::path::Path;
 
 use crate::{
-    git_backend::{agent_worktree_head_commit, delete_agent_worktree},
+    git_backend::{
+        agent_instance_worktree_path, agent_worktree_head_commit, delete_agent_worktree,
+    },
     *,
 };
 
@@ -411,7 +413,10 @@ pub(crate) async fn plan_worktree_audit(
     let records = database
         .plan_worktree_audit()
         .map_err(ApiError::from_workspace_error)?;
-    let items = records.into_iter().map(plan_worktree_audit_item).collect();
+    let items = records
+        .into_iter()
+        .map(|record| plan_worktree_audit_item(&workspace.path, record))
+        .collect();
 
     Ok(Json(PlanWorktreeAuditResponse {
         items,
@@ -444,7 +449,7 @@ pub(crate) async fn cleanup_plan_worktree(
                 "plan worktree audit item was not found: {instance_id}"
             ))
         })?;
-    let item = plan_worktree_audit_item(record.clone());
+    let item = plan_worktree_audit_item(&workspace.path, record.clone());
     if !item.cleanup_allowed {
         return Err(ApiError::bad_request(
             "plan worktree audit item is not eligible for cleanup",
@@ -456,16 +461,17 @@ pub(crate) async fn cleanup_plan_worktree(
         .ok_or_else(|| {
             ApiError::bad_request(format!("Agent instance was not found: {instance_id}"))
         })?;
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::bad_request("Agent instance no longer has an isolated worktree")
-    })?;
-    if root_path != record.worktree_path {
+    if instance.execution_workspace_mode
+        != foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree
+        || instance.worktree_status.as_deref() == Some("deleted")
+    {
         return Err(ApiError::bad_request(
-            "Agent worktree audit record is stale; refresh before cleanup",
+            "Agent instance no longer has an isolated worktree",
         ));
     }
+    let root_path = agent_instance_worktree_path(&workspace.path, &record.agent_instance_id);
 
-    delete_agent_worktree(&workspace.path, Path::new(root_path), true)?;
+    delete_agent_worktree(&workspace.path, &root_path, true)?;
     database
         .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
         .map_err(ApiError::from_workspace_error)?;
@@ -573,8 +579,13 @@ struct CreateStepStorage {
 
 const PLAN_WORKTREE_RECOVERY_NOTE: &str = "Plans without sharedMergeCommitId were not merged into the shared workspace. Historical implemented/completed plans in this state need manual cherry-pick/merge from the listed worktree branch or a rerun; Foco does not auto cherry-pick historical commits.";
 
-fn plan_worktree_audit_item(record: PlanWorktreeAuditRecord) -> PlanWorktreeAuditItem {
-    let (head_commit_id, head_error) = agent_worktree_head_commit(Path::new(&record.worktree_path))
+fn plan_worktree_audit_item(
+    workspace_path: &Path,
+    record: PlanWorktreeAuditRecord,
+) -> PlanWorktreeAuditItem {
+    let worktree_path = agent_instance_worktree_path(workspace_path, &record.agent_instance_id);
+    let worktree_path_display = worktree_path.display().to_string();
+    let (head_commit_id, head_error) = agent_worktree_head_commit(&worktree_path)
         .map(|commit| (Some(commit), None))
         .unwrap_or_else(|error| (None, Some(error.message().to_string())));
     let head_commit_short = head_commit_id.as_deref().map(short_commit_id);
@@ -590,7 +601,7 @@ fn plan_worktree_audit_item(record: PlanWorktreeAuditRecord) -> PlanWorktreeAudi
         agent_task_id: record.agent_task_id,
         agent_task_status: record.agent_task_status,
         agent_instance_id: record.agent_instance_id.to_string(),
-        worktree_path: record.worktree_path,
+        worktree_path: worktree_path_display,
         base_revision: record.base_revision,
         ref_name: record.branch.as_deref().map(branch_ref_name),
         branch: record.branch,

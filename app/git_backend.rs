@@ -13,6 +13,8 @@ use gix::{
     },
 };
 
+use foco_agent::AgentInstanceId;
+
 use super::{
     ApiError, GitBranchesResponse, GitDiffResponse, GitStatusFileSummary, GitStatusResponse,
     GitWorktreeSummary,
@@ -835,6 +837,19 @@ pub(super) fn agent_worktree_root(workspace_path: &Path) -> PathBuf {
     workspace_path.join(".foco").join(AGENT_WORKTREE_ROOT_DIR)
 }
 
+pub(super) fn agent_instance_worktree_relative_path(instance_id: &AgentInstanceId) -> String {
+    format!(".foco/{AGENT_WORKTREE_ROOT_DIR}/{instance_id}")
+}
+
+pub(super) fn agent_instance_worktree_path(
+    workspace_path: &Path,
+    instance_id: &AgentInstanceId,
+) -> PathBuf {
+    // ponytail: Foco-managed worktrees always live under the current workspace;
+    // if that layout changes, make the relative location explicit in the DB.
+    agent_worktree_path(workspace_path, instance_id.as_str())
+}
+
 fn agent_worktree_path(workspace_path: &Path, instance_id: &str) -> PathBuf {
     agent_worktree_root(workspace_path).join(instance_id)
 }
@@ -1345,6 +1360,31 @@ impl PendingTree {
             .map(|id| id.detach())
             .map_err(|source| ApiError::internal(format!("failed to write git tree: {source}")))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn agent_instance_worktree_path_is_derived_from_current_workspace() {
+    let first_workspace = Path::new("/old/windows/migration/source");
+    let second_workspace = Path::new("/Users/fonla/Repos/Foco");
+    let instance_id = AgentInstanceId::new("agent-instance-migrated".to_string()).expect("id");
+
+    assert_eq!(
+        agent_instance_worktree_relative_path(&instance_id),
+        ".foco/agent-worktrees/agent-instance-migrated"
+    );
+    assert_eq!(
+        agent_instance_worktree_path(second_workspace, &instance_id),
+        second_workspace
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("agent-instance-migrated")
+    );
+    assert_ne!(
+        agent_instance_worktree_path(first_workspace, &instance_id),
+        agent_instance_worktree_path(second_workspace, &instance_id),
+        "worktree execution paths must follow the current workspace instead of a persisted absolute path"
+    );
 }
 
 #[cfg(test)]

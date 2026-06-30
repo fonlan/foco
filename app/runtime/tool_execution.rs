@@ -52,7 +52,9 @@ use foco_tools::{
 };
 use serde_json::Value;
 
-use crate::git_backend::{create_agent_worktree, delete_agent_worktree};
+use crate::git_backend::{
+    agent_instance_worktree_relative_path, create_agent_worktree, delete_agent_worktree,
+};
 use crate::{
     MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME, READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
 };
@@ -1796,9 +1798,10 @@ fn execute_agent_create_instances(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let worktree_root_paths = worktrees
+    let worktree_root_paths = instance_ids
         .iter()
-        .map(|worktree| worktree.root_path.to_string_lossy().to_string())
+        .take(worktrees.len())
+        .map(agent_instance_worktree_relative_path)
         .collect::<Vec<_>>();
     let new_instances = instance_ids
         .iter()

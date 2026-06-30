@@ -32,8 +32,9 @@ static AGENT_SECRET_ASSIGNMENT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 const AGENT_REDACTED_VALUE: &str = "<redacted>";
 
 use crate::git_backend::{
-    agent_worktree_diff_id, create_agent_worktree, delete_agent_worktree, git_diff_response,
-    git_status_response, merge_agent_worktree,
+    agent_instance_worktree_path, agent_instance_worktree_relative_path, agent_worktree_diff_id,
+    create_agent_worktree, delete_agent_worktree, git_diff_response, git_status_response,
+    merge_agent_worktree,
 };
 use crate::runtime::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
@@ -476,7 +477,7 @@ pub(crate) async fn create_agent_instances(
             .map(|id| {
                 let info = create_agent_worktree(&workspace.path, id.as_str())?;
                 Ok(CreatedAgentWorktree {
-                    root_path: display_path(&info.root_path),
+                    root_path: agent_instance_worktree_relative_path(id),
                     base_revision: info.base_revision,
                     branch: info.branch,
                 })
@@ -703,7 +704,7 @@ fn execute_agent_worktree_action(
     instance: &AgentInstanceRecord,
     action: AgentRuntimeAction,
 ) -> Result<serde_json::Value, ApiError> {
-    let worktree_path = agent_instance_worktree_path(instance)?;
+    let worktree_path = resolve_agent_instance_worktree_path(workspace_path, instance)?;
     let action_name = match action {
         AgentRuntimeAction::WorktreeStatus => "worktree_status",
         AgentRuntimeAction::WorktreeDiff => "worktree_diff",
@@ -799,20 +800,17 @@ fn execute_agent_worktree_action(
     Ok(result)
 }
 
-fn agent_instance_worktree_path(instance: &AgentInstanceRecord) -> Result<PathBuf, ApiError> {
+fn resolve_agent_instance_worktree_path(
+    workspace_path: &Path,
+    instance: &AgentInstanceRecord,
+) -> Result<PathBuf, ApiError> {
     if instance.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
         return Err(ApiError::bad_request(format!(
             "Agent instance '{}' does not use an isolated worktree",
             instance.id
         )));
     }
-    let path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "Agent instance '{}' has no execution root path",
-            instance.id
-        ))
-    })?;
-    Ok(PathBuf::from(path))
+    Ok(agent_instance_worktree_path(workspace_path, &instance.id))
 }
 
 fn display_path(path: &Path) -> String {

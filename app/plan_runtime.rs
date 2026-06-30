@@ -20,9 +20,10 @@ use serde_json::Value;
 
 use crate::{
     git_backend::{
-        AgentWorktreeInfo, agent_worktree_committed_diff, commit_staged_changes,
-        delete_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
-        merge_agent_worktree, shared_workspace_head_commit_id, stage_git_file,
+        AgentWorktreeInfo, agent_instance_worktree_path, agent_worktree_committed_diff,
+        commit_staged_changes, delete_agent_worktree,
+        fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
+        shared_workspace_head_commit_id, stage_git_file,
     },
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
     *,
@@ -202,7 +203,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
 
     match task.status {
         AgentTaskStatus::Completed => {
-            let commit_id = match commit_plan_phase_to_worktree(&phase, &instance) {
+            let commit_id = match commit_plan_phase_to_worktree(workspace, &phase, &instance) {
                 Ok(commit_id) => commit_id,
                 Err(error) => {
                     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
@@ -516,7 +517,7 @@ async fn dispatch_plan_phase(
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         (
-            plan_worktree_info(&database, &plan)?,
+            plan_worktree_info(workspace, &database, &plan)?,
             previous_plan_phase_conclusions(&database, &plan, phase)
                 .map_err(ApiError::from_workspace_error)?,
         )
@@ -595,12 +596,7 @@ async fn finalize_plan_worktree(
         };
         source
     };
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::internal(format!(
-            "plan '{}' worktree Coordinator is missing execution root",
-            plan.id
-        ))
-    })?;
+    let root_path = plan_instance_worktree_path(workspace, &instance);
     let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
         ApiError::internal(format!(
             "plan '{}' worktree Coordinator is missing base revision",
@@ -609,7 +605,7 @@ async fn finalize_plan_worktree(
     })?;
     match fast_forward_shared_workspace_to_agent_worktree(
         &workspace.path,
-        Path::new(root_path),
+        &root_path,
         base_revision,
     ) {
         Ok(_) => {
@@ -637,6 +633,7 @@ async fn finalize_plan_worktree(
 }
 
 fn commit_plan_phase_to_worktree(
+    workspace: &WorkspaceConfig,
     phase: &PlanPhaseRecord,
     instance: &AgentInstanceRecord,
 ) -> Result<Option<String>, ApiError> {
@@ -652,14 +649,9 @@ fn commit_plan_phase_to_worktree(
             phase.id
         )));
     }
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::internal(format!(
-            "plan phase '{}' Coordinator is missing execution root",
-            phase.id
-        ))
-    })?;
+    let root_path = plan_instance_worktree_path(workspace, instance);
     commit_workspace_changes(
-        Path::new(root_path),
+        &root_path,
         format!("plan: implement {}", phase.title.trim()),
     )
 }
@@ -681,19 +673,14 @@ fn merge_and_commit_plan_phase(
             phase.id
         )));
     }
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::internal(format!(
-            "plan phase '{}' Coordinator is missing execution root",
-            phase.id
-        ))
-    })?;
+    let root_path = plan_instance_worktree_path(workspace, instance);
     let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
         ApiError::internal(format!(
             "plan phase '{}' Coordinator is missing worktree base revision",
             phase.id
         ))
     })?;
-    let merge = merge_agent_worktree(&workspace.path, Path::new(root_path), base_revision)?;
+    let merge = merge_agent_worktree(&workspace.path, &root_path, base_revision)?;
     if merge.changed_paths.is_empty() {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
@@ -744,18 +731,14 @@ fn commit_workspace_changes(
 }
 
 fn plan_worktree_info(
+    workspace: &WorkspaceConfig,
     database: &WorkspaceDatabase,
     plan: &PlanRecord,
 ) -> Result<Option<AgentWorktreeInfo>, ApiError> {
     let Some((_, instance)) = plan_worktree_source(database, plan)? else {
         return Ok(None);
     };
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::internal(format!(
-            "plan '{}' worktree Coordinator is missing execution root",
-            plan.id
-        ))
-    })?;
+    let root_path = plan_instance_worktree_path(workspace, &instance);
     let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
         ApiError::internal(format!(
             "plan '{}' worktree Coordinator is missing base revision",
@@ -769,7 +752,7 @@ fn plan_worktree_info(
         ))
     })?;
     Ok(Some(AgentWorktreeInfo {
-        root_path: PathBuf::from(root_path),
+        root_path,
         base_revision: base_revision.to_string(),
         branch: branch.to_string(),
     }))
@@ -831,6 +814,13 @@ fn plan_phase_coordinator_instance(
         .map_err(ApiError::from_workspace_error)
 }
 
+fn plan_instance_worktree_path(
+    workspace: &WorkspaceConfig,
+    instance: &AgentInstanceRecord,
+) -> PathBuf {
+    agent_instance_worktree_path(&workspace.path, &instance.id)
+}
+
 fn delete_plan_worktrees(
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
@@ -841,10 +831,10 @@ fn delete_plan_worktrees(
     let instances = plan_worktree_instances(&database, plan)?;
     let mut deleted_roots = BTreeSet::new();
     for instance in instances {
-        if let Some(root_path) = instance.execution_root_path.as_deref() {
-            if deleted_roots.insert(root_path.to_string()) {
-                delete_agent_worktree(&workspace.path, Path::new(root_path), allow_changes)?;
-            }
+        let root_path = plan_instance_worktree_path(workspace, &instance);
+        let root_key = root_path.display().to_string();
+        if deleted_roots.insert(root_key) {
+            delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
         }
         database
             .switch_agent_instance_to_shared_workspace(&instance.id)
@@ -858,10 +848,8 @@ fn delete_instance_worktree(
     instance: &AgentInstanceRecord,
     allow_changes: bool,
 ) -> Result<(), ApiError> {
-    let Some(root_path) = instance.execution_root_path.as_deref() else {
-        return Ok(());
-    };
-    delete_agent_worktree(&workspace.path, Path::new(root_path), allow_changes)?;
+    let root_path = plan_instance_worktree_path(workspace, instance);
+    delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     database
@@ -1186,18 +1174,13 @@ fn plan_phase_source_diff(
     workspace: &WorkspaceConfig,
     instance: &AgentInstanceRecord,
 ) -> Result<String, ApiError> {
-    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
-        ApiError::internal(format!(
-            "Agent instance '{}' is missing execution root",
-            instance.id
-        ))
-    })?;
-    let diff = git_diff_response(Path::new(root_path), None)?;
+    let root_path = plan_instance_worktree_path(workspace, instance);
+    let diff = git_diff_response(&root_path, None)?;
     let committed_diff = instance
         .worktree_base_revision
         .as_deref()
         .map(|base_revision| {
-            agent_worktree_committed_diff(&workspace.path, Path::new(root_path), base_revision)
+            agent_worktree_committed_diff(&workspace.path, &root_path, base_revision)
         })
         .transpose()?
         .unwrap_or_default();
