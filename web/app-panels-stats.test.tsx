@@ -555,7 +555,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
-  it("restarts a failed plan phase through the plan action", async () => {
+  it("retries a failed plan phase through the phase retry endpoint", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";
     const failedStep = {
@@ -691,7 +691,7 @@ describe("app-panels-stats verification surfaces", () => {
         });
       }
 
-      if (path === "/api/workspaces/workspace-1/plans/plan-failed/action") {
+      if (path === "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry") {
         didRetry = true;
         return jsonResponse({ plan: retriedPlan });
       }
@@ -710,9 +710,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/workspace-1/plans/plan-failed/action",
+        "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry",
         expect.objectContaining({
-          body: JSON.stringify({ action: "start" }),
+          body: JSON.stringify({}),
           method: "POST",
         }),
       );

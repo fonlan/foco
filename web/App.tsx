@@ -1666,9 +1666,7 @@ export function App() {
 
       try {
         const response = await requestJson<PlanResponse>(
-          override
-            ? `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/phases/${encodeURIComponent(phaseId)}/retry`
-            : `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/phases/${encodeURIComponent(phaseId)}/retry`,
           {
             body: JSON.stringify(
               override
@@ -1679,7 +1677,7 @@ export function App() {
                       ? { thinkingLevel: override.thinkingLevel }
                       : {}),
                   }
-                : { action: "start" },
+                : {},
             ),
             headers: { "Content-Type": "application/json" },
             method: "POST",
