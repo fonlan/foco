@@ -1,5 +1,7 @@
 use std::{fs, path::PathBuf};
 
+use chrono::{DateTime, Utc};
+
 use foco_providers::{
     NeutralChatRequest, NeutralChatRole, NeutralToolDefinition, ProviderConnectionConfig,
 };
@@ -25,6 +27,8 @@ use crate::{
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
 const WORKSPACE_SPEC_TIMEOUT_MS: u64 = 120_000;
+// ponytail: coarse stale-job recovery; replace with runner heartbeat/lease if long jobs become normal.
+const WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS: i64 = 30 * 60 * 1000;
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
 const WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES: usize = 56 * 1024;
 const WORKSPACE_SPEC_FILE_SUMMARY_LIMIT: i64 = 24;
@@ -282,6 +286,52 @@ fn log_workspace_spec_update_queue_skip(
     );
 }
 
+pub(crate) fn workspace_spec_running_job_is_stale(
+    job: &WorkspaceSpecJobRecord,
+    now: DateTime<Utc>,
+) -> bool {
+    let started_at = job.started_at.as_deref().unwrap_or(&job.created_at);
+    let Ok(started_at) = DateTime::parse_from_rfc3339(started_at) else {
+        return false;
+    };
+    now.signed_duration_since(started_at.with_timezone(&Utc))
+        .num_milliseconds()
+        > WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS
+}
+
+fn recover_stale_running_workspace_spec_job(
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+) -> Result<bool, ApiError> {
+    let Some(job) = database
+        .running_workspace_spec_job()
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    if !workspace_spec_running_job_is_stale(&job, Utc::now()) {
+        return Ok(false);
+    }
+
+    let error_message = format!(
+        "workspace spec job was still running after {} ms and was recovered as failed",
+        WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS
+    );
+    database
+        .mark_workspace_spec_job_failed(&job.id, &error_message)
+        .map_err(ApiError::from_workspace_error)?;
+    tracing::warn!(
+        workspace_id = %workspace_id,
+        job_id = %job.id,
+        trigger_type = %job.trigger_type,
+        started_at = ?job.started_at,
+        created_at = %job.created_at,
+        "stale running workspace spec job marked failed"
+    );
+    log_workspace_spec_job_status_from_database(database, workspace_id, &job.id);
+    Ok(true)
+}
+
 pub(crate) fn queue_workspace_spec_update_job(
     context: &PreparedChatContext,
     final_state: &str,
@@ -321,6 +371,8 @@ pub(crate) fn queue_workspace_spec_update_job(
     }
     let spec = spec.expect("spec state checked before queueing workspace spec update");
 
+    let stale_running_job_recovered =
+        recover_stale_running_workspace_spec_job(&mut database, &context.workspace_id)?;
     let running_job_exists = database
         .running_workspace_spec_job()
         .map_err(ApiError::from_workspace_error)?
@@ -336,6 +388,7 @@ pub(crate) fn queue_workspace_spec_update_job(
         spec_exists = spec_state.exists,
         spec_enabled = spec_state.enabled,
         spec_content_empty = spec_state.content_empty,
+        stale_running_job_recovered,
         running_job_exists,
         "workspace spec update job queueing"
     );

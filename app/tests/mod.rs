@@ -27,7 +27,7 @@ use foco_store::{
     workspace::{
         LlmRequestAuditFilters, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphSymbol,
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession,
-        NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
+        NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
     },
 };
 use foco_tools::{
@@ -84,7 +84,7 @@ use crate::spec_runtime::{
     WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
     prepare_workspace_spec_job, queue_workspace_spec_update_job,
-    workspace_spec_update_queue_decision,
+    workspace_spec_running_job_is_stale, workspace_spec_update_queue_decision,
 };
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
@@ -8738,6 +8738,36 @@ fn workspace_spec_update_queue_decision_reports_skip_reasons() {
         ),
         WorkspaceSpecUpdateQueueDecision::Queue
     );
+}
+
+#[test]
+fn workspace_spec_running_job_stale_detection_uses_started_at() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-06-30T12:00:00Z")
+        .expect("now")
+        .with_timezone(&chrono::Utc);
+    let mut job = WorkspaceSpecJobRecord {
+        id: "job-1".to_string(),
+        trigger_type: "chat_completed".to_string(),
+        status: "running".to_string(),
+        chat_id: Some("chat-1".to_string()),
+        run_id: Some("run-1".to_string()),
+        model_id: Some("model".to_string()),
+        base_revision: Some(1),
+        input_summary_json: "{}".to_string(),
+        output_json: None,
+        error_message: None,
+        created_at: "2026-06-30T11:00:00Z".to_string(),
+        started_at: Some("2026-06-30T11:31:00Z".to_string()),
+        completed_at: None,
+    };
+
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
+
+    job.started_at = Some("2026-06-30T11:29:00Z".to_string());
+    assert!(workspace_spec_running_job_is_stale(&job, now));
+
+    job.started_at = None;
+    assert!(workspace_spec_running_job_is_stale(&job, now));
 }
 
 #[test]
