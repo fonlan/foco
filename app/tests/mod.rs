@@ -7935,6 +7935,56 @@ fn text_code_change_stats_ignores_line_ending_only_changes() {
 }
 
 #[test]
+fn maybe_git_diff_summary_skips_plan_mode_changes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-diff-summary-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    gix::init(&workspace_dir).expect("init git repo");
+
+    let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
+    fs::write(workspace_dir.join("note.txt"), "new content\n").expect("write changed file");
+
+    let summary = maybe_git_diff_summary_for_session_mode(
+        "Done.\n",
+        &baseline,
+        &workspace_dir,
+        "en-US",
+        Some("plan"),
+    );
+
+    assert_eq!(summary.text, "Done.\n");
+    assert!(!summary.text.contains("### 本轮代码变更"));
+    assert!(!summary.text.contains("### Code changes in this turn"));
+    assert_eq!(summary.stats, CodeChangeStats::default());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn maybe_git_diff_summary_keeps_non_plan_changes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-chat-diff-summary-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    gix::init(&workspace_dir).expect("init git repo");
+
+    let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
+    fs::write(workspace_dir.join("note.txt"), "new content\n").expect("write changed file");
+
+    let summary = maybe_git_diff_summary_for_session_mode(
+        "Done.\n",
+        &baseline,
+        &workspace_dir,
+        "en-US",
+        None,
+    );
+
+    assert!(summary.text.contains("### Code changes in this turn\n\n"));
+    assert!(summary.text.contains("- `note.txt`: +1 / -0"));
+    assert_eq!(summary.stats.additions, 1);
+    assert_eq!(summary.stats.deletions, 0);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn git_diff_summary_uses_chinese_heading_for_chinese_language() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-zh-diff-summary-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

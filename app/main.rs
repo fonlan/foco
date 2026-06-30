@@ -3262,11 +3262,12 @@ impl PreparedChatContext {
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
-                                let git_diff_summary_result = git_diff_summary(
+                                let git_diff_summary_result = maybe_git_diff_summary_for_session_mode(
                                     &assistant_message_text,
                                     &self.code_change_baseline,
                                     &self.workspace_path,
                                     &self.global_config.app.language,
+                                    self.session_mode.as_deref(),
                                 );
                                 let assistant_message_text = git_diff_summary_result.text;
                                 self.code_change_stats = git_diff_summary_result.stats;
@@ -7678,6 +7679,23 @@ fn collect_git_diff_file_stats(diff_text: &str, stats: &mut GitDiffStatsByFile) 
 struct GitDiffSummary {
     text: String,
     stats: CodeChangeStats,
+}
+
+fn maybe_git_diff_summary_for_session_mode(
+    assistant_text: &str,
+    baseline: &SessionCodeChangeBaselineState,
+    workspace_path: &Path,
+    language: &str,
+    session_mode: Option<&str>,
+) -> GitDiffSummary {
+    if session_mode == Some("plan") {
+        return GitDiffSummary {
+            text: assistant_text.to_string(),
+            stats: CodeChangeStats::default(),
+        };
+    }
+
+    git_diff_summary(assistant_text, baseline, workspace_path, language)
 }
 
 fn git_diff_summary(
