@@ -2291,6 +2291,36 @@ impl WorkspaceDatabase {
         Ok(count)
     }
 
+    pub fn fail_running_plan_phases_without_agent_runs(
+        &mut self,
+        error_message: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let phases = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT plan_id, id
+                     FROM plan_phases
+                     WHERE status = 'running'
+                       AND implementation_chat_id IS NULL
+                       AND agent_team_id IS NULL
+                       AND agent_task_id IS NULL",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+        let count = phases.len();
+        for (plan_id, phase_id) in phases {
+            self.fail_plan_phase_by_id(&plan_id, &phase_id, error_message)?;
+        }
+        Ok(count)
+    }
+
     pub fn fail_plan_phase_by_id(
         &mut self,
         plan_id: &str,

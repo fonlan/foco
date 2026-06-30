@@ -28,10 +28,29 @@ pub(crate) fn read_file(
     workspace_path: &Path,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
+    read_file_inner(workspace_path, arguments, false)
+}
+
+pub(crate) fn read_file_with_external_access(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    read_file_inner(workspace_path, arguments, true)
+}
+
+fn read_file_inner(
+    workspace_path: &Path,
+    arguments: Value,
+    allow_external_access: bool,
+) -> Result<Value, ToolRuntimeError> {
     let request: ReadFileInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let requested_line_range = parse_optional_line_range(request.start_line, request.end_line)?;
-    let path = resolve_workspace_file(workspace_path, &request.path)?;
+    let path = if allow_external_access {
+        resolve_read_file_path(workspace_path, &request.path)?
+    } else {
+        resolve_workspace_file(workspace_path, &request.path)?
+    };
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
         source,
@@ -90,6 +109,60 @@ pub(crate) fn read_file(
         "endLine": line_range.as_ref().map(|range| range.end),
         "timeoutMs": timeout_ms
     }))
+}
+
+fn resolve_read_file_path(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
+    resolve_workspace_file(workspace_path, input)
+        .or_else(|_| resolve_external_read_file_path(workspace_path, input))
+}
+
+fn resolve_external_read_file_path(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ToolRuntimeError::InvalidPath(
+            "path must not be empty".to_string(),
+        ));
+    }
+
+    let requested = Path::new(trimmed);
+    let path = if requested.is_absolute() {
+        fs::canonicalize(requested).map_err(|source| ToolRuntimeError::Io {
+            path: requested.to_path_buf(),
+            source,
+        })?
+    } else {
+        let joined = workspace_path.join(requested);
+        fs::canonicalize(&joined).map_err(|source| ToolRuntimeError::Io {
+            path: joined,
+            source,
+        })?
+    };
+
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+    if path.starts_with(&workspace) {
+        return Err(ToolRuntimeError::InvalidPath(format!(
+            "path is inside workspace: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+pub(crate) fn read_file_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, ToolRuntimeError> {
+    match resolve_external_read_file_path(workspace_path, input) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => resolve_workspace_file(workspace_path, input).map(|_| None),
+    }
 }
 
 pub(crate) fn find_files(

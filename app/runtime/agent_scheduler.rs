@@ -247,6 +247,11 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
         database
             .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
             .map_err(ApiError::from_workspace_error)?;
+        database
+            .fail_running_plan_phases_without_agent_runs(
+                "Plan phase start did not create an implementation chat or Agent task",
+            )
+            .map_err(ApiError::from_workspace_error)?;
         for instance in database
             .isolated_agent_instances()
             .map_err(ApiError::from_workspace_error)?

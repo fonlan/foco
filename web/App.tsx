@@ -254,7 +254,6 @@ type PendingPlanPhaseRetryRefresh = {
   workspaceId: string;
   planId: string;
   phaseId: string;
-  agentTaskId: string;
 };
 
 function isAutoRunPlanInFlight(plan: Plan) {
@@ -1655,12 +1654,11 @@ export function App() {
       workspaceId: string,
       planId: string,
       phaseId: string,
-      agentTaskId: string,
       implementationChatId: string | null,
       override?: PlanPhaseRetryOverride,
     ) => {
-      const operationKey = `retry-phase:${agentTaskId}`;
-      const refreshTarget = { agentTaskId, phaseId, planId, workspaceId };
+      const operationKey = `retry-phase:${planId}:${phaseId}`;
+      const refreshTarget = { phaseId, planId, workspaceId };
       setPlanOperationKey(operationKey);
       setActivePlansError(null);
 
@@ -9237,26 +9235,24 @@ export function App() {
                     selectWorkspaceChat(workspaceId, chatId);
                   }
                 }}
-                onPlanPhaseRetry={(planId, phaseId, agentTaskId, implementationChatId) => {
+                onPlanPhaseRetry={(planId, phaseId, implementationChatId) => {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanPhaseRetry(
                       workspaceId,
                       planId,
                       phaseId,
-                      agentTaskId,
                       implementationChatId,
                     );
                   }
                 }}
-                onPlanPhaseRetryWithOverride={(planId, phaseId, agentTaskId, implementationChatId, override) => {
+                onPlanPhaseRetryWithOverride={(planId, phaseId, implementationChatId, override) => {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanPhaseRetry(
                       workspaceId,
                       planId,
                       phaseId,
-                      agentTaskId,
                       implementationChatId,
                       override,
                     );
@@ -12242,11 +12238,7 @@ function planPhaseRetryRefreshStillRunning(
   if (!plan) {
     return false;
   }
-  const phase = plan.phases.find(
-    (candidate) =>
-      candidate.id === target.phaseId ||
-      candidate.agentTaskId === target.agentTaskId,
-  );
+  const phase = plan.phases.find((candidate) => candidate.id === target.phaseId);
   return phase?.status === "running";
 }
 
@@ -12257,8 +12249,7 @@ function samePlanPhaseRetryRefreshTarget(
   return (
     left.workspaceId === right.workspaceId &&
     left.planId === right.planId &&
-    left.phaseId === right.phaseId &&
-    left.agentTaskId === right.agentTaskId
+    left.phaseId === right.phaseId
   );
 }
 

@@ -559,7 +559,7 @@ describe("app-panels-stats verification surfaces", () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";
     const failedStep = {
-      acceptance: ["Retry uses the original Agent task."],
+      acceptance: ["Retry uses the phase retry endpoint."],
       checkedAt: null,
       createdAt: timestamp,
       detail: "The Plan runner should see the same task complete after retry.",
@@ -572,7 +572,7 @@ describe("app-panels-stats verification surfaces", () => {
       updatedAt: timestamp,
     };
     const failedPhase = {
-      agentTaskId: "agent-task-failed",
+      agentTaskId: null,
       agentTeamId: "agent-team-failed",
       attempts: [
         {

@@ -738,6 +738,61 @@ fn phase_commit_does_not_mark_plan_shared_merged() {
 }
 
 #[test]
+fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-running-without-agent-run",
+            title: "Running without Agent run",
+            overview: "A failed dispatch must not leave the phase stuck running.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-running-without-agent-run-phase-1",
+                title: "Phase one",
+                summary: "Dispatch failed before a chat was created.",
+                steps: vec![NewPlanStep {
+                    id: "plan-running-without-agent-run-step-1",
+                    title: "Do work",
+                    detail: "Create an Agent run.",
+                    acceptance: vec!["phase is not stuck".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    let running = database
+        .transition_plan("plan-running-without-agent-run", "start")
+        .expect("start plan");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.phases[0].status, "running");
+    assert!(running.phases[0].implementation_chat_id.is_none());
+    assert!(running.phases[0].agent_team_id.is_none());
+    assert!(running.phases[0].agent_task_id.is_none());
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+        )
+        .expect("repair running phase without Agent run");
+    assert_eq!(repaired, 1);
+
+    let failed = database
+        .plan("plan-running-without-agent-run")
+        .expect("failed plan")
+        .expect("failed plan");
+    assert_eq!(failed.status, "failed");
+    assert!(failed.active_phase_id.is_none());
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].steps[0].status, "failed");
+    assert_eq!(
+        failed.phases[0].error_message.as_deref(),
+        Some("Plan phase start did not create an implementation chat or Agent task"),
+    );
+}
+
+#[test]
 fn starting_failed_plan_phase_clears_previous_agent_run() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

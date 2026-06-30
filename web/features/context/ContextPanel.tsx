@@ -215,13 +215,11 @@ const ContextPanel = memo(function ContextPanel({
   onPlanPhaseRetry: (
     planId: string,
     phaseId: string,
-    agentTaskId: string,
     implementationChatId: string | null,
   ) => void;
   onPlanPhaseRetryWithOverride: (
     planId: string,
     phaseId: string,
-    agentTaskId: string,
     implementationChatId: string | null,
     override: PlanPhaseRetryOverride,
   ) => void;
@@ -711,13 +709,11 @@ function ContextPlanTab({
   onPhaseRetry: (
     planId: string,
     phaseId: string,
-    agentTaskId: string,
     implementationChatId: string | null,
   ) => void;
   onPhaseRetryWithOverride: (
     planId: string,
     phaseId: string,
-    agentTaskId: string,
     implementationChatId: string | null,
     override: PlanPhaseRetryOverride,
   ) => void;
@@ -1006,9 +1002,7 @@ function ContextPlanTab({
                       const phaseKey = `${plan.id}:${phase.id}`;
                       const isExpanded = expandedPhaseKeys.has(phaseKey);
                       const canRetryPhase = isRetryablePlanPhase(phase);
-                      const retryOperationKey = phase.agentTaskId
-                        ? planPhaseRetryOperationKey(phase.agentTaskId)
-                        : null;
+                      const retryOperationKey = planPhaseRetryOperationKey(plan.id, phase.id);
                       const isRetrying = operationKey === retryOperationKey;
                       const isRetryMenuOpen = retryMenuPhaseKey === phaseKey;
                       const implementationChatId = phase.implementationChatId;
@@ -1074,14 +1068,10 @@ function ContextPlanTab({
                                     className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                                     disabled={operationKey !== null}
                                     onClick={() => {
-                                      if (!phase.agentTaskId) {
-                                        return;
-                                      }
                                       setRetryMenuPhaseKey(null);
                                       onPhaseRetry(
                                         plan.id,
                                         phase.id,
-                                        phase.agentTaskId,
                                         phase.implementationChatId,
                                       );
                                     }}
@@ -1176,13 +1166,9 @@ function ContextPlanTab({
           onClose={() => setOverrideRetryPhase(null)}
           onSubmit={(override) => {
             const phase = overrideRetryPhase.phase;
-            if (!phase.agentTaskId) {
-              return;
-            }
             onPhaseRetryWithOverride(
               overrideRetryPhase.plan.id,
               phase.id,
-              phase.agentTaskId,
               phase.implementationChatId,
               override,
             );
@@ -2936,11 +2922,11 @@ function primaryPlanAction(status: PlanStatus) {
 }
 
 function isRetryablePlanPhase(phase: PlanPhase) {
-  return Boolean(phase.agentTaskId) && phase.status === "failed";
+  return phase.status === "failed";
 }
 
-function planPhaseRetryOperationKey(agentTaskId: string) {
-  return `retry-phase:${agentTaskId}`;
+function planPhaseRetryOperationKey(planId: string, phaseId: string) {
+  return `retry-phase:${planId}:${phaseId}`;
 }
 
 function planActionLabel(action: string) {

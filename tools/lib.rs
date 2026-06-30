@@ -217,6 +217,26 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
     cancellation_token: Option<ToolCancellationToken>,
     output_sink: Option<Arc<dyn ToolOutputSink>>,
 ) -> ToolExecution {
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+        workspace_path,
+        chat_id,
+        tool_name,
+        arguments,
+        cancellation_token,
+        output_sink,
+        false,
+    )
+}
+
+pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+    output_sink: Option<Arc<dyn ToolOutputSink>>,
+    allow_external_read_access: bool,
+) -> ToolExecution {
     match execute_builtin_tool_inner(
         workspace_path,
         chat_id,
@@ -224,6 +244,7 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
         arguments,
         cancellation_token.as_ref(),
         output_sink.as_deref(),
+        allow_external_read_access,
     ) {
         Ok(output) => ToolExecution {
             output,
@@ -236,6 +257,14 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
     }
 }
 
+pub fn read_file_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, String> {
+    file_tools::read_file_target_outside_workspace(workspace_path, input)
+        .map_err(|error| error.to_string())
+}
+
 fn execute_builtin_tool_inner(
     workspace_path: &Path,
     chat_id: Option<&str>,
@@ -243,8 +272,12 @@ fn execute_builtin_tool_inner(
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
     output_sink: Option<&dyn ToolOutputSink>,
+    allow_external_read_access: bool,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
+        READ_FILE_TOOL if allow_external_read_access => {
+            file_tools::read_file_with_external_access(workspace_path, arguments)
+        }
         READ_FILE_TOOL => file_tools::read_file(workspace_path, arguments),
         FIND_FILES_TOOL => file_tools::find_files(workspace_path, arguments),
         GRAPH_FIND_SYMBOLS_TOOL => graph_tools::graph_find_symbols(workspace_path, arguments),
@@ -961,6 +994,61 @@ mod tests {
                 .and_then(Value::as_str)
                 .expect("error")
                 .contains("escapes the workspace")
+        );
+    }
+
+    #[test]
+    fn reads_external_file_only_with_explicit_access() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_path = outside.path().join("outside.txt");
+        fs::write(&outside_path, "outside").expect("write outside");
+        let relative_escape = format!(
+            "../{}/outside.txt",
+            outside
+                .path()
+                .file_name()
+                .expect("outside dir name")
+                .to_string_lossy()
+        );
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": relative_escape, "startLine": null, "endLine": null }),
+        );
+        assert!(denied.is_error);
+
+        let allowed = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some("chat-external-read-test"),
+            READ_FILE_TOOL,
+            json!({ "path": outside_path.to_string_lossy(), "startLine": null, "endLine": null }),
+            None,
+            None,
+            true,
+        );
+        assert!(!allowed.is_error);
+        assert_eq!(allowed.output["content"], "1\toutside");
+    }
+
+    #[test]
+    fn detects_read_file_target_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_path = outside.path().join("outside.txt");
+        fs::write(&outside_path, "outside").expect("write outside");
+        fs::write(workspace.path().join("inside.txt"), "inside").expect("write inside");
+
+        assert!(
+            read_file_target_outside_workspace(workspace.path(), outside_path.to_str().unwrap())
+                .expect("outside path")
+                .is_some()
+        );
+        assert_eq!(
+            read_file_target_outside_workspace(workspace.path(), "inside.txt")
+                .expect("inside path"),
+            None
         );
     }
 

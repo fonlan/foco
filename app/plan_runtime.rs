@@ -100,7 +100,14 @@ pub(crate) async fn transition_plan_action(
             .transition_plan(plan_id, action)
             .map_err(ApiError::from_workspace_error)?
     };
-    dispatch_plan_phase(state, &workspace.id, plan, None).await
+    let dispatch_plan = plan.clone();
+    match dispatch_plan_phase(state, &workspace.id, dispatch_plan, None).await {
+        Ok(plan) => Ok(plan),
+        Err(error) => {
+            fail_plan_phase_dispatch_error(&workspace, &plan, &error)?;
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn retry_plan_phase(
@@ -162,7 +169,21 @@ pub(crate) async fn retry_plan_phase(
             })?;
         (attempt.id, plan, selection)
     };
-    dispatch_plan_phase(state, &workspace.id, plan, Some((attempt_id, selection))).await
+    let dispatch_plan = plan.clone();
+    match dispatch_plan_phase(
+        state,
+        &workspace.id,
+        dispatch_plan,
+        Some((attempt_id, selection)),
+    )
+    .await
+    {
+        Ok(plan) => Ok(plan),
+        Err(error) => {
+            fail_plan_phase_dispatch_error(&workspace, &plan, &error)?;
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn sync_plan_phase_for_agent_task(
@@ -449,6 +470,22 @@ async fn continue_plan_if_ready(
     Ok(())
 }
 
+fn fail_plan_phase_dispatch_error(
+    workspace: &WorkspaceConfig,
+    plan: &PlanRecord,
+    error: &ApiError,
+) -> Result<(), ApiError> {
+    let Some(phase_id) = plan.active_phase_id.as_deref() else {
+        return Ok(());
+    };
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .fail_plan_phase_start(&plan.id, phase_id, &error.message)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
 async fn dispatch_plan_phase(
     state: &AppState,
     workspace_id: &str,
@@ -522,7 +559,7 @@ async fn dispatch_plan_phase(
                 .map_err(ApiError::from_workspace_error)?,
         )
     };
-    let queued = match queue_chat_message_internal(
+    let queued = queue_chat_message_internal(
         state,
         workspace_id,
         QueueChatMessageInput {
@@ -547,18 +584,7 @@ async fn dispatch_plan_phase(
             },
         },
     )
-    .await
-    {
-        Ok(queued) => queued,
-        Err(error) => {
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .fail_plan_phase_start(&plan.id, &phase.id, &error.message)
-                .map_err(ApiError::from_workspace_error)?;
-            return Err(error);
-        }
-    };
+    .await?;
 
     let team_id = queued
         .agent_team_id

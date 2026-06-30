@@ -43,7 +43,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
+        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

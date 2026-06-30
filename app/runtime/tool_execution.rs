@@ -1,7 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -25,7 +25,8 @@ use foco_tools::{
     AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
     AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken,
     ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
-    execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access,
+    read_file_target_outside_workspace,
 };
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -944,6 +945,30 @@ pub(crate) async fn execute_tool(
         let remaining_timeout = tool_deadline
             .and_then(remaining_duration_until)
             .unwrap_or(Duration::ZERO);
+        let allow_external_read_access = match ensure_read_file_external_access(
+            question_registry.clone(),
+            question_event_tx.clone(),
+            workspace_id,
+            tool_workspace_path,
+            chat_id,
+            tool_call_id,
+            tool_name,
+            &arguments,
+            cancellation_token.clone(),
+        )
+        .await
+        {
+            Ok(allow_external_read_access) => allow_external_read_access,
+            Err(error) => {
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({ "error": error }),
+                        is_error: true,
+                    },
+                    hook_summary,
+                };
+            }
+        };
         set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
         let worker = tokio::task::spawn_blocking({
@@ -954,7 +979,7 @@ pub(crate) async fn execute_tool(
             let tool_name = tool_name.clone();
             let cancellation_token = cancellation_token.clone();
             move || {
-                execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+                execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
                     &workspace_path,
                     Some(&chat_id),
                     &tool_name,
@@ -969,6 +994,7 @@ pub(crate) async fn execute_tool(
                     } else {
                         None
                     },
+                    allow_external_read_access,
                 )
             }
         });
@@ -2817,6 +2843,178 @@ fn matching_option_value(question: &QuestionItem, answer: &str) -> Option<String
         .map(|option| option.value.clone())
 }
 
+static READ_FILE_EXTERNAL_ACCESS_CHATS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn read_file_external_access_chats() -> &'static Mutex<HashSet<String>> {
+    READ_FILE_EXTERNAL_ACCESS_CHATS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn chat_allows_external_read_file(chat_id: &str) -> bool {
+    read_file_external_access_chats()
+        .lock()
+        .expect("external read access lock")
+        .contains(chat_id)
+}
+
+fn allow_external_read_file_for_chat(chat_id: &str) {
+    // ponytail: process memory is enough for this session-scoped grant; persist per-chat auth if it must survive restarts.
+    read_file_external_access_chats()
+        .lock()
+        .expect("external read access lock")
+        .insert(chat_id.to_string());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadFileExternalAccessDecision {
+    AllowOnce,
+    AllowAll,
+    Deny,
+}
+
+async fn ensure_read_file_external_access(
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    workspace_id: &str,
+    workspace_path: &Path,
+    chat_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    cancellation_token: ToolCancellationToken,
+) -> Result<bool, String> {
+    if tool_name != READ_FILE_TOOL {
+        return Ok(false);
+    }
+
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "read_file requires string path".to_string())?;
+    let Some(target_path) = read_file_target_outside_workspace(workspace_path, path)? else {
+        return Ok(false);
+    };
+
+    if chat_allows_external_read_file(chat_id) {
+        return Ok(true);
+    }
+
+    match ask_read_file_external_access(
+        question_registry,
+        question_event_tx,
+        workspace_id,
+        chat_id,
+        tool_call_id,
+        &target_path,
+        cancellation_token,
+    )
+    .await?
+    {
+        ReadFileExternalAccessDecision::AllowOnce => Ok(true),
+        ReadFileExternalAccessDecision::AllowAll => {
+            allow_external_read_file_for_chat(chat_id);
+            Ok(true)
+        }
+        ReadFileExternalAccessDecision::Deny => Err(format!(
+            "user denied read_file access to workspace-external file: {}",
+            target_path.display()
+        )),
+    }
+}
+
+async fn ask_read_file_external_access(
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    workspace_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    target_path: &Path,
+    cancellation_token: ToolCancellationToken,
+) -> Result<ReadFileExternalAccessDecision, String> {
+    let request_id = unique_id("read-file-external-question");
+    let request = QuestionRequest {
+        id: request_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        questions: vec![QuestionItem {
+            id: format!("{request_id}-item-1"),
+            question: format!(
+                "read_file 想要读取 workspace 外的文件:\n{}",
+                target_path.display()
+            ),
+            options: vec![
+                QuestionOption {
+                    label: "允许".to_string(),
+                    value: "allow".to_string(),
+                    description: Some("仅允许本次读取。".to_string()),
+                },
+                QuestionOption {
+                    label: "全部允许".to_string(),
+                    value: "allow_all".to_string(),
+                    description: Some(
+                        "允许当前聊天会话内所有 workspace 外 read_file 读取。".to_string(),
+                    ),
+                },
+                QuestionOption {
+                    label: "拒绝".to_string(),
+                    value: "deny".to_string(),
+                    description: Some("阻止本次读取。".to_string()),
+                },
+            ],
+            allow_free_text: false,
+        }],
+    };
+    let registration = question_registry
+        .register(request.clone())
+        .map_err(|source| source.message)?;
+
+    if question_event_tx.send(request.clone()).is_err() {
+        return Err(format!(
+            "failed to show read_file external access question '{}' because the chat stream is closed",
+            request.id
+        ));
+    }
+
+    let answer = match tokio::select! {
+        _ = cancellation_token_cancelled(cancellation_token) => None,
+        answer = registration.answer_rx => Some(answer),
+    } {
+        Some(Ok(answer)) => answer,
+        Some(Err(_)) => {
+            return Err(format!(
+                "read_file external access question '{}' was cancelled before the user answered",
+                request.id
+            ));
+        }
+        None => {
+            return Err(format!(
+                "read_file external access question '{}' was cancelled because the chat run was cancelled",
+                request.id
+            ));
+        }
+    };
+
+    read_file_external_access_decision_from_answer(&answer)
+}
+
+fn read_file_external_access_decision_from_answer(
+    answer: &QuestionAnswer,
+) -> Result<ReadFileExternalAccessDecision, String> {
+    let selected = answer
+        .answers
+        .first()
+        .and_then(|answer| answer.selected_option_value.as_deref())
+        .unwrap_or_default();
+
+    match selected {
+        "allow" => Ok(ReadFileExternalAccessDecision::AllowOnce),
+        "allow_all" => Ok(ReadFileExternalAccessDecision::AllowAll),
+        "deny" => Ok(ReadFileExternalAccessDecision::Deny),
+        other => Err(format!(
+            "read_file external access question returned unknown option: {other}"
+        )),
+    }
+}
 async fn execute_hook_permission_question(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
@@ -2959,6 +3157,238 @@ mod tests {
         config::{AgentDefinitionSettings, AgentModelOptions},
         workspace::{NewAgentTeam, WorkspaceDatabase},
     };
+    use std::fs;
+
+    #[test]
+    fn parses_read_file_external_access_decisions() {
+        let answer = |selected: &str| QuestionAnswer {
+            answers: vec![QuestionItemAnswer {
+                id: "question-item".to_string(),
+                answer: selected.to_string(),
+                selected_option_value: Some(selected.to_string()),
+            }],
+        };
+
+        assert_eq!(
+            read_file_external_access_decision_from_answer(&answer("allow"))
+                .expect("allow decision"),
+            ReadFileExternalAccessDecision::AllowOnce
+        );
+        assert_eq!(
+            read_file_external_access_decision_from_answer(&answer("allow_all"))
+                .expect("allow all decision"),
+            ReadFileExternalAccessDecision::AllowAll
+        );
+        assert_eq!(
+            read_file_external_access_decision_from_answer(&answer("deny")).expect("deny decision"),
+            ReadFileExternalAccessDecision::Deny
+        );
+        assert!(read_file_external_access_decision_from_answer(&answer("other")).is_err());
+    }
+
+    #[test]
+    fn tracks_read_file_external_access_by_chat() {
+        let chat_id = format!("chat-external-access-test-{}", unique_id("case"));
+
+        assert!(!chat_allows_external_read_file(&chat_id));
+        allow_external_read_file_for_chat(&chat_id);
+        assert!(chat_allows_external_read_file(&chat_id));
+        assert!(!chat_allows_external_read_file(
+            "chat-external-access-test-other"
+        ));
+    }
+
+    fn external_read_file_answer(selected: &str, item_id: &str) -> QuestionAnswer {
+        QuestionAnswer {
+            answers: vec![QuestionItemAnswer {
+                id: item_id.to_string(),
+                answer: selected.to_string(),
+                selected_option_value: Some(selected.to_string()),
+            }],
+        }
+    }
+
+    async fn answer_next_external_read_question(
+        registry: QuestionRegistry,
+        event_rx: &mut mpsc::UnboundedReceiver<QuestionRequest>,
+        selected: &str,
+    ) -> QuestionRequest {
+        let request = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("external read question event")
+            .expect("external read question request");
+        let item_id = request.questions[0].id.clone();
+        registry
+            .answer(
+                &request.id,
+                external_read_file_answer(selected, item_id.as_str()),
+            )
+            .expect("answer external read question");
+        request
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_skips_question_for_workspace_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("inside.txt"), "inside").expect("write inside");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-inside-{}", unique_id("case"));
+
+        let allowed = ensure_read_file_external_access(
+            registry,
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &json!({ "path": "inside.txt", "startLine": null, "endLine": null }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("inside workspace access check");
+
+        assert!(!allowed);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_allows_once_and_reads_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(outside.path(), "outside once").expect("write outside");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-allow-{}", unique_id("case"));
+        let path = outside.path().to_string_lossy().to_string();
+        let arguments = json!({ "path": path, "startLine": null, "endLine": null });
+        let access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &arguments,
+            ToolCancellationToken::default(),
+        );
+
+        let (_, allowed) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "allow"),
+            access
+        );
+        assert!(allowed.expect("allow once access"));
+
+        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some(&chat_id),
+            READ_FILE_TOOL,
+            json!({ "path": outside.path().to_string_lossy(), "startLine": null, "endLine": null }),
+            None,
+            None,
+            true,
+        );
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "1\toutside once");
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_denies_without_reading_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(outside.path(), "outside denied").expect("write outside");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-deny-{}", unique_id("case"));
+        let path = outside.path().to_string_lossy().to_string();
+        let arguments = json!({ "path": path, "startLine": null, "endLine": null });
+        let access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &arguments,
+            ToolCancellationToken::default(),
+        );
+
+        let (_, denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            access
+        );
+        let error = denied.expect_err("deny should block access");
+        assert!(error.contains("user denied read_file access"));
+
+        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some(&chat_id),
+            READ_FILE_TOOL,
+            json!({ "path": outside.path().to_string_lossy(), "startLine": null, "endLine": null }),
+            None,
+            None,
+            false,
+        );
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_allow_all_skips_second_question() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = tempfile::NamedTempFile::new().expect("first outside file");
+        let second = tempfile::NamedTempFile::new().expect("second outside file");
+        fs::write(first.path(), "first outside").expect("write first outside");
+        fs::write(second.path(), "second outside").expect("write second outside");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-all-{}", unique_id("case"));
+        let first_path = first.path().to_string_lossy().to_string();
+        let first_arguments = json!({ "path": first_path, "startLine": null, "endLine": null });
+        let access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &first_arguments,
+            ToolCancellationToken::default(),
+        );
+
+        let (request, allowed) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "allow_all"),
+            access
+        );
+        assert!(
+            request.questions[0]
+                .question
+                .contains(&first.path().display().to_string())
+        );
+        assert!(allowed.expect("allow all access"));
+
+        let second_arguments =
+            json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let second_allowed = ensure_read_file_external_access(
+            registry,
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-2",
+            READ_FILE_TOOL,
+            &second_arguments,
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("second outside access check");
+
+        assert!(second_allowed);
+        assert!(event_rx.try_recv().is_err());
+    }
 
     fn test_agent_definition(
         suffix: &str,
