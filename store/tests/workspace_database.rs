@@ -990,90 +990,122 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
 }
 
 #[test]
-fn interrupted_agent_task_reconciliation_fails_stale_running_plan_phase() {
-    let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+fn terminal_agent_task_reconciliation_fails_stale_running_plan_phase() {
+    for (suffix, transition, expected_attempt_status) in [
+        ("failed", AgentTaskTransition::Fail, "failed"),
+        ("cancelled", AgentTaskTransition::Cancel, "cancelled"),
+        ("interrupted", AgentTaskTransition::Interrupt, "interrupted"),
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let plan_id = format!("plan-stale-{suffix}-phase");
+        let phase_id = format!("{plan_id}-1");
+        let step_id = format!("plan-stale-{suffix}-step-1");
 
-    database
-        .create_plan(NewPlan {
-            id: "plan-stale-interrupted-phase",
-            title: "Stale interrupted phase",
-            overview: "Startup reconciliation should repair a stale running phase.",
-            status: "ready",
-            source_chat_id: None,
-            phases: vec![NewPlanPhase {
-                id: "plan-stale-interrupted-phase-1",
-                title: "Phase one",
-                summary: "The Agent task was interrupted before phase sync.",
-                steps: vec![NewPlanStep {
-                    id: "plan-stale-interrupted-step-1",
-                    title: "Do work",
-                    detail: "Complete the change.",
-                    acceptance: vec!["phase failed".to_string()],
+        database
+            .create_plan(NewPlan {
+                id: &plan_id,
+                title: "Stale terminal phase",
+                overview: "Startup reconciliation should repair a stale running phase.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase one",
+                    summary: "The Agent task ended before phase sync.",
+                    steps: vec![NewPlanStep {
+                        id: &step_id,
+                        title: "Do work",
+                        detail: "Complete the change.",
+                        acceptance: vec!["phase failed".to_string()],
+                    }],
                 }],
-            }],
-        })
-        .expect("create plan");
-    database
-        .transition_plan("plan-stale-interrupted-phase", "start")
-        .expect("start phase");
-    let (team_id, instance_id) =
-        create_test_agent_team(&mut database, "chat-stale-interrupted", "stale-interrupted");
-    let task_id = AgentTaskId::new("agent-task-stale-interrupted").expect("task id");
-    let attempt_id = AgentAttemptId::new("agent-attempt-stale-interrupted").expect("attempt id");
-    database
-        .enqueue_agent_task(NewAgentTask {
-            id: &task_id,
-            team_id: &team_id,
-            owner_instance_id: &instance_id,
-            origin_instance_id: None,
-            parent_task_id: None,
-            input_json: "{}",
-        })
-        .expect("enqueue task");
-    database
-        .attach_plan_phase_run(
-            "plan-stale-interrupted-phase",
-            "plan-stale-interrupted-phase-1",
-            "chat-stale-interrupted",
-            &team_id,
-            &task_id,
-        )
-        .expect("attach phase");
-    database
-        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
-        .expect("claim")
-        .expect("claimed");
-    database
-        .update_agent_task_state(AgentTaskStateUpdate {
-            team_id: &team_id,
-            task_id: &task_id,
-            expected_status: AgentTaskStatus::Running,
-            transition: AgentTaskTransition::Interrupt,
-            result_json: None,
-            error_json: Some(r#"{"message":"backend restarted"}"#),
-            interruption_reason: Some("backend restarted"),
-        })
-        .expect("interrupt task");
-    let stale = database
-        .plan("plan-stale-interrupted-phase")
-        .expect("stale plan")
-        .expect("stale plan");
-    assert_eq!(stale.status, "running");
-    assert_eq!(stale.phases[0].status, "running");
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start phase");
+        let (team_id, instance_id) = create_test_agent_team(
+            &mut database,
+            &format!("chat-stale-{suffix}"),
+            &format!("stale-{suffix}"),
+        );
+        let task_id = AgentTaskId::new(format!("agent-task-stale-{suffix}")).expect("task id");
+        let attempt_id =
+            AgentAttemptId::new(format!("agent-attempt-stale-{suffix}")).expect("attempt id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin phase attempt");
+        database
+            .attach_plan_phase_attempt_run(
+                &format!("plan-phase-attempt-{phase_id}-0"),
+                &format!("chat-stale-{suffix}"),
+                &team_id,
+                &task_id,
+            )
+            .expect("attach phase attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .expect("claim")
+            .expect("claimed");
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition,
+                result_json: None,
+                error_json: Some(r#"{"message":"task reached terminal state before phase sync"}"#),
+                interruption_reason: if matches!(transition, AgentTaskTransition::Interrupt) {
+                    Some("backend restarted")
+                } else {
+                    None
+                },
+            })
+            .expect("finish task");
+        let stale = database
+            .plan(&plan_id)
+            .expect("stale plan")
+            .expect("stale plan");
+        assert_eq!(stale.status, "running");
+        assert_eq!(stale.phases[0].status, "running");
 
-    let repaired = database
-        .fail_running_plan_phases_for_interrupted_agent_tasks("backend restarted")
-        .expect("repair stale phase");
-    assert_eq!(repaired, 1);
-    let failed = database
-        .plan("plan-stale-interrupted-phase")
-        .expect("failed plan")
-        .expect("failed plan");
-    assert_eq!(failed.status, "failed");
-    assert_eq!(failed.phases[0].status, "failed");
-    assert_eq!(failed.phases[0].steps[0].status, "failed");
+        let repaired = database
+            .fail_running_plan_phases_for_terminal_agent_tasks(
+                "task reached terminal state before phase sync",
+            )
+            .expect("repair stale phase");
+        assert_eq!(repaired, 1);
+        let failed = database
+            .plan(&plan_id)
+            .expect("failed plan")
+            .expect("failed plan");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.phases[0].status, "failed");
+        assert_eq!(failed.phases[0].steps[0].status, "failed");
+        let attempts = database
+            .plan_phase_attempts_for_phase(&phase_id)
+            .expect("phase attempts");
+        assert_eq!(attempts[0].status, expected_attempt_status);
+    }
 }
 
 #[test]

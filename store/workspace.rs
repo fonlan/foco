@@ -2264,7 +2264,7 @@ impl WorkspaceDatabase {
         self.fail_plan_phase_record(phase, error_message).map(Some)
     }
 
-    pub fn fail_running_plan_phases_for_interrupted_agent_tasks(
+    pub fn fail_running_plan_phases_for_terminal_agent_tasks(
         &mut self,
         error_message: &str,
     ) -> Result<usize, WorkspaceDatabaseError> {
@@ -2276,7 +2276,7 @@ impl WorkspaceDatabase {
                      FROM plan_phases AS phase
                      JOIN agent_tasks AS task ON task.id = phase.agent_task_id
                      WHERE phase.status = 'running'
-                       AND task.status = 'interrupted'",
+                       AND task.status IN ('failed', 'cancelled', 'interrupted')",
                 )
                 .map_err(|source| self.sqlite_error(source))?;
             let rows = statement

@@ -245,7 +245,7 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
             )?;
         }
         database
-            .fail_running_plan_phases_for_interrupted_agent_tasks(RESTART_INTERRUPTION_REASON)
+            .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
             .map_err(ApiError::from_workspace_error)?;
         for instance in database
             .isolated_agent_instances()
