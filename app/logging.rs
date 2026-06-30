@@ -11,6 +11,8 @@ use tracing_subscriber::{
     filter::LevelFilter, fmt::MakeWriter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
+const FOCO_LOG_LEVEL_ENV: &str = "FOCO_LOG_LEVEL";
+
 pub fn init(log_dir: &Path) -> Result<(), LoggingError> {
     fs::create_dir_all(log_dir).map_err(|source| LoggingError::Io {
         path: log_dir.to_path_buf(),
@@ -24,16 +26,31 @@ pub fn init(log_dir: &Path) -> Result<(), LoggingError> {
         .with_ansi(false)
         .with_writer(writer);
 
+    let level = configured_level_filter();
+    let invalid_level = std::env::var(FOCO_LOG_LEVEL_ENV)
+        .ok()
+        .filter(|value| parse_level_filter(value).is_none());
+
     // try_init succeeds only for the first caller.  On Windows release
     // builds the tray entrypoint initialises logging before spawning the
     // server thread, so the server's second call will get an "already set"
     // error — that is harmless and we silently ignore it.
     match tracing_subscriber::registry()
-        .with(LevelFilter::INFO)
+        .with(level)
         .with(file_layer)
         .try_init()
     {
-        Ok(()) => install_panic_hook(),
+        Ok(()) => {
+            install_panic_hook();
+            if let Some(value) = invalid_level {
+                tracing::warn!(
+                    env_var = FOCO_LOG_LEVEL_ENV,
+                    value = %value,
+                    fallback = "info",
+                    "invalid log level configured"
+                );
+            }
+        }
         Err(_) => {}
     }
 
@@ -56,6 +73,25 @@ fn install_panic_hook() {
         );
         default_hook(info);
     }));
+}
+
+fn configured_level_filter() -> LevelFilter {
+    std::env::var(FOCO_LOG_LEVEL_ENV)
+        .ok()
+        .and_then(|value| parse_level_filter(&value))
+        .unwrap_or(LevelFilter::INFO)
+}
+
+fn parse_level_filter(value: &str) -> Option<LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" => Some(LevelFilter::TRACE),
+        "debug" => Some(LevelFilter::DEBUG),
+        "info" => Some(LevelFilter::INFO),
+        "warn" | "warning" => Some(LevelFilter::WARN),
+        "error" => Some(LevelFilter::ERROR),
+        "off" => Some(LevelFilter::OFF),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -133,4 +169,18 @@ impl Write for DailyLogFile {
 
 fn current_log_file(log_dir: &Path) -> PathBuf {
     log_dir.join(format!("foco-{}.log", Local::now().format("%Y-%m-%d")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_log_level_env_value() {
+        assert_eq!(parse_level_filter("debug"), Some(LevelFilter::DEBUG));
+        assert_eq!(parse_level_filter(" TRACE "), Some(LevelFilter::TRACE));
+        assert_eq!(parse_level_filter("warning"), Some(LevelFilter::WARN));
+        assert_eq!(parse_level_filter("off"), Some(LevelFilter::OFF));
+        assert_eq!(parse_level_filter("verbose"), None);
+    }
 }
