@@ -24,7 +24,7 @@ use crate::{
     SelectDirectoryResponse, SelectFilesResponse, attachment_content_type_for_path,
 };
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use crate::prompt::is_wsl_environment;
 
 const NATIVE_BROWSER_AUTHORIZATION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -144,11 +144,16 @@ fn native_select_directory() -> Result<Option<String>, ApiError> {
         return native_select_directory_windows();
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        native_select_directory_macos()
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if !is_wsl_environment() {
             return Err(ApiError::bad_request(
-                "native directory picker is only available on Windows",
+                "native directory picker is only available on Windows and macOS",
             ));
         }
 
@@ -156,29 +161,7 @@ fn native_select_directory() -> Result<Option<String>, ApiError> {
             return Ok(None);
         };
 
-        let output = Command::new("wslpath")
-            .args(["-u", &selected_path])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|source| {
-                ApiError::internal(format!("failed to convert selected Windows path: {source}"))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(ApiError::internal(format!(
-                "failed to convert selected Windows path{}",
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {stderr}")
-                }
-            )));
-        }
-
-        Ok(Some(
-            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        ))
+        Ok(Some(windows_path_to_wsl_path(selected_path)?))
     }
 }
 
@@ -322,7 +305,118 @@ fn native_select_directory_windows() -> Result<Option<String>, ApiError> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn native_select_directory_macos() -> Result<Option<String>, ApiError> {
+    let script = r#"
+const app = Application.currentApplication();
+app.includeStandardAdditions = true;
+try {
+  const folder = app.chooseFolder({ withPrompt: "Choose workspace path" });
+  JSON.stringify(folder.toString());
+} catch (error) {
+  if (error.errorNumber === -128) {
+    "null";
+  } else {
+    throw error;
+  }
+}
+"#;
+
+    let stdout = run_macos_picker_script(script, "native directory picker")?;
+    parse_macos_directory_picker_output(&stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn native_select_files_macos() -> Result<Vec<String>, ApiError> {
+    let script = r#"
+const app = Application.currentApplication();
+app.includeStandardAdditions = true;
+try {
+  const selected = app.chooseFile({
+    withPrompt: "Choose attachments",
+    multipleSelectionsAllowed: true
+  });
+  const files = Array.isArray(selected) ? selected : [selected];
+  JSON.stringify(files.map(file => file.toString()));
+} catch (error) {
+  if (error.errorNumber === -128) {
+    "[]";
+  } else {
+    throw error;
+  }
+}
+"#;
+
+    let stdout = run_macos_picker_script(script, "native file picker")?;
+    parse_macos_file_picker_output(&stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_picker_script(script: &str, picker_name: &str) -> Result<String, ApiError> {
+    // ponytail: osascript/JXA gives native dialogs without adding AppKit glue; ceiling is
+    // richer filters and sandbox-specific behavior, which should move to NSOpenPanel later.
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", script])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to launch {picker_name}: {source}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError::internal(format!(
+            "{picker_name} failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn parse_macos_directory_picker_output(stdout: &str) -> Result<Option<String>, ApiError> {
+    let stdout = stdout.trim();
+    if stdout.is_empty() || stdout == "null" {
+        return Ok(None);
+    }
+
+    let path = serde_json::from_str::<String>(stdout).map_err(|source| {
+        ApiError::internal(format!(
+            "native directory picker returned invalid JSON: {source}"
+        ))
+    })?;
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err(ApiError::internal(
+            "native directory picker returned an empty path",
+        ));
+    }
+
+    Ok(Some(path))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn parse_macos_file_picker_output(stdout: &str) -> Result<Vec<String>, ApiError> {
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let paths = serde_json::from_str::<Vec<String>>(stdout).map_err(|source| {
+        ApiError::internal(format!(
+            "native file picker returned invalid JSON: {source}"
+        ))
+    })?;
+
+    Ok(paths)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn native_select_directory_with_powershell() -> Result<Option<String>, ApiError> {
     if !is_wsl_environment() {
         return Err(ApiError::bad_request(
@@ -469,11 +563,16 @@ fn native_select_files() -> Result<Vec<NativeSelectedFile>, ApiError> {
         return native_select_files_windows();
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        native_selected_files_from_paths(native_select_files_macos()?)
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if !is_wsl_environment() {
             return Err(ApiError::bad_request(
-                "native file picker is only available on Windows",
+                "native file picker is only available on Windows and macOS",
             ));
         }
 
@@ -564,7 +663,7 @@ fn native_select_files_windows() -> Result<Vec<NativeSelectedFile>, ApiError> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn native_select_files_with_powershell() -> Result<Vec<String>, ApiError> {
     if !is_wsl_environment() {
         return Err(ApiError::bad_request(
@@ -621,7 +720,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn windows_path_to_wsl_path(path: String) -> Result<String, ApiError> {
     let output = Command::new("wslpath")
         .args(["-u", &path])
@@ -718,4 +817,57 @@ fn native_selected_files_from_paths(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_directory_picker_output_parses_json_string_and_cancel() {
+        assert_eq!(
+            parse_macos_directory_picker_output(r#""/Users/alice/Workspace""#)
+                .expect("directory path parses"),
+            Some("/Users/alice/Workspace".to_string())
+        );
+        assert_eq!(
+            parse_macos_directory_picker_output("null").expect("null is cancel"),
+            None
+        );
+        assert_eq!(
+            parse_macos_directory_picker_output("   ").expect("empty is cancel"),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_picker_output_parses_json_array_and_cancel() {
+        assert_eq!(
+            parse_macos_file_picker_output(r#"["/tmp/a file.txt","/tmp/b.png"]"#)
+                .expect("file paths parse"),
+            vec!["/tmp/a file.txt".to_string(), "/tmp/b.png".to_string()]
+        );
+        assert!(
+            parse_macos_file_picker_output("[]")
+                .expect("empty array is cancel")
+                .is_empty()
+        );
+        assert!(
+            parse_macos_file_picker_output("   ")
+                .expect("empty stdout is cancel")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn macos_picker_output_rejects_invalid_json() {
+        assert!(parse_macos_directory_picker_output("/tmp/not-json").is_err());
+        assert!(parse_macos_file_picker_output(r#"{"path":"/tmp/a"}"#).is_err());
+    }
+
+    #[test]
+    fn selected_file_paths_keep_existing_empty_path_validation() {
+        let paths = parse_macos_file_picker_output(r#"[""]"#).expect("json paths parse");
+        assert!(native_selected_files_from_paths(paths).is_err());
+    }
 }
