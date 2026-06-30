@@ -132,6 +132,21 @@ npm run build:release
 
 该命令会构建 Web 资源，然后运行 `cargo build --release -p foco-app`。Windows release 构建会启用 Windows subsystem 设置并嵌入应用图标资源。
 
+### macOS 预支持
+
+macOS 预支持目前只覆盖运行时集成点：release 启动为菜单栏后台应用、Open Foco 使用默认浏览器打开、Quit 退出处理、用户级 LaunchAgent 自启动、原生文件/目录选择器、macOS 默认 zsh 终端，以及新建工作区时的 zsh 默认值。当前仍不包含 macOS 发布链路：没有 `.app`、`.dmg`、codesign、notarization 或 CI 构建/发布支持。
+
+后续迁移到 macOS 实机后的验收命令：
+
+```bash
+npm run build:release
+./target/release/foco-app
+cargo test -p foco-app macos_
+cargo test -p foco-store default_terminal_shell_matches_platform
+```
+
+macOS 实机手工检查项：release 启动后出现菜单栏项，Open Foco 能打开浏览器 UI，Quit 对运行中的任务处理正确，LaunchAgent 自启动可启用和关闭，原生文件/目录选择器能返回所选路径，集成终端默认启动 zsh。
+
 ## 配置与数据
 
 Foco 会把全局配置和应用级数据存放在配置根目录下。默认路径在类 Unix 系统上是 `~/.foco`，在 Windows 上是 `%USERPROFILE%\.foco`。可以通过 `FOCO_CONFIG_DIR` 指定其他根目录。

@@ -132,6 +132,21 @@ npm run build:release
 
 This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource.
 
+### macOS Pre-Support
+
+macOS pre-support currently covers the runtime integration points only: release startup as a menu bar background app, Open Foco in the default browser, Quit handling, user LaunchAgent auto-start, native file and directory pickers, zsh as the default macOS shell, and zsh defaults for newly created workspaces. It does not include a macOS distribution pipeline: no `.app`, `.dmg`, codesigning, notarization, or CI build/release support is provided yet.
+
+Validated-on-mac checklist for the next macOS pass:
+
+```bash
+npm run build:release
+./target/release/foco-app
+cargo test -p foco-app macos_
+cargo test -p foco-store default_terminal_shell_matches_platform
+```
+
+Manual checks on macOS: release launch creates a menu bar item, Open Foco opens the browser UI, Quit handles active runs correctly, LaunchAgent auto-start can be enabled and disabled, native file and directory pickers return selected paths, and the integrated terminal starts zsh by default.
+
 ## Configuration And Data
 
 Foco stores global config and app-level data under the configured root directory. By default that is `~/.foco` on Unix-like systems and `%USERPROFILE%\.foco` on Windows. Set `FOCO_CONFIG_DIR` to use a different root.
