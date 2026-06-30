@@ -23,7 +23,7 @@ use crate::{
         AgentWorktreeInfo, agent_instance_worktree_path, agent_worktree_committed_diff,
         commit_staged_changes, delete_agent_worktree,
         fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
-        shared_workspace_head_commit_id, stage_git_file,
+        resolve_agent_worktree_path, shared_workspace_head_commit_id, stage_git_file,
     },
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
     *,
@@ -818,7 +818,11 @@ fn plan_instance_worktree_path(
     workspace: &WorkspaceConfig,
     instance: &AgentInstanceRecord,
 ) -> PathBuf {
-    agent_instance_worktree_path(&workspace.path, &instance.id)
+    instance
+        .execution_root_path
+        .as_deref()
+        .map(|root_path| resolve_agent_worktree_path(&workspace.path, root_path))
+        .unwrap_or_else(|| agent_instance_worktree_path(&workspace.path, &instance.id))
 }
 
 fn delete_plan_worktrees(

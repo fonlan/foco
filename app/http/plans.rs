@@ -12,9 +12,7 @@ use serde_json::Value;
 use std::path::Path;
 
 use crate::{
-    git_backend::{
-        agent_instance_worktree_path, agent_worktree_head_commit, delete_agent_worktree,
-    },
+    git_backend::{agent_worktree_head_commit, delete_agent_worktree, resolve_agent_worktree_path},
     *,
 };
 
@@ -469,7 +467,7 @@ pub(crate) async fn cleanup_plan_worktree(
             "Agent instance no longer has an isolated worktree",
         ));
     }
-    let root_path = agent_instance_worktree_path(&workspace.path, &record.agent_instance_id);
+    let root_path = resolve_agent_worktree_path(&workspace.path, &record.worktree_path);
 
     delete_agent_worktree(&workspace.path, &root_path, true)?;
     database
@@ -583,7 +581,7 @@ fn plan_worktree_audit_item(
     workspace_path: &Path,
     record: PlanWorktreeAuditRecord,
 ) -> PlanWorktreeAuditItem {
-    let worktree_path = agent_instance_worktree_path(workspace_path, &record.agent_instance_id);
+    let worktree_path = resolve_agent_worktree_path(workspace_path, &record.worktree_path);
     let worktree_path_display = worktree_path.display().to_string();
     let (head_commit_id, head_error) = agent_worktree_head_commit(&worktree_path)
         .map(|commit| (Some(commit), None))

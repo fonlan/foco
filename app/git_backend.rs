@@ -841,6 +841,32 @@ pub(super) fn agent_instance_worktree_relative_path(instance_id: &AgentInstanceI
     format!(".foco/{AGENT_WORKTREE_ROOT_DIR}/{instance_id}")
 }
 
+pub(super) fn agent_worktree_relative_path(
+    workspace_path: &Path,
+    worktree_path: &Path,
+) -> Result<String, ApiError> {
+    if worktree_path.is_absolute() {
+        let relative = worktree_path.strip_prefix(workspace_path).map_err(|_| {
+            ApiError::bad_request(format!(
+                "Agent worktree path is outside workspace: {}",
+                worktree_path.display()
+            ))
+        })?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    } else {
+        Ok(worktree_path.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+pub(super) fn resolve_agent_worktree_path(workspace_path: &Path, root_path: &str) -> PathBuf {
+    let root_path = Path::new(root_path);
+    if root_path.is_absolute() {
+        root_path.to_path_buf()
+    } else {
+        workspace_path.join(root_path)
+    }
+}
+
 pub(super) fn agent_instance_worktree_path(
     workspace_path: &Path,
     instance_id: &AgentInstanceId,

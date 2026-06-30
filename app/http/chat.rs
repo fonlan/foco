@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::git_backend::{
-    AgentWorktreeInfo, agent_instance_worktree_relative_path, create_agent_worktree,
-    delete_agent_worktree,
+    AgentWorktreeInfo, agent_worktree_relative_path, create_agent_worktree, delete_agent_worktree,
 };
 use crate::*;
 
@@ -612,7 +611,8 @@ pub(crate) async fn queue_chat_message_internal(
         };
         let coordinator_worktree_root = coordinator_worktree
             .as_ref()
-            .map(|_| agent_instance_worktree_relative_path(&instance_id));
+            .map(|worktree| agent_worktree_relative_path(&workspace.path, &worktree.root_path))
+            .transpose()?;
         let (created_team, created_coordinator) = database
             .create_agent_team(foco_store::workspace::NewAgentTeam {
                 id: &team_id,

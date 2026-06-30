@@ -34,7 +34,7 @@ const AGENT_REDACTED_VALUE: &str = "<redacted>";
 use crate::git_backend::{
     agent_instance_worktree_path, agent_instance_worktree_relative_path, agent_worktree_diff_id,
     create_agent_worktree, delete_agent_worktree, git_diff_response, git_status_response,
-    merge_agent_worktree,
+    merge_agent_worktree, resolve_agent_worktree_path,
 };
 use crate::runtime::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
@@ -810,7 +810,11 @@ fn resolve_agent_instance_worktree_path(
             instance.id
         )));
     }
-    Ok(agent_instance_worktree_path(workspace_path, &instance.id))
+    Ok(instance
+        .execution_root_path
+        .as_deref()
+        .map(|root_path| resolve_agent_worktree_path(workspace_path, root_path))
+        .unwrap_or_else(|| agent_instance_worktree_path(workspace_path, &instance.id)))
 }
 
 fn display_path(path: &Path) -> String {

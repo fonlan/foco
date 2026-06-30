@@ -5664,6 +5664,91 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
 }
 
 #[tokio::test]
+async fn queue_plan_phase_reuses_existing_worktree_relative_path() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+
+    let reused_instance_id = "agent-instance-existing-plan-worktree";
+    let reused_relative_path = format!(".foco/agent-worktrees/{reused_instance_id}");
+    let reused_root = workspace_dir.join(&reused_relative_path);
+    fs::create_dir_all(&reused_root).expect("reused worktree directory");
+    let reused_branch = format!("foco/agent-worktrees/{reused_instance_id}");
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            chat_title_override: Some("Plan phase reuse test".to_string()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Run reused worktree phase".to_string(),
+            team_mode_enabled: true,
+            defer_start: true,
+            attachments: Vec::new(),
+            agent_definition_id: None,
+            coordinator_execution_workspace_mode:
+                foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree,
+            coordinator_worktree: Some(crate::git_backend::AgentWorktreeInfo {
+                root_path: reused_root.clone(),
+                base_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                branch: reused_branch.clone(),
+            }),
+            correlation_id: None,
+            origin: crate::http::chat::QueuedChatMessageOrigin::PlanPhase {
+                plan_id: "plan-worktree-reuse-test".to_string(),
+                phase_id: "plan-worktree-reuse-test-phase-2".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("queue reused worktree phase");
+
+    assert!(queued.agent_task_id.is_some());
+    assert!(
+        timeout(Duration::from_millis(50), scheduler_rx.recv())
+            .await
+            .is_err()
+    );
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let team = database
+        .agent_team(&queued.agent_team_id.expect("agent team id"))
+        .expect("team lookup")
+        .expect("agent team");
+    let coordinator = database
+        .agent_instance(&team.coordinator_instance_id)
+        .expect("coordinator lookup")
+        .expect("coordinator instance");
+
+    assert_eq!(
+        coordinator.execution_root_path.as_deref(),
+        Some(reused_relative_path.as_str())
+    );
+    assert_eq!(
+        coordinator.worktree_branch.as_deref(),
+        Some(reused_branch.as_str())
+    );
+    assert_ne!(coordinator.id.as_str(), reused_instance_id);
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn scheduled_task_dispatch_queues_visible_chat_and_completes_one_shot() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-profile"));

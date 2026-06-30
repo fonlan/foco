@@ -1,4 +1,9 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use foco_agent::{
@@ -23,7 +28,10 @@ use tokio::{
     time,
 };
 
-use crate::git_backend::{agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response};
+use crate::git_backend::{
+    agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response,
+    resolve_agent_worktree_path,
+};
 use crate::*;
 
 // ponytail: fixed first-slice limits avoid new config surface; make them configurable when
@@ -246,7 +254,7 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
             if instance.worktree_status.as_deref() == Some("deleted") {
                 continue;
             }
-            let root_path = agent_instance_worktree_path(&workspace.path, &instance.id);
+            let root_path = agent_instance_execution_root(&workspace.path, &instance);
             if root_path.exists() {
                 continue;
             }
@@ -521,7 +529,7 @@ async fn run_coordinator_task_inner(
     chat_context.tool_workspace_path = match instance.execution_workspace_mode {
         AgentExecutionWorkspaceMode::Shared => workspace.path.clone(),
         AgentExecutionWorkspaceMode::IsolatedWorktree => {
-            agent_instance_worktree_path(&workspace.path, &instance.id)
+            agent_instance_execution_root(&workspace.path, &instance)
         }
     };
     let allowed_tools = instance
@@ -1690,6 +1698,14 @@ fn finish_claimed_task(
     Ok(())
 }
 
+fn agent_instance_execution_root(workspace_path: &Path, instance: &AgentInstanceRecord) -> PathBuf {
+    instance
+        .execution_root_path
+        .as_deref()
+        .map(|root_path| resolve_agent_worktree_path(workspace_path, root_path))
+        .unwrap_or_else(|| agent_instance_worktree_path(workspace_path, &instance.id))
+}
+
 fn agent_task_worktree_result(
     workspace_path: &Path,
     instance: &AgentInstanceRecord,
@@ -1697,7 +1713,7 @@ fn agent_task_worktree_result(
     if instance.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
         return Ok(None);
     }
-    let root_path = agent_instance_worktree_path(workspace_path, &instance.id);
+    let root_path = agent_instance_execution_root(workspace_path, instance);
     let diff = git_diff_response(&root_path, None)?;
     Ok(Some(json!({
         "mode": instance.execution_workspace_mode.as_str(),
