@@ -963,7 +963,7 @@ fn team_chat_task_event_stream(
                 for event in subscription.replay {
                     if event.sequence > last_sequence {
                         last_sequence = event.sequence;
-                        yield Ok(sse_event_payload(&event.payload_json));
+                        yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                     }
                 }
 
@@ -975,7 +975,7 @@ fn team_chat_task_event_stream(
                                     while let Ok(event) = subscription.event_rx.try_recv() {
                                         if event.sequence > last_sequence {
                                             last_sequence = event.sequence;
-                                            yield Ok(sse_event_payload(&event.payload_json));
+                                            yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                                         }
                                     }
                                     break;
@@ -986,7 +986,7 @@ fn team_chat_task_event_stream(
                                     Ok(event) => {
                                         if event.sequence > last_sequence {
                                             last_sequence = event.sequence;
-                                            yield Ok(sse_event_payload(&event.payload_json));
+                                            yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1064,7 +1064,7 @@ fn team_chat_task_event_stream(
             for event in new_run_events {
                 if event.sequence > last_run_event_sequence {
                     last_run_event_sequence = event.sequence;
-                    yield Ok(sse_event_payload(&event.payload_json));
+                    yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                 }
             }
             let new_agent_events = match database
@@ -1133,7 +1133,7 @@ fn team_chat_task_event_stream(
                 for event in events {
                     if event.sequence > last_run_event_sequence {
                         last_run_event_sequence = event.sequence;
-                        yield Ok(sse_event_payload(&event.payload_json));
+                        yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                     }
                 }
                 yield Ok(sse_event(&ChatSseEvent::StreamEnd));

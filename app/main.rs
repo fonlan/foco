@@ -5815,6 +5815,10 @@ fn sse_event_payload(data: &str) -> Event {
     Event::default().data(data)
 }
 
+fn sequenced_sse_event_payload(sequence: i64, data: &str) -> Event {
+    sse_event_payload(data).id(sequence.to_string())
+}
+
 fn capture_first_token(
     started_at: Instant,
     first_token_at: &mut Option<String>,

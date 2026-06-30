@@ -7114,6 +7114,8 @@ async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting()
         body.push_str(&String::from_utf8_lossy(&chunk));
     }
 
+    assert!(body.contains("id: 0"), "{body}");
+    assert!(body.contains("id: 1"), "{body}");
     assert!(body.contains(r#""type":"start""#), "{body}");
     assert!(body.contains(r#""type":"textDelta""#), "{body}");
     assert!(body.contains("Already running."), "{body}");
