@@ -81,8 +81,10 @@ use crate::runtime::{
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 use crate::spec_runtime::{
+    WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
     prepare_workspace_spec_job, queue_workspace_spec_update_job,
+    workspace_spec_update_queue_decision,
 };
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
@@ -8559,6 +8561,96 @@ fn workspace_spec_successful_primary_turn_queues_update_job() {
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_update_queue_decision_reports_skip_reasons() {
+    assert_eq!(
+        workspace_spec_update_queue_decision("failed", true, None, true, None),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "final_state_not_succeeded"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision("succeeded", false, None, true, None),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "not_agent_primary_chat_output"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision("succeeded", true, Some("plan"), true, None),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "plan_mode_session_not_plan_phase_implementation"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision("succeeded", true, None, false, None),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "spec_auto_disabled"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision(
+            "succeeded",
+            true,
+            None,
+            true,
+            Some(WorkspaceSpecUpdateSpecState {
+                exists: false,
+                enabled: false,
+                content_empty: true,
+            }),
+        ),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_missing"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision(
+            "succeeded",
+            true,
+            None,
+            true,
+            Some(WorkspaceSpecUpdateSpecState {
+                exists: true,
+                enabled: false,
+                content_empty: false,
+            }),
+        ),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_disabled"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision(
+            "succeeded",
+            true,
+            None,
+            true,
+            Some(WorkspaceSpecUpdateSpecState {
+                exists: true,
+                enabled: true,
+                content_empty: true,
+            }),
+        ),
+        WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_content_empty"
+        }
+    );
+    assert_eq!(
+        workspace_spec_update_queue_decision(
+            "succeeded",
+            true,
+            None,
+            true,
+            Some(WorkspaceSpecUpdateSpecState {
+                exists: true,
+                enabled: true,
+                content_empty: false,
+            }),
+        ),
+        WorkspaceSpecUpdateQueueDecision::Queue
+    );
 }
 
 #[test]

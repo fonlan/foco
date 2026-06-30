@@ -9,7 +9,7 @@ use foco_store::{
     workspace::{
         CodeChangeStats, CodeGraphFileSummaryRecord, CodeGraphSymbolRecord, NewWorkspaceSpecJob,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WorkspaceDatabase, WorkspaceSpecJobRecord, WorkspaceSpecJobStatus,
+        WorkspaceDatabase, WorkspaceSpecJobRecord, WorkspaceSpecJobStatus, WorkspaceSpecRecord,
         WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision, workspace_database_path,
     },
 };
@@ -178,34 +178,167 @@ pub(crate) async fn run_workspace_spec_job(
     run_workspace_spec_jobs(config, workspace_id, workspace_path, job_id).await
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceSpecUpdateSpecState {
+    pub(crate) exists: bool,
+    pub(crate) enabled: bool,
+    pub(crate) content_empty: bool,
+}
+
+impl WorkspaceSpecUpdateSpecState {
+    fn from_record(spec: Option<&WorkspaceSpecRecord>) -> Self {
+        match spec {
+            Some(spec) => Self {
+                exists: true,
+                enabled: spec.enabled,
+                content_empty: spec.content_markdown.trim().is_empty(),
+            },
+            None => Self {
+                exists: false,
+                enabled: false,
+                content_empty: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceSpecUpdateQueueDecision {
+    Queue,
+    Skip { reason: &'static str },
+}
+
+pub(crate) fn workspace_spec_update_queue_decision(
+    final_state: &str,
+    agent_primary_chat_output: bool,
+    session_mode: Option<&str>,
+    spec_auto_enabled: bool,
+    spec_state: Option<WorkspaceSpecUpdateSpecState>,
+) -> WorkspaceSpecUpdateQueueDecision {
+    // ponytail: only models queue gating; tracing field coverage stays in thin caller logs.
+    if final_state != "succeeded" {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "final_state_not_succeeded",
+        };
+    }
+    if !agent_primary_chat_output {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "not_agent_primary_chat_output",
+        };
+    }
+    if session_mode == Some("plan") {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "plan_mode_session_not_plan_phase_implementation",
+        };
+    }
+    if !spec_auto_enabled {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "spec_auto_disabled",
+        };
+    }
+    let Some(spec_state) = spec_state else {
+        return WorkspaceSpecUpdateQueueDecision::Queue;
+    };
+    if !spec_state.exists {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_missing",
+        };
+    }
+    if !spec_state.enabled {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_disabled",
+        };
+    }
+    if spec_state.content_empty {
+        return WorkspaceSpecUpdateQueueDecision::Skip {
+            reason: "workspace_spec_content_empty",
+        };
+    }
+    WorkspaceSpecUpdateQueueDecision::Queue
+}
+
+fn log_workspace_spec_update_queue_skip(
+    context: &PreparedChatContext,
+    final_state: &str,
+    reason: &str,
+    spec_state: Option<WorkspaceSpecUpdateSpecState>,
+) {
+    let spec_exists = spec_state.map(|state| state.exists);
+    let spec_enabled = spec_state.map(|state| state.enabled);
+    let spec_content_empty = spec_state.map(|state| state.content_empty);
+    tracing::debug!(
+        workspace_id = %context.workspace_id,
+        chat_id = %context.chat_id,
+        run_id = %context.llm_request_id,
+        final_state = %final_state,
+        session_mode = ?context.session_mode.as_deref(),
+        agent_primary_chat_output = context.agent_primary_chat_output,
+        spec_auto_enabled = context.global_config.spec.auto_enabled,
+        spec_exists = ?spec_exists,
+        spec_enabled = ?spec_enabled,
+        spec_content_empty = ?spec_content_empty,
+        skip_reason = reason,
+        "workspace spec update job skipped"
+    );
+}
+
 pub(crate) fn queue_workspace_spec_update_job(
     context: &PreparedChatContext,
     final_state: &str,
 ) -> Result<(), ApiError> {
-    if final_state != "succeeded" || !context.agent_primary_chat_output {
-        return Ok(());
-    }
-    if context.session_mode.as_deref() == Some("plan") {
-        return Ok(());
-    }
-    if !context.global_config.spec.auto_enabled {
-        return Ok(());
+    match workspace_spec_update_queue_decision(
+        final_state,
+        context.agent_primary_chat_output,
+        context.session_mode.as_deref(),
+        context.global_config.spec.auto_enabled,
+        None,
+    ) {
+        WorkspaceSpecUpdateQueueDecision::Queue => {}
+        WorkspaceSpecUpdateQueueDecision::Skip { reason } => {
+            log_workspace_spec_update_queue_skip(context, final_state, reason, None);
+            return Ok(());
+        }
     }
 
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    let Some(spec) = database
+    let spec = database
         .workspace_spec()
-        .map_err(ApiError::from_workspace_error)?
-        .filter(|spec| spec.enabled && !spec.content_markdown.trim().is_empty())
-    else {
-        return Ok(());
-    };
+        .map_err(ApiError::from_workspace_error)?;
+    let spec_state = WorkspaceSpecUpdateSpecState::from_record(spec.as_ref());
+    match workspace_spec_update_queue_decision(
+        final_state,
+        context.agent_primary_chat_output,
+        context.session_mode.as_deref(),
+        context.global_config.spec.auto_enabled,
+        Some(spec_state),
+    ) {
+        WorkspaceSpecUpdateQueueDecision::Queue => {}
+        WorkspaceSpecUpdateQueueDecision::Skip { reason } => {
+            log_workspace_spec_update_queue_skip(context, final_state, reason, Some(spec_state));
+            return Ok(());
+        }
+    }
+    let spec = spec.expect("spec state checked before queueing workspace spec update");
 
     let running_job_exists = database
         .running_workspace_spec_job()
         .map_err(ApiError::from_workspace_error)?
         .is_some();
+    tracing::debug!(
+        workspace_id = %context.workspace_id,
+        chat_id = %context.chat_id,
+        run_id = %context.llm_request_id,
+        final_state = %final_state,
+        session_mode = ?context.session_mode.as_deref(),
+        agent_primary_chat_output = context.agent_primary_chat_output,
+        spec_auto_enabled = context.global_config.spec.auto_enabled,
+        spec_exists = spec_state.exists,
+        spec_enabled = spec_state.enabled,
+        spec_content_empty = spec_state.content_empty,
+        running_job_exists,
+        "workspace spec update job queueing"
+    );
 
     let input =
         workspace_spec_update_input(context, &database, spec.revision, &spec.content_markdown)?;
