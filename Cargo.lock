@@ -814,6 +814,8 @@ dependencies = [
  "getrandom 0.3.4",
  "gix",
  "ico",
+ "objc2",
+ "objc2-app-kit",
  "portable-pty",
  "regex",
  "reqwest",
