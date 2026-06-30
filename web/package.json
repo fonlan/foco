@@ -38,6 +38,7 @@
     "@vitejs/plugin-react": "latest",
     "jsdom": "^29.1.1",
     "tailwindcss": "latest",
+    "type-fest": "^4.41.0",
     "typescript": "latest",
     "vite": "latest",
     "vitest": "^4.1.8"

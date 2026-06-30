@@ -114,7 +114,7 @@ pub(crate) struct GuidanceMessage {
 }
 
 impl ActiveChatRunRegistry {
-    #[cfg(any(test, all(windows, not(debug_assertions))))]
+    #[cfg(any(test, all(any(windows, target_os = "macos"), not(debug_assertions))))]
     pub(crate) fn active_run_count(&self) -> Result<usize, ApiError> {
         let runs = self
             .runs
