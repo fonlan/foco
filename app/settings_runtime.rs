@@ -28,6 +28,7 @@ use crate::http::settings::{
     default_image_agent_system_prompt_for_config, default_plan_mode_system_prompt,
     default_review_system_prompt, known_agent_tool_names,
 };
+use crate::platform::autostart_windows::auto_start_enabled_for_response;
 use crate::*;
 
 pub(crate) async fn settings_response(
@@ -40,7 +41,7 @@ pub(crate) async fn settings_response(
 
     Ok(Json(SettingsResponse {
         general: GeneralSettingsSummary {
-            auto_start_enabled: config.app.auto_start_enabled,
+            auto_start_enabled: auto_start_enabled_for_response(config.app.auto_start_enabled),
             default_team_mode_enabled: config.app.default_team_mode_enabled,
             web_server: WebServerSettingsSummary {
                 listen_host: config.app.web_server.listen_host.clone(),

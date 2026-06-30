@@ -1,12 +1,14 @@
 #[cfg(any(windows, target_os = "macos"))]
 use std::env;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use std::path::Path;
 
 use crate::ApiError;
 
 #[cfg(any(windows, test))]
 use crate::AUTO_START_COMMAND;
+#[cfg(any(target_os = "macos", test))]
+use foco_store::config::FOCO_CONFIG_DIR_ENV;
 
 #[cfg(windows)]
 use crate::normalize_windows_verbatim_path;
@@ -58,6 +60,22 @@ pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn auto_start_enabled_for_response(configured: bool) -> bool {
+    match macos_auto_start_status() {
+        Ok(status) => status.is_enabled(),
+        Err(error) => {
+            tracing::warn!(?error, "failed to inspect macOS auto start status");
+            configured
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn auto_start_enabled_for_response(configured: bool) -> bool {
+    configured
+}
+
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
     if enabled {
@@ -76,14 +94,11 @@ fn windows_auto_start_command(exe_path: &Path) -> String {
 
 #[cfg(target_os = "macos")]
 fn enable_macos_auto_start() -> Result<(), ApiError> {
-    let exe_path = env::current_exe().map_err(|source| {
-        ApiError::internal(format!(
-            "failed to resolve current executable path for macOS auto start: {source}"
-        ))
-    })?;
+    let exe_path = macos_auto_start_executable_path()?;
     let exe_path = exe_path.to_string_lossy();
     let plist_path = macos_launch_agent_path()?;
-    let plist = macos_launch_agent_plist(&exe_path);
+    let environment = macos_launch_agent_environment();
+    let plist = macos_launch_agent_plist(&exe_path, &environment);
 
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
@@ -132,6 +147,85 @@ fn enable_macos_auto_start() -> Result<(), ApiError> {
     Err(ApiError::internal(format!(
         "failed to enable macOS auto start with launchctl bootstrap or load: bootstrap: {bootstrap_error}; load: {load_error}"
     )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_auto_start_status() -> Result<MacosAutoStartStatus, ApiError> {
+    let plist_path = macos_launch_agent_path()?;
+    let plist_exists = plist_path.exists();
+    let expected_executable_path = macos_auto_start_executable_path()?;
+    let plist_executable_path = if plist_exists {
+        let plist = fs::read_to_string(&plist_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read macOS LaunchAgent plist {}: {source}",
+                plist_path.display()
+            ))
+        })?;
+        macos_launch_agent_program_argument(&plist).map(PathBuf::from)
+    } else {
+        None
+    };
+    let executable_path_matches_current_app = plist_executable_path
+        .as_deref()
+        .is_some_and(|path| paths_match(path, &expected_executable_path));
+    let service_loaded = macos_launch_agent_is_loaded()?;
+
+    Ok(MacosAutoStartStatus {
+        plist_exists,
+        executable_path_matches_current_app,
+        service_loaded,
+    })
+}
+
+#[cfg(target_os = "macos")]
+struct MacosAutoStartStatus {
+    plist_exists: bool,
+    executable_path_matches_current_app: bool,
+    service_loaded: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosAutoStartStatus {
+    fn is_enabled(&self) -> bool {
+        self.plist_exists && self.executable_path_matches_current_app && self.service_loaded
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_auto_start_executable_path() -> Result<PathBuf, ApiError> {
+    let exe_path = env::current_exe().map_err(|source| {
+        ApiError::internal(format!(
+            "failed to resolve current executable path for macOS auto start: {source}"
+        ))
+    })?;
+
+    Ok(macos_auto_start_executable_path_from_current_exe(&exe_path))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_auto_start_executable_path_from_current_exe(current_exe: &Path) -> PathBuf {
+    current_exe.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_is_loaded() -> Result<bool, ApiError> {
+    let uid = macos_user_id()?;
+    let service = format!("gui/{uid}/{MACOS_LAUNCH_AGENT_LABEL}");
+    match run_launchctl(&["print", &service]) {
+        Ok(()) => Ok(true),
+        Err(error) if launchctl_missing_service_error(&error) => Ok(false),
+        Err(error) => {
+            tracing::warn!(%error, "failed to inspect macOS LaunchAgent service");
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn paths_match(left: &Path, right: &Path) -> bool {
+    let left_canonical = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right_canonical = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left_canonical == right_canonical
 }
 
 #[cfg(target_os = "macos")]
@@ -253,7 +347,49 @@ fn launchctl_missing_service_error(error: &str) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn macos_launch_agent_plist(executable_path: &str) -> String {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MacosLaunchAgentEnvironment {
+    path: String,
+    config_dir: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_environment() -> MacosLaunchAgentEnvironment {
+    MacosLaunchAgentEnvironment {
+        path: env::var("PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(default_macos_launch_agent_path),
+        config_dir: env::var(FOCO_CONFIG_DIR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_macos_launch_agent_path() -> String {
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_launch_agent_plist(
+    executable_path: &str,
+    environment: &MacosLaunchAgentEnvironment,
+) -> String {
+    let mut environment_entries = format!(
+        "        <key>PATH</key>\n\
+        <string>{}</string>\n",
+        xml_escape(&environment.path)
+    );
+    if let Some(config_dir) = environment.config_dir.as_deref() {
+        environment_entries.push_str(&format!(
+            "        <key>{}</key>\n\
+        <string>{}</string>\n",
+            xml_escape(FOCO_CONFIG_DIR_ENV),
+            xml_escape(config_dir)
+        ));
+    }
+
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -265,13 +401,29 @@ fn macos_launch_agent_plist(executable_path: &str) -> String {
     <array>\n\
         <string>{}</string>\n\
     </array>\n\
+    <key>EnvironmentVariables</key>\n\
+    <dict>\n\
+{}\
+    </dict>\n\
     <key>RunAtLoad</key>\n\
     <true/>\n\
 </dict>\n\
 </plist>\n",
         xml_escape(MACOS_LAUNCH_AGENT_LABEL),
-        xml_escape(executable_path)
+        xml_escape(executable_path),
+        environment_entries
     )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_launch_agent_program_argument(plist: &str) -> Option<String> {
+    let program_arguments_index = plist.find("<key>ProgramArguments</key>")?;
+    let program_arguments = &plist[program_arguments_index..];
+    let array_index = program_arguments.find("<array>")?;
+    let array = &program_arguments[array_index..];
+    let string_start = array.find("<string>")? + "<string>".len();
+    let string_end = array[string_start..].find("</string>")? + string_start;
+    Some(xml_unescape(&array[string_start..string_end]))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -282,6 +434,16 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
 }
 
 #[cfg(windows)]
@@ -405,7 +567,10 @@ fn wide_bytes(value: &[u16]) -> Vec<u8> {
 mod tests {
     use std::path::Path;
 
-    use super::{macos_launch_agent_plist, windows_auto_start_command};
+    use super::{
+        MacosLaunchAgentEnvironment, macos_auto_start_executable_path_from_current_exe,
+        macos_launch_agent_plist, macos_launch_agent_program_argument, windows_auto_start_command,
+    };
 
     #[test]
     fn windows_auto_start_command_includes_internal_flag() {
@@ -416,13 +581,59 @@ mod tests {
 
     #[test]
     fn macos_launch_agent_plist_contains_required_keys() {
-        let plist = macos_launch_agent_plist("/Applications/Foco & Tools/foco");
+        let environment = MacosLaunchAgentEnvironment {
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
+            config_dir: Some("/Users/foco/.foco-dev".to_string()),
+        };
+        let plist =
+            macos_launch_agent_plist("/Applications/Foco.app/Contents/MacOS/foco", &environment);
 
         assert!(plist.contains("<key>Label</key>"));
         assert!(plist.contains("<string>com.foco.app</string>"));
         assert!(plist.contains("<key>ProgramArguments</key>"));
-        assert!(plist.contains("<string>/Applications/Foco &amp; Tools/foco</string>"));
+        assert!(plist.contains("<string>/Applications/Foco.app/Contents/MacOS/foco</string>"));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin:/bin</string>"));
+        assert!(plist.contains("<key>FOCO_CONFIG_DIR</key>"));
+        assert!(plist.contains("<string>/Users/foco/.foco-dev</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<true/>"));
+    }
+
+    #[test]
+    fn macos_launch_agent_plist_omits_empty_optional_config_dir() {
+        let environment = MacosLaunchAgentEnvironment {
+            path: "/usr/bin:/bin".to_string(),
+            config_dir: None,
+        };
+        let plist = macos_launch_agent_plist("/Applications/Foco & Tools/foco", &environment);
+
+        assert!(!plist.contains("FOCO_CONFIG_DIR"));
+        assert!(plist.contains("<string>/Applications/Foco &amp; Tools/foco</string>"));
+    }
+
+    #[test]
+    fn macos_launch_agent_program_argument_reads_first_argument() {
+        let environment = MacosLaunchAgentEnvironment {
+            path: "/usr/bin:/bin".to_string(),
+            config_dir: None,
+        };
+        let plist = macos_launch_agent_plist("/Applications/Foco & Tools/foco", &environment);
+
+        assert_eq!(
+            macos_launch_agent_program_argument(&plist).as_deref(),
+            Some("/Applications/Foco & Tools/foco")
+        );
+    }
+
+    #[test]
+    fn macos_auto_start_executable_path_uses_current_app_bundle_binary() {
+        let current_exe = Path::new("/Applications/Foco.app/Contents/MacOS/foco");
+
+        assert_eq!(
+            macos_auto_start_executable_path_from_current_exe(current_exe),
+            current_exe
+        );
     }
 }
