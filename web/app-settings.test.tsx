@@ -178,6 +178,23 @@ describe("app-settings verification surfaces", () => {
     expect(within(specHistorySection as HTMLElement).getByText("model timed out")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
 
+    const specTable = within(specHistorySection as HTMLElement).getByRole("table");
+    const specTableScroller = specTable.parentElement;
+    const settingsScroller = specTable.closest(".settings-shell") as HTMLElement | null;
+    expect(specTableScroller).toHaveClass("overflow-x-auto");
+    expect(settingsScroller).not.toBeNull();
+    if (!specTableScroller || !settingsScroller) {
+      throw new Error("Expected Spec job history to live inside settings scroller");
+    }
+    settingsScroller.style.overflowY = "auto";
+    Object.defineProperties(settingsScroller, {
+      clientHeight: { configurable: true, value: 360 },
+      scrollHeight: { configurable: true, value: 960 },
+    });
+    settingsScroller.scrollTop = 0;
+    fireEvent.wheel(specTableScroller, { deltaX: 0, deltaY: 120 });
+    expect(settingsScroller.scrollTop).toBe(120);
+
     await userEvent.click(
       within(specHistorySection as HTMLElement).getByRole("button", {
         name: "Retry Spec job",

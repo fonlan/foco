@@ -2422,7 +2422,7 @@ export function SettingsPanel({
     }
   }
 
-  function handleMemoryDreamHistoryWheel(event: ReactWheelEvent<HTMLDivElement>) {
+  function handleSettingsTableWheel(event: ReactWheelEvent<HTMLDivElement>) {
     if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
       return;
     }
@@ -5244,7 +5244,7 @@ export function SettingsPanel({
                   </button>
                 </div>
 
-                <div className="panel-scroll overflow-x-auto">
+                <div className="panel-scroll overflow-x-auto" onWheel={handleSettingsTableWheel}>
                   <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
                     <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
                       <tr>
@@ -6553,7 +6553,7 @@ export function SettingsPanel({
 
                 <div
                   className="panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white"
-                  onWheel={handleMemoryDreamHistoryWheel}
+                  onWheel={handleSettingsTableWheel}
                 >
                   <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
                     <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
