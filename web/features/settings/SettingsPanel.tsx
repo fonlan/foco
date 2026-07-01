@@ -9925,7 +9925,7 @@ export function SettingsPanel({
                   {orderedConfiguredModels.length ? (
                     orderedConfiguredModels.map((model) => (
                       <div
-                        className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 transition ${draggedModelId === model.id
+                        className={`grid grid-cols-1 items-center gap-3 px-4 py-2.5 transition sm:grid-cols-[auto_minmax(0,1fr)_auto] ${draggedModelId === model.id
                             ? "bg-teal-50/70 opacity-80"
                             : "bg-white/0"
                           }`}
@@ -9936,7 +9936,7 @@ export function SettingsPanel({
                         onDragStart={(event) => handleModelDragStart(event, model.id)}
                         onDrop={(event) => void handleModelDrop(event)}
                       >
-                        <div className="flex items-center">
+                        <div className="hidden items-center sm:flex">
                           <span
                             aria-label={t("Reorder model {name}", {
                               name: model.displayName,
@@ -9959,59 +9959,63 @@ export function SettingsPanel({
                             )}
                           </span>
                         </div>
-                        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
-                          <span
-                            className="min-w-0 truncate text-sm font-semibold"
-                            title={model.displayName}
-                          >
-                            {model.displayName}
-                          </span>
-                          <span
-                            aria-hidden="true"
-                            className="shrink-0 text-xs text-stone-300"
-                          >
-                            /
-                          </span>
-                          <span
-                            className="min-w-0 truncate text-xs font-medium text-stone-500"
-                            title={model.id}
-                          >
-                            {model.id}
-                          </span>
-                          <CapabilityPill
-                            className="min-w-0 shrink"
-                            label={t("system prompt {name}", {
-                              name: model.systemPromptName,
-                            })}
-                            ok
-                            title={model.systemPromptName}
-                          />
-                          {!model.canEnable ? (
+                        <div className="min-w-0 space-y-1.5 overflow-hidden sm:flex sm:items-center sm:gap-2 sm:space-y-0">
+                          <div className="flex min-w-0 items-baseline gap-2 overflow-hidden">
+                            <span
+                              className="min-w-0 truncate text-sm font-semibold"
+                              title={model.displayName}
+                            >
+                              {model.displayName}
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className="shrink-0 text-xs text-stone-300"
+                            >
+                              /
+                            </span>
+                            <span
+                              className="min-w-0 truncate text-xs font-medium text-stone-500"
+                              title={model.id}
+                            >
+                              {model.id}
+                            </span>
+                          </div>
+                          <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:flex-nowrap sm:gap-2">
+                            <CapabilityPill
+                              className="min-w-0 shrink"
+                              label={t("system prompt {name}", {
+                                name: model.systemPromptName,
+                              })}
+                              ok
+                              title={model.systemPromptName}
+                            />
+                            {!model.canEnable ? (
+                              <CapabilityPill
+                                className="shrink-0"
+                                label={t("limits missing")}
+                                ok={false}
+                              />
+                            ) : null}
                             <CapabilityPill
                               className="shrink-0"
-                              label={t("limits missing")}
-                              ok={false}
+                              label={t("providers {count}", {
+                                count: model.providerIds.length,
+                              })}
+                              ok={model.providerIds.length > 0}
                             />
-                          ) : null}
-                          <CapabilityPill
-                            className="shrink-0"
-                            label={t("providers {count}", {
-                              count: model.providerIds.length,
-                            })}
-                            ok={model.providerIds.length > 0}
-                          />
-                          <CapabilityPill
-                            className="min-w-0 shrink"
-                            label={
-                              model.activeProviderId
-                                ? t("active {id}", { id: model.activeProviderId })
-                                : t("active missing")
-                            }
-                            ok={model.activeProviderId !== null}
-                            title={model.activeProviderId ?? undefined}
-                          />
+                            <CapabilityPill
+                              className="min-w-0 shrink"
+                              label={
+                                model.activeProviderId
+                                  ? t("active {id}", { id: model.activeProviderId })
+                                  : t("active missing")
+                              }
+                              ok={model.activeProviderId !== null}
+                              title={model.activeProviderId ?? undefined}
+                            />
+                          </div>
                         </div>
-                        <div className="flex shrink-0 items-center gap-2">
+                        <div className="flex shrink-0 items-center justify-end gap-2 sm:self-center">
                           <label
                             className="relative inline-flex h-6 w-11 cursor-pointer items-center disabled:cursor-not-allowed"
                             title={

@@ -1260,6 +1260,13 @@ describe("app-settings verification surfaces", () => {
 
     expect(await screen.findByText("GPT Test")).toBeInTheDocument();
     expect(screen.getByText("system prompt Default")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Disable model GPT Test" })).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Edit model GPT Test" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Delete model GPT Test" }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("limits ok")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Delete model GPT Test" }));
