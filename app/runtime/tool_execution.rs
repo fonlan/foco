@@ -3425,9 +3425,12 @@ mod tests {
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-concurrent-{}", unique_id("case"));
-        let first_arguments = json!({ "path": first.path().to_string_lossy(), "startLine": null, "endLine": null });
-        let second_arguments = json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
-        let third_arguments = json!({ "path": third.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let first_arguments =
+            json!({ "path": first.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let second_arguments =
+            json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let third_arguments =
+            json!({ "path": third.path().to_string_lossy(), "startLine": null, "endLine": null });
 
         let first_access = ensure_read_file_external_access(
             registry.clone(),
