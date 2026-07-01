@@ -6,8 +6,10 @@ import {
   useId,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
 } from "react";
+import { Check, Copy } from "lucide-react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -70,7 +72,7 @@ const MARKDOWN_COMPONENTS: Components = {
       return <MermaidDiagram definition={mermaidDefinition} />;
     }
 
-    return <pre {...props}>{children}</pre>;
+    return <CodeBlock preProps={props}>{children}</CodeBlock>;
   },
 };
 
@@ -103,7 +105,57 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
       {content}
     </ReactMarkdown>
   );
-});
+
+function CodeBlock({
+  children,
+  preProps,
+  preProps,
+}: {
+  children: ReactNode;
+  preProps: ComponentPropsWithoutRef<"pre">;
+}) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  const resetCopiedTimerRef = useRef<number | null>(null);
+  const label = copied ? t("Copied code") : t("Copy code");
+  const Icon = copied ? Check : Copy;
+
+  useEffect(() => {
+    return () => {
+      if (resetCopiedTimerRef.current !== null) {
+        window.clearTimeout(resetCopiedTimerRef.current);
+      }
+    };
+  }, []);
+
+  async function copyCode() {
+    await navigator.clipboard.writeText(codeTextFromPreChildren(children));
+    setCopied(true);
+    if (resetCopiedTimerRef.current !== null) {
+      window.clearTimeout(resetCopiedTimerRef.current);
+    }
+    resetCopiedTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      resetCopiedTimerRef.current = null;
+    }, 1400);
+  }
+
+  return (
+    <div className="markdown-code-block">
+      <button
+        aria-label={label}
+        className="markdown-code-copy-button"
+        onClick={() => void copyCode()}
+        title={label}
+        type="button"
+      >
+        <Icon aria-hidden="true" size={14} />
+        <span>{label}</span>
+      </button>
+      <pre {...preProps}>{children}</pre>
+    </div>
+  );
+}
 
 function MermaidDiagram({ definition }: { definition: string }) {
   const { t } = useI18n();
@@ -204,6 +256,18 @@ function safeBase64ImageUrl(url: string) {
   return /^data:image\/(?:avif|bmp|gif|jpe?g|png|webp);base64,[a-z0-9+/=\s]+$/i.test(
     url,
   );
+}
+
+function codeTextFromPreChildren(children: ReactNode) {
+  const childNodes = Children.toArray(children);
+  if (childNodes.length === 1) {
+    const child = childNodes[0];
+    if (isValidElement<{ children?: ReactNode }>(child)) {
+      return Children.toArray(child.props.children).join("");
+    }
+  }
+
+  return childNodes.join("");
 }
 
 function mermaidDefinitionFromPreChildren(children: ReactNode) {

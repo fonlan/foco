@@ -296,6 +296,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Message Foco": "给 Foco 发送消息",
     "Ask Foco anything about {name}...": "询问 Foco 关于 {name} 的任何问题...",
     "Copy message": "复制消息",
+    "Copy code": "复制代码",
+    "Copied code": "已复制代码",
     "Withdraw queued message": "撤回队列消息",
     "Convert queued message to guidance": "转为引导消息",
     "Queued message is no longer available.": "队列消息已不存在。",

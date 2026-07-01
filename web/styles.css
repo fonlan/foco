@@ -83,6 +83,7 @@ summary {
   button.foco-nav-logo-button,
   button.foco-nav-rail-button,
   button.message-action-menu,
+  button.markdown-code-copy-button,
   button.mobile-sidebar-close,
   button.terminal-toolbar-button,
   button.workspace-file-editor-toolbar-button,
@@ -111,6 +112,7 @@ summary {
   button.foco-nav-logo-button,
   button.foco-nav-rail-button,
   button.message-action-menu,
+  button.markdown-code-copy-button,
   button.mobile-sidebar-close,
   button.terminal-toolbar-button,
   button.workspace-file-editor-toolbar-button
@@ -419,6 +421,53 @@ summary:focus-visible {
   background: transparent;
   padding: 0;
   color: inherit;
+}
+
+.markdown-content .markdown-code-block {
+  position: relative;
+  max-width: 100%;
+  margin: 0.55rem 0;
+}
+
+.message-bubble .markdown-content .markdown-code-block {
+  margin: 0.45rem 0;
+}
+
+.markdown-content .markdown-code-block pre,
+.message-bubble .markdown-content .markdown-code-block pre {
+  margin: 0;
+  padding: 2.45rem 0.75rem 0.75rem;
+}
+
+.markdown-code-copy-button {
+  position: absolute;
+  z-index: 1;
+  top: 0.5rem;
+  right: 0.5rem;
+  display: inline-flex;
+  height: 1.75rem;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid rgba(247, 243, 234, 0.18);
+  border-radius: 0.4375rem;
+  background: rgba(247, 243, 234, 0.08);
+  padding: 0 0.5rem;
+  color: #f7f3ea;
+  font-size: var(--foco-font-micro);
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+}
+
+.markdown-code-copy-button:hover,
+.markdown-code-copy-button:focus-visible {
+  border-color: rgba(247, 243, 234, 0.38);
+  background: rgba(247, 243, 234, 0.16);
+  color: #ffffff;
+}
+
+.markdown-code-copy-button svg {
+  flex: 0 0 auto;
 }
 
 .mermaid-diagram {
