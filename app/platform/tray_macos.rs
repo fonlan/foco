@@ -35,13 +35,16 @@ const MENU_QUIT_ITEM_ID: &str = "foco-quit";
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 pub(crate) async fn run_macos_menu_bar_entrypoint() -> AppResult<()> {
-    run_macos_menu_bar_entrypoint_blocking()
+    let loaded_config = load_or_create_global_config()?;
+    logging::init(&loaded_config.paths.logs_dir)?;
+    crate::platform::macos_environment::apply_macos_gui_environment();
+    run_macos_menu_bar_entrypoint_blocking(loaded_config)
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn run_macos_menu_bar_entrypoint_blocking() -> AppResult<()> {
-    let loaded_config = load_or_create_global_config()?;
-    logging::init(&loaded_config.paths.logs_dir)?;
+fn run_macos_menu_bar_entrypoint_blocking(
+    loaded_config: foco_store::config::LoadedGlobalConfig,
+) -> AppResult<()> {
     let addr = local_addr(&loaded_config.config)?;
     let ui_url = foco_ui_url_for_listen_addr(addr);
     if open_existing_foco_instance_if_running(addr, &ui_url) {
