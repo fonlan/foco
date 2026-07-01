@@ -6623,12 +6623,16 @@ export function App() {
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
                     ),
                     toolCalls: applyToolResult(
                       message.toolCalls,
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
                     ),
                   }
                   : message,
@@ -7625,12 +7629,16 @@ export function App() {
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
                     ),
                     parts: applyToolResultToParts(
                       message.parts,
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
                     ),
                   }
                   : message,
@@ -11057,6 +11065,10 @@ function mergeToolCallUpdate(
     status: keepExistingOutcome ? currentToolCall.status : normalizedToolCall.status,
     output: keepExistingOutcome ? currentToolCall.output : normalizedToolCall.output,
     isError: keepExistingOutcome ? currentToolCall.isError : normalizedToolCall.isError,
+    startedAt: normalizedToolCall.startedAt ?? currentToolCall.startedAt,
+    completedAt: keepExistingOutcome
+      ? currentToolCall.completedAt
+      : normalizedToolCall.completedAt ?? currentToolCall.completedAt,
     liveOutput:
       normalizedToolCall.liveOutput ??
       (normalizedToolCall.output === null ? currentToolCall.liveOutput : undefined),
@@ -11068,6 +11080,8 @@ function applyToolResult(
   toolCallId: string,
   output: JsonValue,
   isError: boolean,
+  startedAt?: string | null,
+  completedAt?: string | null,
 ) {
   return toolCalls.map((toolCall) =>
     toolCall.id === toolCallId
@@ -11076,6 +11090,8 @@ function applyToolResult(
         output,
         isError,
         status: isError ? "error" : "completed",
+        startedAt: startedAt ?? toolCall.startedAt ?? null,
+        completedAt: completedAt ?? toolCall.completedAt ?? null,
         liveOutput: undefined,
       }
       : toolCall,
@@ -11497,6 +11513,8 @@ function applyToolResultToParts(
   toolCallId: string,
   output: JsonValue,
   isError: boolean,
+  startedAt?: string | null,
+  completedAt?: string | null,
 ): ChatMessagePart[] {
   return parts.map((part) =>
     part.type === "toolCall" && part.toolCall.id === toolCallId
@@ -11507,6 +11525,8 @@ function applyToolResultToParts(
           output,
           isError,
           status: isError ? "error" : "completed",
+          startedAt: startedAt ?? part.toolCall.startedAt ?? null,
+          completedAt: completedAt ?? part.toolCall.completedAt ?? null,
           liveOutput: undefined,
         },
       } satisfies ChatMessagePart)
@@ -11594,6 +11614,8 @@ function normalizedToolCallSummary(
     input: normalizedToolInput(toolCall.input),
     output:
       toolCall.output === null ? null : normalizedJsonValue(toolCall.output),
+    startedAt: toolCall.startedAt ?? null,
+    completedAt: toolCall.completedAt ?? null,
   };
 }
 
@@ -12680,17 +12702,29 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     const toolCallId = stringField(value, "toolCallId", "tool_call_id");
     const output = fieldValue(value, "output");
     const isError = fieldValue(value, "isError", "is_error");
+    const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
+    const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
 
     if (
       !assistantMessageId ||
       !toolCallId ||
       !isJsonValue(output) ||
-      typeof isError !== "boolean"
+      typeof isError !== "boolean" ||
+      startedAt === false ||
+      completedAt === false
     ) {
       return null;
     }
 
-    return { type: "toolResult", assistantMessageId, toolCallId, output, isError };
+    return {
+      type: "toolResult",
+      assistantMessageId,
+      toolCallId,
+      output,
+      isError,
+      startedAt: startedAt ?? null,
+      completedAt: completedAt ?? null,
+    };
   }
 
   if (value.type === "questionRequest" || value.type === "question_request") {
@@ -13031,6 +13065,8 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
   const input = fieldValue(value, "input");
   const output = fieldValue(value, "output");
   const isError = fieldValue(value, "isError", "is_error");
+  const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
+  const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
 
   if (
     !id ||
@@ -13038,12 +13074,23 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
     !status ||
     !isJsonValue(input) ||
     !isJsonValue(output) ||
-    typeof isError !== "boolean"
+    typeof isError !== "boolean" ||
+    startedAt === false ||
+    completedAt === false
   ) {
     return null;
   }
 
-  return normalizedToolCallSummary({ id, name, status, input, output, isError });
+  return normalizedToolCallSummary({
+    id,
+    name,
+    status,
+    input,
+    output,
+    isError,
+    startedAt: startedAt ?? null,
+    completedAt: completedAt ?? null,
+  });
 }
 
 function parseChatMemoriesUsed(

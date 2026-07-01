@@ -2084,6 +2084,7 @@ function ToolCallBlock({
   workspaceId: string | null;
 }) {
   const {
+    formatChatCreatedAt,
     formatJsonValue,
     normalizedToolInput,
     toolCallChangeStats,
@@ -2140,6 +2141,16 @@ function ToolCallBlock({
           </span>
         </summary>
         <div className="mt-2 grid gap-2 text-xs text-stone-600">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-stone-500">
+            <span>
+              <span className="font-semibold text-stone-500">{t("Started")}</span>{" "}
+              <span>{toolCall.startedAt ? formatChatCreatedAt(toolCall.startedAt) : "-"}</span>
+            </span>
+            <span>
+              <span className="font-semibold text-stone-500">{t("Ended")}</span>{" "}
+              <span>{toolCall.completedAt ? formatChatCreatedAt(toolCall.completedAt) : "-"}</span>
+            </span>
+          </div>
           <div className="min-w-0">
             <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
             <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">

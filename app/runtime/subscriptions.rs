@@ -508,6 +508,7 @@ impl ActiveChatRunRegistration {
                 tool_call_id,
                 output,
                 is_error,
+                ..
             } if assistant_message_id == &self.assistant_message_id => {
                 let output_json = serde_json::to_string(output).map_err(|source| {
                     ApiError::internal(format!("failed to serialize tool output: {source}"))

@@ -452,8 +452,17 @@ function taskRunTranscriptItem(
       const toolCallId = jsonRawStringField(payload, "toolCallId", "tool_call_id");
       const output = payload.output;
       const isError = jsonBooleanField(payload, "isError", "is_error") ?? false;
+      const startedAt = jsonRawStringField(payload, "startedAt", "started_at");
+      const completedAt = jsonRawStringField(payload, "completedAt", "completed_at");
       if (toolCallId && isJsonValue(output)) {
-        parts = applyToolResultToParts(parts, toolCallId, output, isError);
+        parts = applyToolResultToParts(
+          parts,
+          toolCallId,
+          output,
+          isError,
+          startedAt,
+          completedAt,
+        );
       }
       continue;
     }
@@ -643,6 +652,8 @@ function applyToolResultToParts(
   toolCallId: string,
   output: JsonValue,
   isError: boolean,
+  startedAt?: string | null,
+  completedAt?: string | null,
 ): ChatMessagePart[] {
   return parts.map((part) =>
     part.type === "toolCall" && part.toolCall.id === toolCallId
@@ -653,6 +664,8 @@ function applyToolResultToParts(
             output,
             isError,
             status: isError ? "error" : "completed",
+            startedAt: startedAt ?? part.toolCall.startedAt ?? null,
+            completedAt: completedAt ?? part.toolCall.completedAt ?? null,
             liveOutput: undefined,
           },
         }
@@ -709,6 +722,8 @@ function chatToolCallSummary(value: JsonValue | undefined): ChatToolCallSummary 
   const liveOutput = jsonRecord(jsonField(record, "liveOutput", "live_output"));
   const stdout = liveOutput ? jsonRawStringField(liveOutput, "stdout") ?? "" : "";
   const stderr = liveOutput ? jsonRawStringField(liveOutput, "stderr") ?? "" : "";
+  const startedAt = jsonRawStringField(record, "startedAt", "started_at");
+  const completedAt = jsonRawStringField(record, "completedAt", "completed_at");
   return {
     id,
     name,
@@ -716,6 +731,8 @@ function chatToolCallSummary(value: JsonValue | undefined): ChatToolCallSummary 
     input: isJsonValue(record.input) ? record.input : {},
     output: isJsonValue(output) ? output : null,
     isError: jsonBooleanField(record, "isError", "is_error") ?? false,
+    startedAt,
+    completedAt,
     liveOutput: stdout || stderr ? { stdout, stderr } : undefined,
   };
 }

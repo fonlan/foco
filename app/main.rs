@@ -1633,6 +1633,8 @@ struct ChatToolCallSummary {
     input: Value,
     output: Option<Value>,
     is_error: bool,
+    started_at: Option<String>,
+    completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1758,6 +1760,8 @@ enum ChatSseEvent {
         tool_call_id: String,
         output: Value,
         is_error: bool,
+        started_at: String,
+        completed_at: String,
     },
     ToolOutputDelta {
         assistant_message_id: String,
@@ -3729,6 +3733,8 @@ impl PreparedChatContext {
                                     tool_call_id: executed_tool_call.id.clone(),
                                     output: executed_tool_call.output.clone(),
                                     is_error: executed_tool_call.is_error,
+                                    started_at: executed_tool_call.started_at.clone(),
+                                    completed_at: executed_tool_call.completed_at.clone(),
                                 };
                                 events.push(captured_event(&result_event));
                                 yield result_event;
@@ -7530,6 +7536,8 @@ fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary
         input: tool_call.arguments.clone(),
         output: None,
         is_error: false,
+        started_at: None,
+        completed_at: None,
     }
 }
 
@@ -7546,6 +7554,8 @@ fn executed_tool_call_summary(tool_call: &ExecutedToolCall) -> ChatToolCallSumma
         input: tool_call.input.clone(),
         output: Some(tool_call.output.clone()),
         is_error: tool_call.is_error,
+        started_at: Some(tool_call.started_at.clone()),
+        completed_at: Some(tool_call.completed_at.clone()),
     }
 }
 
@@ -9895,6 +9905,8 @@ fn chat_tool_call_summary(
         input,
         output,
         is_error,
+        started_at: Some(record.started_at),
+        completed_at: record.completed_at,
     })
 }
 

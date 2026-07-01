@@ -282,6 +282,8 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
                 input: json!({ "path": "README.md" }),
                 output: None,
                 is_error: false,
+                started_at: None,
+                completed_at: None,
             },
         },
         ChatSseEvent::ToolResult {
@@ -289,6 +291,8 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
             tool_call_id: "call-1".to_string(),
             output: json!({ "content": "ok" }),
             is_error: false,
+            started_at: "2026-06-29T08:00:00Z".to_string(),
+            completed_at: "2026-06-29T08:00:01Z".to_string(),
         },
         ChatSseEvent::Complete {
             chat_id: "chat-1".to_string(),
@@ -3798,6 +3802,8 @@ fn active_chat_run_private_output_records_events_without_main_chat_draft() {
                     input: json!({ "path": "README.md" }),
                     output: None,
                     is_error: false,
+                    started_at: None,
+                    completed_at: None,
                 },
             },
         )
@@ -3877,6 +3883,8 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 input: json!({ "path": "discarded.txt" }),
                 output: None,
                 is_error: false,
+                started_at: None,
+                completed_at: None,
             },
         },
         ChatSseEvent::StreamReset {
@@ -3895,6 +3903,8 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 input: json!({ "path": "README.md" }),
                 output: None,
                 is_error: false,
+                started_at: None,
+                completed_at: None,
             },
         },
         ChatSseEvent::ToolResult {
@@ -3902,6 +3912,8 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
             tool_call_id: "tool-1".to_string(),
             output: json!({ "content": "hello" }),
             is_error: false,
+            started_at: "2026-06-20T08:00:01Z".to_string(),
+            completed_at: "2026-06-20T08:00:02Z".to_string(),
         },
         ChatSseEvent::ToolCall {
             assistant_message_id: "assistant-1".to_string(),
@@ -3912,6 +3924,8 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 input: json!({ "command": "cargo test" }),
                 output: None,
                 is_error: false,
+                started_at: None,
+                completed_at: None,
             },
         },
     ] {
@@ -4039,6 +4053,8 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             input: json!({ "path": "README.md" }),
             output: None,
             is_error: false,
+            started_at: None,
+            completed_at: None,
         },
     };
     let tool_result_event = ChatSseEvent::ToolResult {
@@ -4046,6 +4062,8 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
         tool_call_id: "call-team-tool".to_string(),
         output: json!({ "content": "hello" }),
         is_error: false,
+        started_at: "2026-06-20T08:00:01Z".to_string(),
+        completed_at: "2026-06-20T08:00:02Z".to_string(),
     };
     for event in [&tool_call_event, &tool_result_event] {
         registration
@@ -4333,6 +4351,8 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         input: json!({ "path": "README.md" }),
         output: Some(json!({ "content": "large result" })),
         is_error: false,
+        started_at: Some("2026-06-29T08:00:00Z".to_string()),
+        completed_at: Some("2026-06-29T08:00:01Z".to_string()),
     };
     let events = [
         (

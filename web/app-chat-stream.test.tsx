@@ -1153,6 +1153,7 @@ describe("app-chat-stream verification surfaces", () => {
           isError: false,
           name: "run_command",
           output: null,
+          startedAt: "started-at",
           status: "running",
         },
         type: "toolCall",
@@ -1245,6 +1246,8 @@ describe("app-chat-stream verification surfaces", () => {
         assistantMessageId,
         isError: false,
         output: "tests done",
+        startedAt: "started-at",
+        completedAt: "completed-at",
         toolCallId: "call-run-command",
         type: "toolResult",
       });
@@ -1268,6 +1271,10 @@ describe("app-chat-stream verification surfaces", () => {
 
     expect(within(row).queryByText("running")).not.toBeInTheDocument();
     expect(within(row).getByText("completed")).toBeInTheDocument();
+    expect(within(row).getByText("Started")).toBeInTheDocument();
+    expect(within(row).getByText("started-at")).toBeInTheDocument();
+    expect(within(row).getByText("Ended")).toBeInTheDocument();
+    expect(within(row).getByText("completed-at")).toBeInTheDocument();
     expect(within(row).getByText(/tests done/)).toBeInTheDocument();
 
     await act(async () => {

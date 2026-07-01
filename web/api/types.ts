@@ -394,6 +394,8 @@ export type ChatToolCallSummary = {
   input: JsonValue;
   output: JsonValue | null;
   isError: boolean;
+  startedAt?: string | null;
+  completedAt?: string | null;
   liveOutput?: ChatToolLiveOutput;
 };
 
@@ -594,6 +596,8 @@ export type ChatStreamEvent =
     toolCallId: string;
     output: JsonValue;
     isError: boolean;
+    startedAt?: string | null;
+    completedAt?: string | null;
   }
   | {
     type: "toolOutputDelta";

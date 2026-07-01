@@ -350,6 +350,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Create git branch": "创建 Git 分支",
     Input: "输入",
     Output: "输出",
+    Started: "开始",
+    Ended: "结束",
     "Mermaid diagram failed to render.": "Mermaid 图渲染失败。",
     error: "错误",
     connected: "已连接",
