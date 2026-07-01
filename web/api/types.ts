@@ -505,6 +505,7 @@ export type ChatMessagesResponse = {
     nextBeforeSequence: number | null;
   };
   activeRun?: ActiveChatRunSummary | null;
+  pendingQuestion?: QuestionRequestSummary | null;
 };
 
 export type QuestionOptionSummary = {

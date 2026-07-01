@@ -229,6 +229,7 @@ pub(crate) struct ChatMessagesResponse {
     pub(crate) messages: Vec<ChatMessageSummary>,
     pub(crate) pagination: ChatMessagesPaginationSummary,
     pub(crate) active_run: Option<ActiveChatRunSummary>,
+    pub(crate) pending_question: Option<QuestionRequest>,
 }
 
 #[derive(Serialize)]
@@ -1719,12 +1720,16 @@ pub(crate) async fn chat_messages(
     let active_run = state
         .active_chat_runs
         .active_run_for_chat(workspace_id, chat_id)?;
+    let pending_question = state
+        .question_registry
+        .pending_for_chat(workspace_id, chat_id)?;
 
     Ok(Json(ChatMessagesResponse {
         chat: Some(chat_summary),
         messages,
         pagination,
         active_run,
+        pending_question,
     }))
 }
 

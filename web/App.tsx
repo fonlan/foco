@@ -3674,6 +3674,7 @@ export function App() {
       );
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
       const pagination = normalizeChatMessagesPagination(data.pagination);
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
       setReadOnlyChatKeys((current) => {
@@ -3694,6 +3695,14 @@ export function App() {
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
+        setPendingQuestion((current) =>
+          restoredQuestion ??
+          (current?.workspaceId === workspaceId && current.chatId === chatId ? null : current),
+        );
+        if (restoredQuestion) {
+          setQuestionError(null);
+          setIsAnsweringQuestion(false);
+        }
       }
       if (activeRun) {
         void subscribeActiveChatRun(activeRun);
@@ -3850,7 +3859,7 @@ export function App() {
       updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
     }
     if (workspaceChatActiveRun) {
-      void subscribeActiveChatRun(workspaceChatActiveRun);
+      void loadChatMessages(workspaceId, chatId);
     }
   }
 

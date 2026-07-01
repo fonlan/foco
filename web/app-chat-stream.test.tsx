@@ -2948,6 +2948,30 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("reattaches from refreshed workspace active run when reopening cached chat", async () => {
     const fetchMock = vi.mocked(fetch);
+    let reattachActiveRun = false;
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            activeRun: reattachActiveRun
+              ? {
+                  acceptingGuidance: true,
+                  chatId: "chat-1",
+                  lastSequence: 0,
+                  runId: "request-stream",
+                  workspaceId: "workspace-1",
+                }
+              : null,
+          }),
+        );
+      }
+      return mockFetch(input, init);
+    });
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
@@ -2974,6 +2998,7 @@ describe("app-chat-stream verification surfaces", () => {
       },
       secondaryWorkspace,
     ];
+    reattachActiveRun = true;
 
     const initialWorkspaceRequests = fetchMock.mock.calls.filter(([url]) =>
       String(url).includes("/api/workspaces"),
@@ -3011,6 +3036,63 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Reattached from workspace list.")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
+  it("restores a pending question when loading an active chat", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: {
+            acceptingGuidance: true,
+            chatId: "chat-1",
+            lastSequence: 853,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+          pendingQuestion: {
+            chatId: "chat-1",
+            id: "read-file-question-1",
+            questions: [
+              {
+                allowFreeText: false,
+                id: "read-file-question-1-item-1",
+                options: [
+                  {
+                    description: "Allow this read.",
+                    label: "Allow",
+                    value: "allow",
+                  },
+                ],
+                question: "read_file wants to read outside the workspace.",
+              },
+            ],
+            toolCallId: "read-file-call-1",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+    expect(
+      within(dialog).getByText("read_file wants to read outside the workspace."),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Allow")).toBeInTheDocument();
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();

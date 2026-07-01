@@ -1768,6 +1768,40 @@ fn question_registry_rejects_invalid_answer_without_consuming_question() {
 }
 
 #[test]
+fn question_registry_returns_pending_question_for_chat() {
+    let registry = QuestionRegistry::default();
+    let _registration = registry
+        .register(QuestionRequest {
+            id: "question-2".to_string(),
+            tool_call_id: "tool-call-2".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            questions: vec![QuestionItem {
+                id: "question-2-item-1".to_string(),
+                question: "Allow the read?".to_string(),
+                options: Vec::new(),
+                allow_free_text: true,
+            }],
+        })
+        .expect("question registration");
+
+    assert_eq!(
+        registry
+            .pending_for_chat("workspace-1", "chat-1")
+            .expect("pending question lookup")
+            .expect("pending question")
+            .id,
+        "question-2"
+    );
+    assert!(
+        registry
+            .pending_for_chat("workspace-1", "chat-2")
+            .expect("other chat pending question lookup")
+            .is_none()
+    );
+}
+
+#[test]
 fn new_provider_is_associated_with_matching_local_models() {
     let mut models = vec![
         test_model_settings("matched-without-provider"),

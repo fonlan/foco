@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ pub(crate) struct QuestionRegistry {
 struct PendingQuestion {
     request: QuestionRequest,
     answer_tx: oneshot::Sender<QuestionAnswer>,
+    registered_at: Instant,
 }
 
 pub(crate) struct QuestionRegistration {
@@ -104,7 +106,14 @@ impl QuestionRegistry {
             .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
 
         if pending
-            .insert(question_id.clone(), PendingQuestion { request, answer_tx })
+            .insert(
+                question_id.clone(),
+                PendingQuestion {
+                    request,
+                    answer_tx,
+                    registered_at: Instant::now(),
+                },
+            )
             .is_some()
         {
             return Err(ApiError::internal(format!(
@@ -147,6 +156,26 @@ impl QuestionRegistry {
                 "question is no longer waiting for an answer: {question_id}"
             ))
         })
+    }
+
+    pub(crate) fn pending_for_chat(
+        &self,
+        workspace_id: &str,
+        chat_id: &str,
+    ) -> Result<Option<QuestionRequest>, ApiError> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
+
+        // ponytail: the UI supports one dialog; return the newest until it supports a queue.
+        Ok(pending
+            .values()
+            .filter(|pending| {
+                pending.request.workspace_id == workspace_id && pending.request.chat_id == chat_id
+            })
+            .max_by_key(|pending| pending.registered_at)
+            .map(|pending| pending.request.clone()))
     }
 
     #[cfg(test)]
