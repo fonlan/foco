@@ -31,10 +31,12 @@ pub(crate) use code_graph::{
 pub(crate) use image_tools::{
     execute_image_tool, image_model_available, image_tool_timeout_ms, is_image_tool_name,
 };
+#[cfg(all(test, windows))]
+pub(crate) use native_tools::find_system_ripgrep;
 #[cfg(test)]
 pub(crate) use native_tools::{
-    GithubReleaseAsset, find_system_ripgrep, ripgrep_asset_target, ripgrep_executable_name,
-    ripgrep_install_dir, select_ripgrep_asset,
+    GithubReleaseAsset, ripgrep_asset_target, ripgrep_executable_name, ripgrep_install_dir,
+    select_ripgrep_asset,
 };
 pub(crate) use native_tools::{
     RipgrepStatus, RipgrepToolSummary, detect_ripgrep, download_and_install_ripgrep,

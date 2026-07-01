@@ -14097,7 +14097,7 @@ fn remove_dir_if_exists(path: &Path) {
     for attempt in 0..10 {
         match fs::remove_dir_all(path) {
             Ok(()) => return,
-            Err(error) if !path.exists() => return,
+            Err(_) if !path.exists() => return,
             Err(error) => {
                 last_error = Some(error);
                 std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));

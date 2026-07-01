@@ -957,7 +957,7 @@ fn ask_question_definition() -> ToolDefinition {
 fn run_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUN_COMMAND_TOOL,
-        description: "Run a local command in the active workspace without invoking a shell.",
+        description: "Run a local command in the active workspace without invoking a shell. Recursive scans must stay inside the workspace.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

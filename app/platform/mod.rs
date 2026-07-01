@@ -1,5 +1,5 @@
 pub mod autostart_windows;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
 pub mod macos_environment;
 pub mod native_browser;
 #[cfg(any(test, all(any(windows, target_os = "macos"), not(debug_assertions))))]

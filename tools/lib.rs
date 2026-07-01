@@ -2198,6 +2198,115 @@ mod tests {
     }
 
     #[test]
+    fn run_command_blocks_recursive_scan_that_escapes_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "find",
+                "args": ["..", "-name", "npm"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("run_command refuses to run recursive scans outside the workspace")
+        );
+    }
+
+    #[test]
+    fn run_command_blocks_shell_recursive_scan_that_escapes_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "bash",
+                "args": ["-lc", "find .. -name npm 2>/dev/null | head -20"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("run_command refuses to run recursive scans outside the workspace")
+        );
+    }
+
+    #[test]
+    fn run_command_blocks_shell_recursive_scan_of_user_home() {
+        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        else {
+            return;
+        };
+        let home = home.to_string_lossy();
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "bash",
+                "args": ["-lc", format!("find {home} -path '*bin/npm' -type f 2>/dev/null | head -20")],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("run_command refuses to run recursive scans outside the workspace")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_allows_recursive_scan_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "hello\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "find",
+                "args": [".", "-maxdepth", "1", "-name", "note.txt"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert!(
+            result.output["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("note.txt")
+        );
+    }
+
+    #[test]
     fn run_command_times_out() {
         let workspace = tempfile::tempdir().expect("workspace");
         let command = std::env::current_exe()

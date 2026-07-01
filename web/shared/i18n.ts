@@ -769,8 +769,6 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Request type": "请求类型",
     Result: "结果",
     Time: "时间",
-    "Manual refresh": "手动刷新",
-    "Chat completed": "会话完成",
     "Spec job failed": "Spec 任务失败",
     "Retry Spec job": "重试 Spec 任务",
     "revision {revision}": "版本 {revision}",

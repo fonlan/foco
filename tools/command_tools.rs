@@ -1,6 +1,6 @@
 use std::{
-    fs,
-    path::Path,
+    env, fs,
+    path::{Component, Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -49,6 +49,8 @@ pub(crate) fn run_command(
     {
         return Err(ToolRuntimeError::NotDirectory(cwd));
     }
+
+    reject_privacy_sensitive_recursive_scan(workspace_path, command, &args)?;
 
     let output = run_command_with_timeout(
         command,
@@ -125,6 +127,277 @@ pub(crate) struct RunCommandInput {
     pub(crate) args: Option<Vec<String>>,
     pub(crate) cwd: Option<String>,
     pub(crate) timeout_ms: Option<u64>,
+}
+
+fn reject_privacy_sensitive_recursive_scan(
+    workspace_path: &Path,
+    command: &str,
+    args: &[String],
+) -> Result<(), ToolRuntimeError> {
+    let command_name = command_basename(command);
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+    let home = home_dir();
+
+    if is_recursive_scan_command(&command_name) {
+        reject_recursive_scan_args(&workspace, home.as_deref(), &command_name, args)?;
+    }
+
+    if is_shell_command(&command_name) {
+        for script in shell_command_scripts(args) {
+            reject_recursive_scan_shell_script(&workspace, home.as_deref(), script)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_recursive_scan_shell_script(
+    workspace: &Path,
+    home: Option<&Path>,
+    script: &str,
+) -> Result<(), ToolRuntimeError> {
+    let words = shell_words(script);
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if is_shell_separator(word) {
+            index += 1;
+            continue;
+        }
+
+        if is_recursive_scan_command(&command_basename(word)) {
+            let command_name = command_basename(word);
+            let start = index + 1;
+            let end = words[start..]
+                .iter()
+                .position(|candidate| is_shell_separator(candidate))
+                .map(|offset| start + offset)
+                .unwrap_or(words.len());
+            reject_recursive_scan_args(workspace, home, &command_name, &words[start..end])?;
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_recursive_scan_args(
+    workspace: &Path,
+    home: Option<&Path>,
+    command: &str,
+    args: &[String],
+) -> Result<(), ToolRuntimeError> {
+    for arg in args {
+        if arg == "--" || arg.is_empty() {
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let Some(reason) = recursive_scan_path_risk(workspace, home, command, arg) else {
+            continue;
+        };
+
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "run_command refuses to run recursive scans outside the workspace ({reason}). Use workspace-relative paths or a narrower explicit path inside the workspace."
+        )));
+    }
+
+    Ok(())
+}
+
+fn recursive_scan_path_risk(
+    workspace: &Path,
+    home: Option<&Path>,
+    command: &str,
+    value: &str,
+) -> Option<String> {
+    if matches!(value, "." | "./") {
+        return None;
+    }
+
+    if value == "~"
+        || value.starts_with("~/")
+        || value == "$HOME"
+        || value.starts_with("$HOME/")
+        || value == "${HOME}"
+        || value.starts_with("${HOME}/")
+    {
+        return Some("target references the user home directory".to_string());
+    }
+
+    let path = Path::new(value);
+    if path.is_absolute() {
+        if path_is_inside(path, workspace) {
+            return None;
+        }
+        if command_uses_path_operands(command) {
+            return Some(format!(
+                "target is outside the workspace: {}",
+                path.display()
+            ));
+        }
+        if let Some(home) = home {
+            if path == home {
+                return Some(format!(
+                    "target is the user home directory: {}",
+                    path.display()
+                ));
+            }
+            if path_is_inside(path, &home.join("Pictures")) {
+                return Some(format!(
+                    "target is inside the macOS Pictures folder: {}",
+                    path.display()
+                ));
+            }
+            if path_is_inside(
+                path,
+                &home.join("Library/Application Support/com.apple.TCC"),
+            ) {
+                return Some(format!(
+                    "target is inside the macOS privacy database folder: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        return None;
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Some(format!("target escapes the workspace: {value}"));
+    }
+
+    None
+}
+
+fn shell_command_scripts(args: &[String]) -> impl Iterator<Item = &str> {
+    args.iter().enumerate().filter_map(|(index, arg)| {
+        if shell_arg_enables_command(arg) {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            None
+        }
+    })
+}
+
+fn shell_arg_enables_command(arg: &str) -> bool {
+    arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
+}
+
+fn shell_words(script: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = script.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            push_shell_word(&mut words, &mut current);
+            continue;
+        }
+
+        if matches!(ch, ';' | '|') {
+            push_shell_word(&mut words, &mut current);
+            words.push(ch.to_string());
+            continue;
+        }
+
+        if ch == '&' {
+            push_shell_word(&mut words, &mut current);
+            if chars.peek() == Some(&'&') {
+                let _ = chars.next();
+                words.push("&&".to_string());
+            } else {
+                words.push("&".to_string());
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    push_shell_word(&mut words, &mut current);
+    words
+}
+
+fn push_shell_word(words: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        words.push(std::mem::take(current));
+    }
+}
+
+fn is_recursive_scan_command(command: &str) -> bool {
+    matches!(
+        command,
+        "find" | "fd" | "fdfind" | "rg" | "grep" | "egrep" | "fgrep" | "ag"
+    )
+}
+
+fn command_uses_path_operands(command: &str) -> bool {
+    matches!(command, "find" | "fd" | "fdfind")
+}
+
+fn is_shell_command(command: &str) -> bool {
+    matches!(command, "bash" | "sh" | "zsh" | "dash" | "ksh")
+}
+
+fn is_shell_separator(word: &str) -> bool {
+    matches!(word, ";" | "|" | "&&" | "&")
+}
+
+fn command_basename(command: &str) -> String {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .to_string()
+}
+
+fn path_is_inside(path: &Path, parent: &Path) -> bool {
+    path == parent || path.starts_with(parent)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[derive(Deserialize)]

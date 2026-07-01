@@ -125,6 +125,8 @@ use crate::prompt::{
     persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
     serialize_provider_request, system_prompt_summaries, tool_prompt_infos,
 };
+#[cfg(all(test, windows))]
+pub(crate) use crate::runtime::find_system_ripgrep;
 #[cfg(test)]
 pub(crate) use crate::runtime::should_vacuum_workspace_database;
 use crate::runtime::{
@@ -143,9 +145,8 @@ use crate::runtime::{
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
-    GithubReleaseAsset, find_system_ripgrep, reconcile_agent_runtime, ripgrep_asset_target,
-    ripgrep_executable_name, ripgrep_install_dir, select_ripgrep_asset,
-    spawn_code_graph_workspace_initialization_if_needed,
+    GithubReleaseAsset, reconcile_agent_runtime, ripgrep_asset_target, ripgrep_executable_name,
+    ripgrep_install_dir, select_ripgrep_asset, spawn_code_graph_workspace_initialization_if_needed,
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
@@ -429,6 +430,9 @@ async fn run_entrypoint() -> AppResult<()> {
 
     #[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
     {
+        #[cfg(target_os = "macos")]
+        crate::platform::native_browser::install_macos_native_picker_dispatcher();
+
         run_server_until_shutdown(None, false, ActiveChatRunRegistry::default()).await
     }
 }
