@@ -2,7 +2,10 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { PLAN_AUTO_RUN_ENABLED_STORAGE_KEY } from "./app/constants";
+import {
+  PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
+  planAutoRunEnabledStorageKey,
+} from "./app/constants";
 import {
   activeMemory,
   agentTeamSnapshot,
@@ -1049,7 +1052,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
-  it("persists the auto-run checkbox preference", async () => {
+  it("persists and migrates the auto-run checkbox preference per workspace", async () => {
     const user = userEvent.setup();
     const runningPlan = {
       ...planFixture,
@@ -1081,6 +1084,7 @@ describe("app-panels-stats verification surfaces", () => {
       return mockFetch(input, init);
     });
     vi.stubGlobal("fetch", fetchMock);
+    const storageKey = planAutoRunEnabledStorageKey("workspace-1");
     window.localStorage.setItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY, "true");
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1092,16 +1096,79 @@ describe("app-panels-stats verification surfaces", () => {
     });
 
     expect(autoRunCheckbox).toBeChecked();
+    expect(window.localStorage.getItem(storageKey)).toBe("true");
+    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
 
     await user.click(autoRunCheckbox);
-    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBe(
-      "false",
-    );
+    expect(window.localStorage.getItem(storageKey)).toBe("false");
+    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
 
     await user.click(autoRunCheckbox);
-    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBe(
+    expect(window.localStorage.getItem(storageKey)).toBe("true");
+    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
+  });
+
+  it("keeps the auto-run checkbox preference scoped to the active workspace", async () => {
+    const user = userEvent.setup();
+    const runningPlan = {
+      ...planFixture,
+      activePhaseId: "phase-1",
+      phases: [
+        {
+          ...planFixture.phases[0],
+          status: "running",
+        },
+      ],
+      status: "running",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path.match(/^\/api\/workspaces\/[^/]+\/plans$/)) {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [runningPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    const autoRunCheckbox = await screen.findByRole("checkbox", {
+      name: /Auto run plans/,
+    });
+    await user.click(autoRunCheckbox);
+    expect(autoRunCheckbox).toBeChecked();
+    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
       "true",
     );
+
+    await user.click(screen.getByRole("button", { name: "Side project" }));
+    await user.click(screen.getByRole("button", { name: /Side note/ }));
+
+    await waitFor(() => {
+      expect(autoRunCheckbox).not.toBeChecked();
+    });
+    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
+      "true",
+    );
+    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-2"))).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Default" }));
+    await user.click(screen.getByRole("button", { name: /Tool run/ }));
+
+    await waitFor(() => {
+      expect(autoRunCheckbox).toBeChecked();
+    });
   });
 
   it("refreshes running plan phases while the visible plan panel is open", async () => {
@@ -1443,6 +1510,9 @@ describe("app-panels-stats verification surfaces", () => {
     await waitFor(() => {
       expect(autoRunCheckbox).not.toBeChecked();
     });
+    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
+      "false",
+    );
     expect(actionCallSummary()).toEqual([
       { action: { action: "start" }, planId: "plan-1" },
       { action: { action: "start" }, planId: "plan-2" },

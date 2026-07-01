@@ -150,6 +150,7 @@ import {
 } from "./features/git/diff-parser";
 import {
   PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
+  planAutoRunEnabledStorageKey,
   chartColor,
   CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
   CONTEXT_PANEL_DEFAULT_WIDTH,
@@ -255,6 +256,40 @@ const PLAN_AUTO_RUN_REFRESH_MS = 3000;
 
 type ViewMode = BrowserRoute["viewMode"];
 type PlanAutoRunnableAction = "start" | "resume";
+type PlanAutoRunEnabledByWorkspace = Record<string, boolean>;
+
+function readPlanAutoRunEnabled(workspaceId: string) {
+  const workspaceValue = window.localStorage.getItem(
+    planAutoRunEnabledStorageKey(workspaceId),
+  );
+  const legacyValue = window.localStorage.getItem(
+    PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
+  );
+  if (workspaceValue !== null) {
+    if (legacyValue !== null) {
+      window.localStorage.removeItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY);
+    }
+    return workspaceValue === "true";
+  }
+
+  if (legacyValue !== null) {
+    window.localStorage.setItem(
+      planAutoRunEnabledStorageKey(workspaceId),
+      legacyValue === "true" ? "true" : "false",
+    );
+    window.localStorage.removeItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY);
+    return legacyValue === "true";
+  }
+
+  return false;
+}
+
+function writePlanAutoRunEnabled(workspaceId: string, enabled: boolean) {
+  window.localStorage.setItem(
+    planAutoRunEnabledStorageKey(workspaceId),
+    enabled ? "true" : "false",
+  );
+}
 
 type PendingPlanPhaseRetryRefresh = {
   workspaceId: string;
@@ -625,9 +660,8 @@ export function App() {
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
-  const [isPlanAutoRunEnabled, setIsPlanAutoRunEnabled] = useState(
-    () => window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY) === "true",
-  );
+  const [planAutoRunEnabledByWorkspace, setPlanAutoRunEnabledByWorkspace] =
+    useState<PlanAutoRunEnabledByWorkspace>({});
   const [isPlanAutoRunDispatching, setIsPlanAutoRunDispatching] =
     useState(false);
   const [pendingPlanPhaseRetryRefresh, setPendingPlanPhaseRetryRefresh] =
@@ -723,6 +757,32 @@ export function App() {
       workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
       workspaces[0],
     [activeWorkspaceId, workspaces],
+  );
+  const activeWorkspaceIdForPlanAutoRun = activeWorkspace?.id ?? "";
+  const isPlanAutoRunEnabled = activeWorkspaceIdForPlanAutoRun
+    ? planAutoRunEnabledByWorkspace[activeWorkspaceIdForPlanAutoRun] ?? false
+    : false;
+  const setPlanAutoRunEnabledForWorkspace = useCallback(
+    (workspaceId: string, enabled: boolean) => {
+      if (!workspaceId) {
+        return;
+      }
+      writePlanAutoRunEnabled(workspaceId, enabled);
+      setPlanAutoRunEnabledByWorkspace((current) => ({
+        ...current,
+        [workspaceId]: enabled,
+      }));
+    },
+    [],
+  );
+  const setIsPlanAutoRunEnabled = useCallback(
+    (enabled: boolean) => {
+      setPlanAutoRunEnabledForWorkspace(
+        activeWorkspaceIdForPlanAutoRun,
+        enabled,
+      );
+    },
+    [activeWorkspaceIdForPlanAutoRun, setPlanAutoRunEnabledForWorkspace],
   );
   const activeChatKey =
     activeChatId === null || isPendingChatId(activeChatId)
@@ -2297,11 +2357,26 @@ export function App() {
   }, [activeWorkspace?.id]);
 
   useEffect(() => {
-    window.localStorage.setItem(
-      PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
-      isPlanAutoRunEnabled ? "true" : "false",
-    );
-  }, [isPlanAutoRunEnabled]);
+    if (!activeWorkspaceIdForPlanAutoRun) {
+      return;
+    }
+    setPlanAutoRunEnabledByWorkspace((current) => {
+      if (
+        Object.prototype.hasOwnProperty.call(
+          current,
+          activeWorkspaceIdForPlanAutoRun,
+        )
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        [activeWorkspaceIdForPlanAutoRun]: readPlanAutoRunEnabled(
+          activeWorkspaceIdForPlanAutoRun,
+        ),
+      };
+    });
+  }, [activeWorkspaceIdForPlanAutoRun]);
 
   useEffect(() => {
     if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
@@ -2317,11 +2392,13 @@ export function App() {
       return;
     }
 
+    const workspaceId = activeWorkspace.id;
+
     const nextPlanAction = nextAutoRunnablePlan(activePlans);
     if (!nextPlanAction) {
       // ponytail: this is only the current active view queue; active plans pageSize=50.
       // Upgrade path: move queue exhaustion detection into a backend persisted runner.
-      setIsPlanAutoRunEnabled(false);
+      setPlanAutoRunEnabledForWorkspace(workspaceId, false);
       return;
     }
 
@@ -2329,13 +2406,13 @@ export function App() {
     // Ceiling: active view limit=50; upgrade path is a backend persisted runner.
     setIsPlanAutoRunDispatching(true);
     void runPlanAction(
-      activeWorkspace.id,
+      workspaceId,
       nextPlanAction.planId,
       nextPlanAction.action,
     ).then((ok) => {
       setIsPlanAutoRunDispatching(false);
       if (!ok) {
-        setIsPlanAutoRunEnabled(false);
+        setPlanAutoRunEnabledForWorkspace(workspaceId, false);
       }
     });
   }, [
@@ -2346,6 +2423,7 @@ export function App() {
     isPlanAutoRunEnabled,
     planOperationKey,
     runPlanAction,
+    setPlanAutoRunEnabledForWorkspace,
   ]);
 
   useEffect(() => {
