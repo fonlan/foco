@@ -2844,9 +2844,25 @@ fn matching_option_value(question: &QuestionItem, answer: &str) -> Option<String
 }
 
 static READ_FILE_EXTERNAL_ACCESS_CHATS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static READ_FILE_EXTERNAL_ACCESS_PROMPT_LOCKS: OnceLock<
+    Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
 
 fn read_file_external_access_chats() -> &'static Mutex<HashSet<String>> {
     READ_FILE_EXTERNAL_ACCESS_CHATS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn read_file_external_access_prompt_lock(chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = READ_FILE_EXTERNAL_ACCESS_PROMPT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("external read access prompt lock table");
+
+    // ponytail: one lock per chat is tiny for process lifetime; add cleanup if chat churn becomes large.
+    locks
+        .entry(chat_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn chat_allows_external_read_file(chat_id: &str) -> bool {
@@ -2893,6 +2909,13 @@ async fn ensure_read_file_external_access(
     let Some(target_path) = read_file_target_outside_workspace(workspace_path, path)? else {
         return Ok(false);
     };
+
+    if chat_allows_external_read_file(chat_id) {
+        return Ok(true);
+    }
+
+    let prompt_lock = read_file_external_access_prompt_lock(chat_id);
+    let _prompt_guard = prompt_lock.lock().await;
 
     if chat_allows_external_read_file(chat_id) {
         return Ok(true);
@@ -3387,6 +3410,91 @@ mod tests {
         .expect("second outside access check");
 
         assert!(second_allowed);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_serializes_concurrent_questions_for_chat() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = tempfile::NamedTempFile::new().expect("first outside file");
+        let second = tempfile::NamedTempFile::new().expect("second outside file");
+        let third = tempfile::NamedTempFile::new().expect("third outside file");
+        fs::write(first.path(), "first outside").expect("write first outside");
+        fs::write(second.path(), "second outside").expect("write second outside");
+        fs::write(third.path(), "third outside").expect("write third outside");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-concurrent-{}", unique_id("case"));
+        let first_arguments = json!({ "path": first.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let second_arguments = json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
+        let third_arguments = json!({ "path": third.path().to_string_lossy(), "startLine": null, "endLine": null });
+
+        let first_access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &first_arguments,
+            ToolCancellationToken::default(),
+        );
+        let second_access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-2",
+            READ_FILE_TOOL,
+            &second_arguments,
+            ToolCancellationToken::default(),
+        );
+        let third_access = ensure_read_file_external_access(
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            &chat_id,
+            "call-3",
+            READ_FILE_TOOL,
+            &third_arguments,
+            ToolCancellationToken::default(),
+        );
+
+        let answer_two_questions = async {
+            let first_request = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("first external read question event")
+                .expect("first external read question request");
+            assert!(event_rx.try_recv().is_err());
+            let first_item_id = first_request.questions[0].id.clone();
+            registry
+                .answer(
+                    &first_request.id,
+                    external_read_file_answer("allow", first_item_id.as_str()),
+                )
+                .expect("answer first external read question");
+
+            let second_request =
+                answer_next_external_read_question(registry.clone(), &mut event_rx, "allow_all")
+                    .await;
+            (first_request, second_request)
+        };
+
+        let ((first_request, second_request), first_allowed, second_allowed, third_allowed) = tokio::join!(
+            answer_two_questions,
+            first_access,
+            second_access,
+            third_access
+        );
+
+        assert_ne!(first_request.id, second_request.id);
+        assert!(first_allowed.expect("first concurrent access"));
+        assert!(second_allowed.expect("second concurrent access"));
+        assert!(third_allowed.expect("third concurrent access"));
+        assert!(chat_allows_external_read_file(&chat_id));
         assert!(event_rx.try_recv().is_err());
     }
 
