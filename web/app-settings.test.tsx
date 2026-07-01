@@ -298,14 +298,14 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
-  it("saves Windows auto start from general settings", async () => {
+  it("saves auto start from general settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     await userEvent.click(
       await screen.findByRole("checkbox", {
-        name: "Start Foco when Windows starts",
+        name: "Start Foco at startup",
       }),
     );
     await userEvent.click(screen.getByRole("button", { name: "Save general settings" }));

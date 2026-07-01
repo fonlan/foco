@@ -4135,7 +4135,7 @@ export function SettingsPanel({
                           className="size-4 shrink-0 fill-current text-teal-700"
                         />
                         <p className="text-sm font-semibold text-stone-800">
-                          {t("Start Foco when Windows starts")}
+                          {t("Start Foco at startup")}
                         </p>
                       </div>
                       <div className="flex items-center gap-2">
@@ -4146,7 +4146,7 @@ export function SettingsPanel({
                           ok={generalForm.autoStartEnabled}
                         />
                         <label
-                          aria-label={t("Start Foco when Windows starts")}
+                          aria-label={t("Start Foco at startup")}
                           className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
                         >
                           <input

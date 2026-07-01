@@ -838,7 +838,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Listen address": "监听地址",
     "Listen port": "监听端口",
     Startup: "启动",
-    "Start Foco when Windows starts": "Windows 启动时打开 Foco",
+    "Start Foco at startup": "开机自启动",
     "Browser authentication": "浏览器认证",
     "Authentication password": "认证密码",
     "Password required": "需要密码",
