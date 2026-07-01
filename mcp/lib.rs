@@ -1,11 +1,11 @@
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::Path,
     time::Duration,
 };
-#[cfg(any(target_os = "macos", all(test, unix)))]
-use std::path::PathBuf;
 
 #[cfg(windows)]
 use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
@@ -826,7 +826,10 @@ fn path_summary(path_env: Option<&std::ffi::OsStr>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     if entries.len() > 6 {
-        format!("PATH has {} entries; first entries: {shown}, ...", entries.len())
+        format!(
+            "PATH has {} entries; first entries: {shown}, ...",
+            entries.len()
+        )
     } else {
         format!("PATH has {} entries: {shown}", entries.len())
     }
@@ -1159,10 +1162,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "foco-mcp-{name}-{}-{suffix}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("foco-mcp-{name}-{}-{suffix}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
     }

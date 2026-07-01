@@ -171,6 +171,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_shell_path_assignment_reads_path_helper_output() {
+        let output = "PATH=\"/usr/local/bin:/usr/bin:/bin\"; export PATH;";
+
+        assert_eq!(
+            parse_shell_path_assignment(output).as_deref(),
+            Some("/usr/local/bin:/usr/bin:/bin")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_path_entries_splits_and_skips_empty_entries() {
+        let mut entries = Vec::new();
+
+        append_path_entries(&mut entries, Some("/opt/homebrew/bin::/usr/bin"));
+
+        assert_eq!(entries, vec!["/opt/homebrew/bin", "/usr/bin"]);
+    }
+
+    #[test]
     fn dedupe_path_entries_keeps_first_occurrence() {
         assert_eq!(
             dedupe_path_entries(vec![
