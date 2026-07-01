@@ -154,6 +154,29 @@ export type WorkspaceSpecJobsResponse = {
   jobs: WorkspaceSpecJobSummary[];
 };
 
+export type SettingsWorkspaceSpecJobSummary = {
+  job: WorkspaceSpecJobSummary;
+  workspaceId: string;
+  workspaceName: string;
+  workspacePath: string;
+};
+
+export type SettingsWorkspaceSpecJobError = {
+  workspaceId: string;
+  workspaceName: string;
+  workspacePath: string;
+  error: string;
+};
+
+export type SettingsWorkspaceSpecJobsResponse = {
+  jobs: SettingsWorkspaceSpecJobSummary[];
+  errors: SettingsWorkspaceSpecJobError[];
+};
+
+export type RetryWorkspaceSpecJobResponse = {
+  job: WorkspaceSpecJobSummary;
+};
+
 // Plan types
 
 export type PlanStatus =

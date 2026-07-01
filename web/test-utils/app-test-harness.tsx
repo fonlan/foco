@@ -6,6 +6,7 @@ import type {
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
   Plan,
+  SettingsWorkspaceSpecJobSummary,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../api/types";
@@ -759,6 +760,39 @@ export const workspaceSpecQueuedJob: WorkspaceSpecJobSummary = {
   startedAt: null,
   status: "queued",
 };
+
+export const settingsSpecCompletedJob: SettingsWorkspaceSpecJobSummary = {
+  job: {
+    ...workspaceSpecJob,
+    output: { contentBytes: 512, revision: 4 },
+  },
+  workspaceId: "workspace-1",
+  workspaceName: "Default",
+  workspacePath: "/Users/fonla/Repos/Foco",
+};
+
+export const settingsSpecFailedJob: SettingsWorkspaceSpecJobSummary = {
+  job: {
+    ...workspaceSpecJob,
+    completedAt: "2026-06-11T03:09:00Z",
+    createdAt: "2026-06-11T03:08:00Z",
+    errorMessage: "model timed out",
+    id: "workspace-spec-job-failed",
+    output: null,
+    startedAt: "2026-06-11T03:08:10Z",
+    status: "failed",
+    triggerType: "chat_completed",
+  },
+  workspaceId: "workspace-2",
+  workspaceName: "Side project",
+  workspacePath: "/Users/fonla/Repos/SideProject",
+};
+
+function clonedSettingsSpecJobs(): SettingsWorkspaceSpecJobSummary[] {
+  return JSON.parse(
+    JSON.stringify([settingsSpecFailedJob, settingsSpecCompletedJob]),
+  ) as SettingsWorkspaceSpecJobSummary[];
+}
 
 export const workspaceSpec: WorkspaceSpecResponse = {
   contentMarkdown:
@@ -1780,6 +1814,7 @@ export const appTestState: {
     workspaces: ConfiguredWorkspaceSummary[];
   };
   workspaceSpecResponse: typeof workspaceSpec;
+  settingsSpecJobsResponse: SettingsWorkspaceSpecJobSummary[];
   workspaceSpecSaveConflict: boolean;
   workspaceSpecGenerateCompletes: boolean;
   workspaceGitBranchesResponses: GitBranchesResponse[];
@@ -1797,6 +1832,7 @@ export const appTestState: {
   scheduledTasksResponse: scheduledTasks,
   settingsResponse: settings,
   workspaceSpecResponse: clonedWorkspaceSpec(),
+  settingsSpecJobsResponse: clonedSettingsSpecJobs(),
   workspaceSpecSaveConflict: false,
   workspaceSpecGenerateCompletes: false,
   workspaceGitBranchesResponses: [],
@@ -1954,6 +1990,7 @@ export function resetAppTestEnvironment() {
   appTestState.scheduledTasksResponse = scheduledTasks;
   appTestState.settingsResponse = settings;
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
+  appTestState.settingsSpecJobsResponse = clonedSettingsSpecJobs();
   appTestState.workspaceSpecSaveConflict = false;
   appTestState.workspaceSpecGenerateCompletes = false;
   appTestState.workspaceGitBranchesResponses = [];
@@ -2388,6 +2425,35 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings") {
     return jsonResponse(appTestState.settingsResponse);
+  }
+
+  if (path === "/api/settings/spec/jobs") {
+    return jsonResponse({ errors: [], jobs: appTestState.settingsSpecJobsResponse });
+  }
+
+  const specJobRetryMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/spec\/jobs\/([^/]+)\/retry$/,
+  );
+  if (specJobRetryMatch) {
+    const workspaceId = decodeURIComponent(specJobRetryMatch[1] ?? "");
+    const jobId = decodeURIComponent(specJobRetryMatch[2] ?? "");
+    const source = appTestState.settingsSpecJobsResponse.find(
+      (item) => item.workspaceId === workspaceId && item.job.id === jobId,
+    );
+    const retryJob: WorkspaceSpecJobSummary = {
+      ...(source?.job ?? workspaceSpecQueuedJob),
+      completedAt: null,
+      createdAt: "2026-06-11T03:12:00Z",
+      errorMessage: null,
+      id: `${jobId}-retry`,
+      output: null,
+      startedAt: null,
+      status: "queued",
+    };
+    appTestState.settingsSpecJobsResponse = source
+      ? [{ ...source, job: retryJob }, ...appTestState.settingsSpecJobsResponse]
+      : appTestState.settingsSpecJobsResponse;
+    return jsonResponse({ job: retryJob });
   }
 
   if (path === "/api/agent-definitions") {

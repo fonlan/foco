@@ -116,8 +116,11 @@ import type {
   ProviderRequestOverrideValueType,
   ProviderTestResponse,
   ProviderTestState,
+  RetryWorkspaceSpecJobResponse,
   SettingsResponse,
   SettingsSection,
+  SettingsWorkspaceSpecJobSummary,
+  SettingsWorkspaceSpecJobsResponse,
   SpecSettingsFormState,
   SystemPromptSummary,
   TerminalShellSummary,
@@ -125,6 +128,7 @@ import type {
   WebSearchFormState,
   WorkspaceCommonCommandSummary,
   WorkspaceFormState,
+  WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../../api/types";
 import {
@@ -457,6 +461,9 @@ export function SettingsPanel({
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
+  const [specJobs, setSpecJobs] = useState<SettingsWorkspaceSpecJobSummary[]>([]);
+  const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
+  const [specJobOperationKey, setSpecJobOperationKey] = useState<string | null>(null);
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
   const [isLoadingPlanHistory, setIsLoadingPlanHistory] = useState(false);
   const [planHistoryError, setPlanHistoryError] = useState<string | null>(null);
@@ -1104,6 +1111,26 @@ export function SettingsPanel({
     }
   }, []);
 
+  const loadSpecJobs = useCallback(async () => {
+    setIsLoadingSpecJobs(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsWorkspaceSpecJobsResponse>(
+        "/api/settings/spec/jobs?limit=100",
+      );
+      setSpecJobs(data.jobs);
+      if (data.errors.length > 0) {
+        setError(data.errors.map((item) => `${item.workspaceName}: ${item.error}`).join("; "));
+      }
+    } catch (requestError) {
+      setSpecJobs([]);
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoadingSpecJobs(false);
+    }
+  }, []);
+
   const loadPlanHistory = useCallback(async () => {
     if (!effectivePlanHistoryWorkspaceId) {
       setPlanHistory([]);
@@ -1179,6 +1206,12 @@ export function SettingsPanel({
       void loadMemoryDreamJobs();
     }
   }, [activeSection, loadMemoryDreamJobs]);
+
+  useEffect(() => {
+    if (activeSection === "spec") {
+      void loadSpecJobs();
+    }
+  }, [activeSection, loadSpecJobs]);
 
   useEffect(() => {
     if (activeSection === "plan") {
@@ -1854,10 +1887,30 @@ export function SettingsPanel({
       setSettings(data);
       onSettingsChange(data);
       syncSpecSettingsForm(data);
+      await loadSpecJobs();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsSavingSpecSettings(false);
+    }
+  }
+
+  async function retrySpecJob(workspaceId: string, jobId: string) {
+    const operationKey = `${workspaceId}:${jobId}`;
+    setSpecJobOperationKey(operationKey);
+    setError(null);
+
+    try {
+      await requestJson<RetryWorkspaceSpecJobResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs/${encodeURIComponent(jobId)}/retry`,
+        { method: "POST" },
+      );
+      // ponytail: no auto polling yet; entering the page and Refresh cover the first version.
+      await loadSpecJobs();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSpecJobOperationKey(null);
     }
   }
 
@@ -5164,6 +5217,125 @@ export function SettingsPanel({
                   {t("Save")}
                 </button>
               </form>
+
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-stone-950">
+                      {t("Spec job history")}
+                    </h3>
+                    <p className="mt-1 truncate text-xs text-stone-500">
+                      {t("All workspace Spec jobs")}
+                    </p>
+                  </div>
+                  <button
+                    aria-label={t("Refresh Spec job history")}
+                    className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    disabled={isLoadingSpecJobs}
+                    onClick={() => void loadSpecJobs()}
+                    title={t("Refresh Spec job history")}
+                    type="button"
+                  >
+                    {isLoadingSpecJobs ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <RefreshCw aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                </div>
+
+                <div className="panel-scroll overflow-x-auto">
+                  <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
+                    <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
+                      <tr>
+                        <th className="px-3 py-2">{t("Time")}</th>
+                        <th className="px-3 py-2">{t("Workspace")}</th>
+                        <th className="px-3 py-2">{t("Request type")}</th>
+                        <th className="px-3 py-2">{t("Status")}</th>
+                        <th className="px-3 py-2">{t("Model")}</th>
+                        <th className="px-3 py-2">{t("Result")}</th>
+                        <th className="px-3 py-2 text-right">{t("Actions")}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {specJobs.length === 0 ? (
+                        <tr>
+                          <td
+                            className="px-3 py-6 text-center text-sm font-medium text-stone-500"
+                            colSpan={7}
+                          >
+                            {isLoadingSpecJobs
+                              ? t("Loading Spec job history...")
+                              : t("No Spec jobs")}
+                          </td>
+                        </tr>
+                      ) : (
+                        specJobs.map((item) => {
+                          const job = item.job;
+                          const operationKey = `${item.workspaceId}:${job.id}`;
+                          const isRetrying = specJobOperationKey === operationKey;
+                          return (
+                            <tr className="bg-white hover:bg-stone-50" key={operationKey}>
+                              <td className="px-3 py-2 align-top">
+                                <span className="whitespace-nowrap text-xs font-semibold text-stone-700">
+                                  {formatAuditDate(specJobTime(job), language)}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                <div className="min-w-40">
+                                  <div className="font-semibold text-stone-900">
+                                    {item.workspaceName}
+                                  </div>
+                                  <div className="mt-1 max-w-56 truncate text-xs text-stone-500" title={item.workspacePath}>
+                                    {item.workspacePath}
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {specJobTriggerLabel(job.triggerType, t)}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                <CapabilityPill
+                                  label={specJobStatusLabel(job.status, t)}
+                                  ok={job.status === "completed"}
+                                  tone={specJobStatusTone(job.status)}
+                                />
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {job.modelId ?? t("Default")}
+                              </td>
+                              <td className="max-w-72 px-3 py-2 align-top text-xs text-stone-600">
+                                {specJobResultLabel(job, t, language)}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                <div className="flex justify-end">
+                                  {job.status === "failed" ? (
+                                    <button
+                                      aria-label={t("Retry Spec job")}
+                                      className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                      disabled={specJobOperationKey !== null}
+                                      onClick={() => void retrySpecJob(item.workspaceId, job.id)}
+                                      title={t("Retry Spec job")}
+                                      type="button"
+                                    >
+                                      {isRetrying ? (
+                                        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <Redo2 aria-hidden="true" className="size-3.5" />
+                                      )}
+                                      {t("Retry")}
+                                    </button>
+                                  ) : null}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </section>
           ) : null}
 
@@ -11698,6 +11870,59 @@ function memoryDreamJobKey(scope: MemoryDreamScope, workspaceId: string | null) 
 
 function memoryDreamScopeLabel(scope: string, t: Translate) {
   return scope === "global" ? t("Global Dream") : t("Workspace Dream");
+}
+
+function specJobTime(job: WorkspaceSpecJobSummary) {
+  return job.completedAt ?? job.startedAt ?? job.createdAt;
+}
+
+function specJobTriggerLabel(triggerType: string, t: Translate) {
+  const labels: Record<string, string> = {
+    chat_completed: "Chat completed",
+    manual_refresh: "Manual refresh",
+  };
+  return t(labels[triggerType] ?? triggerType);
+}
+
+function specJobStatusLabel(status: string, t: Translate) {
+  return memoryDreamStatusLabel(status, t);
+}
+
+function specJobStatusTone(status: string): CapabilityPillTone {
+  return memoryDreamStatusTone(status);
+}
+
+function specJobResultLabel(
+  job: WorkspaceSpecJobSummary,
+  t: Translate,
+  language: AppLanguageId,
+) {
+  if (job.status === "failed") {
+    return job.errorMessage ?? t("Spec job failed");
+  }
+  if (job.status !== "completed") {
+    return "";
+  }
+
+  const output = jsonObject(job.output);
+  const revision = output ? jsonNumber(output.revision) : null;
+  const contentBytes = output ? jsonNumber(output.contentBytes) : null;
+  const parts: string[] = [];
+  if (revision !== null) {
+    parts.push(t("revision {revision}", { revision: formatNumber(revision, language) }));
+  }
+  if (contentBytes !== null) {
+    parts.push(t("{count} bytes", { count: formatNumber(contentBytes, language) }));
+  }
+  return parts.join(" / ");
+}
+
+function jsonObject(value: JsonValue | null): Record<string, JsonValue> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function jsonNumber(value: JsonValue | undefined) {
+  return typeof value === "number" ? value : null;
 }
 
 function memoryDreamTriggerLabel(triggerType: string, t: Translate) {

@@ -159,6 +159,46 @@ describe("app-settings verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows Spec job history and retries failed jobs", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section");
+    expect(specHistorySection).not.toBeNull();
+    expect(await within(specHistorySection as HTMLElement).findByText("Side project")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Default")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Failed")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Completed")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("model timed out")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
+
+    await userEvent.click(
+      within(specHistorySection as HTMLElement).getByRole("button", {
+        name: "Retry Spec job",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed/retry",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          String(input).startsWith("/api/settings/spec/jobs?limit=100"),
+        ).length,
+      ).toBeGreaterThanOrEqual(2),
+    );
+  });
+
   it("localizes the Spec settings surface", async () => {
     const zhSettings = {
       ...settings,
@@ -185,6 +225,9 @@ describe("app-settings verification surfaces", () => {
 
     expect(await screen.findByRole("heading", { name: "Spec 设置" })).toBeInTheDocument();
     expect(screen.getByText("自动 Spec")).toBeInTheDocument();
+    expect(await screen.findByText("Spec 任务历史")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新 Spec 任务历史" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试 Spec 任务" })).toBeInTheDocument();
     expect(screen.getByText("自动化")).toBeInTheDocument();
     expect(screen.getByText("成功聊天轮次结束后更新已启用的工作区 Spec。")).toBeInTheDocument();
     expect(screen.getByLabelText("Spec 生成模型")).toBeInTheDocument();
