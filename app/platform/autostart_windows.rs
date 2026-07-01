@@ -1,7 +1,7 @@
 #[cfg(any(windows, target_os = "macos"))]
 use std::env;
 #[cfg(any(windows, target_os = "macos", test))]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ApiError;
 
