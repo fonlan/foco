@@ -39,7 +39,7 @@ pub(crate) struct SkillSearchRoot {
 
 #[derive(Debug)]
 pub(crate) struct ParsedSkillFile {
-    id: String,
+    pub(crate) id: String,
     name: String,
     description: String,
     frontmatter: String,

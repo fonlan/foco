@@ -83,6 +83,22 @@ pub(crate) fn app_router(state: AppState) -> Router {
         )
         .route("/api/settings", get(crate::http::settings::settings))
         .route(
+            "/api/skill-store/hot",
+            get(crate::http::skill_store::skill_store_hot),
+        )
+        .route(
+            "/api/skill-store/search",
+            get(crate::http::skill_store::skill_store_search),
+        )
+        .route(
+            "/api/skill-store/skills/{skill_id}",
+            get(crate::http::skill_store::skill_store_detail),
+        )
+        .route(
+            "/api/skill-store/install",
+            post(crate::http::skill_store::skill_store_install),
+        )
+        .route(
             "/api/settings/general",
             post(crate::http::settings::save_general_settings),
         )

@@ -9,6 +9,7 @@ pub mod plans;
 pub mod router;
 pub mod scheduled_tasks;
 pub mod settings;
+pub mod skill_store;
 pub mod spec;
 pub mod terminal;
 pub mod workspaces;

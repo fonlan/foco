@@ -51,6 +51,10 @@ use crate::http::{
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
         default_plan_mode_system_prompt, filter_provider_model_ids,
     },
+    skill_store::{
+        SkillStoreFile, ensure_skill_files_valid, install_skill_files_to_target_dir,
+        sanitize_skill_file_path, validate_skill_slug,
+    },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
         generate_workspace_spec, retry_workspace_spec_job, save_workspace_spec,
@@ -13978,6 +13982,72 @@ fn required_disabled_skill_keys_survive_manual_enable_request() {
     let disabled = merge_disabled_skill_keys(user_disabled, &["global:broken".to_string()]);
 
     assert_eq!(disabled, vec!["global:broken"]);
+}
+
+#[test]
+fn skill_store_rejects_unsafe_ids_and_paths() {
+    assert!(validate_skill_slug("gitmemo").is_ok());
+    assert!(validate_skill_slug("../gitmemo").is_err());
+    assert!(validate_skill_slug(".hidden").is_err());
+    assert!(validate_skill_slug("git memo").is_err());
+
+    assert_eq!(
+        sanitize_skill_file_path("support/prompts.md").expect("clean support path"),
+        "support/prompts.md"
+    );
+    assert!(sanitize_skill_file_path("../SKILL.md").is_err());
+    assert!(sanitize_skill_file_path("/tmp/SKILL.md").is_err());
+    assert!(sanitize_skill_file_path(".secret").is_err());
+    assert!(sanitize_skill_file_path("support/.secret").is_err());
+}
+
+#[test]
+fn skill_store_requires_skill_markdown_file() {
+    let files = vec![SkillStoreFile {
+        path: "support/notes.md".to_string(),
+        content: "notes".to_string(),
+    }];
+
+    let error = ensure_skill_files_valid(&files).expect_err("missing SKILL.md should fail");
+
+    assert!(error.message().contains("SKILL.md"));
+}
+
+#[test]
+fn skill_store_install_discovers_written_skill() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-profile-test"));
+    let target_root = profile_dir.join(".agents").join("skills");
+    let files = vec![
+        SkillStoreFile {
+            path: "SKILL.md".to_string(),
+            content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                .to_string(),
+        },
+        SkillStoreFile {
+            path: "support/prompts.md".to_string(),
+            content: "Search memory before repo work.".to_string(),
+        },
+    ];
+
+    let install_path = install_skill_files_to_target_dir(&target_root, "gitmemo", &files, false)
+        .expect("skill install");
+    let conflict = install_skill_files_to_target_dir(&target_root, "gitmemo", &files, false)
+        .expect_err("second install without overwrite should conflict");
+    assert!(conflict.message().contains("already exists"));
+
+    let discovery = discover_skills(&profile_dir, &[]);
+
+    assert!(discovery.errors.is_empty());
+    assert_eq!(install_path, target_root.join("gitmemo"));
+    assert_eq!(discovery.skills.len(), 1);
+    assert_eq!(discovery.skills[0].key, "global:gitmemo");
+    assert_eq!(
+        fs::read_to_string(install_path.join("support").join("prompts.md"))
+            .expect("support file content"),
+        "Search memory before repo work."
+    );
+
+    fs::remove_dir_all(profile_dir).expect("remove skill store profile test");
 }
 
 #[test]
