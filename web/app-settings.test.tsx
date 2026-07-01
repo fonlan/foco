@@ -1263,7 +1263,11 @@ describe("app-settings verification surfaces", () => {
       }
 
       if (path === "/api/providers/models") {
-        return jsonResponse({ providerId: "openai", models: ["o3"] });
+        const body = JSON.parse(String(init?.body ?? "{}")) as { providerId?: string };
+        return jsonResponse({
+          providerId: body.providerId,
+          models: body.providerId === "openai" ? ["o3"] : [],
+        });
       }
 
       return mockFetch(input, init);
@@ -1380,6 +1384,106 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByRole("checkbox", { name: "Gemini Router" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Gemini Router" })).not.toBeDisabled();
     expect(screen.getByLabelText("Active provider")).toHaveValue(geminiProvider.id);
+  });
+
+  it("auto-loads provider models before matching a metadata model to local provider ids", async () => {
+    const geminiProvider = {
+      ...settings.providers[1],
+      id: "gemini-openrouter",
+      kindLabel: "Gemini",
+      name: "Gemini Router",
+    };
+    appTestState.settingsResponse = {
+      ...settings,
+      providers: [settings.providers[0], geminiProvider],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/model-metadata") {
+        return jsonResponse({
+          cachePath: "C:\\Users\\fonla\\.foco\\models.dev.json",
+          configuredModels: [],
+          fetchedAt: "2026-06-05T10:00:00Z",
+          models: [
+            {
+              contextWindow: 1000000,
+              inputModalities: ["text"],
+              key: "google/gemini-3.5-flash",
+              maxOutputTokens: 65536,
+              modelId: "gemini-3.5-flash",
+              name: "Gemini 3.5 Flash",
+              outputModalities: ["text"],
+              pricing: {
+                cacheRead: null,
+                cacheWrite: null,
+                input: 0.3,
+                output: 2.5,
+                reasoning: null,
+              },
+              providerId: "google",
+              providerName: "Google",
+              reasoning: false,
+              refreshedAt: "2026-06-05T10:00:00Z",
+              sourceUrl: "https://models.dev/api.json",
+              supportsCache: false,
+              supportsTools: true,
+            },
+          ],
+          sourceUrl: "https://models.dev/api.json",
+        });
+      }
+
+      if (path === "/api/providers/models") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { providerId?: string };
+        return jsonResponse({
+          providerId: body.providerId,
+          models:
+            body.providerId === geminiProvider.id ? ["gemini-3.5-flash"] : [],
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            url === "/api/providers/models" &&
+            JSON.parse(String(init?.body ?? "{}"))?.providerId === geminiProvider.id,
+        ),
+      ).toBe(true);
+    });
+
+    await userEvent.selectOptions(screen.getByLabelText("Model developer"), "google");
+    await userEvent.selectOptions(screen.getByLabelText("Model id"), "gemini-3.5-flash");
+
+    await waitFor(() => {
+      expect(screen.getByRole("checkbox", { name: "Gemini Router" })).toBeChecked();
+    });
+    expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save model" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/models/manual",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
+        activeProviderId: geminiProvider.id,
+        modelId: "gemini-3.5-flash",
+        providerIds: [geminiProvider.id],
+      });
+    });
   });
 
   it("keeps thinking level editable when configured model supports it despite stale metadata", async () => {

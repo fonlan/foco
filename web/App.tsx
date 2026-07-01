@@ -2820,6 +2820,10 @@ export function App() {
     if (!file) {
       return;
     }
+    if (file.size === 0) {
+      setWorkspaceIconDraft(null);
+      return;
+    }
 
     try {
       const contentBase64 = await fileToBase64(file);

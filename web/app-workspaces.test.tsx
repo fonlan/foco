@@ -763,6 +763,45 @@ describe("app-workspaces verification surfaces", () => {
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
   });
 
+  it("adds a workspace with an empty icon file as the folder icon", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("Workspace name"),
+      "New Workspace",
+    );
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("C:/Users/name/workspace"),
+      "C:/Users/fonla/Documents/Repos/NewWorkspace",
+    );
+
+    await userEvent.upload(
+      within(dialog).getByLabelText("Workspace icon file"),
+      new File([], "empty-logo.png", { type: "image/png" }),
+    );
+
+    expect(within(dialog).getByText("Folder icon")).toBeInTheDocument();
+    expect(within(dialog).queryByText("empty-logo.png")).not.toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => {
+      const addWorkspaceCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
+      );
+      expect(addWorkspaceCall).toBeDefined();
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual({
+        contentBase64: null,
+        name: "New Workspace",
+        path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      });
+    });
+  });
+
   it("uploads and clears a workspace icon in workspace settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

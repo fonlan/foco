@@ -5007,6 +5007,30 @@ fn workspace_logo_file_detects_manual_logo_png() {
 }
 
 #[test]
+fn workspace_logo_file_ignores_empty_logo_file() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-empty-workspace-logo-test"));
+    let logo_dir = workspace_dir.join(".foco");
+    fs::create_dir_all(&logo_dir).expect("logo directory");
+    fs::write(logo_dir.join("logo.png"), []).expect("write empty logo");
+
+    assert!(
+        workspace_logo_file(&workspace_dir)
+            .expect("logo lookup")
+            .is_none()
+    );
+
+    let mut workspace = test_workspace_config("workspace-1");
+    workspace.path = workspace_dir.clone();
+    assert!(
+        workspace_logo_url(&workspace)
+            .expect("logo url lookup")
+            .is_none()
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-save-test"));
     let logo_dir = workspace_dir.join(".foco");
@@ -10645,6 +10669,48 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
     assert_eq!(registered_workspace.name, "New Workspace");
     assert_eq!(registered_workspace.path, registered_path);
     drop(config);
+
+    fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
+    fs::remove_dir_all(new_workspace_dir).expect("remove new workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+}
+
+#[tokio::test]
+async fn add_workspace_allows_empty_logo_content() {
+    let existing_workspace_dir =
+        env::temp_dir().join(unique_id("foco-existing-empty-logo-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-add-empty-logo-profile-test"));
+    let new_workspace_dir = env::temp_dir().join(unique_id("foco-new-empty-logo-workspace-test"));
+
+    fs::create_dir_all(&existing_workspace_dir).expect("existing workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+
+    let config = GlobalConfig::first_run(existing_workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    let response = add_workspace(
+        State(state),
+        Json(WorkspacePathRequest {
+            name: "New Workspace".to_string(),
+            path: new_workspace_dir.display().to_string(),
+            content_base64: Some(String::new()),
+        }),
+    )
+    .await
+    .expect("add workspace with empty logo content");
+
+    let response_workspace = response
+        .0
+        .workspaces
+        .first()
+        .expect("response workspace first");
+    assert_eq!(response_workspace.name, "New Workspace");
+    assert!(response_workspace.logo_url.is_none());
+    assert!(
+        workspace_logo_file(&new_workspace_dir)
+            .expect("workspace logo lookup")
+            .is_none()
+    );
 
     fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
     fs::remove_dir_all(new_workspace_dir).expect("remove new workspace directory");

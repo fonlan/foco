@@ -504,6 +504,7 @@ export function SettingsPanel({
   const [providerModelLists, setProviderModelLists] = useState<
     Record<string, ProviderModelListState>
   >({});
+  const loadingProviderModelIdsRef = useRef<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [isGeneralPasswordVisible, setIsGeneralPasswordVisible] = useState(false);
   const [isProviderApiKeyVisible, setIsProviderApiKeyVisible] = useState(false);
@@ -1309,6 +1310,37 @@ export function SettingsPanel({
       )
       .map((provider) => provider.id);
   }
+
+  useEffect(() => {
+    if (!isModelDialogOpen || editingModel || !form.modelId || !selectedMetadata) {
+      return;
+    }
+
+    const matchedProviderIds = providers
+      .filter((provider) => providerModelListMatches(provider.id, form.modelId))
+      .map((provider) => provider.id);
+    if (!matchedProviderIds.length) {
+      return;
+    }
+
+    setForm((current) => {
+      const configuredProviderIds = new Set(providers.map((provider) => provider.id));
+      if (current.providerIds.some((providerId) => configuredProviderIds.has(providerId))) {
+        return current;
+      }
+      const activeProviderId = matchedProviderIds.includes(current.activeProviderId)
+        ? current.activeProviderId
+        : matchedProviderIds[0] ?? "";
+      return { ...current, providerIds: matchedProviderIds, activeProviderId };
+    });
+  }, [
+    editingModel,
+    form.modelId,
+    isModelDialogOpen,
+    providerModelLists,
+    providers,
+    selectedMetadata,
+  ]);
 
   function formForMetadataModel(
     model: ModelMetadataRecord,
@@ -3695,6 +3727,10 @@ export function SettingsPanel({
   }
 
   async function loadProviderModels(providerId: string) {
+    if (loadingProviderModelIdsRef.current.has(providerId)) {
+      return;
+    }
+    loadingProviderModelIdsRef.current.add(providerId);
     setProviderModelLists((current) => ({
       ...current,
       [providerId]: { message: null, models: [], status: "loading" },
@@ -3727,8 +3763,26 @@ export function SettingsPanel({
           status: "error",
         },
       }));
+    } finally {
+      loadingProviderModelIdsRef.current.delete(providerId);
     }
   }
+
+  useEffect(() => {
+    if (!isModelDialogOpen) {
+      return;
+    }
+
+    for (const provider of providers) {
+      if (
+        provider.enabled &&
+        !providerModelLists[provider.id] &&
+        !loadingProviderModelIdsRef.current.has(provider.id)
+      ) {
+        void loadProviderModels(provider.id);
+      }
+    }
+  }, [isModelDialogOpen, providerModelLists, providers]);
 
   async function refreshProviderModels() {
     setIsRefreshingProviderModels(true);

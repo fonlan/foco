@@ -465,11 +465,9 @@ pub(crate) async fn add_workspace(
     State(state): State<AppState>,
     Json(request): Json<WorkspacePathRequest>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
-    let logo_content_base64 = request.content_base64.clone();
-    let logo = if logo_content_base64.is_some() {
-        let bytes = workspace_logo_request_bytes(&WorkspaceLogoRequest {
-            content_base64: logo_content_base64,
-        })?;
+    let logo = if let Some(bytes) =
+        optional_workspace_logo_request_bytes(request.content_base64.as_deref())?
+    {
         let kind = workspace_logo_kind(&bytes)?;
         Some((bytes, kind))
     } else {

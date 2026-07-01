@@ -6020,16 +6020,25 @@ fn validate_workspace_path(path: &str) -> Result<PathBuf, ApiError> {
 }
 
 fn workspace_logo_request_bytes(request: &WorkspaceLogoRequest) -> Result<Vec<u8>, ApiError> {
-    let content_base64 = request
-        .content_base64
-        .as_deref()
+    let Some(bytes) = optional_workspace_logo_request_bytes(request.content_base64.as_deref())?
+    else {
+        return Err(ApiError::bad_request(
+            "workspace logo request must include contentBase64",
+        ));
+    };
+
+    Ok(bytes)
+}
+
+fn optional_workspace_logo_request_bytes(
+    content_base64: Option<&str>,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let content_base64 = content_base64
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
     let Some(content_base64) = content_base64 else {
-        return Err(ApiError::bad_request(
-            "workspace logo request must include contentBase64",
-        ));
+        return Ok(None);
     };
 
     if content_base64.starts_with("data:") {
@@ -6046,7 +6055,7 @@ fn workspace_logo_request_bytes(request: &WorkspaceLogoRequest) -> Result<Vec<u8
             ))
         })?;
     validate_workspace_logo_size(bytes.len() as u64)?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
@@ -6069,6 +6078,23 @@ fn workspace_logo_file(workspace_path: &Path) -> Result<Option<WorkspaceLogoFile
     for extension in WORKSPACE_LOGO_EXTENSIONS {
         let path = logo_dir.join(format!("logo.{extension}"));
         if !path.exists() {
+            continue;
+        }
+
+        let metadata = fs::metadata(&path).map_err(|source| {
+            ApiError::bad_request(format!(
+                "workspace logo file is not readable: {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "workspace logo path must be a file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() == 0 {
             continue;
         }
 
