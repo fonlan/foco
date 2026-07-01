@@ -105,10 +105,10 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
       {content}
     </ReactMarkdown>
   );
+});
 
 function CodeBlock({
   children,
-  preProps,
   preProps,
 }: {
   children: ReactNode;

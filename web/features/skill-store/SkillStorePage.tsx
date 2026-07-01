@@ -1,0 +1,546 @@
+import {
+  CheckCircle2,
+  Download,
+  ExternalLink,
+  FileText,
+  LoaderCircle,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import type {
+  ConfiguredSkillSummary,
+  SettingsResponse,
+  WorkspaceSummary,
+} from "../../api/types";
+import { errorMessage, requestJson } from "../../shared/api-client";
+import { useI18n } from "../../shared/i18n";
+import "./skill-store.css";
+
+type SkillStorePageProps = {
+  onSettingsChange: (settings: SettingsResponse) => void;
+  onWorkspacesChange: () => Promise<void> | void;
+  settings: SettingsResponse | null;
+  workspaces: WorkspaceSummary[];
+};
+
+type SkillStoreSkill = {
+  id: string;
+  name: string;
+  description: string;
+  source: string | null;
+  installs: number | null;
+  installsYesterday: number | null;
+  change: number | null;
+  official: boolean;
+};
+
+type SkillStoreFile = {
+  path: string;
+  content: string;
+};
+
+type SkillStoreListResponse = {
+  skills: SkillStoreSkill[];
+  total: number;
+  hasMore: boolean;
+  source: string;
+};
+
+type SkillStoreDetailResponse = {
+  id: string;
+  name: string;
+  description: string;
+  source: string | null;
+  files: SkillStoreFile[];
+};
+
+type SkillStoreInstallResponse = {
+  target: string;
+  workspaceId: string | null;
+  path: string;
+  detected: ConfiguredSkillSummary[];
+};
+
+type InstallTarget = "global" | "workspace";
+
+const SEARCH_DEBOUNCE_MS = 300;
+const SUMMARY_LIMIT = 1400;
+
+export function SkillStorePage({
+  onSettingsChange,
+  onWorkspacesChange,
+  settings,
+  workspaces,
+}: SkillStorePageProps) {
+  const { t } = useI18n();
+  const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [skills, setSkills] = useState<SkillStoreSkill[]>([]);
+  const [listSource, setListSource] = useState("");
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SkillStoreDetailResponse | null>(null);
+  const [isLoadingList, setIsLoadingList] = useState(true);
+  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  const [detailReloadKey, setDetailReloadKey] = useState(0);
+  const [listError, setListError] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [installTarget, setInstallTarget] = useState<InstallTarget>("global");
+  const [workspaceId, setWorkspaceId] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [isInstalling, setIsInstalling] = useState(false);
+  const [installMessage, setInstallMessage] = useState<string | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
+
+  const configuredWorkspaces = settings?.workspaces ?? [];
+  const workspaceTargets = useMemo(() => {
+    const items = configuredWorkspaces.length ? configuredWorkspaces : workspaces;
+    return items.map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      path: workspace.path,
+    }));
+  }, [configuredWorkspaces, workspaces]);
+
+  const selectedSkill = useMemo(
+    () => skills.find((skill) => skill.id === selectedSkillId) ?? null,
+    [selectedSkillId, skills],
+  );
+
+  useEffect(() => {
+    if (!workspaceId && workspaceTargets[0]) {
+      setWorkspaceId(workspaceTargets[0].id);
+    }
+  }, [workspaceId, workspaceTargets]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(
+      () => setDebouncedQuery(query.trim()),
+      SEARCH_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(handle);
+  }, [query]);
+
+  const loadSkills = useCallback(async () => {
+    setIsLoadingList(true);
+    setListError(null);
+    setInstallMessage(null);
+    try {
+      const params = new URLSearchParams();
+      let path = "/api/skill-store/hot";
+      if (debouncedQuery) {
+        params.set("query", debouncedQuery);
+        path = `/api/skill-store/search?${params.toString()}`;
+      }
+      const data = await requestJson<SkillStoreListResponse>(path);
+      setSkills(data.skills);
+      setListSource(data.source);
+      setSelectedSkillId((current) =>
+        current && data.skills.some((skill) => skill.id === current)
+          ? current
+          : data.skills[0]?.id ?? null,
+      );
+    } catch (requestError) {
+      setSkills([]);
+      setSelectedSkillId(null);
+      setListSource("");
+      setListError(errorMessage(requestError));
+    } finally {
+      setIsLoadingList(false);
+    }
+  }, [debouncedQuery]);
+
+  useEffect(() => {
+    void loadSkills();
+  }, [loadSkills]);
+
+  useEffect(() => {
+    if (!selectedSkill) {
+      setDetail(null);
+      setDetailError(null);
+      return;
+    }
+
+    const abortController = new AbortController();
+    setIsLoadingDetail(true);
+    setDetail(null);
+    setDetailError(null);
+    setInstallError(null);
+    setInstallMessage(null);
+    setOverwrite(false);
+
+    const params = new URLSearchParams();
+    if (selectedSkill.source) {
+      params.set("source", selectedSkill.source);
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    requestJson<SkillStoreDetailResponse>(
+      `/api/skill-store/skills/${encodeURIComponent(selectedSkill.id)}${suffix}`,
+      { signal: abortController.signal },
+    )
+      .then((data) => setDetail(data))
+      .catch((requestError) => {
+        if (!abortController.signal.aborted) {
+          setDetailError(errorMessage(requestError));
+        }
+      })
+      .finally(() => {
+        if (!abortController.signal.aborted) {
+          setIsLoadingDetail(false);
+        }
+      });
+
+    return () => abortController.abort();
+  }, [detailReloadKey, selectedSkill]);
+
+  async function installSelectedSkill() {
+    if (!detail) {
+      return;
+    }
+
+    setIsInstalling(true);
+    setInstallError(null);
+    setInstallMessage(null);
+    try {
+      const data = await requestJson<SkillStoreInstallResponse>(
+        "/api/skill-store/install",
+        {
+          body: JSON.stringify({
+            files: detail.files,
+            overwrite,
+            skillId: detail.id,
+            source: detail.source ?? selectedSkill?.source ?? undefined,
+            target: installTarget,
+            workspaceId: installTarget === "workspace" ? workspaceId : undefined,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      const refreshedSettings = await requestJson<SettingsResponse>(
+        "/api/skills/refresh",
+        { method: "POST" },
+      );
+      onSettingsChange(refreshedSettings);
+      await onWorkspacesChange();
+      setInstallMessage(t("Installed skill to {path}", { path: data.path }));
+      setOverwrite(false);
+    } catch (requestError) {
+      setInstallError(errorMessage(requestError));
+    } finally {
+      setIsInstalling(false);
+    }
+  }
+
+  const skillSummaryFile = detail?.files.find((file) => file.path === "SKILL.md") ?? null;
+  const readmeFile = detail?.files.find((file) => /^readme\.md$/i.test(file.path)) ?? null;
+  const summaryText = excerpt(readmeFile?.content ?? skillSummaryFile?.content ?? "");
+  const canInstall = Boolean(
+    detail && (installTarget === "global" || workspaceId) && !isInstalling,
+  );
+  const showOverwriteOption = Boolean(
+    installError?.toLocaleLowerCase().includes("already exists") || overwrite,
+  );
+
+  return (
+    <section className="skill-store-page">
+      <header className="skill-store-header">
+        <div className="min-w-0">
+          <h1>{t("Skill Store")}</h1>
+          <p>{t("Browse skills.sh hot skills from the last 24 hours")}</p>
+        </div>
+        <button
+          aria-label={t("Refresh skills")}
+          className="skill-store-icon-button"
+          disabled={isLoadingList}
+          onClick={() => void loadSkills()}
+          title={t("Refresh skills")}
+          type="button"
+        >
+          <RefreshCw
+            aria-hidden="true"
+            className={`size-4 ${isLoadingList ? "animate-spin" : ""}`}
+          />
+        </button>
+      </header>
+
+      <div className="skill-store-layout">
+        <section className="skill-store-list-pane" aria-label={t("Skill list")}>
+          <label className="skill-store-search" htmlFor="skill-store-search">
+            <Search aria-hidden="true" className="size-4" />
+            <input
+              id="skill-store-search"
+              aria-label={t("Search skills")}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={t("Search skills")}
+              type="search"
+              value={query}
+            />
+          </label>
+          <div className="skill-store-list-meta">
+            <span>
+              {debouncedQuery
+                ? t("Search results")
+                : t("Hot skills in the last 24h")}
+            </span>
+            {listSource ? <code>{listSource}</code> : null}
+          </div>
+
+          {listError ? (
+            <StatusBlock
+              actionLabel={t("Retry")}
+              message={listError}
+              onAction={() => void loadSkills()}
+              title={t("Could not load skills")}
+            />
+          ) : isLoadingList ? (
+            <LoadingBlock label={t("Loading skills...")} />
+          ) : skills.length ? (
+            <ol className="skill-store-list">
+              {skills.map((skill, index) => (
+                <li key={`${skill.source ?? "skills"}/${skill.id}`}>
+                  <button
+                    className={
+                      selectedSkillId === skill.id
+                        ? "skill-store-row skill-store-row-active"
+                        : "skill-store-row"
+                    }
+                    onClick={() => setSelectedSkillId(skill.id)}
+                    type="button"
+                  >
+                    <span className="skill-store-rank">#{index + 1}</span>
+                    <span className="skill-store-row-main">
+                      <span className="skill-store-row-title">
+                        {skill.name || skill.id}
+                        {skill.official ? (
+                          <span className="skill-store-official">
+                            <ShieldCheck aria-hidden="true" className="size-3" />
+                            {t("Official")}
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className="skill-store-row-description">
+                        {skill.description || skill.id}
+                      </span>
+                      <span className="skill-store-row-source">
+                        {skill.source ?? t("Unknown source")}
+                      </span>
+                    </span>
+                    <span className="skill-store-row-stats">
+                      <span>{formatMetric(skill.installs)}</span>
+                      <span className={metricChangeClass(skill.change)}>
+                        {formatChange(skill.change)}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <StatusBlock
+              message={t("No skills matched this query")}
+              title={t("No skills")}
+            />
+          )}
+        </section>
+
+        <section className="skill-store-detail-pane" aria-label={t("Skill details")}>
+          {!selectedSkill ? (
+            <StatusBlock
+              message={t("Select a skill from the list")}
+              title={t("No skill selected")}
+            />
+          ) : isLoadingDetail ? (
+            <LoadingBlock label={t("Loading skill details...")} />
+          ) : detailError ? (
+            <StatusBlock
+              actionLabel={t("Retry")}
+              message={detailError}
+              onAction={() => setDetailReloadKey((current) => current + 1)}
+              title={t("Could not load skill details")}
+            />
+          ) : detail ? (
+            <div className="skill-store-detail-content">
+              <div className="skill-store-detail-heading">
+                <div className="min-w-0">
+                  <h2>{detail.name || detail.id}</h2>
+                  <p>{detail.description || selectedSkill.description}</p>
+                  {detail.source ? (
+                    <a
+                      href={`https://github.com/${detail.source}`}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <ExternalLink aria-hidden="true" className="size-3.5" />
+                      {detail.source}
+                    </a>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="skill-store-install-panel">
+                <div className="skill-store-install-targets">
+                  <label>
+                    <span>{t("Install target")}</span>
+                    <select
+                      value={installTarget}
+                      onChange={(event) =>
+                        setInstallTarget(event.target.value as InstallTarget)
+                      }
+                    >
+                      <option value="global">{t("Global")}</option>
+                      <option value="workspace">{t("Workspace")}</option>
+                    </select>
+                  </label>
+                  {installTarget === "workspace" ? (
+                    <label>
+                      <span>{t("Workspace")}</span>
+                      <select
+                        value={workspaceId}
+                        onChange={(event) => setWorkspaceId(event.target.value)}
+                      >
+                        {workspaceTargets.map((workspace) => (
+                          <option key={workspace.id} value={workspace.id}>
+                            {workspace.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+                {showOverwriteOption ? (
+                  <label className="skill-store-overwrite">
+                    <input
+                      checked={overwrite}
+                      onChange={(event) => setOverwrite(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>{t("Overwrite existing skill")}</span>
+                  </label>
+                ) : null}
+                <div className="skill-store-install-actions">
+                  <button
+                    className="skill-store-primary-button"
+                    disabled={!canInstall}
+                    onClick={() => void installSelectedSkill()}
+                    type="button"
+                  >
+                    {isInstalling ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Download aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Install")}
+                  </button>
+                  {installMessage ? (
+                    <span className="skill-store-success" role="status">
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                      {installMessage}
+                    </span>
+                  ) : null}
+                </div>
+                {installError ? (
+                  <p className="skill-store-error" role="alert">
+                    {installError}
+                  </p>
+                ) : null}
+              </div>
+
+              <section className="skill-store-detail-section">
+                <h3>{t("Summary")}</h3>
+                {summaryText ? <pre>{summaryText}</pre> : <p>{t("No summary available")}</p>}
+              </section>
+
+              <section className="skill-store-detail-section">
+                <h3>{t("Files")}</h3>
+                <ul className="skill-store-file-list">
+                  {detail.files.map((file) => (
+                    <li key={file.path}>
+                      <FileText aria-hidden="true" className="size-4" />
+                      <span>{file.path}</span>
+                      <code>{formatBytes(file.content.length)}</code>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function LoadingBlock({ label }: { label: string }) {
+  return (
+    <div className="skill-store-status-block" role="status">
+      <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function StatusBlock({
+  actionLabel,
+  message,
+  onAction,
+  title,
+}: {
+  actionLabel?: string;
+  message: string;
+  onAction?: () => void;
+  title: string;
+}) {
+  return (
+    <div className="skill-store-status-block">
+      <strong>{title}</strong>
+      <span>{message}</span>
+      {actionLabel && onAction ? (
+        <button onClick={onAction} type="button">
+          {actionLabel}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function excerpt(value: string) {
+  const normalized = value.trim();
+  if (normalized.length <= SUMMARY_LIMIT) {
+    return normalized;
+  }
+  return `${normalized.slice(0, SUMMARY_LIMIT).trim()}...`;
+}
+
+function formatMetric(value: number | null) {
+  return typeof value === "number" ? value.toLocaleString() : "-";
+}
+
+function formatChange(value: number | null) {
+  if (typeof value !== "number") {
+    return "-";
+  }
+  return value > 0 ? `+${value.toLocaleString()}` : value.toLocaleString();
+}
+
+function metricChangeClass(value: number | null) {
+  if (typeof value !== "number") {
+    return "skill-store-change";
+  }
+  if (value > 0) {
+    return "skill-store-change skill-store-change-positive";
+  }
+  if (value < 0) {
+    return "skill-store-change skill-store-change-negative";
+  }
+  return "skill-store-change";
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  return `${Math.round(value / 102.4) / 10} KB`;
+}

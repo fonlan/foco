@@ -38,7 +38,8 @@ export type BrowserRoute =
     }
   | { viewMode: "settings"; section: SettingsSection }
   | { viewMode: "stats"; page: number }
-  | { viewMode: "scheduled" };
+  | { viewMode: "scheduled" }
+  | { viewMode: "skill-store" };
 
 export type Translate = (
   key: string,

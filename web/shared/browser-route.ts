@@ -41,6 +41,10 @@ export function browserRouteFromPathname(
     return { viewMode: "scheduled" };
   }
 
+  if (segments[0] === "skills" || segments[0] === "skill-store") {
+    return { viewMode: "skill-store" };
+  }
+
   const tabs = chatTabsFromSearch(search);
   const files = fileTabsFromSearch(search);
   const activeFile = activeFileFromSearch(search);
@@ -93,6 +97,10 @@ export function browserPathForRoute(route: BrowserRoute) {
 
   if (route.viewMode === "scheduled") {
     return "/scheduled";
+  }
+
+  if (route.viewMode === "skill-store") {
+    return "/skills";
   }
 
   const path = browserPathnameForChatRoute(route);

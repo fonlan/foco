@@ -3,6 +3,7 @@ import { vi } from "vitest";
 
 import type {
   ConfiguredModelSummary,
+  ConfiguredSkillSummary,
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
   Plan,
@@ -385,6 +386,82 @@ export const settings = {
     },
   ],
 };
+
+const skillStoreFiles = [
+  {
+    path: "SKILL.md",
+    content:
+      "---\nname: browser-scout\ndescription: Find useful web references.\n---\n\n# Browser Scout\n\nUse this skill to collect focused web references.",
+  },
+  {
+    path: "README.md",
+    content: "# Browser Scout\n\nA focused research helper for local agent work.",
+  },
+  {
+    path: "scripts/search.md",
+    content: "Run a short search and summarize the most useful references.",
+  },
+];
+
+const skillStoreHotSkills = [
+  {
+    change: 7,
+    description: "Find useful web references.",
+    id: "browser-scout",
+    installs: 42,
+    installsYesterday: 35,
+    name: "Browser Scout",
+    official: true,
+    source: "foco/browser-scout",
+  },
+  {
+    change: -1,
+    description: "Clean up Markdown notes.",
+    id: "markdown-cleaner",
+    installs: 12,
+    installsYesterday: 13,
+    name: "Markdown Cleaner",
+    official: false,
+    source: "foco/markdown-cleaner",
+  },
+];
+
+const skillStoreSearchSkills = [skillStoreHotSkills[0]];
+
+function installedSkillFromStore(workspaceId: string | null): ConfiguredSkillSummary {
+  return {
+    canEnable: true,
+    description: "Find useful web references.",
+    enabled: true,
+    id: "browser-scout",
+    key: workspaceId ? `${workspaceId}:browser-scout` : "global:browser-scout",
+    name: "browser-scout",
+    path: workspaceId
+      ? `C:\\Repos\\Default\\.agents\\skills\\browser-scout\\SKILL.md`
+      : "C:\\Users\\fonla\\.agents\\skills\\browser-scout\\SKILL.md",
+    scope: workspaceId ? "workspace" : "global",
+    warnings: [],
+    workspaceId,
+    workspaceName: workspaceId ? "Default" : null,
+  };
+}
+
+function skillStoreRefreshedSettings(workspaceId: string | null) {
+  const installedSkill = installedSkillFromStore(workspaceId);
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    skills: {
+      ...appTestState.settingsResponse.skills,
+      detected: [
+        ...appTestState.settingsResponse.skills.detected.filter(
+          (skill) => skill.id !== installedSkill.id,
+        ),
+        installedSkill as (typeof appTestState.settingsResponse.skills.detected)[number],
+      ],
+    },
+  };
+  return appTestState.settingsResponse;
+}
 
 export const agentDefinitions = {
   agentDefinitions: [
@@ -2431,6 +2508,53 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse({ errors: [], jobs: appTestState.settingsSpecJobsResponse });
   }
 
+  if (path === "/api/skill-store/hot") {
+    return jsonResponse({
+      hasMore: false,
+      skills: skillStoreHotSkills,
+      source: "test-hot",
+      total: skillStoreHotSkills.length,
+    });
+  }
+
+  if (path === "/api/skill-store/search") {
+    return jsonResponse({
+      hasMore: false,
+      skills: skillStoreSearchSkills,
+      source: "test-search",
+      total: skillStoreSearchSkills.length,
+    });
+  }
+
+  const skillStoreDetailMatch = path.match(/^\/api\/skill-store\/skills\/([^/]+)$/);
+  if (skillStoreDetailMatch) {
+    const skillId = decodeURIComponent(skillStoreDetailMatch[1] ?? "");
+    const source = requestUrl.searchParams.get("source");
+    return jsonResponse({
+      description: "Find useful web references.",
+      files: skillStoreFiles,
+      id: skillId,
+      name: "Browser Scout",
+      source,
+    });
+  }
+
+  if (path === "/api/skill-store/install") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      target?: string;
+      workspaceId?: string;
+    };
+    return jsonResponse({
+      detected: [installedSkillFromStore(body.workspaceId ?? null)],
+      path:
+        body.target === "workspace"
+          ? "C:\\Repos\\Default\\.agents\\skills\\browser-scout"
+          : "C:\\Users\\fonla\\.agents\\skills\\browser-scout",
+      target: body.target ?? "global",
+      workspaceId: body.workspaceId ?? null,
+    });
+  }
+
   const specJobRetryMatch = path.match(
     /^\/api\/workspaces\/([^/]+)\/spec\/jobs\/([^/]+)\/retry$/,
   );
@@ -2779,6 +2903,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/skills/manual") {
     return jsonResponse(savedSettings.skills);
+  }
+
+  if (path === "/api/skills/refresh") {
+    return jsonResponse(skillStoreRefreshedSettings(null));
   }
 
   if (path === "/api/ai-statistics") {

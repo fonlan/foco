@@ -83,6 +83,16 @@ describe("browser route chat tabs", () => {
     });
   });
 
+  it("round-trips the skill store route", () => {
+    expect(browserRouteFromPathname("/skills")).toEqual({
+      viewMode: "skill-store",
+    });
+    expect(browserRouteFromPathname("/skill-store")).toEqual({
+      viewMode: "skill-store",
+    });
+    expect(browserPathForRoute({ viewMode: "skill-store" })).toBe("/skills");
+  });
+
   it("round-trips the scheduled tasks route", () => {
     expect(browserRouteFromPathname("/scheduled")).toEqual({
       viewMode: "scheduled",

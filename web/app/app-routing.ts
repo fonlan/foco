@@ -99,6 +99,12 @@ export function useAppRouting({
     updateBrowserRoute({ viewMode: "scheduled" });
   }, [setIsMobileWorkspaceOpen, setViewMode, updateBrowserRoute]);
 
+  const openSkillStoreView = useCallback(() => {
+    setViewMode("skill-store");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({ viewMode: "skill-store" });
+  }, [setIsMobileWorkspaceOpen, setViewMode, updateBrowserRoute]);
+
   const openCurrentChatView = useCallback(() => {
     setViewMode("chat");
     updateBrowserRoute(currentChatBrowserRoute());
@@ -122,6 +128,12 @@ export function useAppRouting({
 
       if (route.viewMode === "scheduled") {
         setViewMode("scheduled");
+        setIsMobileWorkspaceOpen(false);
+        return;
+      }
+
+      if (route.viewMode === "skill-store") {
+        setViewMode("skill-store");
         setIsMobileWorkspaceOpen(false);
         return;
       }
@@ -182,6 +194,7 @@ export function useAppRouting({
     openCurrentChatView,
     openScheduledTasksView,
     openSettingsSection,
+    openSkillStoreView,
     openStatsView,
   };
 }

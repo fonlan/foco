@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShoppingBag,
   SlidersHorizontal,
   SquareTerminal,
   SunMoon,
@@ -241,6 +242,11 @@ import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-cl
 const ScheduledTasksPage = lazy(() =>
   import("./features/scheduled-tasks/ScheduledTasksPage").then((m) => ({
     default: m.ScheduledTasksPage,
+  })),
+);
+const SkillStorePage = lazy(() =>
+  import("./features/skill-store/SkillStorePage").then((m) => ({
+    default: m.SkillStorePage,
   })),
 );
 
@@ -924,7 +930,10 @@ export function App() {
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
   const isGlobalView =
-    viewMode === "settings" || viewMode === "stats" || viewMode === "scheduled";
+    viewMode === "settings" ||
+    viewMode === "stats" ||
+    viewMode === "scheduled" ||
+    viewMode === "skill-store";
   const showContextPanel = !isGlobalView && isContextPanelOpen;
   const canUseApp = Boolean(
     authStatus && (!authStatus.enabled || authStatus.authenticated),
@@ -5779,6 +5788,7 @@ export function App() {
     openCurrentChatView,
     openScheduledTasksView,
     openSettingsSection,
+    openSkillStoreView,
     openStatsView,
   } = useAppRouting({
     activeChatId,
@@ -8417,6 +8427,7 @@ export function App() {
               onHomeClick={handleHomeNavClick}
               onOpenScheduledTasks={openScheduledTasksView}
               onOpenSettings={() => openSettingsSection("general")}
+              onOpenSkillStore={openSkillStoreView}
               onOpenStats={openStatsView}
               onReturnHome={handleLogoNavClick}
               onToggleTheme={() =>
@@ -8454,6 +8465,13 @@ export function App() {
                 <ScheduledTasksPage
                   agentDefinitions={agentDefinitions}
                   onOpenChat={selectWorkspaceChat}
+                  settings={settings}
+                  workspaces={workspaces}
+                />
+              ) : viewMode === "skill-store" ? (
+                <SkillStorePage
+                  onSettingsChange={handleSettingsPanelSettingsChange}
+                  onWorkspacesChange={refreshWorkspaces}
                   settings={settings}
                   workspaces={workspaces}
                 />
@@ -8512,6 +8530,7 @@ export function App() {
               onLogout={handleLogout}
               onOpenScheduledTasks={openScheduledTasksView}
               onOpenSettings={() => openSettingsSection("general")}
+              onOpenSkillStore={openSkillStoreView}
               onOpenStats={openStatsView}
               onHomeClick={handleHomeNavClick}
               onReturnHome={handleLogoNavClick}
@@ -10196,6 +10215,7 @@ function FocoNavRail({
   onHomeClick,
   onOpenScheduledTasks,
   onOpenSettings,
+  onOpenSkillStore,
   onOpenStats,
   onReturnHome,
   onToggleTheme,
@@ -10211,6 +10231,7 @@ function FocoNavRail({
   onHomeClick: () => void;
   onOpenScheduledTasks: () => void;
   onOpenSettings: () => void;
+  onOpenSkillStore: () => void;
   onOpenStats: () => void;
   onReturnHome: () => void;
   onToggleTheme: () => void;
@@ -10250,6 +10271,12 @@ function FocoNavRail({
           icon={CalendarClock}
           label={t("Scheduled tasks")}
           onClick={onOpenScheduledTasks}
+        />
+        <NavRailButton
+          active={activeMode === "skill-store"}
+          icon={ShoppingBag}
+          label={t("Skill Store")}
+          onClick={onOpenSkillStore}
         />
         <NavRailButton
           active={activeMode === "settings"}
