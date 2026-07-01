@@ -1,12 +1,16 @@
 use std::{
     collections::HashMap,
-    ffi::c_void,
     fs,
     net::SocketAddr,
     path::PathBuf,
+    time::{Duration, Instant},
+};
+
+#[cfg(target_os = "macos")]
+use std::{
+    ffi::c_void,
     ptr,
     sync::{Mutex, OnceLock, mpsc},
-    time::{Duration, Instant},
 };
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
