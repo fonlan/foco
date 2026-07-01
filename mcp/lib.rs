@@ -4,10 +4,12 @@ use std::{
     path::Path,
     time::Duration,
 };
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::path::PathBuf;
 
 #[cfg(windows)]
 use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use rmcp::transport::ConfigureCommandExt;
 use rmcp::{
     ServiceExt,
@@ -724,7 +726,7 @@ fn package_name(spec: &str) -> &str {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn drain_child_stderr(mut stderr: tokio::process::ChildStderr) {
     use tokio::io::AsyncBufReadExt;
 
@@ -739,7 +741,117 @@ fn drain_child_stderr(mut stderr: tokio::process::ChildStderr) {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn start_stdio_transport(
+    command: &str,
+    args: Vec<String>,
+    workspace_path: &Path,
+) -> std::io::Result<TokioChildProcess> {
+    let path_env = std::env::var_os("PATH");
+    let program = resolve_command_in_path(command, path_env.as_deref())?;
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).current_dir(workspace_path);
+    if let Some(path_env) = path_env {
+        command.env("PATH", path_env);
+    }
+
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stderr) = stderr {
+        drain_child_stderr(stderr);
+    }
+
+    Ok(transport)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn resolve_command_in_path(
+    command: &str,
+    path_env: Option<&std::ffi::OsStr>,
+) -> std::io::Result<PathBuf> {
+    if command.contains('/') {
+        return Ok(PathBuf::from(command));
+    }
+
+    if let Some(path_env) = path_env {
+        for dir in std::env::split_paths(path_env) {
+            let candidate = if dir.as_os_str().is_empty() {
+                PathBuf::from(command)
+            } else {
+                dir.join(command)
+            };
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(command_not_found(format!(
+        "PATH lookup failed; {}",
+        path_summary(path_env)
+    )))
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn command_not_found(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, message)
+}
+
+#[cfg(unix)]
+fn path_summary(path_env: Option<&std::ffi::OsStr>) -> String {
+    let Some(path_env) = path_env else {
+        return "PATH is not set".to_string();
+    };
+    let entries = std::env::split_paths(path_env).collect::<Vec<_>>();
+    if entries.is_empty() {
+        return "PATH is empty".to_string();
+    }
+
+    // ponytail: keep UI errors short; full PATH diagnostics live in startup logs.
+    // If this is not enough, include a redacted full PATH behind a debug log.
+    let shown = entries
+        .iter()
+        .take(6)
+        .map(|entry| display_path_entry(entry))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if entries.len() > 6 {
+        format!("PATH has {} entries; first entries: {shown}, ...", entries.len())
+    } else {
+        format!("PATH has {} entries: {shown}", entries.len())
+    }
+}
+
+#[cfg(unix)]
+fn display_path_entry(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return ".".to_string();
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home);
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(rest) = path.strip_prefix(home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+
+    path.display().to_string()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn start_stdio_transport(
     command: &str,
     args: Vec<String>,
@@ -750,6 +862,31 @@ fn start_stdio_transport(
             cmd.args(args);
             cmd.current_dir(workspace_path);
         }),
+    )
+}
+
+fn stdio_start_error(command: &str, source: &std::io::Error) -> String {
+    match source.kind() {
+        std::io::ErrorKind::NotFound => {
+            let mut message = format!("MCP stdio command '{command}' was not found. {source}");
+            #[cfg(unix)]
+            {
+                let source_message = source.to_string();
+                if !source_message.contains("PATH ") {
+                    let path_env = std::env::var_os("PATH");
+                    message.push_str("; ");
+                    message.push_str(&path_summary(path_env.as_deref()));
+                }
+            }
+            message
+        }
+        _ => format!("failed to start MCP stdio command '{command}': {source}"),
+    }
+}
+
+fn stdio_initialize_error(server_name: &str, source: impl fmt::Display) -> String {
+    format!(
+        "MCP stdio server '{server_name}' closed during initialize: {source}. Check MCP stderr logs."
     )
 }
 
@@ -772,10 +909,16 @@ async fn start_runtime(
                     definition.id
                 ))
             })?;
-            let transport =
-                start_stdio_transport(command, definition.args.clone(), workspace_path)?;
+            let transport = start_stdio_transport(command, definition.args.clone(), workspace_path)
+                .map_err(|source| McpError::Runtime(stdio_start_error(command, &source)))?;
 
-            client_info.clone().serve(transport).await
+            client_info
+                .clone()
+                .serve(transport)
+                .await
+                .map_err(|source| {
+                    McpError::Runtime(stdio_initialize_error(&definition.name, source))
+                })?
         }
         McpTransportKind::StreamableHttp => {
             let url = definition.url.as_deref().ok_or_else(|| {
@@ -783,10 +926,13 @@ async fn start_runtime(
             })?;
             let transport = StreamableHttpClientTransport::from_uri(url.to_string());
 
-            client_info.clone().serve(transport).await
+            client_info
+                .clone()
+                .serve(transport)
+                .await
+                .map_err(|source| McpError::Runtime(source.to_string()))?
         }
-    }
-    .map_err(|source| McpError::Runtime(source.to_string()))?;
+    };
     let remote_tools = service
         .peer()
         .list_all_tools()
@@ -994,7 +1140,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn disabled_stdio_server(id: &str) -> McpServerDefinition {
         McpServerDefinition {
@@ -1006,6 +1152,53 @@ mod tests {
             args: Vec::new(),
             url: None,
         }
+    }
+    #[cfg(unix)]
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "foco-mcp-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_command_in_path_finds_executable_without_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_test_dir("path-resolve");
+        let executable = dir.join("uvx");
+        std::fs::write(&executable, "#!/bin/sh\n").expect("test executable should be written");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("test executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("test executable chmod");
+
+        let resolved = resolve_command_in_path("uvx", Some(dir.as_os_str()))
+            .expect("command should resolve from explicit PATH");
+
+        assert_eq!(resolved, executable);
+        std::fs::remove_dir_all(dir).expect("temp dir should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_stdio_command_error_includes_path_summary() {
+        let path = std::ffi::OsString::from("/usr/bin:/bin:/opt/homebrew/bin");
+        let error = resolve_command_in_path("definitely-not-foco-mcp", Some(path.as_os_str()))
+            .expect_err("missing command should fail");
+        let message = stdio_start_error("definitely-not-foco-mcp", &error);
+
+        assert!(message.contains("definitely-not-foco-mcp"));
+        assert!(message.contains("PATH has 3 entries"));
+        assert!(message.contains("/opt/homebrew/bin"));
     }
 
     #[tokio::test]
