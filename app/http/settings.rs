@@ -97,6 +97,8 @@ pub(crate) struct ManualMemorySettingsRequest {
     pub(crate) retention_days: Option<u32>,
     pub(crate) extraction_model_id: Option<String>,
     pub(crate) retrieval_model_id: Option<String>,
+    pub(crate) extraction_llm_timeout_ms: u64,
+    pub(crate) retrieval_llm_timeout_ms: u64,
     pub(crate) dream: Option<ManualMemoryDreamSettingsRequest>,
 }
 
@@ -113,6 +115,7 @@ pub(crate) struct ManualMemoryDreamSettingsRequest {
     pub(crate) max_facts_per_run: u32,
     pub(crate) max_changes_per_run: u32,
     pub(crate) scheduler_scan_minutes: u32,
+    pub(crate) llm_timeout_ms: u64,
     pub(crate) workspace_threshold_facts: Option<u32>,
     pub(crate) global_threshold_facts: Option<u32>,
 }
@@ -124,6 +127,7 @@ pub(crate) struct ManualSpecSettingsRequest {
     pub(crate) generation_model_id: Option<String>,
     pub(crate) generation_system_prompt: Option<String>,
     pub(crate) update_system_prompt: Option<String>,
+    pub(crate) llm_timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +352,8 @@ pub(crate) struct MemorySettingsSummary {
     pub(crate) retention_days: Option<u32>,
     pub(crate) extraction_model_id: Option<String>,
     pub(crate) retrieval_model_id: Option<String>,
+    pub(crate) extraction_llm_timeout_ms: u64,
+    pub(crate) retrieval_llm_timeout_ms: u64,
     pub(crate) dream: MemoryDreamSettingsSummary,
     pub(crate) extraction_modes: Vec<MemoryExtractionModeSummary>,
     pub(crate) retrieval_modes: Vec<MemoryExtractionModeSummary>,
@@ -368,6 +374,7 @@ pub(crate) struct MemoryDreamSettingsSummary {
     pub(crate) scheduler_scan_minutes: u32,
     pub(crate) workspace_threshold_facts: u32,
     pub(crate) global_threshold_facts: u32,
+    pub(crate) llm_timeout_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -386,6 +393,7 @@ pub(crate) struct SpecSettingsSummary {
     pub(crate) update_system_prompt: Option<String>,
     pub(crate) default_generation_system_prompt: String,
     pub(crate) default_update_system_prompt: String,
+    pub(crate) llm_timeout_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -1363,6 +1371,8 @@ pub(crate) async fn save_memory_settings(
         retention_days: request.retention_days,
         extraction_model_id,
         retrieval_model_id,
+        extraction_llm_timeout_ms: request.extraction_llm_timeout_ms,
+        retrieval_llm_timeout_ms: request.retrieval_llm_timeout_ms,
         dream,
     };
     config
@@ -1383,6 +1393,7 @@ pub(crate) async fn save_spec_settings(
         generation_model_id: optional_trimmed_string(request.generation_model_id),
         generation_system_prompt: optional_trimmed_string(request.generation_system_prompt),
         update_system_prompt: optional_trimmed_string(request.update_system_prompt),
+        llm_timeout_ms: request.llm_timeout_ms,
     };
     config
         .validate(Some(&state.config_file))
@@ -1428,6 +1439,7 @@ fn memory_dream_settings_from_request(
         max_facts_per_run: request.max_facts_per_run,
         max_changes_per_run: request.max_changes_per_run,
         scheduler_scan_minutes: request.scheduler_scan_minutes,
+        llm_timeout_ms: request.llm_timeout_ms,
         workspace_threshold_facts: request
             .workspace_threshold_facts
             .unwrap_or(current.workspace_threshold_facts),

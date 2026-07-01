@@ -6619,6 +6619,8 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             retention_days: None,
             extraction_model_id: Some("extract-model".to_string()),
             retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
             dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
@@ -7407,6 +7409,8 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
             dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
@@ -7509,6 +7513,8 @@ fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
         retention_days: None,
         extraction_model_id: Some("extract-model".to_string()),
         retrieval_model_id: None,
+        extraction_llm_timeout_ms: 120_000,
+        retrieval_llm_timeout_ms: 60_000,
         dream: MemoryDreamSettings::default(),
     };
     let outcome = ChatAuditOutcome {
@@ -7749,6 +7755,8 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
             dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
@@ -10146,6 +10154,8 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        extraction_llm_timeout_ms: 120_000,
+        retrieval_llm_timeout_ms: 60_000,
         dream: MemoryDreamSettings::default(),
     };
     let automatic_settings = MemorySettings {
@@ -10155,6 +10165,8 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        extraction_llm_timeout_ms: 120_000,
+        retrieval_llm_timeout_ms: 60_000,
         dream: MemoryDreamSettings::default(),
     };
     let manual_settings = MemorySettings {
@@ -10164,6 +10176,8 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        extraction_llm_timeout_ms: 120_000,
+        retrieval_llm_timeout_ms: 60_000,
         dream: MemoryDreamSettings::default(),
     };
 
@@ -13864,6 +13878,8 @@ fn memory_tool_test_context(
             extraction_model_id: None,
             retrieval_model_id: None,
             retention_days: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
             dream: MemoryDreamSettings::default(),
         },
     }

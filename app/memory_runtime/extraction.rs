@@ -340,6 +340,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
         &provider_id,
         &provider_config,
         request,
+        task.config.memory.extraction_llm_timeout_ms,
         task.config.app.llm_request_retry_count,
         api_audit_save_details(&task.config),
     )
@@ -701,6 +702,7 @@ pub(crate) async fn call_memory_extraction_provider(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    timeout_ms: u64,
     retry_count: u32,
     save_details: bool,
 ) -> Result<Value, ApiError> {
@@ -714,7 +716,7 @@ pub(crate) async fn call_memory_extraction_provider(
         "memory extraction",
         MEMORY_EXTRACTION_TOOL_NAME,
         "submit tool",
-        MEMORY_EXTRACTION_TIMEOUT_MS,
+        timeout_ms,
         retry_count,
         save_details,
     )
@@ -728,6 +730,7 @@ pub(crate) async fn call_memory_retrieval_provider(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    timeout_ms: u64,
     retry_count: u32,
     save_details: bool,
 ) -> Result<Value, ApiError> {
@@ -741,7 +744,7 @@ pub(crate) async fn call_memory_retrieval_provider(
         "memory retrieval",
         MEMORY_RETRIEVAL_TOOL_NAME,
         "select tool",
-        MEMORY_RETRIEVAL_TIMEOUT_MS,
+        timeout_ms,
         retry_count,
         save_details,
     )

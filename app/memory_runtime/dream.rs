@@ -36,7 +36,6 @@ const STALE_PENDING_DAYS: i64 = 30;
 const LOW_CONFIDENCE_PENDING_THRESHOLD: f64 = 0.5;
 const HIGH_CONFIDENCE_PENDING_THRESHOLD: f64 = 0.85;
 const MEMORY_DREAM_PLANNER_TOOL_NAME: &str = "submit_memory_dream_changeset";
-const MEMORY_DREAM_PLANNER_TIMEOUT_MS: u64 = 60_000;
 const MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS: u32 = 2048;
 const MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS: u32 = 80;
 const MEMORY_DREAM_PLANNER_MAX_REFERENCE_RECORDS: u32 = 200;
@@ -1594,7 +1593,7 @@ async fn call_memory_dream_planner_provider(
         "memory Dream planner",
         MEMORY_DREAM_PLANNER_TOOL_NAME,
         "submit changeset tool",
-        MEMORY_DREAM_PLANNER_TIMEOUT_MS,
+        planner.config.memory.dream.llm_timeout_ms,
         planner.config.app.llm_request_retry_count,
         api_audit_save_details(planner.config),
     )
@@ -4672,6 +4671,7 @@ mod tests {
             scheduler_scan_minutes: 60,
             workspace_threshold_facts: 50,
             global_threshold_facts: 50,
+            llm_timeout_ms: 120_000,
         }))
     }
 

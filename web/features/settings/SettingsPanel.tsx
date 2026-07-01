@@ -880,6 +880,7 @@ export function SettingsPanel({
       generationModelId: data.spec.generationModelId ?? "",
       generationSystemPrompt: data.spec.generationSystemPrompt ?? "",
       updateSystemPrompt: data.spec.updateSystemPrompt ?? "",
+      llmTimeoutMs: String(data.spec.llmTimeoutMs),
     });
   }
 
@@ -896,6 +897,8 @@ export function SettingsPanel({
       retrievalMode: data.memory.retrievalMode,
       extractionModelId: data.memory.extractionModelId ?? "",
       retrievalModelId: data.memory.retrievalModelId ?? "",
+      extractionLlmTimeoutMs: String(data.memory.extractionLlmTimeoutMs),
+      retrievalLlmTimeoutMs: String(data.memory.retrievalLlmTimeoutMs),
       retentionDays:
         data.memory.retentionDays === null ? "" : String(data.memory.retentionDays),
       dream: {
@@ -909,6 +912,7 @@ export function SettingsPanel({
         maxFactsPerRun: String(data.memory.dream.maxFactsPerRun),
         maxChangesPerRun: String(data.memory.dream.maxChangesPerRun),
         schedulerScanMinutes: String(data.memory.dream.schedulerScanMinutes),
+        llmTimeoutMs: String(data.memory.dream.llmTimeoutMs),
       },
     });
     setMemoryFilter((current) => ({
@@ -1807,6 +1811,10 @@ export function SettingsPanel({
           generationSystemPrompt:
             specSettingsForm.generationSystemPrompt.trim() || null,
           updateSystemPrompt: specSettingsForm.updateSystemPrompt.trim() || null,
+          llmTimeoutMs: requiredPositiveInteger(
+            specSettingsForm.llmTimeoutMs,
+            t("Spec LLM timeout ms"),
+          ),
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -2161,6 +2169,14 @@ export function SettingsPanel({
           retrievalMode: memorySettingsForm.retrievalMode,
           extractionModelId: memorySettingsForm.extractionModelId.trim() || null,
           retrievalModelId: memorySettingsForm.retrievalModelId.trim() || null,
+          extractionLlmTimeoutMs: requiredPositiveInteger(
+            memorySettingsForm.extractionLlmTimeoutMs,
+            t("Extraction LLM timeout ms"),
+          ),
+          retrievalLlmTimeoutMs: requiredPositiveInteger(
+            memorySettingsForm.retrievalLlmTimeoutMs,
+            t("Retrieval LLM timeout ms"),
+          ),
           retentionDays: optionalPositiveInteger(
             memorySettingsForm.retentionDays,
             t("Retention days"),
@@ -2190,6 +2206,10 @@ export function SettingsPanel({
             schedulerScanMinutes: requiredPositiveInteger(
               memorySettingsForm.dream.schedulerScanMinutes,
               t("Scheduler scan minutes"),
+            ),
+            llmTimeoutMs: requiredPositiveInteger(
+              memorySettingsForm.dream.llmTimeoutMs,
+              t("Dream LLM timeout ms"),
             ),
           },
         }),
@@ -4998,6 +5018,20 @@ export function SettingsPanel({
                         />
                       </label>
                     </div>
+                    <div className="mt-3">
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Spec LLM timeout ms")}
+                        onChange={(value) =>
+                          setSpecSettingsForm((current) => ({
+                            ...current,
+                            llmTimeoutMs: value,
+                          }))
+                        }
+                        placeholder="120000"
+                        value={specSettingsForm.llmTimeoutMs}
+                      />
+                    </div>
                   </fieldset>
 
                   <label className="block">
@@ -5866,6 +5900,20 @@ export function SettingsPanel({
                             value={memorySettingsForm.retentionDays}
                           />
                         </div>
+                        <div className="sm:col-span-2">
+                          <TextField
+                            inputMode="numeric"
+                            label={t("Extraction LLM timeout ms")}
+                            onChange={(value) =>
+                              setMemorySettingsForm((current) => ({
+                                ...current,
+                                extractionLlmTimeoutMs: value,
+                              }))
+                            }
+                            placeholder="120000"
+                            value={memorySettingsForm.extractionLlmTimeoutMs}
+                          />
+                        </div>
                       </div>
                     </fieldset>
 
@@ -5926,6 +5974,20 @@ export function SettingsPanel({
                             ))}
                           </select>
                         </label>
+                        <div className="sm:col-span-2">
+                          <TextField
+                            inputMode="numeric"
+                            label={t("Retrieval LLM timeout ms")}
+                            onChange={(value) =>
+                              setMemorySettingsForm((current) => ({
+                                ...current,
+                                retrievalLlmTimeoutMs: value,
+                              }))
+                            }
+                            placeholder="60000"
+                            value={memorySettingsForm.retrievalLlmTimeoutMs}
+                          />
+                        </div>
                       </div>
                     </fieldset>
                   </div>
@@ -6110,6 +6172,17 @@ export function SettingsPanel({
                         }
                         placeholder="60"
                         value={memorySettingsForm.dream.schedulerScanMinutes}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Dream LLM timeout ms")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            llmTimeoutMs: value,
+                          })
+                        }
+                        placeholder="120000"
+                        value={memorySettingsForm.dream.llmTimeoutMs}
                       />
                     </div>
                   </fieldset>
@@ -10692,6 +10765,7 @@ function emptySpecSettingsForm(): SpecSettingsFormState {
     generationModelId: "",
     generationSystemPrompt: "",
     updateSystemPrompt: "",
+    llmTimeoutMs: "120000",
   };
 }
 
@@ -10774,6 +10848,8 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
     retrievalMode: "fts",
     extractionModelId: "",
     retrievalModelId: "",
+    extractionLlmTimeoutMs: "120000",
+    retrievalLlmTimeoutMs: "60000",
     retentionDays: "",
     dream: {
       enabled: false,
@@ -10786,6 +10862,7 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
       maxFactsPerRun: "200",
       maxChangesPerRun: "50",
       schedulerScanMinutes: "60",
+      llmTimeoutMs: "120000",
     },
   };
 }

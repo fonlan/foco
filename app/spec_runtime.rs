@@ -26,7 +26,6 @@ use crate::{
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
-const WORKSPACE_SPEC_TIMEOUT_MS: u64 = 120_000;
 // ponytail: coarse stale-job recovery; replace with runner heartbeat/lease if long jobs become normal.
 const WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS: i64 = 30 * 60 * 1000;
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
@@ -518,7 +517,7 @@ async fn run_workspace_spec_job_inner(
         "workspace spec generation",
         WORKSPACE_SPEC_TOOL_NAME,
         "submit workspace spec tool",
-        WORKSPACE_SPEC_TIMEOUT_MS,
+        config.spec.llm_timeout_ms,
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
     )
@@ -607,7 +606,7 @@ async fn run_workspace_spec_update_job_inner(
         "workspace spec update",
         WORKSPACE_SPEC_UPDATE_TOOL_NAME,
         "submit workspace spec update tool",
-        WORKSPACE_SPEC_TIMEOUT_MS,
+        config.spec.llm_timeout_ms,
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
     )
@@ -899,7 +898,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
         "workspace spec compaction",
         WORKSPACE_SPEC_TOOL_NAME,
         "submit compacted workspace spec tool",
-        WORKSPACE_SPEC_TIMEOUT_MS,
+        config.spec.llm_timeout_ms,
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
     )

@@ -384,6 +384,7 @@ async fn relevant_memory_facts_llm(
         &provider_id,
         &provider_config,
         request,
+        config.memory.retrieval_llm_timeout_ms,
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
     )

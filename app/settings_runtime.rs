@@ -98,6 +98,8 @@ pub(crate) async fn settings_response(
             retention_days: config.memory.retention_days,
             extraction_model_id: config.memory.extraction_model_id.clone(),
             retrieval_model_id: config.memory.retrieval_model_id.clone(),
+            extraction_llm_timeout_ms: config.memory.extraction_llm_timeout_ms,
+            retrieval_llm_timeout_ms: config.memory.retrieval_llm_timeout_ms,
             dream: MemoryDreamSettingsSummary {
                 enabled: config.memory.dream.enabled,
                 auto_enabled: config.memory.dream.auto_enabled,
@@ -111,6 +113,7 @@ pub(crate) async fn settings_response(
                 scheduler_scan_minutes: config.memory.dream.scheduler_scan_minutes,
                 workspace_threshold_facts: config.memory.dream.workspace_threshold_facts,
                 global_threshold_facts: config.memory.dream.global_threshold_facts,
+                llm_timeout_ms: config.memory.dream.llm_timeout_ms,
             },
             extraction_modes: vec![
                 MemoryExtractionModeSummary {
@@ -150,6 +153,7 @@ pub(crate) async fn settings_response(
                 crate::spec_runtime::default_workspace_spec_generation_system_prompt(),
             default_update_system_prompt:
                 crate::spec_runtime::default_workspace_spec_update_system_prompt(),
+            llm_timeout_ms: config.spec.llm_timeout_ms,
         },
         plan: PlanSettingsSummary {
             merge_automation_mode: config.plan.merge_automation_mode.clone(),

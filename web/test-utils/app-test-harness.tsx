@@ -176,6 +176,8 @@ export const settings = {
     retrievalMode: "fts",
     extractionModelId: null,
     retrievalModelId: null,
+    extractionLlmTimeoutMs: 120000,
+    retrievalLlmTimeoutMs: 60000,
     dream: {
       enabled: false,
       autoEnabled: false,
@@ -189,6 +191,7 @@ export const settings = {
       schedulerScanMinutes: 60,
       workspaceThresholdFacts: 50,
       globalThresholdFacts: 50,
+      llmTimeoutMs: 120000,
     },
     extractionModes: [
       { label: "Manual", value: "manual" },
@@ -213,6 +216,7 @@ export const settings = {
     generationModelId: null,
     generationSystemPrompt: null,
     updateSystemPrompt: null,
+    llmTimeoutMs: 120000,
     defaultGenerationSystemPrompt:
       "Generate a concise Project Spec Markdown document from provided evidence.",
     defaultUpdateSystemPrompt:
@@ -2489,6 +2493,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   if (path === "/api/settings/memory") {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
       dream?: typeof settings.memory.dream;
+      extractionLlmTimeoutMs?: number;
+      extractionModelId?: string | null;
+      retentionDays?: number | null;
+      retrievalLlmTimeoutMs?: number;
+      retrievalModelId?: string | null;
     };
     return jsonResponse({
       ...settings,
@@ -2497,9 +2506,13 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         enabled: true,
         extractionMode: "pending_review",
         retrievalMode: "llm",
-        extractionModelId: "gpt-test",
-        retrievalModelId: "gpt-test",
-        retentionDays: 30,
+        extractionModelId: body.extractionModelId ?? "gpt-test",
+        retrievalModelId: body.retrievalModelId ?? "gpt-test",
+        extractionLlmTimeoutMs:
+          body.extractionLlmTimeoutMs ?? settings.memory.extractionLlmTimeoutMs,
+        retrievalLlmTimeoutMs:
+          body.retrievalLlmTimeoutMs ?? settings.memory.retrievalLlmTimeoutMs,
+        retentionDays: body.retentionDays ?? 30,
         dream: body.dream ?? settings.memory.dream,
       },
     });
@@ -2515,6 +2528,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         generationModelId: body.generationModelId ?? null,
         generationSystemPrompt: body.generationSystemPrompt ?? null,
         updateSystemPrompt: body.updateSystemPrompt ?? null,
+        llmTimeoutMs: body.llmTimeoutMs,
       },
     });
   }

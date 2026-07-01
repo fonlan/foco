@@ -368,6 +368,7 @@ describe("app-settings verification surfaces", () => {
       screen.getByLabelText("Spec update system prompt"),
       "Update the workspace spec after durable changes.",
     );
+    changeInput(screen.getByLabelText("Spec LLM timeout ms"), "90000");
     await userEvent.click(screen.getByRole("button", { name: "Save spec settings" }));
 
     await waitFor(() => {
@@ -380,6 +381,7 @@ describe("app-settings verification surfaces", () => {
         generationModelId: "gpt-test",
         generationSystemPrompt: "Generate the workspace spec from evidence.",
         updateSystemPrompt: "Update the workspace spec after durable changes.",
+        llmTimeoutMs: 90000,
       });
     });
   });
@@ -430,6 +432,8 @@ describe("app-settings verification surfaces", () => {
     await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "automatic");
     await userEvent.selectOptions(screen.getByLabelText("Memory matching"), "llm");
     changeInput(screen.getByLabelText("Retention days"), "30");
+    changeInput(screen.getByLabelText("Extraction LLM timeout ms"), "130000");
+    changeInput(screen.getByLabelText("Retrieval LLM timeout ms"), "70000");
     await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
     await userEvent.selectOptions(screen.getByLabelText("Matching model"), "gpt-test");
     await userEvent.click(screen.getByLabelText("Enable Dream"));
@@ -441,6 +445,7 @@ describe("app-settings verification surfaces", () => {
     changeInput(screen.getByLabelText("Max facts per run"), "120");
     changeInput(screen.getByLabelText("Max changes per run"), "25");
     changeInput(screen.getByLabelText("Scheduler scan minutes"), "45");
+    changeInput(screen.getByLabelText("Dream LLM timeout ms"), "140000");
     await userEvent.click(screen.getByLabelText("Create transcript chat"));
     await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
 
@@ -455,6 +460,8 @@ describe("app-settings verification surfaces", () => {
         retrievalMode: "llm",
         extractionModelId: "gpt-test",
         retrievalModelId: "gpt-test",
+        extractionLlmTimeoutMs: 130000,
+        retrievalLlmTimeoutMs: 70000,
         retentionDays: 30,
         dream: {
           enabled: true,
@@ -467,6 +474,7 @@ describe("app-settings verification surfaces", () => {
           maxFactsPerRun: 120,
           maxChangesPerRun: 25,
           schedulerScanMinutes: 45,
+          llmTimeoutMs: 140000,
         },
       });
     });

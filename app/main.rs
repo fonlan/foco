@@ -273,13 +273,9 @@ Use the submit_commit_message tool exactly once. Do not return prose. \
 Prefer Conventional Commits format when the staged changes clearly map to a type, otherwise use a short imperative subject. \
 The subject must be at most 72 characters. Include an optional body only when it materially improves clarity. \
 Do not mention unstaged changes, model limitations, or that a diff was provided.";
-// Timeout for the background model call that extracts durable memory facts.
-const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
 // One retry is enough for malformed model tool output; repeated failures are ignored.
 const MEMORY_EXTRACTION_MAX_ATTEMPTS: usize = 2;
 
-// Timeout for model-based memory retrieval during prompt assembly.
-const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
 // Maximum output tokens allowed for the memory extraction model request.
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Maximum output tokens allowed for the memory retrieval model request.

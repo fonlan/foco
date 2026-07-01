@@ -843,6 +843,12 @@ pub struct HookConfig {
     pub hooks: HookEventMap,
 }
 
+pub const DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_SPEC_LLM_TIMEOUT_MS: u64 = 120_000;
+const MAX_BACKGROUND_LLM_TIMEOUT_MS: u64 = 600_000;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemorySettings {
@@ -858,6 +864,10 @@ pub struct MemorySettings {
     pub extraction_model_id: Option<String>,
     #[serde(default)]
     pub retrieval_model_id: Option<String>,
+    #[serde(default = "default_memory_extraction_llm_timeout_ms")]
+    pub extraction_llm_timeout_ms: u64,
+    #[serde(default = "default_memory_retrieval_llm_timeout_ms")]
+    pub retrieval_llm_timeout_ms: u64,
     #[serde(default)]
     pub dream: MemoryDreamSettings,
 }
@@ -871,6 +881,8 @@ impl Default for MemorySettings {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            extraction_llm_timeout_ms: default_memory_extraction_llm_timeout_ms(),
+            retrieval_llm_timeout_ms: default_memory_retrieval_llm_timeout_ms(),
             dream: MemoryDreamSettings::default(),
         }
     }
@@ -903,6 +915,8 @@ pub struct MemoryDreamSettings {
     pub workspace_threshold_facts: u32,
     #[serde(default = "default_memory_dream_global_threshold_facts")]
     pub global_threshold_facts: u32,
+    #[serde(default = "default_memory_dream_llm_timeout_ms")]
+    pub llm_timeout_ms: u64,
 }
 
 impl Default for MemoryDreamSettings {
@@ -920,6 +934,7 @@ impl Default for MemoryDreamSettings {
             scheduler_scan_minutes: default_memory_dream_scheduler_scan_minutes(),
             workspace_threshold_facts: default_memory_dream_workspace_threshold_facts(),
             global_threshold_facts: default_memory_dream_global_threshold_facts(),
+            llm_timeout_ms: default_memory_dream_llm_timeout_ms(),
         }
     }
 }
@@ -935,6 +950,8 @@ pub struct SpecSettings {
     pub generation_system_prompt: Option<String>,
     #[serde(default)]
     pub update_system_prompt: Option<String>,
+    #[serde(default = "default_spec_llm_timeout_ms")]
+    pub llm_timeout_ms: u64,
 }
 
 impl Default for SpecSettings {
@@ -944,6 +961,7 @@ impl Default for SpecSettings {
             generation_model_id: None,
             generation_system_prompt: None,
             update_system_prompt: None,
+            llm_timeout_ms: default_spec_llm_timeout_ms(),
         }
     }
 }
@@ -1092,6 +1110,22 @@ fn default_memory_dream_workspace_threshold_facts() -> u32 {
 
 fn default_memory_dream_global_threshold_facts() -> u32 {
     50
+}
+
+fn default_memory_extraction_llm_timeout_ms() -> u64 {
+    DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS
+}
+
+fn default_memory_retrieval_llm_timeout_ms() -> u64 {
+    DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS
+}
+
+fn default_memory_dream_llm_timeout_ms() -> u64 {
+    DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS
+}
+
+fn default_spec_llm_timeout_ms() -> u64 {
+    DEFAULT_SPEC_LLM_TIMEOUT_MS
 }
 
 fn default_plan_merge_automation_mode() -> String {
@@ -1977,6 +2011,17 @@ fn validate_memory_settings(
         return invalid_config(config_path, "memory.retention_days must be greater than 0");
     }
 
+    validate_background_llm_timeout_ms(
+        config_path,
+        "memory.extraction_llm_timeout_ms",
+        settings.extraction_llm_timeout_ms,
+    )?;
+    validate_background_llm_timeout_ms(
+        config_path,
+        "memory.retrieval_llm_timeout_ms",
+        settings.retrieval_llm_timeout_ms,
+    )?;
+
     if let Some(model_id) = &settings.extraction_model_id {
         require_non_empty(config_path, "memory.extraction_model_id", model_id)?;
 
@@ -2075,6 +2120,11 @@ fn validate_memory_dream_settings(
             "memory.dream.global_threshold_facts must be greater than 0",
         );
     }
+    validate_background_llm_timeout_ms(
+        config_path,
+        "memory.dream.llm_timeout_ms",
+        settings.llm_timeout_ms,
+    )?;
 
     Ok(())
 }
@@ -2113,6 +2163,26 @@ fn validate_spec_settings(
         "spec.update_system_prompt",
         settings.update_system_prompt.as_deref(),
     )?;
+    validate_background_llm_timeout_ms(
+        config_path,
+        "spec.llm_timeout_ms",
+        settings.llm_timeout_ms,
+    )?;
+
+    Ok(())
+}
+
+fn validate_background_llm_timeout_ms(
+    config_path: Option<&Path>,
+    name: &str,
+    value: u64,
+) -> Result<(), ConfigError> {
+    if value == 0 || value > MAX_BACKGROUND_LLM_TIMEOUT_MS {
+        return invalid_config(
+            config_path,
+            format!("{name} must be between 1 and {MAX_BACKGROUND_LLM_TIMEOUT_MS}"),
+        );
+    }
 
     Ok(())
 }
@@ -3471,6 +3541,7 @@ mod tests {
             generation_model_id: Some("spec-model".to_string()),
             generation_system_prompt: Some("Generate a concise project spec.".to_string()),
             update_system_prompt: Some("Update the project spec if needed.".to_string()),
+            llm_timeout_ms: 120_000,
         };
 
         save_global_config(&loaded.paths.config_file, &loaded.config)
@@ -3525,6 +3596,7 @@ mod tests {
             scheduler_scan_minutes: 15,
             workspace_threshold_facts: 40,
             global_threshold_facts: 80,
+            llm_timeout_ms: 120_000,
         };
 
         save_global_config(&loaded.paths.config_file, &loaded.config)

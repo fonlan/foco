@@ -1318,6 +1318,7 @@ type SpecSettingsSummary = {
   generationModelId: string | null;
   generationSystemPrompt: string | null;
   updateSystemPrompt: string | null;
+  llmTimeoutMs: number;
   defaultGenerationSystemPrompt: string;
   defaultUpdateSystemPrompt: string;
 };
@@ -1337,6 +1338,7 @@ export type SpecSettingsFormState = {
   generationModelId: string;
   generationSystemPrompt: string;
   updateSystemPrompt: string;
+  llmTimeoutMs: string;
 };
 
 export type TerminalShellSummary = {
@@ -1378,6 +1380,7 @@ export type MemoryDreamSettingsSummary = {
   schedulerScanMinutes: number;
   workspaceThresholdFacts: number;
   globalThresholdFacts: number;
+  llmTimeoutMs: number;
 };
 
 type MemorySettingsSummary = {
@@ -1387,6 +1390,8 @@ type MemorySettingsSummary = {
   retentionDays: number | null;
   extractionModelId: string | null;
   retrievalModelId: string | null;
+  extractionLlmTimeoutMs: number;
+  retrievalLlmTimeoutMs: number;
   dream: MemoryDreamSettingsSummary;
   extractionModes: MemoryExtractionModeSummary[];
   retrievalModes: MemoryExtractionModeSummary[];
@@ -1461,6 +1466,8 @@ export type MemorySettingsFormState = {
   retentionDays: string;
   extractionModelId: string;
   retrievalModelId: string;
+  extractionLlmTimeoutMs: string;
+  retrievalLlmTimeoutMs: string;
   dream: {
     enabled: boolean;
     autoEnabled: boolean;
@@ -1472,6 +1479,7 @@ export type MemorySettingsFormState = {
     maxFactsPerRun: string;
     maxChangesPerRun: string;
     schedulerScanMinutes: string;
+    llmTimeoutMs: string;
   };
 };
 
