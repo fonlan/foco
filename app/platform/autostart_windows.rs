@@ -13,7 +13,7 @@ use foco_store::config::FOCO_CONFIG_DIR_ENV;
 #[cfg(windows)]
 use crate::normalize_windows_verbatim_path;
 #[cfg(target_os = "macos")]
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, process::Command};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
