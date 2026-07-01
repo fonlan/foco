@@ -2,9 +2,10 @@ use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
 };
+use foco_store::config::WorkspaceConfig;
 use foco_store::workspace::{
     NewWorkspaceSpecJob, WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord, WorkspaceSpecTriggerType,
+    WorkspaceSpecRecord, WorkspaceSpecTriggerType, workspace_database_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +63,37 @@ pub(crate) struct GenerateWorkspaceSpecResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceSpecJobsResponse {
     jobs: Vec<WorkspaceSpecJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsWorkspaceSpecJobsResponse {
+    jobs: Vec<WorkspaceSpecJobWithWorkspaceSummary>,
+    errors: Vec<SettingsWorkspaceSpecJobError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceSpecJobRetryResponse {
+    job: WorkspaceSpecJobSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceSpecJobWithWorkspaceSummary {
+    job: WorkspaceSpecJobSummary,
+    workspace_id: String,
+    workspace_name: String,
+    workspace_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsWorkspaceSpecJobError {
+    workspace_id: String,
+    workspace_name: String,
+    workspace_path: String,
+    error: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,12 +254,7 @@ pub(crate) async fn workspace_spec_jobs(
     let workspace = workspace_by_id(&config, &workspace_id)?;
     let database =
         WorkspaceDatabase::open_or_create(&workspace.path).map_err(spec_workspace_error)?;
-    let limit = query.limit.unwrap_or(DEFAULT_SPEC_JOB_LIMIT);
-    if !(1..=MAX_SPEC_JOB_LIMIT).contains(&limit) {
-        return Err(ApiError::bad_request(format!(
-            "limit must be between 1 and {MAX_SPEC_JOB_LIMIT}"
-        )));
-    }
+    let limit = spec_job_limit(query.limit)?;
 
     let jobs = database
         .workspace_spec_jobs(limit)
@@ -237,6 +264,123 @@ pub(crate) async fn workspace_spec_jobs(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(WorkspaceSpecJobsResponse { jobs }))
+}
+
+pub(crate) async fn settings_workspace_spec_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<WorkspaceSpecJobsQuery>,
+) -> Result<Json<SettingsWorkspaceSpecJobsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let limit = spec_job_limit(query.limit)?;
+    let mut jobs = Vec::new();
+    let mut errors = Vec::new();
+
+    for workspace in &config.workspaces {
+        if !workspace_database_path(&workspace.path).exists() {
+            continue;
+        }
+        match workspace_spec_jobs_for_workspace(workspace, limit) {
+            Ok(mut workspace_jobs) => jobs.append(&mut workspace_jobs),
+            Err(error) => errors.push(SettingsWorkspaceSpecJobError {
+                workspace_id: workspace.id.clone(),
+                workspace_name: workspace.name.clone(),
+                workspace_path: workspace.path.display().to_string(),
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    jobs.sort_by(|left, right| {
+        right
+            .job
+            .created_at
+            .cmp(&left.job.created_at)
+            .then_with(|| right.job.id.cmp(&left.job.id))
+    });
+    jobs.truncate(limit as usize);
+
+    Ok(Json(SettingsWorkspaceSpecJobsResponse { jobs, errors }))
+}
+
+pub(crate) async fn retry_workspace_spec_job(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, job_id)): AxumPath<(String, String)>,
+) -> Result<Json<WorkspaceSpecJobRetryResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace.path).map_err(spec_workspace_error)?;
+    let should_spawn = database
+        .running_workspace_spec_job()
+        .map_err(spec_workspace_error)?
+        .is_none();
+    let new_job = database
+        .retry_failed_workspace_spec_job(&job_id, &unique_id("workspace-spec-job"))
+        .map_err(spec_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request("workspace spec job is not failed or was not found")
+        })?;
+    log_workspace_spec_job_status(&workspace_id, &new_job);
+    let response = workspace_spec_job_summary(new_job.clone())?;
+    drop(database);
+
+    if should_spawn {
+        let runtime_state = state.clone();
+        let runtime_workspace_id = workspace_id.clone();
+        let runtime_job_id = new_job.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_workspace_spec_job(
+                runtime_state,
+                runtime_workspace_id.clone(),
+                runtime_job_id.clone(),
+            )
+            .await
+            {
+                tracing::error!(
+                    workspace_id = %runtime_workspace_id,
+                    job_id = %runtime_job_id,
+                    error = %error.message,
+                    "workspace spec retry job failed"
+                );
+            }
+        });
+    }
+
+    Ok(Json(WorkspaceSpecJobRetryResponse { job: response }))
+}
+
+fn spec_job_limit(limit: Option<i64>) -> Result<i64, ApiError> {
+    let limit = limit.unwrap_or(DEFAULT_SPEC_JOB_LIMIT);
+    if !(1..=MAX_SPEC_JOB_LIMIT).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_SPEC_JOB_LIMIT}"
+        )));
+    }
+    Ok(limit)
+}
+
+fn workspace_spec_jobs_for_workspace(
+    workspace: &WorkspaceConfig,
+    limit: i64,
+) -> Result<Vec<WorkspaceSpecJobWithWorkspaceSummary>, WorkspaceDatabaseError> {
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
+    database
+        .workspace_spec_jobs(limit)?
+        .into_iter()
+        .map(|job| {
+            let job = workspace_spec_job_summary(job).map_err(|error| {
+                WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                    message: error.message,
+                }
+            })?;
+            Ok(WorkspaceSpecJobWithWorkspaceSummary {
+                job,
+                workspace_id: workspace.id.clone(),
+                workspace_name: workspace.name.clone(),
+                workspace_path: workspace.path.display().to_string(),
+            })
+        })
+        .collect()
 }
 
 fn workspace_spec_response(

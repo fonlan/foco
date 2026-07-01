@@ -871,6 +871,31 @@ impl WorkspaceDatabase {
         })
     }
 
+    pub fn retry_failed_workspace_spec_job(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        let Some(old_job) = self.workspace_spec_job(old_id)? else {
+            return Ok(None);
+        };
+        if old_job.status != WorkspaceSpecJobStatus::Failed.as_str() {
+            return Ok(None);
+        }
+
+        // ponytail: no retry_of_job_id schema yet; history correlation stays on copied chat/run/base/input.
+        self.insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: new_id,
+            trigger_type: &old_job.trigger_type,
+            chat_id: old_job.chat_id.as_deref(),
+            run_id: old_job.run_id.as_deref(),
+            model_id: old_job.model_id.as_deref(),
+            base_revision: old_job.base_revision,
+            input_summary_json: Some(&old_job.input_summary_json),
+        })
+        .map(Some)
+    }
+
     pub fn workspace_spec_jobs(
         &self,
         limit: i64,

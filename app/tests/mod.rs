@@ -53,7 +53,8 @@ use crate::http::{
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
-        generate_workspace_spec, save_workspace_spec, save_workspace_spec_settings, workspace_spec,
+        generate_workspace_spec, retry_workspace_spec_job, save_workspace_spec,
+        save_workspace_spec_settings, settings_workspace_spec_jobs, workspace_spec,
         workspace_spec_jobs,
     },
     terminal::create_terminal_session,
@@ -8534,6 +8535,194 @@ async fn workspace_spec_http_queues_manual_generate_job() {
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
     assert!(database.chats().expect("normal chats").is_empty());
+}
+
+#[tokio::test]
+async fn settings_workspace_spec_jobs_aggregates_workspace_history() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace_one = tempfile::tempdir().expect("workspace one");
+    let workspace_two = tempfile::tempdir().expect("workspace two");
+    let missing_workspace = tempfile::tempdir().expect("missing workspace");
+    let mut config = GlobalConfig::first_run(workspace_one.path().to_path_buf());
+    let workspace_one_id = config.workspaces[0].id.clone();
+    config.workspaces[0].name = "One".to_string();
+    let mut workspace_two_config = config.workspaces[0].clone();
+    workspace_two_config.id = "workspace-two".to_string();
+    workspace_two_config.name = "Two".to_string();
+    workspace_two_config.path = workspace_two.path().to_path_buf();
+    let mut missing_workspace_config = config.workspaces[0].clone();
+    missing_workspace_config.id = "workspace-missing-db".to_string();
+    missing_workspace_config.name = "Missing DB".to_string();
+    missing_workspace_config.path = missing_workspace.path().to_path_buf();
+    config.workspaces.push(workspace_two_config);
+    config.workspaces.push(missing_workspace_config);
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_one.path()).expect("workspace one db");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-one",
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model-one"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("job one");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_two.path()).expect("workspace two db");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-two",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model-two"),
+                base_revision: Some(1),
+                input_summary_json: Some(r#"{"files":["README.md"]}"#),
+            })
+            .expect("job two");
+    }
+
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let query = serde_json::from_value(json!({ "limit": 100 })).expect("jobs query");
+    let Json(response) = settings_workspace_spec_jobs(State(state), Query(query))
+        .await
+        .expect("settings spec jobs");
+    let response = serde_json::to_value(response).expect("settings jobs json");
+
+    assert_eq!(response["jobs"].as_array().expect("jobs").len(), 2);
+    assert!(response["errors"].as_array().expect("errors").is_empty());
+    assert_eq!(response["jobs"][0]["job"]["id"], "spec-job-two");
+    assert_eq!(response["jobs"][0]["workspaceId"], "workspace-two");
+    assert_eq!(response["jobs"][0]["workspaceName"], "Two");
+    assert_eq!(
+        response["jobs"][0]["workspacePath"],
+        workspace_two.path().display().to_string()
+    );
+    assert_eq!(response["jobs"][1]["job"]["id"], "spec-job-one");
+    assert_eq!(response["jobs"][1]["workspaceId"], workspace_one_id);
+    assert!(!missing_workspace.path().join(".foco").exists());
+}
+
+#[tokio::test]
+async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat("chat-1", "Spec retry chat")
+            .expect("retry chat");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "failed-spec-job",
+                trigger_type: "chat_completed",
+                chat_id: Some("chat-1"),
+                run_id: Some("run-1"),
+                model_id: Some("model"),
+                base_revision: Some(7),
+                input_summary_json: Some(r#"{"summary":"changed"}"#),
+            })
+            .expect("failed job");
+        database
+            .mark_workspace_spec_job_failed("failed-spec-job", "provider failed")
+            .expect("mark failed");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "running-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(7),
+                input_summary_json: None,
+            })
+            .expect("running job");
+        database
+            .mark_workspace_spec_job_running("running-spec-job")
+            .expect("mark running");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "completed-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(7),
+                input_summary_json: None,
+            })
+            .expect("completed job");
+        database
+            .mark_workspace_spec_job_completed("completed-spec-job", None)
+            .expect("mark completed");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "queued-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(7),
+                input_summary_json: None,
+            })
+            .expect("queued job");
+    }
+
+    let Json(response) = retry_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "failed-spec-job".to_string())),
+    )
+    .await
+    .expect("retry failed job");
+    let response = serde_json::to_value(response).expect("retry response json");
+    let new_job_id = response["job"]["id"]
+        .as_str()
+        .expect("new job id")
+        .to_string();
+    assert_eq!(response["job"]["status"], "queued");
+    assert_eq!(response["job"]["triggerType"], "chat_completed");
+    assert_eq!(response["job"]["chatId"], "chat-1");
+    assert_eq!(response["job"]["runId"], "run-1");
+    assert_eq!(response["job"]["modelId"], "model");
+    assert_eq!(response["job"]["baseRevision"], 7);
+    assert_eq!(response["job"]["inputSummary"]["summary"], "changed");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+    let old_job = database
+        .workspace_spec_job("failed-spec-job")
+        .expect("old job lookup")
+        .expect("old job");
+    assert_eq!(old_job.status, "failed");
+    let new_job = database
+        .workspace_spec_job(&new_job_id)
+        .expect("new job lookup")
+        .expect("new job");
+    assert_eq!(new_job.status, "queued");
+    assert_eq!(new_job.chat_id.as_deref(), Some("chat-1"));
+    assert_eq!(new_job.run_id.as_deref(), Some("run-1"));
+    assert_eq!(new_job.model_id.as_deref(), Some("model"));
+    assert_eq!(new_job.base_revision, Some(7));
+    drop(database);
+
+    for job_id in ["completed-spec-job", "running-spec-job", "queued-spec-job"] {
+        let error = retry_workspace_spec_job(
+            State(state.clone()),
+            AxumPath((workspace_id.clone(), job_id.to_string())),
+        )
+        .await
+        .expect_err("retry non-failed job should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[test]

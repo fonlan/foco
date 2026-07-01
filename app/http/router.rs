@@ -99,6 +99,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::settings::save_spec_settings),
         )
         .route(
+            "/api/settings/spec/jobs",
+            get(crate::http::spec::settings_workspace_spec_jobs),
+        )
+        .route(
             "/api/settings/plan",
             post(crate::http::settings::save_plan_settings),
         )
@@ -251,6 +255,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/spec/jobs",
             get(crate::http::spec::workspace_spec_jobs),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spec/jobs/{job_id}/retry",
+            post(crate::http::spec::retry_workspace_spec_job),
         )
         .route(
             "/api/workspaces/{workspace_id}/plans",
