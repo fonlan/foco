@@ -2027,7 +2027,7 @@ function ContextSpecTab({
           )}
         </div>
 
-        <div className="rounded-md border border-stone-200 bg-white px-3 py-2 text-xs leading-5 text-stone-600">
+        <div className="hidden rounded-md border border-stone-200 bg-white px-3 py-2 text-xs leading-5 text-stone-600 md:block">
           {spec ? (
             <>
               <div>
