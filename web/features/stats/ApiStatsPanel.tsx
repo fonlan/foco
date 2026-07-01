@@ -485,11 +485,11 @@ export function ApiStatsPanel({
             </div>
           ) : null}
           <div
-            className="panel-scroll min-w-0 overflow-x-auto"
+            className="panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
             onWheel={(event) => {
-              // overflow-x-auto forces overflow-y to compute to auto in Chromium,
-              // so this container traps vertical wheel events even though the table
-              // never overflows vertically. Forward them to the scrollable ancestor.
+              // Keep desktop trackpad/wheel vertical motion flowing to the
+              // page scroller; mobile touch uses overflow-y-hidden so this
+              // horizontal table wrapper does not claim vertical pans.
               if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
                 return;
               }

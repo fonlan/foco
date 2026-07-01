@@ -2468,6 +2468,7 @@ describe("app-panels-stats verification surfaces", () => {
     const table = screen.getByRole("table");
     expect(table.parentElement).toHaveClass("panel-scroll");
     expect(table.parentElement).toHaveClass("overflow-x-auto");
+    expect(table.parentElement).toHaveClass("overflow-y-hidden");
     expect(table.parentElement).not.toHaveClass("overflow-auto");
     expect(table.closest(".overflow-y-auto")).toHaveClass("panel-scroll");
     await waitFor(() =>
