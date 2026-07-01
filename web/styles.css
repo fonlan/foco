@@ -76,6 +76,7 @@ summary {
   button.chat-toolbar-button,
   button.chat-toolbar-profile,
   button.composer-run-button,
+  button.composer-team-toggle,
   button.composer-tool-button,
   button.context-memory-delete-button,
   button.diff-file-button,
@@ -103,6 +104,7 @@ summary {
   button.chat-toolbar-button,
   button.chat-toolbar-profile,
   button.composer-run-button,
+  button.composer-team-toggle,
   button.composer-tool-button,
   button.context-memory-delete-button,
   button.diff-file-button,
@@ -3064,17 +3066,6 @@ body,
   color: var(--foco-text-muted);
   font-size: var(--foco-font-micro);
   font-weight: 700;
-  transition:
-    background-color 150ms ease,
-    border-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease;
-}
-
-.composer-team-toggle:hover {
-  border-color: var(--foco-border-active);
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
 }
 
 .composer-team-toggle:focus-visible {
@@ -3085,15 +3076,7 @@ body,
 
 .composer-team-toggle-enabled {
   border-color: var(--foco-accent);
-  background: var(--foco-accent-strong);
-  color: #ffffff;
-  box-shadow: 0 12px 28px rgba(200, 101, 27, 0.2);
-}
-
-.composer-team-toggle-enabled:hover {
-  border-color: var(--foco-accent-strong);
-  background: var(--foco-accent-strong);
-  color: #ffffff;
+  box-shadow: inset 0 0 0 1px var(--foco-accent);
 }
 
 .message-composer-control-row .composer-select-summary,
@@ -3988,6 +3971,7 @@ summary:focus-visible {
 }
 
 .composer-tool-button,
+.composer-team-toggle,
 .composer-select-summary,
 .composer-branch-select {
   border-color: var(--foco-border);
@@ -3996,6 +3980,7 @@ summary:focus-visible {
 }
 
 .composer-tool-button:hover,
+.composer-team-toggle:hover,
 .composer-select-summary:hover,
 .composer-branch-select:hover {
   border-color: var(--foco-border-active);
@@ -4003,6 +3988,8 @@ summary:focus-visible {
   color: var(--foco-accent-strong);
 }
 
+.composer-tool-button:focus-visible,
+.composer-team-toggle:focus-visible,
 .composer-select-summary:focus-visible,
 .composer-branch-select:focus-visible {
   border-color: var(--foco-accent);

@@ -8545,7 +8545,7 @@ export function App() {
                   <div className="flex shrink-0 items-center gap-1.5">
                     <button
                       aria-label={t("Refresh workspaces")}
-                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      className="inline-flex size-8 items-center justify-center rounded-lg text-stone-600 transition hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent"
                       disabled={isLoading}
                       onClick={() => void refreshWorkspaces()}
                       title={t("Refresh workspaces")}
@@ -8559,7 +8559,7 @@ export function App() {
                     <button
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
-                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-8 items-center justify-center rounded-lg text-stone-600 transition hover:bg-teal-50 hover:text-teal-800"
                       onClick={() => setWorkspaceChatSearchOpen((current) => !current)}
                       title={t("Search chats")}
                       type="button"
