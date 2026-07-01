@@ -23,6 +23,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -40,6 +41,12 @@ import type {
 } from "../../api/types";
 import { type AiStatsColumnId } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
+import {
+  findVerticalScrollAncestor,
+  forwardVerticalTouchDrag,
+  startVerticalTouchDragForward,
+  type VerticalTouchDragState,
+} from "../../shared/scroll-forwarding";
 import {
   readAiStatsVisibleColumnIds,
   writeAiStatsVisibleColumnIds,
@@ -87,6 +94,7 @@ export function ApiStatsPanel({
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
+  const touchDragRef = useRef<VerticalTouchDragState | null>(null);
   const requests = stats?.requests ?? [];
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const totalCount = stats?.totalCount ?? summary.totalRequests;
@@ -486,10 +494,36 @@ export function ApiStatsPanel({
           ) : null}
           <div
             className="panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
+            onTouchCancel={() => {
+              touchDragRef.current = null;
+            }}
+            onTouchEnd={() => {
+              touchDragRef.current = null;
+            }}
+            onTouchMove={(event) => {
+              const touch = event.touches[0];
+              if (!touch) {
+                return;
+              }
+              if (
+                forwardVerticalTouchDrag(
+                  touchDragRef.current,
+                  touch,
+                  event.currentTarget,
+                )
+              ) {
+                event.preventDefault();
+              }
+            }}
+            onTouchStart={(event) => {
+              const touch = event.touches[0];
+              touchDragRef.current = touch
+                ? startVerticalTouchDragForward(touch)
+                : null;
+            }}
             onWheel={(event) => {
               // Keep desktop trackpad/wheel vertical motion flowing to the
-              // page scroller; mobile touch uses overflow-y-hidden so this
-              // horizontal table wrapper does not claim vertical pans.
+              // page scroller while horizontal table swipes stay native.
               if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
                 return;
               }
@@ -499,18 +533,12 @@ export function ApiStatsPanel({
                   : event.deltaMode === 2
                     ? event.currentTarget.clientHeight
                     : 1;
-              let node: HTMLElement | null = event.currentTarget.parentElement;
-              while (node) {
-                const overflowY = window.getComputedStyle(node).overflowY;
-                if (
-                  /(auto|scroll)/.test(overflowY) &&
-                  node.scrollHeight > node.clientHeight
-                ) {
-                  node.scrollTop += event.deltaY * deltaUnit;
-                  event.preventDefault();
-                  return;
-                }
-                node = node.parentElement;
+              const node = findVerticalScrollAncestor(
+                event.currentTarget.parentElement,
+              );
+              if (node) {
+                node.scrollTop += event.deltaY * deltaUnit;
+                event.preventDefault();
               }
             }}
           >

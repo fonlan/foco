@@ -2466,11 +2466,31 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("API details")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
     const table = screen.getByRole("table");
-    expect(table.parentElement).toHaveClass("panel-scroll");
-    expect(table.parentElement).toHaveClass("overflow-x-auto");
-    expect(table.parentElement).toHaveClass("overflow-y-hidden");
-    expect(table.parentElement).not.toHaveClass("overflow-auto");
-    expect(table.closest(".overflow-y-auto")).toHaveClass("panel-scroll");
+    const tableScroller = table.parentElement;
+    const statsScroller = table.closest(".overflow-y-auto") as HTMLElement | null;
+    expect(tableScroller).toHaveClass("panel-scroll");
+    expect(tableScroller).toHaveClass("overflow-x-auto");
+    expect(tableScroller).toHaveClass("overflow-y-hidden");
+    expect(tableScroller).not.toHaveClass("overflow-auto");
+    expect(statsScroller).toHaveClass("panel-scroll");
+    if (!tableScroller || !statsScroller) {
+      throw new Error("Expected request audit table to live inside stats scroller");
+    }
+    statsScroller.style.overflowY = "auto";
+    Object.defineProperties(statsScroller, {
+      clientHeight: { configurable: true, value: 360 },
+      scrollHeight: { configurable: true, value: 960 },
+    });
+    statsScroller.scrollTop = 0;
+    fireEvent.touchStart(tableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
+    fireEvent.touchMove(tableScroller, { touches: [{ clientX: 24, clientY: 90 }] });
+    expect(statsScroller.scrollTop).toBe(50);
+    fireEvent.touchEnd(tableScroller);
+    statsScroller.scrollTop = 0;
+    fireEvent.touchStart(tableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
+    fireEvent.touchMove(tableScroller, { touches: [{ clientX: 90, clientY: 110 }] });
+    expect(statsScroller.scrollTop).toBe(0);
+    fireEvent.touchEnd(tableScroller);
     await waitFor(() =>
       expect(within(table).getByText("openai")).toBeInTheDocument(),
     );

@@ -619,6 +619,16 @@ describe("app-settings verification surfaces", () => {
     settingsScroller.scrollTop = 0;
     fireEvent.wheel(dreamTableScroller, { deltaX: 0, deltaY: 120 });
     expect(settingsScroller.scrollTop).toBe(120);
+    settingsScroller.scrollTop = 0;
+    fireEvent.touchStart(dreamTableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
+    fireEvent.touchMove(dreamTableScroller, { touches: [{ clientX: 24, clientY: 90 }] });
+    expect(settingsScroller.scrollTop).toBe(50);
+    fireEvent.touchEnd(dreamTableScroller);
+    settingsScroller.scrollTop = 0;
+    fireEvent.touchStart(dreamTableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
+    fireEvent.touchMove(dreamTableScroller, { touches: [{ clientX: 90, clientY: 110 }] });
+    expect(settingsScroller.scrollTop).toBe(0);
+    fireEvent.touchEnd(dreamTableScroller);
     expect(within(dreamTable).getAllByText(workspace.name)).toHaveLength(2);
     expect(within(dreamTable).getAllByRole("button", { name: "View details" })).toHaveLength(2);
     expect(screen.queryByText(memoryDreamJob.summary!)).not.toBeInTheDocument();
