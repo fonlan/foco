@@ -166,7 +166,7 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("Coordinates the Agent team.")).toBeInTheDocument();
     expect(
       screen.getByRole("checkbox", { name: "Default Team mode for new chats" }),
-    ).not.toBeChecked();
+    ).toBeChecked();
     expect(screen.getByRole("button", { name: "Edit agent Coordinator" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete agent Coordinator" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -334,7 +334,7 @@ describe("app agents verification surfaces", () => {
       );
       expect(saveCall).toBeDefined();
       expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
-        defaultTeamModeEnabled: true,
+        defaultTeamModeEnabled: false,
       });
     });
   });
@@ -596,7 +596,7 @@ describe("app agents verification surfaces", () => {
     await waitFor(() => expect(snapshotCallCount()).toBeGreaterThan(callsAfterStart));
   });
 
-  it("queues the first message with Team tools disabled by default from the composer", async () => {
+  it("queues the first message with Team tools enabled by default from the composer", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -617,7 +617,7 @@ describe("app agents verification surfaces", () => {
       const [, init] = queueCall!;
       expect(JSON.parse(init?.body as string)).toMatchObject({
         message: "handle this",
-        teamModeEnabled: false,
+        teamModeEnabled: true,
       });
     });
   });
@@ -657,7 +657,7 @@ describe("app agents verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    await userEvent.click(within(workspaceList).getByText("Tool run"));
+    await userEvent.click(await within(workspaceList).findByText("Tool run"));
     const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
     expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
 
@@ -690,7 +690,7 @@ describe("app agents verification surfaces", () => {
             ...settings,
             general: {
               ...settings.general,
-              defaultTeamModeEnabled: true,
+              defaultTeamModeEnabled: false,
             },
           })
           : mockFetch(input, init);
@@ -714,7 +714,7 @@ describe("app agents verification surfaces", () => {
       expect(queueCall).toBeDefined();
       expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
         message: "use the default",
-        teamModeEnabled: true,
+        teamModeEnabled: false,
       });
     });
   });

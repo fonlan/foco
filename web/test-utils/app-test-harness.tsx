@@ -142,7 +142,7 @@ export const settings = {
       saveRequestResponseDetails: true,
     },
     autoStartEnabled: false,
-    defaultTeamModeEnabled: false,
+    defaultTeamModeEnabled: true,
     hookAuditEnabled: false,
     language: "en",
     llmRequestRetryCount: 3,
