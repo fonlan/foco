@@ -586,7 +586,7 @@ export type ChatStreamEvent =
     llmRequestId?: string;
     memoriesUsed: ChatMemoryUsedSummary[];
   }
-  | { type: "textDelta"; assistantMessageId?: string; delta: string }
+  | { type: "textDelta"; assistantMessageId?: string; delta: string; reasoningDurationMs?: number | null }
   | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
   | {
     type: "streamAttemptStart";
@@ -614,6 +614,7 @@ export type ChatStreamEvent =
     assistantMessageId: string;
     text: string;
     reasoning?: string | null;
+    reasoningDurationMs?: number | null;
     usage?: ChatUsage | null;
     stopReason?: string | null;
     metrics: ChatReplyMetrics;
@@ -623,6 +624,7 @@ export type ChatStreamEvent =
   | {
     type: "toolCall";
     assistantMessageId: string;
+    reasoningDurationMs?: number | null;
     toolCall: ChatToolCallSummary;
   }
   | {

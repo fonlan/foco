@@ -291,9 +291,11 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
         ChatSseEvent::TextDelta {
             assistant_message_id: "assistant-1".to_string(),
             delta: "done".to_string(),
+            reasoning_duration_ms: None,
         },
         ChatSseEvent::ToolCall {
             assistant_message_id: "assistant-1".to_string(),
+            reasoning_duration_ms: None,
             tool_call: ChatToolCallSummary {
                 id: "call-1".to_string(),
                 name: "read_file".to_string(),
@@ -318,6 +320,7 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
             assistant_message_id: "assistant-1".to_string(),
             text: "done".to_string(),
             reasoning: None,
+            reasoning_duration_ms: None,
             usage: None,
             stop_reason: Some("stop".to_string()),
             metrics: ChatReplyMetrics {
@@ -3764,6 +3767,7 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
             &ChatSseEvent::TextDelta {
                 assistant_message_id: "assistant-1".to_string(),
                 delta: "Partial".to_string(),
+                reasoning_duration_ms: None,
             },
         )
         .expect("text delta record");
@@ -3852,6 +3856,7 @@ fn active_chat_run_finish_suspended_clears_streaming_assistant_state() {
             &ChatSseEvent::TextDelta {
                 assistant_message_id: "assistant-1".to_string(),
                 delta: "Waiting on worker.".to_string(),
+                reasoning_duration_ms: None,
             },
         )
         .expect("text delta record");
@@ -3922,6 +3927,7 @@ fn active_chat_run_private_output_records_events_without_main_chat_draft() {
             &ChatSseEvent::TextDelta {
                 assistant_message_id: "assistant-private".to_string(),
                 delta: "Worker-only text".to_string(),
+                reasoning_duration_ms: None,
             },
         )
         .expect("private text delta record");
@@ -3931,6 +3937,7 @@ fn active_chat_run_private_output_records_events_without_main_chat_draft() {
             "chat-1",
             &ChatSseEvent::ToolCall {
                 assistant_message_id: "assistant-private".to_string(),
+                reasoning_duration_ms: None,
                 tool_call: ChatToolCallSummary {
                     id: "tool-private".to_string(),
                     name: "read_file".to_string(),
@@ -4012,6 +4019,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
     for event in [
         ChatSseEvent::ToolCall {
             assistant_message_id: "assistant-1".to_string(),
+            reasoning_duration_ms: None,
             tool_call: ChatToolCallSummary {
                 id: "tool-reset".to_string(),
                 name: "read_file".to_string(),
@@ -4032,6 +4040,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
         },
         ChatSseEvent::ToolCall {
             assistant_message_id: "assistant-1".to_string(),
+            reasoning_duration_ms: None,
             tool_call: ChatToolCallSummary {
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
@@ -4053,6 +4062,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
         },
         ChatSseEvent::ToolCall {
             assistant_message_id: "assistant-1".to_string(),
+            reasoning_duration_ms: None,
             tool_call: ChatToolCallSummary {
                 id: "tool-2".to_string(),
                 name: "run_command".to_string(),
@@ -4182,6 +4192,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
         .expect("register active run");
     let tool_call_event = ChatSseEvent::ToolCall {
         assistant_message_id: context.assistant_message_id.clone(),
+        reasoning_duration_ms: None,
         tool_call: ChatToolCallSummary {
             id: "call-team-tool".to_string(),
             name: "read_file".to_string(),
@@ -4320,6 +4331,7 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
                 assistant_message_id: "assistant-1".to_string(),
                 text: "Done.".to_string(),
                 reasoning: None,
+                reasoning_duration_ms: None,
                 usage: None,
                 stop_reason: Some("stop".to_string()),
                 metrics: ChatReplyMetrics {
@@ -4552,6 +4564,55 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
 }
 
 #[test]
+fn finalized_assistant_parts_persist_reasoning_duration_from_stream_events() {
+    let events = [
+        (
+            "reasoning_delta",
+            "2026-06-18T10:00:00Z",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "delta": "Think."
+            }),
+        ),
+        (
+            "text_delta",
+            "2026-06-18T10:00:01.500Z",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "delta": "Answer."
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, event_at, value)| CapturedAuditEvent {
+        event_at: event_at.to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let stored_parts =
+        finalized_assistant_message_parts("assistant-1", &events, "Answer.", Some("Think."), &[])
+            .expect("stored parts");
+    let metadata_json = assistant_message_metadata_json(
+        Some("Think."),
+        &[],
+        &CodeChangeStats::default(),
+        None,
+        Some(&stored_parts),
+    )
+    .expect("assistant metadata");
+    assert!(metadata_json.contains(r#""duration_ms":1500"#));
+
+    let parts = assistant_parts_from_metadata(&metadata_json, &[])
+        .expect("hydrate parts")
+        .expect("stored parts present");
+    assert!(
+        matches!(&parts[0], ChatMessagePart::Reasoning { text, duration_ms: Some(1500) } if text == "Think.")
+    );
+}
+
+#[test]
 fn compact_audit_events_keeps_only_final_tool_call_delta() {
     let events = vec![
         CapturedAuditEvent {
@@ -4748,14 +4809,14 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         .next()
         .expect("assistant summary");
     assert!(
-        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text, .. } if text == "Think one.")
     );
     assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
     assert!(
         matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
     );
     assert!(
-        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think two.")
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think two.")
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
 
@@ -4856,14 +4917,14 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
         .next()
         .expect("assistant summary");
     assert!(
-        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text, .. } if text == "Think one.")
     );
     assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
     assert!(
         matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
     );
     assert!(
-        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think two.")
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think two.")
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
 
@@ -5006,14 +5067,14 @@ fn historical_chat_stream_reset_restores_attempt_start_parts() {
         .expect("assistant summary");
     assert_eq!(summary.parts.len(), 6);
     assert!(
-        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text, .. } if text == "Think one.")
     );
     assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
     assert!(
         matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
     );
     assert!(
-        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think final.")
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think final.")
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "Final."));
     assert!(
@@ -5064,7 +5125,7 @@ fn historical_chat_fallback_parts_are_not_cached_as_run_events() {
         .next()
         .expect("assistant summary");
     assert!(
-        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Fallback reasoning.")
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text, .. } if text == "Fallback reasoning.")
     );
     assert!(
         matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Fallback answer.")
@@ -6993,6 +7054,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         assistant_message_id: "assistant-1".to_string(),
         text: "Done.".to_string(),
         reasoning: None,
+        reasoning_duration_ms: None,
         usage: None,
         stop_reason: Some("stop".to_string()),
         metrics: ChatReplyMetrics {
@@ -7507,6 +7569,7 @@ async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting()
             ChatSseEvent::TextDelta {
                 assistant_message_id: assistant_message_id.to_string(),
                 delta: "Already running.".to_string(),
+                reasoning_duration_ms: None,
             },
         ]
         .into_iter()
@@ -8205,10 +8268,12 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
     let first_event = ChatSseEvent::TextDelta {
         assistant_message_id: "assistant-1".to_string(),
         delta: "hello".to_string(),
+        reasoning_duration_ms: None,
     };
     let second_event = ChatSseEvent::TextDelta {
         assistant_message_id: "assistant-1".to_string(),
         delta: " world".to_string(),
+        reasoning_duration_ms: None,
     };
     registration
         .record_event(&workspace_dir, "chat-1", &first_event)
@@ -8269,6 +8334,7 @@ fn active_chat_run_registration_continues_persisted_run_event_sequence() {
             &ChatSseEvent::TextDelta {
                 assistant_message_id: "assistant-1".to_string(),
                 delta: "before wait".to_string(),
+                reasoning_duration_ms: None,
             },
         )
         .expect("record first attempt event");
@@ -8299,6 +8365,7 @@ fn active_chat_run_registration_continues_persisted_run_event_sequence() {
             &ChatSseEvent::TextDelta {
                 assistant_message_id: "assistant-2".to_string(),
                 delta: "after wait".to_string(),
+                reasoning_duration_ms: None,
             },
         )
         .expect("record second attempt event");

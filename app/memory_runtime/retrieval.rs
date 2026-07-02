@@ -1458,7 +1458,7 @@ fn replay_stored_assistant_parts(
                     messages.push(neutral_assistant_message(text, None));
                 }
             }
-            StoredChatMessagePart::Reasoning { text } => {
+            StoredChatMessagePart::Reasoning { text, .. } => {
                 if !text.trim().is_empty() {
                     messages.push(neutral_assistant_message(String::new(), Some(text)));
                 }

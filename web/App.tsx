@@ -6714,7 +6714,10 @@ export function App() {
         liveReasoningDurationTimer = null;
       }
     };
-    const finishLiveReasoningDuration = (eventAssistantMessageId?: string) => {
+    const finishLiveReasoningDuration = (
+      eventAssistantMessageId?: string,
+      reasoningDurationMs?: number | null,
+    ) => {
       const startedAtMs = activeReasoningStartedAtMs;
       if (startedAtMs === null) {
         return;
@@ -6723,18 +6726,22 @@ export function App() {
       stopLiveReasoningDuration();
       const endedAtMs = Date.now();
       setMessagesForChatKey(chatKey, (current) =>
-        current.map((message) =>
-          isCurrentAssistantMessage(message, eventAssistantMessageId)
-            ? {
-              ...message,
-              parts: finishActiveReasoningPart(
-                message.parts,
-                startedAtMs,
-                endedAtMs,
-              ),
-            }
-            : message,
-        ),
+        current.map((message) => {
+          if (!isCurrentAssistantMessage(message, eventAssistantMessageId)) {
+            return message;
+          }
+          const serverParts = finishReasoningPartWithDuration(
+            message.parts,
+            reasoningDurationMs,
+          );
+          return {
+            ...message,
+            parts:
+              serverParts === message.parts
+                ? finishActiveReasoningPart(message.parts, startedAtMs, endedAtMs)
+                : serverParts,
+          };
+        }),
       );
     };
     // Resolve which assistant bubble a post-guidance event targets: once a
@@ -6881,7 +6888,10 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          finishLiveReasoningDuration(
+            streamEvent.assistantMessageId,
+            streamEvent.reasoningDurationMs,
+          );
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -7055,7 +7065,10 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          finishLiveReasoningDuration(
+            streamEvent.assistantMessageId,
+            streamEvent.reasoningDurationMs,
+          );
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -7657,7 +7670,10 @@ export function App() {
         liveReasoningDurationTimer = null;
       }
     };
-    const finishLiveReasoningDuration = (eventAssistantMessageId?: string) => {
+    const finishLiveReasoningDuration = (
+      eventAssistantMessageId?: string,
+      reasoningDurationMs?: number | null,
+    ) => {
       const startedAtMs = activeReasoningStartedAtMs;
       if (startedAtMs === null) {
         return;
@@ -7666,18 +7682,22 @@ export function App() {
       stopLiveReasoningDuration();
       const endedAtMs = Date.now();
       setMessagesForChatKey(runMessagesKey, (current) =>
-        current.map((message) =>
-          isCurrentAssistantMessage(message, eventAssistantMessageId)
-            ? {
-              ...message,
-              parts: finishActiveReasoningPart(
-                message.parts,
-                startedAtMs,
-                endedAtMs,
-              ),
-            }
-            : message,
-        ),
+        current.map((message) => {
+          if (!isCurrentAssistantMessage(message, eventAssistantMessageId)) {
+            return message;
+          }
+          const serverParts = finishReasoningPartWithDuration(
+            message.parts,
+            reasoningDurationMs,
+          );
+          return {
+            ...message,
+            parts:
+              serverParts === message.parts
+                ? finishActiveReasoningPart(message.parts, startedAtMs, endedAtMs)
+                : serverParts,
+          };
+        }),
       );
     };
     try {
@@ -7864,9 +7884,12 @@ export function App() {
           void refreshWorkspaces();
           return;
         }
-
         if (streamEvent.type === "textDelta") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          finishLiveReasoningDuration(
+            streamEvent.assistantMessageId,
+            streamEvent.reasoningDurationMs,
+          );
+
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -8044,7 +8067,10 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          finishLiveReasoningDuration(
+            streamEvent.assistantMessageId,
+            streamEvent.reasoningDurationMs,
+          );
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -11327,11 +11353,15 @@ function completedAssistantMessage(
     parts = appendReasoningPart(parts, reasoningDelta);
   }
   if (activeReasoningStartedAtMs !== null) {
-    parts = finishActiveReasoningPart(
+    const serverParts = finishReasoningPartWithDuration(
       parts,
-      activeReasoningStartedAtMs,
-      completedAtMs,
+      streamEvent.reasoningDurationMs,
     );
+    parts = serverParts === parts
+      ? finishActiveReasoningPart(parts, activeReasoningStartedAtMs, completedAtMs)
+      : serverParts;
+  } else {
+    parts = finishReasoningPartWithDuration(parts, streamEvent.reasoningDurationMs);
   }
   const textDelta = missingFinalSuffix(message.content, streamEvent.text);
   if (textDelta) {
@@ -11363,13 +11393,25 @@ function completedGuidanceAssistantMessage(
   activeReasoningStartedAtMs: number | null,
   completedAtMs: number,
 ): ShellMessage {
-  const parts = activeReasoningStartedAtMs === null
-    ? message.parts
-    : finishActiveReasoningPart(
+  const parts = (() => {
+    if (activeReasoningStartedAtMs !== null) {
+      const serverParts = finishReasoningPartWithDuration(
+        message.parts,
+        streamEvent.reasoningDurationMs,
+      );
+      return serverParts === message.parts
+        ? finishActiveReasoningPart(
+          message.parts,
+          activeReasoningStartedAtMs,
+          completedAtMs,
+        )
+        : serverParts;
+    }
+    return finishReasoningPartWithDuration(
       message.parts,
-      activeReasoningStartedAtMs,
-      completedAtMs,
+      streamEvent.reasoningDurationMs,
     );
+  })();
 
   return {
     ...message,
@@ -11557,6 +11599,28 @@ function updateActiveReasoningPartDuration(
     {
       ...lastPart,
       liveDurationMs: Math.max(0, nowMs - startedAtMs),
+    },
+  ];
+}
+
+function finishReasoningPartWithDuration(
+  parts: ChatMessagePart[],
+  durationMs: number | null | undefined,
+): ChatMessagePart[] {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) {
+    return parts;
+  }
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "reasoning" || lastPart.durationMs !== undefined) {
+    return parts;
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      type: "reasoning",
+      text: lastPart.text,
+      durationMs: Math.max(0, durationMs),
     },
   ];
 }
@@ -12517,12 +12581,17 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "assistant_message_id",
     );
     const delta = stringField(value, "delta");
+    const reasoningDurationMs = optionalNumberField(
+      value,
+      "reasoningDurationMs",
+      "reasoning_duration_ms",
+    );
 
-    if (assistantMessageId === null || delta === null) {
+    if (assistantMessageId === null || delta === null || reasoningDurationMs === false) {
       return null;
     }
 
-    return { type: "textDelta", assistantMessageId, delta };
+    return { type: "textDelta", assistantMessageId, delta, reasoningDurationMs };
   }
 
   if (value.type === "reasoningDelta" || value.type === "reasoning_delta") {
@@ -12671,6 +12740,11 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     );
     const text = stringField(value, "text");
     const reasoning = optionalNullableStringField(value, "reasoning");
+    const reasoningDurationMs = optionalNumberField(
+      value,
+      "reasoningDurationMs",
+      "reasoning_duration_ms",
+    );
     const usage = parseNullableChatUsage(fieldValue(value, "usage"));
     const stopReason = optionalNullableStringField(
       value,
@@ -12688,6 +12762,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
 
     if (
       reasoning === false ||
+      reasoningDurationMs === false ||
       usage === false ||
       stopReason === false ||
       metrics === false ||
@@ -12702,6 +12777,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       assistantMessageId,
       text,
       reasoning,
+      reasoningDurationMs,
       usage,
       stopReason,
       metrics,
@@ -12718,12 +12794,17 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     const toolCall = parseChatToolCallSummary(
       fieldValue(value, "toolCall", "tool_call"),
     );
+    const reasoningDurationMs = optionalNumberField(
+      value,
+      "reasoningDurationMs",
+      "reasoning_duration_ms",
+    );
 
-    if (!assistantMessageId || !toolCall) {
+    if (!assistantMessageId || !toolCall || reasoningDurationMs === false) {
       return null;
     }
 
-    return { type: "toolCall", assistantMessageId, toolCall };
+    return { type: "toolCall", assistantMessageId, reasoningDurationMs, toolCall };
   }
 
   if (value.type === "toolResult" || value.type === "tool_result") {
@@ -13697,6 +13778,20 @@ function optionalNullableStringField(
   }
 
   return false;
+}
+
+function optionalNumberField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
+  const field = fieldValue(value, camelName, snakeName);
+
+  if (typeof field === "undefined" || field === null) {
+    return field;
+  }
+
+  return typeof field === "number" && Number.isFinite(field) ? field : false;
 }
 
 function fieldValue(

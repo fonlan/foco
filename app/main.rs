@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response, sse::Event},
 };
 use base64::{Engine as _, engine::general_purpose};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
@@ -1664,18 +1664,36 @@ struct ChatToolCallSummary {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatMessagePart {
-    Text { text: String },
-    Reasoning { text: String },
-    Attachment { attachment: ChatAttachmentPart },
-    ToolCall { tool_call: ChatToolCallSummary },
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
+    },
+    Attachment {
+        attachment: ChatAttachmentPart,
+    },
+    ToolCall {
+        tool_call: ChatToolCallSummary,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum StoredChatMessagePart {
-    Text { text: String },
-    Reasoning { text: String },
-    ToolCall { tool_call_id: String },
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
+    },
+    ToolCall {
+        tool_call_id: String,
+    },
 }
 
 const STORED_CHAT_PARTS_VERSION: i64 = 3;
@@ -1753,6 +1771,8 @@ enum ChatSseEvent {
     TextDelta {
         assistant_message_id: String,
         delta: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_duration_ms: Option<i64>,
     },
     ReasoningDelta {
         assistant_message_id: String,
@@ -1777,6 +1797,8 @@ enum ChatSseEvent {
     },
     ToolCall {
         assistant_message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_duration_ms: Option<i64>,
         tool_call: ChatToolCallSummary,
     },
     ToolResult {
@@ -1849,6 +1871,8 @@ enum ChatSseEvent {
         assistant_message_id: String,
         text: String,
         reasoning: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_duration_ms: Option<i64>,
         usage: Option<NeutralUsage>,
         stop_reason: Option<String>,
         metrics: ChatReplyMetrics,
@@ -2352,6 +2376,8 @@ impl PreparedChatContext {
                     let mut events = vec![captured_event(&start_event)];
                     let mut assistant_text = String::new();
                     let mut assistant_reasoning = String::new();
+                    let mut reasoning_started_at: Option<Instant> = None;
+                    let mut reasoning_duration_ms: Option<i64> = None;
                     let mut first_token_at = None;
                     let mut first_token_latency_ms = None;
                     let mut seen_tool_call_ids = HashSet::new();
@@ -2602,6 +2628,8 @@ impl PreparedChatContext {
                         };
                         let attempt_assistant_text = assistant_text.clone();
                         let attempt_assistant_reasoning = assistant_reasoning.clone();
+                        let attempt_reasoning_started_at = reasoning_started_at;
+                        let attempt_reasoning_duration_ms = reasoning_duration_ms;
                         let attempt_first_token_at = first_token_at.clone();
                         let attempt_first_token_latency_ms = first_token_latency_ms;
                         let attempt_seen_tool_call_ids = seen_tool_call_ids.clone();
@@ -2759,6 +2787,8 @@ impl PreparedChatContext {
                                     turn_retry_count = turn_retry_count.saturating_add(1);
                                     assistant_text = attempt_assistant_text;
                                     assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                                     first_token_at = attempt_first_token_at;
                                     first_token_latency_ms = attempt_first_token_latency_ms;
                                     seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -2902,6 +2932,8 @@ impl PreparedChatContext {
                                         turn_retry_count = turn_retry_count.saturating_add(1);
                                         assistant_text = attempt_assistant_text;
                                         assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                                         first_token_at = attempt_first_token_at;
                                         first_token_latency_ms = attempt_first_token_latency_ms;
                                         seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -2961,11 +2993,17 @@ impl PreparedChatContext {
                                 NeutralChatStreamEvent::TextDelta { delta } => {
                                     capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                                     capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                                    if reasoning_duration_ms.is_none()
+                                        && let Some(started_at) = reasoning_started_at.take()
+                                    {
+                                        reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                    }
                                     assistant_text.push_str(&delta);
                                     turn_text.push_str(&delta);
                                     let event = ChatSseEvent::TextDelta {
                                         assistant_message_id: self.assistant_message_id.clone(),
                                         delta,
+                                        reasoning_duration_ms,
                                     };
                                     events.push(captured_event(&event));
                                     yield event;
@@ -2973,6 +3011,10 @@ impl PreparedChatContext {
                                 NeutralChatStreamEvent::ReasoningDelta { delta } => {
                                     capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                                     capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                                    if reasoning_started_at.is_none() {
+                                        reasoning_started_at = Some(Instant::now());
+                                        reasoning_duration_ms = None;
+                                    }
                                     assistant_reasoning.push_str(&delta);
                                     turn_reasoning.push_str(&delta);
                                     let event = ChatSseEvent::ReasoningDelta {
@@ -2992,6 +3034,14 @@ impl PreparedChatContext {
                                     if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
                                         let event = ChatSseEvent::ToolCall {
                                             assistant_message_id: self.assistant_message_id.clone(),
+                                            reasoning_duration_ms: if reasoning_duration_ms.is_none()
+                                                && let Some(started_at) = reasoning_started_at.take()
+                                            {
+                                                reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                                reasoning_duration_ms
+                                            } else {
+                                                reasoning_duration_ms
+                                            },
                                             tool_call: pending_tool_call_summary(&tool_call),
                                         };
                                         let captured = captured_event(&event);
@@ -3028,6 +3078,8 @@ impl PreparedChatContext {
                                             turn_retry_count = turn_retry_count.saturating_add(1);
                                             assistant_text = attempt_assistant_text;
                                             assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                                             first_token_at = attempt_first_token_at;
                                             first_token_latency_ms = attempt_first_token_latency_ms;
                                             seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -3094,6 +3146,8 @@ impl PreparedChatContext {
                                             turn_retry_count = turn_retry_count.saturating_add(1);
                                             assistant_text = attempt_assistant_text;
                                             assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                                             first_token_at = attempt_first_token_at;
                                             first_token_latency_ms = attempt_first_token_latency_ms;
                                             seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -3303,6 +3357,11 @@ impl PreparedChatContext {
                                         let assistant_message_text = git_diff_summary_result.text;
                                         self.code_change_stats = git_diff_summary_result.stats;
                                         let total_latency_ms = elapsed_millis(started_at);
+                                        if reasoning_duration_ms.is_none()
+                                            && let Some(started_at) = reasoning_started_at.take()
+                                        {
+                                            reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                        }
                                         let metrics = ChatReplyMetrics {
                                             model_id: self.model_id.clone(),
                                             provider_id: self.provider_id.clone(),
@@ -3315,6 +3374,7 @@ impl PreparedChatContext {
                                             assistant_message_id: self.assistant_message_id.clone(),
                                             text: assistant_message_text.clone(),
                                             reasoning: non_empty_string(&assistant_reasoning),
+                                            reasoning_duration_ms,
                                             usage: final_usage.clone(),
                                             stop_reason: stop_reason.clone(),
                                             metrics,
@@ -3549,6 +3609,14 @@ impl PreparedChatContext {
                                         seen_tool_call_ids.insert(tool_call.call_id.clone());
                                         let event = ChatSseEvent::ToolCall {
                                             assistant_message_id: self.assistant_message_id.clone(),
+                                            reasoning_duration_ms: if reasoning_duration_ms.is_none()
+                                                && let Some(started_at) = reasoning_started_at.take()
+                                            {
+                                                reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                                reasoning_duration_ms
+                                            } else {
+                                                reasoning_duration_ms
+                                            },
                                             tool_call: pending_tool_call_summary(tool_call),
                                         };
                                         events.push(captured_event(&event));
@@ -3865,6 +3933,8 @@ impl PreparedChatContext {
                                         turn_retry_count = turn_retry_count.saturating_add(1);
                                         assistant_text = attempt_assistant_text;
                                         assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                                         first_token_at = attempt_first_token_at;
                                         first_token_latency_ms = attempt_first_token_latency_ms;
                                         seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -3938,6 +4008,8 @@ impl PreparedChatContext {
                             turn_retry_count = turn_retry_count.saturating_add(1);
                             assistant_text = attempt_assistant_text;
                             assistant_reasoning = attempt_assistant_reasoning;
+                                    reasoning_started_at = attempt_reasoning_started_at;
+                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
                             first_token_at = attempt_first_token_at;
                             first_token_latency_ms = attempt_first_token_latency_ms;
                             seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -8304,7 +8376,9 @@ fn assistant_parts_from_metadata(
         .into_iter()
         .map(|part| match part {
             StoredChatMessagePart::Text { text } => Ok(ChatMessagePart::Text { text }),
-            StoredChatMessagePart::Reasoning { text } => Ok(ChatMessagePart::Reasoning { text }),
+            StoredChatMessagePart::Reasoning { text, duration_ms } => {
+                Ok(ChatMessagePart::Reasoning { text, duration_ms })
+            }
             StoredChatMessagePart::ToolCall { tool_call_id } => tool_calls_by_id
                 .get(tool_call_id.as_str())
                 .map(|tool_call| ChatMessagePart::ToolCall {
@@ -8943,7 +9017,8 @@ fn materialize_missing_assistant_parts(
     let mut parts_by_message = HashMap::<String, Vec<ChatMessagePart>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
     let mut stream_attempt_snapshots_by_message =
-        HashMap::<String, (Vec<ChatMessagePart>, HashSet<String>)>::new();
+        HashMap::<String, (Vec<ChatMessagePart>, HashSet<String>, Option<String>)>::new();
+    let mut reasoning_started_at_by_message = HashMap::<String, String>::new();
     for event in &events {
         let value = parse_json_value(&event.payload_json, "chat run event")?;
         let Some(message_id) =
@@ -8957,6 +9032,13 @@ fn materialize_missing_assistant_parts(
 
         match event.event_type.as_str() {
             "text_delta" => {
+                if let Some(started_at) = reasoning_started_at_by_message.remove(message_id) {
+                    finish_reasoning_part_duration(
+                        parts_by_message.entry(message_id.to_string()).or_default(),
+                        &started_at,
+                        &event.created_at,
+                    );
+                }
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
                     push_text_part(
                         parts_by_message.entry(message_id.to_string()).or_default(),
@@ -8966,6 +9048,9 @@ fn materialize_missing_assistant_parts(
             }
             "reasoning_delta" => {
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                    reasoning_started_at_by_message
+                        .entry(message_id.to_string())
+                        .or_insert_with(|| event.created_at.clone());
                     push_reasoning_part(
                         parts_by_message.entry(message_id.to_string()).or_default(),
                         delta,
@@ -8973,6 +9058,13 @@ fn materialize_missing_assistant_parts(
                 }
             }
             "tool_call" => {
+                if let Some(started_at) = reasoning_started_at_by_message.remove(message_id) {
+                    finish_reasoning_part_duration(
+                        parts_by_message.entry(message_id.to_string()).or_default(),
+                        &started_at,
+                        &event.created_at,
+                    );
+                }
                 let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                 else {
                     continue;
@@ -9002,20 +9094,31 @@ fn materialize_missing_assistant_parts(
                             .get(message_id)
                             .cloned()
                             .unwrap_or_default(),
+                        reasoning_started_at_by_message.get(message_id).cloned(),
                     ),
                 );
             }
             "stream_reset" => {
-                if let Some((parts_snapshot, seen_tool_call_ids_snapshot)) =
-                    stream_attempt_snapshots_by_message.get(message_id).cloned()
+                if let Some((
+                    parts_snapshot,
+                    seen_tool_call_ids_snapshot,
+                    reasoning_started_at_snapshot,
+                )) = stream_attempt_snapshots_by_message.get(message_id).cloned()
                 {
                     parts_by_message.insert(message_id.to_string(), parts_snapshot);
                     seen_tool_call_ids_by_message
                         .insert(message_id.to_string(), seen_tool_call_ids_snapshot);
+                    if let Some(reasoning_started_at_snapshot) = reasoning_started_at_snapshot {
+                        reasoning_started_at_by_message
+                            .insert(message_id.to_string(), reasoning_started_at_snapshot);
+                    } else {
+                        reasoning_started_at_by_message.remove(message_id);
+                    }
                     continue;
                 }
                 parts_by_message.remove(message_id);
                 seen_tool_call_ids_by_message.remove(message_id);
+                reasoning_started_at_by_message.remove(message_id);
                 if let Some(reasoning) =
                     nullable_string_json_field(&value, "reasoning", "reasoning")
                 {
@@ -9051,6 +9154,22 @@ fn materialize_missing_assistant_parts(
                 }
             }
             _ => {}
+        }
+    }
+
+    for (message_id, started_at) in reasoning_started_at_by_message {
+        let ended_at = events
+            .iter()
+            .rev()
+            .find(|event| {
+                parse_json_value(&event.payload_json, "chat run event")
+                    .map(|value| event_matches_assistant_message(&value, &message_id))
+                    .unwrap_or(false)
+            })
+            .map(|event| event.created_at.as_str())
+            .unwrap_or(started_at.as_str());
+        if let Some(parts) = parts_by_message.get_mut(&message_id) {
+            finish_reasoning_part_duration(parts, &started_at, ended_at);
         }
     }
 
@@ -9693,6 +9812,12 @@ fn event_matches_assistant_message(value: &Value, message_id: &str) -> bool {
     }
 }
 
+fn event_matches_assistant_message_json(event_json: &str, message_id: &str) -> bool {
+    serde_json::from_str::<Value>(event_json)
+        .map(|value| event_matches_assistant_message(&value, message_id))
+        .unwrap_or(false)
+}
+
 fn string_json_field<'a>(value: &'a Value, primary: &str, alternate: &str) -> Option<&'a str> {
     value
         .get(primary)
@@ -9753,7 +9878,9 @@ fn finalized_assistant_message_parts(
         .map(|tool_call| (tool_call.id.as_str(), tool_call))
         .collect::<HashMap<_, _>>();
     let mut seen_tool_call_ids = HashSet::new();
-    let mut stream_attempt_snapshot = None::<(Vec<ChatMessagePart>, HashSet<String>)>;
+    let mut stream_attempt_snapshot =
+        None::<(Vec<ChatMessagePart>, HashSet<String>, Option<String>)>;
+    let mut reasoning_started_at = None::<String>;
     let mut parts = Vec::new();
 
     for event in events {
@@ -9774,16 +9901,25 @@ fn finalized_assistant_message_parts(
 
         match event.event_type.as_str() {
             "text_delta" => {
+                if let Some(started_at) = reasoning_started_at.take() {
+                    finish_reasoning_part_duration(&mut parts, &started_at, &event.event_at);
+                }
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
                     push_text_part(&mut parts, delta);
                 }
             }
             "reasoning_delta" => {
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                    if reasoning_started_at.is_none() {
+                        reasoning_started_at = Some(event.event_at.clone());
+                    }
                     push_reasoning_part(&mut parts, delta);
                 }
             }
             "tool_call" => {
+                if let Some(started_at) = reasoning_started_at.take() {
+                    finish_reasoning_part_duration(&mut parts, &started_at, &event.event_at);
+                }
                 if let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                     && let Some(tool_call_id) = string_json_field(tool_call, "id", "callId")
                         .or_else(|| string_json_field(tool_call, "call_id", "callId"))
@@ -9797,18 +9933,27 @@ fn finalized_assistant_message_parts(
                 }
             }
             "stream_attempt_start" => {
-                stream_attempt_snapshot = Some((parts.clone(), seen_tool_call_ids.clone()));
+                stream_attempt_snapshot = Some((
+                    parts.clone(),
+                    seen_tool_call_ids.clone(),
+                    reasoning_started_at.clone(),
+                ));
             }
             "stream_reset" => {
-                if let Some((parts_snapshot, seen_tool_call_ids_snapshot)) =
-                    stream_attempt_snapshot.clone()
+                if let Some((
+                    parts_snapshot,
+                    seen_tool_call_ids_snapshot,
+                    reasoning_started_at_snapshot,
+                )) = stream_attempt_snapshot.clone()
                 {
                     parts = parts_snapshot;
                     seen_tool_call_ids = seen_tool_call_ids_snapshot;
+                    reasoning_started_at = reasoning_started_at_snapshot;
                     continue;
                 }
                 parts.clear();
                 seen_tool_call_ids.clear();
+                reasoning_started_at = None;
                 if let Some(reasoning) =
                     nullable_string_json_field(&value, "reasoning", "reasoning")
                 {
@@ -9840,6 +9985,21 @@ fn finalized_assistant_message_parts(
         }
     }
 
+    if let Some(started_at) = reasoning_started_at.take() {
+        let ended_at = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event_matches_assistant_message_json(
+                    &event.normalized_event_json,
+                    assistant_message_id,
+                )
+            })
+            .map(|event| event.event_at.as_str())
+            .unwrap_or(started_at.as_str());
+        finish_reasoning_part_duration(&mut parts, &started_at, ended_at);
+    }
+
     if assistant_reasoning.is_some()
         && !parts
             .iter()
@@ -9851,6 +10011,7 @@ fn finalized_assistant_message_parts(
                 text: assistant_reasoning
                     .expect("reasoning was checked above")
                     .to_string(),
+                duration_ms: None,
             },
         );
     }
@@ -9884,7 +10045,9 @@ fn stored_chat_message_parts(
         .into_iter()
         .map(|part| match part {
             ChatMessagePart::Text { text } => Ok(StoredChatMessagePart::Text { text }),
-            ChatMessagePart::Reasoning { text } => Ok(StoredChatMessagePart::Reasoning { text }),
+            ChatMessagePart::Reasoning { text, duration_ms } => {
+                Ok(StoredChatMessagePart::Reasoning { text, duration_ms })
+            }
             ChatMessagePart::ToolCall { tool_call } => Ok(StoredChatMessagePart::ToolCall {
                 tool_call_id: tool_call.id,
             }),
@@ -9924,15 +10087,30 @@ fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
     }
 }
 
+fn timestamp_duration_ms(started_at: &str, ended_at: &str) -> Option<i64> {
+    let started_at = DateTime::parse_from_rfc3339(started_at).ok()?;
+    let ended_at = DateTime::parse_from_rfc3339(ended_at).ok()?;
+    Some((ended_at - started_at).num_milliseconds().max(0))
+}
+
+fn finish_reasoning_part_duration(parts: &mut [ChatMessagePart], started_at: &str, ended_at: &str) {
+    if let Some(ChatMessagePart::Reasoning { duration_ms, .. }) = parts.last_mut()
+        && duration_ms.is_none()
+    {
+        *duration_ms = timestamp_duration_ms(started_at, ended_at);
+    }
+}
+
 fn push_reasoning_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
     if text.is_empty() {
         return;
     }
 
     match parts.last_mut() {
-        Some(ChatMessagePart::Reasoning { text: existing }) => existing.push_str(text),
+        Some(ChatMessagePart::Reasoning { text: existing, .. }) => existing.push_str(text),
         _ => parts.push(ChatMessagePart::Reasoning {
             text: text.to_string(),
+            duration_ms: None,
         }),
     }
 }

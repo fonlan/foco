@@ -442,6 +442,7 @@ impl ActiveChatRunRegistration {
             ChatSseEvent::TextDelta {
                 assistant_message_id,
                 delta,
+                ..
             } if assistant_message_id == &self.assistant_message_id => {
                 self.assistant_draft.content.push_str(delta);
                 self.assistant_draft.status = StreamingAssistantStatus::Streaming;
@@ -484,6 +485,7 @@ impl ActiveChatRunRegistration {
             ChatSseEvent::ToolCall {
                 assistant_message_id,
                 tool_call,
+                ..
             } if assistant_message_id == &self.assistant_message_id => {
                 let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
                     ApiError::internal(format!("failed to serialize tool input: {source}"))
