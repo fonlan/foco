@@ -57,13 +57,13 @@ use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, MIGRATION_023, Migration,
+    MIGRATION_022, MIGRATION_023, MIGRATION_024, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 23;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 24;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -212,6 +212,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 23,
         sql: MIGRATION_023,
+    },
+    Migration {
+        version: 24,
+        sql: MIGRATION_024,
     },
 ];
 
@@ -2352,6 +2356,91 @@ impl WorkspaceDatabase {
         Ok(count)
     }
 
+    pub fn reconcile_plan_phase_attempts_for_terminal_phases(
+        &mut self,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        self.reconcile_plan_phase_attempts_for_terminal_phases_inner(None)
+    }
+
+    fn reconcile_plan_phase_attempts_for_terminal_phases_in_plan(
+        &mut self,
+        plan_id: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        self.reconcile_plan_phase_attempts_for_terminal_phases_inner(Some(plan_id.trim()))
+    }
+
+    fn reconcile_plan_phase_attempts_for_terminal_phases_inner(
+        &mut self,
+        plan_id: Option<&str>,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = (
+                         SELECT phase.status
+                         FROM plan_phases AS phase
+                         WHERE phase.id = plan_phase_attempts.phase_id
+                           AND phase.plan_id = plan_phase_attempts.plan_id
+                     ),
+                     commit_id = CASE
+                         WHEN (
+                             SELECT phase.status
+                             FROM plan_phases AS phase
+                             WHERE phase.id = plan_phase_attempts.phase_id
+                               AND phase.plan_id = plan_phase_attempts.plan_id
+                         ) = 'completed'
+                         THEN (
+                             SELECT phase.commit_id
+                             FROM plan_phases AS phase
+                             WHERE phase.id = plan_phase_attempts.phase_id
+                               AND phase.plan_id = plan_phase_attempts.plan_id
+                         )
+                         ELSE commit_id
+                     END,
+                     error_message = CASE
+                         WHEN (
+                             SELECT phase.status
+                             FROM plan_phases AS phase
+                             WHERE phase.id = plan_phase_attempts.phase_id
+                               AND phase.plan_id = plan_phase_attempts.plan_id
+                         ) = 'failed'
+                         THEN (
+                             SELECT phase.error_message
+                             FROM plan_phases AS phase
+                             WHERE phase.id = plan_phase_attempts.phase_id
+                               AND phase.plan_id = plan_phase_attempts.plan_id
+                         )
+                         WHEN (
+                             SELECT phase.status
+                             FROM plan_phases AS phase
+                             WHERE phase.id = plan_phase_attempts.phase_id
+                               AND phase.plan_id = plan_phase_attempts.plan_id
+                         ) IN ('completed', 'cancelled')
+                         THEN NULL
+                         ELSE error_message
+                     END,
+                     completed_at = COALESCE((
+                         SELECT phase.completed_at
+                         FROM plan_phases AS phase
+                         WHERE phase.id = plan_phase_attempts.phase_id
+                           AND phase.plan_id = plan_phase_attempts.plan_id
+                     ), completed_at, ?1),
+                     updated_at = ?1
+                 WHERE status IN ('queued', 'running')
+                   AND (?2 IS NULL OR plan_id = ?2)
+                   AND EXISTS (
+                       SELECT 1
+                       FROM plan_phases AS phase
+                       WHERE phase.id = plan_phase_attempts.phase_id
+                         AND phase.plan_id = plan_phase_attempts.plan_id
+                         AND phase.status IN ('completed', 'failed', 'cancelled')
+                   )",
+                params![now, plan_id],
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn fail_plan_phase_by_id(
         &mut self,
         plan_id: &str,
@@ -2662,7 +2751,12 @@ impl WorkspaceDatabase {
                 message: format!("plan was not found: {}", plan_id.trim()),
             })?;
         if matches!(plan.status.as_str(), "completed" | "cancelled") {
-            return Ok(plan);
+            self.reconcile_plan_phase_attempts_for_terminal_phases_in_plan(plan_id)?;
+            return self
+                .plan(plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found after refresh: {}", plan_id.trim()),
+                });
         }
         let now = now_timestamp();
         for phase in &plan.phases {
@@ -2757,6 +2851,7 @@ impl WorkspaceDatabase {
                 params![plan_id.trim(), next_status, active_phase_id, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        self.reconcile_plan_phase_attempts_for_terminal_phases_in_plan(plan_id)?;
         self.plan(plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after refresh: {}", plan_id.trim()),

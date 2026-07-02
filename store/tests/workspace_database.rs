@@ -101,6 +101,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "plans",
         "plan_phases",
         "plan_steps",
+        "plan_phase_attempts",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -1161,6 +1162,313 @@ fn terminal_agent_task_reconciliation_fails_stale_running_plan_phase() {
             .expect("phase attempts");
         assert_eq!(attempts[0].status, expected_attempt_status);
     }
+}
+
+#[test]
+fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-attempt-step-complete",
+            title: "Attempt step complete",
+            overview: "Manual step completion should finish the active attempt.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-attempt-step-complete-phase-1",
+                title: "Phase one",
+                summary: "Complete via checkbox.",
+                steps: vec![NewPlanStep {
+                    id: "plan-attempt-step-complete-step-1",
+                    title: "Do work",
+                    detail: "Finish manually.",
+                    acceptance: vec!["attempt is completed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-attempt-step-complete", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-attempt-step-complete",
+            "plan-attempt-step-complete-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-attempt-step-complete",
+        "attempt-step-complete",
+    );
+    let task_id = AgentTaskId::new("agent-task-attempt-step-complete").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-attempt-step-complete",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach attempt");
+
+    let updated = database
+        .update_plan_step(
+            "plan-attempt-step-complete",
+            "plan-attempt-step-complete-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step");
+
+    assert_eq!(updated.status, "implemented");
+    assert_eq!(updated.phases[0].status, "completed");
+    assert_eq!(updated.phases[0].attempts[0].status, "completed");
+    assert!(updated.phases[0].attempts[0].completed_at.is_some());
+}
+
+#[test]
+fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
+    for (suffix, terminal_status, commit_id, error_message) in [
+        ("completed", "completed", Some("commit-completed"), None),
+        ("failed", "failed", None, Some("phase failed")),
+        ("cancelled", "cancelled", None, None),
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let plan_id = format!("plan-attempt-reconcile-{suffix}");
+        let phase_id = format!("{plan_id}-phase-1");
+        let step_id = format!("{plan_id}-step-1");
+        database
+            .create_plan(NewPlan {
+                id: &plan_id,
+                title: "Attempt reconcile",
+                overview: "Repair active attempts for terminal phases.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase one",
+                    summary: "Already terminal.",
+                    steps: vec![NewPlanStep {
+                        id: &step_id,
+                        title: "Do work",
+                        detail: "Reach terminal state.",
+                        acceptance: vec!["attempt reconciled".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        let (team_id, instance_id) = create_test_agent_team(
+            &mut database,
+            &format!("chat-attempt-reconcile-{suffix}"),
+            &format!("attempt-reconcile-{suffix}"),
+        );
+        let task_id =
+            AgentTaskId::new(format!("agent-task-attempt-reconcile-{suffix}")).expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                &format!("chat-attempt-reconcile-{suffix}"),
+                &team_id,
+                &task_id,
+            )
+            .expect("attach attempt");
+        let connection = Connection::open(database.database_path()).expect("open database");
+        connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = ?2,
+                     commit_id = ?3,
+                     error_message = ?4,
+                     completed_at = '2026-07-02T00:00:00.000Z',
+                     updated_at = '2026-07-02T00:00:00.000Z'
+                 WHERE id = ?1",
+                params![phase_id, terminal_status, commit_id, error_message],
+            )
+            .expect("make phase terminal");
+        connection
+            .execute(
+                "INSERT INTO plan_phase_attempts (
+                    id, plan_id, phase_id, sequence, trigger, status, error_message, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 'initial', 'failed', 'old terminal',
+                    '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')",
+                params![
+                    format!("plan-phase-attempt-{phase_id}-terminal"),
+                    plan_id,
+                    phase_id
+                ],
+            )
+            .expect("insert terminal attempt history");
+        drop(connection);
+
+        let repaired = database
+            .reconcile_plan_phase_attempts_for_terminal_phases()
+            .expect("reconcile attempts");
+        assert_eq!(repaired, 1);
+        let attempts = database
+            .plan_phase_attempts_for_phase(&phase_id)
+            .expect("phase attempts");
+        assert_eq!(attempts[0].status, terminal_status);
+        assert_eq!(attempts[0].commit_id.as_deref(), commit_id);
+        assert_eq!(attempts[0].error_message.as_deref(), error_message);
+        assert_eq!(
+            attempts[0].completed_at.as_deref(),
+            Some("2026-07-02T00:00:00.000Z")
+        );
+        assert_eq!(attempts[1].status, "failed");
+        assert_eq!(attempts[1].error_message.as_deref(), Some("old terminal"));
+    }
+}
+
+#[test]
+fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-attempt-migration-024",
+            title: "Attempt migration",
+            overview: "Migration repairs stale active attempts.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-attempt-migration-024-completed",
+                    title: "Completed phase",
+                    summary: "Has commit.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-attempt-migration-024-completed-step",
+                        title: "Do completed work",
+                        detail: "Done.",
+                        acceptance: vec!["completed".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-attempt-migration-024-failed",
+                    title: "Failed phase",
+                    summary: "Has error.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-attempt-migration-024-failed-step",
+                        title: "Do failed work",
+                        detail: "Fail.",
+                        acceptance: vec!["failed".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-attempt-migration-024-cancelled",
+                    title: "Cancelled phase",
+                    summary: "Was cancelled.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-attempt-migration-024-cancelled-step",
+                        title: "Do cancelled work",
+                        detail: "Cancel.",
+                        acceptance: vec!["cancelled".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    for phase_id in [
+        "plan-attempt-migration-024-completed",
+        "plan-attempt-migration-024-failed",
+        "plan-attempt-migration-024-cancelled",
+    ] {
+        database
+            .begin_plan_phase_attempt(
+                "plan-attempt-migration-024",
+                phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+    }
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let connection = Connection::open(&database_path).expect("open database");
+    connection
+        .execute_batch(
+            "UPDATE plan_phases
+             SET status = 'completed', commit_id = 'commit-from-phase', completed_at = '2026-07-02T00:00:00.000Z'
+             WHERE id = 'plan-attempt-migration-024-completed';
+             UPDATE plan_phases
+             SET status = 'failed', error_message = 'phase failed', completed_at = '2026-07-02T00:00:01.000Z'
+             WHERE id = 'plan-attempt-migration-024-failed';
+             UPDATE plan_phases
+             SET status = 'cancelled', completed_at = '2026-07-02T00:00:02.000Z'
+             WHERE id = 'plan-attempt-migration-024-cancelled';
+             PRAGMA user_version = 23;",
+        )
+        .expect("seed stale v23 data");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let completed = database
+        .plan_phase_attempts_for_phase("plan-attempt-migration-024-completed")
+        .expect("completed attempts");
+    assert_eq!(completed[0].status, "completed");
+    assert_eq!(completed[0].commit_id.as_deref(), Some("commit-from-phase"));
+    assert_eq!(
+        completed[0].completed_at.as_deref(),
+        Some("2026-07-02T00:00:00.000Z")
+    );
+    let failed = database
+        .plan_phase_attempts_for_phase("plan-attempt-migration-024-failed")
+        .expect("failed attempts");
+    assert_eq!(failed[0].status, "failed");
+    assert_eq!(failed[0].error_message.as_deref(), Some("phase failed"));
+    let cancelled = database
+        .plan_phase_attempts_for_phase("plan-attempt-migration-024-cancelled")
+        .expect("cancelled attempts");
+    assert_eq!(cancelled[0].status, "cancelled");
 }
 
 #[test]

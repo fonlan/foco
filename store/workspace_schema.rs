@@ -1141,6 +1141,78 @@ FROM plan_phases
 WHERE agent_task_id IS NOT NULL;
 "#;
 
+pub(crate) const MIGRATION_024: &str = r#"
+UPDATE plan_phase_attempts
+SET status = (
+        SELECT phase.status
+        FROM plan_phases AS phase
+        WHERE phase.id = plan_phase_attempts.phase_id
+          AND phase.plan_id = plan_phase_attempts.plan_id
+    ),
+    commit_id = CASE
+        WHEN (
+            SELECT phase.status
+            FROM plan_phases AS phase
+            WHERE phase.id = plan_phase_attempts.phase_id
+              AND phase.plan_id = plan_phase_attempts.plan_id
+        ) = 'completed'
+        THEN (
+            SELECT phase.commit_id
+            FROM plan_phases AS phase
+            WHERE phase.id = plan_phase_attempts.phase_id
+              AND phase.plan_id = plan_phase_attempts.plan_id
+        )
+        ELSE commit_id
+    END,
+    error_message = CASE
+        WHEN (
+            SELECT phase.status
+            FROM plan_phases AS phase
+            WHERE phase.id = plan_phase_attempts.phase_id
+              AND phase.plan_id = plan_phase_attempts.plan_id
+        ) = 'failed'
+        THEN (
+            SELECT phase.error_message
+            FROM plan_phases AS phase
+            WHERE phase.id = plan_phase_attempts.phase_id
+              AND phase.plan_id = plan_phase_attempts.plan_id
+        )
+        WHEN (
+            SELECT phase.status
+            FROM plan_phases AS phase
+            WHERE phase.id = plan_phase_attempts.phase_id
+              AND phase.plan_id = plan_phase_attempts.plan_id
+        ) IN ('completed', 'cancelled')
+        THEN NULL
+        ELSE error_message
+    END,
+    completed_at = COALESCE((
+        SELECT phase.completed_at
+        FROM plan_phases AS phase
+        WHERE phase.id = plan_phase_attempts.phase_id
+          AND phase.plan_id = plan_phase_attempts.plan_id
+    ), completed_at, (
+        SELECT phase.updated_at
+        FROM plan_phases AS phase
+        WHERE phase.id = plan_phase_attempts.phase_id
+          AND phase.plan_id = plan_phase_attempts.plan_id
+    ), updated_at),
+    updated_at = COALESCE((
+        SELECT phase.updated_at
+        FROM plan_phases AS phase
+        WHERE phase.id = plan_phase_attempts.phase_id
+          AND phase.plan_id = plan_phase_attempts.plan_id
+    ), updated_at)
+WHERE status IN ('queued', 'running')
+  AND EXISTS (
+      SELECT 1
+      FROM plan_phases AS phase
+      WHERE phase.id = plan_phase_attempts.phase_id
+        AND phase.plan_id = plan_phase_attempts.plan_id
+        AND phase.status IN ('completed', 'failed', 'cancelled')
+  );
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};
