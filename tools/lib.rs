@@ -1071,7 +1071,7 @@ mod tests {
     };
     use foco_store::workspace::{
         NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-        NewCodeGraphSymbol, WorkspaceDatabase,
+        NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep, WorkspaceDatabase,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_rejects_plan_status_mutations() {
+    fn plan_mode_rejects_plan_status_mutations_but_allows_content_updates() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
@@ -1619,23 +1619,34 @@ mod tests {
             session_mode: Some("plan"),
         };
 
-        let invalid_create = execute_builtin_tool_with_context(
-            workspace.path(),
-            context,
-            CREATE_PLAN_TOOL,
-            plan_tool_create_input("plan-running", Some("running"), Some("other-chat")),
-        );
-        assert!(invalid_create.is_error);
-        assert_error_contains(&invalid_create, "Plan Mode cannot modify");
+        for status in ["running", "failed", "implemented"] {
+            let invalid_create = execute_builtin_tool_with_context(
+                workspace.path(),
+                context,
+                CREATE_PLAN_TOOL,
+                plan_tool_create_input(&format!("plan-{status}"), Some(status), Some("other-chat")),
+            );
+            assert!(invalid_create.is_error, "{status} should be rejected");
+            assert_error_contains(&invalid_create, "Plan Mode cannot modify");
+        }
 
-        let create = execute_builtin_tool_with_context(
+        let omitted_status = execute_builtin_tool_with_context(
             workspace.path(),
             context,
             CREATE_PLAN_TOOL,
-            plan_tool_create_input("plan-ready", None, Some("other-chat")),
+            plan_tool_create_input("plan-omitted", None, Some("other-chat")),
         );
-        assert!(!create.is_error, "{:?}", create.output);
-        assert_eq!(create.output["plan"]["sourceChatId"], "chat-plan");
+        assert!(!omitted_status.is_error, "{:?}", omitted_status.output);
+        assert_eq!(omitted_status.output["plan"]["status"], "ready");
+        assert_eq!(omitted_status.output["plan"]["sourceChatId"], "chat-plan");
+
+        let ready_status = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            CREATE_PLAN_TOOL,
+            plan_tool_create_input("plan-ready", Some("ready"), Some("other-chat")),
+        );
+        assert!(!ready_status.is_error, "{:?}", ready_status.output);
 
         let update_status = execute_builtin_tool_with_context(
             workspace.path(),
@@ -1669,6 +1680,24 @@ mod tests {
         assert!(update_error.is_error);
         assert_error_contains(&update_error, "Plan Mode cannot modify");
 
+        let update_title = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            UPDATE_PLAN_TOOL,
+            json!({
+                "planId": "plan-ready",
+                "title": "Updated title",
+                "overview": "Updated overview",
+                "status": null,
+                "errorMessage": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!update_title.is_error, "{:?}", update_title.output);
+        assert_eq!(update_title.output["plan"]["title"], "Updated title");
+        assert_eq!(update_title.output["plan"]["overview"], "Updated overview");
+        assert_eq!(update_title.output["plan"]["status"], "ready");
+
         let update_step_status = execute_builtin_tool_with_context(
             workspace.path(),
             context,
@@ -1685,6 +1714,31 @@ mod tests {
         );
         assert!(update_step_status.is_error);
         assert_error_contains(&update_step_status, "Plan Mode cannot modify");
+
+        let update_step_detail = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            UPDATE_PLAN_STEP_TOOL,
+            json!({
+                "planId": "plan-ready",
+                "stepId": "step-plan-ready",
+                "title": "Updated step",
+                "detail": "Updated detail",
+                "acceptance": ["Updated acceptance"],
+                "status": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(
+            !update_step_detail.is_error,
+            "{:?}",
+            update_step_detail.output
+        );
+        let step = &update_step_detail.output["plan"]["phases"][0]["steps"][0];
+        assert_eq!(step["title"], "Updated step");
+        assert_eq!(step["detail"], "Updated detail");
+        assert_eq!(step["acceptance"], json!(["Updated acceptance"]));
+        assert_eq!(step["status"], "pending");
     }
 
     #[test]
@@ -1725,13 +1779,18 @@ mod tests {
         );
         assert!(denied.is_error);
         assert_error_contains(&denied, "current chat");
-        assert!(
-            WorkspaceDatabase::open_or_create(workspace.path())
-                .expect("database")
-                .plan("plan-owned")
-                .expect("plan query")
-                .is_some()
+        assert_plan_exists(workspace.path(), "plan-owned");
+
+        insert_test_plan(workspace.path(), "plan-historical", None);
+        let denied_historical = execute_builtin_tool_with_context(
+            workspace.path(),
+            owner_context,
+            DELETE_PLAN_TOOL,
+            json!({ "planId": "plan-historical", "timeoutMs": null }),
         );
+        assert!(denied_historical.is_error);
+        assert_error_contains(&denied_historical, "current chat");
+        assert_plan_exists(workspace.path(), "plan-historical");
 
         let missing_chat = execute_builtin_tool_with_context(
             workspace.path(),
@@ -1741,6 +1800,7 @@ mod tests {
         );
         assert!(missing_chat.is_error);
         assert_error_contains(&missing_chat, "current chat id");
+        assert_plan_exists(workspace.path(), "plan-owned");
 
         let deleted = execute_builtin_tool_with_context(
             workspace.path(),
@@ -1751,13 +1811,7 @@ mod tests {
         assert!(!deleted.is_error, "{:?}", deleted.output);
         assert_eq!(deleted.output["deleted"], true);
         assert_eq!(deleted.output["planId"], "plan-owned");
-        assert!(
-            WorkspaceDatabase::open_or_create(workspace.path())
-                .expect("database")
-                .plan("plan-owned")
-                .expect("plan query")
-                .is_none()
-        );
+        assert_plan_missing(workspace.path(), "plan-owned");
 
         let missing = execute_builtin_tool_with_context(
             workspace.path(),
@@ -1767,6 +1821,50 @@ mod tests {
         );
         assert!(missing.is_error);
         assert_error_contains(&missing, "plan was not found");
+    }
+
+    fn insert_test_plan(workspace_path: &Path, plan_id: &str, source_chat_id: Option<&str>) {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Historical plan",
+                overview: "Plan inserted directly for ownership checks.",
+                status: "ready",
+                source_chat_id,
+                phases: vec![NewPlanPhase {
+                    id: &format!("phase-{plan_id}"),
+                    title: "Phase 1",
+                    summary: "",
+                    steps: vec![NewPlanStep {
+                        id: &format!("step-{plan_id}"),
+                        title: "Step 1",
+                        detail: "",
+                        acceptance: Vec::new(),
+                    }],
+                }],
+            })
+            .expect("insert test plan");
+    }
+
+    fn assert_plan_exists(workspace_path: &Path, plan_id: &str) {
+        assert!(
+            WorkspaceDatabase::open_or_create(workspace_path)
+                .expect("database")
+                .plan(plan_id)
+                .expect("plan query")
+                .is_some()
+        );
+    }
+
+    fn assert_plan_missing(workspace_path: &Path, plan_id: &str) {
+        assert!(
+            WorkspaceDatabase::open_or_create(workspace_path)
+                .expect("database")
+                .plan(plan_id)
+                .expect("plan query")
+                .is_none()
+        );
     }
 
     fn plan_tool_create_input(
