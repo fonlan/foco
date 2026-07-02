@@ -368,6 +368,7 @@ export const settings = {
     ],
     directories: ["C:\\Users\\fonla\\.agents\\skills"],
     errors: [],
+    translationModelId: null,
   },
   thinkingLevels: [
     { label: "Low", value: "low" },

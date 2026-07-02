@@ -510,6 +510,7 @@ pub(crate) fn skills_settings_summary(
             })
             .collect(),
         errors: discovery.errors,
+        translation_model_id: config.skills.translation_model_id.clone(),
     }
 }
 

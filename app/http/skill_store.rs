@@ -7,14 +7,19 @@ use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
 };
-use foco_store::config::{SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SkillSettings};
+use foco_providers::{NeutralChatRequest, NeutralChatRole, NeutralToolDefinition};
+use foco_store::config::{
+    GlobalConfig, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
+    SkillSettings,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, config_snapshot, discover_skills, merge_disabled_skill_keys,
+    ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
+    discover_skills, merge_disabled_skill_keys, neutral_text_message, provider_connection_config,
     refresh_derived_enabled_skills, save_config, skills::parse_skill_markdown, unique_id,
-    workspace_by_id,
+    workspace_by_id, xml_cdata_section,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -22,6 +27,9 @@ const DEFAULT_SKILLS_API_BASE_URL: &str = "https://skills-api.deeptoai.com";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 const SKILL_FILE_NAME: &str = "SKILL.md";
+const SKILL_TRANSLATION_TOOL_NAME: &str = "submit_skill_translation";
+const SKILL_TRANSLATION_TIMEOUT_MS: u64 = 120_000;
+const SKILL_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +54,13 @@ pub(crate) struct SkillStoreInstallRequest {
     overwrite: bool,
     #[serde(default)]
     files: Vec<SkillStoreFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreTranslateRequest {
+    pub(crate) content: String,
+    pub(crate) target_language: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +109,12 @@ pub(crate) struct SkillStoreInstallResponse {
     workspace_id: Option<String>,
     path: String,
     detected: Vec<SkillSettings>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreTranslateResponse {
+    translated_content: String,
 }
 
 #[derive(Clone)]
@@ -506,6 +527,177 @@ pub(crate) async fn skill_store_detail(
             .detail(&skill_id, query.source.as_deref())
             .await?,
     ))
+}
+
+pub(crate) async fn skill_store_translate(
+    State(state): State<AppState>,
+    Json(request): Json<SkillStoreTranslateRequest>,
+) -> Result<Json<SkillStoreTranslateResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let model = resolve_skill_translation_model(&config)?;
+    let provider = provider_for_model(&config, model)?;
+    let workspace = workspace_by_id(&config, &config.app.active_workspace_id)?;
+    let request = skill_translation_provider_request(
+        &model.id,
+        request.content.as_str(),
+        request.target_language.as_str(),
+    )?;
+    let tool_arguments = audited_provider_tool_request(
+        &workspace.path,
+        &workspace.id,
+        None,
+        &provider.id,
+        &provider_connection_config(provider)?,
+        request,
+        "skill store translation",
+        SKILL_TRANSLATION_TOOL_NAME,
+        "submit skill translation tool",
+        SKILL_TRANSLATION_TIMEOUT_MS,
+        config.app.llm_request_retry_count,
+        api_audit_save_details(&config),
+    )
+    .await?;
+    let translated_content = parse_skill_translation_output(tool_arguments)?;
+
+    Ok(Json(SkillStoreTranslateResponse { translated_content }))
+}
+
+pub(crate) fn resolve_skill_translation_model(
+    config: &GlobalConfig,
+) -> Result<&ModelSettings, ApiError> {
+    let model_id = config
+        .skills
+        .translation_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .ok_or_else(|| ApiError::bad_request("skill translation model is not configured"))?;
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("skill translation model was not found: {model_id}"))
+        })?;
+    if !model.enabled || !model_outputs_text(model) {
+        return Err(ApiError::bad_request(format!(
+            "skill translation model '{model_id}' is disabled or cannot output text"
+        )));
+    }
+    if model
+        .active_provider_id
+        .as_deref()
+        .map_or(true, |provider_id| provider_id.is_empty())
+    {
+        return Err(ApiError::bad_request(format!(
+            "skill translation model '{model_id}' has no active provider selected"
+        )));
+    }
+
+    Ok(model)
+}
+
+fn provider_for_model<'a>(
+    config: &'a GlobalConfig,
+    model: &ModelSettings,
+) -> Result<&'a ProviderSettings, ApiError> {
+    let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "skill translation model '{}' has no active provider selected",
+            model.id
+        ))
+    })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' is not associated with skill translation model '{}'",
+            provider_id, model.id
+        )));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("provider '{provider_id}' was not found")))?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    Ok(provider)
+}
+
+pub(crate) fn skill_translation_provider_request(
+    model_id: &str,
+    content: &str,
+    target_language: &str,
+) -> Result<NeutralChatRequest, ApiError> {
+    let target_language = target_language.trim();
+    if target_language.is_empty() {
+        return Err(ApiError::bad_request("targetLanguage must not be empty"));
+    }
+    if content.trim().is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+
+    Ok(NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                "Translate SKILL.md display text only. Preserve Markdown structure, frontmatter keys, YAML syntax, code fences, inline code, commands, paths, URLs, package names, environment variables, placeholders, IDs, and product or proper names unless they are normal prose. Return the result by calling submit_skill_translation exactly once.".to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "Target language: {target_language}\n\nTranslate this SKILL.md content for display only. Do not add commentary.\n{}",
+                    xml_cdata_section("skill_markdown", content)
+                ),
+            ),
+        ],
+        tools: vec![skill_translation_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(SKILL_TRANSLATION_MAX_OUTPUT_TOKENS),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    })
+}
+
+fn skill_translation_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: SKILL_TRANSLATION_TOOL_NAME.to_string(),
+        description: "Submit the translated SKILL.md display Markdown.".to_string(),
+        strict: true,
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "translatedContent": {
+                    "type": "string",
+                    "description": "The translated SKILL.md Markdown for display."
+                }
+            },
+            "required": ["translatedContent"]
+        }),
+    }
+}
+
+fn parse_skill_translation_output(arguments: Value) -> Result<String, ApiError> {
+    arguments
+        .get("translatedContent")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| ApiError::internal("skill translation response was empty"))
+}
+
+fn model_outputs_text(model: &ModelSettings) -> bool {
+    model.output_modalities.is_empty()
+        || model
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "text")
 }
 
 pub(crate) async fn skill_store_install(

@@ -52,8 +52,9 @@ use crate::http::{
         default_plan_mode_system_prompt, filter_provider_model_ids,
     },
     skill_store::{
-        SkillStoreFile, ensure_skill_files_valid, install_skill_files_to_target_dir,
-        registry_files_from_value, registry_source_from_value, sanitize_skill_file_path,
+        SkillStoreFile, SkillStoreTranslateRequest, ensure_skill_files_valid,
+        install_skill_files_to_target_dir, registry_files_from_value, registry_source_from_value,
+        sanitize_skill_file_path, skill_store_translate, skill_translation_provider_request,
         validate_skill_slug,
     },
     spec::{
@@ -14547,6 +14548,62 @@ fn skill_store_registry_files_parse_skill_and_support_files() {
     assert_eq!(files[0].content, "---\nname: lark-calendar\n---\n");
     assert_eq!(files[1].path, "support/prompts.md");
     assert_eq!(files[1].content, "Use the calendar API.");
+}
+
+#[test]
+fn skill_store_translation_request_preserves_target_and_tool_schema() {
+    let request = skill_translation_provider_request(
+        "translator",
+        "---\nname: gitmemo\n---\n\n# Use `git status`\n",
+        "Chinese",
+    )
+    .expect("translation request");
+
+    assert_eq!(request.model_id, "translator");
+    assert_eq!(request.tools.len(), 1);
+    assert_eq!(request.tools[0].name, "submit_skill_translation");
+    assert_eq!(
+        request.tools[0]
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required fields"),
+        &vec![Value::String("translatedContent".to_string())]
+    );
+    assert!(request.messages.iter().any(|message| {
+        message.content.contains("Target language: Chinese")
+            && message.content.contains("name: gitmemo")
+            && message.content.contains("git status")
+    }));
+}
+
+#[tokio::test]
+async fn skill_store_translate_requires_configured_model() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-translate-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-skill-translate-workspace-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    let error = skill_store_translate(
+        State(state),
+        Json(SkillStoreTranslateRequest {
+            content: "# Skill".to_string(),
+            target_language: "Chinese".to_string(),
+        }),
+    )
+    .await
+    .expect_err("missing translation model should fail");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        error
+            .message()
+            .contains("translation model is not configured")
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 #[test]

@@ -357,6 +357,7 @@ impl GlobalConfig {
                 detected: Vec::new(),
                 disabled: Vec::new(),
                 enabled: Vec::new(),
+                translation_model_id: None,
             },
             workspaces: vec![WorkspaceConfig {
                 id: DEFAULT_WORKSPACE_ID.to_string(),
@@ -670,6 +671,12 @@ impl GlobalConfig {
         for skill_id in &self.skills.disabled {
             validate_id(config_path, "skills.disabled", skill_id)?;
         }
+        validate_skill_translation_model(
+            config_path,
+            self.skills.translation_model_id.as_deref(),
+            &self.models,
+            &self.providers,
+        )?;
 
         Ok(())
     }
@@ -1271,6 +1278,9 @@ pub struct SkillConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub enabled: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "translationModelId", skip_serializing_if = "Option::is_none")]
+    pub translation_model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1932,6 +1942,57 @@ fn model_outputs_text(model: &ModelSettings) -> bool {
             .output_modalities
             .iter()
             .any(|modality| modality == "text")
+}
+
+fn validate_skill_translation_model(
+    config_path: Option<&Path>,
+    model_id: Option<&str>,
+    models: &[ModelSettings],
+    providers: &[ProviderSettings],
+) -> Result<(), ConfigError> {
+    let Some(model_id) = model_id else {
+        return Ok(());
+    };
+    require_non_empty(config_path, "skills.translationModelId", model_id)?;
+
+    let Some(model) = models.iter().find(|model| model.id == model_id) else {
+        return invalid_config(
+            config_path,
+            format!("skills.translationModelId references missing model '{model_id}'"),
+        );
+    };
+    if !model.enabled || !model_outputs_text(model) {
+        return invalid_config(
+            config_path,
+            format!(
+                "skills.translationModelId references disabled or non-text-output model '{model_id}'"
+            ),
+        );
+    }
+    let active_provider_id =
+        model
+            .active_provider_id
+            .as_deref()
+            .ok_or_else(|| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: format!(
+                    "skills.translationModelId model '{model_id}' has no active provider selected"
+                ),
+            })?;
+    let active_provider_enabled = providers
+        .iter()
+        .find(|provider| provider.id == active_provider_id)
+        .is_some_and(|provider| provider.enabled);
+    if !active_provider_enabled {
+        return invalid_config(
+            config_path,
+            format!(
+                "skills.translationModelId model '{model_id}' references missing or disabled active provider '{active_provider_id}'"
+            ),
+        );
+    }
+
+    Ok(())
 }
 
 pub fn validate_agent_definition_tool_references(

@@ -1671,6 +1671,7 @@ type SkillsSettingsSummary = {
   directories: string[];
   detected: ConfiguredSkillSummary[];
   errors: SkillDiscoveryErrorSummary[];
+  translationModelId: string | null;
 };
 
 export type ConfiguredSkillSummary = {

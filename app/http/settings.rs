@@ -253,6 +253,7 @@ pub(crate) struct ManualMcpServerRequest {
 pub(crate) struct ManualSkillsRequest {
     pub(crate) disabled: Option<Vec<String>>,
     pub(crate) enabled: Option<Vec<String>>,
+    pub(crate) translation_model_id: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -557,6 +558,7 @@ pub(crate) struct SkillsSettingsSummary {
     pub(crate) directories: Vec<String>,
     pub(crate) detected: Vec<ConfiguredSkillSummary>,
     pub(crate) errors: Vec<SkillDiscoveryErrorSummary>,
+    pub(crate) translation_model_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1939,14 +1941,30 @@ pub(crate) async fn save_skills(
     Json(request): Json<ManualSkillsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
+    let ManualSkillsRequest {
+        disabled,
+        enabled,
+        translation_model_id,
+    } = request;
     let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
-    let disabled =
-        normalize_manual_disabled_skill_ids(request.disabled, request.enabled, &discovery.skills)?;
+    let disabled = if disabled.is_none() && enabled.is_none() {
+        config.skills.disabled.clone()
+    } else {
+        normalize_manual_disabled_skill_ids(disabled, enabled, &discovery.skills)?
+    };
 
     config.skills.directories.clear();
     config.skills.detected = discovery.skills;
     config.skills.disabled = merge_disabled_skill_keys(disabled, &discovery.required_disabled);
+    if let Some(model_id) = translation_model_id {
+        config.skills.translation_model_id = model_id
+            .map(|model_id| model_id.trim().to_string())
+            .filter(|model_id| !model_id.is_empty());
+    }
     refresh_derived_enabled_skills(&mut config);
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
     save_config(&state, config.clone())?;
 
