@@ -3,7 +3,14 @@ import { createContext, useContext } from "react";
 import type { AppLanguageId, Translate } from "../api/types";
 
 export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
-  en: {},
+  en: {
+    "Could not translate summary": "Could not translate summary",
+    "No translation model": "No translation model",
+    "Show original": "Show original",
+    "Skill translation model": "Skill translation model",
+    Translate: "Translate",
+    Translating: "Translating",
+  },
   "zh-CN": {
     "Local workspace": "本地工作区",
     "Refresh workspaces": "刷新工作区",
@@ -112,6 +119,12 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Installed skill to {path}": "技能已安装到 {path}",
     "No summary available": "暂无摘要",
     Summary: "摘要",
+    Translate: "翻译",
+    "Show original": "显示原文",
+    Translating: "正在翻译",
+    "Could not translate summary": "无法翻译摘要",
+    "Skill translation model": "技能翻译模型",
+    "No translation model": "不使用翻译模型",
     "Refresh scheduled tasks": "刷新定时任务",
     "tasks {count}": "{count} 个任务",
     "New task": "新建任务",

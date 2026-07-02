@@ -368,7 +368,7 @@ export const settings = {
     ],
     directories: ["C:\\Users\\fonla\\.agents\\skills"],
     errors: [],
-    translationModelId: null,
+    translationModelId: null as string | null,
   },
   thinkingLevels: [
     { label: "Low", value: "low" },
@@ -2001,6 +2001,37 @@ function saveManualWorkspaceSettings(init?: RequestInit) {
 
   return appTestState.settingsResponse;
 }
+
+function savedSkillsSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as {
+    disabled?: string[];
+    enabled?: string[];
+    translationModelId?: string | null;
+  };
+  const enabled = new Set(body.enabled ?? []);
+  const disabled = new Set(body.disabled ?? []);
+
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    skills: {
+      ...appTestState.settingsResponse.skills,
+      detected: appTestState.settingsResponse.skills.detected.map((skill) => ({
+        ...skill,
+        enabled: enabled.has(skill.key)
+          ? true
+          : disabled.has(skill.key)
+            ? false
+            : skill.enabled,
+      })),
+      translationModelId:
+        body.translationModelId === undefined
+          ? appTestState.settingsResponse.skills.translationModelId
+          : body.translationModelId,
+    },
+  };
+
+  return appTestState.settingsResponse;
+}
 export function savedGeneralSettings(init?: RequestInit) {
   const body =
     typeof init?.body === "string"
@@ -2580,6 +2611,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  if (path === "/api/skill-store/translate") {
+    return jsonResponse({ translatedContent: "Translated SKILL.md summary" });
+  }
+
   const specJobRetryMatch = path.match(
     /^\/api\/workspaces\/([^/]+)\/spec\/jobs\/([^/]+)\/retry$/,
   );
@@ -2941,7 +2976,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/skills/manual") {
-    return jsonResponse(savedSettings.skills);
+    return jsonResponse(savedSkillsSettings(init));
   }
 
   if (path === "/api/skills/refresh") {

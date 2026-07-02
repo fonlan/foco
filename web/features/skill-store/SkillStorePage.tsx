@@ -4,12 +4,13 @@ import {
   ExternalLink,
   FileText,
   Folder,
+  Languages,
   LoaderCircle,
   RefreshCw,
   Search,
   ShieldCheck,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   ConfiguredSkillSummary,
@@ -66,6 +67,10 @@ type SkillStoreInstallResponse = {
   detected: ConfiguredSkillSummary[];
 };
 
+type SkillStoreTranslateResponse = {
+  translatedContent: string;
+};
+
 type InstallTarget = "global" | "workspace";
 
 type FileTreeNode =
@@ -108,6 +113,12 @@ export function SkillStorePage({
   const [isInstalling, setIsInstalling] = useState(false);
   const [installMessage, setInstallMessage] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
+  const [translatedSummary, setTranslatedSummary] = useState<string | null>(null);
+  const [isTranslated, setIsTranslated] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translationError, setTranslationError] = useState<string | null>(null);
+  const [translationCacheKey, setTranslationCacheKey] = useState<string | null>(null);
+  const lastTranslationResetKeyRef = useRef<string | null>(null);
 
   const configuredWorkspaces = settings?.workspaces ?? [];
   const workspaceTargets = useMemo(() => {
@@ -251,6 +262,15 @@ export function SkillStorePage({
 
   const skillSummaryFile = detail?.files.find((file) => file.path === "SKILL.md") ?? null;
   const summaryText = skillSummaryFile?.content.trim() ?? "";
+  const translationModelId = settings?.skills.translationModelId ?? null;
+  const targetLanguage = settings?.general.language ?? "en";
+  const summaryTranslationKey = `${detail?.id ?? ""}\u0000${detail?.source ?? ""}\u0000${targetLanguage}\u0000${translationModelId ?? ""}\u0000${summaryText}`;
+  const hasCurrentTranslation = Boolean(
+    translatedSummary && translationCacheKey === summaryTranslationKey,
+  );
+  const showingTranslatedSummary = isTranslated && hasCurrentTranslation;
+  const displaySummaryText = showingTranslatedSummary && translatedSummary ? translatedSummary : summaryText;
+  const canTranslateSummary = Boolean(translationModelId && summaryText);
   const fileTree = useMemo(() => buildFileTree(detail?.files ?? []), [detail?.files]);
   const canInstall = Boolean(
     detail && (installTarget === "global" || workspaceId) && !isInstalling,
@@ -258,6 +278,70 @@ export function SkillStorePage({
   const showOverwriteOption = Boolean(
     installError?.toLocaleLowerCase().includes("already exists") || overwrite,
   );
+
+  useEffect(() => {
+    if (lastTranslationResetKeyRef.current === summaryTranslationKey) {
+      return;
+    }
+
+    lastTranslationResetKeyRef.current = summaryTranslationKey;
+    setTranslatedSummary(null);
+    setIsTranslated(false);
+    setIsTranslating(false);
+    setTranslationError(null);
+    setTranslationCacheKey(null);
+  }, [summaryTranslationKey]);
+
+  async function toggleSummaryTranslation() {
+    if (showingTranslatedSummary) {
+      setIsTranslated(false);
+      setTranslationError(null);
+      return;
+    }
+
+    if (hasCurrentTranslation) {
+      setIsTranslated(true);
+      setTranslationError(null);
+      return;
+    }
+
+    if (!summaryText) {
+      return;
+    }
+
+    setIsTranslating(true);
+    setTranslationError(null);
+    const requestKey = summaryTranslationKey;
+    try {
+      const data = await requestJson<SkillStoreTranslateResponse>(
+        "/api/skill-store/translate",
+        {
+          body: JSON.stringify({
+            content: summaryText,
+            targetLanguage,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      if (lastTranslationResetKeyRef.current !== requestKey) {
+        return;
+      }
+      setTranslatedSummary(data.translatedContent);
+      setTranslationCacheKey(requestKey);
+      setIsTranslated(true);
+    } catch (requestError) {
+      if (lastTranslationResetKeyRef.current === requestKey) {
+        setTranslationError(
+          `${t("Could not translate summary")}: ${errorMessage(requestError)}`,
+        );
+      }
+    } finally {
+      if (lastTranslationResetKeyRef.current === requestKey) {
+        setIsTranslating(false);
+      }
+    }
+  }
 
   return (
     <section className="skill-store-page">
@@ -464,10 +548,47 @@ export function SkillStorePage({
               </div>
 
               <section className="skill-store-detail-section">
-                <h3>{t("Summary")}</h3>
+                <div className="skill-store-section-heading">
+                  <h3>{t("Summary")}</h3>
+                  {canTranslateSummary ? (
+                    <button
+                      aria-label={
+                        isTranslating
+                          ? t("Translating")
+                          : showingTranslatedSummary
+                            ? t("Show original")
+                            : t("Translate")
+                      }
+                      className="skill-store-icon-button"
+                      disabled={isTranslating}
+                      onClick={() => void toggleSummaryTranslation()}
+                      title={
+                        isTranslating
+                          ? t("Translating")
+                          : showingTranslatedSummary
+                            ? t("Show original")
+                            : t("Translate")
+                      }
+                      type="button"
+                    >
+                      {isTranslating ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : showingTranslatedSummary ? (
+                        <RefreshCw aria-hidden="true" className="size-4" />
+                      ) : (
+                        <Languages aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
+                  ) : null}
+                </div>
+                {translationError ? (
+                  <p className="skill-store-translation-error" role="alert">
+                    {translationError}
+                  </p>
+                ) : null}
                 {summaryText ? (
                   <div className="markdown-content skill-store-summary-markdown">
-                    <MarkdownRenderer allowHtml={false} content={summaryText} />
+                    <MarkdownRenderer allowHtml={false} content={displaySummaryText} />
                   </div>
                 ) : (
                   <p className="skill-store-detail-empty">{t("No summary available")}</p>
@@ -475,7 +596,9 @@ export function SkillStorePage({
               </section>
 
               <section className="skill-store-detail-section">
-                <h3>{t("Files")}</h3>
+                <div className="skill-store-section-heading">
+                  <h3>{t("Files")}</h3>
+                </div>
                 <FileTree nodes={fileTree} />
               </section>
             </div>

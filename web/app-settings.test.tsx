@@ -95,6 +95,31 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
+  it("saves the skill translation model without changing enabled skills", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    await userEvent.selectOptions(screen.getByLabelText("Skill translation model"), "gpt-test");
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/skills/manual",
+        expect.objectContaining({
+          body: JSON.stringify({
+            disabled: [],
+            enabled: ["global:gitmemo"],
+            translationModelId: "gpt-test",
+          }),
+          method: "POST",
+        }),
+      );
+    });
+  });
+
   it("filters plan history by selected workspace", async () => {
     appTestState.settingsResponse = {
       ...settings,
@@ -1922,6 +1947,7 @@ describe("app-settings verification surfaces", () => {
           body: JSON.stringify({
             disabled: [],
             enabled: ["global:gitmemo"],
+            translationModelId: null,
           }),
           method: "POST",
         }),

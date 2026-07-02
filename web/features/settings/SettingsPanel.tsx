@@ -3514,7 +3514,10 @@ export function SettingsPanel({
     }
   }
 
-  async function saveSkills(nextEnabledSkillIds: Set<string>) {
+  async function saveSkills(
+    nextEnabledSkillIds: Set<string>,
+    nextTranslationModelId = skills?.translationModelId ?? null,
+  ) {
     setIsSavingSkills(true);
     setError(null);
 
@@ -3526,6 +3529,7 @@ export function SettingsPanel({
         body: JSON.stringify({
           disabled: disabledSkillIds,
           enabled: Array.from(nextEnabledSkillIds),
+          translationModelId: nextTranslationModelId,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -4041,6 +4045,15 @@ export function SettingsPanel({
 
     setEnabledSkillIds(next);
     void saveSkills(next);
+  }
+
+  function changeSkillTranslationModel(modelId: string) {
+    const currentEnabledSkillIds = new Set(
+      (skills?.detected ?? [])
+        .filter((skill) => skill.enabled)
+        .map((skill) => skill.key),
+    );
+    void saveSkills(currentEnabledSkillIds, modelId || null);
   }
 
   function handleModelDragStart(
@@ -9928,6 +9941,28 @@ export function SettingsPanel({
 
           {activeSection === "skills" ? (
             <section className="grid gap-4">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    {t("Skill translation model")}
+                  </span>
+                  <select
+                    aria-label={t("Skill translation model")}
+                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                    disabled={isSavingSkills}
+                    onChange={(event) => changeSkillTranslationModel(event.target.value)}
+                    value={skills?.translationModelId ?? ""}
+                  >
+                    <option value="">{t("No translation model")}</option>
+                    {configuredModelsByName.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </section>
+
               <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">

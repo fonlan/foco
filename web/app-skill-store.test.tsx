@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  appTestState,
   changeInput,
   jsonResponse,
   mockFetch,
@@ -79,6 +80,62 @@ describe("skill store app surface", () => {
       ),
     ).toBe(true);
     expect(await screen.findByText(/Installed skill to/)).toBeInTheDocument();
+  });
+
+  it("hides the summary translation button until a model is configured", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    const detailPane = await screen.findByRole("region", { name: "Skill details" });
+    expect(await within(detailPane).findByText("Use this skill to collect focused web references.")).toBeInTheDocument();
+
+    expect(within(detailPane).queryByRole("button", { name: "Translate" })).not.toBeInTheDocument();
+  });
+
+  it("translates the summary once and toggles back to the original", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const skillContent = [
+      "---",
+      "name: browser-scout",
+      "description: Find useful web references.",
+      "---",
+      "",
+      "# Browser Scout",
+      "",
+      "Use this skill to collect focused web references.",
+    ].join("\n");
+    appTestState.settingsResponse = {
+      ...settings,
+      skills: { ...settings.skills, translationModelId: "gpt-test" },
+    };
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    const detailPane = await screen.findByRole("region", { name: "Skill details" });
+    expect(await within(detailPane).findByText("Use this skill to collect focused web references.")).toBeInTheDocument();
+
+    await userEvent.click(within(detailPane).getByRole("button", { name: "Translate" }));
+
+    await waitFor(() =>
+      expect(within(detailPane).getByText("Translated SKILL.md summary")).toBeInTheDocument(),
+    );
+    const translateCalls = fetchMock.mock.calls.filter(
+      ([url, init]) => url === "/api/skill-store/translate" && init?.method === "POST",
+    );
+    expect(translateCalls).toHaveLength(1);
+    expect(JSON.parse(String(translateCalls[0]?.[1]?.body))).toEqual({
+      content: skillContent,
+      targetLanguage: "en",
+    });
+
+    await userEvent.click(within(detailPane).getByRole("button", { name: "Show original" }));
+
+    expect(within(detailPane).getByText("Use this skill to collect focused web references.")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) => url === "/api/skill-store/translate" && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
   });
 
   it("shows localized full SKILL.md summary instead of README", async () => {
