@@ -361,20 +361,49 @@ fn show_about_foco_alert() {
 fn foco_macos_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
     const SIZE: u32 = 18;
     let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
-    for y in 3..15 {
-        for x in 4..14 {
-            let vertical = x <= 6;
-            let top = y <= 5;
-            let middle = (8..=10).contains(&y);
-            if vertical || top || middle {
+    // ponytail: hand-tuned 18px mask; upgrade to build-time SVG mask rasterization if
+    // we need exact multi-size fidelity later.
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let in_stem = rounded_rect_contains(px, py, 3.5, 3.0, 6.5, 12.0, 3.25);
+            let in_top = rounded_rect_contains(px, py, 3.5, 3.0, 12.0, 4.0, 2.0);
+            let in_focus = circle_contains(px, py, 9.5, 10.5, 3.0);
+            if in_stem || in_top || in_focus {
                 let index = ((y * SIZE + x) * 4) as usize;
-                rgba[index] = 0;
-                rgba[index + 1] = 0;
-                rgba[index + 2] = 0;
                 rgba[index + 3] = 255;
             }
         }
     }
 
     tray_icon::Icon::from_rgba(rgba, SIZE, SIZE)
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn rounded_rect_contains(
+    px: f32,
+    py: f32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+) -> bool {
+    let right = left + width;
+    let bottom = top + height;
+    if px < left || px >= right || py < top || py >= bottom {
+        return false;
+    }
+
+    let closest_x = px.clamp(left + radius, right - radius);
+    let closest_y = py.clamp(top + radius, bottom - radius);
+    circle_contains(px, py, closest_x, closest_y, radius)
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn circle_contains(px: f32, py: f32, cx: f32, cy: f32, radius: f32) -> bool {
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= radius * radius
 }
