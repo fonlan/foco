@@ -3,11 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Plan } from "./api/types";
-
-import {
-  PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
-  planAutoRunEnabledStorageKey,
-} from "./app/constants";
 import {
   activeMemory,
   agentTeamSnapshot,
@@ -1054,90 +1049,63 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
-  it("persists and migrates the auto-run checkbox preference per workspace", async () => {
+  it("loads and toggles backend plan auto-run state", async () => {
     const user = userEvent.setup();
-    const runningPlan = {
-      ...planFixture,
-      activePhaseId: "phase-1",
-      phases: [
-        {
-          ...planFixture.phases[0],
-          status: "running",
-        },
-      ],
-      status: "running",
-    };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
-
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [runningPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
-
-      return mockFetch(input, init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const storageKey = planAutoRunEnabledStorageKey("workspace-1");
-    window.localStorage.setItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY, "true");
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
-
-    renderApp();
-
-    await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    const autoRunCheckbox = await screen.findByRole("checkbox", {
-      name: /Auto run plans/,
-    });
-
-    expect(autoRunCheckbox).toBeChecked();
-    expect(window.localStorage.getItem(storageKey)).toBe("true");
-    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
-
-    await user.click(autoRunCheckbox);
-    expect(window.localStorage.getItem(storageKey)).toBe("false");
-    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
-
-    await user.click(autoRunCheckbox);
-    expect(window.localStorage.getItem(storageKey)).toBe("true");
-    expect(window.localStorage.getItem(PLAN_AUTO_RUN_ENABLED_STORAGE_KEY)).toBeNull();
-  });
-
-  it("keeps the auto-run checkbox preference scoped to the active workspace", async () => {
-    const user = userEvent.setup();
-    const runningPlan = {
-      ...planFixture,
-      activePhaseId: "phase-1",
-      phases: [
-        {
-          ...planFixture.phases[0],
-          status: "running",
-        },
-      ],
-      status: "running",
-    };
-    const planRequestPaths: string[] = [];
+    const autoRunRequests: Array<{ enabled?: boolean; method: string }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const rawUrl = typeof input === "string" ? input : input.toString();
       const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path.match(/^\/api\/workspaces\/[^/]+\/plans$/)) {
-        planRequestPaths.push(path);
-        const workspaceId = path.split("/")[3] ?? "";
-        const plans = workspaceId === "workspace-2" ? [] : [runningPlan];
+      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+          : {};
+        autoRunRequests.push({ enabled: body.enabled, method: init?.method ?? "GET" });
+        return jsonResponse({ busy: body.enabled ?? false, enabled: body.enabled ?? false });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    const autoRunCheckbox = await screen.findByRole("checkbox", {
+      name: /Auto run plans/,
+    });
+    expect(autoRunCheckbox).not.toBeChecked();
+
+    await user.click(autoRunCheckbox);
+
+    await waitFor(() => {
+      expect(autoRunRequests).toContainEqual({ enabled: true, method: "PUT" });
+    });
+    expect(autoRunCheckbox).toBeChecked();
+    expect(await screen.findByText("Auto running")).toBeInTheDocument();
+  });
+
+  it("keeps plan auto-run state scoped to the active workspace", async () => {
+    const user = userEvent.setup();
+    const autoRunEnabledByWorkspace: Record<string, boolean> = {
+      "workspace-1": true,
+      "workspace-2": false,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+      const match = path.match(/^\/api\/workspaces\/([^/]+)\/plans\/auto-run$/);
+
+      if (match) {
+        const workspaceId = decodeURIComponent(match[1] ?? "");
+        if (init?.method === "PUT") {
+          const body = JSON.parse(String(init.body ?? "{}")) as { enabled?: boolean };
+          autoRunEnabledByWorkspace[workspaceId] = body.enabled ?? false;
+        }
         return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans,
-          totalCount: plans.length,
-          totalPages: plans.length ? 1 : 0,
+          busy: false,
+          enabled: autoRunEnabledByWorkspace[workspaceId] ?? false,
         });
       }
 
@@ -1152,25 +1120,16 @@ describe("app-panels-stats verification surfaces", () => {
     const autoRunCheckbox = await screen.findByRole("checkbox", {
       name: /Auto run plans/,
     });
-    await user.click(autoRunCheckbox);
-    expect(autoRunCheckbox).toBeChecked();
-    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
-      "true",
-    );
+    await waitFor(() => {
+      expect(autoRunCheckbox).toBeChecked();
+    });
 
     await user.click(screen.getByRole("button", { name: "Side project" }));
     await user.click(screen.getByRole("button", { name: /Side note/ }));
+
     await waitFor(() => {
       expect(autoRunCheckbox).not.toBeChecked();
     });
-    await waitFor(() => {
-      expect(planRequestPaths).toContain("/api/workspaces/workspace-2/plans");
-    });
-    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
-    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
-      "true",
-    );
-    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-2"))).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Default" }));
     await user.click(screen.getByRole("tab", { name: /Tool run/ }));
@@ -1296,240 +1255,9 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
 
-  it("auto-runs active plans in order while waiting for running plans", async () => {
-    const user = userEvent.setup();
-    const timestamp = "2026-06-28T05:00:00Z";
-    const makePlan = (
-      id: string,
-      title: string,
-      status: "ready" | "running" | "implemented" | "completed" | "cancelled",
-      sortOrder: number,
-    ) => {
-      const phaseId = `${id}-phase-1`;
-      const stepId = `${id}-step-1`;
-      const isRunning = status === "running";
-      const isCompleted = status === "implemented" || status === "completed";
-      const isCancelled = status === "cancelled";
-      const isTerminal = isCompleted || isCancelled;
 
-      return {
-        activePhaseId: isRunning ? phaseId : null,
-        completedAt: isCompleted ? timestamp : null,
-        completedByUserAt: status === "completed" ? timestamp : null,
-        createdAt: timestamp,
-        errorMessage: null,
-        sharedMergeCommitId: null,
-        id,
-        overview: `${title} overview`,
-        pauseRequestedAt: null,
-        phases: [
-          {
-            agentTaskId: isRunning ? `${id}-task-1` : null,
-            agentTeamId: isRunning ? `${id}-team-1` : null,
-            commitId: status === "implemented" ? `${id}-commit-1` : null,
-            completedAt: isTerminal ? timestamp : null,
-            createdAt: timestamp,
-            errorMessage: null,
-            id: phaseId,
-            implementationChatId: null,
-            mergeAttemptCount: 0,
-            planId: id,
-            sequence: 0,
-            startedAt: isRunning || isTerminal ? timestamp : null,
-            status: isRunning
-              ? "running"
-              : isCompleted
-                ? "completed"
-                : isCancelled
-                  ? "cancelled"
-                  : "pending",
-            steps: [
-              {
-                acceptance: [`${title} acceptance`],
-                checkedAt: isCompleted ? timestamp : null,
-                createdAt: timestamp,
-                detail: `${title} detail`,
-                id: stepId,
-                phaseId,
-                planId: id,
-                sequence: 0,
-                status: isCompleted
-                  ? "completed"
-                  : isCancelled
-                    ? "cancelled"
-                    : "pending",
-                title: `${title} step`,
-                updatedAt: timestamp,
-              },
-            ],
-            summary: `${title} phase`,
-            title: `${title} phase`,
-            updatedAt: timestamp,
-          },
-        ],
-        sortOrder,
-        sourceChatId: "chat-1",
-        status,
-        title,
-        updatedAt: timestamp,
-      };
-    };
-    const planSnapshots = [
-      [
-        makePlan("plan-1", "First ready plan", "ready", 0),
-        makePlan("plan-2", "Second ready plan", "ready", 1),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "running", 0),
-        makePlan("plan-2", "Second ready plan", "ready", 1),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "implemented", 0),
-        makePlan("plan-2", "Second ready plan", "ready", 1),
-        makePlan("plan-3", "Third added plan", "ready", 2),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "implemented", 0),
-        makePlan("plan-2", "Second ready plan", "running", 1),
-        makePlan("plan-3", "Third added plan", "ready", 2),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "implemented", 0),
-        makePlan("plan-2", "Second ready plan", "implemented", 1),
-        makePlan("plan-3", "Third added plan", "ready", 2),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "implemented", 0),
-        makePlan("plan-2", "Second ready plan", "implemented", 1),
-        makePlan("plan-3", "Third added plan", "running", 2),
-      ],
-      [
-        makePlan("plan-1", "First ready plan", "implemented", 0),
-        makePlan("plan-2", "Second ready plan", "completed", 1),
-        makePlan("plan-3", "Third added plan", "cancelled", 2),
-      ],
-    ];
-    let planStage = 0;
-    const waitForAutoRunRefresh = () =>
-      act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 3100));
-      });
-    const actionCallSummary = () =>
-      fetchMock.mock.calls
-        .map(([input, init]) => {
-          const url = typeof input === "string" ? input : input.toString();
-          const path = new URL(url, "http://127.0.0.1").pathname;
-          const match = path.match(
-            /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
-          );
 
-          if (!match) {
-            return null;
-          }
-
-          return {
-            action: JSON.parse(String(init?.body ?? "{}")) as { action?: string },
-            planId: decodeURIComponent(match[1] ?? ""),
-          };
-        })
-        .filter((call): call is { action: { action?: string }; planId: string } =>
-          call !== null,
-        );
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
-
-      if (path === "/api/workspaces/workspace-1/plans") {
-        const plans = planSnapshots[planStage] ?? planSnapshots.at(-1) ?? [];
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans,
-          totalCount: plans.length,
-          totalPages: 1,
-        });
-      }
-
-      const actionMatch = path.match(
-        /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
-      );
-      if (actionMatch) {
-        const planId = decodeURIComponent(actionMatch[1] ?? "");
-        planStage = planId === "plan-1" ? 1 : planId === "plan-2" ? 3 : 5;
-        const plan = (planSnapshots[planStage] ?? []).find(
-          (candidate) => candidate.id === planId,
-        );
-        return jsonResponse({ plan });
-      }
-
-      return mockFetch(input, init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
-
-    renderApp();
-
-    await screen.findAllByText("Default");
-    await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    await screen.findByText("First ready plan", {}, { timeout: 3000 });
-    const autoRunCheckbox = await screen.findByRole("checkbox", {
-      name: /Auto run plans/,
-    });
-    await user.click(autoRunCheckbox);
-    expect(autoRunCheckbox).toBeChecked();
-
-    await waitFor(() => {
-      expect(actionCallSummary()).toEqual([
-        { action: { action: "start" }, planId: "plan-1" },
-      ]);
-    });
-
-    await waitForAutoRunRefresh();
-    expect(actionCallSummary()).toEqual([
-      { action: { action: "start" }, planId: "plan-1" },
-    ]);
-
-    planStage = 2;
-    await waitForAutoRunRefresh();
-    await waitFor(() => {
-      expect(actionCallSummary()).toEqual([
-        { action: { action: "start" }, planId: "plan-1" },
-        { action: { action: "start" }, planId: "plan-2" },
-      ]);
-    });
-
-    await waitForAutoRunRefresh();
-    expect(actionCallSummary()).toEqual([
-      { action: { action: "start" }, planId: "plan-1" },
-      { action: { action: "start" }, planId: "plan-2" },
-    ]);
-
-    planStage = 4;
-    await waitForAutoRunRefresh();
-    await waitFor(() => {
-      expect(actionCallSummary()).toEqual([
-        { action: { action: "start" }, planId: "plan-1" },
-        { action: { action: "start" }, planId: "plan-2" },
-        { action: { action: "start" }, planId: "plan-3" },
-      ]);
-    });
-
-    planStage = 6;
-    await waitForAutoRunRefresh();
-    await waitFor(() => {
-      expect(autoRunCheckbox).not.toBeChecked();
-    });
-    expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
-      "false",
-    );
-    expect(actionCallSummary()).toEqual([
-      { action: { action: "start" }, planId: "plan-1" },
-      { action: { action: "start" }, planId: "plan-2" },
-      { action: { action: "start" }, planId: "plan-3" },
-    ]);
-  }, 30000);
-
-  it("reorders active plans and auto-runs the new first plan", async () => {
+  it("reorders active plans without frontend auto-running the new first plan", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-07-02T11:00:00Z";
     const makePlan = (id: string, title: string, sortOrder: number) => ({
@@ -1559,10 +1287,18 @@ describe("app-panels-stats verification surfaces", () => {
     const secondPlan = makePlan("plan-2", "Second queue plan", 1);
     let plans: Plan[] = [firstPlan, secondPlan];
     const orderRequests: Array<{ planIds: string[] }> = [];
-    const actionCalls: Array<{ action?: string; planId: string }> = [];
+    const autoRunRequests: Array<{ enabled?: boolean; method: string }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const rawUrl = typeof input === "string" ? input : input.toString();
       const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+          : {};
+        autoRunRequests.push({ enabled: body.enabled, method: init?.method ?? "GET" });
+        return jsonResponse({ busy: false, enabled: body.enabled ?? false });
+      }
 
       if (path === "/api/workspaces/workspace-1/plans/order") {
         const body = JSON.parse(String(init?.body ?? "{}")) as { planIds: string[] };
@@ -1595,11 +1331,6 @@ describe("app-panels-stats verification surfaces", () => {
       );
       if (actionMatch) {
         const planId = decodeURIComponent(actionMatch[1] ?? "");
-        const body = JSON.parse(String(init?.body ?? "{}")) as { action?: string };
-        actionCalls.push({ action: body.action, planId });
-        plans = plans.map((plan) =>
-          plan.id === planId ? { ...plan, activePhaseId: `${plan.id}-phase-1`, status: "running" as const } : plan,
-        );
         const plan = plans.find((candidate) => candidate.id === planId) ?? secondPlan;
         return jsonResponse({ plan });
       }
@@ -1646,8 +1377,12 @@ describe("app-panels-stats verification surfaces", () => {
 
     await user.click(await screen.findByRole("checkbox", { name: /Auto run plans/ }));
     await waitFor(() => {
-      expect(actionCalls).toEqual([{ action: "start", planId: "plan-2" }]);
+      expect(autoRunRequests).toContainEqual({ enabled: true, method: "PUT" });
     });
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^\/api\/workspaces\/workspace-1\/plans\/[^/]+\/action$/),
+      expect.anything(),
+    );
   });
 
   it("shows retry merge for dirty merge blocked plans and refreshes after retry", async () => {

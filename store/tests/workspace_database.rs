@@ -617,6 +617,90 @@ fn create_plan_reports_duplicate_step_id_within_same_request() {
     );
 }
 
+fn create_auto_run_test_plan(database: &mut WorkspaceDatabase, id: &str, status: &str) {
+    database
+        .create_plan(NewPlan {
+            id,
+            title: id,
+            overview: "auto run plan",
+            status,
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: &format!("{id}-phase"),
+                title: "Phase",
+                summary: "Run it",
+                steps: vec![NewPlanStep {
+                    id: &format!("{id}-step"),
+                    title: "Step",
+                    detail: "Do it",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create auto-run test plan");
+}
+
+#[test]
+fn plan_auto_run_candidate_selects_next_runnable_plan() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let mut database = database;
+
+    create_auto_run_test_plan(&mut database, "paused", "paused");
+    create_auto_run_test_plan(&mut database, "ready", "ready");
+    create_auto_run_test_plan(&mut database, "failed", "failed");
+
+    let candidate = database
+        .next_plan_auto_run_candidate()
+        .expect("candidate query")
+        .expect("candidate");
+    assert_eq!(candidate.plan_id, "paused");
+    assert_eq!(candidate.action, "resume");
+}
+
+#[test]
+fn plan_auto_run_idle_disables_persisted_state() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    create_auto_run_test_plan(&mut database, "completed", "completed");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+
+    assert!(
+        database
+            .disable_plan_auto_run_if_idle()
+            .expect("disable idle auto-run")
+    );
+    assert!(!database.plan_auto_run_state().expect("state").enabled);
+}
+
+#[test]
+fn plan_auto_run_marks_running_plan_busy_without_candidate() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    create_auto_run_test_plan(&mut database, "running-plan", "ready");
+    database
+        .transition_plan("running-plan", "start")
+        .expect("start plan");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+
+    assert!(database.plan_auto_run_has_in_flight().expect("in flight"));
+    assert!(
+        database
+            .next_plan_auto_run_candidate()
+            .expect("candidate query")
+            .is_none()
+    );
+    assert!(database.plan_auto_run_state().expect("state").busy);
+}
+
 #[test]
 fn plan_phase_run_completion_advances_until_pause() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");

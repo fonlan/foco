@@ -45,13 +45,14 @@ pub use workspace_records::{
     NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
     NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection,
     NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListPage, PlanPatch,
-    PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunStateRecord,
+    PlanListFilter, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
+    RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord,
+    ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -691,6 +692,81 @@ impl WorkspaceDatabase {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn plan_auto_run_state(&self) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
+        let enabled = self.workspace_metadata("plan_auto_run_enabled")?.as_deref() == Some("true");
+        let busy =
+            self.next_plan_auto_run_candidate()?.is_some() || self.plan_auto_run_has_in_flight()?;
+        Ok(PlanAutoRunStateRecord { enabled, busy })
+    }
+
+    pub fn set_plan_auto_run_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
+        self.set_workspace_metadata(
+            "plan_auto_run_enabled",
+            if enabled { "true" } else { "false" },
+        )?;
+        self.plan_auto_run_state()
+    }
+
+    pub fn next_plan_auto_run_candidate(
+        &self,
+    ) -> Result<Option<PlanAutoRunCandidateRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, status FROM plans
+                 WHERE status IN ('draft', 'ready', 'failed', 'paused')
+                 ORDER BY sort_order ASC, created_at ASC, id ASC
+                 LIMIT 1",
+                [],
+                |row| {
+                    let plan_id = row.get::<_, String>(0)?;
+                    let status = row.get::<_, String>(1)?;
+                    let action = if status == "paused" {
+                        "resume"
+                    } else {
+                        "start"
+                    };
+                    Ok(PlanAutoRunCandidateRecord {
+                        plan_id,
+                        action: action.to_string(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn disable_plan_auto_run_if_idle(&mut self) -> Result<bool, WorkspaceDatabaseError> {
+        if self.next_plan_auto_run_candidate()?.is_some() {
+            return Ok(false);
+        }
+        self.set_workspace_metadata("plan_auto_run_enabled", "false")?;
+        Ok(true)
+    }
+
+    pub fn plan_auto_run_has_in_flight(&self) -> Result<bool, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM plans
+                    WHERE status = 'running'
+                       OR EXISTS (
+                           SELECT 1 FROM plan_phases
+                           WHERE plan_phases.plan_id = plans.id
+                             AND (
+                                plan_phases.status = 'running'
+                                OR plan_phases.status = 'queued'
+                             )
+                       )
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
             .map_err(|source| self.sqlite_error(source))
     }
 

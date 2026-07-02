@@ -288,6 +288,11 @@ export type PlanResponse = {
   plan: Plan;
 };
 
+export type PlanAutoRunResponse = {
+  enabled: boolean;
+  busy: boolean;
+};
+
 export type PlanWorktreeAuditItem = {
   planId: string;
   planStatus: string;

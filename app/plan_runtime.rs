@@ -253,8 +253,9 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
     };
 
     if let Some(target) = plan_merge_target_for_task(&task)? {
-        sync_plan_merge_task(state, workspace, &target, &task, &instance).await?;
-        return Ok(());
+        let result = sync_plan_merge_task(state, workspace, &target, &task, &instance).await;
+        state.plan_auto_run_scheduler.wake()?;
+        return result;
     }
 
     let Some(phase) = phase else {
@@ -296,6 +297,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
         AgentTaskStatus::Queued | AgentTaskStatus::Running | AgentTaskStatus::Waiting => {}
     }
 
+    state.plan_auto_run_scheduler.wake()?;
     Ok(())
 }
 

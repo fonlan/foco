@@ -117,6 +117,7 @@ use crate::memory_runtime::{
     splice_resolved_memory, stored_prompt_context_record_memory_keys,
     stored_stable_prompt_context_messages,
 };
+use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
     configured_extra_prompt_message, configured_prompt_messages, context_usage_response,
@@ -156,6 +157,7 @@ mod hooks_support;
 mod http;
 mod logging;
 mod memory_runtime;
+mod plan_auto_run;
 mod plan_runtime;
 mod platform;
 mod prompt;
@@ -369,6 +371,7 @@ pub(crate) struct AppState {
     memory_dream_runs: Arc<AsyncMutex<HashSet<String>>>,
     agent_scheduler: AgentScheduler,
     scheduled_task_scheduler: ScheduledTaskScheduler,
+    plan_auto_run_scheduler: PlanAutoRunScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     #[cfg(all(windows, not(debug_assertions)))]
@@ -648,6 +651,7 @@ async fn run_server_until_shutdown(
     let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
     let (scheduled_task_scheduler, scheduled_task_scheduler_wake_rx) =
         ScheduledTaskScheduler::new();
+    let (plan_auto_run_scheduler, plan_auto_run_scheduler_wake_rx) = PlanAutoRunScheduler::new();
     let memory_dream_scheduler = MemoryDreamScheduler::new();
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
@@ -669,6 +673,7 @@ async fn run_server_until_shutdown(
         memory_dream_runs: Arc::new(AsyncMutex::new(HashSet::new())),
         agent_scheduler: agent_scheduler.clone(),
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
+        plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
         #[cfg(all(windows, not(debug_assertions)))]
@@ -677,6 +682,8 @@ async fn run_server_until_shutdown(
     let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
     let scheduled_task_scheduler_task =
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
+    let plan_auto_run_scheduler_task =
+        plan_auto_run_scheduler.spawn(state.clone(), plan_auto_run_scheduler_wake_rx);
     let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
     let api_audit_cleanup_task = spawn_api_audit_cleanup_scheduler(
         state.clone(),
@@ -730,6 +737,7 @@ async fn run_server_until_shutdown(
     if server_result.is_err() {
         agent_scheduler_task.abort();
         scheduled_task_scheduler_task.abort();
+        plan_auto_run_scheduler_task.abort();
         memory_dream_scheduler_task.abort();
         api_audit_cleanup_task.abort();
         provider_model_sync_task.abort();
@@ -737,6 +745,7 @@ async fn run_server_until_shutdown(
     model_metadata_cache_task.abort();
     let _ = agent_scheduler_task.await;
     let _ = scheduled_task_scheduler_task.await;
+    let _ = plan_auto_run_scheduler_task.await;
     let _ = memory_dream_scheduler_task.await;
     let _ = api_audit_cleanup_task.await;
     let _ = provider_model_sync_task.await;

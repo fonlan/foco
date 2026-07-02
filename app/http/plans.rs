@@ -71,6 +71,12 @@ pub(crate) struct UpdatePlanRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PlanAutoRunRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PlanActionRequest {
     action: String,
 }
@@ -116,6 +122,13 @@ pub(crate) struct PlanResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeletePlanResponse {
     deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanAutoRunResponse {
+    enabled: bool,
+    busy: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,6 +320,38 @@ pub(crate) async fn save_plan_order(
         page_size: DEFAULT_ACTIVE_PLAN_LIMIT,
         total_count: page_record.total_count,
         total_pages: total_pages(page_record.total_count, DEFAULT_ACTIVE_PLAN_LIMIT),
+    }))
+}
+
+pub(crate) async fn plan_auto_run(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<PlanAutoRunResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let auto_run = crate::plan_auto_run::plan_auto_run_state(workspace)?;
+
+    Ok(Json(PlanAutoRunResponse {
+        enabled: auto_run.enabled,
+        busy: auto_run.busy,
+    }))
+}
+
+pub(crate) async fn set_plan_auto_run(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<PlanAutoRunRequest>,
+) -> Result<Json<PlanAutoRunResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let auto_run = crate::plan_auto_run::set_plan_auto_run_enabled(workspace, request.enabled)?;
+    if request.enabled {
+        state.plan_auto_run_scheduler.wake()?;
+    }
+
+    Ok(Json(PlanAutoRunResponse {
+        enabled: auto_run.enabled,
+        busy: auto_run.busy,
     }))
 }
 
@@ -528,6 +573,7 @@ pub(crate) async fn plan_action(
         &request.action,
     )
     .await?;
+    state.plan_auto_run_scheduler.wake()?;
 
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),
@@ -552,6 +598,7 @@ pub(crate) async fn retry_plan_phase(
         },
     )
     .await?;
+    state.plan_auto_run_scheduler.wake()?;
 
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),
@@ -591,6 +638,7 @@ pub(crate) async fn plan_step_action(
             },
         )
         .map_err(ApiError::from_workspace_error)?;
+    state.plan_auto_run_scheduler.wake()?;
 
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),

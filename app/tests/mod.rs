@@ -77,6 +77,7 @@ use crate::memory_runtime::{
     parse_memory_extraction_output, resolve_prompt_context_memory, should_queue_memory_extraction,
     store_extracted_memory_facts, validate_extracted_memory_facts,
 };
+use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
     context_token_breakdown,
@@ -15009,6 +15010,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let foco_root_dir = user_profile_dir.join(".foco");
     let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
     let (scheduled_task_scheduler, _scheduled_task_scheduler_rx) = ScheduledTaskScheduler::new();
+    let (plan_auto_run_scheduler, _plan_auto_run_scheduler_rx) = PlanAutoRunScheduler::new();
 
     AppState {
         config: Arc::new(Mutex::new(config)),
@@ -15032,6 +15034,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         memory_dream_runs: Arc::new(AsyncMutex::new(HashSet::new())),
         agent_scheduler,
         scheduled_task_scheduler,
+        plan_auto_run_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
     }

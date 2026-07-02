@@ -2135,6 +2135,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  const planAutoRunMatch = path.match(/^\/api\/workspaces\/([^/]+)\/plans\/auto-run$/);
+  if (planAutoRunMatch) {
+    const body = init?.body ? JSON.parse(String(init.body)) as { enabled?: boolean } : null;
+    return jsonResponse({
+      busy: false,
+      enabled: body?.enabled ?? false,
+    });
+  }
+
   const plansMatch = path.match(/^\/api\/workspaces\/([^/]+)\/plans$/);
   if (plansMatch) {
     const workspaceId = decodeURIComponent(plansMatch[1] ?? "");

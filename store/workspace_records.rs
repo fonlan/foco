@@ -70,6 +70,18 @@ pub struct AgentInstanceRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanAutoRunStateRecord {
+    pub enabled: bool,
+    pub busy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanAutoRunCandidateRecord {
+    pub plan_id: String,
+    pub action: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewAgentTask<'a> {
     pub id: &'a AgentTaskId,
