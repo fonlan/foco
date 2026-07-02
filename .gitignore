@@ -4,6 +4,7 @@ CODE_SPLIT_IMPLEMENTATION_PLAN.md
 CODE_SPLIT_PHASE_0_BASELINE.md
 macos-support-implementation-plan.md
 
+.DS_Store
 .mem/
 .codegraph/
 .agents/

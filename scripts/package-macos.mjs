@@ -28,36 +28,29 @@ const iconPath = path.join(resourcesDir, `${APP_NAME}.icns`);
 const dmgPath = path.join(distRoot, `${APP_NAME}.dmg`);
 
 try {
-  const options = parseArgs(process.argv.slice(2));
+  parseArgs(process.argv.slice(2));
   assertMacosHost();
 
   runNpm(["run", "build", "-w", "web"]);
   runCargo(["build", "--release", "-p", "foco-app"]);
 
   await buildAppBundle();
-
-  if (options.dmg) {
+  try {
     await buildDmg();
+  } finally {
+    await rm(appRoot, { force: true, recursive: true });
   }
 
-  console.log(`[macos] packaged ${appRoot}`);
-  if (options.dmg) {
-    console.log(`[macos] packaged ${dmgPath}`);
-  }
+  console.log(`[macos] packaged ${dmgPath}`);
 } catch (error) {
   console.error(`[macos] ${errorMessage(error)}`);
   process.exitCode = 1;
 }
 
 function parseArgs(args) {
-  const unknown = args.filter((arg) => arg !== "--dmg");
-  if (unknown.length > 0) {
-    throw new Error(`unknown argument: ${unknown[0]}`);
+  if (args.length > 0) {
+    throw new Error(`unknown argument: ${args[0]}`);
   }
-
-  return {
-    dmg: args.includes("--dmg"),
-  };
 }
 
 function assertMacosHost() {

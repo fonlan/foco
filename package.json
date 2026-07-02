@@ -16,7 +16,6 @@
     "typecheck": "npm run typecheck -w web",
     "build:release": "node scripts/build-release.mjs",
     "build:dist": "node scripts/build-release.mjs --dist",
-    "build:macos-app": "node scripts/package-macos.mjs",
-    "build:macos-dmg": "node scripts/package-macos.mjs --dmg"
+    "build:macos": "node scripts/package-macos.mjs"
   }
 }

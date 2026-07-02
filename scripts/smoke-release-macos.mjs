@@ -36,7 +36,9 @@ if (process.platform !== "darwin") {
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const buildTargetDir = await mkdtemp(path.join(tmpdir(), "foco-macos-release-target-"));
 const profileDir = await mkdtemp(path.join(tmpdir(), "foco-macos-release-smoke-"));
-const releaseApp = path.join(repoRoot, "dist", "macos", "Foco.app");
+const mountDir = await mkdtemp(path.join(tmpdir(), "foco-macos-release-dmg-"));
+const releaseDmg = path.join(repoRoot, "dist", "macos", "Foco.dmg");
+const releaseApp = path.join(mountDir, "Foco.app");
 const releaseExecutable = path.join(releaseApp, "Contents", "MacOS", "foco");
 const port = String(await freePort());
 let appProcess = null;
@@ -45,12 +47,18 @@ let isStopping = false;
 const appOutput = new RingBuffer(64_000);
 
 try {
-  await run("npm", ["run", "build:macos-app"], {
+  await run("npm", ["run", "build:macos"], {
     CARGO_TARGET_DIR: buildTargetDir,
   });
 
+  if (!existsSync(releaseDmg)) {
+    throw new Error(`release dmg was not created: ${releaseDmg}`);
+  }
+
+  await run("hdiutil", ["attach", releaseDmg, "-mountpoint", mountDir, "-nobrowse", "-quiet"]);
+
   if (!existsSync(releaseApp)) {
-    throw new Error(`release app bundle was not created: ${releaseApp}`);
+    throw new Error(`release app bundle was not created in dmg: ${releaseApp}`);
   }
 
   if (!existsSync(releaseExecutable)) {
@@ -99,6 +107,8 @@ try {
     await terminateProcess(appProcess.pid);
   }
 
+  await run("hdiutil", ["detach", mountDir, "-quiet"]).catch(() => {});
+  await rm(mountDir, { force: true, recursive: true });
   await rm(profileDir, { force: true, recursive: true });
   await rm(buildTargetDir, { force: true, recursive: true });
 }
