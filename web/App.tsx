@@ -764,7 +764,8 @@ export function App() {
     "generate" | "save" | "settings" | null
   >(null);
   const [activePlans, setActivePlans] = useState<Plan[]>([]);
-  const [hasLoadedActivePlans, setHasLoadedActivePlans] = useState(false);
+  const [loadedActivePlansWorkspaceId, setLoadedActivePlansWorkspaceId] =
+    useState<string | null>(null);
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
@@ -1753,10 +1754,14 @@ export function App() {
         return null;
       }
       setActivePlans(data.plans);
-      setHasLoadedActivePlans(true);
+      setLoadedActivePlansWorkspaceId(workspaceId);
       return data;
     } catch (requestError) {
+      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+        return null;
+      }
       setActivePlans([]);
+      setLoadedActivePlansWorkspaceId(null);
       setActivePlansError(errorMessage(requestError));
       return null;
     } finally {
@@ -1785,7 +1790,7 @@ export function App() {
           return;
         }
         setActivePlans(response.plans);
-        setHasLoadedActivePlans(true);
+        setLoadedActivePlansWorkspaceId(workspaceId);
       } catch (requestError) {
         setActivePlans(previousPlans);
         setActivePlansError(errorMessage(requestError));
@@ -2444,7 +2449,7 @@ export function App() {
   useEffect(() => {
     if (!activeWorkspace?.id) {
       setActivePlans([]);
-      setHasLoadedActivePlans(false);
+      setLoadedActivePlansWorkspaceId(null);
       setActivePlansError(null);
       setIsLoadingActivePlans(false);
       return;
@@ -2479,7 +2484,7 @@ export function App() {
 
   useEffect(() => {
     setActivePlans([]);
-    setHasLoadedActivePlans(false);
+    setLoadedActivePlansWorkspaceId(null);
     setActivePlansError(null);
     setPlanOperationKey(null);
     setIsPlanAutoRunDispatching(false);
@@ -2515,7 +2520,7 @@ export function App() {
     if (isPlanAutoRunDispatching || planOperationKey) {
       return;
     }
-    if (!hasLoadedActivePlans) {
+    if (loadedActivePlansWorkspaceId !== activeWorkspace.id) {
       return;
     }
     if (activePlans.some(isAutoRunPlanInFlight)) {
@@ -2548,7 +2553,7 @@ export function App() {
   }, [
     activePlans,
     activeWorkspace?.id,
-    hasLoadedActivePlans,
+    loadedActivePlansWorkspaceId,
     isPlanAutoRunDispatching,
     isPlanAutoRunEnabled,
     planOperationKey,

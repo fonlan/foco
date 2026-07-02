@@ -1123,17 +1123,21 @@ describe("app-panels-stats verification surfaces", () => {
       ],
       status: "running",
     };
+    const planRequestPaths: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const rawUrl = typeof input === "string" ? input : input.toString();
       const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
       if (path.match(/^\/api\/workspaces\/[^/]+\/plans$/)) {
+        planRequestPaths.push(path);
+        const workspaceId = path.split("/")[3] ?? "";
+        const plans = workspaceId === "workspace-2" ? [] : [runningPlan];
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [runningPlan],
-          totalCount: 1,
-          totalPages: 1,
+          plans,
+          totalCount: plans.length,
+          totalPages: plans.length ? 1 : 0,
         });
       }
 
@@ -1156,10 +1160,13 @@ describe("app-panels-stats verification surfaces", () => {
 
     await user.click(screen.getByRole("button", { name: "Side project" }));
     await user.click(screen.getByRole("button", { name: /Side note/ }));
-
     await waitFor(() => {
       expect(autoRunCheckbox).not.toBeChecked();
     });
+    await waitFor(() => {
+      expect(planRequestPaths).toContain("/api/workspaces/workspace-2/plans");
+    });
+    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
     expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-1"))).toBe(
       "true",
     );
