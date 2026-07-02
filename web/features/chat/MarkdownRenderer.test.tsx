@@ -17,7 +17,10 @@ describe("MarkdownRenderer", () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    const copyButton = screen.getByRole("button", { name: "Copy code" });
+
+    expect(copyButton).toHaveTextContent("");
+    await userEvent.click(copyButton);
 
     expect(writeText).toHaveBeenCalledWith("const answer = 42;\n");
     expect(

@@ -150,7 +150,6 @@ function CodeBlock({
         type="button"
       >
         <Icon aria-hidden="true" size={14} />
-        <span>{label}</span>
       </button>
       <pre {...preProps}>{children}</pre>
     </div>

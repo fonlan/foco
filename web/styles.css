@@ -445,13 +445,14 @@ summary:focus-visible {
   top: 0.5rem;
   right: 0.5rem;
   display: inline-flex;
+  width: 1.75rem;
   height: 1.75rem;
   align-items: center;
-  gap: 0.35rem;
+  justify-content: center;
   border: 1px solid rgba(247, 243, 234, 0.18);
   border-radius: 0.4375rem;
   background: rgba(247, 243, 234, 0.08);
-  padding: 0 0.5rem;
+  padding: 0;
   color: #f7f3ea;
   font-size: var(--foco-font-micro);
   font-weight: 700;
