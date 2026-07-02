@@ -417,9 +417,9 @@ describe("app agents verification surfaces", () => {
       "aria-selected",
       "true",
     );
-    expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
-    expect(screen.getByText("Found the issue in the workspace notes.")).toBeInTheDocument();
-    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(await screen.findByText("Found the issue in the workspace notes.")).toBeInTheDocument();
+    expect(await screen.findByText("Inspection complete.")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Open agent Coordinator" }));
 

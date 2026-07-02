@@ -47,14 +47,6 @@ type NetworkInformationLike = {
   saveData?: boolean;
 };
 
-type WindowWithIdleCallback = Window & {
-  cancelIdleCallback?: (handle: number) => void;
-  requestIdleCallback?: (
-    callback: (deadline: { didTimeout: boolean; timeRemaining: () => number }) => void,
-    options?: { timeout?: number },
-  ) => number;
-};
-
 const WORKSPACE_IMAGE_FILE_EXTENSIONS = new Set(["gif", "jpeg", "jpg", "png", "svg", "webp"]);
 const markdownSelectedSkillPrefix = () => null;
 
@@ -79,21 +71,6 @@ function canPreloadOptionalMonaco() {
 
   const connection = (navigator as Navigator & { connection?: NetworkInformationLike }).connection;
   return connection?.saveData !== true;
-}
-
-export function scheduleOptionalMonacoPreload() {
-  if (typeof window === "undefined" || !canPreloadOptionalMonaco()) {
-    return undefined;
-  }
-
-  const idleWindow = window as WindowWithIdleCallback;
-  if (idleWindow.requestIdleCallback) {
-    const handle = idleWindow.requestIdleCallback(preloadMonacoQuietly, { timeout: 5000 });
-    return () => idleWindow.cancelIdleCallback?.(handle);
-  }
-
-  const handle = window.setTimeout(preloadMonacoQuietly, 3000);
-  return () => window.clearTimeout(handle);
 }
 
 export function preloadOptionalMonaco() {
@@ -321,6 +298,10 @@ function MonacoFileEditor({
   );
 
   useEffect(() => {
+    if (previewEnabled) {
+      return undefined;
+    }
+
     const container = containerRef.current;
     if (!container) {
       return undefined;
@@ -385,7 +366,7 @@ function MonacoFileEditor({
       editorRef.current = null;
       modelRef.current = null;
     };
-  }, [language, onChange, onSave, path]);
+  }, [language, onChange, onSave, path, previewEnabled]);
 
   useEffect(() => {
     const model = modelRef.current;

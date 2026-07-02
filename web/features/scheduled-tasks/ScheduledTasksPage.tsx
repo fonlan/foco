@@ -93,7 +93,7 @@ const TASK_STATUSES: ScheduledTaskStatus[] = [
   "archived",
 ];
 const FORM_TASK_STATUSES: ScheduledTaskStatus[] = ["enabled", "paused"];
-const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
+const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-coordinator";
 const DEFAULT_INTERVAL_SECONDS = 86400;
 const INTERVAL_UNIT_SECONDS: Record<IntervalUnit, number> = {
   minutes: 60,
@@ -867,6 +867,27 @@ function ScheduledTaskDrawer({
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewRuns, setPreviewRuns] = useState<string[]>([]);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+
+  useEffect(() => {
+    if (mode.type !== "create" || agentDefinitions.length === 0) {
+      return;
+    }
+
+    setForm((current) => {
+      if (current.agentDefinitionId) {
+        return current;
+      }
+
+      const defaults = taskFormDefaults(mode, workspaces, enabledModels, agentDefinitions);
+      return {
+        ...current,
+        agentDefinitionId: defaults.agentDefinitionId,
+        modelId: defaults.modelId,
+        providerId: defaults.providerId,
+        thinkingLevel: defaults.thinkingLevel,
+      };
+    });
+  }, [agentDefinitions, enabledModels, mode, workspaces]);
 
   const selectedModel = enabledModels.find((model) => model.id === form.modelId) ?? null;
   const selectableProviders = selectedModel

@@ -225,20 +225,31 @@ import {
 import {
   isWorkspaceImageFilePath,
   preloadOptionalMonaco,
-  scheduleOptionalMonacoPreload,
   WorkspaceFileEditorPanel,
   type OpenFileTab,
   type WorkspaceFileEditorState,
 } from "./features/files/WorkspaceFileEditorPanel";
-import { AgentsRuntimePanel } from "./features/agents/AgentsRuntimePanel";
+const AgentsRuntimePanel = lazy(() =>
+  import("./features/agents/AgentsRuntimePanel").then((m) => ({
+    default: m.AgentsRuntimePanel,
+  })),
+);
 import {
   ContextPanelSidebar,
   ResponsiveContextPanelIcon,
   type ContextPanelTab,
   type PlanPhaseRetryOverride,
 } from "./features/context/ContextPanel";
-import { AgentTranscriptPanel } from "./features/agents/AgentTranscriptPanel";
-import { SettingsPanel } from "./features/settings/SettingsPanel";
+const AgentTranscriptPanel = lazy(() =>
+  import("./features/agents/AgentTranscriptPanel").then((m) => ({
+    default: m.AgentTranscriptPanel,
+  })),
+);
+const SettingsPanel = lazy(() =>
+  import("./features/settings/SettingsPanel").then((m) => ({
+    default: m.SettingsPanel,
+  })),
+);
 import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
 const ScheduledTasksPage = lazy(() =>
   import("./features/scheduled-tasks/ScheduledTasksPage").then((m) => ({
@@ -326,6 +337,47 @@ export function nextAutoRunnablePlan(
   return null;
 }
 
+export function trimInactiveChatMessageCaches(
+  current: Record<string, ShellMessage[]>,
+  accessOrder: string[],
+  options: {
+    activeChatKey: string | null;
+    fullCacheLimit?: number;
+    openChatKeys: Set<string>;
+    pageLimit?: number;
+    runningChatKeys: Set<string>;
+  },
+) {
+  const pageLimit = options.pageLimit ?? CHAT_MESSAGES_PAGE_LIMIT;
+  const fullCacheLimit = options.fullCacheLimit ?? INACTIVE_CHAT_FULL_CACHE_LIMIT;
+  const inactiveChatKeys = accessOrder.filter(
+    (chatKey) =>
+      chatKey !== options.activeChatKey &&
+      !options.runningChatKeys.has(chatKey) &&
+      options.openChatKeys.has(chatKey) &&
+      (current[chatKey]?.length ?? 0) > pageLimit,
+  );
+  if (inactiveChatKeys.length <= fullCacheLimit) {
+    return { messagesByKey: current, trimmedChatKeys: [] as string[] };
+  }
+
+  const trimmedChatKeys = inactiveChatKeys.slice(
+    0,
+    inactiveChatKeys.length - fullCacheLimit,
+  );
+  let changed = false;
+  const next = { ...current };
+  for (const chatKey of trimmedChatKeys) {
+    const cachedMessages = next[chatKey];
+    if (!cachedMessages || cachedMessages.length <= pageLimit) {
+      continue;
+    }
+    next[chatKey] = cachedMessages.slice(-pageLimit);
+    changed = true;
+  }
+  return { messagesByKey: changed ? next : current, trimmedChatKeys };
+}
+
 
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
@@ -400,9 +452,10 @@ type WorkspaceFileContextMenuState = {
   workspacePath: string;
 };
 
-const LIVE_REASONING_DURATION_REFRESH_MS = 250;
+const LIVE_REASONING_DURATION_REFRESH_MS = 1000;
 const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
 const CHAT_MESSAGES_PAGE_LIMIT = 100;
+const INACTIVE_CHAT_FULL_CACHE_LIMIT = 8;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
 const EMPTY_GIT_STATUS_FILES: GitStatusFileSummary[] = [];
@@ -520,10 +573,44 @@ export function App() {
     useState<WorkspaceChatContextMenuState | null>(null);
   const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
     useState<WorkspaceFileContextMenuState | null>(null);
-  const [, setChatMessagesByKeyState] = useState<
-    Record<string, ShellMessage[]>
-  >({});
+  // ponytail: keep inactive chat cache ref-only so hot streaming paths don't
+  // rerender App; ceiling is App still owns too much chat state, upgrade path is
+  // moving this cache into a dedicated hook/store.
   const chatMessagesByKeyRef = useRef<Record<string, ShellMessage[]>>({});
+  const cachedChatAccessOrderRef = useRef<string[]>([]);
+  const trimmedChatCacheKeysRef = useRef<Set<string>>(new Set());
+  function rememberChatCacheAccess(chatKey: string) {
+    cachedChatAccessOrderRef.current = [
+      ...cachedChatAccessOrderRef.current.filter((key) => key !== chatKey),
+      chatKey,
+    ];
+  }
+
+  function trimInactiveChatCaches() {
+    const { messagesByKey, trimmedChatKeys } = trimInactiveChatMessageCaches(
+      chatMessagesByKeyRef.current,
+      cachedChatAccessOrderRef.current,
+      {
+        activeChatKey: activeChatKeyRef.current,
+        openChatKeys: new Set(
+          openChatTabsRef.current.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
+        ),
+        runningChatKeys: runningChatKeysRef.current,
+      },
+    );
+    if (!trimmedChatKeys.length) {
+      return;
+    }
+
+    // ponytail: cap only inactive, non-running chats and keep the newest page;
+    // if offline tab switching must preserve full history, move this to an LRU store.
+    setChatMessagesByKey(messagesByKey);
+    trimmedChatCacheKeysRef.current = new Set([
+      ...trimmedChatCacheKeysRef.current,
+      ...trimmedChatKeys,
+    ]);
+  }
+
   function setChatMessagesByKey(
     updater:
       | Record<string, ShellMessage[]>
@@ -536,11 +623,13 @@ export function App() {
         ? updater(chatMessagesByKeyRef.current)
         : updater;
     chatMessagesByKeyRef.current = next;
-    setChatMessagesByKeyState(next);
+    cachedChatAccessOrderRef.current = cachedChatAccessOrderRef.current.filter(
+      (chatKey) => chatKey in next,
+    );
+    trimmedChatCacheKeysRef.current = new Set(
+      [...trimmedChatCacheKeysRef.current].filter((chatKey) => chatKey in next),
+    );
   }
-  const [, setChatMessagePaginationByKeyState] = useState<
-    Record<string, ChatMessagesPaginationState>
-  >({});
   const chatMessagePaginationByKeyRef = useRef<
     Record<string, ChatMessagesPaginationState>
   >({});
@@ -556,7 +645,6 @@ export function App() {
         ? updater(chatMessagePaginationByKeyRef.current)
         : updater;
     chatMessagePaginationByKeyRef.current = next;
-    setChatMessagePaginationByKeyState(next);
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
@@ -1009,14 +1097,6 @@ export function App() {
   const unsupportedDraftAttachmentMessage = unsupportedDraftAttachment
     ? unsupportedAttachmentMessage(selectedModel, unsupportedDraftAttachment, t)
     : null;
-
-  useEffect(() => {
-    if (!canUseApp) {
-      return undefined;
-    }
-
-    return scheduleOptionalMonacoPreload();
-  }, [canUseApp]);
 
   const updateSidebarWidthFromClientX = useCallback((clientX: number) => {
     const sidebarLeft =
@@ -2974,13 +3054,15 @@ export function App() {
     const nextForKey = resolveNext(currentByKey[chatKey] ?? []);
     const nextByKey = { ...currentByKey, [chatKey]: nextForKey };
     setChatMessagesByKey(nextByKey);
+    rememberChatCacheAccess(chatKey);
+    trimInactiveChatCaches();
 
     if (activeChatKeyRef.current === chatKey) {
       setMessages(nextForKey);
     }
   }
 
-  const STREAM_TEXT_DELTA_FLUSH_MS = 32;
+  const STREAM_DELTA_FLUSH_MS = 32;
 
   function appendBufferedTextDelta(
     current: ShellMessage[],
@@ -3002,6 +3084,71 @@ export function App() {
       content: message.content + delta,
       parts: appendTextPart(message.parts, delta),
     };
+    return next;
+  }
+
+  function appendBufferedReasoningDelta(
+    current: ShellMessage[],
+    assistantMessageId: string,
+    delta: string,
+    startedAtMs: number,
+  ) {
+    const messageIndex = current.findIndex(
+      (message) =>
+        message.role === "assistant" && message.id === assistantMessageId,
+    );
+    if (messageIndex < 0) {
+      return current;
+    }
+
+    const message = current[messageIndex];
+    const next = [...current];
+    next[messageIndex] = {
+      ...message,
+      reasoning: `${message.reasoning ?? ""}${delta}`,
+      parts: appendReasoningPart(message.parts, delta, startedAtMs),
+    };
+    return next;
+  }
+
+  type BufferedToolOutputDelta = {
+    assistantMessageId: string;
+    delta: string;
+    stream: "stdout" | "stderr";
+    toolCallId: string;
+  };
+
+  function appendBufferedToolOutputDeltas(
+    current: ShellMessage[],
+    deltas: BufferedToolOutputDelta[],
+  ) {
+    let next = current;
+    for (const delta of deltas) {
+      const messageOwnsToolCall = (message: ShellMessage) =>
+        messageHasToolCall(message, delta.toolCallId);
+      const updateExistingToolCall = next.some(messageOwnsToolCall);
+      next = next.map((message) =>
+        (updateExistingToolCall
+          ? messageOwnsToolCall(message)
+          : message.role === "assistant" && message.id === delta.assistantMessageId)
+          ? {
+            ...message,
+            parts: applyToolOutputDeltaToParts(
+              message.parts,
+              delta.toolCallId,
+              delta.stream,
+              delta.delta,
+            ),
+            toolCalls: applyToolOutputDelta(
+              message.toolCalls,
+              delta.toolCallId,
+              delta.stream,
+              delta.delta,
+            ),
+          }
+          : message,
+      );
+    }
     return next;
   }
 
@@ -3028,11 +3175,13 @@ export function App() {
       bufferedDeltasByChatKey.clear();
 
       for (const [chatKey, messageDeltas] of bufferedDeltas) {
-        for (const [assistantMessageId, delta] of messageDeltas) {
-          setMessagesForChatKey(chatKey, (current) =>
-            appendBufferedTextDelta(current, assistantMessageId, delta),
-          );
-        }
+        setMessagesForChatKey(chatKey, (current) => {
+          let next = current;
+          for (const [assistantMessageId, delta] of messageDeltas) {
+            next = appendBufferedTextDelta(next, assistantMessageId, delta);
+          }
+          return next;
+        });
       }
     };
 
@@ -3060,7 +3209,142 @@ export function App() {
         flushTimer = window.setTimeout(() => {
           flushTimer = null;
           flush();
-        }, STREAM_TEXT_DELTA_FLUSH_MS);
+        }, STREAM_DELTA_FLUSH_MS);
+      },
+    };
+  }
+
+  function createReasoningDeltaBuffer() {
+    const bufferedDeltasByChatKey = new Map<
+      string,
+      Map<string, { delta: string; startedAtMs: number }>
+    >();
+    let flushTimer: number | null = null;
+
+    const cancelScheduledFlush = () => {
+      if (flushTimer === null) {
+        return;
+      }
+
+      window.clearTimeout(flushTimer);
+      flushTimer = null;
+    };
+
+    const flush = () => {
+      cancelScheduledFlush();
+      if (!bufferedDeltasByChatKey.size) {
+        return;
+      }
+
+      const bufferedDeltas = Array.from(bufferedDeltasByChatKey.entries());
+      bufferedDeltasByChatKey.clear();
+
+      for (const [chatKey, messageDeltas] of bufferedDeltas) {
+        setMessagesForChatKey(chatKey, (current) => {
+          let next = current;
+          for (const [assistantMessageId, bufferedDelta] of messageDeltas) {
+            next = appendBufferedReasoningDelta(
+              next,
+              assistantMessageId,
+              bufferedDelta.delta,
+              bufferedDelta.startedAtMs,
+            );
+          }
+          return next;
+        });
+      }
+    };
+
+    return {
+      flush,
+      push(
+        chatKey: string,
+        assistantMessageId: string,
+        delta: string,
+        startedAtMs: number,
+      ) {
+        const messageDeltas =
+          bufferedDeltasByChatKey.get(chatKey) ??
+          new Map<string, { delta: string; startedAtMs: number }>();
+        const current = messageDeltas.get(assistantMessageId);
+        messageDeltas.set(assistantMessageId, {
+          delta: `${current?.delta ?? ""}${delta}`,
+          startedAtMs: current?.startedAtMs ?? startedAtMs,
+        });
+        bufferedDeltasByChatKey.set(chatKey, messageDeltas);
+
+        if (flushTimer !== null) {
+          return;
+        }
+
+        flushTimer = window.setTimeout(() => {
+          flushTimer = null;
+          flush();
+        }, STREAM_DELTA_FLUSH_MS);
+      },
+    };
+  }
+
+  function createToolOutputDeltaBuffer() {
+    const bufferedDeltasByChatKey = new Map<
+      string,
+      Map<string, BufferedToolOutputDelta>
+    >();
+    let flushTimer: number | null = null;
+
+    const cancelScheduledFlush = () => {
+      if (flushTimer === null) {
+        return;
+      }
+
+      window.clearTimeout(flushTimer);
+      flushTimer = null;
+    };
+
+    const flush = () => {
+      cancelScheduledFlush();
+      if (!bufferedDeltasByChatKey.size) {
+        return;
+      }
+
+      const bufferedDeltas = Array.from(bufferedDeltasByChatKey.entries());
+      bufferedDeltasByChatKey.clear();
+
+      for (const [chatKey, toolDeltas] of bufferedDeltas) {
+        setMessagesForChatKey(chatKey, (current) =>
+          appendBufferedToolOutputDeltas(current, Array.from(toolDeltas.values())),
+        );
+      }
+    };
+
+    return {
+      flush,
+      push(
+        chatKey: string,
+        delta: BufferedToolOutputDelta,
+      ) {
+        const toolDeltas =
+          bufferedDeltasByChatKey.get(chatKey) ??
+          new Map<string, BufferedToolOutputDelta>();
+        const key = `${delta.toolCallId}\u0000${delta.stream}`;
+        const current = toolDeltas.get(key);
+        toolDeltas.set(key, {
+          ...delta,
+          assistantMessageId: current?.assistantMessageId ?? delta.assistantMessageId,
+          delta: `${current?.delta ?? ""}${delta.delta}`,
+        });
+        bufferedDeltasByChatKey.set(chatKey, toolDeltas);
+
+        if (flushTimer !== null) {
+          return;
+        }
+
+        // ponytail: simple Map buffer; very large tool output still grows in
+        // memory until flush, upgrade path is backend summarization/truncation.
+        flushTimer = window.setTimeout(() => {
+          flushTimer = null;
+          flush();
+        }, STREAM_DELTA_FLUSH_MS);
       },
     };
   }
@@ -3782,7 +4066,10 @@ export function App() {
         return next;
       });
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
+      rememberChatCacheAccess(chatKey);
+      trimmedChatCacheKeysRef.current.delete(chatKey);
       setChatMessagePaginationByKey((current) => ({ ...current, [chatKey]: pagination }));
+      trimInactiveChatCaches();
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
@@ -3855,6 +4142,8 @@ export function App() {
         ];
         return { ...current, [chatKey]: nextMessagesForChat };
       });
+      rememberChatCacheAccess(chatKey);
+      trimmedChatCacheKeysRef.current.delete(chatKey);
       setChatMessagePaginationByKey((current) => ({
         ...current,
         [chatKey]: nextPagination,
@@ -3918,6 +4207,7 @@ export function App() {
       }
     }
     const cachedMessages = chatMessagesByKeyRef.current[chatKey];
+    const cacheWasTrimmed = trimmedChatCacheKeysRef.current.has(chatKey);
 
     if (!cachedMessages) {
       setActiveWorkspaceId(workspaceId);
@@ -3943,13 +4233,14 @@ export function App() {
     setExpandedWorkspaceId(workspaceId);
     openChatTab(workspaceId, chatId);
     setActiveWorkspaceChatRefs(workspaceId, chatId);
+    rememberChatCacheAccess(chatKey);
     setMessages(cachedMessages);
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
     if (options.updateUrl !== false) {
       updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
     }
-    if (workspaceChatActiveRun) {
+    if (workspaceChatActiveRun || cacheWasTrimmed) {
       void loadChatMessages(workspaceId, chatId);
     }
   }
@@ -6217,6 +6508,13 @@ export function App() {
     let hasGuidanceTurns = false;
     let streamHadError = false;
     const textDeltaBuffer = createTextDeltaBuffer();
+    const reasoningDeltaBuffer = createReasoningDeltaBuffer();
+    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
+    const flushStreamDeltaBuffers = () => {
+      textDeltaBuffer.flush();
+      reasoningDeltaBuffer.flush();
+      toolOutputDeltaBuffer.flush();
+    };
     const refreshRunContextUsage = () => {
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
@@ -6445,6 +6743,12 @@ export function App() {
         if (streamEvent.type !== "textDelta") {
           textDeltaBuffer.flush();
         }
+        if (streamEvent.type !== "reasoningDelta") {
+          reasoningDeltaBuffer.flush();
+        }
+        if (streamEvent.type !== "toolOutputDelta") {
+          toolOutputDeltaBuffer.flush();
+        }
 
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
@@ -6511,23 +6815,15 @@ export function App() {
 
         if (streamEvent.type === "reasoningDelta") {
           const reasoningStartedAtMs = startLiveReasoningDuration();
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          const targetAssistantMessageId = resolvedAssistantMessageId(
+            streamEvent.assistantMessageId,
           );
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
-                  parts: appendReasoningPart(
-                    message.parts,
-                    streamEvent.delta,
-                    reasoningStartedAtMs,
-                  ),
-                }
-                : message,
-            ),
+          ensureStreamingAssistantMessage(targetAssistantMessageId);
+          reasoningDeltaBuffer.push(
+            chatKey,
+            targetAssistantMessageId,
+            streamEvent.delta,
+            reasoningStartedAtMs,
           );
           return;
         }
@@ -6744,33 +7040,14 @@ export function App() {
         }
 
         if (streamEvent.type === "toolOutputDelta") {
-          const messageOwnsToolCall = (message: ShellMessage) =>
-            messageHasToolCall(message, streamEvent.toolCallId);
-          deferStreamSideUpdate(() => {
-            setMessagesForChatKey(chatKey, (current) => {
-              const updateExistingToolCall = current.some(messageOwnsToolCall);
-              return current.map((message) =>
-                (updateExistingToolCall
-                  ? messageOwnsToolCall(message)
-                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                  ? {
-                    ...message,
-                    parts: applyToolOutputDeltaToParts(
-                      message.parts,
-                      streamEvent.toolCallId,
-                      streamEvent.stream,
-                      streamEvent.delta,
-                    ),
-                    toolCalls: applyToolOutputDelta(
-                      message.toolCalls,
-                      streamEvent.toolCallId,
-                      streamEvent.stream,
-                      streamEvent.delta,
-                    ),
-                  }
-                  : message,
-              );
-            });
+          const targetAssistantMessageId = resolvedAssistantMessageId(
+            streamEvent.assistantMessageId,
+          );
+          toolOutputDeltaBuffer.push(chatKey, {
+            assistantMessageId: targetAssistantMessageId,
+            delta: streamEvent.delta,
+            stream: streamEvent.stream,
+            toolCallId: streamEvent.toolCallId,
           });
           return;
         }
@@ -6917,7 +7194,7 @@ export function App() {
 
       await refreshWorkspaces();
     } catch (requestError) {
-      textDeltaBuffer.flush();
+      flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
@@ -6947,7 +7224,7 @@ export function App() {
         setError(errorMessage(requestError));
       }
     } finally {
-      textDeltaBuffer.flush();
+      flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
@@ -7051,6 +7328,13 @@ export function App() {
     let activeRunId: string | null = null;
     const abortController = new AbortController();
     const textDeltaBuffer = createTextDeltaBuffer();
+    const reasoningDeltaBuffer = createReasoningDeltaBuffer();
+    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
+    const flushStreamDeltaBuffers = () => {
+      textDeltaBuffer.flush();
+      reasoningDeltaBuffer.flush();
+      toolOutputDeltaBuffer.flush();
+    };
     const refreshRunContextUsage = () => {
       if (!latestResponseUsage) {
         return;
@@ -7347,6 +7631,12 @@ export function App() {
         if (streamEvent.type !== "textDelta") {
           textDeltaBuffer.flush();
         }
+        if (streamEvent.type !== "reasoningDelta") {
+          reasoningDeltaBuffer.flush();
+        }
+        if (streamEvent.type !== "toolOutputDelta") {
+          toolOutputDeltaBuffer.flush();
+        }
 
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
@@ -7510,23 +7800,15 @@ export function App() {
 
         if (streamEvent.type === "reasoningDelta") {
           const reasoningStartedAtMs = startLiveReasoningDuration();
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          const targetAssistantMessageId = resolvedAssistantMessageId(
+            streamEvent.assistantMessageId,
           );
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
-                  parts: appendReasoningPart(
-                    message.parts,
-                    streamEvent.delta,
-                    reasoningStartedAtMs,
-                  ),
-                }
-                : message,
-            ),
+          ensureStreamingAssistantMessage(targetAssistantMessageId);
+          reasoningDeltaBuffer.push(
+            runMessagesKey,
+            targetAssistantMessageId,
+            streamEvent.delta,
+            reasoningStartedAtMs,
           );
           return;
         }
@@ -7750,36 +8032,15 @@ export function App() {
         }
 
         if (streamEvent.type === "toolOutputDelta") {
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          const targetAssistantMessageId = resolvedAssistantMessageId(
+            streamEvent.assistantMessageId,
           );
-          const messageOwnsToolCall = (message: ShellMessage) =>
-            messageHasToolCall(message, streamEvent.toolCallId);
-          deferStreamSideUpdate(() => {
-            setMessagesForChatKey(runMessagesKey, (current) => {
-              const updateExistingToolCall = current.some(messageOwnsToolCall);
-              return current.map((message) =>
-                (updateExistingToolCall
-                  ? messageOwnsToolCall(message)
-                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                  ? {
-                    ...message,
-                    toolCalls: applyToolOutputDelta(
-                      message.toolCalls,
-                      streamEvent.toolCallId,
-                      streamEvent.stream,
-                      streamEvent.delta,
-                    ),
-                    parts: applyToolOutputDeltaToParts(
-                      message.parts,
-                      streamEvent.toolCallId,
-                      streamEvent.stream,
-                      streamEvent.delta,
-                    ),
-                  }
-                  : message,
-              );
-            });
+          ensureStreamingAssistantMessage(targetAssistantMessageId);
+          toolOutputDeltaBuffer.push(runMessagesKey, {
+            assistantMessageId: targetAssistantMessageId,
+            delta: streamEvent.delta,
+            stream: streamEvent.stream,
+            toolCallId: streamEvent.toolCallId,
           });
           return;
         }
@@ -7928,7 +8189,7 @@ export function App() {
       await refreshWorkspaces();
       runSucceeded = !streamHadError;
     } catch (requestError) {
-      textDeltaBuffer.flush();
+      flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
@@ -7953,7 +8214,7 @@ export function App() {
         ),
       );
     } finally {
-      textDeltaBuffer.flush();
+      flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       if (
@@ -8305,23 +8566,25 @@ export function App() {
   const openAgentInstanceTabForContextPanel = useStableCallback(openAgentInstanceTab);
   const agentsPanelForContextPanel = useMemo(
     () => (
-      <AgentsRuntimePanel
-        activeChatId={
-          activeChatId && !isPendingChatId(activeChatId)
-            ? activeChatId
-            : null
-        }
-        error={agentTeamError}
-        isLoading={isLoadingAgentTeam}
-        onRefresh={refreshAgentPanelForContextPanel}
-        onSelectInstance={openAgentInstanceTabForContextPanel}
-        selectedInstanceId={
-          activeMainTab.type === "agent"
-            ? activeMainTab.instanceId
-            : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
-        }
-        snapshot={agentTeamSnapshot}
-      />
+      <Suspense fallback={<PanelLoadingFallback />}>
+        <AgentsRuntimePanel
+          activeChatId={
+            activeChatId && !isPendingChatId(activeChatId)
+              ? activeChatId
+              : null
+          }
+          error={agentTeamError}
+          isLoading={isLoadingAgentTeam}
+          onRefresh={refreshAgentPanelForContextPanel}
+          onSelectInstance={openAgentInstanceTabForContextPanel}
+          selectedInstanceId={
+            activeMainTab.type === "agent"
+              ? activeMainTab.instanceId
+              : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
+          }
+          snapshot={agentTeamSnapshot}
+        />
+      </Suspense>
     ),
     [
       activeChatId,
@@ -8394,10 +8657,6 @@ export function App() {
     },
   );
   const handleContextPanelTabChange = useStableCallback((tab: ContextPanelTab) => {
-    if (tab === "files") {
-      preloadOptionalMonaco();
-    }
-
     setContextPanelTab(tab);
     setIsContextPanelOpen(true);
   });
@@ -9167,23 +9426,25 @@ export function App() {
                   onSave={saveWorkspaceFileEditor}
                 />
               ) : activeMainTab.type === "agent" && activeAgentTab ? (
-                <AgentTranscriptPanel
-                  error={agentTeamError}
-                  helpers={chatPanelHelpers}
-                  instanceId={activeAgentTab.instanceId}
-                  isLoading={isLoadingAgentTeam}
-                  onOpenMainChat={() =>
-                    selectWorkspaceChat(activeAgentTab.workspaceId, activeAgentTab.chatId)
-                  }
-                  onRefresh={async () => {
-                    await loadAgentTeamSnapshot(
-                      activeAgentTab.workspaceId,
-                      activeAgentTab.chatId,
-                    );
-                  }}
-                  snapshot={agentTeamSnapshot}
-                  workspaceId={activeAgentTab.workspaceId}
-                />
+                <Suspense fallback={<PanelLoadingFallback />}>
+                  <AgentTranscriptPanel
+                    error={agentTeamError}
+                    helpers={chatPanelHelpers}
+                    instanceId={activeAgentTab.instanceId}
+                    isLoading={isLoadingAgentTeam}
+                    onOpenMainChat={() =>
+                      selectWorkspaceChat(activeAgentTab.workspaceId, activeAgentTab.chatId)
+                    }
+                    onRefresh={async () => {
+                      await loadAgentTeamSnapshot(
+                        activeAgentTab.workspaceId,
+                        activeAgentTab.chatId,
+                      );
+                    }}
+                    snapshot={agentTeamSnapshot}
+                    workspaceId={activeAgentTab.workspaceId}
+                  />
+                </Suspense>
               ) : (
                 <ChatPanel
                   activeWorkspaceName={activeWorkspace?.name ?? null}
@@ -10441,6 +10702,7 @@ function ApiOverviewPanel({
   const [isLoading, setIsLoading] = useState(false);
   const activeOverviewRequestRef = useRef<AbortController | null>(null);
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
+  const hasLoadedOverview = stats !== null;
   const providerLabels = useMemo(
     () =>
       new Map(
@@ -10582,10 +10844,6 @@ function ApiOverviewPanel({
     setHasAppliedInitialWorkspace(true);
   }, [preferredWorkspaceId]);
 
-  useEffect(() => {
-    void loadOverview();
-  }, [loadOverview]);
-
   function updateOverviewFilters(update: Partial<typeof filters>) {
     setHasAppliedInitialWorkspace(true);
     setFilters((current) => ({
@@ -10693,9 +10951,13 @@ function ApiOverviewPanel({
         />
       </section>
 
-      {summary.totalRequests === 0 ? (
+      {!hasLoadedOverview || summary.totalRequests === 0 ? (
         <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
-          {isLoading ? t("Loading...") : t("No statistics yet")}
+          {!hasLoadedOverview
+            ? t("Refresh request audit to load charts")
+            : isLoading
+              ? t("Loading...")
+              : t("No statistics yet")}
         </section>
       ) : (
         <Suspense fallback={<PanelLoadingFallback />}>

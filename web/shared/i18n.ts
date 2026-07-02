@@ -452,6 +452,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Configured models": "已配置模型",
     "Request audit": "请求审计",
     "Refresh request audit": "刷新请求审计",
+    "Refresh request audit to load charts": "刷新请求审计以加载图表",
     Columns: "列",
     Usage: "用量",
     "Recorded requests": "已记录请求",

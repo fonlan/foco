@@ -1164,7 +1164,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(window.localStorage.getItem(planAutoRunEnabledStorageKey("workspace-2"))).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Default" }));
-    await user.click(screen.getByRole("button", { name: /Tool run/ }));
+    await user.click(screen.getByRole("tab", { name: /Tool run/ }));
 
     await waitFor(() => {
       expect(autoRunCheckbox).toBeChecked();
@@ -2592,10 +2592,12 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
 
-  it("loads API overview for the active workspace first", async () => {
+  it("loads API overview for the active workspace after refresh", async () => {
     renderApp();
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(aiStatisticsCallUrls()).toHaveLength(0);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
     await waitFor(() =>
       expect(
         aiStatisticsCallUrls().some(
@@ -2614,6 +2616,7 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
     await waitFor(() =>
       expect(screen.getAllByText("17.6K").length).toBeGreaterThan(0),
     );

@@ -37,6 +37,20 @@ function currentFileTabs() {
   return new URLSearchParams(window.location.search).getAll("file");
 }
 
+function aiStatisticsCallUrlsFromMock(fetchMock: ReturnType<typeof vi.mocked<typeof fetch>>) {
+  return fetchMock.mock.calls
+    .map(([input]) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      return new URL(rawPath, "http://localhost");
+    })
+    .filter((url) => url.pathname === "/api/ai-statistics");
+}
+
 function getAssistantFinalAnswer(container: HTMLElement) {
   return within(container).getByText((_content, element) =>
     Boolean(
@@ -598,7 +612,9 @@ describe("app-shell verification surfaces", () => {
     expect(within(statusSelect).getByRole("option", { name: "Paused" })).toBeInTheDocument();
     expect(within(statusSelect).queryByRole("option", { name: "Completed" })).not.toBeInTheDocument();
     expect(within(statusSelect).queryByRole("option", { name: "Archived" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Agent")).toHaveValue("agent-definition-coordinator");
+    await waitFor(() =>
+      expect(screen.getByLabelText("Agent")).toHaveValue("agent-definition-coordinator"),
+    );
     expect(screen.getByLabelText("Model")).toHaveValue("gpt-test");
     expect(screen.getByLabelText("Provider")).toHaveValue("openai");
     expect(screen.getByRole("checkbox", { name: "Enable Team mode" })).toBeChecked();
@@ -1101,6 +1117,8 @@ describe("app-shell verification surfaces", () => {
     expect(
       screen.getByPlaceholderText(sideProjectComposerPlaceholder),
     ).toBeInTheDocument();
+    expect(aiStatisticsCallUrlsFromMock(fetchMock)).toHaveLength(0);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(([url]) => {

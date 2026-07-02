@@ -1919,7 +1919,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("cancels API overview statistics while queueing a new chat", async () => {
+  it("keeps API overview idle while queueing a new chat", async () => {
     const fetchMock = vi.mocked(fetch);
     let statsSignal: AbortSignal | null = null;
     fetchMock.mockImplementation((input, init) => {
@@ -1930,11 +1930,7 @@ describe("app-chat-stream verification surfaces", () => {
 
       if (path === "/api/ai-statistics") {
         statsSignal = init?.signal ?? null;
-        return new Promise<Response>((_, reject) => {
-          statsSignal?.addEventListener("abort", () => {
-            reject(new DOMException("Aborted", "AbortError"));
-          });
-        });
+        return Promise.resolve(jsonResponse(aiStatistics));
       }
 
       return mockFetch(input, init);
@@ -1942,14 +1938,13 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
-    await waitFor(() => expect(statsSignal).not.toBeNull());
+    expect(statsSignal).toBeNull();
     await userEvent.type(
-      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      await screen.findByRole("textbox"),
       "stats must not block",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-    await waitFor(() => expect(statsSignal?.aborted).toBe(true));
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(
@@ -1959,6 +1954,7 @@ describe("app-chat-stream verification surfaces", () => {
         ),
       ).toBe(true),
     );
+    expect(statsSignal).toBeNull();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
