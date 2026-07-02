@@ -14747,6 +14747,94 @@ fn init_plan_merge_git_workspace(workspace_path: &Path) {
         .expect("initial commit");
 }
 
+#[tokio::test]
+async fn warm_model_metadata_cache_skips_existing_readable_cache() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    fs::create_dir_all(state.model_metadata_file.parent().expect("cache parent"))
+        .expect("cache dir");
+    let existing = foco_store::model_metadata::ModelMetadataCache {
+        source_url: "cached".to_string(),
+        fetched_at: "2026-07-02T00:00:00Z".to_string(),
+        models: Vec::new(),
+    };
+    foco_store::model_metadata::write_model_metadata_cache(&state.model_metadata_file, &existing)
+        .expect("write cache");
+
+    crate::http::settings::warm_model_metadata_cache_once_from_url(&state, "http://127.0.0.1:9/")
+        .await
+        .expect("warmup should skip fetch");
+
+    let cache = foco_store::model_metadata::read_model_metadata_cache(&state.model_metadata_file)
+        .expect("read cache")
+        .expect("cache exists");
+    assert_eq!(cache, existing);
+}
+
+#[tokio::test]
+async fn warm_model_metadata_cache_writes_missing_cache() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    fs::create_dir_all(state.model_metadata_file.parent().expect("cache parent"))
+        .expect("cache dir");
+    let (source_url, server_task) = serve_models_dev_fixture(
+        r#"{
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "models": {
+      "gpt-test": {
+        "id": "gpt-test",
+        "name": "GPT Test",
+        "tool_call": true,
+        "limit": { "context": 128000, "output": 16384 },
+        "cost": { "input": 1.25, "output": 10.0 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}"#,
+    )
+    .await;
+
+    crate::http::settings::warm_model_metadata_cache_once_from_url(&state, &source_url)
+        .await
+        .expect("warmup should write cache");
+    server_task.abort();
+
+    let cache = foco_store::model_metadata::read_model_metadata_cache(&state.model_metadata_file)
+        .expect("read cache")
+        .expect("cache exists");
+    assert_eq!(cache.source_url, source_url);
+    assert_eq!(cache.models.len(), 1);
+    assert_eq!(cache.models[0].key, "openai/gpt-test");
+    assert_eq!(cache.models[0].context_window, Some(128000));
+}
+
+async fn serve_models_dev_fixture(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || async move { (StatusCode::OK, body) }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind fixture server");
+    let addr = listener.local_addr().expect("fixture server address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/"), task)
+}
+
 fn managed_agent_worktree_count(workspace_path: &Path) -> usize {
     let root = workspace_path.join(".foco").join("agent-worktrees");
     match fs::read_dir(root) {

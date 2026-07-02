@@ -683,6 +683,7 @@ async fn run_server_until_shutdown(
         Duration::from_secs(API_AUDIT_CLEANUP_STARTUP_DELAY_SECS),
     );
     let provider_model_sync_task = spawn_provider_model_sync_scheduler(state.clone());
+    let model_metadata_cache_task = spawn_model_metadata_cache_warmup(state.clone());
     agent_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -733,11 +734,13 @@ async fn run_server_until_shutdown(
         api_audit_cleanup_task.abort();
         provider_model_sync_task.abort();
     }
+    model_metadata_cache_task.abort();
     let _ = agent_scheduler_task.await;
     let _ = scheduled_task_scheduler_task.await;
     let _ = memory_dream_scheduler_task.await;
     let _ = api_audit_cleanup_task.await;
     let _ = provider_model_sync_task.await;
+    let _ = model_metadata_cache_task.await;
     server_result?;
 
     Ok(())
@@ -767,6 +770,17 @@ fn initialize_workspace_databases_for_startup(
     }
 
     Ok(count)
+}
+
+fn spawn_model_metadata_cache_warmup(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match crate::http::settings::warm_model_metadata_cache_once(&state).await {
+            Ok(()) => tracing::info!("model metadata cache warmup completed"),
+            Err(error) => {
+                tracing::warn!(error = %error.message, "model metadata cache warmup failed")
+            }
+        }
+    })
 }
 
 fn spawn_provider_model_sync_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {

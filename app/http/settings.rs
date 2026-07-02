@@ -21,8 +21,8 @@ use foco_store::{
         REVIEW_SYSTEM_PROMPT_NAME, SpecSettings,
     },
     model_metadata::{
-        MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
-        write_model_metadata_cache,
+        MODELS_DEV_API_URL, ModelMetadataCache, parse_models_dev_metadata,
+        read_model_metadata_cache, write_model_metadata_cache,
     },
 };
 
@@ -2018,8 +2018,50 @@ pub(crate) async fn model_metadata(
 pub(crate) async fn refresh_model_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let cache = fetch_and_write_model_metadata_cache(&state).await?;
+
+    let config = config_snapshot(&state)?;
+
+    Ok(Json(model_metadata_response(
+        Some(cache),
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
+pub(crate) async fn warm_model_metadata_cache_once(state: &AppState) -> Result<(), ApiError> {
+    warm_model_metadata_cache_once_from_url(state, MODELS_DEV_API_URL).await
+}
+
+pub(crate) async fn warm_model_metadata_cache_once_from_url(
+    state: &AppState,
+    source_url: &str,
+) -> Result<(), ApiError> {
+    match read_model_metadata_cache(&state.model_metadata_file) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "model metadata cache is unreadable; refreshing");
+        }
+    }
+
+    fetch_and_write_model_metadata_cache_from_url(state, source_url)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn fetch_and_write_model_metadata_cache(
+    state: &AppState,
+) -> Result<ModelMetadataCache, ApiError> {
+    fetch_and_write_model_metadata_cache_from_url(state, MODELS_DEV_API_URL).await
+}
+
+async fn fetch_and_write_model_metadata_cache_from_url(
+    state: &AppState,
+    source_url: &str,
+) -> Result<ModelMetadataCache, ApiError> {
     let fetched_at = utc_timestamp();
-    let content = reqwest::get(MODELS_DEV_API_URL)
+    let content = reqwest::get(source_url)
         .await
         .map_err(|source| {
             ApiError::internal(format!("failed to fetch models.dev metadata: {source}"))
@@ -2033,19 +2075,13 @@ pub(crate) async fn refresh_model_metadata(
         .map_err(|source| {
             ApiError::internal(format!("failed to read models.dev metadata: {source}"))
         })?;
-    let cache = parse_models_dev_metadata(&content, MODELS_DEV_API_URL, &fetched_at)
+    let cache = parse_models_dev_metadata(&content, source_url, &fetched_at)
         .map_err(ApiError::from_model_metadata_error)?;
 
     write_model_metadata_cache(&state.model_metadata_file, &cache)
         .map_err(ApiError::from_model_metadata_error)?;
 
-    let config = config_snapshot(&state)?;
-
-    Ok(Json(model_metadata_response(
-        Some(cache),
-        &config,
-        &state.model_metadata_file,
-    )))
+    Ok(cache)
 }
 
 pub(crate) async fn save_manual_model(
