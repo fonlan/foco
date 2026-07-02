@@ -18,6 +18,7 @@ use crate::{
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
+const DEFAULT_SKILLS_API_BASE_URL: &str = "https://skills-api.deeptoai.com";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -99,6 +100,7 @@ pub(crate) struct SkillStoreInstallResponse {
 struct SkillStoreClient {
     http: reqwest::Client,
     skills_base_url: String,
+    skills_api_base_url: String,
     github_api_base_url: String,
     github_raw_base_url: String,
     token: Option<String>,
@@ -112,6 +114,10 @@ impl SkillStoreClient {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_SKILLS_SH_BASE_URL.to_string()),
+            skills_api_base_url: env::var("SKILLS_API_BASE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_SKILLS_API_BASE_URL.to_string()),
             github_api_base_url: env::var("SKILLS_STORE_GITHUB_API_BASE_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -209,45 +215,139 @@ impl SkillStoreClient {
         source: Option<&str>,
     ) -> Result<SkillStoreDetailResponse, ApiError> {
         let skill_id = validate_skill_slug(skill_id)?;
+        let mut token_detail = None;
         if self.token.is_some() {
             let url = self.skills_url(&format!("/api/v1/skills/{skill_id}"));
             match self.skills_get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
                     let value = response.json::<Value>().await.map_err(network_error)?;
-                    let mut detail = detail_response_from_value(value, &skill_id, source);
-                    if detail.files.iter().any(|file| file.path == SKILL_FILE_NAME) {
-                        return Ok(detail);
+                    let detail = detail_response_from_value(value, &skill_id, source);
+                    if skill_files_have_skill_md(&detail.files) {
+                        match ensure_skill_files_valid(&detail.files) {
+                            Ok(()) => return Ok(detail),
+                            Err(error) => {
+                                tracing::warn!(error = %error.message(), "skills.sh v1 detail files were invalid; trying registry detail");
+                            }
+                        }
                     }
-                    if let Some(source) = detail.source.as_deref().or(source) {
-                        detail.files = self.github_skill_files(source, &skill_id).await?;
-                        return Ok(detail);
-                    }
-                    return Err(ApiError::bad_request(
-                        "skill detail did not include files and no GitHub source was provided",
-                    ));
+                    token_detail = Some(detail);
                 }
                 Ok(response) => {
-                    tracing::warn!(status = %response.status(), "skills.sh v1 detail request failed; trying GitHub source fallback");
+                    tracing::warn!(status = %response.status(), "skills.sh v1 detail request failed; trying registry detail");
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "skills.sh v1 detail request failed; trying GitHub source fallback");
+                    tracing::warn!(error = %error, "skills.sh v1 detail request failed; trying registry detail");
                 }
             }
         }
 
-        let source = source.ok_or_else(|| {
-            ApiError::bad_request(
-                "skill source is required for detail fallback without SKILLS_SH_TOKEN or VERCEL_OIDC_TOKEN",
-            )
-        })?;
-        let files = self.github_skill_files(source, &skill_id).await?;
-        Ok(SkillStoreDetailResponse {
-            id: skill_id.clone(),
-            name: skill_id,
-            description: String::new(),
-            source: Some(source.to_string()),
-            files,
-        })
+        match self.skills_api_detail(&skill_id).await {
+            Ok(mut detail) => {
+                if skill_files_have_skill_md(&detail.files) {
+                    match ensure_skill_files_valid(&detail.files) {
+                        Ok(()) => return Ok(detail),
+                        Err(error) => {
+                            tracing::warn!(error = %error.message(), "skills-api detail files were invalid; trying file endpoint");
+                        }
+                    }
+                }
+
+                if let Some(source) = detail.source.clone() {
+                    match self.skills_api_skill_files(&source, &skill_id).await {
+                        Ok(files) => {
+                            detail.files = files;
+                            return Ok(detail);
+                        }
+                        Err(error) => {
+                            tracing::warn!(source, error = %error.message(), "skills-api file request failed; trying GitHub fallback");
+                        }
+                    }
+
+                    if let Ok(files) = self.github_skill_files(&source, &skill_id).await {
+                        detail.files = files;
+                        return Ok(detail);
+                    }
+                }
+
+                Err(ApiError::bad_request(format!(
+                    "skill detail did not include {SKILL_FILE_NAME} and registry source was unavailable"
+                )))
+            }
+            Err(registry_error) => {
+                tracing::warn!(error = %registry_error.message(), "skills-api detail request failed; trying GitHub fallback");
+                let fallback_source = token_detail
+                    .as_ref()
+                    .and_then(|detail| detail.source.as_deref())
+                    .or(source)
+                    .and_then(|source| validate_github_source(source).ok());
+                if let Some(source) = fallback_source {
+                    let files = self.github_skill_files(&source, &skill_id).await?;
+                    let mut detail = token_detail.unwrap_or_else(|| SkillStoreDetailResponse {
+                        id: skill_id.clone(),
+                        name: skill_id.clone(),
+                        description: String::new(),
+                        source: Some(source.clone()),
+                        files: Vec::new(),
+                    });
+                    detail.source = Some(source);
+                    detail.files = files;
+                    return Ok(detail);
+                }
+                Err(registry_error)
+            }
+        }
+    }
+
+    async fn skills_api_detail(
+        &self,
+        skill_id: &str,
+    ) -> Result<SkillStoreDetailResponse, ApiError> {
+        let skill_id = validate_skill_slug(skill_id)?;
+        let url = self.skills_api_url(&format!("/api/skills/{}", url_segment(&skill_id)));
+        let value = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?
+            .json::<Value>()
+            .await
+            .map_err(network_error)?;
+        Ok(detail_response_from_value(value, &skill_id, None))
+    }
+
+    async fn skills_api_skill_files(
+        &self,
+        source: &str,
+        skill_id: &str,
+    ) -> Result<Vec<SkillStoreFile>, ApiError> {
+        let source = validate_github_source(source)?;
+        let skill_id = validate_skill_slug(skill_id)?;
+        let mut parts = source.split('/');
+        let owner = parts.next().unwrap_or_default();
+        let repo = parts.next().unwrap_or_default();
+        let url = self.skills_api_url(&format!(
+            "/api/skills/{}/{}/{}/files",
+            url_segment(owner),
+            url_segment(repo),
+            url_segment(&skill_id)
+        ));
+        let value = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?
+            .json::<Value>()
+            .await
+            .map_err(network_error)?;
+        let files = files_from_value(&value);
+        ensure_skill_files_valid(&files)?;
+        Ok(files)
     }
 
     async fn github_skill_files(
@@ -358,6 +458,10 @@ impl SkillStoreClient {
 
     fn skills_url(&self, path: &str) -> String {
         format!("{}{}", self.skills_base_url.trim_end_matches('/'), path)
+    }
+
+    fn skills_api_url(&self, path: &str) -> String {
+        format!("{}{}", self.skills_api_base_url.trim_end_matches('/'), path)
     }
 
     fn skills_get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -735,6 +839,180 @@ fn github_path_is_under_root(path: &str, root: &str) -> bool {
     }
 }
 
+fn detail_response_from_value(
+    value: Value,
+    fallback_id: &str,
+    fallback_source: Option<&str>,
+) -> SkillStoreDetailResponse {
+    let id = string_field(&value, &["skillId", "id", "slug", "name"])
+        .unwrap_or_else(|| fallback_id.to_string());
+    let files = files_from_value(&value);
+    SkillStoreDetailResponse {
+        name: string_field(&value, &["name", "title"]).unwrap_or_else(|| id.clone()),
+        description: string_field(&value, &["description", "summary"]).unwrap_or_default(),
+        source: registry_source_from_value(&value).or_else(|| fallback_source.map(str::to_string)),
+        id,
+        files,
+    }
+}
+
+pub(crate) fn registry_source_from_value(value: &Value) -> Option<String> {
+    registry_value_candidates(value)
+        .into_iter()
+        .find_map(github_source_from_registry_value)
+}
+
+fn github_source_from_registry_value(value: &Value) -> Option<String> {
+    let owner = string_field(
+        value,
+        &[
+            "owner",
+            "githubOwner",
+            "repoOwner",
+            "repositoryOwner",
+            "sourceOwner",
+        ],
+    );
+    let repo = string_field(
+        value,
+        &[
+            "repo",
+            "repository",
+            "githubRepo",
+            "repoName",
+            "repositoryName",
+            "sourceRepo",
+        ],
+    );
+    if let (Some(owner), Some(repo)) = (owner, repo) {
+        let source = format!("{owner}/{repo}");
+        if validate_github_source(&source).is_ok() {
+            return Some(source);
+        }
+    }
+
+    value
+        .get("repository")
+        .and_then(Value::as_object)
+        .and_then(|repository| {
+            let owner = repository
+                .get("owner")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let repo = repository
+                .get("repo")
+                .or_else(|| repository.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            github_source_from_string(&format!("{owner}/{repo}"))
+        })
+        .or_else(|| {
+            string_field(
+                value,
+                &[
+                    "source",
+                    "repository",
+                    "repo",
+                    "github",
+                    "githubUrl",
+                    "repositoryUrl",
+                ],
+            )
+            .and_then(|source| github_source_from_string(&source))
+        })
+}
+
+fn github_source_from_string(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches(".git");
+    if validate_github_source(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+
+    for prefix in [
+        "https://github.com/",
+        "http://github.com/",
+        "git@github.com:",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let source = rest.trim_end_matches('/');
+            let source = source.split('/').take(2).collect::<Vec<_>>().join("/");
+            if validate_github_source(&source).is_ok() {
+                return Some(source);
+            }
+        }
+    }
+    None
+}
+
+fn files_from_value(value: &Value) -> Vec<SkillStoreFile> {
+    registry_files_from_value(value)
+}
+
+pub(crate) fn registry_files_from_value(value: &Value) -> Vec<SkillStoreFile> {
+    registry_value_candidates(value)
+        .into_iter()
+        .find_map(files_from_registry_candidate)
+        .unwrap_or_default()
+}
+
+fn files_from_registry_candidate(value: &Value) -> Option<Vec<SkillStoreFile>> {
+    if let Some(files) = value.as_array().map(|files| files_from_array(files)) {
+        if !files.is_empty() {
+            return Some(files);
+        }
+    }
+
+    let files_value = value.get("files")?;
+    if let Some(files) = files_value.as_array().map(|files| files_from_array(files)) {
+        return Some(files);
+    }
+    files_value.as_object().map(|files| {
+        files
+            .iter()
+            .filter_map(|(path, content)| {
+                let content = content.as_str()?.to_string();
+                Some(SkillStoreFile {
+                    path: path.clone(),
+                    content,
+                })
+            })
+            .collect()
+    })
+}
+
+fn files_from_array(files: &[Value]) -> Vec<SkillStoreFile> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let path = string_field(file, &["path", "name", "filename"])?;
+            let content = raw_string_field(file, &["content", "text", "body"])?;
+            Some(SkillStoreFile { path, content })
+        })
+        .collect()
+}
+
+fn registry_value_candidates(value: &Value) -> Vec<&Value> {
+    let mut candidates = Vec::new();
+    candidates.push(value);
+    for key in ["data", "result", "skill"] {
+        if let Some(candidate) = value.get(key) {
+            candidates.push(candidate);
+            if let Some(skill) = candidate.get("skill") {
+                candidates.push(skill);
+            }
+        }
+    }
+    candidates
+}
+
+fn skill_files_have_skill_md(files: &[SkillStoreFile]) -> bool {
+    files
+        .iter()
+        .any(|file| sanitize_skill_file_path(&file.path).ok().as_deref() == Some(SKILL_FILE_NAME))
+}
+
 fn list_response_from_value(value: Value, source: &str) -> SkillStoreListResponse {
     let skills_value = value
         .get("skills")
@@ -785,43 +1063,6 @@ fn skill_summary_from_value(value: &Value) -> Option<SkillStoreSkillSummary> {
     })
 }
 
-fn detail_response_from_value(
-    value: Value,
-    fallback_id: &str,
-    fallback_source: Option<&str>,
-) -> SkillStoreDetailResponse {
-    let id = string_field(&value, &["skillId", "id", "slug", "name"])
-        .unwrap_or_else(|| fallback_id.to_string());
-    let files = files_from_value(&value);
-    SkillStoreDetailResponse {
-        name: string_field(&value, &["name", "title"]).unwrap_or_else(|| id.clone()),
-        description: string_field(&value, &["description", "summary"]).unwrap_or_default(),
-        source: string_field(&value, &["source", "repository", "repo"])
-            .or_else(|| fallback_source.map(str::to_string)),
-        id,
-        files,
-    }
-}
-
-fn files_from_value(value: &Value) -> Vec<SkillStoreFile> {
-    let Some(files) = value
-        .get("files")
-        .or_else(|| value.pointer("/skill/files"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    files
-        .iter()
-        .filter_map(|file| {
-            let path = string_field(file, &["path", "name"])?;
-            let content = string_field(file, &["content", "text"])?;
-            Some(SkillStoreFile { path, content })
-        })
-        .collect()
-}
-
 fn string_field(value: &Value, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
         value
@@ -831,6 +1072,12 @@ fn string_field(value: &Value, names: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+fn raw_string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str).map(str::to_string))
 }
 
 fn u64_field(value: &Value, names: &[&str]) -> Option<u64> {

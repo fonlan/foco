@@ -53,7 +53,8 @@ use crate::http::{
     },
     skill_store::{
         SkillStoreFile, ensure_skill_files_valid, install_skill_files_to_target_dir,
-        sanitize_skill_file_path, validate_skill_slug,
+        registry_files_from_value, registry_source_from_value, sanitize_skill_file_path,
+        validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -14011,6 +14012,46 @@ fn skill_store_requires_skill_markdown_file() {
     let error = ensure_skill_files_valid(&files).expect_err("missing SKILL.md should fail");
 
     assert!(error.message().contains("SKILL.md"));
+}
+#[test]
+fn skill_store_registry_detail_prefers_canonical_github_source() {
+    let value = json!({
+        "data": {
+            "id": "lark-calendar",
+            "source": "open.feishu.cn",
+            "owner": "larksuite",
+            "repo": "cli"
+        }
+    });
+
+    assert_eq!(
+        registry_source_from_value(&value),
+        Some("larksuite/cli".to_string())
+    );
+}
+
+#[test]
+fn skill_store_registry_files_parse_skill_and_support_files() {
+    let value = json!({
+        "files": [
+            {
+                "path": "SKILL.md",
+                "content": "---\nname: lark-calendar\n---\n"
+            },
+            {
+                "path": "support/prompts.md",
+                "content": "Use the calendar API."
+            }
+        ]
+    });
+
+    let files = registry_files_from_value(&value);
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].path, "SKILL.md");
+    assert_eq!(files[0].content, "---\nname: lark-calendar\n---\n");
+    assert_eq!(files[1].path, "support/prompts.md");
+    assert_eq!(files[1].content, "Use the calendar API.");
 }
 
 #[test]
