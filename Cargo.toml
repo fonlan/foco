@@ -31,6 +31,7 @@ futures-util = { version = "0.3.31", features = ["sink"] }
 genai = { version = "0.6.4", default-features = true }
 getrandom = "0.3.4"
 gix = { version = "0.84.0", default-features = false, features = ["sha1", "status", "worktree-mutation"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks"] }
 process-wrap = { version = "9.1.0", default-features = true, features = ["tokio1"] }
 regex = "1.12.2"

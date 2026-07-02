@@ -5164,7 +5164,7 @@ fn workspace_logo_file_detects_manual_logo_png() {
     let logo_url = workspace_logo_url(&workspace)
         .expect("logo url lookup")
         .expect("logo url");
-    assert!(logo_url.starts_with("/api/workspaces/workspace-1/logo?v="));
+    assert!(logo_url.starts_with("/api/workspaces/workspace-1/logo/thumbnail?v="));
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -5214,6 +5214,37 @@ fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
         logo.path.file_name().and_then(|name| name.to_str()),
         Some("logo.jpg")
     );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_logo_thumbnail_generates_png_with_32px_bounds() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-thumb-test"));
+    let logo_dir = workspace_dir.join(".foco");
+    fs::create_dir_all(&logo_dir).expect("logo directory");
+
+    let source = image::RgbaImage::from_fn(96, 48, |x, y| {
+        image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+    });
+    let mut source_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(source)
+        .write_to(&mut source_png, image::ImageFormat::Png)
+        .expect("encode source png");
+    let source_png = source_png.into_inner();
+    fs::write(logo_dir.join("logo.png"), &source_png).expect("write png logo");
+
+    let logo = workspace_logo_file(&workspace_dir)
+        .expect("logo lookup")
+        .expect("saved logo");
+    let thumbnail = workspace_logo_thumbnail_file(&logo).expect("thumbnail");
+
+    assert_eq!(thumbnail.content_type, "image/png");
+    assert!(thumbnail.bytes.len() < source_png.len());
+    let decoded = image::load_from_memory_with_format(&thumbnail.bytes, image::ImageFormat::Png)
+        .expect("decode thumbnail png");
+    assert!(decoded.width() <= 32);
+    assert!(decoded.height() <= 32);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -11300,10 +11331,9 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
         .expect("response workspace first");
     assert_eq!(response_workspace.name, "New Workspace");
     assert!(
-        response_workspace
-            .logo_url
-            .as_deref()
-            .is_some_and(|logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo?v="))
+        response_workspace.logo_url.as_deref().is_some_and(
+            |logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo/thumbnail?v=")
+        )
     );
     let logo = workspace_logo_file(&new_workspace_dir)
         .expect("workspace logo lookup")

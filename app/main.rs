@@ -75,6 +75,7 @@ use foco_tools::{
     UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
 };
+use image::{ImageFormat, ImageReader};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -328,6 +329,8 @@ const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 // File extensions accepted for persisted workspace logo images.
 const WORKSPACE_LOGO_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "svg"];
+const WORKSPACE_LOGO_THUMBNAIL_FILE: &str = "logo-thumb-32.png";
+const WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE: &str = "logo-thumb-32.version";
 // Prefix used to identify injected AGENTS.md instruction messages.
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 // Prefix used to identify injected user-configured prompt file messages.
@@ -6156,8 +6159,12 @@ fn optional_workspace_logo_request_bytes(
 }
 
 pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
-    Ok(workspace_logo_file(&workspace.path)?
-        .map(|logo| format!("/api/workspaces/{}/logo?v={}", workspace.id, logo.version)))
+    Ok(workspace_logo_file(&workspace.path)?.map(|logo| {
+        format!(
+            "/api/workspaces/{}/logo/thumbnail?v={}",
+            workspace.id, logo.version
+        )
+    }))
 }
 
 fn workspace_logo_file(workspace_path: &Path) -> Result<Option<WorkspaceLogoFile>, ApiError> {
@@ -6280,6 +6287,22 @@ fn remove_workspace_logo_files(logo_dir: &Path) -> Result<(), ApiError> {
         })?;
     }
 
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        let path = logo_dir.join(file_name);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to remove old workspace logo thumbnail {}: {}",
+                    path.display(),
+                    source
+                ))
+            })?;
+        }
+    }
+
     Ok(())
 }
 
@@ -6307,6 +6330,151 @@ fn read_workspace_logo_file(path: &Path) -> Result<(Vec<u8>, fs::Metadata), ApiE
         ))
     })?;
     Ok((bytes, metadata))
+}
+
+struct WorkspaceLogoThumbnail {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+}
+
+fn workspace_logo_thumbnail_file(
+    logo: &WorkspaceLogoFile,
+) -> Result<WorkspaceLogoThumbnail, ApiError> {
+    let (bytes, metadata) = read_workspace_logo_file(&logo.path)?;
+    let kind = workspace_logo_kind(&bytes)?;
+    if kind != logo.kind {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo changed while it was being read: {}",
+            logo.path.display()
+        )));
+    }
+
+    if kind.extension == "svg" {
+        // ponytail: SVG is already cheap for browsers to scale; rasterize later with resvg if needed.
+        return Ok(WorkspaceLogoThumbnail {
+            bytes,
+            content_type: kind.content_type,
+        });
+    }
+
+    if let Some(thumbnail) = read_workspace_logo_thumbnail_cache(logo)? {
+        return Ok(WorkspaceLogoThumbnail {
+            bytes: thumbnail,
+            content_type: "image/png",
+        });
+    }
+
+    let thumbnail = generate_workspace_logo_thumbnail_png(&bytes, &logo.path)?;
+    write_workspace_logo_thumbnail_cache(logo, &thumbnail, &metadata)?;
+    Ok(WorkspaceLogoThumbnail {
+        bytes: thumbnail,
+        content_type: "image/png",
+    })
+}
+
+fn workspace_logo_thumbnail_cache_paths(
+    logo: &WorkspaceLogoFile,
+) -> Result<(PathBuf, PathBuf), ApiError> {
+    let Some(logo_dir) = logo.path.parent() else {
+        return Err(ApiError::internal(format!(
+            "workspace logo has no parent directory: {}",
+            logo.path.display()
+        )));
+    };
+
+    Ok((
+        logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE),
+        logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE),
+    ))
+}
+
+fn read_workspace_logo_thumbnail_cache(
+    logo: &WorkspaceLogoFile,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let (thumbnail_path, version_path) = workspace_logo_thumbnail_cache_paths(logo)?;
+    if !thumbnail_path.exists() || !version_path.exists() {
+        return Ok(None);
+    }
+    if !thumbnail_path.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo thumbnail path must be a file: {}",
+            thumbnail_path.display()
+        )));
+    }
+
+    let cached_version = fs::read_to_string(&version_path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to read workspace logo thumbnail version {}: {}",
+            version_path.display(),
+            source
+        ))
+    })?;
+    if cached_version != logo.version {
+        return Ok(None);
+    }
+
+    fs::read(&thumbnail_path).map(Some).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to read workspace logo thumbnail {}: {}",
+            thumbnail_path.display(),
+            source
+        ))
+    })
+}
+
+fn write_workspace_logo_thumbnail_cache(
+    logo: &WorkspaceLogoFile,
+    thumbnail: &[u8],
+    metadata: &fs::Metadata,
+) -> Result<(), ApiError> {
+    let (thumbnail_path, version_path) = workspace_logo_thumbnail_cache_paths(logo)?;
+    fs::write(&thumbnail_path, thumbnail).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to write workspace logo thumbnail {}: {}",
+            thumbnail_path.display(),
+            source
+        ))
+    })?;
+    fs::write(&version_path, workspace_logo_version(metadata)).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to write workspace logo thumbnail version {}: {}",
+            version_path.display(),
+            source
+        ))
+    })
+}
+
+fn generate_workspace_logo_thumbnail_png(bytes: &[u8], path: &Path) -> Result<Vec<u8>, ApiError> {
+    let image = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|source| {
+            ApiError::bad_request(format!(
+                "workspace logo format could not be detected: {}: {}",
+                path.display(),
+                source
+            ))
+        })?
+        .decode()
+        .map_err(|source| {
+            ApiError::bad_request(format!(
+                "workspace logo could not be decoded as an image: {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .thumbnail(32, 32)
+        .write_to(&mut png, ImageFormat::Png)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "workspace logo thumbnail could not be encoded: {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+    Ok(png.into_inner())
 }
 
 fn validate_workspace_logo_size(size_bytes: u64) -> Result<(), ApiError> {

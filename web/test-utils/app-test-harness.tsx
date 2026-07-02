@@ -81,7 +81,7 @@ export const workspace = {
   ],
   commonCommands: [],
   id: "workspace-1",
-  logoUrl: "/api/workspaces/workspace-1/logo?v=1",
+  logoUrl: "/api/workspaces/workspace-1/logo/thumbnail?v=1",
   name: "Default",
   path: "C:\\Users\\fonla\\.foco\\workspace",
   pinned: false,
@@ -2496,7 +2496,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         {
           chats: [],
           id: "new-workspace",
-          logoUrl: "/api/workspaces/new-workspace/logo?v=1",
+          logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",
           name: "New Workspace",
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
           pinned: false,
@@ -2889,7 +2889,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           logoUrl:
             init?.method === "DELETE"
               ? null
-              : "/api/workspaces/workspace-1/logo?v=2",
+              : "/api/workspaces/workspace-1/logo/thumbnail?v=2",
         },
       ],
     });

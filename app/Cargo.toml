@@ -25,6 +25,7 @@ flate2.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 gix.workspace = true
+image.workspace = true
 portable-pty.workspace = true
 reqwest.workspace = true
 regex.workspace = true

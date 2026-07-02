@@ -74,6 +74,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
                 .delete(crate::http::workspaces::clear_workspace_logo)
                 .layer(DefaultBodyLimit::max(WORKSPACE_LOGO_BODY_LIMIT_BYTES)),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/logo/thumbnail",
+            get(crate::http::workspaces::workspace_logo_thumbnail),
+        )
         .route("/api/native/browser-probe.svg", get(native_browser_probe))
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/native/select-files", post(select_files))

@@ -621,6 +621,28 @@ pub(crate) async fn workspace_logo(
         .expect("workspace logo response is valid"))
 }
 
+pub(crate) async fn workspace_logo_thumbnail(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let Some(logo) = workspace_logo_file(&workspace.path)? else {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("workspace logo was not found"))
+            .expect("workspace logo thumbnail response is valid"));
+    };
+    let thumbnail = workspace_logo_thumbnail_file(&logo)?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, thumbnail.content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=60")
+        .body(Body::from(thumbnail.bytes))
+        .expect("workspace logo thumbnail response is valid"))
+}
+
 pub(crate) async fn save_workspace_logo(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
