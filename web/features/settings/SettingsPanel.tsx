@@ -9238,7 +9238,7 @@ export function SettingsPanel({
                       </div>
                       <button
                         aria-label={t("Save provider")}
-                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
                         disabled={
                           isSavingProvider ||
                           !providerForm.name.trim() ||
@@ -9263,6 +9263,7 @@ export function SettingsPanel({
                         ) : (
                           <KeyRound aria-hidden="true" className="size-4" />
                         )}
+                        <span>{t("Save provider")}</span>
                       </button>
                     </div>
                     </div>
@@ -10448,7 +10449,7 @@ export function SettingsPanel({
 
                         <button
                           aria-label={t("Save model")}
-                          className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
                           disabled={
                             isSaving ||
                             enabledNeedsLimits ||
@@ -10467,6 +10468,7 @@ export function SettingsPanel({
                           ) : (
                             <CheckCircle2 aria-hidden="true" className="size-4" />
                           )}
+                          <span>{t("Save model")}</span>
                         </button>
                       </div>
                     </div>
