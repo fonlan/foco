@@ -668,13 +668,15 @@ async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfi
         .iter()
         .any(|definition| definition.id == default_id)
     {
-        if let Some(definition) = default_agent_definition_for_config(&config, default_id.clone()) {
+        if let Some(definition) =
+            default_agent_definition_for_config(state, &config, default_id.clone()).await
+        {
             config.agent_definitions.insert(0, definition);
             changed = true;
         }
     }
 
-    if refresh_builtin_agent_definitions(&mut config)? {
+    if refresh_builtin_agent_definitions(state, &mut config).await? {
         changed = true;
     }
 
@@ -842,20 +844,27 @@ fn image_agent_runner_selection_valid(
             .any(|provider| provider.enabled && provider.id == definition.provider_id)
 }
 
-fn refresh_builtin_agent_definitions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+async fn refresh_builtin_agent_definitions(
+    state: &AppState,
+    config: &mut GlobalConfig,
+) -> Result<bool, ApiError> {
     let mut changed = ensure_review_agent_definition(config)?;
     if ensure_image_agent_definition(config)? {
         changed = true;
     }
-    if refresh_default_agent_permissions(config)? {
+    if refresh_default_agent_permissions(state, config).await? {
         changed = true;
     }
     Ok(changed)
 }
 
-fn refresh_default_agent_permissions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+async fn refresh_default_agent_permissions(
+    state: &AppState,
+    config: &mut GlobalConfig,
+) -> Result<bool, ApiError> {
     let default_id = default_agent_definition_id()?;
     let allowed_agent_definition_ids = default_agent_allowed_definition_ids(config, &default_id);
+    let allowed_tools = sorted_known_agent_tool_names(state, config).await;
     let Some(default_definition) = config
         .agent_definitions
         .iter_mut()
@@ -865,6 +874,10 @@ fn refresh_default_agent_permissions(config: &mut GlobalConfig) -> Result<bool, 
     };
 
     let mut changed = false;
+    if default_definition.allowed_tools != allowed_tools {
+        default_definition.allowed_tools = allowed_tools;
+        changed = true;
+    }
     if default_definition.permissions.allowed_agent_definition_ids != allowed_agent_definition_ids {
         default_definition.permissions.allowed_agent_definition_ids = allowed_agent_definition_ids;
         changed = true;
@@ -983,18 +996,14 @@ fn image_agent_definition_for_config(
         permissions: AgentPermissions::default(),
     })
 }
-fn default_agent_definition_for_config(
+async fn default_agent_definition_for_config(
+    state: &AppState,
     config: &GlobalConfig,
     id: AgentDefinitionId,
 ) -> Option<AgentDefinitionSettings> {
     let model = default_agent_runner_model(config)?;
     let provider_id = model.active_provider_id.clone()?;
-    let mut allowed_tools = foco_tools::builtin_tool_definitions()
-        .into_iter()
-        .map(|definition| definition.name.to_string())
-        .collect::<Vec<_>>();
-    allowed_tools.sort();
-    allowed_tools.dedup();
+    let allowed_tools = sorted_known_agent_tool_names(state, config).await;
     let allowed_agent_definition_ids = default_agent_allowed_definition_ids(config, &id);
 
     Some(AgentDefinitionSettings {
@@ -1058,7 +1067,7 @@ pub(crate) async fn create_agent_definition(
         AGENT_DEFINITION_INITIAL_REVISION,
         request.definition,
     ));
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -1092,7 +1101,7 @@ pub(crate) async fn update_agent_definition(
             "Image generation agent requires an enabled text-output runner model with an enabled provider",
         ));
     }
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -1140,11 +1149,13 @@ pub(crate) async fn delete_agent_definition(
         .iter()
         .any(|definition| definition.id == default_id)
     {
-        if let Some(definition) = default_agent_definition_for_config(&config, default_id) {
+        if let Some(definition) =
+            default_agent_definition_for_config(&state, &config, default_id).await
+        {
             config.agent_definitions.insert(0, definition);
         }
     }
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -1209,6 +1220,18 @@ pub(crate) async fn known_agent_tool_names(
             .into_iter()
             .map(|definition| definition.name),
     );
+    tools
+}
+
+pub(crate) async fn sorted_known_agent_tool_names(
+    state: &AppState,
+    config: &GlobalConfig,
+) -> Vec<String> {
+    let mut tools = known_agent_tool_names(state, config)
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    tools.sort();
     tools
 }
 
@@ -1470,7 +1493,7 @@ pub(crate) async fn save_prompt_settings(
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
     };
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     refresh_review_agent_system_prompt(&mut config)?;
     config
         .validate(Some(&state.config_file))
@@ -1603,7 +1626,7 @@ pub(crate) async fn save_manual_provider(
         config.providers.push(provider);
     }
 
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
 
     config
         .validate(Some(&state.config_file))
@@ -1682,7 +1705,7 @@ pub(crate) async fn sync_auto_provider_models_once(state: &AppState) -> Result<u
     sync_provider_model_associations(&mut config, providers).await?;
 
     if config.providers != previous_providers || config.models != previous_models {
-        refresh_builtin_agent_definitions(&mut config)?;
+        refresh_builtin_agent_definitions(&state, &mut config).await?;
         config
             .validate(Some(&state.config_file))
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -1825,7 +1848,7 @@ pub(crate) async fn delete_provider(
         }
     }
 
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -2242,7 +2265,7 @@ pub(crate) async fn save_manual_model(
         config.models.push(model);
     }
 
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
 
     config
         .validate(Some(&state.config_file))
@@ -2289,7 +2312,7 @@ pub(crate) async fn delete_model(
         return Err(ApiError::bad_request(format!("model was not found: {id}")));
     }
 
-    refresh_builtin_agent_definitions(&mut config)?;
+    refresh_builtin_agent_definitions(&state, &mut config).await?;
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;

@@ -2222,6 +2222,88 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
 }
 
 #[tokio::test]
+async fn agent_definitions_api_creates_default_agent_with_current_known_tools() {
+    let fixture = prompt_state_fixture(|config| {
+        config.memory.enabled = true;
+        config.mcp.servers.push(McpServerConfig {
+            id: "docs".to_string(),
+            name: "Docs".to_string(),
+            enabled: true,
+            transport: "stdio".to_string(),
+            command: Some("test-mcp-server".to_string()),
+            args: Vec::new(),
+            url: None,
+        });
+    });
+    let state = fixture.state.clone();
+    let mcp_tool_name = "mcp__docs__search";
+    let mcp_server = {
+        let config = state.config.lock().expect("config lock");
+        config.mcp.servers[0]
+            .to_definition()
+            .expect("mcp server definition")
+    };
+    state
+        .mcp_registry
+        .insert_test_server_tools(
+            mcp_server,
+            vec![McpToolDefinition {
+                name: mcp_tool_name.to_string(),
+                server_id: "docs".to_string(),
+                server_name: "Docs".to_string(),
+                original_name: "search".to_string(),
+                description: "Search docs.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            }],
+        )
+        .await;
+
+    let listed = crate::http::settings::agent_definitions(State(state))
+        .await
+        .expect("list agent definitions")
+        .0;
+    let default_definition_id =
+        AgentDefinitionId::new("agent-definition-default").expect("default definition id");
+    let default_definition = listed
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == default_definition_id)
+        .expect("default definition");
+
+    let mut sorted_tools = default_definition.allowed_tools.clone();
+    sorted_tools.sort();
+    sorted_tools.dedup();
+    assert_eq!(default_definition.allowed_tools, sorted_tools);
+    for tool in foco_tools::builtin_tool_definitions() {
+        assert!(
+            default_definition
+                .allowed_tools
+                .contains(&tool.name.to_string()),
+            "default agent should allow built-in tool {}",
+            tool.name
+        );
+    }
+    for tool in crate::memory_runtime::memory_tool_definitions() {
+        assert!(
+            default_definition.allowed_tools.contains(&tool.name),
+            "default agent should allow memory tool {}",
+            tool.name
+        );
+    }
+    assert!(
+        default_definition
+            .allowed_tools
+            .contains(&mcp_tool_name.to_string())
+    );
+}
+
+#[tokio::test]
 async fn review_agent_uses_custom_review_system_prompt() {
     let fixture = prompt_state_fixture(|config| {
         config.prompts.system_prompts = vec![
