@@ -107,6 +107,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Loading skill details...": "正在加载技能详情...",
     "Could not load skill details": "无法加载技能详情",
     "Install target": "安装目标",
+    Install: "安装",
     "Overwrite existing skill": "覆盖已有技能",
     "Installed skill to {path}": "技能已安装到 {path}",
     "No summary available": "暂无摘要",

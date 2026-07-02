@@ -55,7 +55,14 @@ describe("skill store app surface", () => {
     );
 
     const detailPane = await screen.findByRole("region", { name: "Skill details" });
-    expect(within(detailPane).getByText("scripts/search.md")).toBeInTheDocument();
+    const scriptsItem = within(detailPane).getByText("scripts").closest("li");
+    expect(scriptsItem).not.toBeNull();
+    expect(within(scriptsItem as HTMLElement).getByText("search.md")).toBeInTheDocument();
+    expect(within(detailPane).getByTitle("scripts/search.md")).toBeInTheDocument();
+    expect(within(detailPane).queryByText("scripts/search.md")).not.toBeInTheDocument();
+    expect(
+      within(detailPane).getByRole("heading", { level: 1, name: "Browser Scout" }),
+    ).toBeInTheDocument();
 
     await userEvent.click(within(detailPane).getByRole("button", { name: "Install" }));
 
@@ -81,7 +88,9 @@ describe("skill store app surface", () => {
       "description: Find useful web references.",
       "---",
       "",
-      "# Browser Scout",
+      "## Markdown Check",
+      "",
+      "- **bold marker**",
       "",
       "SKILL.md summary starts here.",
       "x".repeat(1500),
@@ -125,6 +134,11 @@ describe("skill store app surface", () => {
     const detailPane = await screen.findByRole("region", { name: "技能详情" });
 
     expect(await within(detailPane).findByRole("heading", { name: "摘要" })).toBeInTheDocument();
+    expect(within(detailPane).getByRole("button", { name: "安装" })).toBeInTheDocument();
+    expect(
+      within(detailPane).getByRole("heading", { level: 2, name: "Markdown Check" }),
+    ).toBeInTheDocument();
+    expect(within(detailPane).getByText("bold marker").tagName).toBe("STRONG");
     expect(within(detailPane).getByText(/SKILL_MD_TAIL_SENTINEL/)).toBeInTheDocument();
     expect(within(detailPane).queryByText("README-only summary text")).not.toBeInTheDocument();
   });

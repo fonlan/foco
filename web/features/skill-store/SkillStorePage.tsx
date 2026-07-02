@@ -3,6 +3,7 @@ import {
   Download,
   ExternalLink,
   FileText,
+  Folder,
   LoaderCircle,
   RefreshCw,
   Search,
@@ -17,6 +18,7 @@ import type {
 } from "../../api/types";
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import { MarkdownRenderer } from "../chat/MarkdownRenderer";
 import "./skill-store.css";
 
 type SkillStorePageProps = {
@@ -65,6 +67,20 @@ type SkillStoreInstallResponse = {
 };
 
 type InstallTarget = "global" | "workspace";
+
+type FileTreeNode =
+  | {
+      children: FileTreeNode[];
+      name: string;
+      path: string;
+      type: "directory";
+    }
+  | {
+      file: SkillStoreFile;
+      name: string;
+      path: string;
+      type: "file";
+    };
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -235,6 +251,7 @@ export function SkillStorePage({
 
   const skillSummaryFile = detail?.files.find((file) => file.path === "SKILL.md") ?? null;
   const summaryText = skillSummaryFile?.content.trim() ?? "";
+  const fileTree = useMemo(() => buildFileTree(detail?.files ?? []), [detail?.files]);
   const canInstall = Boolean(
     detail && (installTarget === "global" || workspaceId) && !isInstalling,
   );
@@ -380,6 +397,19 @@ export function SkillStorePage({
 
               <div className="skill-store-install-panel">
                 <div className="skill-store-install-targets">
+                  <button
+                    className="skill-store-primary-button skill-store-install-button"
+                    disabled={!canInstall}
+                    onClick={() => void installSelectedSkill()}
+                    type="button"
+                  >
+                    {isInstalling ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Download aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Install")}
+                  </button>
                   <label>
                     <span>{t("Install target")}</span>
                     <select
@@ -418,27 +448,14 @@ export function SkillStorePage({
                     <span>{t("Overwrite existing skill")}</span>
                   </label>
                 ) : null}
-                <div className="skill-store-install-actions">
-                  <button
-                    className="skill-store-primary-button"
-                    disabled={!canInstall}
-                    onClick={() => void installSelectedSkill()}
-                    type="button"
-                  >
-                    {isInstalling ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <Download aria-hidden="true" className="size-4" />
-                    )}
-                    {t("Install")}
-                  </button>
-                  {installMessage ? (
+                {installMessage ? (
+                  <div className="skill-store-install-actions">
                     <span className="skill-store-success" role="status">
                       <CheckCircle2 aria-hidden="true" className="size-4" />
                       {installMessage}
                     </span>
-                  ) : null}
-                </div>
+                  </div>
+                ) : null}
                 {installError ? (
                   <p className="skill-store-error" role="alert">
                     {installError}
@@ -448,20 +465,18 @@ export function SkillStorePage({
 
               <section className="skill-store-detail-section">
                 <h3>{t("Summary")}</h3>
-                {summaryText ? <pre>{summaryText}</pre> : <p>{t("No summary available")}</p>}
+                {summaryText ? (
+                  <div className="markdown-content skill-store-summary-markdown">
+                    <MarkdownRenderer allowHtml={false} content={summaryText} />
+                  </div>
+                ) : (
+                  <p className="skill-store-detail-empty">{t("No summary available")}</p>
+                )}
               </section>
 
               <section className="skill-store-detail-section">
                 <h3>{t("Files")}</h3>
-                <ul className="skill-store-file-list">
-                  {detail.files.map((file) => (
-                    <li key={file.path}>
-                      <FileText aria-hidden="true" className="size-4" />
-                      <span>{file.path}</span>
-                      <code>{formatBytes(file.content.length)}</code>
-                    </li>
-                  ))}
-                </ul>
+                <FileTree nodes={fileTree} />
               </section>
             </div>
           ) : null}
@@ -469,6 +484,87 @@ export function SkillStorePage({
       </div>
     </section>
   );
+}
+
+function FileTree({ nodes }: { nodes: FileTreeNode[] }) {
+  return (
+    <ul className="skill-store-file-list">
+      {nodes.map((node) => (
+        <li key={`${node.type}:${node.path}`}>
+          <div className="skill-store-file-tree-row" title={node.path}>
+            {node.type === "directory" ? (
+              <Folder aria-hidden="true" className="size-4" />
+            ) : (
+              <FileText aria-hidden="true" className="size-4" />
+            )}
+            <span>{node.name}</span>
+            {node.type === "file" ? <code>{formatBytes(node.file.content.length)}</code> : null}
+          </div>
+          {node.type === "directory" ? <FileTree nodes={node.children} /> : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function buildFileTree(files: SkillStoreFile[]): FileTreeNode[] {
+  type FileNode = Extract<FileTreeNode, { type: "file" }>;
+  type MutableDirectory = {
+    children: Map<string, MutableDirectory | FileNode>;
+    name: string;
+    path: string;
+    type: "directory";
+  };
+
+  const root: MutableDirectory = {
+    children: new Map(),
+    name: "",
+    path: "",
+    type: "directory",
+  };
+
+  for (const file of files) {
+    const parts = file.path.split("/").filter(Boolean);
+    let directory = root;
+    for (const [index, part] of parts.entries()) {
+      const path = parts.slice(0, index + 1).join("/");
+      if (index === parts.length - 1) {
+        directory.children.set(part, { file, name: part, path: file.path, type: "file" });
+        continue;
+      }
+
+      const existing = directory.children.get(part);
+      if (existing?.type === "directory") {
+        directory = existing;
+        continue;
+      }
+
+      const next: MutableDirectory = {
+        children: new Map(),
+        name: part,
+        path,
+        type: "directory",
+      };
+      directory.children.set(part, next);
+      directory = next;
+    }
+  }
+
+  function freeze(directory: MutableDirectory): FileTreeNode[] {
+    return Array.from(directory.children.values()).map((node) => {
+      if (node.type === "file") {
+        return node;
+      }
+      return {
+        children: freeze(node),
+        name: node.name,
+        path: node.path,
+        type: "directory",
+      };
+    });
+  }
+
+  return freeze(root);
 }
 
 function LoadingBlock({ label }: { label: string }) {
