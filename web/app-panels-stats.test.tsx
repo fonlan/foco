@@ -1520,6 +1520,94 @@ describe("app-panels-stats verification surfaces", () => {
     ]);
   }, 30000);
 
+  it("shows retry merge for dirty merge blocked plans and refreshes after retry", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-02T10:00:00Z";
+    const blockedMessage =
+      "cannot merge Agent worktree while shared workspace has uncommitted changes";
+    const blockedPlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: blockedMessage,
+      sharedMergeCommitId: null,
+      id: "plan-merge-blocked",
+      overview: "Retry the existing plan worktree merge.",
+      pauseRequestedAt: null,
+      phases: [],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "implemented",
+      title: "Blocked merge plan",
+      updatedAt: timestamp,
+    };
+    const mergedPlan = {
+      ...blockedPlan,
+      errorMessage: null,
+      sharedMergeCommitId: "1234567890abcdef",
+      updatedAt: "2026-07-02T10:01:00Z",
+    };
+    let didRetryMerge = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [didRetryMerge ? mergedPlan : blockedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/plan-merge-blocked/action") {
+        didRetryMerge = true;
+        return jsonResponse({ plan: mergedPlan });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(screen.getByRole("tab", { name: "Plan" }));
+
+    const planCard = (await screen.findByText("Blocked merge plan")).closest("article");
+    expect(planCard).not.toBeNull();
+    const retryButton = within(planCard as HTMLElement).getByRole("button", {
+      name: "Retry Merge",
+    });
+    expect(retryButton).toHaveAttribute(
+      "title",
+      "Clean the shared workspace, then retry merge",
+    );
+    expect(within(planCard as HTMLElement).getByText(blockedMessage)).toBeInTheDocument();
+
+    await user.click(retryButton);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/plans/plan-merge-blocked/action",
+        expect.objectContaining({
+          body: JSON.stringify({ action: "retry_merge" }),
+          method: "POST",
+        }),
+      );
+    });
+    expect(await screen.findByText("1234567")).toHaveAttribute(
+      "title",
+      "Merged into shared workspace",
+    );
+    expect(screen.queryByRole("button", { name: "Retry Merge" })).not.toBeInTheDocument();
+  });
+
   it("marks implemented plans as merged in the plan panel", async () => {
     const timestamp = "2026-06-28T04:45:00Z";
     const completedStep = {

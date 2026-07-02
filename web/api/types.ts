@@ -187,6 +187,7 @@ export type PlanStatus =
   | "paused"
   | "implemented"
   | "completed"
+  | "blocked"
   | "failed"
   | "cancelled";
 

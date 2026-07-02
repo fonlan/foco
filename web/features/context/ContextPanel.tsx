@@ -89,6 +89,8 @@ export type PlanPhaseRetryOverride = {
   thinkingLevel: string | null;
 };
 
+type PlanAction = "mark_complete" | "pause" | "resume" | "retry_merge" | "start";
+
 export function ResponsiveContextPanelIcon({
   className,
 }: {
@@ -210,7 +212,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitCommitMessageChange: (message: string) => void;
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
-  onPlanAction: (planId: string, action: string) => void;
+  onPlanAction: (planId: string, action: PlanAction) => void;
   onPlanAutoRunToggle: (enabled: boolean) => void;
   onPlanPhaseRetry: (
     planId: string,
@@ -700,7 +702,7 @@ function ContextPlanTab({
   autoRunToggleDisabled: boolean;
   error: string | null;
   isLoading: boolean;
-  onAction: (planId: string, action: string) => void;
+  onAction: (planId: string, action: PlanAction) => void;
   onAutoRunToggle: (enabled: boolean) => void;
   onCleanupWorktree: (agentInstanceId: string) => Promise<void>;
   onDeletePlan: (planId: string) => void;
@@ -929,6 +931,9 @@ function ContextPlanTab({
               const action = primaryPlanAction(plan.status);
               const actionKey = action ? `${action}:${plan.id}` : null;
               const mergedCommitId = planMergedIntoSharedWorkspace(plan);
+              const canRetryMerge = planNeedsMergeRetry(plan);
+              const retryMergeKey = planRetryMergeOperationKey(plan.id);
+              const isRetryingMerge = operationKey === retryMergeKey;
 
               return (
                 <article
@@ -952,6 +957,22 @@ function ContextPlanTab({
                           <CheckCircle2 aria-hidden="true" className="size-3" />
                           {mergedCommitId}
                         </span>
+                      ) : canRetryMerge ? (
+                        <button
+                          aria-label={t("Retry Merge")}
+                          className="context-memory-pin inline-flex items-center gap-1 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          disabled={operationKey !== null}
+                          onClick={() => onAction(plan.id, "retry_merge")}
+                          title={t("Clean the shared workspace, then retry merge")}
+                          type="button"
+                        >
+                          {isRetryingMerge ? (
+                            <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                          ) : (
+                            <RefreshCw aria-hidden="true" className="size-3" />
+                          )}
+                          {t("Retry Merge")}
+                        </button>
                       ) : null}
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
@@ -992,6 +1013,14 @@ function ContextPlanTab({
                     {plan.title}
                   </h3>
                   <p>{plan.overview}</p>
+                  {plan.errorMessage ? (
+                    <div
+                      className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700"
+                      title={canRetryMerge ? t("Clean the shared workspace, then retry merge") : undefined}
+                    >
+                      {plan.errorMessage}
+                    </div>
+                  ) : null}
                   <small>
                     {t("Updated {time}", {
                       time: formatTodoGraphDate(plan.updatedAt, language),
@@ -2905,7 +2934,7 @@ function taskStatusClass(status: TaskStatus) {
   return `${base} bg-stone-100 text-stone-600`;
 }
 
-function primaryPlanAction(status: PlanStatus) {
+function primaryPlanAction(status: PlanStatus): PlanAction | null {
   if (status === "implemented" || status === "failed" || status === "cancelled") {
     return "mark_complete";
   }
@@ -2929,7 +2958,21 @@ function planPhaseRetryOperationKey(planId: string, phaseId: string) {
   return `retry-phase:${planId}:${phaseId}`;
 }
 
-function planActionLabel(action: string) {
+function planRetryMergeOperationKey(planId: string) {
+  return `retry_merge:${planId}`;
+}
+
+function planNeedsMergeRetry(plan: Plan) {
+  const errorMessage = plan.errorMessage?.trim();
+  return (
+    !plan.sharedMergeCommitId?.trim() &&
+    !!errorMessage &&
+    (plan.status === "implemented" || plan.status === "blocked") &&
+    errorMessage.includes("shared workspace has uncommitted changes")
+  );
+}
+
+function planActionLabel(action: PlanAction) {
   switch (action) {
     case "mark_complete":
       return "Mark complete";
@@ -2939,6 +2982,8 @@ function planActionLabel(action: string) {
       return "Start";
     case "pause":
       return "Pause";
+    case "retry_merge":
+      return "Retry Merge";
     default:
       return action;
   }
@@ -2963,6 +3008,8 @@ function planStatusLabel(status: string) {
       return "Implemented";
     case "completed":
       return "Completed";
+    case "blocked":
+      return "Blocked";
     case "failed":
       return "Failed";
     case "cancelled":
@@ -2981,7 +3028,7 @@ function planStatusClass(status: PlanStatus) {
   if (status === "implemented" || status === "completed") {
     return `${base} bg-emerald-100 text-emerald-800`;
   }
-  if (status === "ready" || status === "running") {
+  if (status === "ready" || status === "running" || status === "blocked") {
     return `${base} bg-amber-100 text-amber-800`;
   }
   if (status === "failed") {
@@ -2995,7 +3042,7 @@ function planPhaseStatusClass(status: string) {
   if (status === "completed" || status === "implemented") {
     return `${base} bg-emerald-100 text-emerald-800`;
   }
-  if (status === "ready" || status === "running") {
+  if (status === "ready" || status === "running" || status === "blocked") {
     return `${base} bg-amber-100 text-amber-800`;
   }
   if (status === "failed") {
