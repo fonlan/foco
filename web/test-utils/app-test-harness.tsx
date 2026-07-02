@@ -2820,7 +2820,21 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/memory/dream/jobs") {
-    return jsonResponse({ jobs: [memoryDreamJob, failedMemoryDreamJob] });
+    const page = Number(requestUrl.searchParams.get("page") ?? "1");
+    const pageSize = Math.min(
+      200,
+      Math.max(1, Number(requestUrl.searchParams.get("pageSize") ?? "10") || 10),
+    );
+    const jobs = [memoryDreamJob, failedMemoryDreamJob];
+    const totalCount = jobs.length;
+    const offset = (page - 1) * pageSize;
+    return jsonResponse({
+      jobs: jobs.slice(offset, offset + pageSize),
+      page,
+      pageSize,
+      totalCount,
+      totalPages: totalCount ? Math.ceil(totalCount / pageSize) : 0,
+    });
   }
 
   if (path === "/api/memory/dream/run") {

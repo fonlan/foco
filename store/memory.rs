@@ -1575,6 +1575,47 @@ impl MemoryDatabase {
         status: Option<MemoryDreamJobStatus>,
         limit: u32,
     ) -> Result<Vec<MemoryDreamJobRecord>, MemoryDatabaseError> {
+        self.dream_jobs_for_scope_page(scope, workspace_id, status, limit, 0)
+    }
+
+    pub fn count_dream_jobs_for_scope(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+        status: Option<MemoryDreamJobStatus>,
+    ) -> Result<u32, MemoryDatabaseError> {
+        self.validate_dream_scope(scope, workspace_id)?;
+
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memory_dream_jobs
+                 WHERE scope = ?1
+                   AND (?2 IS NULL OR workspace_id = ?2)
+                   AND (?3 IS NULL OR status = ?3)",
+                params![
+                    scope.as_str(),
+                    workspace_id,
+                    status.map(MemoryDreamJobStatus::as_str),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        u32::try_from(count).map_err(|_| MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("memory Dream job count exceeds u32: {count}"),
+        })
+    }
+
+    pub fn dream_jobs_for_scope_page(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+        status: Option<MemoryDreamJobStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<MemoryDreamJobRecord>, MemoryDatabaseError> {
         self.validate_dream_scope(scope, workspace_id)?;
         if limit == 0 {
             return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -1593,7 +1634,7 @@ impl MemoryDatabase {
                    AND (?2 IS NULL OR workspace_id = ?2)
                    AND (?3 IS NULL OR status = ?3)
                  ORDER BY created_at DESC, id ASC
-                 LIMIT ?4",
+                 LIMIT ?4 OFFSET ?5",
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
@@ -1603,6 +1644,7 @@ impl MemoryDatabase {
                     workspace_id,
                     status.map(MemoryDreamJobStatus::as_str),
                     limit,
+                    offset,
                 ],
                 memory_dream_job_from_row,
             )

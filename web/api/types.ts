@@ -1561,6 +1561,10 @@ export type MemoryDreamJobSummary = {
 
 export type MemoryDreamJobsResponse = {
   jobs: MemoryDreamJobSummary[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 export type MemoryDreamRunResponse = {

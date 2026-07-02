@@ -409,6 +409,12 @@ export function SettingsPanel({
   const [memoryDreamJobs, setMemoryDreamJobs] = useState<MemoryDreamJobSummary[]>(
     [],
   );
+  const [memoryDreamMeta, setMemoryDreamMeta] = useState<MemoryListMeta>({
+    page: 1,
+    pageSize: MEMORY_DREAM_DEFAULT_PAGE_SIZE,
+    totalCount: 0,
+    totalPages: 0,
+  });
   const [memoryDreamPage, setMemoryDreamPage] = useState(1);
   const [memoryDreamPageSize, setMemoryDreamPageSize] = useState(
     MEMORY_DREAM_DEFAULT_PAGE_SIZE,
@@ -419,6 +425,8 @@ export function SettingsPanel({
   const [memoryDreamDetailJobId, setMemoryDreamDetailJobId] = useState<
     string | null
   >(null);
+  const [memoryDreamDetailJobSnapshot, setMemoryDreamDetailJobSnapshot] =
+    useState<MemoryDreamJobSummary | null>(null);
   const [memoryDreamError, setMemoryDreamError] = useState<string | null>(null);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [memorySources, setMemorySources] = useState<MemorySourceRecord[]>([]);
@@ -602,35 +610,19 @@ export function SettingsPanel({
     ? Math.min(memoryListMeta.totalCount, memoryPageStart + memories.length - 1)
     : 0;
   const memoryDreamWorkspaceId = memoryFilter.workspaceId || memoryWorkspace?.id || "";
-  const sortedMemoryDreamJobs = useMemo(
-    () =>
-      [...memoryDreamJobs].sort(
-        (left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt),
-      ),
-    [memoryDreamJobs],
-  );
-  const memoryDreamTotalPages = sortedMemoryDreamJobs.length
-    ? Math.ceil(sortedMemoryDreamJobs.length / memoryDreamPageSize)
-    : 0;
-  const currentMemoryDreamPage =
-    memoryDreamTotalPages === 0
-      ? 1
-      : Math.min(memoryDreamPage, memoryDreamTotalPages);
-  const paginatedMemoryDreamJobs = sortedMemoryDreamJobs.slice(
-    (currentMemoryDreamPage - 1) * memoryDreamPageSize,
-    currentMemoryDreamPage * memoryDreamPageSize,
-  );
+  const currentMemoryDreamPage = memoryDreamMeta.page;
+  const memoryDreamTotalPages = memoryDreamMeta.totalPages;
   const memoryDreamPaginationItems = auditPaginationItems(
     currentMemoryDreamPage,
     memoryDreamTotalPages,
   );
-  const memoryDreamPageStart = paginatedMemoryDreamJobs.length
-    ? (currentMemoryDreamPage - 1) * memoryDreamPageSize + 1
+  const memoryDreamPageStart = memoryDreamJobs.length
+    ? (currentMemoryDreamPage - 1) * memoryDreamMeta.pageSize + 1
     : 0;
-  const memoryDreamPageEnd = paginatedMemoryDreamJobs.length
+  const memoryDreamPageEnd = memoryDreamJobs.length
     ? Math.min(
-      sortedMemoryDreamJobs.length,
-      memoryDreamPageStart + paginatedMemoryDreamJobs.length - 1,
+      memoryDreamMeta.totalCount,
+      memoryDreamPageStart + memoryDreamJobs.length - 1,
     )
     : 0;
   const specJobsPaginationItems = auditPaginationItems(
@@ -653,17 +645,18 @@ export function SettingsPanel({
   const planHistoryPageEnd = planHistory.length
     ? Math.min(planHistoryTotalCount, planHistoryPageStart + planHistory.length - 1)
     : 0;
-  const memoryDreamDetailJob =
-    sortedMemoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
-    null;
+  const memoryDreamDetailJob = memoryDreamDetailJobId
+    ? memoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
+      memoryDreamDetailJobSnapshot
+    : null;
   const activeMemoryDreamJobKeys = useMemo(
     () =>
       new Set(
-        sortedMemoryDreamJobs
+        memoryDreamJobs
           .filter((job) => isActiveMemoryDreamStatus(job.status))
           .map((job) => memoryDreamJobKey(job.scope, job.workspaceId)),
       ),
-    [sortedMemoryDreamJobs],
+    [memoryDreamJobs],
   );
   const globalDreamRunKey = memoryDreamJobKey("global", null);
   const workspaceDreamRunKey = memoryDreamJobKey(
@@ -671,9 +664,9 @@ export function SettingsPanel({
     memoryDreamWorkspaceId,
   );
   const latestSuccessfulMemoryDreamJob =
-    sortedMemoryDreamJobs.find((job) => job.status === "completed") ?? null;
+    memoryDreamJobs.find((job) => job.status === "completed") ?? null;
   const latestFailedMemoryDreamJob =
-    sortedMemoryDreamJobs.find((job) => job.status === "failed") ?? null;
+    memoryDreamJobs.find((job) => job.status === "failed") ?? null;
   const memoryDreamNextRunEstimate = nextMemoryDreamRunEstimate(
     latestSuccessfulMemoryDreamJob,
     memorySettingsForm.dream,
@@ -1095,27 +1088,50 @@ export function SettingsPanel({
     }
   }, [memoryFilter]);
 
-  const loadMemoryDreamJobs = useCallback(async () => {
+  const loadMemoryDreamJobs = useCallback(async (pageOverride?: number) => {
+    const requestedPage = pageOverride ?? memoryDreamPage;
     setIsLoadingMemoryDreamJobs(true);
     setMemoryDreamError(null);
 
     try {
+      const params = new URLSearchParams({
+        page: String(requestedPage),
+        pageSize: String(memoryDreamPageSize),
+      });
       const data = await requestJson<MemoryDreamJobsResponse>(
-        "/api/memory/dream/jobs",
+        `/api/memory/dream/jobs?${params.toString()}`,
       );
       setMemoryDreamJobs(data.jobs);
-      setMemoryDreamDetailJobId((current) =>
-        current && data.jobs.some((job) => job.id === current) ? current : null,
-      );
+      setMemoryDreamMeta({
+        page: data.page,
+        pageSize: data.pageSize,
+        totalCount: data.totalCount,
+        totalPages: data.totalPages,
+      });
+      setMemoryDreamPage(data.page);
+      setMemoryDreamPageSize(data.pageSize);
+      setMemoryDreamDetailJobSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        return data.jobs.find((job) => job.id === current.id) ?? current;
+      });
     } catch (requestError) {
       setMemoryDreamJobs([]);
-      setMemoryDreamChanges([]);
+      setMemoryDreamMeta({
+        page: requestedPage,
+        pageSize: memoryDreamPageSize,
+        totalCount: 0,
+        totalPages: 0,
+      });
       setMemoryDreamDetailJobId(null);
+      setMemoryDreamDetailJobSnapshot(null);
       setMemoryDreamError(errorMessage(requestError));
     } finally {
       setIsLoadingMemoryDreamJobs(false);
     }
-  }, []);
+  }, [memoryDreamPage, memoryDreamPageSize]);
+
 
   const loadMemoryDreamChanges = useCallback(async (jobId: string) => {
     setIsLoadingMemoryDreamChanges(true);
@@ -1222,6 +1238,7 @@ export function SettingsPanel({
 
   function closeMemoryDreamDetailDialog() {
     setMemoryDreamDetailJobId(null);
+    setMemoryDreamDetailJobSnapshot(null);
     setMemoryDreamChanges([]);
   }
 
@@ -1235,7 +1252,6 @@ export function SettingsPanel({
       void loadHooks(hookWorkspaceId);
     }
   }, [hookWorkspaceId, loadHooks]);
-
   useEffect(() => {
     if (activeSection === "memory") {
       void loadMemories();
@@ -1266,7 +1282,10 @@ export function SettingsPanel({
       return;
     }
 
-    if (!memoryDreamJobs.some((job) => job.id === memoryDreamDetailJobId)) {
+    const detailJob =
+      memoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
+      memoryDreamDetailJobSnapshot;
+    if (!detailJob) {
       closeMemoryDreamDetailDialog();
       return;
     }
@@ -1277,8 +1296,8 @@ export function SettingsPanel({
     loadMemoryDreamChanges,
     memoryDreamDetailJobId,
     memoryDreamJobs,
+    memoryDreamDetailJobSnapshot,
   ]);
-
   useEffect(() => {
     if (activeSection !== "memory" || !selectedMemory) {
       setMemorySources([]);
@@ -2374,7 +2393,7 @@ export function SettingsPanel({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      await loadMemoryDreamJobs();
+      await loadMemoryDreamJobs(1);
     } catch (requestError) {
       setMemoryDreamError(errorMessage(requestError));
     } finally {
@@ -6736,7 +6755,7 @@ export function SettingsPanel({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-stone-100">
-                      {sortedMemoryDreamJobs.length === 0 ? (
+                      {memoryDreamJobs.length === 0 ? (
                         <tr>
                           <td
                             className="px-3 py-6 text-center text-sm font-medium text-stone-500"
@@ -6748,7 +6767,7 @@ export function SettingsPanel({
                           </td>
                         </tr>
                       ) : (
-                        paginatedMemoryDreamJobs.map((job) => {
+                        memoryDreamJobs.map((job) => {
                           const transcriptWorkspaceId =
                             job.transcriptWorkspaceId ?? job.workspaceId;
                           const scopeLabel =
@@ -6812,6 +6831,7 @@ export function SettingsPanel({
                                     className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                                     onClick={(event) => {
                                       event.stopPropagation();
+                                      setMemoryDreamDetailJobSnapshot(job);
                                       setMemoryDreamDetailJobId(job.id);
                                     }}
                                     title={t("View details")}
@@ -6852,7 +6872,7 @@ export function SettingsPanel({
                     {t("Showing {start}-{end} of {total}", {
                       end: formatNumber(memoryDreamPageEnd, language),
                       start: formatNumber(memoryDreamPageStart, language),
-                      total: formatNumber(sortedMemoryDreamJobs.length, language),
+                      total: formatNumber(memoryDreamMeta.totalCount, language),
                     })}
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-3">

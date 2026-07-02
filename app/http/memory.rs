@@ -149,6 +149,8 @@ pub(crate) struct MemoryDreamJobsQuery {
     workspace_id: Option<String>,
     status: Option<String>,
     limit: Option<u32>,
+    page: Option<u32>,
+    page_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +236,10 @@ pub(crate) struct MemoryDreamRunResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryDreamJobsResponse {
     jobs: Vec<MemoryDreamJobSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u32,
+    total_pages: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -1036,6 +1042,7 @@ pub(crate) async fn memory_dream_jobs(
     Query(query): Query<MemoryDreamJobsQuery>,
 ) -> Result<Json<MemoryDreamJobsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
+    let workspace_id = normalized_optional_text(query.workspace_id);
     let scope = query
         .scope
         .as_deref()
@@ -1044,12 +1051,12 @@ pub(crate) async fn memory_dream_jobs(
         .map(MemoryDreamScope::parse)
         .transpose()
         .map_err(ApiError::from_memory_error)?;
-    let scope = if query.workspace_id.is_some() && scope.is_none() {
+    let scope = if workspace_id.is_some() && scope.is_none() {
         Some(MemoryDreamScope::Workspace)
     } else {
         scope
     };
-    if scope == Some(MemoryDreamScope::Global) && query.workspace_id.is_some() {
+    if scope == Some(MemoryDreamScope::Global) && workspace_id.is_some() {
         return Err(ApiError::bad_request(
             "global memory Dream jobs must not include workspaceId",
         ));
@@ -1062,19 +1069,25 @@ pub(crate) async fn memory_dream_jobs(
         .map(MemoryDreamJobStatus::parse)
         .transpose()
         .map_err(ApiError::from_memory_error)?;
-    let limit = dream_limit(
-        query.limit,
-        MEMORY_DREAM_JOBS_LIMIT_DEFAULT,
-        MEMORY_DREAM_JOBS_LIMIT_MAX,
-    );
-    let workspace_id = normalized_optional_text(query.workspace_id);
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query
+        .page_size
+        .or(query.limit)
+        .unwrap_or(MEMORY_DREAM_JOBS_LIMIT_DEFAULT)
+        .clamp(1, MEMORY_DREAM_JOBS_LIMIT_MAX);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let fetch_limit = offset.saturating_add(page_size);
     let mut jobs = Vec::new();
+    let mut total_count = 0;
 
     if scope.is_none() || scope == Some(MemoryDreamScope::Global) {
         let database = open_dream_memory_database(&state, &config, MemoryDreamScope::Global, None)?;
+        total_count += database
+            .count_dream_jobs_for_scope(MemoryDreamScope::Global, None, status)
+            .map_err(ApiError::from_memory_error)?;
         let transcript_workspaces = memory_dream_transcript_workspace_ids(&config)?;
         for job in database
-            .dream_jobs_for_scope(MemoryDreamScope::Global, None, status, limit)
+            .dream_jobs_for_scope_page(MemoryDreamScope::Global, None, status, fetch_limit, 0)
             .map_err(ApiError::from_memory_error)?
         {
             let transcript_workspace_id = job
@@ -1098,12 +1111,20 @@ pub(crate) async fn memory_dream_jobs(
                 MemoryDreamScope::Workspace,
                 Some(&workspace.id),
             )?;
-            for job in database
-                .dream_jobs_for_scope(
+            total_count += database
+                .count_dream_jobs_for_scope(
                     MemoryDreamScope::Workspace,
                     Some(&workspace.id),
                     status,
-                    limit,
+                )
+                .map_err(ApiError::from_memory_error)?;
+            for job in database
+                .dream_jobs_for_scope_page(
+                    MemoryDreamScope::Workspace,
+                    Some(&workspace.id),
+                    status,
+                    fetch_limit,
+                    0,
                 )
                 .map_err(ApiError::from_memory_error)?
             {
@@ -1122,9 +1143,23 @@ pub(crate) async fn memory_dream_jobs(
             .cmp(&left.created_at)
             .then_with(|| left.id.cmp(&right.id))
     });
-    jobs.truncate(limit as usize);
+    let jobs = jobs
+        .into_iter()
+        .skip(offset as usize)
+        .take(page_size as usize)
+        .collect();
 
-    Ok(Json(MemoryDreamJobsResponse { jobs }))
+    Ok(Json(MemoryDreamJobsResponse {
+        jobs,
+        page,
+        page_size,
+        total_count,
+        total_pages: if total_count == 0 {
+            0
+        } else {
+            total_count.div_ceil(page_size)
+        },
+    }))
 }
 
 pub(crate) async fn memory_dream_job(

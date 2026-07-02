@@ -682,7 +682,15 @@ describe("app-settings verification surfaces", () => {
       const path = new URL(rawPath, "http://localhost").pathname;
 
       if (path === "/api/memory/dream/jobs") {
-        return Promise.resolve(jsonResponse({ jobs: dreamJobs }));
+        return Promise.resolve(
+          jsonResponse({
+            jobs: dreamJobs,
+            page: 1,
+            pageSize: 10,
+            totalCount: dreamJobs.length,
+            totalPages: 1,
+          }),
+        );
       }
 
       return Promise.resolve(mockFetch(input, init));
@@ -717,6 +725,59 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("requests Dream history pages from the server", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    const dreamHistory = (await screen.findByText("Dream history")).closest("section");
+    if (!dreamHistory) {
+      throw new Error("Expected Dream history section");
+    }
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return (
+            url.pathname === "/api/memory/dream/jobs" &&
+            url.searchParams.get("page") === "1" &&
+            url.searchParams.get("pageSize") === "10"
+          );
+        }),
+      ).toBe(true);
+    });
+
+    changeInput(within(dreamHistory).getByLabelText("Page size"), "1");
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return (
+            url.pathname === "/api/memory/dream/jobs" &&
+            url.searchParams.get("page") === "1" &&
+            url.searchParams.get("pageSize") === "1"
+          );
+        }),
+      ).toBe(true);
+    });
+
+    await userEvent.click(within(dreamHistory).getByRole("button", { name: "Next page" }));
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return (
+            url.pathname === "/api/memory/dream/jobs" &&
+            url.searchParams.get("page") === "2" &&
+            url.searchParams.get("pageSize") === "1"
+          );
+        }),
+      ).toBe(true);
+    });
+  });
   it("shows Dream history actions and runs manual Dream jobs", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

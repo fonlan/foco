@@ -9899,6 +9899,105 @@ async fn auto_memory_dream_scheduler_runs_due_jobs_without_scheduled_task_rows()
 }
 
 #[tokio::test]
+async fn memory_dream_jobs_paginates_and_filters_on_server() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace_one = tempfile::tempdir().expect("workspace one");
+    let workspace_two = tempfile::tempdir().expect("workspace two");
+    let mut config = GlobalConfig::first_run(workspace_one.path().to_path_buf());
+    let workspace_one_id = config.workspaces[0].id.clone();
+    let mut workspace_two_config = config.workspaces[0].clone();
+    workspace_two_config.id = "workspace-two".to_string();
+    workspace_two_config.path = workspace_two.path().to_path_buf();
+    config.workspaces.push(workspace_two_config);
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut global_database =
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .expect("global memory database");
+        for index in 0..51 {
+            insert_test_dream_job(
+                &mut global_database,
+                &format!("global-dream-{index:02}"),
+                MemoryDreamScope::Global,
+                None,
+                MemoryDreamJobStatus::Completed,
+            );
+        }
+    }
+    {
+        WorkspaceDatabase::open_or_create(workspace_one.path()).expect("workspace one database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace_one.path()))
+                .expect("workspace one memory database");
+        insert_test_dream_job(
+            &mut memory_database,
+            "workspace-one-completed",
+            MemoryDreamScope::Workspace,
+            Some(&workspace_one_id),
+            MemoryDreamJobStatus::Completed,
+        );
+        insert_test_dream_job(
+            &mut memory_database,
+            "workspace-one-failed",
+            MemoryDreamScope::Workspace,
+            Some(&workspace_one_id),
+            MemoryDreamJobStatus::Failed,
+        );
+    }
+    {
+        WorkspaceDatabase::open_or_create(workspace_two.path()).expect("workspace two database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace_two.path()))
+                .expect("workspace two memory database");
+        insert_test_dream_job(
+            &mut memory_database,
+            "workspace-two-failed",
+            MemoryDreamScope::Workspace,
+            Some("workspace-two"),
+            MemoryDreamJobStatus::Failed,
+        );
+    }
+
+    let default_query = serde_json::from_value(json!({})).expect("default jobs query");
+    let Json(default_response) = memory_dream_jobs(State(state.clone()), Query(default_query))
+        .await
+        .expect("default dream jobs");
+    let default_response = serde_json::to_value(default_response).expect("default dream jobs json");
+    assert_eq!(default_response["jobs"].as_array().expect("jobs").len(), 50);
+    assert_eq!(default_response["page"], 1);
+    assert_eq!(default_response["pageSize"], 50);
+    assert_eq!(default_response["totalCount"], 54);
+    assert_eq!(default_response["totalPages"], 2);
+
+    let clamp_query = serde_json::from_value(json!({ "pageSize": 999 })).expect("clamp query");
+    let Json(clamp_response) = memory_dream_jobs(State(state.clone()), Query(clamp_query))
+        .await
+        .expect("clamped dream jobs");
+    let clamp_response = serde_json::to_value(clamp_response).expect("clamped dream jobs json");
+    assert_eq!(clamp_response["pageSize"], 200);
+    assert_eq!(clamp_response["jobs"].as_array().expect("jobs").len(), 54);
+
+    let filtered_query = serde_json::from_value(json!({
+        "scope": "workspace",
+        "workspaceId": workspace_one_id,
+        "status": "failed",
+        "page": 1,
+        "pageSize": 10
+    }))
+    .expect("filtered query");
+    let Json(filtered_response) = memory_dream_jobs(State(state), Query(filtered_query))
+        .await
+        .expect("filtered dream jobs");
+    let filtered_response =
+        serde_json::to_value(filtered_response).expect("filtered dream jobs json");
+    assert_eq!(filtered_response["totalCount"], 1);
+    assert_eq!(filtered_response["totalPages"], 1);
+    assert_eq!(filtered_response["jobs"][0]["id"], "workspace-one-failed");
+    assert_eq!(filtered_response["jobs"][0]["scope"], "workspace");
+    assert_eq!(filtered_response["jobs"][0]["status"], "failed");
+}
+#[tokio::test]
 async fn auto_memory_dream_scheduler_uses_threshold_trigger() {
     let profile = tempfile::tempdir().expect("profile");
     let workspace = tempfile::tempdir().expect("workspace");
@@ -10051,11 +10150,12 @@ async fn auto_memory_dream_startup_reconciles_interrupted_runs() {
     );
 }
 
-fn insert_completed_dream_job(
+fn insert_test_dream_job(
     database: &mut MemoryDatabase,
     id: &str,
     scope: MemoryDreamScope,
     workspace_id: Option<&str>,
+    status: MemoryDreamJobStatus,
 ) {
     database
         .insert_dream_job(NewMemoryDreamJob {
@@ -10064,14 +10164,33 @@ fn insert_completed_dream_job(
             workspace_id,
             trigger_type: MemoryDreamTriggerType::Manual,
             mode: MemoryDreamRunMode::DeterministicOnly,
-            status: MemoryDreamJobStatus::Completed,
+            status,
             model_id: None,
             input_summary_json: "{}",
-            output_summary_json: Some(r#"{"summary":"seed"}"#),
+            output_summary_json: status
+                .eq(&MemoryDreamJobStatus::Completed)
+                .then_some(r#"{"summary":"seed"}"#),
             transcript_chat_id: None,
-            error_message: None,
+            error_message: status
+                .eq(&MemoryDreamJobStatus::Failed)
+                .then_some("seed failure"),
         })
-        .expect("completed dream job");
+        .expect("dream job");
+}
+
+fn insert_completed_dream_job(
+    database: &mut MemoryDatabase,
+    id: &str,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+) {
+    insert_test_dream_job(
+        database,
+        id,
+        scope,
+        workspace_id,
+        MemoryDreamJobStatus::Completed,
+    );
 }
 
 #[test]
