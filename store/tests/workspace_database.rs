@@ -1530,7 +1530,9 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
     let connection = Connection::open(&database_path).expect("open database");
     connection
         .execute_batch(
-            "UPDATE plan_phases
+            "DROP INDEX IF EXISTS workspace_spec_jobs_active_retry_idx;
+             ALTER TABLE workspace_spec_jobs DROP COLUMN retry_of_job_id;
+             UPDATE plan_phases
              SET status = 'completed', commit_id = 'commit-from-phase', completed_at = '2026-07-02T00:00:00.000Z'
              WHERE id = 'plan-attempt-migration-024-completed';
              UPDATE plan_phases
