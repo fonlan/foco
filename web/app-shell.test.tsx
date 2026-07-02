@@ -211,12 +211,21 @@ describe("app-shell verification surfaces", () => {
     expect(screen.getByText("+1")).toHaveClass("text-emerald-700");
     expect(screen.getByText("-1")).toHaveClass("text-rose-700");
     expect(screen.getByText("README.md")).toBeInTheDocument();
+    const diffLines = Array.from(
+      assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"),
+    );
+    const removedLine = diffLines.find((line) => line.textContent === "-1hello");
+    const addedLine = diffLines.find((line) => line.textContent === "+1hello world");
+    expect(removedLine).toHaveClass("bg-rose-50", "text-rose-800");
+    expect(addedLine).toHaveClass("bg-emerald-50", "text-emerald-800");
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
     expect(
-      screen.getByText((_content, element) =>
+      within(assistantBubble).queryByText((_content, element) =>
         element?.tagName === "PRE" &&
         Boolean(element.textContent?.includes('"oldStr": "hello"')),
       ),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
     expect(getAssistantFinalAnswer(assistantBubble)).toBeInTheDocument();
     expect(await screen.findByTestId("mermaid-svg", undefined, { timeout: 5000 })).toBeInTheDocument();
     expect(mermaidMock.render).toHaveBeenCalledWith(
@@ -442,6 +451,51 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   }, 10000);
 
+  it("keeps failed edit_file tool results in the JSON view", async () => {
+    const failedChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = failedChatMessages.messages[1];
+    const failedToolCall = {
+      ...assistantMessage.toolCalls[0],
+      isError: true,
+      output: { error: "oldStr not found" },
+    };
+    assistantMessage.toolCalls = [failedToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: failedToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...failedChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByText("edit_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"oldStr": "hello"')),
+      ),
+    ).toBeInTheDocument();
+    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
+  });
   it("localizes completed tool status and uses success color", async () => {
     const zhSettings = {
       ...settings,

@@ -2074,6 +2074,73 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
   );
 }
 
+type EditFileDiffLine = {
+  kind: "added" | "removed";
+  lineNumber: number;
+  text: string;
+};
+
+type EditFileDiff = {
+  lines: EditFileDiffLine[];
+};
+
+function successfulEditFileDiff(
+  toolCall: ChatToolCallSummary,
+  input: JsonValue,
+): EditFileDiff | null {
+  if (toolCall.name !== "edit_file" || toolCall.isError || toolCall.status !== "completed") {
+    return null;
+  }
+  if (input === null || Array.isArray(input) || typeof input !== "object") {
+    return null;
+  }
+
+  const oldStr = input.oldStr;
+  const newStr = input.newStr;
+  if (typeof oldStr !== "string" || typeof newStr !== "string") {
+    return null;
+  }
+
+  // ponytail: this is replacement-snippet diff, not a full-file diff; upgrade when the backend returns real hunks/startLine.
+  return {
+    lines: [
+      ...oldStr.split("\n").map((text, index) => ({
+        kind: "removed" as const,
+        lineNumber: index + 1,
+        text,
+      })),
+      ...newStr.split("\n").map((text, index) => ({
+        kind: "added" as const,
+        lineNumber: index + 1,
+        text,
+      })),
+    ],
+  };
+}
+
+function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-1 font-semibold text-stone-500">Diff</div>
+      <div className="panel-scroll max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5">
+        {diff.lines.map((line, index) => (
+          <div
+            className={`edit-file-diff-line grid grid-cols-[1.5rem_2.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${line.kind === "added"
+              ? "bg-emerald-50 text-emerald-800"
+              : "bg-rose-50 text-rose-800"
+              }`}
+            key={`${line.kind}-${line.lineNumber}-${index}`}
+          >
+            <span className="select-none font-semibold">{line.kind === "added" ? "+" : "-"}</span>
+            <span className="select-none pr-2 text-right text-stone-500">{line.lineNumber}</span>
+            <span>{line.text}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ToolCallBlock({
   helpers,
   toolCall,
@@ -2094,6 +2161,7 @@ function ToolCallBlock({
   } = helpers;
   const { t } = useI18n();
   const input = normalizedToolInput(toolCall.input);
+  const editFileDiff = successfulEditFileDiff(toolCall, input);
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
@@ -2151,34 +2219,40 @@ function ToolCallBlock({
               <span>{toolCall.completedAt ? formatChatCreatedAt(toolCall.completedAt) : "-"}</span>
             </span>
           </div>
-          <div className="min-w-0">
-            <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-            <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-              {formatJsonValue(input)}
-            </pre>
-          </div>
-          {toolCall.output !== null ? (
-            <div className="min-w-0">
-              <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
-              <pre
-                className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
-                    ? "border-rose-200 text-rose-700"
-                    : "border-stone-200"
-                  }`}
-              >
-                {formatJsonValue(toolCall.output)}
-              </pre>
-            </div>
-          ) : liveOutputText ? (
-            <div className="min-w-0">
-              <div className="mb-1 font-semibold text-stone-500">
-                {t("Live output")}
+          {editFileDiff ? (
+            <EditFileDiffBlock diff={editFileDiff} />
+          ) : (
+            <>
+              <div className="min-w-0">
+                <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+                <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+                  {formatJsonValue(input)}
+                </pre>
               </div>
-              <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
-                {liveOutputText}
-              </pre>
-            </div>
-          ) : null}
+              {toolCall.output !== null ? (
+                <div className="min-w-0">
+                  <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+                  <pre
+                    className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+                      ? "border-rose-200 text-rose-700"
+                      : "border-stone-200"
+                      }`}
+                  >
+                    {formatJsonValue(toolCall.output)}
+                  </pre>
+                </div>
+              ) : liveOutputText ? (
+                <div className="min-w-0">
+                  <div className="mb-1 font-semibold text-stone-500">
+                    {t("Live output")}
+                  </div>
+                  <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
+                    {liveOutputText}
+                  </pre>
+                </div>
+              ) : null}
+            </>
+          )}
         </div>
       </details>
     </div>
