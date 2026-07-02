@@ -1,7 +1,6 @@
 import focoLogoSvg from "../foco.svg?raw";
 import {
   Activity,
-  BarChart3,
   Bot,
   CalendarClock,
   CheckCircle2,
@@ -24,12 +23,10 @@ import {
   Search,
   Settings,
   ShoppingBag,
-  SlidersHorizontal,
   SquareTerminal,
   SunMoon,
   Trash2,
   X,
-  type LucideIcon,
 } from "lucide-react";
 import {
   CSSProperties,
@@ -57,7 +54,6 @@ import type {
   ActiveRunInfo,
   AiStatisticsModelBreakdown,
   AiStatisticsProviderBreakdown,
-  AiStatisticsResponse,
   AiStatisticsSummary,
   AgentDefinitionInput,
   AgentDefinitionSettings,
@@ -8498,12 +8494,10 @@ export function App() {
     () => (
       <ApiOverviewPanel
         activeWorkspaceId={activeWorkspaceId}
-        autoLoadEnabled={!isPreparingChatRun}
-        settings={settings}
         workspaces={workspaces}
       />
     ),
-    [activeWorkspaceId, isPreparingChatRun, settings, workspaces],
+    [activeWorkspaceId, workspaces],
   );
   const handleAddPastedImageAttachmentsForChatPanel = useStableCallback(
     (files: File[]) => void handleAddPastedImageAttachments(files),
@@ -10676,342 +10670,37 @@ function NavRailButton({
 
 function ApiOverviewPanel({
   activeWorkspaceId,
-  autoLoadEnabled,
-  settings,
   workspaces,
 }: {
   activeWorkspaceId: string;
-  autoLoadEnabled: boolean;
-  settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
 }) {
-  const { language, t } = useI18n();
-  const initialWorkspaceId = preferredOverviewWorkspaceId(
-    activeWorkspaceId,
-    workspaces,
-  );
-  const [filters, setFilters] = useState({
-    startedAfter: "",
-    startedBefore: "",
-    workspaceId: initialWorkspaceId,
-  });
-  const [hasAppliedInitialWorkspace, setHasAppliedInitialWorkspace] =
-    useState(initialWorkspaceId !== "");
-  const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const activeOverviewRequestRef = useRef<AbortController | null>(null);
-  const summary = stats?.summary ?? emptyAiStatisticsSummary();
-  const hasLoadedOverview = stats !== null;
-  const providerLabels = useMemo(
-    () =>
-      new Map(
-        (settings?.providers ?? []).map((provider) => [
-          provider.id,
-          provider.name,
-        ]),
-      ),
-    [settings?.providers],
-  );
-  const modelLabels = useMemo(
-    () =>
-      new Map(
-        (settings?.configuredModels ?? []).map((model) => [
-          model.id,
-          model.displayName,
-        ]),
-      ),
-    [settings?.configuredModels],
-  );
-  const preferredWorkspaceId = preferredOverviewWorkspaceId(
-    activeWorkspaceId,
-    workspaces,
-  );
+  const { t } = useI18n();
   const selectedWorkspace =
-    workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
-  const trendData = summary.trend.map((point) => ({
-    id: point.bucket,
-    label: formatTrendBucket(point.bucket, language),
-    primaryValue: point.requestCount,
-    secondaryValue: point.totalTokens,
-  }));
-  const modelTokenData = summary.modelBreakdown.map((item) => ({
-    id: item.modelId,
-    label: modelLabels.get(item.modelId) ?? item.modelId,
-    value: item.totalTokens,
-  }));
-  const modelRequestData = summary.modelBreakdown.map((item) => ({
-    id: item.modelId,
-    label: modelLabels.get(item.modelId) ?? item.modelId,
-    value: item.requestCount,
-  }));
-  const providerTokenData = summary.providerBreakdown.map((item) => ({
-    id: item.providerId,
-    label: providerLabels.get(item.providerId) ?? item.providerId,
-    value: item.totalTokens,
-  }));
-  const providerRequestData = summary.providerBreakdown.map((item) => ({
-    id: item.providerId,
-    label: providerLabels.get(item.providerId) ?? item.providerId,
-    value: item.requestCount,
-  }));
-  const providerQualityData = summary.providerBreakdown.flatMap((item) => {
-    if (item.averageLatencyMs === null || item.successRate === null) {
-      return [];
-    }
-
-    return [
-      {
-        displayXValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
-        displayYValue: formatPercent(item.successRate, language),
-        id: item.providerId,
-        label: providerLabels.get(item.providerId) ?? item.providerId,
-        x: item.averageLatencyMs,
-        y: item.successRate,
-      },
-    ];
-  });
-
-  const loadOverview = useCallback(async () => {
-    if (
-      !autoLoadEnabled ||
-      settings === null ||
-      workspaces.length === 0 ||
-      !hasAppliedInitialWorkspace
-    ) {
-      return;
-    }
-
-    activeOverviewRequestRef.current?.abort();
-    const controller = new AbortController();
-    activeOverviewRequestRef.current = controller;
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const query = aiOverviewQuery(filters);
-      const data = await requestJson<AiStatisticsResponse>(
-        `/api/ai-statistics${query ? `?${query}` : ""}`,
-        { signal: controller.signal },
-      );
-      if (controller.signal.aborted) {
-        return;
-      }
-      setStats(data);
-    } catch (requestError) {
-      if (controller.signal.aborted) {
-        return;
-      }
-      setError(errorMessage(requestError));
-    } finally {
-      if (activeOverviewRequestRef.current === controller) {
-        activeOverviewRequestRef.current = null;
-        setIsLoading(false);
-      }
-    }
-  }, [
-    autoLoadEnabled,
-    filters,
-    hasAppliedInitialWorkspace,
-    settings,
-    workspaces.length,
-  ]);
-
-  useEffect(() => {
-    if (autoLoadEnabled) {
-      return;
-    }
-
-    activeOverviewRequestRef.current?.abort();
-  }, [autoLoadEnabled]);
-
-  useEffect(
-    () => () => {
-      activeOverviewRequestRef.current?.abort();
-    },
-    [],
-  );
-
-  useEffect(() => {
-    if (preferredWorkspaceId === "") {
-      return;
-    }
-
-    setFilters((current) => ({
-      ...current,
-      workspaceId: preferredWorkspaceId,
-    }));
-    setHasAppliedInitialWorkspace(true);
-  }, [preferredWorkspaceId]);
-
-  function updateOverviewFilters(update: Partial<typeof filters>) {
-    setHasAppliedInitialWorkspace(true);
-    setFilters((current) => ({
-      ...current,
-      ...update,
-    }));
-  }
+    workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
+    workspaces[0] ??
+    null;
 
   return (
-    <div className="api-overview-panel flex w-full flex-col gap-4">
-      <section className="foco-reticle rounded-2xl border border-stone-200 bg-white/85 px-5 py-5 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="inline-flex size-11 items-center justify-center rounded-xl bg-teal-50 text-teal-800 shadow-[inset_0_0_0_1px_rgba(200,101,27,0.18)]">
-              <BarChart3 aria-hidden="true" className="size-5" />
-            </span>
-            <div className="min-w-0">
-              <span className="foco-eyebrow">{t("API overview")}</span>
-              <h2 className="foco-display mt-0.5 truncate text-2xl leading-tight text-stone-950">
-                {selectedWorkspace?.name ?? t("All workspaces")}
-              </h2>
-            </div>
-          </div>
-          <button
-            aria-label={t("Refresh request audit")}
-            className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-            disabled={isLoading}
-            onClick={() => void loadOverview()}
-            title={t("Refresh request audit")}
-            type="button"
-          >
-            <RefreshCw
-              aria-hidden="true"
-              className="api-refresh-icon size-4"
-              data-loading={isLoading ? "true" : "false"}
-            />
-          </button>
+    <section className="api-overview-panel grid min-h-[18rem] w-full place-items-center px-4 py-10 text-center">
+      <div className="flex max-w-full flex-col items-center gap-4">
+        <span className="inline-flex size-20 items-center justify-center rounded-2xl border border-stone-200 bg-white text-teal-800 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+          <WorkspaceIcon
+            className="size-16 rounded-xl object-cover"
+            fallbackClassName="size-10"
+            logoUrl={selectedWorkspace?.logoUrl}
+          />
+        </span>
+        <div className="min-w-0">
+          <span className="foco-eyebrow">{t("Workspace")}</span>
+          <h2 className="foco-display mt-1 truncate text-3xl leading-tight text-stone-950">
+            {selectedWorkspace?.name ?? t("No workspace selected")}
+          </h2>
         </div>
-        <div className="mt-4 grid gap-3 md:grid-cols-3">
-          <FilterSelect
-            label={t("Workspace")}
-            onChange={(value) => updateOverviewFilters({ workspaceId: value })}
-            options={workspaces.map((workspace) => ({
-              label: workspace.name,
-              value: workspace.id,
-            }))}
-            placeholder={t("All workspaces")}
-            value={filters.workspaceId}
-          />
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-              {t("Started after")}
-            </span>
-            <input
-              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-              onChange={(event) =>
-                updateOverviewFilters({ startedAfter: event.target.value })
-              }
-              type="datetime-local"
-              value={filters.startedAfter}
-            />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-              {t("Started before")}
-            </span>
-            <input
-              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-              onChange={(event) =>
-                updateOverviewFilters({ startedBefore: event.target.value })
-              }
-              type="datetime-local"
-              value={filters.startedBefore}
-            />
-          </label>
-        </div>
-      </section>
-
-      {error ? (
-        <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-          {error}
-        </div>
-      ) : null}
-
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <StatsCard
-          icon={Activity}
-          label={t("Total requests")}
-          value={formatNumber(summary.totalRequests, language)}
-        />
-        <StatsCard
-          icon={Bot}
-          label={t("Total tokens")}
-          value={formatCompactNumber(summary.totalTokens, language)}
-        />
-        <StatsCard
-          icon={SlidersHorizontal}
-          label={t("Average latency")}
-          value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
-        />
-        <StatsCard
-          icon={CircleAlert}
-          label={t("Failed requests")}
-          value={formatNumber(summary.failedRequests, language)}
-        />
-      </section>
-
-      {!hasLoadedOverview || summary.totalRequests === 0 ? (
-        <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
-          {!hasLoadedOverview
-            ? t("Refresh request audit to load charts")
-            : isLoading
-              ? t("Loading...")
-              : t("No statistics yet")}
-        </section>
-      ) : (
-        <Suspense fallback={<PanelLoadingFallback />}>
-        <section className="grid gap-4 xl:grid-cols-2">
-          <DualLineChartCard
-            data={trendData}
-            primaryFormatter={(value) => formatNumber(value, language)}
-            primaryLabel={t("Requests")}
-            secondaryFormatter={(value) => formatCompactNumber(value, language)}
-            secondaryLabel={t("Tokens")}
-            title={t("Requests and tokens trend")}
-          />
-          <DoubleDonutChartCard
-            innerData={modelTokenData}
-            innerFormatter={(value) => formatCompactNumber(value, language)}
-            innerLabel={t("Tokens")}
-            outerData={modelRequestData}
-            outerFormatter={(value) => formatNumber(value, language)}
-            outerLabel={t("Requests")}
-            title={t("Model distribution")}
-          />
-          <DoubleDonutChartCard
-            innerData={providerTokenData}
-            innerFormatter={(value) => formatCompactNumber(value, language)}
-            innerLabel={t("Tokens")}
-            outerData={providerRequestData}
-            outerFormatter={(value) => formatNumber(value, language)}
-            outerLabel={t("Requests")}
-            title={t("Channel distribution")}
-          />
-          <ScatterChartCard
-            data={providerQualityData}
-            title={t("Channel quality")}
-            xFormatter={(value) => formatNullableLatencySeconds(value, language)}
-            xLabel={t("Response time")}
-            yFormatter={(value) => formatPercent(value, language)}
-            yLabel={t("Success rate")}
-          />
-        </section>
-        </Suspense>
-      )}
-    </div>
+      </div>
+    </section>
   );
 }
-
-const DualLineChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.DualLineChartCard })),
-);
-const DoubleDonutChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.DoubleDonutChartCard })),
-);
-const ScatterChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.ScatterChartCard })),
-);
 
 function PanelLoadingFallback() {
   return (
@@ -11021,61 +10710,7 @@ function PanelLoadingFallback() {
   );
 }
 
-function FilterSelect({
-  label,
-  onChange,
-  options,
-  placeholder,
-  value,
-}: {
-  label: string;
-  onChange: (value: string) => void;
-  options: { label: string; value: string }[];
-  placeholder: string;
-  value: string;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-        {label}
-      </span>
-      <select
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-        onChange={(event) => onChange(event.target.value)}
-        value={value}
-      >
-        <option value="">{placeholder}</option>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
 
-function StatsCard({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: LucideIcon;
-  label: string;
-  value: string;
-}) {
-  return (
-    <article className="rounded-2xl border border-stone-200/80 bg-white p-5 shadow-sm">
-      <div className="foco-eyebrow flex items-center gap-2">
-        <Icon aria-hidden="true" className="size-4 text-teal-700" />
-        <span>{label}</span>
-      </div>
-      <div className="foco-display mt-3 text-4xl leading-none text-stone-950">
-        {value}
-      </div>
-    </article>
-  );
-}
 
 function FocoLogoMark() {
   return (
@@ -12448,70 +12083,7 @@ function liveToolBreakdown(messages: ShellMessage[]) {
     );
 }
 
-function preferredOverviewWorkspaceId(
-  activeWorkspaceId: string,
-  workspaces: WorkspaceSummary[],
-) {
-  if (
-    activeWorkspaceId &&
-    workspaces.some((workspace) => workspace.id === activeWorkspaceId)
-  ) {
-    return activeWorkspaceId;
-  }
 
-  return workspaces[0]?.id ?? "";
-}
-
-function aiOverviewQuery(filters: {
-  startedAfter: string;
-  startedBefore: string;
-  workspaceId: string;
-}) {
-  const params = new URLSearchParams();
-  if (filters.workspaceId) {
-    params.set("workspaceId", filters.workspaceId);
-  }
-  const startedAfter = datetimeLocalToRfc3339(filters.startedAfter);
-  if (startedAfter) {
-    params.set("startedAfter", startedAfter);
-  }
-  const startedBefore = datetimeLocalToRfc3339(filters.startedBefore);
-  if (startedBefore) {
-    params.set("startedBefore", startedBefore);
-  }
-  params.set("page", "1");
-  params.set("pageSize", "1");
-
-  return params.toString();
-}
-
-function formatTrendBucket(bucket: string, language: AppLanguageId = "en") {
-  const date = new Date(`${bucket}T00:00:00`);
-
-  if (Number.isNaN(date.getTime())) {
-    return bucket;
-  }
-
-  return new Intl.DateTimeFormat(language, {
-    day: "2-digit",
-    month: "short",
-  }).format(date);
-}
-
-function datetimeLocalToRfc3339(value: string) {
-  const trimmed = value.trim();
-
-  if (!trimmed) {
-    return "";
-  }
-
-  const date = new Date(trimmed);
-  if (Number.isNaN(date.getTime())) {
-    throw new Error(`invalid date time: ${value}`);
-  }
-
-  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
-}
 
 function formatNullableNumber(
   value: number | null,
@@ -12563,16 +12135,7 @@ function formatTokensPerSecond(
   }).format(metrics.outputTokens / (metrics.totalLatencyMs / 1000));
 }
 
-function formatPercent(value: number | null, language: AppLanguageId = "en") {
-  if (value === null) {
-    return "n/a";
-  }
 
-  return new Intl.NumberFormat(language, {
-    maximumFractionDigits: 1,
-    style: "percent",
-  }).format(value);
-}
 
 function formatNumber(value: number, language: AppLanguageId = "en") {
   return new Intl.NumberFormat(language).format(value);

@@ -2592,40 +2592,48 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
 
-  it("loads API overview for the active workspace after refresh", async () => {
+  it("shows the active workspace identity in the empty chat area", async () => {
     renderApp();
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
     expect(aiStatisticsCallUrls()).toHaveLength(0);
-    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
-    await waitFor(() =>
-      expect(
-        aiStatisticsCallUrls().some(
-          (url) => url.searchParams.get("workspaceId") === workspace.id,
-        ),
-      ).toBe(true),
-    );
-    expect(
-      aiStatisticsCallUrls().every(
-        (url) => url.searchParams.get("workspaceId") === workspace.id,
-      ),
-    ).toBe(true);
   });
 
   it("shows AI statistics and request details", async () => {
     renderApp();
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
-    await waitFor(() =>
-      expect(screen.getAllByText("17.6K").length).toBeGreaterThan(0),
-    );
+    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
     expect(screen.queryByText("Workspace shell is ready")).not.toBeInTheDocument();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
 
     expect(await screen.findByText("API details")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getAllByText("17.6K").length).toBeGreaterThan(0),
+    );
+    expect(screen.getByText("Total requests")).toBeInTheDocument();
+    expect(screen.getByText("Total tokens")).toBeInTheDocument();
+    expect(screen.getByText("Average latency")).toBeInTheDocument();
+    expect(screen.getByText("Failed requests")).toBeInTheDocument();
+    expect(await screen.findByText("Requests and tokens trend")).toBeInTheDocument();
+    expect(screen.getByText("Model distribution")).toBeInTheDocument();
+    expect(screen.getByText("Channel distribution")).toBeInTheDocument();
+    expect(screen.getByText("Channel quality")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Provider" }),
+      "openai",
+    );
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some(
+          (url) =>
+            url.searchParams.get("providerId") === "openai" &&
+            url.searchParams.get("page") === "1",
+        ),
+      ).toBe(true),
+    );
     const table = screen.getByRole("table");
     const tableScroller = table.parentElement;
     const statsScroller = table.closest(".overflow-y-auto") as HTMLElement | null;

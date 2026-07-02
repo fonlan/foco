@@ -1919,7 +1919,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("keeps API overview idle while queueing a new chat", async () => {
+  it("keeps workspace identity idle while queueing a new chat", async () => {
     const fetchMock = vi.mocked(fetch);
     let statsSignal: AbortSignal | null = null;
     fetchMock.mockImplementation((input, init) => {
@@ -1937,7 +1937,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
     renderApp();
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
     expect(statsSignal).toBeNull();
     await userEvent.type(
       await screen.findByRole("textbox"),
@@ -1961,7 +1961,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("spins the API overview refresh icon while reloading", async () => {
+  it("spins the API details refresh icon while reloading", async () => {
     const fetchMock = vi.mocked(fetch);
     let holdNextStatsRequest = false;
     const heldStatsRequests: Deferred<Response>[] = [];
@@ -1985,7 +1985,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
     renderApp();
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    expect(await screen.findByText("API details")).toBeInTheDocument();
     const refreshButton = screen.getByRole("button", {
       name: "Refresh request audit",
     });

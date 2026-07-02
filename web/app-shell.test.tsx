@@ -1101,11 +1101,13 @@ describe("app-shell verification surfaces", () => {
     expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
   });
 
-  it("switches the API overview to the clicked workspace when starting a new chat", async () => {
+  it("switches the workspace identity panel to the clicked workspace when starting a new chat", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: workspace.name }),
+    ).toBeInTheDocument();
 
     await userEvent.click(
       await screen.findByRole("button", { name: "New chat in Side project" }),
@@ -1118,18 +1120,6 @@ describe("app-shell verification surfaces", () => {
       screen.getByPlaceholderText(sideProjectComposerPlaceholder),
     ).toBeInTheDocument();
     expect(aiStatisticsCallUrlsFromMock(fetchMock)).toHaveLength(0);
-    await userEvent.click(screen.getByRole("button", { name: "Refresh request audit" }));
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some(([url]) => {
-          if (typeof url !== "string" || !url.startsWith("/api/ai-statistics")) {
-            return false;
-          }
-          return new URL(url, "http://127.0.0.1").searchParams.get("workspaceId") ===
-            secondaryWorkspace.id;
-        }),
-      ).toBe(true),
-    );
   });
 
   it("sends a workspace plus chat as a new chat request", async () => {
@@ -1346,7 +1336,7 @@ describe("app-shell verification surfaces", () => {
       within(tabList).getByRole("button", { name: "Close chat tab Second chat" }),
     );
 
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
     expect(messageList.scrollTop).toBe(0);
   });
 

@@ -8,11 +8,11 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   Code2,
   Copy,
   Eye,
   LoaderCircle,
-  MessageSquare,
   RefreshCw,
   SlidersHorizontal,
   X,
@@ -20,6 +20,8 @@ import {
 } from "lucide-react";
 import {
   CSSProperties,
+  Suspense,
+  lazy,
   useCallback,
   useEffect,
   useMemo,
@@ -52,6 +54,16 @@ import {
   writeAiStatsVisibleColumnIds,
 } from "./ai-stats-preferences";
 import { useAiStatisticsData } from "./use-ai-statistics-data";
+
+const DualLineChartCard = lazy(() =>
+  import("./StatCharts").then((m) => ({ default: m.DualLineChartCard })),
+);
+const DoubleDonutChartCard = lazy(() =>
+  import("./StatCharts").then((m) => ({ default: m.DoubleDonutChartCard })),
+);
+const ScatterChartCard = lazy(() =>
+  import("./StatCharts").then((m) => ({ default: m.ScatterChartCard })),
+);
 
 type AiStatsColumn = {
   cellClassName: string;
@@ -109,6 +121,68 @@ export function ApiStatsPanel({
     : 0;
   const selectedWorkspace =
     workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
+  const providerLabels = useMemo(
+    () =>
+      new Map(
+        (settings?.providers ?? []).map((provider) => [
+          provider.id,
+          provider.name,
+        ]),
+      ),
+    [settings?.providers],
+  );
+  const modelLabels = useMemo(
+    () =>
+      new Map(
+        (settings?.configuredModels ?? []).map((model) => [
+          model.id,
+          model.displayName,
+        ]),
+      ),
+    [settings?.configuredModels],
+  );
+  const trendData = summary.trend.map((point) => ({
+    id: point.bucket,
+    label: formatTrendBucket(point.bucket, language),
+    primaryValue: point.requestCount,
+    secondaryValue: point.totalTokens,
+  }));
+  const modelTokenData = summary.modelBreakdown.map((item) => ({
+    id: item.modelId,
+    label: modelLabels.get(item.modelId) ?? item.modelId,
+    value: item.totalTokens,
+  }));
+  const modelRequestData = summary.modelBreakdown.map((item) => ({
+    id: item.modelId,
+    label: modelLabels.get(item.modelId) ?? item.modelId,
+    value: item.requestCount,
+  }));
+  const providerTokenData = summary.providerBreakdown.map((item) => ({
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.totalTokens,
+  }));
+  const providerRequestData = summary.providerBreakdown.map((item) => ({
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.requestCount,
+  }));
+  const providerQualityData = summary.providerBreakdown.flatMap((item) => {
+    if (item.averageLatencyMs === null || item.successRate === null) {
+      return [];
+    }
+
+    return [
+      {
+        displayXValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
+        displayYValue: formatPercent(item.successRate, language),
+        id: item.providerId,
+        label: providerLabels.get(item.providerId) ?? item.providerId,
+        x: item.averageLatencyMs,
+        y: item.successRate,
+      },
+    ];
+  });
   const chatOptions = (selectedWorkspace ? [selectedWorkspace] : workspaces)
     .flatMap((workspace) =>
       workspace.chats.map((chat) => ({
@@ -142,7 +216,7 @@ export function ApiStatsPanel({
     requests.map((request) => request.finalState),
     (status) => auditStatusText(status, t),
   );
-  const totalInputTokens = summary.totalInputTokens;
+
   const totalOutputTokens = summary.totalOutputTokens;
   const aiStatsColumns: AiStatsColumn[] = [
     {
@@ -342,77 +416,7 @@ export function ApiStatsPanel({
               />
             </button>
           </div>
-        </section>
-
-        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <StatsCard
-            icon={Activity}
-            label={t("Total requests")}
-            value={formatNumber(totalCount, language)}
-          />
-          <StatsCard
-            icon={MessageSquare}
-            label={t("Total tokens")}
-            value={formatCompactNumber(summary.totalTokens, language)}
-          />
-          <StatsCard
-            icon={Bot}
-            label={t("Input tokens")}
-            value={formatCompactNumber(totalInputTokens, language)}
-          />
-          <StatsCard
-            icon={SlidersHorizontal}
-            label={t("Average latency")}
-            value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
-          />
-        </section>
-
-        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-            <div>
-              <h3 className="text-sm font-semibold text-stone-950">
-                {t("Request audit")}
-              </h3>
-              <p className="mt-1 text-xs text-stone-500">
-                {t("requests {count}", {
-                  count: formatNumber(totalCount, language),
-                })}
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="text-xs text-stone-500">
-                {t("Output tokens")}:{" "}
-                {formatCompactNumber(totalOutputTokens, language)}
-              </div>
-              <details className="relative">
-                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 [&::-webkit-details-marker]:hidden">
-                  <SlidersHorizontal aria-hidden="true" className="size-4" />
-                  {t("Columns")}
-                </summary>
-                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[0_18px_42px_rgba(75,63,42,0.16)]">
-                  {aiStatsColumns.map((column) => (
-                    <label
-                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
-                      key={column.id}
-                    >
-                      <input
-                        checked={visibleColumnIds.has(column.id)}
-                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
-                        disabled={
-                          visibleColumnIds.has(column.id) &&
-                          visibleColumnIds.size === 1
-                        }
-                        onChange={() => toggleAiStatsColumn(column.id)}
-                        type="checkbox"
-                      />
-                      <span className="min-w-0 truncate">{column.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </details>
-            </div>
-          </div>
-          <div className="grid gap-3 border-b border-stone-200 bg-stone-50/70 px-4 py-4 md:grid-cols-2 xl:grid-cols-7">
+          <div className="mt-4 grid gap-3 border-t border-stone-200 pt-4 md:grid-cols-2 xl:grid-cols-7">
             <FilterSelect
               label={t("Workspace")}
               onChange={(value) =>
@@ -487,11 +491,128 @@ export function ApiStatsPanel({
               />
             </label>
           </div>
-          {error ? (
-            <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-              {error}
+        </section>
+
+        {error ? (
+          <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {error}
+          </div>
+        ) : null}
+
+        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <StatsCard
+            icon={Activity}
+            label={t("Total requests")}
+            value={formatNumber(summary.totalRequests, language)}
+          />
+          <StatsCard
+            icon={Bot}
+            label={t("Total tokens")}
+            value={formatCompactNumber(summary.totalTokens, language)}
+          />
+          <StatsCard
+            icon={SlidersHorizontal}
+            label={t("Average latency")}
+            value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
+          />
+          <StatsCard
+            icon={CircleAlert}
+            label={t("Failed requests")}
+            value={formatNumber(summary.failedRequests, language)}
+          />
+        </section>
+
+        {summary.totalRequests === 0 ? (
+          <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
+            {isLoading ? t("Loading...") : t("No statistics yet")}
+          </section>
+        ) : (
+          <Suspense fallback={<PanelLoadingFallback />}>
+            <section className="grid gap-4 xl:grid-cols-2">
+              <DualLineChartCard
+                data={trendData}
+                primaryFormatter={(value) => formatNumber(value, language)}
+                primaryLabel={t("Requests")}
+                secondaryFormatter={(value) => formatCompactNumber(value, language)}
+                secondaryLabel={t("Tokens")}
+                title={t("Requests and tokens trend")}
+              />
+              <DoubleDonutChartCard
+                innerData={modelTokenData}
+                innerFormatter={(value) => formatCompactNumber(value, language)}
+                innerLabel={t("Tokens")}
+                outerData={modelRequestData}
+                outerFormatter={(value) => formatNumber(value, language)}
+                outerLabel={t("Requests")}
+                title={t("Model distribution")}
+              />
+              <DoubleDonutChartCard
+                innerData={providerTokenData}
+                innerFormatter={(value) => formatCompactNumber(value, language)}
+                innerLabel={t("Tokens")}
+                outerData={providerRequestData}
+                outerFormatter={(value) => formatNumber(value, language)}
+                outerLabel={t("Requests")}
+                title={t("Channel distribution")}
+              />
+              <ScatterChartCard
+                data={providerQualityData}
+                title={t("Channel quality")}
+                xFormatter={(value) => formatNullableLatencySeconds(value, language)}
+                xLabel={t("Response time")}
+                yFormatter={(value) => formatPercent(value, language)}
+                yLabel={t("Success rate")}
+              />
+            </section>
+          </Suspense>
+        )}
+
+        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+            <div>
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Request audit")}
+              </h3>
+              <p className="mt-1 text-xs text-stone-500">
+                {t("requests {count}", {
+                  count: formatNumber(totalCount, language),
+                })}
+              </p>
             </div>
-          ) : null}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="text-xs text-stone-500">
+                {t("Output tokens")}:{" "}
+                {formatCompactNumber(totalOutputTokens, language)}
+              </div>
+              <details className="relative">
+                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 [&::-webkit-details-marker]:hidden">
+                  <SlidersHorizontal aria-hidden="true" className="size-4" />
+                  {t("Columns")}
+                </summary>
+                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[0_18px_42px_rgba(75,63,42,0.16)]">
+                  {aiStatsColumns.map((column) => (
+                    <label
+                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                      key={column.id}
+                    >
+                      <input
+                        checked={visibleColumnIds.has(column.id)}
+                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                        disabled={
+                          visibleColumnIds.has(column.id) &&
+                          visibleColumnIds.size === 1
+                        }
+                        onChange={() => toggleAiStatsColumn(column.id)}
+                        type="checkbox"
+                      />
+                      <span className="min-w-0 truncate">{column.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </details>
+            </div>
+          </div>
+
           <div
             className="panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
             onTouchCancel={() => {
@@ -1034,19 +1155,25 @@ function auditPaginationItems(
   return items;
 }
 
-function datetimeLocalToRfc3339(value: string) {
-  const trimmed = value.trim();
+function formatTrendBucket(bucket: string, language: AppLanguageId = "en") {
+  const date = new Date(`${bucket}T00:00:00`);
 
-  if (!trimmed) {
-    return "";
-  }
-
-  const date = new Date(trimmed);
   if (Number.isNaN(date.getTime())) {
-    throw new Error(`invalid date time: ${value}`);
+    return bucket;
   }
 
-  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return new Intl.DateTimeFormat(language, {
+    day: "2-digit",
+    month: "short",
+  }).format(date);
+}
+
+function PanelLoadingFallback() {
+  return (
+    <div className="grid min-h-40 w-full place-items-center p-8 text-stone-400">
+      <LoaderCircle aria-hidden="true" className="size-6 animate-spin" />
+    </div>
+  );
 }
 
 function auditOptions(
