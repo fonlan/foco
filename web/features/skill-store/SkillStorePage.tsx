@@ -67,7 +67,6 @@ type SkillStoreInstallResponse = {
 type InstallTarget = "global" | "workspace";
 
 const SEARCH_DEBOUNCE_MS = 300;
-const SUMMARY_LIMIT = 1400;
 
 export function SkillStorePage({
   onSettingsChange,
@@ -235,8 +234,7 @@ export function SkillStorePage({
   }
 
   const skillSummaryFile = detail?.files.find((file) => file.path === "SKILL.md") ?? null;
-  const readmeFile = detail?.files.find((file) => /^readme\.md$/i.test(file.path)) ?? null;
-  const summaryText = excerpt(readmeFile?.content ?? skillSummaryFile?.content ?? "");
+  const summaryText = skillSummaryFile?.content.trim() ?? "";
   const canInstall = Boolean(
     detail && (installTarget === "global" || workspaceId) && !isInstalling,
   );
@@ -504,14 +502,6 @@ function StatusBlock({
       ) : null}
     </div>
   );
-}
-
-function excerpt(value: string) {
-  const normalized = value.trim();
-  if (normalized.length <= SUMMARY_LIMIT) {
-    return normalized;
-  }
-  return `${normalized.slice(0, SUMMARY_LIMIT).trim()}...`;
 }
 
 function formatMetric(value: number | null) {

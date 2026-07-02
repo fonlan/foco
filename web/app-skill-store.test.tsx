@@ -4,8 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   changeInput,
+  jsonResponse,
+  mockFetch,
   renderApp,
   resetAppTestEnvironment,
+  settings,
 } from "./test-utils/app-test-harness";
 
 describe("skill store app surface", () => {
@@ -69,5 +72,60 @@ describe("skill store app surface", () => {
       ),
     ).toBe(true);
     expect(await screen.findByText(/Installed skill to/)).toBeInTheDocument();
+  });
+
+  it("shows localized full SKILL.md summary instead of README", async () => {
+    const longSkillSummary = [
+      "---",
+      "name: browser-scout",
+      "description: Find useful web references.",
+      "---",
+      "",
+      "# Browser Scout",
+      "",
+      "SKILL.md summary starts here.",
+      "x".repeat(1500),
+      "SKILL_MD_TAIL_SENTINEL",
+    ].join("\n");
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" },
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/settings") {
+          return jsonResponse(zhSettings);
+        }
+        if (path === "/api/skill-store/skills/browser-scout") {
+          return jsonResponse({
+            description: "Find useful web references.",
+            files: [
+              { path: "SKILL.md", content: longSkillSummary },
+              { path: "README.md", content: "README-only summary text" },
+            ],
+            id: "browser-scout",
+            name: "Browser Scout",
+            source: "foco/browser-scout",
+          });
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "技能商店" }));
+    const detailPane = await screen.findByRole("region", { name: "技能详情" });
+
+    expect(await within(detailPane).findByRole("heading", { name: "摘要" })).toBeInTheDocument();
+    expect(within(detailPane).getByText(/SKILL_MD_TAIL_SENTINEL/)).toBeInTheDocument();
+    expect(within(detailPane).queryByText("README-only summary text")).not.toBeInTheDocument();
   });
 });

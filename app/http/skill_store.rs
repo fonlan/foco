@@ -174,30 +174,42 @@ impl SkillStoreClient {
         if query.is_empty() {
             return Err(ApiError::bad_request("search query must not be empty"));
         }
-        if self.token.is_none() {
-            return Err(ApiError::bad_request(
-                "skills.sh search requires SKILLS_SH_TOKEN or VERCEL_OIDC_TOKEN",
-            ));
+        let encoded_query = url_query_value(query);
+        if self.token.is_some() {
+            let url = format!(
+                "{}?query={}&q={}",
+                self.skills_url("/api/v1/skills/search"),
+                encoded_query,
+                encoded_query
+            );
+            match self.skills_get(&url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let value = response.json::<Value>().await.map_err(network_error)?;
+                    return Ok(list_response_from_value(value, "skills.sh:v1-search"));
+                }
+                Ok(response) => {
+                    tracing::warn!(status = %response.status(), "skills.sh v1 search request failed; falling back to public registry search");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "skills.sh v1 search request failed; falling back to public registry search");
+                }
+            }
         }
 
-        let encoded_query = query
-            .bytes()
-            .flat_map(|byte| match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    vec![byte as char]
-                }
-                b' ' => vec!['+'],
-                _ => format!("%{byte:02X}").chars().collect(),
-            })
-            .collect::<String>();
+        self.skills_api_search(query).await
+    }
+
+    async fn skills_api_search(&self, query: &str) -> Result<SkillStoreListResponse, ApiError> {
+        let encoded_query = url_query_value(query);
         let url = format!(
             "{}?query={}&q={}",
-            self.skills_url("/api/v1/skills/search"),
+            self.skills_api_url("/api/skills"),
             encoded_query,
             encoded_query
         );
         let value = self
-            .skills_get(&url)
+            .http
+            .get(url)
             .send()
             .await
             .map_err(network_error)?
@@ -206,7 +218,7 @@ impl SkillStoreClient {
             .json::<Value>()
             .await
             .map_err(network_error)?;
-        Ok(list_response_from_value(value, "skills.sh:v1-search"))
+        Ok(list_response_from_value(value, "skills-api:search"))
     }
 
     async fn detail(
@@ -1100,6 +1112,19 @@ fn bool_field(value: &Value, names: &[&str]) -> Option<bool> {
 
 fn network_error(error: reqwest::Error) -> ApiError {
     ApiError::bad_request(format!("skill store request failed: {error}"))
+}
+
+fn url_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            b' ' => vec!['+'],
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn url_segment(value: &str) -> String {

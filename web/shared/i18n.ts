@@ -110,6 +110,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Overwrite existing skill": "覆盖已有技能",
     "Installed skill to {path}": "技能已安装到 {path}",
     "No summary available": "暂无摘要",
+    Summary: "摘要",
     "Refresh scheduled tasks": "刷新定时任务",
     "tasks {count}": "{count} 个任务",
     "New task": "新建任务",
