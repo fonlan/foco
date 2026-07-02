@@ -876,6 +876,7 @@ const CREATE_PLAN_TOOL_NAME: &str = "create_plan";
 const GET_PLANS_TOOL_NAME: &str = "get_plans";
 const UPDATE_PLAN_TOOL_NAME: &str = "update_plan";
 const UPDATE_PLAN_STEP_TOOL_NAME: &str = "update_plan_step";
+const DELETE_PLAN_TOOL_NAME: &str = "delete_plan";
 const READ_SPEC_TOOL_NAME: &str = "read_spec";
 const UPDATE_SPEC_TOOL_NAME: &str = "update_spec";
 const AGENT_LIST_TOOL_NAME: &str = "agent_list";
@@ -1541,12 +1542,13 @@ pub fn tool_resource_locks(
             resource: ToolResource::TodoGraph,
             access: ToolResourceAccess::Read,
         }],
-        CREATE_PLAN_TOOL_NAME | UPDATE_PLAN_TOOL_NAME | UPDATE_PLAN_STEP_TOOL_NAME => {
-            vec![ToolResourceLock {
-                resource: ToolResource::Plan,
-                access: ToolResourceAccess::Write,
-            }]
-        }
+        CREATE_PLAN_TOOL_NAME
+        | UPDATE_PLAN_TOOL_NAME
+        | UPDATE_PLAN_STEP_TOOL_NAME
+        | DELETE_PLAN_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::Plan,
+            access: ToolResourceAccess::Write,
+        }],
         GET_PLANS_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::Plan,
             access: ToolResourceAccess::Read,
@@ -1647,6 +1649,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | CREATE_PLAN_TOOL_NAME
         | UPDATE_PLAN_TOOL_NAME
         | UPDATE_PLAN_STEP_TOOL_NAME
+        | DELETE_PLAN_TOOL_NAME
         | UPDATE_SPEC_TOOL_NAME
         | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
         RUN_COMMAND_TOOL_NAME => ToolEffect::ExternalOrUnknown,
@@ -1796,6 +1799,7 @@ fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
             | CREATE_PLAN_TOOL_NAME
             | UPDATE_PLAN_TOOL_NAME
             | UPDATE_PLAN_STEP_TOOL_NAME
+            | DELETE_PLAN_TOOL_NAME
             | MEMORY_WRITE_TOOL_NAME
     ) || tool_name.starts_with(MCP_TOOL_NAME_PREFIX)
 }
@@ -2085,6 +2089,10 @@ mod tests {
             ToolEffect::WorkspaceMutation
         );
         assert_eq!(
+            tool_effect(DELETE_PLAN_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
             tool_effect(RUN_COMMAND_TOOL_NAME),
             ToolEffect::ExternalOrUnknown
         );
@@ -2125,6 +2133,16 @@ mod tests {
             .expect("plan locks");
         assert_eq!(
             plan_locks,
+            vec![ToolResourceLock {
+                resource: ToolResource::Plan,
+                access: ToolResourceAccess::Write,
+            }]
+        );
+        let delete_plan_locks =
+            tool_resource_locks(&test_tool_call(DELETE_PLAN_TOOL_NAME, json!({})))
+                .expect("delete plan locks");
+        assert_eq!(
+            delete_plan_locks,
             vec![ToolResourceLock {
                 resource: ToolResource::Plan,
                 access: ToolResourceAccess::Write,
@@ -2211,6 +2229,7 @@ mod tests {
                 .any(|file_lock| tool_resource_locks_conflict(update_lock, file_lock))
         }));
     }
+
     #[test]
     fn plan_tool_locks_do_not_conflict_with_running_command_lock() {
         let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))

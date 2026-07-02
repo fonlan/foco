@@ -863,6 +863,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         workspace.path(),
         workspace.path(),
         "chat-1",
+        None,
         "run-1",
         "model-1",
         "provider-1",

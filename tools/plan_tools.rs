@@ -8,18 +8,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    DEFAULT_PLAN_TOOL_TIMEOUT_MS,
+    BuiltinToolContext, DEFAULT_PLAN_TOOL_TIMEOUT_MS,
     errors::{ToolRuntimeError, tool_timeout_ms},
     parse_arguments,
 };
 
 pub(crate) fn create_plan(
     workspace_path: &Path,
-    chat_id: Option<&str>,
+    context: BuiltinToolContext<'_>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
     let request: CreatePlanInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_PLAN_TOOL_TIMEOUT_MS)?;
+    validate_plan_mode_create_status(context, request.status.as_deref())?;
     let mut database = open_plan_database(workspace_path)?;
     let phase_storage = request
         .phases
@@ -58,10 +59,9 @@ pub(crate) fn create_plan(
                 .collect(),
         })
         .collect();
-    let source_chat_id = request
-        .source_chat_id
-        .as_deref()
-        .or(chat_id)
+    let source_chat_id = context
+        .chat_id
+        .or(request.source_chat_id.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let plan = database.create_plan(NewPlan {
@@ -114,10 +114,12 @@ pub(crate) fn get_plans(
 
 pub(crate) fn update_plan(
     workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
     let request: UpdatePlanInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_PLAN_TOOL_TIMEOUT_MS)?;
+    validate_plan_mode_update_plan(context, &request)?;
     let mut database = open_plan_database(workspace_path)?;
     let error_message = request.error_message.as_deref().map(|message| {
         if message.trim().is_empty() {
@@ -141,10 +143,12 @@ pub(crate) fn update_plan(
 
 pub(crate) fn update_plan_step(
     workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
     let request: UpdatePlanStepInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_PLAN_TOOL_TIMEOUT_MS)?;
+    validate_plan_mode_update_plan_step(context, &request)?;
     let mut database = open_plan_database(workspace_path)?;
     let plan = database.update_plan_step(
         &request.plan_id,
@@ -158,6 +162,93 @@ pub(crate) fn update_plan_step(
     )?;
 
     Ok(plan_json(plan, timeout_ms))
+}
+
+pub(crate) fn delete_plan(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: DeletePlanInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_PLAN_TOOL_TIMEOUT_MS)?;
+    let chat_id = context
+        .chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(
+                "delete_plan requires the current chat id to check plan ownership".to_string(),
+            )
+        })?;
+    let mut database = open_plan_database(workspace_path)?;
+    let plan = database.plan(&request.plan_id)?.ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "plan was not found: {}",
+            request.plan_id.trim()
+        ))
+    })?;
+
+    if plan.source_chat_id.as_deref() != Some(chat_id) {
+        return Err(ToolRuntimeError::InvalidArguments(
+            "delete_plan can only delete plans created by the current chat".to_string(),
+        ));
+    }
+
+    if !database.delete_plan(&request.plan_id)? {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "plan was not found: {}",
+            request.plan_id.trim()
+        )));
+    }
+
+    Ok(json!({
+        "deleted": true,
+        "planId": request.plan_id,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+fn validate_plan_mode_create_status(
+    context: BuiltinToolContext<'_>,
+    status: Option<&str>,
+) -> Result<(), ToolRuntimeError> {
+    if context.is_plan_mode()
+        && status
+            .map(str::trim)
+            .is_some_and(|status| status != "ready")
+    {
+        return Err(plan_mode_status_error());
+    }
+
+    Ok(())
+}
+
+fn validate_plan_mode_update_plan(
+    context: BuiltinToolContext<'_>,
+    request: &UpdatePlanInput,
+) -> Result<(), ToolRuntimeError> {
+    if context.is_plan_mode() && (request.status.is_some() || request.error_message.is_some()) {
+        return Err(plan_mode_status_error());
+    }
+
+    Ok(())
+}
+
+fn validate_plan_mode_update_plan_step(
+    context: BuiltinToolContext<'_>,
+    request: &UpdatePlanStepInput,
+) -> Result<(), ToolRuntimeError> {
+    if context.is_plan_mode() && request.status.is_some() {
+        return Err(plan_mode_status_error());
+    }
+
+    Ok(())
+}
+
+fn plan_mode_status_error() -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(
+        "Plan Mode cannot modify plan, phase, or step status; status is updated by the execution flow, phase outcomes, or manual UI actions".to_string(),
+    )
 }
 
 fn open_plan_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
@@ -241,6 +332,13 @@ struct UpdatePlanStepInput {
     detail: Option<String>,
     acceptance: Option<Vec<String>>,
     status: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletePlanInput {
+    plan_id: String,
     timeout_ms: Option<u64>,
 }
 

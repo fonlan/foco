@@ -23,10 +23,9 @@ use foco_store::workspace::{
 use foco_tools::{
     AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
     AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
-    AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken,
-    ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
-    execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access,
-    read_file_target_outside_workspace,
+    AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, BuiltinToolContext, RUN_COMMAND_TOOL, SLEEP_TOOL,
+    ToolCancellationToken, ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
+    execute_builtin_tool_with_context_and_options, read_file_target_outside_workspace,
 };
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -47,11 +46,11 @@ use crate::*;
 
 use foco_providers::NeutralToolCall;
 use foco_tools::{
-    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
-    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL,
+    GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
     GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
     READ_SPEC_TOOL, SEARCH_TEXT_TOOL, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
-    UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL,
+    UPDATE_TODO_GRAPH_TOOL,
 };
 use serde_json::Value;
 
@@ -191,6 +190,7 @@ fn builtin_tool_uses_workspace_database(tool_name: &str) -> bool {
             | GET_PLANS_TOOL
             | UPDATE_PLAN_TOOL
             | UPDATE_PLAN_STEP_TOOL
+            | DELETE_PLAN_TOOL
             | READ_SPEC_TOOL
             | UPDATE_SPEC_TOOL
     )
@@ -233,6 +233,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     workspace_path: &Path,
     tool_workspace_path: &Path,
     chat_id: &str,
+    session_mode: Option<&str>,
     run_id: &str,
     model_id: &str,
     provider_id: &str,
@@ -275,6 +276,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         workspace_path,
                         tool_workspace_path,
                         chat_id,
+                        session_mode,
                         run_id,
                         model_id,
                         provider_id,
@@ -291,6 +293,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let tool_workspace_path = tool_workspace_path.to_path_buf();
                     let workspace_id = workspace_id.to_string();
                     let chat_id = chat_id.to_string();
+                    let session_mode = session_mode.map(str::to_string);
                     let run_id = run_id.to_string();
                     let model_id = model_id.to_string();
                     let provider_id = provider_id.to_string();
@@ -340,6 +343,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 &workspace_path,
                                 &tool_workspace_path,
                                 &chat_id,
+                                session_mode.as_deref(),
                                 &run_id,
                                 &model_id,
                                 &provider_id,
@@ -392,6 +396,7 @@ async fn execute_tool_call(
     workspace_path: &Path,
     tool_workspace_path: &Path,
     chat_id: &str,
+    session_mode: Option<&str>,
     run_id: &str,
     model_id: &str,
     provider_id: &str,
@@ -420,6 +425,7 @@ async fn execute_tool_call(
         workspace_path,
         tool_workspace_path,
         chat_id,
+        session_mode,
         run_id,
         model_id,
         provider_id,
@@ -496,6 +502,7 @@ pub(crate) async fn execute_tool(
     workspace_path: &Path,
     tool_workspace_path: &Path,
     chat_id: &str,
+    session_mode: Option<&str>,
     run_id: &str,
     model_id: &str,
     provider_id: &str,
@@ -996,14 +1003,18 @@ pub(crate) async fn execute_tool(
         let worker = tokio::task::spawn_blocking({
             let workspace_path = builtin_workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
+            let session_mode = session_mode.map(str::to_string);
             let assistant_message_id = assistant_message_id.to_string();
             let tool_call_id = tool_call_id.to_string();
             let tool_name = tool_name.clone();
             let cancellation_token = cancellation_token.clone();
             move || {
-                execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                execute_builtin_tool_with_context_and_options(
                     &workspace_path,
-                    Some(&chat_id),
+                    BuiltinToolContext {
+                        chat_id: Some(&chat_id),
+                        session_mode: session_mode.as_deref(),
+                    },
                     &tool_name,
                     arguments,
                     Some(cancellation_token),
@@ -3285,6 +3296,7 @@ mod tests {
             workspace.path(),
             isolated_workspace.path(),
             &chat_id,
+            None,
             "run-1",
             "model-1",
             "provider-1",
@@ -3443,9 +3455,9 @@ mod tests {
         );
         assert!(allowed.expect("allow once access"));
 
-        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+        let result = execute_builtin_tool_with_context_and_options(
             workspace.path(),
-            Some(&chat_id),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
             READ_FILE_TOOL,
             json!({ "path": outside.path().to_string_lossy(), "startLine": null, "endLine": null }),
             None,
@@ -3485,9 +3497,9 @@ mod tests {
         let error = denied.expect_err("deny should block access");
         assert!(error.contains("user denied read_file access"));
 
-        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+        let result = execute_builtin_tool_with_context_and_options(
             workspace.path(),
-            Some(&chat_id),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
             READ_FILE_TOOL,
             json!({ "path": outside.path().to_string_lossy(), "startLine": null, "endLine": null }),
             None,

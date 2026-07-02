@@ -1,12 +1,13 @@
 use serde_json::{Value, json};
 
 use crate::{
-    ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
-    GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
-    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL,
-    SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL,
-    UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL,
+    FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL,
+    GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL,
+    GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL,
+    READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition,
+    UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL,
+    WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -32,6 +33,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         get_plans_definition(),
         update_plan_definition(),
         update_plan_step_definition(),
+        delete_plan_definition(),
         read_spec_definition(),
         update_spec_definition(),
         ask_question_definition(),
@@ -718,7 +720,7 @@ fn create_plan_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["id", "title", "overview", "status", "sourceChatId", "phases", "timeoutMs"]
+            "required": ["id", "title", "overview", "phases"]
         }),
         strict: true,
     }
@@ -845,6 +847,29 @@ fn update_plan_step_definition() -> ToolDefinition {
                 }
             },
             "required": ["planId", "stepId", "title", "detail", "acceptance", "status", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn delete_plan_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DELETE_PLAN_TOOL,
+        description: "Delete a durable workspace plan created by the current chat. This tool cannot delete plans from other chats.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "planId": {
+                    "type": "string",
+                    "description": "Plan id to delete."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["planId", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1136,7 +1161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_plan_schema_requires_every_property() {
+    fn create_plan_schema_requires_minimum_properties() {
         let definition = create_plan_definition();
         let required = definition.input_schema["required"]
             .as_array()
@@ -1145,18 +1170,7 @@ mod tests {
             .map(|value| value.as_str().expect("required string"))
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            required,
-            vec![
-                "id",
-                "title",
-                "overview",
-                "status",
-                "sourceChatId",
-                "phases",
-                "timeoutMs"
-            ]
-        );
+        assert_eq!(required, vec!["id", "title", "overview", "phases"]);
         assert_eq!(
             definition.input_schema["additionalProperties"],
             serde_json::Value::Bool(false)

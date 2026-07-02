@@ -623,6 +623,7 @@ fn plan_mode_builtin_tool_allowed(tool_name: &str) -> bool {
             | GET_PLANS_TOOL
             | UPDATE_PLAN_TOOL
             | UPDATE_PLAN_STEP_TOOL
+            | DELETE_PLAN_TOOL
     )
 }
 

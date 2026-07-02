@@ -54,6 +54,7 @@ pub const CREATE_PLAN_TOOL: &str = "create_plan";
 pub const GET_PLANS_TOOL: &str = "get_plans";
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 pub const UPDATE_PLAN_STEP_TOOL: &str = "update_plan_step";
+pub const DELETE_PLAN_TOOL: &str = "delete_plan";
 pub const READ_SPEC_TOOL: &str = "read_spec";
 pub const UPDATE_SPEC_TOOL: &str = "update_spec";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
@@ -132,6 +133,25 @@ pub enum ToolOutputStream {
     Stderr,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuiltinToolContext<'a> {
+    pub chat_id: Option<&'a str>,
+    pub session_mode: Option<&'a str>,
+}
+
+impl<'a> BuiltinToolContext<'a> {
+    pub fn for_chat(chat_id: Option<&'a str>) -> Self {
+        Self {
+            chat_id,
+            session_mode: None,
+        }
+    }
+
+    pub fn is_plan_mode(self) -> bool {
+        self.session_mode == Some("plan")
+    }
+}
+
 pub trait ToolOutputSink: Send + Sync {
     fn output_chunk(&self, chunk: ToolOutputChunk);
 }
@@ -174,7 +194,12 @@ pub fn execute_builtin_tool(
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
-    execute_builtin_tool_for_chat(workspace_path, None, tool_name, arguments)
+    execute_builtin_tool_with_context(
+        workspace_path,
+        BuiltinToolContext::default(),
+        tool_name,
+        arguments,
+    )
 }
 
 pub fn execute_builtin_tool_for_chat(
@@ -183,9 +208,23 @@ pub fn execute_builtin_tool_for_chat(
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
-    execute_builtin_tool_for_chat_with_cancellation(
+    execute_builtin_tool_with_context(
         workspace_path,
-        chat_id,
+        BuiltinToolContext::for_chat(chat_id),
+        tool_name,
+        arguments,
+    )
+}
+
+pub fn execute_builtin_tool_with_context(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    tool_name: &str,
+    arguments: Value,
+) -> ToolExecution {
+    execute_builtin_tool_with_context_and_cancellation(
+        workspace_path,
+        context,
         tool_name,
         arguments,
         None,
@@ -199,9 +238,25 @@ pub fn execute_builtin_tool_for_chat_with_cancellation(
     arguments: Value,
     cancellation_token: Option<ToolCancellationToken>,
 ) -> ToolExecution {
-    execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+    execute_builtin_tool_with_context_and_cancellation(
         workspace_path,
-        chat_id,
+        BuiltinToolContext::for_chat(chat_id),
+        tool_name,
+        arguments,
+        cancellation_token,
+    )
+}
+
+pub fn execute_builtin_tool_with_context_and_cancellation(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+) -> ToolExecution {
+    execute_builtin_tool_with_context_cancellation_and_output_sink(
+        workspace_path,
+        context,
         tool_name,
         arguments,
         cancellation_token,
@@ -217,9 +272,27 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
     cancellation_token: Option<ToolCancellationToken>,
     output_sink: Option<Arc<dyn ToolOutputSink>>,
 ) -> ToolExecution {
-    execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+    execute_builtin_tool_with_context_cancellation_and_output_sink(
         workspace_path,
-        chat_id,
+        BuiltinToolContext::for_chat(chat_id),
+        tool_name,
+        arguments,
+        cancellation_token,
+        output_sink,
+    )
+}
+
+pub fn execute_builtin_tool_with_context_cancellation_and_output_sink(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+    output_sink: Option<Arc<dyn ToolOutputSink>>,
+) -> ToolExecution {
+    execute_builtin_tool_with_context_and_options(
+        workspace_path,
+        context,
         tool_name,
         arguments,
         cancellation_token,
@@ -237,9 +310,29 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_exter
     output_sink: Option<Arc<dyn ToolOutputSink>>,
     allow_external_read_access: bool,
 ) -> ToolExecution {
+    execute_builtin_tool_with_context_and_options(
+        workspace_path,
+        BuiltinToolContext::for_chat(chat_id),
+        tool_name,
+        arguments,
+        cancellation_token,
+        output_sink,
+        allow_external_read_access,
+    )
+}
+
+pub fn execute_builtin_tool_with_context_and_options(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+    output_sink: Option<Arc<dyn ToolOutputSink>>,
+    allow_external_read_access: bool,
+) -> ToolExecution {
     match execute_builtin_tool_inner(
         workspace_path,
-        chat_id,
+        context,
         tool_name,
         arguments,
         cancellation_token.as_ref(),
@@ -267,7 +360,7 @@ pub fn read_file_target_outside_workspace(
 
 fn execute_builtin_tool_inner(
     workspace_path: &Path,
-    chat_id: Option<&str>,
+    context: BuiltinToolContext<'_>,
     tool_name: &str,
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
@@ -294,13 +387,20 @@ fn execute_builtin_tool_inner(
         }
         WRITE_FILE_TOOL => file_tools::write_file(workspace_path, arguments),
         EDIT_FILE_TOOL => file_tools::edit_file(workspace_path, arguments),
-        CREATE_TODO_GRAPH_TOOL => todo_tools::create_todo_graph(workspace_path, chat_id, arguments),
-        UPDATE_TODO_GRAPH_TOOL => todo_tools::update_todo_graph(workspace_path, chat_id, arguments),
-        GET_TODO_GRAPH_TOOL => todo_tools::get_todo_graph(workspace_path, chat_id, arguments),
-        CREATE_PLAN_TOOL => plan_tools::create_plan(workspace_path, chat_id, arguments),
+        CREATE_TODO_GRAPH_TOOL => {
+            todo_tools::create_todo_graph(workspace_path, context.chat_id, arguments)
+        }
+        UPDATE_TODO_GRAPH_TOOL => {
+            todo_tools::update_todo_graph(workspace_path, context.chat_id, arguments)
+        }
+        GET_TODO_GRAPH_TOOL => {
+            todo_tools::get_todo_graph(workspace_path, context.chat_id, arguments)
+        }
+        CREATE_PLAN_TOOL => plan_tools::create_plan(workspace_path, context, arguments),
         GET_PLANS_TOOL => plan_tools::get_plans(workspace_path, arguments),
-        UPDATE_PLAN_TOOL => plan_tools::update_plan(workspace_path, arguments),
-        UPDATE_PLAN_STEP_TOOL => plan_tools::update_plan_step(workspace_path, arguments),
+        UPDATE_PLAN_TOOL => plan_tools::update_plan(workspace_path, context, arguments),
+        UPDATE_PLAN_STEP_TOOL => plan_tools::update_plan_step(workspace_path, context, arguments),
+        DELETE_PLAN_TOOL => plan_tools::delete_plan(workspace_path, context, arguments),
         READ_SPEC_TOOL => spec_tools::read_spec(workspace_path, arguments),
         UPDATE_SPEC_TOOL => spec_tools::update_spec(workspace_path, arguments),
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
@@ -1503,6 +1603,207 @@ mod tests {
         );
         assert_eq!(completed.output["tasks"][0]["id"], "probe");
         assert_eq!(completed.output["tasks"][0]["subtasks"], json!([]));
+    }
+
+    #[test]
+    fn plan_mode_rejects_plan_status_mutations() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat("chat-plan", "Plan mode chat")
+            .expect("chat insert");
+        drop(database);
+        let context = BuiltinToolContext {
+            chat_id: Some("chat-plan"),
+            session_mode: Some("plan"),
+        };
+
+        let invalid_create = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            CREATE_PLAN_TOOL,
+            plan_tool_create_input("plan-running", Some("running"), Some("other-chat")),
+        );
+        assert!(invalid_create.is_error);
+        assert_error_contains(&invalid_create, "Plan Mode cannot modify");
+
+        let create = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            CREATE_PLAN_TOOL,
+            plan_tool_create_input("plan-ready", None, Some("other-chat")),
+        );
+        assert!(!create.is_error, "{:?}", create.output);
+        assert_eq!(create.output["plan"]["sourceChatId"], "chat-plan");
+
+        let update_status = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            UPDATE_PLAN_TOOL,
+            json!({
+                "planId": "plan-ready",
+                "title": null,
+                "overview": null,
+                "status": "failed",
+                "errorMessage": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(update_status.is_error);
+        assert_error_contains(&update_status, "Plan Mode cannot modify");
+
+        let update_error = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            UPDATE_PLAN_TOOL,
+            json!({
+                "planId": "plan-ready",
+                "title": null,
+                "overview": null,
+                "status": null,
+                "errorMessage": "not from Plan Mode",
+                "timeoutMs": null
+            }),
+        );
+        assert!(update_error.is_error);
+        assert_error_contains(&update_error, "Plan Mode cannot modify");
+
+        let update_step_status = execute_builtin_tool_with_context(
+            workspace.path(),
+            context,
+            UPDATE_PLAN_STEP_TOOL,
+            json!({
+                "planId": "plan-ready",
+                "stepId": "step-plan-ready",
+                "title": null,
+                "detail": null,
+                "acceptance": null,
+                "status": "completed",
+                "timeoutMs": null
+            }),
+        );
+        assert!(update_step_status.is_error);
+        assert_error_contains(&update_step_status, "Plan Mode cannot modify");
+    }
+
+    #[test]
+    fn delete_plan_requires_current_chat_ownership() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat("chat-owner", "Owner chat")
+            .expect("owner chat insert");
+        database
+            .insert_chat("chat-other", "Other chat")
+            .expect("other chat insert");
+        drop(database);
+
+        let owner_context = BuiltinToolContext {
+            chat_id: Some("chat-owner"),
+            session_mode: Some("plan"),
+        };
+        let other_context = BuiltinToolContext {
+            chat_id: Some("chat-other"),
+            session_mode: Some("plan"),
+        };
+
+        let create_owned = execute_builtin_tool_with_context(
+            workspace.path(),
+            owner_context,
+            CREATE_PLAN_TOOL,
+            plan_tool_create_input("plan-owned", None, Some("chat-other")),
+        );
+        assert!(!create_owned.is_error, "{:?}", create_owned.output);
+
+        let denied = execute_builtin_tool_with_context(
+            workspace.path(),
+            other_context,
+            DELETE_PLAN_TOOL,
+            json!({ "planId": "plan-owned", "timeoutMs": null }),
+        );
+        assert!(denied.is_error);
+        assert_error_contains(&denied, "current chat");
+        assert!(
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database")
+                .plan("plan-owned")
+                .expect("plan query")
+                .is_some()
+        );
+
+        let missing_chat = execute_builtin_tool_with_context(
+            workspace.path(),
+            BuiltinToolContext::default(),
+            DELETE_PLAN_TOOL,
+            json!({ "planId": "plan-owned", "timeoutMs": null }),
+        );
+        assert!(missing_chat.is_error);
+        assert_error_contains(&missing_chat, "current chat id");
+
+        let deleted = execute_builtin_tool_with_context(
+            workspace.path(),
+            owner_context,
+            DELETE_PLAN_TOOL,
+            json!({ "planId": "plan-owned", "timeoutMs": null }),
+        );
+        assert!(!deleted.is_error, "{:?}", deleted.output);
+        assert_eq!(deleted.output["deleted"], true);
+        assert_eq!(deleted.output["planId"], "plan-owned");
+        assert!(
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database")
+                .plan("plan-owned")
+                .expect("plan query")
+                .is_none()
+        );
+
+        let missing = execute_builtin_tool_with_context(
+            workspace.path(),
+            owner_context,
+            DELETE_PLAN_TOOL,
+            json!({ "planId": "plan-missing", "timeoutMs": null }),
+        );
+        assert!(missing.is_error);
+        assert_error_contains(&missing, "plan was not found");
+    }
+
+    fn plan_tool_create_input(
+        plan_id: &str,
+        status: Option<&str>,
+        source_chat_id: Option<&str>,
+    ) -> Value {
+        let phase_id = format!("phase-{plan_id}");
+        let step_id = format!("step-{plan_id}");
+        json!({
+            "id": plan_id,
+            "title": format!("Plan {plan_id}"),
+            "overview": "Test plan",
+            "status": status,
+            "sourceChatId": source_chat_id,
+            "phases": [{
+                "id": phase_id,
+                "title": "Phase 1",
+                "summary": null,
+                "steps": [{
+                    "id": step_id,
+                    "title": "Step 1",
+                    "detail": null,
+                    "acceptance": []
+                }]
+            }],
+            "timeoutMs": null
+        })
+    }
+
+    fn assert_error_contains(execution: &ToolExecution, expected: &str) {
+        let error = execution
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error message");
+        assert!(error.contains(expected), "{error}");
     }
 
     #[test]
