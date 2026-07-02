@@ -3199,8 +3199,9 @@ mod tests {
     use super::*;
     use foco_agent::{AgentDefinitionId, AgentTeamId};
     use foco_store::{
-        config::{AgentDefinitionSettings, AgentModelOptions},
-        workspace::{NewAgentTeam, WorkspaceDatabase},
+        config::{AgentDefinitionSettings, AgentModelOptions, MemorySettings},
+        memory::MemoryStatus,
+        workspace::{NewAgentTeam, WorkspaceDatabase, workspace_database_path},
     };
     use std::fs;
 
@@ -3228,6 +3229,96 @@ mod tests {
         ] {
             assert!(!builtin_tool_uses_workspace_database(tool_name));
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_create_todo_graph_writes_canonical_workspace_database() {
+        let workspace = tempfile::tempdir().expect("canonical workspace");
+        let isolated_workspace = tempfile::tempdir().expect("isolated workspace");
+        let chat_id = format!("chat-isolated-todo-{}", unique_id("case"));
+
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("canonical database");
+            database
+                .insert_chat(&chat_id, "Isolated todo graph test")
+                .expect("canonical chat");
+        }
+
+        let isolated_database_path = workspace_database_path(isolated_workspace.path());
+        assert!(!isolated_database_path.exists());
+
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let output = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &HookConfig::default(),
+            true,
+            &GlobalConfig::first_run(workspace.path().to_path_buf()),
+            &ProviderConnectionConfig {
+                kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+                    .expect("provider kind"),
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+                request_overrides: Vec::new(),
+            },
+            &WebSearchSettings::default(),
+            QuestionRegistry::default(),
+            mpsc::unbounded_channel().0,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-1".to_string(),
+                tool_call_id: "call-1".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            isolated_workspace.path(),
+            &chat_id,
+            "run-1",
+            "model-1",
+            "provider-1",
+            0,
+            "call-1",
+            CREATE_TODO_GRAPH_TOOL,
+            json!({
+                "tasks": [{
+                    "id": "task-1",
+                    "title": "Task 1",
+                    "status": "ready",
+                    "dependsOn": [],
+                    "acceptance": [],
+                    "summary": "",
+                    "createdAt": null,
+                    "updatedAt": null,
+                    "subtasks": []
+                }],
+                "timeoutMs": 1000
+            }),
+        )
+        .await;
+
+        assert!(!output.execution.is_error, "{:?}", output.execution.output);
+        assert!(!isolated_database_path.exists());
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("canonical database");
+        let graph = database
+            .todo_graph(&chat_id)
+            .expect("canonical todo graph query")
+            .expect("canonical todo graph");
+        assert_eq!(graph.tasks.len(), 1);
+        assert_eq!(graph.tasks[0].id, "task-1");
     }
 
     #[test]
