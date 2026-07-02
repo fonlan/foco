@@ -1538,7 +1538,7 @@ describe("app-panels-stats verification surfaces", () => {
       phases: [],
       sortOrder: 0,
       sourceChatId: "chat-1",
-      status: "implemented",
+      status: "blocked",
       title: "Blocked merge plan",
       updatedAt: timestamp,
     };

@@ -5839,6 +5839,161 @@ async fn queue_plan_phase_reuses_existing_worktree_relative_path() {
 }
 
 #[tokio::test]
+async fn plan_dirty_shared_workspace_blocks_merge_without_dispatching_merge_worktree() {
+    let mut fixture = blocked_plan_worktree_fixture("dirty-blocked").await;
+    let database = WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
+    let plan = database
+        .plan(&fixture.plan_id)
+        .expect("plan lookup")
+        .expect("plan");
+    let source_instance = database
+        .agent_instance(&fixture.source_instance_id)
+        .expect("source instance lookup")
+        .expect("source instance");
+
+    assert_eq!(plan.status, "implemented");
+    assert!(plan.shared_merge_commit_id.is_none());
+    assert!(
+        plan.error_message
+            .as_deref()
+            .expect("plan error")
+            .contains(crate::git_backend::AGENT_WORKTREE_SHARED_DIRTY_MESSAGE)
+    );
+    assert_eq!(
+        plan.phases[0].agent_task_id.as_deref(),
+        Some(fixture.phase_task_id.as_str())
+    );
+    assert_eq!(plan.phases[0].merge_attempt_count, 0);
+    assert_eq!(source_instance.worktree_status.as_deref(), Some("active"));
+    assert!(fixture.source_root.exists());
+    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 1);
+    assert!(
+        timeout(Duration::from_millis(50), fixture.agent_scheduler_rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retry_merge_after_dirty_block_cleans_ff_and_records_shared_merge_commit() {
+    let fixture = blocked_plan_worktree_fixture("retry-ff").await;
+    fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
+
+    let retried = crate::plan_runtime::transition_plan_action(
+        &fixture.state,
+        &fixture.workspace.id,
+        &fixture.plan_id,
+        "retry_merge",
+    )
+    .await
+    .expect("retry merge");
+    let merged_commit = retried
+        .shared_merge_commit_id
+        .as_deref()
+        .expect("shared merge commit");
+
+    assert_eq!(retried.status, "implemented");
+    assert!(retried.error_message.is_none());
+    assert_eq!(merged_commit, fixture.source_commit);
+    assert_eq!(
+        crate::git_backend::shared_workspace_head_commit_id(&fixture.workspace.path)
+            .expect("shared HEAD"),
+        fixture.source_commit
+    );
+    assert!(!fixture.source_root.exists());
+    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 0);
+
+    let database = WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
+    let source_instance = database
+        .agent_instance(&fixture.source_instance_id)
+        .expect("source instance lookup")
+        .expect("source instance");
+    assert_eq!(
+        source_instance.execution_workspace_mode,
+        foco_agent::AgentExecutionWorkspaceMode::Shared
+    );
+    assert!(source_instance.worktree_status.is_none());
+}
+
+#[tokio::test]
+async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once() {
+    let mut fixture = blocked_plan_worktree_fixture("retry-head-advanced").await;
+    fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
+    fs::write(
+        fixture.workspace.path.join("shared-advance.txt"),
+        "advance\n",
+    )
+    .expect("advance file");
+    crate::git_backend::stage_git_file(&fixture.workspace.path, "shared-advance.txt")
+        .expect("stage advance");
+    let advanced_head = crate::git_backend::commit_staged_changes(
+        &fixture.workspace.path,
+        "advance shared head".to_string(),
+    )
+    .expect("advance shared head");
+
+    let retried = crate::plan_runtime::transition_plan_action(
+        &fixture.state,
+        &fixture.workspace.id,
+        &fixture.plan_id,
+        "retry_merge",
+    )
+    .await
+    .expect("retry merge");
+
+    assert_eq!(retried.status, "running");
+    assert!(retried.shared_merge_commit_id.is_none());
+    assert_eq!(retried.phases[0].merge_attempt_count, 1);
+    assert_ne!(
+        retried.phases[0].agent_task_id.as_deref(),
+        Some(fixture.phase_task_id.as_str())
+    );
+    assert_eq!(fixture.agent_scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
+    let source_instance = database
+        .agent_instance(&fixture.source_instance_id)
+        .expect("source instance lookup")
+        .expect("source instance");
+    assert_eq!(source_instance.worktree_status.as_deref(), Some("kept"));
+    assert!(fixture.source_root.exists());
+
+    let merge_team_id = foco_agent::AgentTeamId::new(
+        retried.phases[0]
+            .agent_team_id
+            .as_deref()
+            .expect("merge team id"),
+    )
+    .expect("merge team id");
+    let merge_team = database
+        .agent_team(&merge_team_id)
+        .expect("merge team lookup")
+        .expect("merge team");
+    let merge_instance = database
+        .agent_instance(&merge_team.coordinator_instance_id)
+        .expect("merge instance lookup")
+        .expect("merge instance");
+    assert_eq!(
+        merge_instance.execution_workspace_mode,
+        foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree
+    );
+    assert_ne!(merge_instance.id, fixture.source_instance_id);
+    assert_eq!(merge_instance.worktree_status.as_deref(), Some("active"));
+    let merge_root = merge_instance
+        .execution_root_path
+        .as_deref()
+        .map(|path| crate::git_backend::resolve_agent_worktree_path(&fixture.workspace.path, path))
+        .expect("merge root");
+    assert!(merge_root.exists());
+    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 2);
+    assert_eq!(
+        crate::git_backend::shared_workspace_head_commit_id(&fixture.workspace.path)
+            .expect("shared HEAD"),
+        advanced_head
+    );
+}
+
+#[tokio::test]
 async fn scheduled_task_dispatch_queues_visible_chat_and_completes_one_shot() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-profile"));
@@ -14402,6 +14557,203 @@ fn insert_test_memory_fact_with_status(
             metadata_json: "{}",
         })
         .expect("memory fact insert");
+}
+
+struct BlockedPlanWorktreeFixture {
+    _workspace_tempdir: tempfile::TempDir,
+    _profile_tempdir: tempfile::TempDir,
+    state: AppState,
+    workspace: WorkspaceConfig,
+    plan_id: String,
+    phase_task_id: foco_agent::AgentTaskId,
+    source_instance_id: foco_agent::AgentInstanceId,
+    source_root: PathBuf,
+    source_commit: String,
+    agent_scheduler_rx: tokio::sync::mpsc::Receiver<()>,
+}
+
+async fn blocked_plan_worktree_fixture(suffix: &str) -> BlockedPlanWorktreeFixture {
+    let workspace_tempdir = tempfile::tempdir().expect("workspace");
+    let profile_tempdir = tempfile::tempdir().expect("profile");
+    let workspace_path = workspace_tempdir.path().to_path_buf();
+    init_plan_merge_git_workspace(&workspace_path);
+
+    let mut config = prompt_test_config(workspace_path.clone());
+    config.plan.merge_automation_mode =
+        foco_store::config::PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE.to_string();
+    let workspace = config.workspaces[0].clone();
+    let mut state = test_app_state(config, profile_tempdir.path().to_path_buf());
+    let (agent_scheduler, agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+
+    let plan_id = format!("plan-{suffix}");
+    let phase_id = format!("plan-{suffix}-phase");
+    let source_instance_id =
+        foco_agent::AgentInstanceId::new(format!("agent-instance-{suffix}-source"))
+            .expect("source instance id");
+    let source_worktree =
+        crate::git_backend::create_agent_worktree(&workspace_path, source_instance_id.as_str())
+            .expect("source worktree");
+    fs::write(source_worktree.root_path.join("phase.txt"), "phase\n").expect("phase file");
+    fs::write(workspace_path.join("shared-dirty.txt"), "dirty\n").expect("dirty shared file");
+    let source_root_relative = source_worktree
+        .root_path
+        .strip_prefix(&workspace_path)
+        .expect("relative source root")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let phase_task_id =
+        foco_agent::AgentTaskId::new(format!("agent-task-{suffix}-phase")).expect("phase task id");
+    let team_id =
+        foco_agent::AgentTeamId::new(format!("agent-team-{suffix}-phase")).expect("phase team id");
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_path).expect("database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: &plan_id,
+                title: "Blocked merge test",
+                overview: "Dirty shared workspace should block merge.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase one",
+                    summary: "Creates a worktree commit.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: &format!("{phase_id}-step"),
+                        title: "Do work",
+                        detail: "Write the phase file.",
+                        acceptance: vec!["merge state is correct".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        database
+            .insert_chat(&format!("chat-{suffix}-phase"), "Plan phase")
+            .expect("chat insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new(format!("agent-definition-{suffix}-phase"))
+                .expect("definition id"),
+            revision: 1,
+            name: "Plan phase coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Be precise.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: &format!("chat-{suffix}-phase"),
+                coordinator_instance_id: &source_instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(&source_root_relative),
+                coordinator_worktree_base_revision: Some(&source_worktree.base_revision),
+                coordinator_worktree_branch: Some(&source_worktree.branch),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .expect("create isolated team");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &phase_task_id,
+                team_id: &team_id,
+                owner_instance_id: &source_instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue phase task");
+        database
+            .attach_plan_phase_run(
+                &plan_id,
+                &phase_id,
+                &format!("chat-{suffix}-phase"),
+                &team_id,
+                &phase_task_id,
+            )
+            .expect("attach phase run");
+        database
+            .claim_runnable_agent_task(
+                &team_id,
+                &phase_task_id,
+                &foco_agent::AgentAttemptId::new(format!("agent-attempt-{suffix}-phase"))
+                    .expect("attempt id"),
+            )
+            .expect("claim phase task")
+            .expect("claimed phase task");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &phase_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some("{}"),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete phase task");
+    }
+
+    crate::plan_runtime::sync_plan_phase_for_agent_task(&state, &workspace, &phase_task_id)
+        .await
+        .expect("sync phase task");
+    let source_commit =
+        crate::git_backend::shared_workspace_head_commit_id(&source_worktree.root_path)
+            .expect("source HEAD");
+
+    BlockedPlanWorktreeFixture {
+        _workspace_tempdir: workspace_tempdir,
+        _profile_tempdir: profile_tempdir,
+        state,
+        workspace,
+        plan_id,
+        phase_task_id,
+        source_instance_id,
+        source_root: source_worktree.root_path,
+        source_commit,
+        agent_scheduler_rx,
+    }
+}
+
+fn init_plan_merge_git_workspace(workspace_path: &Path) {
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    fs::write(workspace_path.join(".gitignore"), ".foco/\n").expect("ignore Foco internals");
+    crate::git_backend::stage_git_file(workspace_path, "README.md").expect("stage base");
+    crate::git_backend::stage_git_file(workspace_path, ".gitignore").expect("stage gitignore");
+    crate::git_backend::commit_staged_changes(workspace_path, "initial".to_string())
+        .expect("initial commit");
+}
+
+fn managed_agent_worktree_count(workspace_path: &Path) -> usize {
+    let root = workspace_path.join(".foco").join("agent-worktrees");
+    match fs::read_dir(root) {
+        Ok(entries) => entries.filter_map(Result::ok).count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read worktree root: {error}"),
+    }
 }
 
 fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
