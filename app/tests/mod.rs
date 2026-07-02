@@ -8871,7 +8871,8 @@ async fn settings_workspace_spec_jobs_aggregates_workspace_history() {
 async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
     let profile = tempfile::tempdir().expect("profile");
     let workspace = tempfile::tempdir().expect("workspace");
-    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.spec.generation_model_id = Some("current-spec-model".to_string());
     let workspace_id = config.workspaces[0].id.clone();
     let state = test_app_state(config, profile.path().to_path_buf());
     {
@@ -8886,7 +8887,7 @@ async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
                 trigger_type: "chat_completed",
                 chat_id: Some("chat-1"),
                 run_id: Some("run-1"),
-                model_id: Some("model"),
+                model_id: Some("old-spec-model"),
                 base_revision: Some(7),
                 input_summary_json: Some(r#"{"summary":"changed"}"#),
             })
@@ -8950,7 +8951,7 @@ async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
     assert_eq!(response["job"]["triggerType"], "chat_completed");
     assert_eq!(response["job"]["chatId"], "chat-1");
     assert_eq!(response["job"]["runId"], "run-1");
-    assert_eq!(response["job"]["modelId"], "model");
+    assert_eq!(response["job"]["modelId"], "current-spec-model");
     assert_eq!(response["job"]["baseRevision"], 7);
     assert_eq!(response["job"]["inputSummary"]["summary"], "changed");
 
@@ -8960,6 +8961,7 @@ async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
         .expect("old job lookup")
         .expect("old job");
     assert_eq!(old_job.status, "failed");
+    assert_eq!(old_job.model_id.as_deref(), Some("old-spec-model"));
     let new_job = database
         .workspace_spec_job(&new_job_id)
         .expect("new job lookup")
@@ -8967,8 +8969,18 @@ async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
     assert_eq!(new_job.status, "queued");
     assert_eq!(new_job.chat_id.as_deref(), Some("chat-1"));
     assert_eq!(new_job.run_id.as_deref(), Some("run-1"));
-    assert_eq!(new_job.model_id.as_deref(), Some("model"));
-    assert_eq!(new_job.base_revision, Some(7));
+    assert_eq!(new_job.model_id.as_deref(), Some("current-spec-model"));
+    drop(database);
+
+    let error = retry_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "failed-spec-job".to_string())),
+    )
+    .await
+    .expect_err("duplicate retry should fail");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+    assert_eq!(database.workspace_spec_job_count().expect("job count"), 5);
     drop(database);
 
     for job_id in ["completed-spec-job", "running-spec-job", "queued-spec-job"] {

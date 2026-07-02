@@ -475,6 +475,7 @@ export function SettingsPanel({
   const [specJobsTotalPages, setSpecJobsTotalPages] = useState(0);
   const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
   const [specJobOperationKey, setSpecJobOperationKey] = useState<string | null>(null);
+  const specJobOperationKeysRef = useRef<Set<string>>(new Set());
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
   const [isLoadingPlanHistory, setIsLoadingPlanHistory] = useState(false);
   const [planHistoryError, setPlanHistoryError] = useState<string | null>(null);
@@ -1934,9 +1935,12 @@ export function SettingsPanel({
       setIsSavingSpecSettings(false);
     }
   }
-
   async function retrySpecJob(workspaceId: string, jobId: string) {
     const operationKey = `${workspaceId}:${jobId}`;
+    if (specJobOperationKeysRef.current.has(operationKey)) {
+      return;
+    }
+    specJobOperationKeysRef.current.add(operationKey);
     setSpecJobOperationKey(operationKey);
     setError(null);
 
@@ -1950,9 +1954,11 @@ export function SettingsPanel({
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
-      setSpecJobOperationKey(null);
+      specJobOperationKeysRef.current.delete(operationKey);
+      setSpecJobOperationKey((current) => (current === operationKey ? null : current));
     }
   }
+
 
   async function savePlanSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -5387,7 +5393,7 @@ export function SettingsPanel({
                                     <button
                                       aria-label={t("Retry Spec job")}
                                       className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                                      disabled={specJobOperationKey !== null}
+                                      disabled={isRetrying}
                                       onClick={() => void retrySpecJob(item.workspaceId, job.id)}
                                       title={t("Retry Spec job")}
                                       type="button"

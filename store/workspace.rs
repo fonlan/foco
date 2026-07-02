@@ -57,13 +57,13 @@ use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, MIGRATION_023, MIGRATION_024, Migration,
+    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 24;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 25;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -216,6 +216,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 24,
         sql: MIGRATION_024,
+    },
+    Migration {
+        version: 25,
+        sql: MIGRATION_025,
     },
 ];
 
@@ -879,25 +883,91 @@ impl WorkspaceDatabase {
         &mut self,
         old_id: &str,
         new_id: &str,
+        model_id: Option<&str>,
     ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
-        let Some(old_job) = self.workspace_spec_job(old_id)? else {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(old_job) = transaction
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE id = ?1",
+                params![old_id],
+                workspace_spec_job_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+        else {
             return Ok(None);
         };
         if old_job.status != WorkspaceSpecJobStatus::Failed.as_str() {
             return Ok(None);
         }
+        let active_retry_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM workspace_spec_jobs
+                    WHERE retry_of_job_id = ?1
+                      AND status IN ('queued', 'running')
+                 )",
+                params![old_id],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if active_retry_exists {
+            return Err(WorkspaceDatabaseError::WorkspaceSpecRetryAlreadyQueued {
+                job_id: old_id.to_string(),
+            });
+        }
 
-        // ponytail: no retry_of_job_id schema yet; history correlation stays on copied chat/run/base/input.
-        self.insert_workspace_spec_job(NewWorkspaceSpecJob {
-            id: new_id,
-            trigger_type: &old_job.trigger_type,
-            chat_id: old_job.chat_id.as_deref(),
-            run_id: old_job.run_id.as_deref(),
-            model_id: old_job.model_id.as_deref(),
-            base_revision: old_job.base_revision,
-            input_summary_json: Some(&old_job.input_summary_json),
-        })
-        .map(Some)
+        WorkspaceSpecTriggerType::parse(&old_job.trigger_type)?;
+        let input_summary_json =
+            redact_workspace_spec_json_object(&old_job.input_summary_json, "input_summary_json")?;
+        let base_revision = old_job
+            .base_revision
+            .map(|revision| workspace_spec_revision_to_i64(revision, "base_revision"))
+            .transpose()?;
+        let now = now_timestamp();
+        transaction
+            .execute(
+                "INSERT INTO workspace_spec_jobs
+                    (id, trigger_type, status, retry_of_job_id, chat_id, run_id, model_id,
+                     base_revision, input_summary_json, created_at)
+                 VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    new_id,
+                    old_job.trigger_type,
+                    old_id,
+                    old_job.chat_id.as_deref(),
+                    old_job.run_id.as_deref(),
+                    model_id,
+                    base_revision,
+                    input_summary_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let new_job = transaction
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE id = ?1",
+                params![new_id],
+                workspace_spec_job_from_row,
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(Some(new_job))
     }
 
     pub fn workspace_spec_jobs(
@@ -10222,6 +10292,9 @@ pub enum WorkspaceDatabaseError {
         found: u32,
         latest: u32,
     },
+    WorkspaceSpecRetryAlreadyQueued {
+        job_id: String,
+    },
     WorkspaceNotDirectory {
         path: PathBuf,
     },
@@ -10311,6 +10384,10 @@ impl fmt::Display for WorkspaceDatabaseError {
                 found,
                 latest
             ),
+            Self::WorkspaceSpecRetryAlreadyQueued { job_id } => write!(
+                formatter,
+                "workspace spec job '{job_id}' already has a queued or running retry"
+            ),
             Self::WorkspaceNotDirectory { path } => write!(
                 formatter,
                 "workspace path does not exist or is not a directory: {}",
@@ -10348,6 +10425,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::MissingToolCall { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
+            | Self::WorkspaceSpecRetryAlreadyQueued { .. }
             | Self::WorkspaceNotDirectory { .. } => None,
         }
     }

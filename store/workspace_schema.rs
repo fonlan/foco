@@ -1213,6 +1213,15 @@ WHERE status IN ('queued', 'running')
   );
 "#;
 
+pub(crate) const MIGRATION_025: &str = r#"
+ALTER TABLE workspace_spec_jobs
+ADD COLUMN retry_of_job_id TEXT REFERENCES workspace_spec_jobs(id) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX workspace_spec_jobs_active_retry_idx
+ON workspace_spec_jobs(retry_of_job_id)
+WHERE retry_of_job_id IS NOT NULL AND status IN ('queued', 'running');
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

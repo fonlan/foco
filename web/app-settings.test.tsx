@@ -230,6 +230,62 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("keeps Spec job history retry buttons scoped per failed job", async () => {
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [
+      failedJob,
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          id: "workspace-spec-job-failed-2",
+        },
+        workspaceId: "workspace-1",
+        workspaceName: "Default",
+      },
+    ];
+    const retryGate = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed/retry") {
+        return retryGate.promise;
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    const retryButtons = await within(specHistorySection).findAllByRole("button", {
+      name: "Retry Spec job",
+    });
+
+    fireEvent.click(retryButtons[0]);
+    fireEvent.click(retryButtons[0]);
+
+    await waitFor(() => expect(retryButtons[0]).toBeDisabled());
+    expect(retryButtons[1]).not.toBeDisabled();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input]) =>
+          String(input) ===
+          "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed/retry",
+      ),
+    ).toHaveLength(1);
+
+    retryGate.resolve(jsonResponse({ job: failedJob.job }));
+    await waitFor(() => expect(retryButtons[0]).not.toBeDisabled());
+  });
+
   it("paginates Spec job history", async () => {
     const baseJob = appTestState.settingsSpecJobsResponse[0];
     appTestState.settingsSpecJobsResponse = Array.from({ length: 25 }, (_, index) => ({

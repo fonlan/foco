@@ -342,8 +342,13 @@ pub(crate) async fn retry_workspace_spec_job(
         .running_workspace_spec_job()
         .map_err(spec_workspace_error)?
         .is_none();
+    let model_id = config
+        .spec
+        .generation_model_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     let new_job = database
-        .retry_failed_workspace_spec_job(&job_id, &unique_id("workspace-spec-job"))
+        .retry_failed_workspace_spec_job(&job_id, &unique_id("workspace-spec-job"), model_id)
         .map_err(spec_workspace_error)?
         .ok_or_else(|| {
             ApiError::bad_request("workspace spec job is not failed or was not found")
@@ -517,6 +522,9 @@ fn spec_workspace_error(error: WorkspaceDatabaseError) -> ApiError {
     match error {
         WorkspaceDatabaseError::InvalidWorkspaceSpec { .. } => {
             ApiError::bad_request(error.to_string())
+        }
+        WorkspaceDatabaseError::WorkspaceSpecRetryAlreadyQueued { .. } => {
+            ApiError::conflict(error.to_string())
         }
         _ => ApiError::from_workspace_error(error),
     }
