@@ -2076,7 +2076,6 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
 
 type EditFileDiffLine = {
   kind: "added" | "removed";
-  lineNumber: number;
   text: string;
 };
 
@@ -2104,18 +2103,27 @@ function successfulEditFileDiff(
   // ponytail: this is replacement-snippet diff, not a full-file diff; upgrade when the backend returns real hunks/startLine.
   return {
     lines: [
-      ...oldStr.split("\n").map((text, index) => ({
+      ...oldStr.split("\n").map((text) => ({
         kind: "removed" as const,
-        lineNumber: index + 1,
         text,
       })),
-      ...newStr.split("\n").map((text, index) => ({
+      ...newStr.split("\n").map((text) => ({
         kind: "added" as const,
-        lineNumber: index + 1,
         text,
       })),
     ],
   };
+}
+
+function successfulReadFileContent(toolCall: ChatToolCallSummary): string | null {
+  if (toolCall.name !== "read_file" || toolCall.isError || toolCall.status !== "completed") {
+    return null;
+  }
+  if (toolCall.output === null || Array.isArray(toolCall.output) || typeof toolCall.output !== "object") {
+    return null;
+  }
+
+  return typeof toolCall.output.content === "string" ? toolCall.output.content : null;
 }
 
 function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
@@ -2125,14 +2133,13 @@ function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
       <div className="panel-scroll max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5">
         {diff.lines.map((line, index) => (
           <div
-            className={`edit-file-diff-line grid grid-cols-[1.5rem_2.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${line.kind === "added"
+            className={`edit-file-diff-line grid grid-cols-[1.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${line.kind === "added"
               ? "bg-emerald-50 text-emerald-800"
               : "bg-rose-50 text-rose-800"
               }`}
-            key={`${line.kind}-${line.lineNumber}-${index}`}
+            key={`${line.kind}-${index}`}
           >
             <span className="select-none font-semibold">{line.kind === "added" ? "+" : "-"}</span>
-            <span className="select-none pr-2 text-right text-stone-500">{line.lineNumber}</span>
             <span>{line.text}</span>
           </div>
         ))}
@@ -2162,6 +2169,7 @@ function ToolCallBlock({
   const { t } = useI18n();
   const input = normalizedToolInput(toolCall.input);
   const editFileDiff = successfulEditFileDiff(toolCall, input);
+  const readFileContent = successfulReadFileContent(toolCall);
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
@@ -2221,6 +2229,8 @@ function ToolCallBlock({
           </div>
           {editFileDiff ? (
             <EditFileDiffBlock diff={editFileDiff} />
+          ) : readFileContent !== null ? (
+            <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">{readFileContent}</pre>
           ) : (
             <>
               <div className="min-w-0">

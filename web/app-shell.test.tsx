@@ -228,8 +228,10 @@ describe("app-shell verification surfaces", () => {
     const diffLines = Array.from(
       assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"),
     );
-    const removedLine = diffLines.find((line) => line.textContent === "-1hello");
-    const addedLine = diffLines.find((line) => line.textContent === "+1hello world");
+    const removedLine = diffLines.find((line) => line.textContent === "-hello");
+    const addedLine = diffLines.find((line) => line.textContent === "+hello world");
+    expect(diffLines.some((line) => line.textContent === "-1hello")).toBe(false);
+    expect(diffLines.some((line) => line.textContent === "+1hello world")).toBe(false);
     expect(removedLine).toHaveClass("bg-rose-50", "text-rose-800");
     expect(addedLine).toHaveClass("bg-emerald-50", "text-emerald-800");
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
@@ -510,6 +512,58 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
     expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
   });
+
+  it("shows successful read_file content without the JSON view", async () => {
+    const readFileChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = readFileChatMessages.messages[1];
+    const readFileToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { path: "README.md" },
+      name: "read_file",
+      output: { content: "alpha\nbeta", path: "README.md" },
+    };
+    assistantMessage.toolCalls = [readFileToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: readFileToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...readFileChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByText("read_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" && element.textContent === "alpha\nbeta",
+      ),
+    ).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(
+      within(assistantBubble).queryByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"content": "alpha')),
+      ),
+    ).not.toBeInTheDocument();
+  });
+
   it("localizes completed tool status and uses success color", async () => {
     const zhSettings = {
       ...settings,
