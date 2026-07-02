@@ -790,6 +790,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Dream LLM timeout ms": "Dream LLM 超时 ms",
     "Save spec settings": "保存 Spec 设置",
     "Spec job history": "Spec 任务历史",
+    "Spec job history pagination": "Spec 任务历史分页",
     "All workspace Spec jobs": "全部工作区 Spec 任务",
     "Refresh Spec job history": "刷新 Spec 任务历史",
     "Loading Spec job history...": "正在加载 Spec 任务历史...",

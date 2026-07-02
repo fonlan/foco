@@ -469,6 +469,10 @@ export function SettingsPanel({
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
   const [specJobs, setSpecJobs] = useState<SettingsWorkspaceSpecJobSummary[]>([]);
+  const [specJobsPage, setSpecJobsPage] = useState(1);
+  const [specJobsPageSize, setSpecJobsPageSize] = useState(20);
+  const [specJobsTotalCount, setSpecJobsTotalCount] = useState(0);
+  const [specJobsTotalPages, setSpecJobsTotalPages] = useState(0);
   const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
   const [specJobOperationKey, setSpecJobOperationKey] = useState<string | null>(null);
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
@@ -627,6 +631,16 @@ export function SettingsPanel({
       sortedMemoryDreamJobs.length,
       memoryDreamPageStart + paginatedMemoryDreamJobs.length - 1,
     )
+    : 0;
+  const specJobsPaginationItems = auditPaginationItems(
+    specJobsPage,
+    specJobsTotalPages,
+  );
+  const specJobsPageStart = specJobs.length
+    ? (specJobsPage - 1) * specJobsPageSize + 1
+    : 0;
+  const specJobsPageEnd = specJobs.length
+    ? Math.min(specJobsTotalCount, specJobsPageStart + specJobs.length - 1)
     : 0;
   const planHistoryPaginationItems = auditPaginationItems(
     planHistoryPage,
@@ -1124,20 +1138,38 @@ export function SettingsPanel({
     setError(null);
 
     try {
+      const params = new URLSearchParams({
+        page: String(specJobsPage),
+        pageSize: String(specJobsPageSize),
+      });
       const data = await requestJson<SettingsWorkspaceSpecJobsResponse>(
-        "/api/settings/spec/jobs?limit=100",
+        `/api/settings/spec/jobs?${params.toString()}`,
       );
+      if (data.totalPages > 0 && data.page > data.totalPages) {
+        setSpecJobsPage(data.totalPages);
+        return;
+      }
+      if (data.totalPages === 0 && data.page !== 1) {
+        setSpecJobsPage(1);
+        return;
+      }
       setSpecJobs(data.jobs);
+      setSpecJobsPage(data.page);
+      setSpecJobsPageSize(data.pageSize);
+      setSpecJobsTotalCount(data.totalCount);
+      setSpecJobsTotalPages(data.totalPages);
       if (data.errors.length > 0) {
         setError(data.errors.map((item) => `${item.workspaceName}: ${item.error}`).join("; "));
       }
     } catch (requestError) {
       setSpecJobs([]);
+      setSpecJobsTotalCount(0);
+      setSpecJobsTotalPages(0);
       setError(errorMessage(requestError));
     } finally {
       setIsLoadingSpecJobs(false);
     }
-  }, []);
+  }, [specJobsPage, specJobsPageSize]);
 
   const loadPlanHistory = useCallback(async () => {
     if (!effectivePlanHistoryWorkspaceId) {
@@ -2376,6 +2408,18 @@ export function SettingsPanel({
         MEMORY_DREAM_MAX_PAGE_SIZE,
         positiveIntegerText(value, current),
       ),
+    );
+  }
+
+  function goToSpecJobsPage(page: number) {
+    const maxPage = specJobsTotalPages || 1;
+    setSpecJobsPage(Math.min(Math.max(1, page), maxPage));
+  }
+
+  function updateSpecJobsPageSize(value: string) {
+    setSpecJobsPage(1);
+    setSpecJobsPageSize((current) =>
+      Math.min(100, positiveIntegerText(value, current)),
     );
   }
 
@@ -5364,6 +5408,90 @@ export function SettingsPanel({
                       )}
                     </tbody>
                   </table>
+                </div>
+
+                <div className="flex flex-col gap-3 border-t border-stone-200 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="text-xs font-medium text-stone-500">
+                    {specJobsTotalCount
+                      ? t("Showing {start}-{end} of {total}", {
+                        end: formatNumber(specJobsPageEnd, language),
+                        start: formatNumber(specJobsPageStart, language),
+                        total: formatNumber(specJobsTotalCount, language),
+                      })
+                      : t("No Spec jobs")}
+                  </div>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
+                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-stone-500 sm:w-auto">
+                      <span>{t("Page size")}</span>
+                      <input
+                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        disabled={isLoadingSpecJobs}
+                        inputMode="numeric"
+                        onChange={(event) => updateSpecJobsPageSize(event.target.value)}
+                        value={specJobsPageSize}
+                      />
+                    </label>
+                    <nav
+                      aria-label={t("Spec job history pagination")}
+                      className="flex flex-wrap items-center gap-1.5"
+                    >
+                      <button
+                        aria-label={t("Previous page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={isLoadingSpecJobs || specJobsPage <= 1}
+                        onClick={() => goToSpecJobsPage(specJobsPage - 1)}
+                        title={t("Previous page")}
+                        type="button"
+                      >
+                        <ChevronLeft aria-hidden="true" className="size-4" />
+                      </button>
+                      {specJobsPaginationItems.map((item, index) =>
+                        item === "ellipsis" ? (
+                          <span
+                            aria-hidden="true"
+                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            key={`spec-jobs-ellipsis-${index}`}
+                          >
+                            ...
+                          </span>
+                        ) : (
+                          <button
+                            aria-current={item === specJobsPage ? "page" : undefined}
+                            aria-label={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === specJobsPage
+                                ? "border-teal-700 bg-teal-700 text-white"
+                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              }`}
+                            disabled={isLoadingSpecJobs}
+                            key={item}
+                            onClick={() => goToSpecJobsPage(item)}
+                            title={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            type="button"
+                          >
+                            {formatNumber(item, language)}
+                          </button>
+                        ),
+                      )}
+                      <button
+                        aria-label={t("Next page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={
+                          isLoadingSpecJobs ||
+                          specJobsTotalPages === 0 ||
+                          specJobsPage >= specJobsTotalPages
+                        }
+                        onClick={() => goToSpecJobsPage(specJobsPage + 1)}
+                        title={t("Next page")}
+                        type="button"
+                      >
+                        <ChevronRight aria-hidden="true" className="size-4" />
+                      </button>
+                    </nav>
+                  </div>
                 </div>
               </section>
             </section>

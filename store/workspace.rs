@@ -925,6 +925,13 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
+    pub fn workspace_spec_job_count(&self) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM workspace_spec_jobs", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.sqlite_error(source))
+    }
 
     pub fn running_workspace_spec_job(
         &self,

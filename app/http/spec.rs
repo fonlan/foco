@@ -14,6 +14,7 @@ use crate::spec_runtime::{log_workspace_spec_job_status, run_workspace_spec_job}
 use crate::*;
 
 const DEFAULT_SPEC_JOB_LIMIT: i64 = 50;
+const DEFAULT_SPEC_JOB_PAGE_SIZE: i64 = 20;
 const MAX_SPEC_JOB_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
@@ -40,6 +41,8 @@ pub(crate) struct GenerateWorkspaceSpecRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceSpecJobsQuery {
     limit: Option<i64>,
+    page: Option<i64>,
+    page_size: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +73,10 @@ pub(crate) struct WorkspaceSpecJobsResponse {
 pub(crate) struct SettingsWorkspaceSpecJobsResponse {
     jobs: Vec<WorkspaceSpecJobWithWorkspaceSummary>,
     errors: Vec<SettingsWorkspaceSpecJobError>,
+    page: i64,
+    page_size: i64,
+    total_count: i64,
+    total_pages: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,16 +278,26 @@ pub(crate) async fn settings_workspace_spec_jobs(
     Query(query): Query<WorkspaceSpecJobsQuery>,
 ) -> Result<Json<SettingsWorkspaceSpecJobsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
-    let limit = spec_job_limit(query.limit)?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = spec_job_page_size(query.page_size.or(query.limit))?;
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let fetch_limit = offset.saturating_add(page_size);
     let mut jobs = Vec::new();
     let mut errors = Vec::new();
+    let mut total_count = 0;
 
     for workspace in &config.workspaces {
         if !workspace_database_path(&workspace.path).exists() {
             continue;
         }
-        match workspace_spec_jobs_for_workspace(workspace, limit) {
-            Ok(mut workspace_jobs) => jobs.append(&mut workspace_jobs),
+        // ponytail: cross-workspace pagination reads each workspace through the requested
+        // page window, then globally sorts and slices. Huge histories can upgrade to a
+        // per-workspace cursor/merge without changing the HTTP contract.
+        match workspace_spec_jobs_for_workspace(workspace, fetch_limit) {
+            Ok((mut workspace_jobs, workspace_total_count)) => {
+                jobs.append(&mut workspace_jobs);
+                total_count += workspace_total_count;
+            }
             Err(error) => errors.push(SettingsWorkspaceSpecJobError {
                 workspace_id: workspace.id.clone(),
                 workspace_name: workspace.name.clone(),
@@ -297,9 +314,20 @@ pub(crate) async fn settings_workspace_spec_jobs(
             .cmp(&left.job.created_at)
             .then_with(|| right.job.id.cmp(&left.job.id))
     });
-    jobs.truncate(limit as usize);
+    let jobs = jobs
+        .into_iter()
+        .skip(offset as usize)
+        .take(page_size as usize)
+        .collect();
 
-    Ok(Json(SettingsWorkspaceSpecJobsResponse { jobs, errors }))
+    Ok(Json(SettingsWorkspaceSpecJobsResponse {
+        jobs,
+        errors,
+        page,
+        page_size,
+        total_count,
+        total_pages: spec_job_total_pages(total_count, page_size),
+    }))
 }
 
 pub(crate) async fn retry_workspace_spec_job(
@@ -351,20 +379,36 @@ pub(crate) async fn retry_workspace_spec_job(
 
 fn spec_job_limit(limit: Option<i64>) -> Result<i64, ApiError> {
     let limit = limit.unwrap_or(DEFAULT_SPEC_JOB_LIMIT);
-    if !(1..=MAX_SPEC_JOB_LIMIT).contains(&limit) {
+    spec_job_page_size(Some(limit)).map_err(|_| {
+        ApiError::bad_request(format!("limit must be between 1 and {MAX_SPEC_JOB_LIMIT}"))
+    })
+}
+
+fn spec_job_page_size(page_size: Option<i64>) -> Result<i64, ApiError> {
+    let page_size = page_size.unwrap_or(DEFAULT_SPEC_JOB_PAGE_SIZE);
+    if !(1..=MAX_SPEC_JOB_LIMIT).contains(&page_size) {
         return Err(ApiError::bad_request(format!(
-            "limit must be between 1 and {MAX_SPEC_JOB_LIMIT}"
+            "pageSize must be between 1 and {MAX_SPEC_JOB_LIMIT}"
         )));
     }
-    Ok(limit)
+    Ok(page_size)
+}
+
+fn spec_job_total_pages(total_count: i64, page_size: i64) -> i64 {
+    if total_count == 0 {
+        0
+    } else {
+        (total_count + page_size - 1) / page_size
+    }
 }
 
 fn workspace_spec_jobs_for_workspace(
     workspace: &WorkspaceConfig,
     limit: i64,
-) -> Result<Vec<WorkspaceSpecJobWithWorkspaceSummary>, WorkspaceDatabaseError> {
+) -> Result<(Vec<WorkspaceSpecJobWithWorkspaceSummary>, i64), WorkspaceDatabaseError> {
     let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
-    database
+    let total_count = database.workspace_spec_job_count()?;
+    let jobs = database
         .workspace_spec_jobs(limit)?
         .into_iter()
         .map(|job| {
@@ -380,7 +424,8 @@ fn workspace_spec_jobs_for_workspace(
                 workspace_path: workspace.path.display().to_string(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((jobs, total_count))
 }
 
 fn workspace_spec_response(

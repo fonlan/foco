@@ -2505,7 +2505,22 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/settings/spec/jobs") {
-    return jsonResponse({ errors: [], jobs: appTestState.settingsSpecJobsResponse });
+    const page = Math.max(1, Number(requestUrl.searchParams.get("page") ?? "1") || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number(requestUrl.searchParams.get("pageSize") ?? requestUrl.searchParams.get("limit") ?? "20") || 20),
+    );
+    const totalCount = appTestState.settingsSpecJobsResponse.length;
+    const totalPages = totalCount ? Math.ceil(totalCount / pageSize) : 0;
+    const offset = (page - 1) * pageSize;
+    return jsonResponse({
+      errors: [],
+      jobs: appTestState.settingsSpecJobsResponse.slice(offset, offset + pageSize),
+      page,
+      pageSize,
+      totalCount,
+      totalPages,
+    });
   }
 
   if (path === "/api/skill-store/hot") {

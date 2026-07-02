@@ -177,6 +177,15 @@ describe("app-settings verification surfaces", () => {
     expect(within(specHistorySection as HTMLElement).getByText("Completed")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("model timed out")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Showing 1-2 of 2")).toBeInTheDocument();
+    const pageSizeControl = within(specHistorySection as HTMLElement).getByLabelText("Page size");
+    const pagination = within(specHistorySection as HTMLElement).getByRole("navigation", {
+      name: "Spec job history pagination",
+    });
+    expect(
+      pageSizeControl.compareDocumentPosition(pagination) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
     const specTable = within(specHistorySection as HTMLElement).getByRole("table");
     const specTableScroller = specTable.parentElement;
@@ -209,11 +218,68 @@ describe("app-settings verification surfaces", () => {
     );
     await waitFor(() =>
       expect(
-        fetchMock.mock.calls.filter(([input]) =>
-          String(input).startsWith("/api/settings/spec/jobs?limit=100"),
-        ).length,
+        fetchMock.mock.calls.filter(([input]) => {
+          const value = String(input);
+          return (
+            value.startsWith("/api/settings/spec/jobs?") &&
+            value.includes("page=1") &&
+            value.includes("pageSize=20")
+          );
+        }).length,
       ).toBeGreaterThanOrEqual(2),
     );
+  });
+
+  it("paginates Spec job history", async () => {
+    const baseJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = Array.from({ length: 25 }, (_, index) => ({
+      ...baseJob,
+      job: {
+        ...baseJob.job,
+        id: `workspace-spec-job-${index + 1}`,
+        createdAt: `2026-06-11T03:${String(59 - index).padStart(2, "0")}:00Z`,
+      },
+    }));
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    const pageSizeControl = await within(specHistorySection).findByLabelText("Page size");
+    changeInput(pageSizeControl, "10");
+
+    await waitFor(() => {
+      const pageSizeCall = fetchMock.mock.calls.find(([input]) => {
+        const value = String(input);
+        return (
+          value.startsWith("/api/settings/spec/jobs?") &&
+          value.includes("page=1") &&
+          value.includes("pageSize=10")
+        );
+      });
+      expect(pageSizeCall).toBeDefined();
+    });
+
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Next page" }),
+    );
+
+    await waitFor(() => {
+      const nextPageCall = fetchMock.mock.calls.find(([input]) => {
+        const value = String(input);
+        return (
+          value.startsWith("/api/settings/spec/jobs?") &&
+          value.includes("page=2") &&
+          value.includes("pageSize=10")
+        );
+      });
+      expect(nextPageCall).toBeDefined();
+    });
   });
 
   it("localizes the Spec settings surface", async () => {
@@ -243,6 +309,8 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByRole("heading", { name: "Spec 设置" })).toBeInTheDocument();
     expect(screen.getByText("自动 Spec")).toBeInTheDocument();
     expect(await screen.findByText("Spec 任务历史")).toBeInTheDocument();
+    expect(screen.getByText("每页数量")).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Spec 任务历史分页" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新 Spec 任务历史" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试 Spec 任务" })).toBeInTheDocument();
     expect(screen.getByText("自动化")).toBeInTheDocument();

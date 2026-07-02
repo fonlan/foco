@@ -172,6 +172,10 @@ export type SettingsWorkspaceSpecJobError = {
 export type SettingsWorkspaceSpecJobsResponse = {
   jobs: SettingsWorkspaceSpecJobSummary[];
   errors: SettingsWorkspaceSpecJobError[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 export type RetryWorkspaceSpecJobResponse = {

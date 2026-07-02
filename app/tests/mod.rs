@@ -8750,23 +8750,25 @@ async fn settings_workspace_spec_jobs_aggregates_workspace_history() {
     }
 
     let state = test_app_state(config, profile.path().to_path_buf());
-    let query = serde_json::from_value(json!({ "limit": 100 })).expect("jobs query");
+    let query = serde_json::from_value(json!({ "page": 2, "pageSize": 1 })).expect("jobs query");
     let Json(response) = settings_workspace_spec_jobs(State(state), Query(query))
         .await
         .expect("settings spec jobs");
     let response = serde_json::to_value(response).expect("settings jobs json");
 
-    assert_eq!(response["jobs"].as_array().expect("jobs").len(), 2);
+    assert_eq!(response["jobs"].as_array().expect("jobs").len(), 1);
     assert!(response["errors"].as_array().expect("errors").is_empty());
-    assert_eq!(response["jobs"][0]["job"]["id"], "spec-job-two");
-    assert_eq!(response["jobs"][0]["workspaceId"], "workspace-two");
-    assert_eq!(response["jobs"][0]["workspaceName"], "Two");
+    assert_eq!(response["page"], 2);
+    assert_eq!(response["pageSize"], 1);
+    assert_eq!(response["totalCount"], 2);
+    assert_eq!(response["totalPages"], 2);
+    assert_eq!(response["jobs"][0]["job"]["id"], "spec-job-one");
+    assert_eq!(response["jobs"][0]["workspaceId"], workspace_one_id);
+    assert_eq!(response["jobs"][0]["workspaceName"], "One");
     assert_eq!(
         response["jobs"][0]["workspacePath"],
-        workspace_two.path().display().to_string()
+        workspace_one.path().display().to_string()
     );
-    assert_eq!(response["jobs"][1]["job"]["id"], "spec-job-one");
-    assert_eq!(response["jobs"][1]["workspaceId"], workspace_one_id);
     assert!(!missing_workspace.path().join(".foco").exists());
 }
 
