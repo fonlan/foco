@@ -47,9 +47,11 @@ use crate::*;
 
 use foco_providers::NeutralToolCall;
 use foco_tools::{
-    FIND_FILES_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
-    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
+    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
+    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
+    READ_SPEC_TOOL, SEARCH_TEXT_TOOL, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL,
+    UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL,
 };
 use serde_json::Value;
 
@@ -176,6 +178,20 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             | GET_TODO_GRAPH_TOOL
             | READ_SPEC_TOOL
             | MEMORY_SEARCH_TOOL_NAME
+    )
+}
+
+fn builtin_tool_uses_workspace_database(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        CREATE_TODO_GRAPH_TOOL
+            | UPDATE_TODO_GRAPH_TOOL
+            | GET_TODO_GRAPH_TOOL
+            | CREATE_PLAN_TOOL
+            | GET_PLANS_TOOL
+            | UPDATE_PLAN_TOOL
+            | UPDATE_PLAN_STEP_TOOL
+            | READ_SPEC_TOOL
     )
 }
 
@@ -971,8 +987,13 @@ pub(crate) async fn execute_tool(
         };
         set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
+        let builtin_workspace_path = if builtin_tool_uses_workspace_database(&tool_name) {
+            workspace_path
+        } else {
+            tool_workspace_path
+        };
         let worker = tokio::task::spawn_blocking({
-            let workspace_path = tool_workspace_path.to_path_buf();
+            let workspace_path = builtin_workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
             let assistant_message_id = assistant_message_id.to_string();
             let tool_call_id = tool_call_id.to_string();
@@ -3181,6 +3202,31 @@ mod tests {
         workspace::{NewAgentTeam, WorkspaceDatabase},
     };
     use std::fs;
+
+    #[test]
+    fn builtin_workspace_database_tools_are_routed_to_canonical_workspace() {
+        for tool_name in [
+            CREATE_TODO_GRAPH_TOOL,
+            UPDATE_TODO_GRAPH_TOOL,
+            GET_TODO_GRAPH_TOOL,
+            CREATE_PLAN_TOOL,
+            GET_PLANS_TOOL,
+            UPDATE_PLAN_TOOL,
+            UPDATE_PLAN_STEP_TOOL,
+            READ_SPEC_TOOL,
+        ] {
+            assert!(builtin_tool_uses_workspace_database(tool_name));
+        }
+
+        for tool_name in [
+            READ_FILE_TOOL,
+            WRITE_FILE_TOOL,
+            RUN_COMMAND_TOOL,
+            GRAPH_EXPLORE_TOOL,
+        ] {
+            assert!(!builtin_tool_uses_workspace_database(tool_name));
+        }
+    }
 
     #[test]
     fn parses_read_file_external_access_decisions() {
