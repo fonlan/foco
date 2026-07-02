@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { nextAutoRunnablePlan, trimInactiveChatMessageCaches } from "./App";
+import { nextAutoRunnablePlan, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { Plan, ShellMessage } from "./api/types";
 
 function plan(id: string, status: Plan["status"]): Plan {
@@ -96,5 +96,56 @@ describe("trimInactiveChatMessageCaches", () => {
     expect(result.messagesByKey["chat-3"]).toBe(messagesByKey["chat-3"]);
     expect(result.messagesByKey["chat-5"]).toBe(messagesByKey["chat-5"]);
     expect(result.messagesByKey["chat-6"]).toBe(messagesByKey["chat-6"]);
+  });
+});
+
+describe("preserveCachedReasoningDurations", () => {
+  it("preserves cached reasoning durations without mutating refreshed messages", () => {
+    const refreshedMessages: ShellMessage[] = [
+      {
+        ...message("assistant-1"),
+        parts: [
+          { text: "First thought", type: "reasoning" },
+          { text: "Answer", type: "text" },
+          { text: "Second thought", type: "reasoning" },
+        ],
+      },
+      {
+        ...message("assistant-2"),
+        parts: [{ durationMs: 3000, text: "Server thought", type: "reasoning" }],
+      },
+    ];
+    const cachedMessages: ShellMessage[] = [
+      {
+        ...message("assistant-1"),
+        parts: [
+          { durationMs: 1000, text: "First thought", type: "reasoning" },
+          { text: "Answer", type: "text" },
+          { liveDurationMs: 2000, text: "Second thought", type: "reasoning" },
+        ],
+      },
+      {
+        ...message("assistant-2"),
+        parts: [{ durationMs: 1000, text: "Server thought", type: "reasoning" }],
+      },
+    ];
+    const originalRefreshedParts = refreshedMessages[0].parts;
+
+    const result = preserveCachedReasoningDurations(refreshedMessages, cachedMessages);
+
+    expect(result[0].parts).toEqual([
+      { durationMs: 1000, text: "First thought", type: "reasoning" },
+      { text: "Answer", type: "text" },
+      { liveDurationMs: 2000, text: "Second thought", type: "reasoning" },
+    ]);
+    expect(result[1].parts).toEqual([
+      { durationMs: 3000, text: "Server thought", type: "reasoning" },
+    ]);
+    expect(refreshedMessages[0].parts).toEqual([
+      { text: "First thought", type: "reasoning" },
+      { text: "Answer", type: "text" },
+      { text: "Second thought", type: "reasoning" },
+    ]);
+    expect(result[0].parts).not.toBe(originalRefreshedParts);
   });
 });

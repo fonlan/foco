@@ -398,6 +398,77 @@ export function trimInactiveChatMessageCaches(
   return { messagesByKey: changed ? next : current, trimmedChatKeys };
 }
 
+export function preserveCachedReasoningDurations(
+  messages: ShellMessage[],
+  cachedMessages: ShellMessage[],
+): ShellMessage[] {
+  if (!messages.length || !cachedMessages.length) {
+    return messages;
+  }
+
+  const cachedMessagesById = new Map(
+    cachedMessages.map((message) => [message.id, message]),
+  );
+  let changed = false;
+
+  const nextMessages = messages.map((message) => {
+    const cachedMessage = cachedMessagesById.get(message.id);
+    if (!cachedMessage) {
+      return message;
+    }
+
+    const cachedReasoningParts = cachedMessage.parts.filter(
+      (part): part is Extract<ChatMessagePart, { type: "reasoning" }> =>
+        part.type === "reasoning",
+    );
+    if (!cachedReasoningParts.length) {
+      return message;
+    }
+
+    let reasoningIndex = 0;
+    let partsChanged = false;
+    const nextParts = message.parts.map((part) => {
+      if (part.type !== "reasoning") {
+        return part;
+      }
+
+      const cachedPart = cachedReasoningParts[reasoningIndex++];
+      if (
+        !cachedPart ||
+        cachedPart.text !== part.text ||
+        part.durationMs !== undefined ||
+        part.liveDurationMs !== undefined
+      ) {
+        return part;
+      }
+
+      const durationPatch = {
+        ...(cachedPart.durationMs !== undefined
+          ? { durationMs: cachedPart.durationMs }
+          : {}),
+        ...(cachedPart.liveDurationMs !== undefined
+          ? { liveDurationMs: cachedPart.liveDurationMs }
+          : {}),
+      };
+      if (!Object.keys(durationPatch).length) {
+        return part;
+      }
+
+      partsChanged = true;
+      return { ...part, ...durationPatch };
+    });
+
+    if (!partsChanged) {
+      return message;
+    }
+
+    changed = true;
+    return { ...message, parts: nextParts };
+  });
+
+  return changed ? nextMessages : messages;
+}
+
 
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
@@ -4102,7 +4173,11 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_PAGE_LIMIT}`,
         { signal: controller.signal },
       );
-      const nextMessages = data.messages.map(normalizeChatMessageSummary);
+      const normalizedMessages = data.messages.map(normalizeChatMessageSummary);
+      const nextMessages = preserveCachedReasoningDurations(
+        normalizedMessages,
+        chatMessagesByKeyRef.current[chatKey] ?? [],
+      );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
       const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
       const pagination = normalizeChatMessagesPagination(data.pagination);
