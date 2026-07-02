@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::{
     git_backend::{
+        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE,
         AgentWorktreeInfo, agent_instance_worktree_path, agent_worktree_committed_diff,
         commit_staged_changes, delete_agent_worktree,
         fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
@@ -80,6 +81,9 @@ pub(crate) async fn transition_plan_action(
     action: &str,
 ) -> Result<PlanRecord, ApiError> {
     let action = action.trim();
+    if action == "retry_merge" {
+        return retry_plan_merge(state, workspace_id, plan_id).await;
+    }
     if !matches!(action, "start" | "resume") {
         let config = config_snapshot(state)?;
         let workspace = workspace_by_id(&config, workspace_id)?;
@@ -108,6 +112,41 @@ pub(crate) async fn transition_plan_action(
             Err(error)
         }
     }
+}
+
+pub(crate) async fn retry_plan_merge(
+    state: &AppState,
+    workspace_id: &str,
+    plan_id: &str,
+) -> Result<PlanRecord, ApiError> {
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?.clone();
+    let plan = {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .plan(plan_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("plan was not found: {}", plan_id.trim()))
+            })?
+    };
+    if plan.shared_merge_commit_id.is_some() {
+        return Ok(plan);
+    }
+    if !is_plan_merge_blocked(&plan) && plan.status != "implemented" {
+        return Err(ApiError::bad_request(format!(
+            "plan '{}' is not waiting for merge retry",
+            plan.id
+        )));
+    }
+    finalize_plan_worktree(state, &workspace, &plan).await?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .plan(plan_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("plan was not found: {}", plan_id.trim())))
 }
 
 pub(crate) async fn retry_plan_phase(
@@ -296,11 +335,30 @@ async fn sync_plan_merge_task(
             let commit_id = match commit_id {
                 Ok(commit_id) => commit_id,
                 Err(error) => {
+                    if instance.execution_workspace_mode
+                        == AgentExecutionWorkspaceMode::IsolatedWorktree
+                    {
+                        delete_instance_worktree(workspace, instance, true)?;
+                    }
                     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                         .map_err(ApiError::from_workspace_error)?;
-                    database
-                        .fail_plan_phase_by_id(&target.plan_id, &target.phase_id, &error.message)
-                        .map_err(ApiError::from_workspace_error)?;
+                    if is_shared_workspace_dirty_merge_error(&error) {
+                        database
+                            .block_plan_phase_merge(
+                                &target.plan_id,
+                                &target.phase_id,
+                                &error.message,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                    } else {
+                        database
+                            .fail_plan_phase_by_id(
+                                &target.plan_id,
+                                &target.phase_id,
+                                &error.message,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                    }
                     return Ok(());
                 }
             };
@@ -644,7 +702,17 @@ async fn finalize_plan_worktree(
             delete_plan_worktrees(workspace, plan, true)
         }
         Err(error) => {
-            if dispatch_plan_merge(state, workspace, plan, &phase, &instance, &error).await? {
+            if is_shared_workspace_dirty_merge_error(&error) {
+                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+                return Ok(());
+            }
+            if is_shared_head_mismatch_merge_error(&error)
+                && dispatch_plan_merge(state, workspace, plan, &phase, &instance, &error).await?
+            {
                 Ok(())
             } else {
                 let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
@@ -656,6 +724,24 @@ async fn finalize_plan_worktree(
             }
         }
     }
+}
+
+fn is_shared_workspace_dirty_merge_error(error: &ApiError) -> bool {
+    error.message.contains(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE)
+}
+
+fn is_shared_head_mismatch_merge_error(error: &ApiError) -> bool {
+    error
+        .message
+        .contains(AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE)
+}
+
+fn is_plan_merge_blocked(plan: &PlanRecord) -> bool {
+    plan.shared_merge_commit_id.is_none()
+        && plan
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE))
 }
 
 fn commit_plan_phase_to_worktree(
@@ -789,13 +875,15 @@ fn plan_worktree_source(
     plan: &PlanRecord,
 ) -> Result<Option<(PlanPhaseRecord, AgentInstanceRecord)>, ApiError> {
     for phase in plan.phases.iter().rev() {
-        let Some(instance) = plan_phase_coordinator_instance(database, phase)? else {
-            continue;
-        };
-        if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
-            && instance.worktree_status.as_deref() != Some("deleted")
+        for instance in plan_phase_worktree_instances(database, phase)?
+            .into_iter()
+            .rev()
         {
-            return Ok(Some((phase.clone(), instance)));
+            if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+                && instance.worktree_status.as_deref() != Some("deleted")
+            {
+                return Ok(Some((phase.clone(), instance)));
+            }
         }
     }
     Ok(None)
@@ -808,12 +896,33 @@ fn plan_worktree_instances(
     let mut seen = BTreeSet::new();
     let mut instances = Vec::new();
     for phase in &plan.phases {
-        let Some(instance) = plan_phase_coordinator_instance(database, phase)? else {
+        for instance in plan_phase_worktree_instances(database, phase)? {
+            if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+                && seen.insert(instance.id.to_string())
+            {
+                instances.push(instance);
+            }
+        }
+    }
+    Ok(instances)
+}
+
+fn plan_phase_worktree_instances(
+    database: &WorkspaceDatabase,
+    phase: &PlanPhaseRecord,
+) -> Result<Vec<AgentInstanceRecord>, ApiError> {
+    let mut instances = Vec::new();
+    if let Some(instance) = plan_phase_coordinator_instance(database, phase)? {
+        instances.push(instance);
+    }
+    for attempt in database
+        .plan_phase_attempts_for_phase(&phase.id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        let Some(team_id) = attempt.agent_team_id.as_deref() else {
             continue;
         };
-        if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
-            && seen.insert(instance.id.to_string())
-        {
+        if let Some(instance) = coordinator_instance_for_team(database, team_id)? {
             instances.push(instance);
         }
     }
@@ -827,6 +936,13 @@ fn plan_phase_coordinator_instance(
     let Some(team_id) = phase.agent_team_id.as_deref() else {
         return Ok(None);
     };
+    coordinator_instance_for_team(database, team_id)
+}
+
+fn coordinator_instance_for_team(
+    database: &WorkspaceDatabase,
+    team_id: &str,
+) -> Result<Option<AgentInstanceRecord>, ApiError> {
     let team_id = AgentTeamId::new(team_id.to_string())
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let Some(team) = database
@@ -1341,6 +1457,23 @@ mod tests {
             plan_phase_chat_title("Build plan runner UI", "Wire start action"),
             "Build plan runner UI - Wire start action"
         );
+    }
+    #[test]
+    fn plan_merge_block_helpers_classify_dirty_workspace() {
+        let dirty = ApiError::bad_request(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE);
+        let advanced = ApiError::bad_request(format!(
+            "shared workspace HEAD 'new' {AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE} 'base'"
+        ));
+        assert!(is_shared_workspace_dirty_merge_error(&dirty));
+        assert!(!is_shared_head_mismatch_merge_error(&dirty));
+        assert!(is_shared_head_mismatch_merge_error(&advanced));
+
+        let mut plan = plan_record_for_prompt(phase_record_for_prompt());
+        plan.status = "implemented".to_string();
+        plan.error_message = Some(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE.to_string());
+        assert!(is_plan_merge_blocked(&plan));
+        plan.shared_merge_commit_id = Some("shared".to_string());
+        assert!(!is_plan_merge_blocked(&plan));
     }
 
     #[test]

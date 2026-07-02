@@ -1553,6 +1553,7 @@ impl WorkspaceDatabase {
             .execute(
                 "UPDATE plans
                  SET shared_merge_commit_id = ?2,
+                     error_message = NULL,
                      updated_at = ?3
                  WHERE id = ?1",
                 params![plan_id.trim(), commit_id, now],
@@ -2514,6 +2515,69 @@ impl WorkspaceDatabase {
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after phase failure: {}", phase.plan_id),
+            })
+        })
+    }
+    pub fn block_plan_phase_merge(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        let now = now_timestamp();
+        let error_message = error_message.trim();
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND trigger = 'merge_auto'
+                   AND status IN ('queued', 'running')",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'implemented',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = COALESCE(completed_at, ?3),
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![phase.plan_id.as_str(), error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(&phase.plan_id).and_then(|plan| {
+            plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after merge block: {}", phase.plan_id),
             })
         })
     }

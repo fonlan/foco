@@ -21,6 +21,10 @@ use super::{
 };
 
 const AGENT_WORKTREE_ROOT_DIR: &str = "agent-worktrees";
+pub(super) const AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE: &str =
+    "does not match Agent worktree base revision";
+pub(super) const AGENT_WORKTREE_SHARED_DIRTY_MESSAGE: &str =
+    "cannot merge Agent worktree while shared workspace has uncommitted changes";
 
 #[derive(Clone, Debug)]
 pub(super) struct AgentWorktreeInfo {
@@ -653,9 +657,7 @@ pub(super) fn merge_agent_worktree(
         )));
     }
     if !status_entries_for_repo(workspace_path, &shared_repo)?.is_empty() {
-        return Err(ApiError::bad_request(
-            "cannot merge Agent worktree while shared workspace has uncommitted changes",
-        ));
+        return Err(ApiError::bad_request(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE));
     }
 
     let entries = status_entries_for_repo(&worktree_path, &worktree_repo)?;
@@ -704,6 +706,9 @@ pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
     let worktree_path = validate_agent_worktree_path(workspace_path, worktree_path)?;
     let shared_repo = open_repo(workspace_path)?;
     let worktree_repo = open_repo(&worktree_path)?;
+    if !status_entries_for_repo(workspace_path, &shared_repo)?.is_empty() {
+        return Err(ApiError::bad_request(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE));
+    }
     let shared_head = shared_repo
         .head_id()
         .map_err(|source| {
@@ -714,11 +719,6 @@ pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
         return Err(ApiError::bad_request(format!(
             "shared workspace HEAD '{shared_head}' does not match Agent worktree base revision '{base_revision}'"
         )));
-    }
-    if !status_entries_for_repo(workspace_path, &shared_repo)?.is_empty() {
-        return Err(ApiError::bad_request(
-            "cannot merge Agent worktree while shared workspace has uncommitted changes",
-        ));
     }
     if !status_entries_for_repo(&worktree_path, &worktree_repo)?.is_empty() {
         return Err(ApiError::bad_request(
