@@ -118,8 +118,18 @@ fn tool_results_affect_plans_requires_successful_plan_tool_result() {
         is_error: true,
         ..read_file_result.clone()
     };
+    let failed_delete_plan_result = ExecutedToolCall {
+        name: DELETE_PLAN_TOOL.to_string(),
+        is_error: true,
+        ..read_file_result.clone()
+    };
     let successful_update_plan_result = ExecutedToolCall {
         name: UPDATE_PLAN_TOOL.to_string(),
+        is_error: false,
+        ..read_file_result.clone()
+    };
+    let successful_delete_plan_result = ExecutedToolCall {
+        name: DELETE_PLAN_TOOL.to_string(),
         is_error: false,
         ..read_file_result.clone()
     };
@@ -127,7 +137,9 @@ fn tool_results_affect_plans_requires_successful_plan_tool_result() {
     assert!(!tool_results_affect_plans(&[]));
     assert!(!tool_results_affect_plans(&[read_file_result]));
     assert!(!tool_results_affect_plans(&[failed_create_plan_result]));
+    assert!(!tool_results_affect_plans(&[failed_delete_plan_result]));
     assert!(tool_results_affect_plans(&[successful_update_plan_result]));
+    assert!(tool_results_affect_plans(&[successful_delete_plan_result]));
 }
 
 fn test_provider_kind() -> foco_providers::ProviderKind {
@@ -11927,6 +11939,7 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
     assert!(tool_names.contains(GET_PLANS_TOOL));
     assert!(tool_names.contains(UPDATE_PLAN_TOOL));
     assert!(tool_names.contains(UPDATE_PLAN_STEP_TOOL));
+    assert!(tool_names.contains(DELETE_PLAN_TOOL));
     assert!(tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
     assert!(tool_names.contains(mcp_tool_name));
     assert!(!tool_names.contains(WRITE_FILE_TOOL));
@@ -11944,6 +11957,14 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
     assert!(plan_mode_prompt.ends_with("</agent_definition_prompt>"));
     assert!(plan_mode_prompt.contains("Plan Mode is for planning only, not implementation"));
     assert!(plan_mode_prompt.contains("call create_plan"));
+    assert!(plan_mode_prompt.contains("use delete_plan to remove it"));
+    assert!(plan_mode_prompt.contains("do not try to delete plans created by other chat sessions"));
+    assert!(plan_mode_prompt.contains("Do not update plan or step status fields"));
+    assert!(
+        plan_mode_prompt.contains(
+            "statuses are updated by execution start, run results, and explicit UI actions"
+        )
+    );
     assert!(plan_mode_prompt.contains("Do not send a final answer until the plan tool succeeds"));
     assert!(plan_mode_prompt.contains("ask_question"));
     assert!(plan_mode_prompt.contains("choose priorities, an approach, scope, or trade-offs"));
@@ -11966,6 +11987,11 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
         available_tools_message
             .content
             .contains(&format!(r#"<tool name="{CREATE_PLAN_TOOL}">"#))
+    );
+    assert!(
+        available_tools_message
+            .content
+            .contains(&format!(r#"<tool name="{DELETE_PLAN_TOOL}">"#))
     );
     assert!(
         available_tools_message
