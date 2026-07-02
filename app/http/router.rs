@@ -281,6 +281,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::plans::plans).post(crate::http::plans::create_plan),
         )
         .route(
+            "/api/workspaces/{workspace_id}/plans/order",
+            post(crate::http::plans::save_plan_order),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/plans/worktrees/audit",
             get(crate::http::plans::plan_worktree_audit),
         )

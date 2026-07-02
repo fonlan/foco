@@ -85,6 +85,12 @@ pub(crate) struct PlanPhaseRetryHttpRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PlanOrderRequest {
+    plan_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CleanupPlanWorktreeRequest {
     agent_instance_id: String,
     confirm: bool,
@@ -271,6 +277,36 @@ pub(crate) async fn plans(
         page_size,
         total_count: page_record.total_count,
         total_pages: total_pages(page_record.total_count, page_size),
+    }))
+}
+
+pub(crate) async fn save_plan_order(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<PlanOrderRequest>,
+) -> Result<Json<PlansResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .reorder_active_plans(&request.plan_ids)
+        .map_err(ApiError::from_workspace_error)?;
+    let page_record = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            limit: DEFAULT_ACTIVE_PLAN_LIMIT,
+            offset: 0,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    Ok(Json(PlansResponse {
+        plans: page_record.plans.into_iter().map(plan_summary).collect(),
+        page: 1,
+        page_size: DEFAULT_ACTIVE_PLAN_LIMIT,
+        total_count: page_record.total_count,
+        total_pages: total_pages(page_record.total_count, DEFAULT_ACTIVE_PLAN_LIMIT),
     }))
 }
 

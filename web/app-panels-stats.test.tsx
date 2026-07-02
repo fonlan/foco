@@ -2,6 +2,8 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { Plan } from "./api/types";
+
 import {
   PLAN_AUTO_RUN_ENABLED_STORAGE_KEY,
   planAutoRunEnabledStorageKey,
@@ -1519,6 +1521,127 @@ describe("app-panels-stats verification surfaces", () => {
       { action: { action: "start" }, planId: "plan-3" },
     ]);
   }, 30000);
+
+  it("reorders active plans and auto-runs the new first plan", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-02T11:00:00Z";
+    const makePlan = (id: string, title: string, sortOrder: number) => ({
+      ...planFixture,
+      activePhaseId: null,
+      id,
+      overview: `${title} overview`,
+      phases: planFixture.phases.map((phase) => ({
+        ...phase,
+        id: `${id}-phase-1`,
+        planId: id,
+        steps: phase.steps.map((step) => ({
+          ...step,
+          id: `${id}-step-1`,
+          phaseId: `${id}-phase-1`,
+          planId: id,
+          title: `${title} step`,
+        })),
+        title: `${title} phase`,
+      })),
+      sortOrder,
+      status: "ready" as const,
+      title,
+      updatedAt: timestamp,
+    });
+    const firstPlan = makePlan("plan-1", "First queue plan", 0);
+    const secondPlan = makePlan("plan-2", "Second queue plan", 1);
+    let plans: Plan[] = [firstPlan, secondPlan];
+    const orderRequests: Array<{ planIds: string[] }> = [];
+    const actionCalls: Array<{ action?: string; planId: string }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans/order") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { planIds: string[] };
+        orderRequests.push(body);
+        plans = body.planIds.map((planId, index) => ({
+          ...(plans.find((plan) => plan.id === planId) ?? firstPlan),
+          sortOrder: index,
+        }));
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans,
+          totalCount: plans.length,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans,
+          totalCount: plans.length,
+          totalPages: 1,
+        });
+      }
+
+      const actionMatch = path.match(
+        /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
+      );
+      if (actionMatch) {
+        const planId = decodeURIComponent(actionMatch[1] ?? "");
+        const body = JSON.parse(String(init?.body ?? "{}")) as { action?: string };
+        actionCalls.push({ action: body.action, planId });
+        plans = plans.map((plan) =>
+          plan.id === planId ? { ...plan, activePhaseId: `${plan.id}-phase-1`, status: "running" as const } : plan,
+        );
+        const plan = plans.find((candidate) => candidate.id === planId) ?? secondPlan;
+        return jsonResponse({ plan });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    const firstTitle = await screen.findByText("First queue plan");
+    const secondTitle = await screen.findByText("Second queue plan");
+    expect(firstTitle.compareDocumentPosition(secondTitle)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+    const dragData = {
+      dropEffect: "move",
+      effectAllowed: "move",
+      getData: vi.fn(() => "plan-2"),
+      setData: vi.fn(),
+    };
+    const reorderHandles = screen.getAllByRole("button", { name: "Reorder plan" });
+    const firstArticle = firstTitle.closest("article");
+    if (!firstArticle) {
+      throw new Error("Expected first plan article");
+    }
+    fireEvent.dragStart(reorderHandles[1], { dataTransfer: dragData });
+    fireEvent.dragOver(firstArticle, { dataTransfer: dragData });
+    fireEvent.drop(firstArticle, { dataTransfer: dragData });
+    fireEvent.dragEnd(reorderHandles[1], { dataTransfer: dragData });
+
+    await waitFor(() => {
+      expect(orderRequests).toEqual([{ planIds: ["plan-2", "plan-1"] }]);
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Second queue plan").compareDocumentPosition(
+        screen.getByText("First queue plan"),
+      )).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+
+    await user.click(await screen.findByRole("checkbox", { name: /Auto run plans/ }));
+    await waitFor(() => {
+      expect(actionCalls).toEqual([{ action: "start", planId: "plan-2" }]);
+    });
+  });
 
   it("shows retry merge for dirty merge blocked plans and refreshes after retry", async () => {
     const user = userEvent.setup();

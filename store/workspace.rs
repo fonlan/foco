@@ -1358,6 +1358,92 @@ impl WorkspaceDatabase {
         Ok(PlanListPage { plans, total_count })
     }
 
+    pub fn reorder_active_plans(
+        &mut self,
+        plan_ids: &[String],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let requested_plan_ids = plan_ids.iter().map(|id| id.trim()).collect::<Vec<_>>();
+        if requested_plan_ids.iter().any(|id| id.is_empty()) {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "plan order contains empty plan id".to_string(),
+            });
+        }
+        let mut seen_plan_ids = HashSet::new();
+        for plan_id in &requested_plan_ids {
+            if !seen_plan_ids.insert(*plan_id) {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan order contains duplicate id: {plan_id}"),
+                });
+            }
+        }
+
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let active_plans = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, status, sort_order
+                     FROM plans
+                     WHERE status <> 'completed'
+                     ORDER BY sort_order ASC, created_at ASC, id ASC",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            collect_rows(rows, &database_path)?
+        };
+        let reorderable_plans = active_plans
+            .iter()
+            .filter(|(_, status, _)| is_reorderable_plan_status(status))
+            .collect::<Vec<_>>();
+        let reorderable_ids = reorderable_plans
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>();
+        let reorderable_id_set = reorderable_ids.iter().copied().collect::<HashSet<_>>();
+
+        if requested_plan_ids.len() != reorderable_ids.len() {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan order must contain exactly {} reorderable active plan ids",
+                    reorderable_ids.len()
+                ),
+            });
+        }
+        if let Some(plan_id) = requested_plan_ids
+            .iter()
+            .find(|plan_id| !reorderable_id_set.contains(**plan_id))
+        {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan is not reorderable in the active queue: {plan_id}"),
+            });
+        }
+
+        // ponytail: only the current active queue is reorderable; use a paged/cursor API if this list grows beyond the side panel queue.
+        for (plan_id, (_, _, sort_order)) in requested_plan_ids.iter().zip(reorderable_plans.iter())
+        {
+            transaction
+                .execute(
+                    "UPDATE plans SET sort_order = ?2 WHERE id = ?1",
+                    params![plan_id, sort_order],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
+    }
+
     pub fn plan_worktree_audit(
         &self,
     ) -> Result<Vec<PlanWorktreeAuditRecord>, WorkspaceDatabaseError> {
@@ -10391,6 +10477,10 @@ fn validate_plan_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
             message: format!("unknown plan status: {status}"),
         })
     }
+}
+
+fn is_reorderable_plan_status(status: &str) -> bool {
+    matches!(status, "draft" | "ready" | "paused" | "failed")
 }
 
 fn validate_plan_step_status(status: &str) -> Result<(), WorkspaceDatabaseError> {

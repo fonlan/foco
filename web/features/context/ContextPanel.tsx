@@ -13,6 +13,7 @@ import {
   FileText,
   Folder,
   GitCompare,
+  GripVertical,
   ListChecks,
   LoaderCircle,
   MessageSquare,
@@ -36,6 +37,7 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  type DragEvent,
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
@@ -78,6 +80,7 @@ import { MarkdownContent, type SelectedSkillPrefixResolver } from "../chat/Markd
 import { diffLineClass, parseGitDiffSections, type GitDiffSection } from "../git/diff-parser";
 import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
+import { moveItemId, sameStringList } from "../workspaces/workspace-helpers";
 
 export type ContextPanelTab = "todo" | "plan" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
 
@@ -142,6 +145,7 @@ const ContextPanel = memo(function ContextPanel({
   onMemoryPageChange,
   onPlanAction,
   onPlanAutoRunToggle,
+  onPlanOrderChange,
   onPlanPhaseRetry,
   onOpenPlanPhaseChat,
   onPlanPhaseRetryWithOverride,
@@ -214,6 +218,7 @@ const ContextPanel = memo(function ContextPanel({
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onPlanAction: (planId: string, action: PlanAction) => void;
   onPlanAutoRunToggle: (enabled: boolean) => void;
+  onPlanOrderChange: (planIds: string[]) => void;
   onPlanPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -315,6 +320,7 @@ const ContextPanel = memo(function ContextPanel({
             onDeletePlan={onDeletePlan}
             onLoadWorktreeAudit={onLoadPlanWorktreeAudit}
             onOpenPhaseChat={onOpenPlanPhaseChat}
+            onOrderChange={onPlanOrderChange}
             onPhaseRetry={onPlanPhaseRetry}
             onPhaseRetryWithOverride={onPlanPhaseRetryWithOverride}
             operationKey={planOperationKey}
@@ -689,6 +695,7 @@ function ContextPlanTab({
   onDeletePlan,
   onLoadWorktreeAudit,
   onOpenPhaseChat,
+  onOrderChange,
   onPhaseRetry,
   onPhaseRetryWithOverride,
   operationKey,
@@ -708,6 +715,7 @@ function ContextPlanTab({
   onDeletePlan: (planId: string) => void;
   onLoadWorktreeAudit: () => Promise<PlanWorktreeAuditResponse>;
   onOpenPhaseChat: (chatId: string) => void;
+  onOrderChange: (planIds: string[]) => void;
   onPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -744,6 +752,79 @@ function ContextPlanTab({
   const runningPlanArticleRef = useRef<HTMLElement | null>(null);
   const planListPanelRef = useRef<HTMLDivElement | null>(null);
   const lastScrolledRunningPlanId = useRef<string | null>(null);
+  const [draggedPlanId, setDraggedPlanId] = useState<string | null>(null);
+  const [planOrderPreview, setPlanOrderPreview] = useState<string[] | null>(null);
+  const planOrderPreviewRef = useRef<string[] | null>(null);
+  const planOrderDropHandledRef = useRef(false);
+  const orderedPlans = useMemo(
+    () => (planOrderPreview ? reorderPlansByIds(plans, planOrderPreview) : plans),
+    [planOrderPreview, plans],
+  );
+
+  const clearPlanOrderDrag = () => {
+    setDraggedPlanId(null);
+    setPlanOrderPreview(null);
+    planOrderPreviewRef.current = null;
+    planOrderDropHandledRef.current = false;
+  };
+
+  const commitPlanOrderPreview = () => {
+    const previewIds = planOrderPreviewRef.current;
+    if (!previewIds) {
+      clearPlanOrderDrag();
+      return;
+    }
+    if (!sameStringList(previewIds, reorderablePlanIds(plans))) {
+      onOrderChange(previewIds);
+    }
+    clearPlanOrderDrag();
+  };
+
+  const handlePlanDragStart = (event: DragEvent<HTMLButtonElement>, plan: Plan) => {
+    if (!isPlanReorderable(plan)) {
+      return;
+    }
+    const planIds = reorderablePlanIds(plans);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", plan.id);
+    setDraggedPlanId(plan.id);
+    setPlanOrderPreview(planIds);
+    planOrderPreviewRef.current = planIds;
+    planOrderDropHandledRef.current = false;
+  };
+
+  const handlePlanDragOver = (event: DragEvent<HTMLElement>, targetPlan: Plan) => {
+    const sourcePlanId = draggedPlanId;
+    if (!sourcePlanId || !isPlanReorderable(targetPlan)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const currentPlanIds = planOrderPreviewRef.current ?? reorderablePlanIds(plans);
+    const nextPlanIds = moveItemId(currentPlanIds, sourcePlanId, targetPlan.id);
+    if (sameStringList(nextPlanIds, currentPlanIds)) {
+      return;
+    }
+    planOrderPreviewRef.current = nextPlanIds;
+    setPlanOrderPreview(nextPlanIds);
+  };
+
+  const handlePlanDrop = (event: DragEvent<HTMLElement>, targetPlan: Plan) => {
+    if (!draggedPlanId || !isPlanReorderable(targetPlan)) {
+      return;
+    }
+    event.preventDefault();
+    planOrderDropHandledRef.current = true;
+    commitPlanOrderPreview();
+  };
+
+  const handlePlanDragEnd = () => {
+    if (!planOrderDropHandledRef.current) {
+      commitPlanOrderPreview();
+      return;
+    }
+    clearPlanOrderDrag();
+  };
 
   useEffect(() => {
     if (showWorktreeAudit || !runningPlanId) {
@@ -918,7 +999,7 @@ function ContextPlanTab({
 
         {plans.length > 0 ? (
           <div className="space-y-3">
-            {plans.map((plan) => {
+            {orderedPlans.map((plan) => {
               const totalSteps = plan.phases.reduce(
                 (count, phase) => count + phase.steps.length,
                 0,
@@ -934,11 +1015,14 @@ function ContextPlanTab({
               const canRetryMerge = planNeedsMergeRetry(plan);
               const retryMergeKey = planRetryMergeOperationKey(plan.id);
               const isRetryingMerge = operationKey === retryMergeKey;
+              const canReorderPlan = isPlanReorderable(plan);
 
               return (
                 <article
-                  className="context-memory-item"
+                  className={`context-memory-item ${draggedPlanId === plan.id ? "opacity-60" : ""}`}
                   key={plan.id}
+                  onDragOver={canReorderPlan ? (event) => handlePlanDragOver(event, plan) : undefined}
+                  onDrop={canReorderPlan ? (event) => handlePlanDrop(event, plan) : undefined}
                   ref={plan.id === runningPlanId ? runningPlanArticleRef : undefined}
                 >
                   <div className="context-memory-item-header">
@@ -976,6 +1060,19 @@ function ContextPlanTab({
                       ) : null}
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
+                      {canReorderPlan ? (
+                        <button
+                          aria-label={t("Reorder plan")}
+                          className="inline-flex size-8 shrink-0 cursor-grab items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 active:cursor-grabbing disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          draggable
+                          onDragEnd={handlePlanDragEnd}
+                          onDragStart={(event) => handlePlanDragStart(event, plan)}
+                          title={t("Reorder plan")}
+                          type="button"
+                        >
+                          <GripVertical aria-hidden="true" className="size-3.5" />
+                        </button>
+                      ) : null}
                       {action ? (
                         <button
                           aria-label={t(planActionLabel(action))}
@@ -2952,6 +3049,30 @@ function primaryPlanAction(status: PlanStatus): PlanAction | null {
 
 function isRetryablePlanPhase(phase: PlanPhase) {
   return phase.status === "failed";
+}
+
+function isPlanReorderable(plan: Plan) {
+  return plan.status === "draft" || plan.status === "ready" || plan.status === "paused" || plan.status === "failed";
+}
+
+function reorderablePlanIds(plans: Plan[]) {
+  return plans.filter(isPlanReorderable).map((plan) => plan.id);
+}
+
+function reorderPlansByIds(plans: Plan[], planIds: string[]) {
+  const reorderablePlans = plans.filter(isPlanReorderable);
+  if (reorderablePlans.length !== planIds.length) {
+    return plans;
+  }
+  const plansById = new Map(reorderablePlans.map((plan) => [plan.id, plan]));
+  const nextReorderablePlans = planIds
+    .map((planId) => plansById.get(planId))
+    .filter((plan): plan is Plan => Boolean(plan));
+  if (nextReorderablePlans.length !== reorderablePlans.length) {
+    return plans;
+  }
+  let nextIndex = 0;
+  return plans.map((plan) => (isPlanReorderable(plan) ? nextReorderablePlans[nextIndex++] ?? plan : plan));
 }
 
 function planPhaseRetryOperationKey(planId: string, phaseId: string) {

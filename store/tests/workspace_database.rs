@@ -411,6 +411,104 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
 }
 
 #[test]
+fn reorder_active_plans_updates_only_reorderable_slots() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    create_minimal_plan(&mut database, "plan-ready-1", "ready");
+    create_minimal_plan(&mut database, "plan-running", "ready");
+    create_minimal_plan(&mut database, "plan-ready-2", "ready");
+    create_minimal_plan(&mut database, "plan-implemented", "ready");
+    database
+        .transition_plan("plan-running", "start")
+        .expect("start running plan");
+    database
+        .update_plan_step(
+            "plan-implemented",
+            "plan-implemented-step",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("implement plan");
+
+    database
+        .reorder_active_plans(&["plan-ready-2".to_string(), "plan-ready-1".to_string()])
+        .expect("reorder active plans");
+
+    let active = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            limit: 20,
+            offset: 0,
+        })
+        .expect("active plans");
+    let plan_order = active
+        .plans
+        .iter()
+        .map(|plan| plan.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plan_order,
+        vec![
+            "plan-ready-2",
+            "plan-running",
+            "plan-ready-1",
+            "plan-implemented"
+        ]
+    );
+
+    let duplicate_error = database
+        .reorder_active_plans(&["plan-ready-2".to_string(), "plan-ready-2".to_string()])
+        .expect_err("duplicate id should fail");
+    assert!(duplicate_error.to_string().contains("duplicate id"));
+
+    let missing_error = database
+        .reorder_active_plans(&["plan-ready-2".to_string()])
+        .expect_err("missing id should fail");
+    assert!(
+        missing_error
+            .to_string()
+            .contains("exactly 2 reorderable active plan ids")
+    );
+
+    let running_error = database
+        .reorder_active_plans(&["plan-running".to_string(), "plan-ready-1".to_string()])
+        .expect_err("running plan should fail");
+    assert!(running_error.to_string().contains("not reorderable"));
+}
+
+fn create_minimal_plan(database: &mut WorkspaceDatabase, id: &str, status: &str) {
+    let phase_id = format!("{id}-phase");
+    let step_id = format!("{id}-step");
+    database
+        .create_plan(NewPlan {
+            id,
+            title: id,
+            overview: "Minimal plan for ordering tests.",
+            status,
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: phase_id.as_str(),
+                title: "Phase one",
+                summary: "Single phase.",
+                steps: vec![NewPlanStep {
+                    id: step_id.as_str(),
+                    title: "Step one",
+                    detail: "Single step.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create minimal plan");
+}
+
+#[test]
 fn create_plan_reports_duplicate_step_id_before_sqlite_constraint() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

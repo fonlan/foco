@@ -333,6 +333,30 @@ export function nextAutoRunnablePlan(
   return null;
 }
 
+function isPlanOrderReorderable(plan: Plan) {
+  return plan.status === "draft" || plan.status === "ready" || plan.status === "paused" || plan.status === "failed";
+}
+
+function activePlanOrderIds(plans: Plan[]) {
+  return plans.filter(isPlanOrderReorderable).map((plan) => plan.id);
+}
+
+function reorderActivePlansByIds(plans: Plan[], planIds: string[]) {
+  const reorderablePlans = plans.filter(isPlanOrderReorderable);
+  if (reorderablePlans.length !== planIds.length) {
+    return plans;
+  }
+  const plansById = new Map(reorderablePlans.map((plan) => [plan.id, plan]));
+  const nextReorderablePlans = planIds
+    .map((planId) => plansById.get(planId))
+    .filter((plan): plan is Plan => Boolean(plan));
+  if (nextReorderablePlans.length !== reorderablePlans.length) {
+    return plans;
+  }
+  let nextIndex = 0;
+  return plans.map((plan) => (isPlanOrderReorderable(plan) ? nextReorderablePlans[nextIndex++] ?? plan : plan));
+}
+
 export function trimInactiveChatMessageCaches(
   current: Record<string, ShellMessage[]>,
   accessOrder: string[],
@@ -1739,6 +1763,36 @@ export function App() {
       setIsLoadingActivePlans(false);
     }
   }, []);
+
+  const savePlanOrder = useCallback(
+    async (workspaceId: string, planIds: string[], previousPlans: Plan[]) => {
+      if (sameStringList(planIds, activePlanOrderIds(previousPlans))) {
+        return;
+      }
+      setActivePlans(reorderActivePlansByIds(previousPlans, planIds));
+      setActivePlansError(null);
+
+      try {
+        const response = await requestJson<PlansResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/order`,
+          {
+            body: JSON.stringify({ planIds }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+          return;
+        }
+        setActivePlans(response.plans);
+        setHasLoadedActivePlans(true);
+      } catch (requestError) {
+        setActivePlans(previousPlans);
+        setActivePlansError(errorMessage(requestError));
+      }
+    },
+    [],
+  );
 
   const handlePlanRefresh = useCallback(
     (event: Extract<ChatStreamEvent, { type: "planRefresh" }>) => {
@@ -9640,6 +9694,12 @@ export function App() {
                 onSelectDiffFile={setSelectedDiffPath}
                 onTabChange={handleContextPanelTabChange}
                 onPlanAutoRunToggle={setIsPlanAutoRunEnabled}
+                onPlanOrderChange={(planIds) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    void savePlanOrder(workspaceId, planIds, activePlans);
+                  }
+                }}
                 selectedPath={selectedDiffPath}
                 selectedSkillPrefix={selectedSkillPrefix}
                 setMobileHeight={setContextPanelMobileHeight}
