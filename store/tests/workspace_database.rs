@@ -3364,11 +3364,121 @@ fn repository_helpers_reject_invalid_todo_graph_dependencies() {
 }
 
 #[test]
-fn repository_helpers_round_trip_core_records() {
+fn chat_page_uses_cursor_search_and_scoped_code_change_stats() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
 
+    for (id, title, created_at) in [
+        ("chat-1", "Alpha setup", "2026-07-03T10:00:00.000Z"),
+        ("chat-2", "beta Plan", "2026-07-03T11:00:00.000Z"),
+        ("chat-3", "ALPHA followup", "2026-07-03T12:00:00.000Z"),
+        ("chat-4", "Gamma", "2026-07-03T13:00:00.000Z"),
+    ] {
+        database.insert_chat(id, title).expect("chat insert");
+        Connection::open(database.database_path())
+            .expect("open database")
+            .execute(
+                "UPDATE chats SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+                params![id, created_at],
+            )
+            .expect("timestamp update");
+    }
+
+    database
+        .insert_chat_with_metadata(
+            "chat-dream",
+            "Alpha dream",
+            &format!(r#"{{"kind":"{MEMORY_DREAM_TRANSCRIPT_CHAT_KIND}"}}"#),
+        )
+        .expect("dream insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-3",
+            role: "assistant",
+            content: "Done",
+            sequence: 0,
+            metadata_json: Some(r#"{"codeChangeStats":{"additions":4,"deletions":1}}"#),
+        })
+        .expect("message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-2",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Done",
+            sequence: 0,
+            metadata_json: Some(r#"{"codeChangeStats":{"additions":2,"deletions":3}}"#),
+        })
+        .expect("message insert");
+
+    for (id, created_at) in [
+        ("chat-1", "2026-07-03T10:00:00.000Z"),
+        ("chat-2", "2026-07-03T11:00:00.000Z"),
+        ("chat-3", "2026-07-03T12:00:00.000Z"),
+        ("chat-4", "2026-07-03T13:00:00.000Z"),
+    ] {
+        Connection::open(database.database_path())
+            .expect("open database")
+            .execute(
+                "UPDATE chats SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+                params![id, created_at],
+            )
+            .expect("timestamp update");
+    }
+
+    let first_page = database.chat_page(2, None).expect("first page");
+    assert_eq!(first_page.total_count, 4);
+    assert_eq!(
+        first_page
+            .chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chat-4", "chat-3"]
+    );
+    assert!(first_page.has_more);
+
+    let second_page = database
+        .chat_page(2, first_page.next_cursor.as_ref())
+        .expect("second page");
+    assert_eq!(
+        second_page
+            .chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chat-2", "chat-1"]
+    );
+    assert!(!second_page.has_more);
+
+    let search_page = database
+        .search_chats("alpha", 10, None)
+        .expect("search page");
+    assert_eq!(search_page.total_count, 2);
+    assert_eq!(
+        search_page
+            .chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chat-3", "chat-1"]
+    );
+
+    let stats = database
+        .code_change_stats_for_chats(&["chat-3".to_string()])
+        .expect("stats");
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats["chat-3"].additions, 4);
+    assert_eq!(stats["chat-3"].deletions, 1);
+}
+
+#[test]
+fn repository_helpers_round_trip_core_records() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
     database
         .set_workspace_metadata("active_chat", "chat-1")
         .expect("metadata write");

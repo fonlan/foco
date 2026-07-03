@@ -828,6 +828,13 @@ export type WorkspaceCommonCommandSummary = {
   command: string;
 };
 
+export type WorkspaceChatPagination = {
+  total: number;
+  limit: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+};
+
 export type WorkspaceSummary = {
   id: string;
   name: string;
@@ -837,6 +844,7 @@ export type WorkspaceSummary = {
   terminalShell: string;
   commonCommands: WorkspaceCommonCommandSummary[];
   chats: ChatSummary[];
+  chatPagination: WorkspaceChatPagination;
 };
 
 export type WorkspaceChatListItem = ChatSummary & {
@@ -851,6 +859,10 @@ export type WorkspacesResponse = {
 };
 
 export type WorkspaceChatSearchResponse = WorkspacesResponse;
+
+export type WorkspaceChatsResponse = WorkspaceChatPagination & {
+  chats: ChatSummary[];
+};
 
 export type ConfiguredWorkspaceSummary = {
   id: string;

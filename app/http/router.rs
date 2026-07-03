@@ -40,6 +40,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::workspaces::save_workspace_order),
         )
         .route(
+            "/api/workspaces/{workspace_id}/chats",
+            get(crate::http::workspaces::workspace_chats),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/files",
             get(crate::http::workspaces::workspace_files),
         )

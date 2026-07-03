@@ -11,11 +11,13 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use foco_store::workspace::WorkspaceDatabase;
+use base64::{Engine as _, engine::general_purpose};
+use foco_store::workspace::{ChatPage, ChatPageCursor, WorkspaceDatabase};
 use foco_tools::set_ripgrep_path;
 
 use crate::http::settings::SettingsResponse;
 use crate::runtime::download_and_install_ripgrep;
+use crate::settings_runtime::{WORKSPACE_CHAT_PAGE_LIMIT, encode_workspace_chat_cursor};
 use crate::*;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +65,21 @@ pub(crate) struct WorkspaceOrderRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceChatSearchQuery {
     query: String,
+    #[serde(default = "default_workspace_chat_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceChatsQuery {
+    #[serde(default = "default_workspace_chats_limit")]
+    limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    include_chat_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +112,16 @@ pub(crate) struct SaveWorkspaceFileRequest {
 pub(crate) struct RenameWorkspaceFileRequest {
     path: String,
     new_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceChatsResponse {
+    chats: Vec<ChatSummary>,
+    total: usize,
+    limit: usize,
+    has_more: bool,
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -394,12 +421,47 @@ pub(crate) async fn workspaces(
     Ok(response)
 }
 
+pub(crate) async fn workspace_chats(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<WorkspaceChatsQuery>,
+) -> Result<Json<WorkspaceChatsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let cursor = decode_workspace_chat_cursor(query.cursor.as_deref())?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let mut page = database
+        .chat_page(
+            normalize_workspace_chats_limit(query.limit),
+            cursor.as_ref(),
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    if let Some(include_chat_id) = query.include_chat_id.as_deref() {
+        if !page.chats.iter().any(|chat| chat.id == include_chat_id) {
+            if let Some(chat) = database
+                .chat(include_chat_id)
+                .map_err(ApiError::from_workspace_error)?
+            {
+                page.chats.push(chat);
+            }
+        }
+    }
+    workspace_chats_response(
+        &workspace_id,
+        &mut database,
+        page,
+        normalize_workspace_chats_limit(query.limit),
+        &state.active_chat_runs,
+    )
+}
+
 pub(crate) async fn search_workspace_chats(
     State(state): State<AppState>,
     Query(query): Query<WorkspaceChatSearchQuery>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
-    let needle = query.query.trim().to_lowercase();
+    let needle = query.query.trim();
 
     if needle.is_empty() {
         return Ok(Json(WorkspacesResponse {
@@ -408,38 +470,29 @@ pub(crate) async fn search_workspace_chats(
         }));
     }
 
+    let cursor = decode_workspace_chat_cursor(query.cursor.as_deref())?;
+    let limit = normalize_workspace_chats_limit(query.limit);
     let mut workspaces = Vec::new();
 
     for workspace in &config.workspaces {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
-        let matched_chats = database
-            .chats()
-            .map_err(ApiError::from_workspace_error)?
-            .into_iter()
-            .filter(|chat| chat.title.to_lowercase().contains(&needle))
-            .collect::<Vec<_>>();
+        let page = database
+            .search_chats(needle, limit, cursor.as_ref())
+            .map_err(ApiError::from_workspace_error)?;
 
-        if matched_chats.is_empty() {
+        if page.chats.is_empty() {
             continue;
         }
 
-        let code_change_stats_by_chat = database
-            .chat_code_change_stats()
-            .map_err(ApiError::from_workspace_error)?;
-        let chats = matched_chats
-            .into_iter()
-            .map(|chat| {
-                let active_run = state
-                    .active_chat_runs
-                    .active_run_for_chat(&workspace.id, &chat.id)?;
-                let code_change_stats = code_change_stats_by_chat
-                    .get(&chat.id)
-                    .cloned()
-                    .unwrap_or_default();
-                chat_summary(&mut database, chat, code_change_stats, active_run)
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
+        let response = workspace_chats_response(
+            &workspace.id,
+            &mut database,
+            page,
+            limit,
+            &state.active_chat_runs,
+        )?;
+        let response = response.0;
 
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
@@ -451,7 +504,13 @@ pub(crate) async fn search_workspace_chats(
             common_commands: settings_runtime::workspace_common_command_summaries(
                 &workspace.common_commands,
             ),
-            chats,
+            chats: response.chats,
+            chat_pagination: WorkspaceChatPagination {
+                total: response.total,
+                limit: response.limit,
+                has_more: response.has_more,
+                next_cursor: response.next_cursor,
+            },
         });
     }
 
@@ -459,6 +518,70 @@ pub(crate) async fn search_workspace_chats(
         active_workspace_id: config.app.active_workspace_id,
         workspaces,
     }))
+}
+
+fn workspace_chats_response(
+    workspace_id: &str,
+    database: &mut WorkspaceDatabase,
+    page: ChatPage,
+    limit: usize,
+    active_chat_runs: &ActiveChatRunRegistry,
+) -> Result<Json<WorkspaceChatsResponse>, ApiError> {
+    let chat_ids = page
+        .chats
+        .iter()
+        .map(|chat| chat.id.clone())
+        .collect::<Vec<_>>();
+    let code_change_stats_by_chat = database
+        .code_change_stats_for_chats(&chat_ids)
+        .map_err(ApiError::from_workspace_error)?;
+    let chats = page
+        .chats
+        .into_iter()
+        .map(|chat| {
+            let active_run = active_chat_runs.active_run_for_chat(workspace_id, &chat.id)?;
+            let code_change_stats = code_change_stats_by_chat
+                .get(&chat.id)
+                .cloned()
+                .unwrap_or_default();
+            chat_summary(database, chat, code_change_stats, active_run)
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(Json(WorkspaceChatsResponse {
+        chats,
+        total: page.total_count,
+        limit,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor.map(encode_workspace_chat_cursor),
+    }))
+}
+
+fn normalize_workspace_chats_limit(limit: usize) -> usize {
+    limit.clamp(1, 100)
+}
+
+fn default_workspace_chats_limit() -> usize {
+    WORKSPACE_CHAT_PAGE_LIMIT
+}
+
+fn default_workspace_chat_search_limit() -> usize {
+    WORKSPACE_CHAT_PAGE_LIMIT
+}
+
+fn decode_workspace_chat_cursor(cursor: Option<&str>) -> Result<Option<ChatPageCursor>, ApiError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .map_err(|source| {
+            ApiError::bad_request(format!("workspace chat cursor is invalid: {source}"))
+        })?;
+    let cursor = serde_json::from_slice::<ChatPageCursor>(&bytes).map_err(|source| {
+        ApiError::bad_request(format!("workspace chat cursor is invalid JSON: {source}"))
+    })?;
+    Ok(Some(cursor))
 }
 
 pub(crate) async fn add_workspace(

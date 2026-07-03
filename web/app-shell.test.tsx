@@ -1506,7 +1506,7 @@ describe("app-shell verification surfaces", () => {
     expect(await screen.findByText("Side note")).toBeInTheDocument();
   });
 
-  it("shows only the first 5 workspace chats until the menu item expands more", async () => {
+  it("loads additional workspace chats from the server when expanding more", async () => {
     renderApp();
 
     expect(await screen.findByText("Older chat 3")).toBeInTheDocument();
@@ -1515,6 +1515,16 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(
       screen.getByRole("button", { name: "Show 5 more chats in Default" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(([input]) =>
+            String(input).includes("/api/workspaces/workspace-1/chats?"),
+          ),
+      ).toBe(true),
     );
 
     expect(screen.getByText("Older chat 4")).toBeInTheDocument();
@@ -1529,9 +1539,8 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(defaultToggle);
     expect(defaultToggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText("Older chat 3")).toBeInTheDocument();
-    expect(screen.queryByText("Older chat 4")).not.toBeInTheDocument();
-    expect(screen.getByText("7 hidden chats")).toBeInTheDocument();
+    expect(screen.getByText("Older chat 4")).toBeInTheDocument();
+    expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {

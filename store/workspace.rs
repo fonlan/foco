@@ -32,39 +32,39 @@ mod workspace_schema;
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
-    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatRecord, ChatSpecSnapshotRecord,
-    CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphReferenceRecord,
-    CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
-    ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
-    LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
-    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRollupFilters, MessageRecord,
-    MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
-    NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
-    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
-    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection,
-    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunStateRecord,
-    PlanListFilter, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
-    RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord,
-    ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
+    ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord,
+    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
+    CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
+    LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+    LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
+    LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRollupFilters,
+    MessageRecord, MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot,
+    NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
+    NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
+    NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun,
+    NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
+    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListPage, PlanPatch,
+    PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, Migration,
+    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, MIGRATION_026, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 25;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 26;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -221,6 +221,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 25,
         sql: MIGRATION_025,
+    },
+    Migration {
+        version: 26,
+        sql: MIGRATION_026,
     },
 ];
 
@@ -3299,8 +3303,162 @@ impl WorkspaceDatabase {
         self.chats_matching_kind(None)
     }
 
+    pub fn chat_count(&self) -> Result<usize, WorkspaceDatabaseError> {
+        self.chat_count_matching_title(None)
+    }
+
+    pub fn chat_page(
+        &self,
+        limit: usize,
+        cursor: Option<&ChatPageCursor>,
+    ) -> Result<ChatPage, WorkspaceDatabaseError> {
+        self.chat_page_matching_title(None, limit, cursor)
+    }
+
+    pub fn search_chats(
+        &self,
+        query: &str,
+        limit: usize,
+        cursor: Option<&ChatPageCursor>,
+    ) -> Result<ChatPage, WorkspaceDatabaseError> {
+        self.chat_page_matching_title(Some(query), limit, cursor)
+    }
+
     pub fn dream_transcript_chats(&self) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
         self.chats_matching_kind(Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND))
+    }
+
+    fn chat_page_matching_title(
+        &self,
+        title_query: Option<&str>,
+        limit: usize,
+        cursor: Option<&ChatPageCursor>,
+    ) -> Result<ChatPage, WorkspaceDatabaseError> {
+        let limit = limit.max(1);
+        let total_count = self.chat_count_matching_title(title_query)?;
+        let mut sql = String::from(
+            "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+             FROM chats
+             WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'",
+        );
+        let mut query_params = Vec::new();
+
+        if let Some(query) = title_query {
+            sql.push_str(" AND title LIKE ? ESCAPE '\\' COLLATE NOCASE");
+            query_params.push(SqlValue::Text(like_contains_pattern(query)));
+        }
+
+        if let Some(cursor) = cursor {
+            sql.push_str(
+                " AND (
+                    updated_at < ?
+                    OR (updated_at = ? AND created_at < ?)
+                    OR (updated_at = ? AND created_at = ? AND id < ?)
+                 )",
+            );
+            query_params.push(SqlValue::Text(cursor.updated_at.clone()));
+            query_params.push(SqlValue::Text(cursor.updated_at.clone()));
+            query_params.push(SqlValue::Text(cursor.created_at.clone()));
+            query_params.push(SqlValue::Text(cursor.updated_at.clone()));
+            query_params.push(SqlValue::Text(cursor.created_at.clone()));
+            query_params.push(SqlValue::Text(cursor.id.clone()));
+        }
+
+        sql.push_str(" ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?");
+        query_params.push(SqlValue::Integer((limit + 1) as i64));
+
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), chat_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut chats = collect_rows(rows, &self.database_path)?;
+        let has_more = chats.len() > limit;
+        if has_more {
+            chats.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            chats.last().map(|chat| ChatPageCursor {
+                updated_at: chat.updated_at.clone(),
+                created_at: chat.created_at.clone(),
+                id: chat.id.clone(),
+            })
+        } else {
+            None
+        };
+
+        Ok(ChatPage {
+            chats,
+            total_count,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    fn chat_count_matching_title(
+        &self,
+        title_query: Option<&str>,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let mut sql = String::from(
+            "SELECT COUNT(*)
+             FROM chats
+             WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'",
+        );
+        let mut query_params = Vec::new();
+
+        if let Some(query) = title_query {
+            sql.push_str(" AND title LIKE ? ESCAPE '\\' COLLATE NOCASE");
+            query_params.push(SqlValue::Text(like_contains_pattern(query)));
+        }
+
+        let count = self
+            .connection
+            .query_row(&sql, params_from_iter(query_params), |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        usize::try_from(count).map_err(|_| WorkspaceDatabaseError::InvalidMessageMetadata {
+            message: "chat count is too large".to_string(),
+        })
+    }
+
+    pub fn code_change_stats_for_chats(
+        &self,
+        chat_ids: &[String],
+    ) -> Result<HashMap<String, CodeChangeStats>, WorkspaceDatabaseError> {
+        if chat_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = (1..=chat_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT chat_id, metadata_json
+             FROM messages
+             WHERE role = 'assistant'
+               AND chat_id IN ({placeholders})",
+        );
+        let query_params = chat_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.code_change_stats_from_rows(rows)
     }
 
     fn chats_matching_kind(
@@ -3356,6 +3514,16 @@ impl WorkspaceDatabase {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|source| self.sqlite_error(source))?;
+        self.code_change_stats_from_rows(rows)
+    }
+
+    fn code_change_stats_from_rows(
+        &self,
+        rows: rusqlite::MappedRows<
+            '_,
+            impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(String, String)>,
+        >,
+    ) -> Result<HashMap<String, CodeChangeStats>, WorkspaceDatabaseError> {
         let mut stats_by_chat = HashMap::new();
 
         for row in rows {
@@ -11806,6 +11974,32 @@ fn parse_json_object(
         .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
             message: format!("{context} must be a JSON object"),
         })
+}
+
+fn chat_from_row(row: &Row<'_>) -> rusqlite::Result<ChatRecord> {
+    Ok(ChatRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        archived_at: row.get(4)?,
+        metadata_json: row.get(5)?,
+    })
+}
+
+fn like_contains_pattern(query: &str) -> String {
+    let mut pattern = String::from("%");
+    for character in query.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            _ => pattern.push(character),
+        }
+    }
+    pattern.push('%');
+    pattern
 }
 
 fn chat_metadata_kind_matches(

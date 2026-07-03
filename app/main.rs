@@ -1402,6 +1402,16 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) terminal_shell: String,
     pub(crate) common_commands: Vec<WorkspaceCommonCommandSummary>,
     pub(crate) chats: Vec<ChatSummary>,
+    pub(crate) chat_pagination: WorkspaceChatPagination,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceChatPagination {
+    pub(crate) total: usize,
+    pub(crate) limit: usize,
+    pub(crate) has_more: bool,
+    pub(crate) next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -597,6 +597,21 @@ pub struct ChatRecord {
     pub metadata_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatPageCursor {
+    pub updated_at: String,
+    pub created_at: String,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPage {
+    pub chats: Vec<ChatRecord>,
+    pub total_count: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<ChatPageCursor>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeChangeStats {

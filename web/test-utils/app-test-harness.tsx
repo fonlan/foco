@@ -52,34 +52,53 @@ export function chatSummary(
     codeChangeStats,
     createdAt,
     id,
+    queuedRun: null,
     title,
     updatedAt,
   };
 }
 
+export const workspaceChats = [
+  chatSummary(
+    "chat-1",
+    "Tool run",
+    "2026-06-05T10:00:00Z",
+    "2026-06-05T10:05:00Z",
+  ),
+  chatSummary(
+    "chat-2",
+    "Second chat",
+    "2026-06-05T11:00:00Z",
+    "2026-06-05T11:05:00Z",
+  ),
+  ...Array.from({ length: 10 }, (_, index) => ({
+    activeRun: null,
+    codeChangeStats: { additions: 0, deletions: 0 },
+    createdAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:00:00Z`,
+    id: `older-chat-${index + 1}`,
+    queuedRun: null,
+    title: `Older chat ${index + 1}`,
+    updatedAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:05:00Z`,
+  })),
+];
+
+export const sideProjectChats = [
+  chatSummary(
+    "side-chat-1",
+    "Side note",
+    "2026-06-05T12:00:00Z",
+    "2026-06-05T12:05:00Z",
+  ),
+];
+
 export const workspace = {
-  chats: [
-    chatSummary(
-      "chat-1",
-      "Tool run",
-      "2026-06-05T10:00:00Z",
-      "2026-06-05T10:05:00Z",
-    ),
-    chatSummary(
-      "chat-2",
-      "Second chat",
-      "2026-06-05T11:00:00Z",
-      "2026-06-05T11:05:00Z",
-    ),
-    ...Array.from({ length: 10 }, (_, index) => ({
-      activeRun: null,
-      codeChangeStats: { additions: 0, deletions: 0 },
-      createdAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:00:00Z`,
-      id: `older-chat-${index + 1}`,
-      title: `Older chat ${index + 1}`,
-      updatedAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:05:00Z`,
-    })),
-  ],
+  chatPagination: {
+    hasMore: true,
+    limit: 5,
+    nextCursor: "workspace-page-2",
+    total: workspaceChats.length,
+  },
+  chats: workspaceChats.slice(0, 5),
   commonCommands: [],
   id: "workspace-1",
   logoUrl: "/api/workspaces/workspace-1/logo/thumbnail?v=1",
@@ -90,14 +109,13 @@ export const workspace = {
 };
 
 export const secondaryWorkspace = {
-  chats: [
-    chatSummary(
-      "side-chat-1",
-      "Side note",
-      "2026-06-05T12:00:00Z",
-      "2026-06-05T12:05:00Z",
-    ),
-  ],
+  chatPagination: {
+    hasMore: false,
+    limit: 5,
+    nextCursor: null,
+    total: sideProjectChats.length,
+  },
+  chats: sideProjectChats,
   commonCommands: [],
   id: "workspace-2",
   logoUrl: null,
@@ -1964,16 +1982,52 @@ function workspaceChatSearchWorkspaces(query: string) {
 
   return source
     .map((item) => {
-      const workspaceSummary = item as { chats?: unknown[] };
-      const chats = (workspaceSummary.chats ?? []).filter((chat) =>
+      const workspaceSummary = item as { id?: string; chats?: unknown[] };
+      const availableChats =
+        workspaceSummary.id === workspace.id
+          ? workspaceChats
+          : workspaceSummary.id === secondaryWorkspace.id
+            ? sideProjectChats
+            : (workspaceSummary.chats ?? []);
+      const chats = availableChats.filter((chat) =>
         String((chat as { title?: unknown }).title ?? "")
           .toLocaleLowerCase()
           .includes(normalizedQuery),
       );
 
-      return chats.length > 0 ? { ...(item as object), chats } : null;
+      return chats.length > 0
+        ? {
+          ...(item as object),
+          chatPagination: {
+            hasMore: false,
+            limit: 5,
+            nextCursor: null,
+            total: chats.length,
+          },
+          chats,
+        }
+        : null;
     })
     .filter((item): item is NonNullable<typeof item> => item !== null);
+}
+
+function workspaceChatsPage(workspaceId: string, cursor: string | null, includeChatId: string | null) {
+  const allChats = workspaceId === workspace.id ? workspaceChats : sideProjectChats;
+  const limit = 5;
+  const startIndex = cursor === "workspace-page-2" ? 5 : cursor === "workspace-page-3" ? 10 : 0;
+  const pageChats = allChats.slice(startIndex, startIndex + limit);
+  const chats = includeChatId && !pageChats.some((chat) => chat.id === includeChatId)
+    ? [...pageChats, ...allChats.filter((chat) => chat.id === includeChatId)]
+    : pageChats;
+  const nextIndex = startIndex + limit;
+
+  return {
+    chats,
+    hasMore: nextIndex < allChats.length,
+    limit,
+    nextCursor: nextIndex < allChats.length ? `workspace-page-${Math.floor(nextIndex / limit) + 1}` : null,
+    total: allChats.length,
+  };
 }
 
 function reorderUnknownWorkspacesByIds<T>(items: T[], itemIds: string[]) {
@@ -2235,6 +2289,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       activeWorkspaceId: workspace.id,
       workspaces: appTestState.workspaceResponseWorkspaces,
     });
+  }
+
+  const workspaceChatsMatch = path.match(/^\/api\/workspaces\/([^/]+)\/chats$/);
+  if (workspaceChatsMatch) {
+    return jsonResponse(workspaceChatsPage(
+      decodeURIComponent(workspaceChatsMatch[1] ?? ""),
+      requestUrl.searchParams.get("cursor"),
+      requestUrl.searchParams.get("includeChatId"),
+    ));
   }
 
   const planAutoRunMatch = path.match(/^\/api\/workspaces\/([^/]+)\/plans\/auto-run$/);
@@ -2596,6 +2659,12 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       activeWorkspaceId: "new-workspace",
       workspaces: [
         {
+          chatPagination: {
+            hasMore: false,
+            limit: 5,
+            nextCursor: null,
+            total: 0,
+          },
           chats: [],
           id: "new-workspace",
           logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",

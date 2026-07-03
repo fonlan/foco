@@ -1,6 +1,7 @@
 use std::{collections::HashSet, path::Path, time::Instant};
 
 use axum::Json;
+use base64::{Engine as _, engine::general_purpose};
 use foco_agent::build_default_system_prompt;
 use foco_providers::supported_provider_kinds;
 use foco_store::{
@@ -12,7 +13,7 @@ use foco_store::{
         SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
         WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
     },
-    workspace::WorkspaceDatabase,
+    workspace::{ChatPageCursor, WorkspaceDatabase},
 };
 
 use crate::http::settings::{
@@ -574,6 +575,8 @@ pub(crate) fn configured_model_summary_for_config(
     summary
 }
 
+pub(crate) const WORKSPACE_CHAT_PAGE_LIMIT: usize = 5;
+
 pub(crate) fn workspace_response_from_config(
     config: &GlobalConfig,
     active_chat_runs: &ActiveChatRunRegistry,
@@ -605,39 +608,36 @@ pub(crate) fn workspace_response_from_config(
             elapsed_ms = database_started_at.elapsed().as_millis() as u64,
             "workspace summary database opened"
         );
-        let stats_started_at = Instant::now();
-        tracing::debug!(
-            workspace_id = %workspace.id,
-            "workspace summary code change stats started"
-        );
-        let code_change_stats_by_chat = database
-            .chat_code_change_stats()
-            .map_err(ApiError::from_workspace_error)?;
-        tracing::debug!(
-            workspace_id = %workspace.id,
-            chat_count = code_change_stats_by_chat.len(),
-            elapsed_ms = stats_started_at.elapsed().as_millis() as u64,
-            "workspace summary code change stats completed"
-        );
         let chats_started_at = Instant::now();
         tracing::debug!(
             workspace_id = %workspace.id,
             "workspace summary chats query started"
         );
-        let chat_records = database.chats().map_err(ApiError::from_workspace_error)?;
+        let chat_page = database
+            .chat_page(WORKSPACE_CHAT_PAGE_LIMIT, None)
+            .map_err(ApiError::from_workspace_error)?;
         tracing::debug!(
             workspace_id = %workspace.id,
-            chat_count = chat_records.len(),
+            chat_count = chat_page.chats.len(),
             elapsed_ms = chats_started_at.elapsed().as_millis() as u64,
             "workspace summary chats query completed"
         );
         let summaries_started_at = Instant::now();
         tracing::debug!(
             workspace_id = %workspace.id,
-            chat_count = chat_records.len(),
+            chat_count = chat_page.chats.len(),
             "workspace summary chat summaries started"
         );
-        let chats = chat_records
+        let chat_ids = chat_page
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect::<Vec<_>>();
+        let code_change_stats_by_chat = database
+            .code_change_stats_for_chats(&chat_ids)
+            .map_err(ApiError::from_workspace_error)?;
+        let chats = chat_page
+            .chats
             .into_iter()
             .map(|chat| {
                 let active_run = active_chat_runs.active_run_for_chat(&workspace.id, &chat.id)?;
@@ -648,6 +648,12 @@ pub(crate) fn workspace_response_from_config(
                 chat_summary(&mut database, chat, code_change_stats, active_run)
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
+        let chat_pagination = WorkspaceChatPagination {
+            total: chat_page.total_count,
+            limit: WORKSPACE_CHAT_PAGE_LIMIT,
+            has_more: chat_page.has_more,
+            next_cursor: chat_page.next_cursor.map(encode_workspace_chat_cursor),
+        };
         tracing::debug!(
             workspace_id = %workspace.id,
             chat_count = chats.len(),
@@ -675,6 +681,7 @@ pub(crate) fn workspace_response_from_config(
             terminal_shell: workspace.terminal_shell.clone(),
             common_commands: workspace_common_command_summaries(&workspace.common_commands),
             chats,
+            chat_pagination,
         });
         tracing::debug!(
             workspace_id = %workspace.id,
@@ -692,6 +699,11 @@ pub(crate) fn workspace_response_from_config(
         active_workspace_id: config.app.active_workspace_id.clone(),
         workspaces,
     }))
+}
+
+pub(crate) fn encode_workspace_chat_cursor(cursor: ChatPageCursor) -> String {
+    let json = serde_json::to_vec(&cursor).expect("workspace chat cursor serializes");
+    general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
 
 pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {

@@ -128,6 +128,7 @@ import type {
   TodoGraphTask,
   Translate,
   WorkspaceChatListItem,
+  WorkspaceChatsResponse,
   WorkspaceFileChildrenResponse,
   WorkspaceFileContentResponse,
   WorkspaceFileSaveResponse,
@@ -521,6 +522,29 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
   );
 }
 
+function workspaceChatPagingFromWorkspaces(
+  workspaces: WorkspaceSummary[],
+): WorkspaceChatPagingState {
+  return Object.fromEntries(
+    workspaces.map((workspace) => {
+      const pagination = workspace.chatPagination ?? {
+        hasMore: false,
+        nextCursor: null,
+        total: workspace.chats.length,
+      };
+      return [
+        workspace.id,
+        {
+          hasMore: pagination.hasMore,
+          isLoading: false,
+          nextCursor: pagination.nextCursor,
+          total: pagination.total,
+        },
+      ];
+    }),
+  );
+}
+
 function isAbortError(value: unknown) {
   return (
     typeof value === "object" &&
@@ -529,6 +553,16 @@ function isAbortError(value: unknown) {
     value.name === "AbortError"
   );
 }
+
+type WorkspaceChatPagingState = Record<
+  string,
+  {
+    hasMore: boolean;
+    isLoading: boolean;
+    nextCursor: string | null;
+    total: number;
+  }
+>;
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -547,9 +581,8 @@ export function App() {
   const [workspaceOrderPreview, setWorkspaceOrderPreview] = useState<
     string[] | null
   >(null);
-  const [workspaceChatVisibleCounts, setWorkspaceChatVisibleCounts] = useState<
-    Record<string, number>
-  >({});
+  const [workspaceChatPaging, setWorkspaceChatPaging] =
+    useState<WorkspaceChatPagingState>({});
   const [workspaceChatSearchOpen, setWorkspaceChatSearchOpen] = useState(false);
   const [workspaceChatSearchQuery, setWorkspaceChatSearchQuery] = useState("");
   const [workspaceChatSearchResults, setWorkspaceChatSearchResults] = useState<
@@ -1424,6 +1457,7 @@ export function App() {
     try {
       const data = await requestJson<WorkspacesResponse>("/api/workspaces");
       setWorkspaces(data.workspaces);
+      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
       setActiveWorkspaceId((current) =>
         data.workspaces.some((workspace) => workspace.id === current)
           ? current
@@ -3093,6 +3127,7 @@ export function App() {
         ) ?? data.workspaces[0];
 
       setWorkspaces(data.workspaces);
+      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
       setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       setExpandedWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       updateBrowserRoute({
@@ -4312,6 +4347,58 @@ export function App() {
     }
   }
 
+  async function ensureWorkspaceChatLoaded(workspaceId: string, chatId: string) {
+    if (isPendingChatId(chatId)) {
+      return;
+    }
+    const workspace = workspaces.find((candidate) => candidate.id === workspaceId);
+    if (!workspace || workspace.chats.some((chat) => chat.id === chatId)) {
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams({
+        includeChatId: chatId,
+        limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE),
+      });
+      const data = await requestJson<WorkspaceChatsResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats?${params.toString()}`,
+      );
+      setWorkspaces((current) =>
+        current.map((item) => {
+          if (item.id !== workspaceId) {
+            return item;
+          }
+          const existingChatIds = new Set(item.chats.map((chat) => chat.id));
+          return {
+            ...item,
+            chatPagination: {
+              hasMore: data.hasMore,
+              limit: data.limit,
+              nextCursor: data.nextCursor,
+              total: data.total,
+            },
+            chats: [
+              ...item.chats,
+              ...data.chats.filter((chat) => !existingChatIds.has(chat.id)),
+            ],
+          };
+        }),
+      );
+      setWorkspaceChatPaging((current) => ({
+        ...current,
+        [workspaceId]: {
+          hasMore: data.hasMore,
+          isLoading: false,
+          nextCursor: data.nextCursor,
+          total: data.total,
+        },
+      }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
   function selectWorkspaceChat(
     workspaceId: string,
     chatId: string,
@@ -4342,6 +4429,7 @@ export function App() {
       return;
     }
 
+    void ensureWorkspaceChatLoaded(workspaceId, chatId);
     const chatKey = chatRunKey(workspaceId, chatId);
     const workspaceChatActiveRun = normalizeActiveChatRunSummary(
       workspaces
@@ -5257,6 +5345,7 @@ export function App() {
         { method: "POST" },
       );
       setWorkspaces(data.workspaces);
+      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
       setActiveWorkspaceId((current) =>
         data.workspaces.some((workspace) => workspace.id === current)
           ? current
@@ -8485,22 +8574,64 @@ export function App() {
   function toggleWorkspace(workspaceId: string) {
     const isCollapsingWorkspace = expandedWorkspaceId === workspaceId;
     setExpandedWorkspaceId(isCollapsingWorkspace ? null : workspaceId);
-    if (isCollapsingWorkspace) {
-      setWorkspaceChatVisibleCounts((current) => {
-        const next = { ...current };
-        delete next[workspaceId];
-        return next;
-      });
-    }
   }
 
-  function showMoreWorkspaceChats(workspaceId: string) {
-    setWorkspaceChatVisibleCounts((current) => ({
+  async function showMoreWorkspaceChats(workspaceId: string) {
+    const paging = workspaceChatPaging[workspaceId];
+    if (!paging?.hasMore || paging.isLoading) {
+      return;
+    }
+
+    setWorkspaceChatPaging((current) => ({
       ...current,
-      [workspaceId]:
-        (current[workspaceId] ?? WORKSPACE_CHAT_HISTORY_PAGE_SIZE) +
-        WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
+      [workspaceId]: { ...current[workspaceId], isLoading: true },
     }));
+
+    try {
+      const params = new URLSearchParams({ limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE) });
+      if (paging.nextCursor) {
+        params.set("cursor", paging.nextCursor);
+      }
+      const data = await requestJson<WorkspaceChatsResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats?${params.toString()}`,
+      );
+      setWorkspaces((current) =>
+        current.map((workspace) => {
+          if (workspace.id !== workspaceId) {
+            return workspace;
+          }
+          const existingChatIds = new Set(workspace.chats.map((chat) => chat.id));
+          return {
+            ...workspace,
+            chatPagination: {
+              hasMore: data.hasMore,
+              limit: data.limit,
+              nextCursor: data.nextCursor,
+              total: data.total,
+            },
+            chats: [
+              ...workspace.chats,
+              ...data.chats.filter((chat) => !existingChatIds.has(chat.id)),
+            ],
+          };
+        }),
+      );
+      setWorkspaceChatPaging((current) => ({
+        ...current,
+        [workspaceId]: {
+          hasMore: data.hasMore,
+          isLoading: false,
+          nextCursor: data.nextCursor,
+          total: data.total,
+        },
+      }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setWorkspaceChatPaging((current) => ({
+        ...current,
+        [workspaceId]: { ...current[workspaceId], isLoading: false },
+      }));
+    }
   }
 
   async function saveWorkspaceOrder(
@@ -8908,7 +9039,7 @@ export function App() {
     setWorkspaceChatSearchError(null);
 
     void requestJson<WorkspaceChatSearchResponse>(
-      `/api/workspaces/search-chats?query=${encodeURIComponent(normalizedWorkspaceChatSearchQuery)}`,
+      `/api/workspaces/search-chats?query=${encodeURIComponent(normalizedWorkspaceChatSearchQuery)}&limit=${WORKSPACE_CHAT_HISTORY_PAGE_SIZE}`,
       { signal: abortController.signal },
     )
       .then((data) => {
@@ -9229,25 +9360,11 @@ export function App() {
                           }),
                         )
                         : workspaceChatListItemsFor(workspace);
-                      const selectedChatIndex =
-                        isActive && activeChatId
-                          ? workspaceChats.findIndex((chat) => chat.id === activeChatId)
-                          : -1;
-                      const configuredVisibleChatCount =
-                        workspaceChatVisibleCounts[workspace.id] ??
-                        WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
-                      const visibleChatCount = isWorkspaceSearchActive
-                        ? workspaceChats.length
-                        : selectedChatIndex >= configuredVisibleChatCount
-                          ? selectedChatIndex + 1
-                          : configuredVisibleChatCount;
-                      const visibleChats = workspaceChats.slice(0, visibleChatCount);
+                      const paging = workspaceChatPaging[workspace.id];
+                      const visibleChats = workspaceChats;
                       const hiddenChatCount = isWorkspaceSearchActive
                         ? 0
-                        : Math.max(
-                          workspaceChats.length - visibleChats.length,
-                          0,
-                        );
+                        : Math.max((paging?.total ?? workspace.chats.length) - workspace.chats.length, 0);
                       const nextVisibleChatCount = Math.min(
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
                         hiddenChatCount,
@@ -9446,8 +9563,9 @@ export function App() {
                                         },
                                       )}
                                       className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
+                                      disabled={paging?.isLoading}
                                       onClick={() =>
-                                        showMoreWorkspaceChats(workspace.id)
+                                        void showMoreWorkspaceChats(workspace.id)
                                       }
                                       type="button"
                                     >

@@ -1222,6 +1222,14 @@ ON workspace_spec_jobs(retry_of_job_id)
 WHERE retry_of_job_id IS NOT NULL AND status IN ('queued', 'running');
 "#;
 
+pub(crate) const MIGRATION_026: &str = r#"
+CREATE INDEX IF NOT EXISTS chats_updated_created_id_idx
+ON chats (updated_at DESC, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS chats_title_nocase_idx
+ON chats (title COLLATE NOCASE);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};
