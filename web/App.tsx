@@ -62,6 +62,7 @@ import type {
   AgentTeamSnapshotResponse,
   AppLanguageId,
   AppThemeId,
+  AiStatsFilterState,
   AuthStatusResponse,
   BrowserRoute,
   BrowserRouteChatTab,
@@ -570,6 +571,11 @@ export function App() {
   const [statsRoutePage, setStatsRoutePage] = useState(
     initialBrowserRoute.viewMode === "stats" ? initialBrowserRoute.page : 1,
   );
+  const [statsRouteFilters, setStatsRouteFilters] = useState<
+    Partial<AiStatsFilterState>
+  >(initialBrowserRoute.viewMode === "stats" ? initialBrowserRoute.filters ?? {} : {});
+  const statsRouteFiltersRef = useRef(statsRouteFilters);
+  statsRouteFiltersRef.current = statsRouteFilters;
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
   const [workspaceName, setWorkspaceName] = useState("");
@@ -6306,18 +6312,42 @@ export function App() {
     setIsMobileWorkspaceOpen,
     setMessages,
     setSettingsSection,
+    setStatsRouteFilters,
     setStatsRoutePage,
     setViewMode,
     updateBrowserRoute,
     workspaces,
   });
 
-  const updateStatsRoutePage = useCallback(
-    (page: number) => {
+  const updateStatsRoute = useCallback(
+    (page: number, filters: Partial<AiStatsFilterState> = statsRouteFiltersRef.current) => {
       setStatsRoutePage((current) => (current === page ? current : page));
-      updateBrowserRoute({ page, viewMode: "stats" });
+      setStatsRouteFilters(filters);
+      updateBrowserRoute({ filters, page, viewMode: "stats" });
     },
     [updateBrowserRoute],
+  );
+
+  const handleOpenMessageApiRequests = useCallback(
+    (message: ShellMessage) => {
+      const requestId = message.metrics?.llmRequestIds[0];
+      if (!requestId) {
+        return;
+      }
+
+      const filters: Partial<AiStatsFilterState> = {
+        chatId: activeChatId && !isPendingChatId(activeChatId) ? activeChatId : "",
+        page: "1",
+        requestId,
+        workspaceId: activeWorkspace?.id ?? activeWorkspaceId,
+      };
+      setStatsRoutePage(1);
+      setStatsRouteFilters(filters);
+      setViewMode("stats");
+      setIsMobileWorkspaceOpen(false);
+      updateBrowserRoute({ filters, page: 1, viewMode: "stats" });
+    },
+    [activeChatId, activeWorkspace?.id, activeWorkspaceId, updateBrowserRoute],
   );
 
   function handleHomeNavClick() {
@@ -9013,7 +9043,8 @@ export function App() {
                 />
               ) : (
                 <ApiStatsPanel
-                  onRoutePageChange={updateStatsRoutePage}
+                  initialFilters={statsRouteFilters}
+                  onRouteChange={updateStatsRoute}
                   routePage={statsRoutePage}
                   settings={settings}
                   workspaces={workspaces}
@@ -9694,6 +9725,7 @@ export function App() {
                   onGuideActiveRun={handleGuideActiveRunForChatPanel}
                   onQueueActiveRun={handleQueueActiveRunForChatPanel}
                   onModelChange={handleModelChangeForChatPanel}
+                  onOpenMessageApiRequests={handleOpenMessageApiRequests}
                   onProviderChange={handleProviderChangeForChatPanel}
                   onRemoveAttachment={handleRemoveAttachmentForChatPanel}
                   onRemoveSkill={handleRemoveSkillForChatPanel}

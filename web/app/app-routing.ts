@@ -1,6 +1,7 @@
 import { useCallback, type RefObject } from "react";
 
 import type {
+  AiStatsFilterState,
   BrowserRoute,
   BrowserRouteChatTab,
   BrowserRouteFileTab,
@@ -31,6 +32,7 @@ type AppRoutingOptions = {
   setIsMobileWorkspaceOpen: (isOpen: boolean) => void;
   setMessages: (messages: []) => void;
   setSettingsSection: (section: SettingsSection) => void;
+  setStatsRouteFilters: (filters: Partial<AiStatsFilterState>) => void;
   setStatsRoutePage: (page: number) => void;
   setViewMode: (viewMode: BrowserRoute["viewMode"]) => void;
   updateBrowserRoute: (
@@ -53,6 +55,7 @@ export function useAppRouting({
   setIsMobileWorkspaceOpen,
   setMessages,
   setSettingsSection,
+  setStatsRouteFilters,
   setStatsRoutePage,
   setViewMode,
   updateBrowserRoute,
@@ -82,12 +85,14 @@ export function useAppRouting({
   );
 
   const openStatsView = useCallback(() => {
+    setStatsRouteFilters({});
     setStatsRoutePage(1);
     setViewMode("stats");
     setIsMobileWorkspaceOpen(false);
     updateBrowserRoute({ page: 1, viewMode: "stats" });
   }, [
     setIsMobileWorkspaceOpen,
+    setStatsRouteFilters,
     setStatsRoutePage,
     setViewMode,
     updateBrowserRoute,
@@ -120,6 +125,7 @@ export function useAppRouting({
       }
 
       if (route.viewMode === "stats") {
+        setStatsRouteFilters(route.filters ?? {});
         setStatsRoutePage(route.page);
         setViewMode("stats");
         setIsMobileWorkspaceOpen(false);
@@ -182,6 +188,7 @@ export function useAppRouting({
       setIsMobileWorkspaceOpen,
       setMessages,
       setSettingsSection,
+      setStatsRouteFilters,
       setStatsRoutePage,
       setViewMode,
       workspaces,

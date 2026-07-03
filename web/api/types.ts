@@ -37,7 +37,7 @@ export type BrowserRoute =
       activeFile?: BrowserRouteFileTab;
     }
   | { viewMode: "settings"; section: SettingsSection }
-  | { viewMode: "stats"; page: number }
+  | { viewMode: "stats"; page: number; filters?: Partial<AiStatsFilterState> }
   | { viewMode: "scheduled" }
   | { viewMode: "skill-store" };
 

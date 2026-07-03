@@ -120,6 +120,39 @@ describe("browser route chat tabs", () => {
     );
   });
 
+  it("round-trips stats filters from query params", () => {
+    expect(
+      browserRouteFromPathname(
+        "/stats",
+        "?page=2&workspaceId=workspace-1&chatId=chat-1&requestId=request-1&pageSize=50",
+      ),
+    ).toEqual({
+      filters: {
+        chatId: "chat-1",
+        pageSize: "50",
+        requestId: "request-1",
+        workspaceId: "workspace-1",
+      },
+      page: 2,
+      viewMode: "stats",
+    });
+    expect(
+      browserPathForRoute({
+        filters: {
+          chatId: "chat-1",
+          page: "2",
+          pageSize: "50",
+          requestId: "request-1",
+          workspaceId: "workspace-1",
+        },
+        page: 2,
+        viewMode: "stats",
+      }),
+    ).toBe(
+      "/stats?page=2&workspaceId=workspace-1&requestId=request-1&chatId=chat-1&pageSize=50",
+    );
+  });
+
   it("falls back to stats page 1 for invalid page values", () => {
     for (const search of ["", "?page=0", "?page=-1", "?page=abc", "?page=1.5"]) {
       expect(browserRouteFromPathname("/stats", search)).toEqual({

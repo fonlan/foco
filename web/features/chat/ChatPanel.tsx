@@ -144,6 +144,7 @@ function ChatPanelComponent({
   onGuideQueuedMessage,
   onLoadMoreMessages,
   onModelChange,
+  onOpenMessageApiRequests,
   onProviderChange,
   onQueueActiveRun,
   onRemoveAttachment,
@@ -204,6 +205,7 @@ function ChatPanelComponent({
   onGuideQueuedMessage: (messageId: string) => void;
   onLoadMoreMessages: () => Promise<void>;
   onModelChange: (value: string) => void;
+  onOpenMessageApiRequests: (message: ShellMessage) => void;
   onProviderChange: (value: string) => void;
   onQueueActiveRun: () => void;
   onRemoveAttachment: (attachmentId: string) => void;
@@ -703,6 +705,7 @@ function ChatPanelComponent({
                   message={message}
                   onCopyMessage={handleCopyMessage}
                   onGuideQueuedMessage={onGuideQueuedMessage}
+                  onOpenMessageApiRequests={onOpenMessageApiRequests}
                   onWithdrawQueuedMessage={onWithdrawQueuedMessage}
                   queuedMessageIds={queuedMessageIds}
                   workspaceId={workspaceId}
@@ -1044,6 +1047,7 @@ const MessageRow = memo(function MessageRow({
   message,
   onCopyMessage,
   onGuideQueuedMessage,
+  onOpenMessageApiRequests,
   onWithdrawQueuedMessage,
   queuedMessageIds,
   workspaceId,
@@ -1053,6 +1057,7 @@ const MessageRow = memo(function MessageRow({
   message: ShellMessage;
   onCopyMessage: (messageId: string, text: string) => void;
   onGuideQueuedMessage: (messageId: string) => void;
+  onOpenMessageApiRequests: (message: ShellMessage) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
   queuedMessageIds: ReadonlySet<string>;
   workspaceId: string | null;
@@ -1250,7 +1255,15 @@ const MessageRow = memo(function MessageRow({
             ) : null}
             {!isUser ? <SpecUpdatesBlock updates={message.specUpdates} /> : null}
             {!isUser && message.metrics && message.status !== "streaming" ? (
-              <ChatReplyMetricsLine helpers={helpers} metrics={message.metrics} />
+              <ChatReplyMetricsLine
+                helpers={helpers}
+                metrics={message.metrics}
+                onOpenApiRequests={
+                  message.metrics.llmRequestIds.length
+                    ? () => onOpenMessageApiRequests(message)
+                    : null
+                }
+              />
             ) : null}
           </div>
         </div>
@@ -1911,9 +1924,11 @@ function AttachmentPartBlock({
 function ChatReplyMetricsLine({
   helpers,
   metrics,
+  onOpenApiRequests,
 }: {
   helpers: ChatPanelHelpers;
   metrics: ChatReplyMetrics;
+  onOpenApiRequests: (() => void) | null;
 }) {
   const { formatNullableLatencySeconds, formatTokensPerSecond } = helpers;
   const { language, t } = useI18n();
@@ -1932,12 +1947,25 @@ function ChatReplyMetricsLine({
   ];
 
   return (
-    <div className="flex flex-wrap gap-x-2 gap-y-1 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
-      {values.map((value) => (
-        <span className="min-w-0 break-words" key={value}>
-          {value}
-        </span>
-      ))}
+    <div className="flex items-start justify-between gap-2 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
+      <div className="flex min-w-0 flex-1 flex-wrap gap-x-2 gap-y-1">
+        {values.map((value) => (
+          <span className="min-w-0 break-words" key={value}>
+            {value}
+          </span>
+        ))}
+      </div>
+      {onOpenApiRequests ? (
+        <button
+          aria-label={t("View API requests for this reply")}
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          onClick={onOpenApiRequests}
+          title={t("View API requests for this reply")}
+          type="button"
+        >
+          <Server aria-hidden="true" className="size-3.5" />
+        </button>
+      ) : null}
     </div>
   );
 }

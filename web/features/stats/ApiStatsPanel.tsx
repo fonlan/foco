@@ -68,12 +68,14 @@ type AiStatsColumn = {
 };
 
 export function ApiStatsPanel({
-  onRoutePageChange,
+  initialFilters,
+  onRouteChange,
   routePage,
   settings,
   workspaces,
 }: {
-  onRoutePageChange: (page: number) => void;
+  initialFilters?: Partial<AiStatsFilterState>;
+  onRouteChange: (page: number, filters?: Partial<AiStatsFilterState>) => void;
   routePage: number;
   settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
@@ -96,7 +98,7 @@ export function ApiStatsPanel({
     setAuditPage,
     stats,
     updateAuditFilters,
-  } = useAiStatisticsData(routePage);
+  } = useAiStatisticsData(routePage, initialFilters);
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
@@ -341,12 +343,13 @@ export function ApiStatsPanel({
 
   function goToAuditPage(page: number) {
     const nextPage = updateAuditPage(page, totalPages);
-    onRoutePageChange(nextPage);
+    onRouteChange(nextPage, { ...filters, page: String(nextPage) });
   }
 
   function updateFilters(update: Partial<AiStatsFilterState>) {
+    const nextFilters = { ...filters, ...update, page: "1" };
     updateAuditFilters(update);
-    onRoutePageChange(1);
+    onRouteChange(1, nextFilters);
   }
 
   function toggleAiStatsColumn(columnId: AiStatsColumnId) {

@@ -1,4 +1,5 @@
 import type {
+  AiStatsFilterState,
   BrowserRoute,
   BrowserRouteChatTab,
   BrowserRouteFileTab,
@@ -10,6 +11,17 @@ const CHAT_TAB_QUERY_PARAM = "tab";
 const FILE_TAB_QUERY_PARAM = "file";
 const ACTIVE_FILE_QUERY_PARAM = "activeFile";
 const STATS_PAGE_QUERY_PARAM = "page";
+const STATS_FILTER_QUERY_PARAMS = [
+  "workspaceId",
+  "requestId",
+  "chatId",
+  "providerId",
+  "modelId",
+  "status",
+  "startedAfter",
+  "startedBefore",
+  "pageSize",
+] as const satisfies readonly (keyof AiStatsFilterState)[];
 
 export function currentBrowserRoute(): BrowserRoute {
   if (typeof window === "undefined") {
@@ -34,7 +46,11 @@ export function browserRouteFromPathname(
   }
 
   if (segments[0] === "stats") {
-    return { page: positivePageFromSearch(search), viewMode: "stats" };
+    const filters = statsFiltersFromSearch(search);
+    const page = positivePageFromSearch(search);
+    return filters
+      ? { filters, page, viewMode: "stats" }
+      : { page, viewMode: "stats" };
   }
 
   if (segments[0] === "scheduled") {
@@ -92,6 +108,7 @@ export function browserPathForRoute(route: BrowserRoute) {
   if (route.viewMode === "stats") {
     const params = new URLSearchParams();
     params.set(STATS_PAGE_QUERY_PARAM, String(positivePage(route.page)));
+    appendStatsFiltersSearch(params, route.filters);
     return `/stats?${params.toString()}`;
   }
 
@@ -144,6 +161,36 @@ function chatTabsFromSearch(search: string): BrowserRouteChatTab[] {
 function positivePageFromSearch(search: string) {
   const rawPage = new URLSearchParams(search).get(STATS_PAGE_QUERY_PARAM);
   return positivePage(Number(rawPage));
+}
+
+function statsFiltersFromSearch(search: string): Partial<AiStatsFilterState> | undefined {
+  const params = new URLSearchParams(search);
+  const filters: Partial<AiStatsFilterState> = {};
+
+  for (const key of STATS_FILTER_QUERY_PARAMS) {
+    const value = params.get(key)?.trim() ?? "";
+    if (value) {
+      filters[key] = value;
+    }
+  }
+
+  return Object.keys(filters).length ? filters : undefined;
+}
+
+function appendStatsFiltersSearch(
+  params: URLSearchParams,
+  filters: Partial<AiStatsFilterState> | undefined,
+) {
+  if (!filters) {
+    return;
+  }
+
+  for (const key of STATS_FILTER_QUERY_PARAMS) {
+    const value = filters[key]?.trim() ?? "";
+    if (value) {
+      params.set(key, value);
+    }
+  }
 }
 
 function positivePage(value: number) {

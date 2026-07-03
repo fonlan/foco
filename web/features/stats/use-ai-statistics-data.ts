@@ -25,9 +25,12 @@ export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
   };
 }
 
-export function useAiStatisticsData(initialPage = 1) {
-  const [filters, setFilters] = useState<AiStatsFilterState>(
-    () => emptyAiStatsFilters(initialPage),
+export function useAiStatisticsData(
+  initialPage = 1,
+  initialFilters?: Partial<AiStatsFilterState>,
+) {
+  const [filters, setFilters] = useState<AiStatsFilterState>(() =>
+    aiStatsFiltersFromInitialState(initialPage, initialFilters),
   );
   const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -137,6 +140,14 @@ export function useAiStatisticsData(initialPage = 1) {
     void loadStats(true, true);
   }, [filters, loadStats]);
 
+  const initialFiltersKey = JSON.stringify(initialFilters ?? {});
+  useEffect(() => {
+    setFilters((current) => {
+      const next = aiStatsFiltersFromInitialState(initialPage, initialFilters);
+      return sameAiStatsFilters(current, next) ? current : next;
+    });
+  }, [initialPage, initialFiltersKey]);
+
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       if (!isAiStatsDocumentVisible()) {
@@ -233,6 +244,23 @@ export function useAiStatisticsData(initialPage = 1) {
 
 function positivePage(value: number) {
   return Number.isSafeInteger(value) && value > 0 ? value : 1;
+}
+
+function aiStatsFiltersFromInitialState(
+  initialPage: number,
+  initialFilters: Partial<AiStatsFilterState> | undefined,
+) {
+  return {
+    ...emptyAiStatsFilters(initialPage),
+    ...initialFilters,
+    page: String(positivePage(Number(initialFilters?.page ?? initialPage))),
+  };
+}
+
+function sameAiStatsFilters(left: AiStatsFilterState, right: AiStatsFilterState) {
+  return (Object.keys(left) as (keyof AiStatsFilterState)[]).every(
+    (key) => left[key] === right[key],
+  );
 }
 
 function isAiStatsDocumentVisible() {
