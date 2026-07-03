@@ -25,6 +25,7 @@ import {
   renderApp,
   resetAppTestEnvironment,
   secondaryWorkspace,
+  secondChatMessages,
   settings,
   todoGraph,
   workspace,
@@ -3133,6 +3134,94 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
     });
+  });
+
+  it("opens the pending question chat on startup and answers through the question endpoint", async () => {
+    appTestState.pendingQuestionsResponse = [
+      {
+        chatId: "chat-2",
+        id: "pending-startup-question",
+        questions: [
+          {
+            allowFreeText: false,
+            id: "pending-startup-question-item",
+            options: [
+              {
+                description: null,
+                label: "Proceed",
+                value: "proceed",
+              },
+            ],
+            question: "Should the background run continue?",
+          },
+        ],
+        toolCallId: "ask-question-call",
+        workspaceId: "workspace-1",
+      },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+        return jsonResponse({
+          ...secondChatMessages,
+          activeRun: null,
+          pendingQuestion: appTestState.pendingQuestionsResponse[0],
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    expect(await screen.findByRole("tab", { name: /Second chat/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+    expect(
+      within(dialog).getByText("Should the background run continue?"),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByText("Proceed"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Continue run" }));
+
+    await waitFor(() => {
+      expect(appTestState.answeredQuestionIds).toEqual(["pending-startup-question"]);
+    });
+  });
+
+  it("reports a missing pending question chat without blocking the app", async () => {
+    appTestState.pendingQuestionsResponse = [
+      {
+        chatId: "missing-chat",
+        id: "missing-chat-question",
+        questions: [
+          {
+            allowFreeText: true,
+            id: "missing-chat-question-item",
+            options: [],
+            question: "This chat is gone.",
+          },
+        ],
+        toolCallId: "ask-question-call",
+        workspaceId: "workspace-1",
+      },
+    ];
+
+    renderApp();
+
+    expect(
+      await screen.findByText(
+        "Pending question chat is no longer available: workspace-1/missing-chat",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
   });
 
   it("reconnects an idle active run stream from the last processed sequence", async () => {

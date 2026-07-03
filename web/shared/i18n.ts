@@ -330,6 +330,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Custom answer": "手动输入",
     "Continue run": "继续运行",
     "Answer must not be empty.": "回答不能为空。",
+    "Pending question chat is no longer available: {workspaceId}/{chatId}":
+      "待回答问题所在会话已不可用：{workspaceId}/{chatId}",
     "Create or register a local folder.": "创建或注册本地文件夹。",
     "Close workspace dialog": "关闭工作区弹窗",
     Close: "关闭",

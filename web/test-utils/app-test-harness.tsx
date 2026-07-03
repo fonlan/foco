@@ -7,6 +7,7 @@ import type {
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
   Plan,
+  QuestionRequestSummary,
   SettingsWorkspaceSpecJobSummary,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
@@ -1904,6 +1905,8 @@ export const appTestState: {
   workspaceSpecGenerateCompletes: boolean;
   workspaceGitBranchesResponses: GitBranchesResponse[];
   workspaceGitDiffResponse: typeof gitDiff;
+  pendingQuestionsResponse: QuestionRequestSummary[];
+  answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   lastWorkspaceOrderRequest: string[] | null;
@@ -1922,6 +1925,8 @@ export const appTestState: {
   workspaceSpecGenerateCompletes: false,
   workspaceGitBranchesResponses: [],
   workspaceGitDiffResponse: gitDiff,
+  pendingQuestionsResponse: [],
+  answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
   lastWorkspaceOrderRequest: null,
@@ -2156,6 +2161,8 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceSpecGenerateCompletes = false;
   appTestState.workspaceGitBranchesResponses = [];
   appTestState.workspaceGitDiffResponse = gitDiff;
+  appTestState.pendingQuestionsResponse = [];
+  appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.lastWorkspaceOrderRequest = null;
@@ -2210,6 +2217,16 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/auth/logout") {
     return jsonResponse({ authenticated: false, enabled: true });
+  }
+
+  if (path === "/api/chat/questions/pending") {
+    return jsonResponse({ questions: appTestState.pendingQuestionsResponse });
+  }
+
+  const questionAnswerMatch = path.match(/^\/api\/chat\/questions\/([^/]+)\/answer$/);
+  if (questionAnswerMatch) {
+    appTestState.answeredQuestionIds.push(decodeURIComponent(questionAnswerMatch[1]));
+    return jsonResponse({ ok: true, questionId: decodeURIComponent(questionAnswerMatch[1]) });
   }
 
   if (path === "/api/workspaces") {

@@ -564,6 +564,10 @@ export type QuestionRequestSummary = {
   questions: QuestionItemSummary[];
 };
 
+export type PendingQuestionsResponse = {
+  questions: QuestionRequestSummary[];
+};
+
 export type QuestionAnswerSubmission = {
   answers: {
     id: string;

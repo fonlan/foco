@@ -110,6 +110,7 @@ import type {
   PlanWorktreeAuditResponse,
   PlansResponse,
   PendingDeleteChat,
+  PendingQuestionsResponse,
   QueueChatMessageResponse,
   QueuedMessageRunSummary,
   QuestionAnswerSubmission,
@@ -852,6 +853,8 @@ export function App() {
   const loadingChatControllersRef = useRef<Map<string, AbortController>>(new Map());
   const loadingOlderChatMessageKeysRef = useRef<Set<string>>(new Set());
   const runningChatKeysRef = useRef<Set<string>>(new Set());
+  const restoredPendingQuestionIdsRef = useRef<Set<string>>(new Set());
+  const isCheckingPendingQuestionsRef = useRef(false);
   const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
@@ -1349,6 +1352,64 @@ export function App() {
       setIsCheckingAuth(false);
     }
   }, []);
+
+  const checkPendingQuestions = useStableCallback(
+    async (visibleWorkspaces: WorkspaceSummary[]) => {
+      if (isCheckingPendingQuestionsRef.current) {
+        return;
+      }
+
+      isCheckingPendingQuestionsRef.current = true;
+      try {
+        const data = await requestJson<PendingQuestionsResponse>(
+          "/api/chat/questions/pending",
+        );
+        const question = data.questions
+          .map(parseQuestionRequestSummary)
+          .find(
+            (candidate): candidate is QuestionRequestSummary =>
+              candidate !== null &&
+              !restoredPendingQuestionIdsRef.current.has(candidate.id),
+          );
+
+        if (!question) {
+          return;
+        }
+
+        restoredPendingQuestionIdsRef.current.add(question.id);
+        const workspace = visibleWorkspaces.find(
+          (candidate) => candidate.id === question.workspaceId,
+        );
+        const chat = workspace?.chats.find(
+          (candidate) => candidate.id === question.chatId,
+        );
+
+        if (!workspace || !chat) {
+          setError(
+            t("Pending question chat is no longer available: {workspaceId}/{chatId}", {
+              chatId: question.chatId,
+              workspaceId: question.workspaceId,
+            }),
+          );
+          return;
+        }
+
+        if (
+          activeWorkspaceIdRef.current === question.workspaceId &&
+          activeChatIdRef.current === question.chatId
+        ) {
+          void loadChatMessages(question.workspaceId, question.chatId);
+          return;
+        }
+
+        selectWorkspaceChat(question.workspaceId, question.chatId);
+      } catch (requestError) {
+        setError(errorMessage(requestError));
+      } finally {
+        isCheckingPendingQuestionsRef.current = false;
+      }
+    },
+  );
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -6295,6 +6356,29 @@ export function App() {
     onApplyRoute: applyBrowserRoute,
     onReplaceRoute: (route) => updateBrowserRoute(route, "replace"),
   });
+
+  useEffect(() => {
+    if (!canUseApp || isLoading || workspaces.length === 0) {
+      return undefined;
+    }
+
+    const restorePendingQuestions = () => {
+      void checkPendingQuestions(workspaces);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        restorePendingQuestions();
+      }
+    };
+
+    restorePendingQuestions();
+    window.addEventListener("focus", restorePendingQuestions);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", restorePendingQuestions);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [canUseApp, checkPendingQuestions, isLoading, workspaces]);
 
   useBrowserPopState(applyBrowserRouteRef);
 
