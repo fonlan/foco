@@ -444,9 +444,39 @@ const skillStoreHotSkills = [
     official: false,
     source: "foco/markdown-cleaner",
   },
+  ...Array.from({ length: 19 }, (_, index) => {
+    const skillNumber = index + 3;
+    return {
+      change: 0,
+      description: `Registry skill ${skillNumber}.`,
+      id: `registry-skill-${skillNumber}`,
+      installs: 30 - skillNumber,
+      installsYesterday: 30 - skillNumber,
+      name: skillNumber === 21 ? "Page Two Skill" : `Registry Skill ${skillNumber}`,
+      official: false,
+      source: `foco/registry-skill-${skillNumber}`,
+    };
+  }),
 ];
 
 const skillStoreSearchSkills = [skillStoreHotSkills[0]];
+
+function skillStoreListPage<T>(items: T[], requestUrl: URL) {
+  const page = Number(requestUrl.searchParams.get("page") ?? "1");
+  const pageSize = Number(requestUrl.searchParams.get("pageSize") ?? "20");
+  const safePage = Number.isFinite(page) && page > 0 ? page : 1;
+  const safePageSize = Number.isFinite(pageSize) && pageSize > 0 ? pageSize : 20;
+  const start = (safePage - 1) * safePageSize;
+  const totalPages = Math.ceil(items.length / safePageSize);
+  return {
+    hasMore: safePage < totalPages,
+    page: safePage,
+    pageSize: safePageSize,
+    skills: items.slice(start, start + safePageSize),
+    total: items.length,
+    totalPages,
+  };
+}
 
 function installedSkillFromStore(workspaceId: string | null): ConfiguredSkillSummary {
   return {
@@ -2845,29 +2875,27 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/skill-store/browse") {
+    const page = skillStoreListPage(skillStoreHotSkills, requestUrl);
     return jsonResponse({
-      hasMore: false,
-      skills: skillStoreHotSkills,
+      ...page,
       source: "test-browse",
-      total: skillStoreHotSkills.length,
     });
   }
 
   if (path === "/api/skill-store/hot") {
     return jsonResponse({
       hasMore: false,
-      skills: skillStoreHotSkills,
+      skills: skillStoreHotSkills.slice(0, 20),
       source: "test-hot",
       total: skillStoreHotSkills.length,
     });
   }
 
   if (path === "/api/skill-store/search") {
+    const page = skillStoreListPage(skillStoreSearchSkills, requestUrl);
     return jsonResponse({
-      hasMore: false,
-      skills: skillStoreSearchSkills,
+      ...page,
       source: "test-search",
-      total: skillStoreSearchSkills.length,
     });
   }
 

@@ -54,12 +54,14 @@ use crate::http::{
     },
     skill_store::{
         SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
-        SkillStoreImportPreviewRequest, SkillStoreInstallRequest, SkillStoreTranslateRequest,
-        SkillStoreUpdateRequest, ensure_skill_files_valid, install_skill_files_to_target_dir,
+        SkillStoreImportPreviewRequest, SkillStoreInstallRequest, SkillStorePageParams,
+        SkillStoreSearchQuery, SkillStoreTranslateRequest, SkillStoreUpdateRequest,
+        ensure_skill_files_valid, install_skill_files_to_target_dir,
         parse_skill_store_import_target, registry_files_from_value, registry_source_from_value,
         sanitize_skill_file_path, skill_store_browse, skill_store_detail, skill_store_hot,
-        skill_store_import_preview, skill_store_install, skill_store_translate, skill_store_update,
-        skill_store_update_all, skill_translation_provider_request, validate_skill_slug,
+        skill_store_import_preview, skill_store_install, skill_store_search, skill_store_translate,
+        skill_store_update, skill_store_update_all, skill_translation_provider_request,
+        validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -15288,33 +15290,27 @@ fn skill_store_browse_sort_is_whitelisted() {
     assert!(error.message().contains("unsupported skill store sort"));
 }
 
+#[test]
+fn skill_store_page_params_normalize_bounds() {
+    assert_eq!(
+        SkillStorePageParams::from_query(Some(0), Some(-1)),
+        SkillStorePageParams::from_query(None, None)
+    );
+    assert_eq!(
+        SkillStorePageParams::from_query(Some(2), Some(500)),
+        SkillStorePageParams::from_query(Some(2), Some(100))
+    );
+}
+
 #[tokio::test]
 async fn skill_store_browse_defaults_to_registry_installs_desc() {
     let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
     let _env_guard = skill_store_env_guard(&base_url).await;
 
-    let Json(_response) = skill_store_browse(Query(SkillStoreBrowseQuery { sort: None }))
-        .await
-        .expect("browse response");
-
-    assert_eq!(
-        seen_query
-            .lock()
-            .expect("seen query")
-            .clone()
-            .expect("captured query"),
-        "sortBy=installs&sortOrder=desc"
-    );
-    server_task.abort();
-}
-
-#[tokio::test]
-async fn skill_store_browse_uses_name_sort() {
-    let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
-    let _env_guard = skill_store_env_guard(&base_url).await;
-
-    let Json(_response) = skill_store_browse(Query(SkillStoreBrowseQuery {
-        sort: Some("name_asc".to_string()),
+    let Json(response) = skill_store_browse(Query(SkillStoreBrowseQuery {
+        sort: None,
+        page: None,
+        page_size: None,
     }))
     .await
     .expect("browse response");
@@ -15325,10 +15321,60 @@ async fn skill_store_browse_uses_name_sort() {
             .expect("seen query")
             .clone()
             .expect("captured query"),
-        "sortBy=name&sortOrder=asc"
+        "sortBy=installs&sortOrder=desc&page=1&pageSize=20"
+    );
+    let value = serde_json::to_value(response).expect("serialize browse response");
+    assert_eq!(value.get("hasMore").and_then(Value::as_bool), Some(true));
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn skill_store_browse_uses_name_sort() {
+    let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(_response) = skill_store_browse(Query(SkillStoreBrowseQuery {
+        sort: Some("name_asc".to_string()),
+        page: Some(2),
+        page_size: Some(50),
+    }))
+    .await
+    .expect("browse response");
+
+    assert_eq!(
+        seen_query
+            .lock()
+            .expect("seen query")
+            .clone()
+            .expect("captured query"),
+        "sortBy=name&sortOrder=asc&page=2&pageSize=50"
     );
     server_task.abort();
 }
+#[tokio::test]
+async fn skill_store_search_forwards_pagination() {
+    let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(_response) = skill_store_search(Query(SkillStoreSearchQuery {
+        query: "browser".to_string(),
+        page: Some(2),
+        page_size: Some(20),
+    }))
+    .await
+    .expect("search response");
+
+    assert_eq!(
+        seen_query
+            .lock()
+            .expect("seen query")
+            .clone()
+            .expect("captured query"),
+        "query=browser&q=browser&page=2&pageSize=20"
+    );
+    server_task.abort();
+}
+
 #[tokio::test]
 async fn skill_store_hot_endpoint_still_uses_public_hot_list() {
     let (base_url, _seen_query, server_task) = serve_skill_store_browse_fixture().await;
@@ -16485,8 +16531,10 @@ async fn serve_skill_store_browse_fixture() -> (
                                     "installs": 42
                                 }
                             ],
-                            "total": 1,
-                            "hasMore": false
+                            "total": 40,
+                            "page": 1,
+                            "pageSize": 20,
+                            "totalPages": 2
                         }))
                     }
                 }

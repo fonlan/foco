@@ -11,7 +11,7 @@ import {
   Search,
   ShieldCheck,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
 
 import type {
   ConfiguredSkillSummary,
@@ -91,6 +91,8 @@ type FileTreeNode =
 type SkillStoreSortMode = "installs_desc" | "name_asc" | "name_desc";
 
 const SEARCH_DEBOUNCE_MS = 300;
+const SKILL_STORE_PAGE_SIZE = 20;
+const LOAD_MORE_THRESHOLD_PX = 160;
 const DEFAULT_SORT_MODE: SkillStoreSortMode = "installs_desc";
 const SORT_OPTIONS: Array<{ label: string; value: SkillStoreSortMode }> = [
   { label: "Total installs", value: "installs_desc" },
@@ -120,7 +122,10 @@ export function SkillStorePage({
   const [listSource, setListSource] = useState("");
   const [selectedSkillKey, setSelectedSkillKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<SkillStoreDetailResponse | null>(null);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
   const [isLoadingList, setIsLoadingList] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [detailReloadKey, setDetailReloadKey] = useState(0);
   const [listError, setListError] = useState<string | null>(null);
@@ -141,6 +146,11 @@ export function SkillStorePage({
   const [isTranslating, setIsTranslating] = useState(false);
   const [translationError, setTranslationError] = useState<string | null>(null);
   const [translationCacheKey, setTranslationCacheKey] = useState<string | null>(null);
+  const listRef = useRef<HTMLOListElement | null>(null);
+  const pageRef = useRef(1);
+  const hasMoreRef = useRef(false);
+  const isLoadingListRef = useRef(true);
+  const isLoadingMoreRef = useRef(false);
   const lastTranslationResetKeyRef = useRef<string | null>(null);
 
   const configuredWorkspaces = settings?.workspaces ?? [];
@@ -176,6 +186,22 @@ export function SkillStorePage({
   }, [workspaceId, workspaceTargets]);
 
   useEffect(() => {
+    pageRef.current = page;
+  }, [page]);
+
+  useEffect(() => {
+    hasMoreRef.current = hasMore;
+  }, [hasMore]);
+
+  useEffect(() => {
+    isLoadingListRef.current = isLoadingList;
+  }, [isLoadingList]);
+
+  useEffect(() => {
+    isLoadingMoreRef.current = isLoadingMore;
+  }, [isLoadingMore]);
+
+  useEffect(() => {
     const handle = window.setTimeout(
       () => setDebouncedQuery(query.trim()),
       SEARCH_DEBOUNCE_MS,
@@ -183,40 +209,83 @@ export function SkillStorePage({
     return () => window.clearTimeout(handle);
   }, [query]);
 
-  const loadSkills = useCallback(async () => {
-    setIsLoadingList(true);
-    setListError(null);
-    setInstallMessage(null);
-    try {
-      const params = new URLSearchParams();
-      let path: string;
-      if (debouncedQuery) {
-        params.set("query", debouncedQuery);
-        path = `/api/skill-store/search?${params.toString()}`;
+  const loadSkills = useCallback(
+    async (mode: "reset" | "append" = "reset") => {
+      const nextPage = mode === "append" ? pageRef.current + 1 : 1;
+      if (mode === "append") {
+        if (!hasMoreRef.current || isLoadingListRef.current || isLoadingMoreRef.current) {
+          return;
+        }
+        setIsLoadingMore(true);
+        isLoadingMoreRef.current = true;
       } else {
-        params.set("sort", sortMode);
-        path = `/api/skill-store/browse?${params.toString()}`;
+        setIsLoadingList(true);
+        isLoadingListRef.current = true;
       }
-      const data = await requestJson<SkillStoreListResponse>(path);
-      setSkills(data.skills);
-      setListSource(data.source);
-      setSelectedSkillKey((current) =>
-        current && data.skills.some((skill) => skillSelectionKey(skill) === current)
-          ? current
-          : data.skills[0] ? skillSelectionKey(data.skills[0]) : null,
-      );
-    } catch (requestError) {
-      setSkills([]);
-      setSelectedSkillKey(null);
-      setListSource("");
-      setListError(errorMessage(requestError));
-    } finally {
-      setIsLoadingList(false);
-    }
-  }, [debouncedQuery, sortMode]);
+      setListError(null);
+      setInstallMessage(null);
+      try {
+        const params = new URLSearchParams();
+        params.set("page", String(nextPage));
+        params.set("pageSize", String(SKILL_STORE_PAGE_SIZE));
+        let path: string;
+        if (debouncedQuery) {
+          params.set("query", debouncedQuery);
+          path = `/api/skill-store/search?${params.toString()}`;
+        } else {
+          params.set("sort", sortMode);
+          path = `/api/skill-store/browse?${params.toString()}`;
+        }
+        const data = await requestJson<SkillStoreListResponse>(path);
+        setSkills((currentSkills) =>
+          mode === "append" ? [...currentSkills, ...data.skills] : data.skills,
+        );
+        setListSource(data.source);
+        setHasMore(data.hasMore);
+        hasMoreRef.current = data.hasMore;
+        setPage(nextPage);
+        pageRef.current = nextPage;
+        if (mode === "reset") {
+          setSelectedSkillKey((current) =>
+            current && data.skills.some((skill) => skillSelectionKey(skill) === current)
+              ? current
+              : data.skills[0] ? skillSelectionKey(data.skills[0]) : null,
+          );
+        }
+      } catch (requestError) {
+        setListError(errorMessage(requestError));
+        if (mode === "reset") {
+          setSkills([]);
+          setSelectedSkillKey(null);
+          setListSource("");
+          setHasMore(false);
+          hasMoreRef.current = false;
+          setPage(1);
+          pageRef.current = 1;
+        }
+      } finally {
+        if (mode === "append") {
+          setIsLoadingMore(false);
+          isLoadingMoreRef.current = false;
+        } else {
+          setIsLoadingList(false);
+          isLoadingListRef.current = false;
+        }
+      }
+    },
+    [debouncedQuery, sortMode],
+  );
 
   useEffect(() => {
-    void loadSkills();
+    void loadSkills("reset");
+  }, [loadSkills]);
+
+  const handleListScroll = useCallback((event: UIEvent<HTMLOListElement>) => {
+    const list = event.currentTarget;
+    const remaining = list.scrollHeight - list.scrollTop - list.clientHeight;
+    if (remaining <= LOAD_MORE_THRESHOLD_PX) {
+      void loadSkills("append");
+    }
   }, [loadSkills]);
 
   useEffect(() => {
@@ -442,8 +511,8 @@ export function SkillStorePage({
         <button
           aria-label={t("Refresh skills")}
           className="skill-store-icon-button"
-          disabled={isLoadingList}
-          onClick={() => void loadSkills()}
+          disabled={isLoadingList || isLoadingMore}
+          onClick={() => void loadSkills("reset")}
           title={t("Refresh skills")}
           type="button"
         >
@@ -528,17 +597,24 @@ export function SkillStorePage({
             {listSource ? <code>{listSource}</code> : null}
           </div>
 
-          {listError ? (
+          {listError && displayedSkills.length ? (
+            <p className="skill-store-error skill-store-list-error" role="alert">
+              {listError}
+              <button type="button" onClick={() => void loadSkills("append")}>{t("Retry")}</button>
+            </p>
+          ) : null}
+
+          {listError && !displayedSkills.length ? (
             <StatusBlock
               actionLabel={t("Retry")}
               message={listError}
-              onAction={() => void loadSkills()}
+              onAction={() => void loadSkills("reset")}
               title={t("Could not load skills")}
             />
           ) : isLoadingList ? (
             <LoadingBlock label={t("Loading skills...")} />
           ) : displayedSkills.length ? (
-            <ol className="skill-store-list">
+            <ol className="skill-store-list" onScroll={handleListScroll} ref={listRef}>
               {displayedSkills.map((skill, index) => (
                 <li key={`${skill.source ?? "skills"}/${skill.id}`}>
                   <button
@@ -577,6 +653,12 @@ export function SkillStorePage({
                   </button>
                 </li>
               ))}
+              {isLoadingMore ? (
+                <li className="skill-store-loading-more">
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  {t("Loading more skills...")}
+                </li>
+              ) : null}
             </ol>
           ) : (
             <StatusBlock

@@ -35,12 +35,43 @@ const SKILL_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 16_384;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreSearchQuery {
-    query: String,
+    pub(crate) query: String,
+    pub(crate) page: Option<i64>,
+    pub(crate) page_size: Option<i64>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreBrowseQuery {
     pub(crate) sort: Option<String>,
+    pub(crate) page: Option<i64>,
+    pub(crate) page_size: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SkillStorePageParams {
+    page: u32,
+    page_size: u32,
+}
+
+impl SkillStorePageParams {
+    const DEFAULT_PAGE: u32 = 1;
+    const DEFAULT_PAGE_SIZE: u32 = 20;
+    const MAX_PAGE_SIZE: u32 = 100;
+
+    pub(crate) fn from_query(page: Option<i64>, page_size: Option<i64>) -> Self {
+        let page = page
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(Self::DEFAULT_PAGE);
+        let page_size = page_size
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(Self::DEFAULT_PAGE_SIZE)
+            .min(Self::MAX_PAGE_SIZE);
+
+        Self { page, page_size }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,13 +264,19 @@ impl SkillStoreClient {
                 }),
         }
     }
-    async fn browse(&self, sort: SkillStoreBrowseSort) -> Result<SkillStoreListResponse, ApiError> {
+    async fn browse(
+        &self,
+        sort: SkillStoreBrowseSort,
+        page_params: SkillStorePageParams,
+    ) -> Result<SkillStoreListResponse, ApiError> {
         let (sort_by, sort_order) = sort.registry_params();
         let url = format!(
-            "{}?sortBy={}&sortOrder={}",
+            "{}?sortBy={}&sortOrder={}&page={}&pageSize={}",
             self.skills_api_url("/api/skills"),
             url_query_value(sort_by),
-            url_query_value(sort_order)
+            url_query_value(sort_order),
+            page_params.page,
+            page_params.page_size
         );
         let value = self
             .http
@@ -287,7 +324,11 @@ impl SkillStoreClient {
         Ok(list_response_from_value(value, "skills.sh:public-hot"))
     }
 
-    async fn search(&self, query: &str) -> Result<SkillStoreListResponse, ApiError> {
+    async fn search(
+        &self,
+        query: &str,
+        page_params: SkillStorePageParams,
+    ) -> Result<SkillStoreListResponse, ApiError> {
         let query = query.trim();
         if query.is_empty() {
             return Err(ApiError::bad_request("search query must not be empty"));
@@ -295,10 +336,12 @@ impl SkillStoreClient {
         let encoded_query = url_query_value(query);
         if self.token.is_some() {
             let url = format!(
-                "{}?query={}&q={}",
+                "{}?query={}&q={}&page={}&pageSize={}",
                 self.skills_url("/api/v1/skills/search"),
                 encoded_query,
-                encoded_query
+                encoded_query,
+                page_params.page,
+                page_params.page_size
             );
             match self.skills_get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
@@ -314,16 +357,22 @@ impl SkillStoreClient {
             }
         }
 
-        self.skills_api_search(query).await
+        self.skills_api_search(query, page_params).await
     }
 
-    async fn skills_api_search(&self, query: &str) -> Result<SkillStoreListResponse, ApiError> {
+    async fn skills_api_search(
+        &self,
+        query: &str,
+        page_params: SkillStorePageParams,
+    ) -> Result<SkillStoreListResponse, ApiError> {
         let encoded_query = url_query_value(query);
         let url = format!(
-            "{}?query={}&q={}",
+            "{}?query={}&q={}&page={}&pageSize={}",
             self.skills_api_url("/api/skills"),
             encoded_query,
-            encoded_query
+            encoded_query,
+            page_params.page,
+            page_params.page_size
         );
         let value = self
             .http
@@ -344,7 +393,15 @@ impl SkillStoreClient {
         skill_id: &str,
     ) -> Result<Option<String>, ApiError> {
         let skill_id = validate_skill_slug(skill_id)?;
-        let response = self.skills_api_search(&skill_id).await?;
+        let response = self
+            .skills_api_search(
+                &skill_id,
+                SkillStorePageParams::from_query(
+                    None,
+                    Some(SkillStorePageParams::MAX_PAGE_SIZE as i64),
+                ),
+            )
+            .await?;
         Ok(response
             .skills
             .into_iter()
@@ -728,7 +785,10 @@ pub(crate) async fn skill_store_browse(
 ) -> Result<Json<SkillStoreListResponse>, ApiError> {
     Ok(Json(
         SkillStoreClient::from_env()
-            .browse(SkillStoreBrowseSort::from_query(query.sort.as_deref())?)
+            .browse(
+                SkillStoreBrowseSort::from_query(query.sort.as_deref())?,
+                SkillStorePageParams::from_query(query.page, query.page_size),
+            )
             .await?,
     ))
 }
@@ -737,7 +797,12 @@ pub(crate) async fn skill_store_search(
     Query(query): Query<SkillStoreSearchQuery>,
 ) -> Result<Json<SkillStoreListResponse>, ApiError> {
     Ok(Json(
-        SkillStoreClient::from_env().search(&query.query).await?,
+        SkillStoreClient::from_env()
+            .search(
+                &query.query,
+                SkillStorePageParams::from_query(query.page, query.page_size),
+            )
+            .await?,
     ))
 }
 
@@ -1907,11 +1972,15 @@ fn list_response_from_value(value: Value, source: &str) -> SkillStoreListRespons
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(skills.len());
-    let has_more = value
-        .get("hasMore")
-        .or_else(|| value.get("has_more"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let has_more = bool_field(&value, &["hasMore", "has_more"]).unwrap_or_else(|| {
+        match (
+            u64_field(&value, &["page"]),
+            u64_field(&value, &["totalPages", "total_pages"]),
+        ) {
+            (Some(page), Some(total_pages)) => page < total_pages,
+            _ => false,
+        }
+    });
 
     SkillStoreListResponse {
         skills,

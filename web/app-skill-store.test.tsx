@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -34,7 +34,7 @@ describe("skill store app surface", () => {
     expect(screen.queryByText("Sort")).not.toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(
-        ([url]) => url === "/api/skill-store/browse?sort=installs_desc",
+        ([url]) => url === "/api/skill-store/browse?page=1&pageSize=20&sort=installs_desc",
       ),
     ).toBe(true);
     expect(
@@ -42,6 +42,32 @@ describe("skill store app surface", () => {
         String(url).startsWith("/api/skill-store/skills/browser-scout?"),
       ),
     ).toBe(true);
+  });
+
+  it("loads the next browse page when the skill list reaches the bottom", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    const listPane = await screen.findByRole("region", { name: "Skill list" });
+    const list = await within(listPane).findByRole("list");
+    expect(within(listPane).queryByText("Page Two Skill")).not.toBeInTheDocument();
+
+    Object.defineProperties(list, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 900 },
+      scrollTop: { configurable: true, value: 360, writable: true },
+    });
+    fireEvent.scroll(list);
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/skill-store/browse?page=2&pageSize=20&sort=installs_desc",
+        ),
+      ).toBe(true),
+    );
+    expect(await within(listPane).findByText("Page Two Skill")).toBeInTheDocument();
   });
 
   it("reloads the registry list when the sort changes", async () => {
@@ -59,7 +85,7 @@ describe("skill store app surface", () => {
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(
-          ([url]) => url === "/api/skill-store/browse?sort=name_asc",
+          ([url]) => url === "/api/skill-store/browse?page=1&pageSize=20&sort=name_asc",
         ),
       ).toBe(true),
     );
@@ -188,7 +214,7 @@ describe("skill store app surface", () => {
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(([url]) =>
-          String(url).includes("/api/skill-store/search?query=browser"),
+          String(url).includes("/api/skill-store/search?page=1&pageSize=20&query=browser"),
         ),
       ).toBe(true),
     );
