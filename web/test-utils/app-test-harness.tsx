@@ -2673,6 +2673,22 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  if (path === "/api/skill-store/import-preview") {
+    return jsonResponse({
+      description: "Create HTML presentations from notes.",
+      files: [
+        {
+          path: "SKILL.md",
+          content:
+            "---\nname: html-ppt\ndescription: Create HTML presentations from notes.\n---\n\n# HTML PPT\n",
+        },
+      ],
+      id: "html-ppt",
+      name: "HTML PPT",
+      source: "foco/html-ppt",
+    });
+  }
+
   if (path === "/api/skill-store/install") {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
       target?: string;

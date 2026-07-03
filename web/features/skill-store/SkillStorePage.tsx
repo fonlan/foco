@@ -5,6 +5,7 @@ import {
   FileText,
   Folder,
   Languages,
+  Link2,
   LoaderCircle,
   RefreshCw,
   Search,
@@ -124,6 +125,11 @@ export function SkillStorePage({
   const [detailReloadKey, setDetailReloadKey] = useState(0);
   const [listError, setListError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [importInput, setImportInput] = useState("");
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importedSkill, setImportedSkill] = useState<SkillStoreSkill | null>(null);
+  const [importedDetail, setImportedDetail] = useState<SkillStoreDetailResponse | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
   const [installTarget, setInstallTarget] = useState<InstallTarget>("global");
   const [workspaceId, setWorkspaceId] = useState("");
   const [overwrite, setOverwrite] = useState(false);
@@ -147,9 +153,20 @@ export function SkillStorePage({
     }));
   }, [configuredWorkspaces, workspaces]);
 
+  const displayedSkills = useMemo(() => {
+    if (!importedSkill) {
+      return skills;
+    }
+    const importedKey = skillSelectionKey(importedSkill);
+    return [
+      importedSkill,
+      ...skills.filter((skill) => skillSelectionKey(skill) !== importedKey),
+    ];
+  }, [importedSkill, skills]);
+
   const selectedSkill = useMemo(
-    () => skills.find((skill) => skillSelectionKey(skill) === selectedSkillKey) ?? null,
-    [selectedSkillKey, skills],
+    () => displayedSkills.find((skill) => skillSelectionKey(skill) === selectedSkillKey) ?? null,
+    [selectedSkillKey, displayedSkills],
   );
 
   useEffect(() => {
@@ -217,6 +234,16 @@ export function SkillStorePage({
     setInstallMessage(null);
     setOverwrite(false);
 
+    if (
+      importedDetail &&
+      importedSkill &&
+      skillSelectionKey(importedSkill) === skillSelectionKey(selectedSkill)
+    ) {
+      setDetail(importedDetail);
+      setIsLoadingDetail(false);
+      return () => abortController.abort();
+    }
+
     const params = new URLSearchParams();
     if (selectedSkill.source) {
       params.set("source", selectedSkill.source);
@@ -240,6 +267,48 @@ export function SkillStorePage({
 
     return () => abortController.abort();
   }, [detailReloadKey, selectedSkill]);
+
+  async function previewImport() {
+    const input = importInput.trim();
+    if (!input) {
+      setImportError(t("Paste a skill URL or command"));
+      return;
+    }
+
+    setIsImporting(true);
+    setImportError(null);
+    setInstallMessage(null);
+    setInstallError(null);
+    try {
+      const data = await requestJson<SkillStoreDetailResponse>(
+        "/api/skill-store/import-preview",
+        {
+          body: JSON.stringify({ input }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      const skill: SkillStoreSkill = {
+        change: null,
+        description: data.description,
+        id: data.id,
+        installs: null,
+        installsYesterday: null,
+        name: data.name || data.id,
+        official: false,
+        source: data.source,
+      };
+      setImportedSkill(skill);
+      setImportedDetail(data);
+      setSelectedSkillKey(skillSelectionKey(skill));
+      setDetail(data);
+      setDetailError(null);
+    } catch (requestError) {
+      setImportError(errorMessage(requestError));
+    } finally {
+      setIsImporting(false);
+    }
+  }
 
   async function installSelectedSkill() {
     if (!detail) {
@@ -417,6 +486,42 @@ export function SkillStorePage({
               </select>
             </label>
           </div>
+          <form
+            className="skill-store-import"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void previewImport();
+            }}
+          >
+            <label htmlFor="skill-store-import-input">
+              <Link2 aria-hidden="true" className="size-4" />
+              <input
+                id="skill-store-import-input"
+                aria-label={t("Import skill URL")}
+                onChange={(event) => setImportInput(event.target.value)}
+                placeholder={t("Paste skills.sh, GitHub, or npx command")}
+                type="text"
+                value={importInput}
+              />
+            </label>
+            <button
+              className="skill-store-secondary-button"
+              disabled={isImporting}
+              type="submit"
+            >
+              {isImporting ? (
+                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              ) : (
+                <Link2 aria-hidden="true" className="size-4" />
+              )}
+              {t("Preview")}
+            </button>
+          </form>
+          {importError ? (
+            <p className="skill-store-error skill-store-import-error" role="alert">
+              {importError}
+            </p>
+          ) : null}
           <div className="skill-store-list-meta">
             <span>
               {debouncedQuery ? t("Search results") : t(sortLabel(sortMode))}
@@ -433,9 +538,9 @@ export function SkillStorePage({
             />
           ) : isLoadingList ? (
             <LoadingBlock label={t("Loading skills...")} />
-          ) : skills.length ? (
+          ) : displayedSkills.length ? (
             <ol className="skill-store-list">
-              {skills.map((skill, index) => (
+              {displayedSkills.map((skill, index) => (
                 <li key={`${skill.source ?? "skills"}/${skill.id}`}>
                   <button
                     className={

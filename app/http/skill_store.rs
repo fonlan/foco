@@ -76,6 +76,18 @@ impl SkillStoreBrowseSort {
 pub(crate) struct SkillStoreDetailQuery {
     pub(crate) source: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreImportPreviewRequest {
+    pub(crate) input: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillStoreImportTarget {
+    pub(crate) source: String,
+    pub(crate) skill_id: Option<String>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreInstallRequest {
@@ -453,6 +465,154 @@ impl SkillStoreClient {
         }
     }
 
+    async fn import_preview(&self, input: &str) -> Result<SkillStoreDetailResponse, ApiError> {
+        let target = parse_skill_store_import_target(input)?;
+        let (skill_id, files) = self
+            .github_skill_files_auto(&target.source, target.skill_id.as_deref())
+            .await?;
+        Ok(detail_response_from_files(skill_id, target.source, files))
+    }
+
+    async fn github_skill_files_auto(
+        &self,
+        source: &str,
+        skill_id: Option<&str>,
+    ) -> Result<(String, Vec<SkillStoreFile>), ApiError> {
+        let source = validate_github_source(source)?;
+        let requested_skill_id = skill_id.map(validate_skill_slug).transpose()?;
+
+        if let Some(skill_id) = requested_skill_id {
+            let files = self.github_skill_files(&source, &skill_id).await?;
+            return Ok((skill_id, files));
+        }
+
+        for branch in ["main", "master"] {
+            match self
+                .github_skill_files_auto_for_branch(&source, branch)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) if error.message().contains("multiple") => return Err(error),
+                Err(error) => {
+                    tracing::debug!(branch, error = %error.message(), "GitHub skill auto lookup failed");
+                }
+            }
+        }
+
+        Err(ApiError::bad_request(format!(
+            "could not find a unique {SKILL_FILE_NAME} in GitHub source '{source}'"
+        )))
+    }
+
+    async fn github_skill_files_auto_for_branch(
+        &self,
+        source: &str,
+        branch: &str,
+    ) -> Result<(String, Vec<SkillStoreFile>), ApiError> {
+        let tree_items = self.github_tree_items(source, branch).await?;
+        let root = find_auto_github_skill_root(&tree_items, source)?;
+        let fallback_id = source
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| ApiError::bad_request("GitHub source did not include repo name"))?;
+        let files = self
+            .github_skill_files_for_root(source, branch, &tree_items, &root)
+            .await?;
+        let skill_id = skill_id_from_files(&files).unwrap_or_else(|| fallback_id.to_string());
+        let skill_id = validate_skill_slug(&skill_id)?;
+        Ok((skill_id, files))
+    }
+
+    async fn github_tree_items(&self, source: &str, branch: &str) -> Result<Vec<Value>, ApiError> {
+        let tree_url = format!(
+            "{}/repos/{}/git/trees/{}?recursive=1",
+            self.github_api_base_url.trim_end_matches('/'),
+            source,
+            branch
+        );
+        let tree = self
+            .http
+            .get(tree_url)
+            .header(reqwest::header::USER_AGENT, "foco-skill-store")
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?
+            .json::<Value>()
+            .await
+            .map_err(network_error)?;
+
+        tree.get("tree")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("GitHub tree response did not include files"))
+    }
+
+    async fn github_skill_files_for_root(
+        &self,
+        source: &str,
+        branch: &str,
+        tree_items: &[Value],
+        skill_root: &str,
+    ) -> Result<Vec<SkillStoreFile>, ApiError> {
+        let mut paths = tree_items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("blob"))
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .filter(|path| github_path_is_under_root(*path, skill_root))
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut files = Vec::with_capacity(paths.len());
+        for github_path in paths {
+            let relative = github_path
+                .strip_prefix(skill_root)
+                .unwrap_or(&github_path)
+                .trim_start_matches('/');
+            let clean_path = match sanitize_skill_file_path(if relative.is_empty() {
+                SKILL_FILE_NAME
+            } else {
+                relative
+            }) {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::debug!(path = github_path, error = %error.message(), "skipping unsupported GitHub skill file");
+                    continue;
+                }
+            };
+            let raw_url = format!(
+                "{}/{}/{}/{}",
+                self.github_raw_base_url.trim_end_matches('/'),
+                source,
+                branch,
+                github_path
+                    .split('/')
+                    .map(url_segment)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+            let content = self
+                .http
+                .get(raw_url)
+                .send()
+                .await
+                .map_err(network_error)?
+                .error_for_status()
+                .map_err(network_error)?
+                .text()
+                .await
+                .map_err(network_error)?;
+            files.push(SkillStoreFile {
+                path: clean_path,
+                content,
+            });
+        }
+        ensure_skill_files_valid(&files)?;
+        Ok(files)
+    }
+
     async fn skills_api_detail(
         &self,
         skill_id: &str,
@@ -536,79 +696,10 @@ impl SkillStoreClient {
         skill_id: &str,
         branch: &str,
     ) -> Result<Vec<SkillStoreFile>, ApiError> {
-        let tree_url = format!(
-            "{}/repos/{}/git/trees/{}?recursive=1",
-            self.github_api_base_url.trim_end_matches('/'),
-            source,
-            branch
-        );
-        let tree = self
-            .http
-            .get(tree_url)
-            .header(reqwest::header::USER_AGENT, "foco-skill-store")
-            .send()
+        let tree_items = self.github_tree_items(source, branch).await?;
+        let skill_root = find_github_skill_root(&tree_items, skill_id)?;
+        self.github_skill_files_for_root(source, branch, &tree_items, &skill_root)
             .await
-            .map_err(network_error)?
-            .error_for_status()
-            .map_err(network_error)?
-            .json::<Value>()
-            .await
-            .map_err(network_error)?;
-
-        let tree_items = tree
-            .get("tree")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ApiError::bad_request("GitHub tree response did not include files"))?;
-        let skill_root = find_github_skill_root(tree_items, skill_id)?;
-        let mut paths = tree_items
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("blob"))
-            .filter_map(|item| item.get("path").and_then(Value::as_str))
-            .filter(|path| github_path_is_under_root(*path, &skill_root))
-            .map(|path| path.to_string())
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        let mut files = Vec::with_capacity(paths.len());
-        for github_path in paths {
-            let relative = github_path
-                .strip_prefix(&skill_root)
-                .unwrap_or(&github_path)
-                .trim_start_matches('/');
-            let clean_path = sanitize_skill_file_path(if relative.is_empty() {
-                SKILL_FILE_NAME
-            } else {
-                relative
-            })?;
-            let raw_url = format!(
-                "{}/{}/{}/{}",
-                self.github_raw_base_url.trim_end_matches('/'),
-                source,
-                branch,
-                github_path
-                    .split('/')
-                    .map(url_segment)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-            let content = self
-                .http
-                .get(raw_url)
-                .send()
-                .await
-                .map_err(network_error)?
-                .error_for_status()
-                .map_err(network_error)?
-                .text()
-                .await
-                .map_err(network_error)?;
-            files.push(SkillStoreFile {
-                path: clean_path,
-                content,
-            });
-        }
-        ensure_skill_files_valid(&files)?;
-        Ok(files)
     }
 
     fn skills_url(&self, path: &str) -> String {
@@ -657,6 +748,16 @@ pub(crate) async fn skill_store_detail(
     Ok(Json(
         SkillStoreClient::from_env()
             .detail(&skill_id, query.source.as_deref())
+            .await?,
+    ))
+}
+
+pub(crate) async fn skill_store_import_preview(
+    Json(request): Json<SkillStoreImportPreviewRequest>,
+) -> Result<Json<SkillStoreDetailResponse>, ApiError> {
+    Ok(Json(
+        SkillStoreClient::from_env()
+            .import_preview(&request.input)
             .await?,
     ))
 }
@@ -1355,6 +1456,217 @@ fn validate_repo_segment(value: &str) -> Result<(), ()> {
     Ok(())
 }
 
+pub(crate) fn parse_skill_store_import_target(
+    input: &str,
+) -> Result<SkillStoreImportTarget, ApiError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(ApiError::bad_request("import input must not be empty"));
+    }
+
+    if let Some(target) = parse_npx_skills_add_command(input)? {
+        return Ok(target);
+    }
+    if let Some(target) = parse_skills_sh_skill_url(input)? {
+        return Ok(target);
+    }
+    if let Some(source) = github_source_from_string(input) {
+        return Ok(SkillStoreImportTarget {
+            source,
+            skill_id: None,
+        });
+    }
+
+    Err(ApiError::bad_request(
+        "paste a skills.sh skill URL, GitHub repository URL, or npx skills add command",
+    ))
+}
+
+fn parse_npx_skills_add_command(input: &str) -> Result<Option<SkillStoreImportTarget>, ApiError> {
+    let tokens = shell_words(input)?;
+    let Some(add_index) = tokens
+        .windows(2)
+        .position(|window| window[0] == "skills" && window[1] == "add")
+    else {
+        return Ok(None);
+    };
+    if !tokens[..=add_index].iter().any(|token| token == "npx") {
+        return Ok(None);
+    }
+
+    let mut source = None;
+    let mut skill_id = None;
+    let mut index = add_index + 2;
+    while index < tokens.len() {
+        let token = tokens[index].trim();
+        if let Some(value) = token.strip_prefix("--skill=") {
+            skill_id = Some(validate_skill_slug(value)?);
+        } else if token == "--skill" {
+            let value = tokens
+                .get(index + 1)
+                .ok_or_else(|| ApiError::bad_request("npx skills add --skill requires a value"))?;
+            skill_id = Some(validate_skill_slug(value)?);
+            index += 1;
+        } else if source.is_none() {
+            source = github_source_from_string(token);
+        }
+        index += 1;
+    }
+
+    let source = source.ok_or_else(|| {
+        ApiError::bad_request("npx skills add command must include a GitHub repository URL")
+    })?;
+    Ok(Some(SkillStoreImportTarget { source, skill_id }))
+}
+
+fn shell_words(input: &str) -> Result<Vec<String>, ApiError> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, ch) if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(active), ch) if ch == active => quote = None,
+            (_, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if let Some(active) = quote {
+        return Err(ApiError::bad_request(format!(
+            "import command has an unterminated {active} quote"
+        )));
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn parse_skills_sh_skill_url(input: &str) -> Result<Option<SkillStoreImportTarget>, ApiError> {
+    let Some((host, mut segments)) = http_host_and_path(input) else {
+        return Ok(None);
+    };
+    if host != "skills.sh" && host != "www.skills.sh" {
+        return Ok(None);
+    }
+    if segments.first().map(String::as_str) == Some("skills") {
+        segments.remove(0);
+    }
+    if segments.len() < 3 || segments[0] == "b" || segments[0] == "api" || segments[0] == "docs" {
+        return Err(ApiError::bad_request(
+            "skills.sh URL must point to a skill page like /owner/repo/skill",
+        ));
+    }
+
+    let owner = &segments[0];
+    let repo = segments[1].trim_end_matches(".git");
+    let skill_id = &segments[2];
+    let source = validate_github_source(&format!("{owner}/{repo}"))?;
+    let skill_id = validate_skill_slug(skill_id)?;
+    Ok(Some(SkillStoreImportTarget {
+        source,
+        skill_id: Some(skill_id),
+    }))
+}
+
+fn http_host_and_path(input: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = input
+        .trim()
+        .trim_matches(|ch| matches!(ch, '`' | '\'' | '"' | ','));
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let (host, path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    if host.is_empty() || host.contains('@') || host.contains(':') {
+        return None;
+    }
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.trim_end_matches(".git").to_string())
+        .collect::<Vec<_>>();
+    Some((host.to_ascii_lowercase(), path))
+}
+
+fn find_auto_github_skill_root(tree_items: &[Value], source: &str) -> Result<String, ApiError> {
+    let skill_file_suffix = format!("/{SKILL_FILE_NAME}");
+    let mut candidates = tree_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("blob"))
+        .filter_map(|item| item.get("path").and_then(Value::as_str))
+        .filter(|path| path.ends_with(&skill_file_suffix) || *path == SKILL_FILE_NAME)
+        .map(|path| {
+            path.strip_suffix(&skill_file_suffix)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+    if candidates.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "GitHub tree did not contain {SKILL_FILE_NAME}"
+        )));
+    }
+
+    let repo_name = source.rsplit('/').next().unwrap_or_default();
+    let mut repo_matches = candidates
+        .iter()
+        .filter(|root| root.rsplit('/').next().unwrap_or_default() == repo_name)
+        .cloned()
+        .collect::<Vec<_>>();
+    if repo_matches.len() == 1 {
+        return Ok(repo_matches.remove(0));
+    }
+
+    Err(ApiError::bad_request(format!(
+        "GitHub source '{source}' contains multiple {SKILL_FILE_NAME} files; pass --skill to choose one"
+    )))
+}
+
+fn skill_id_from_files(files: &[SkillStoreFile]) -> Option<String> {
+    files
+        .iter()
+        .find(|file| file.path == SKILL_FILE_NAME)
+        .and_then(|file| parse_skill_markdown(Path::new(SKILL_FILE_NAME), &file.content).ok())
+        .map(|parsed| parsed.id)
+}
+
+fn detail_response_from_files(
+    fallback_id: String,
+    source: String,
+    files: Vec<SkillStoreFile>,
+) -> SkillStoreDetailResponse {
+    let id = skill_id_from_files(&files).unwrap_or(fallback_id);
+    SkillStoreDetailResponse {
+        name: id.clone(),
+        description: String::new(),
+        source: Some(source),
+        id,
+        files,
+    }
+}
+
 fn find_github_skill_root(tree_items: &[Value], skill_id: &str) -> Result<String, ApiError> {
     let skill_file_suffix = format!("/{SKILL_FILE_NAME}");
     let mut candidates = tree_items
@@ -1487,10 +1799,18 @@ fn github_source_from_string(value: &str) -> Option<String> {
     for prefix in [
         "https://github.com/",
         "http://github.com/",
+        "https://www.github.com/",
+        "http://www.github.com/",
+        "github.com/",
+        "www.github.com/",
         "git@github.com:",
     ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let source = rest.trim_end_matches('/');
+            let source = rest
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(rest)
+                .trim_end_matches('/');
             let source = source.split('/').take(2).collect::<Vec<_>>().join("/");
             if validate_github_source(&source).is_ok() {
                 return Some(source);

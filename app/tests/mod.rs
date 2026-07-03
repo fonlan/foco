@@ -54,12 +54,12 @@ use crate::http::{
     },
     skill_store::{
         SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
-        SkillStoreInstallRequest, SkillStoreTranslateRequest, SkillStoreUpdateRequest,
-        ensure_skill_files_valid, install_skill_files_to_target_dir, registry_files_from_value,
-        registry_source_from_value, sanitize_skill_file_path, skill_store_browse,
-        skill_store_detail, skill_store_hot, skill_store_install, skill_store_translate,
-        skill_store_update, skill_store_update_all, skill_translation_provider_request,
-        validate_skill_slug,
+        SkillStoreImportPreviewRequest, SkillStoreInstallRequest, SkillStoreTranslateRequest,
+        SkillStoreUpdateRequest, ensure_skill_files_valid, install_skill_files_to_target_dir,
+        parse_skill_store_import_target, registry_files_from_value, registry_source_from_value,
+        sanitize_skill_file_path, skill_store_browse, skill_store_detail, skill_store_hot,
+        skill_store_import_preview, skill_store_install, skill_store_translate, skill_store_update,
+        skill_store_update_all, skill_translation_provider_request, validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -14676,6 +14676,33 @@ fn skill_store_registry_detail_prefers_canonical_github_source() {
     );
 }
 
+#[test]
+fn skill_store_import_target_parses_supported_inputs() {
+    let skills_url = parse_skill_store_import_target(
+        "https://skills.sh/larksuite/cli/lark-note?utm_source=test",
+    )
+    .expect("skills.sh skill page");
+    assert_eq!(skills_url.source, "larksuite/cli");
+    assert_eq!(skills_url.skill_id.as_deref(), Some("lark-note"));
+
+    let github_url = parse_skill_store_import_target("https://github.com/foco-dev/html-ppt")
+        .expect("GitHub repo URL");
+    assert_eq!(github_url.source, "foco-dev/html-ppt");
+    assert_eq!(github_url.skill_id, None);
+
+    let npx_command = parse_skill_store_import_target(
+        "npx skills add https://github.com/larksuite/cli --skill lark-note",
+    )
+    .expect("npx command");
+    assert_eq!(npx_command.source, "larksuite/cli");
+    assert_eq!(npx_command.skill_id.as_deref(), Some("lark-note"));
+
+    let bad_input = parse_skill_store_import_target("https://example.com/not-a-skill")
+        .expect_err("unsupported URL should fail");
+    assert_eq!(bad_input.status, StatusCode::BAD_REQUEST);
+    assert!(bad_input.message().contains("skills.sh"));
+}
+
 #[tokio::test]
 async fn skill_store_detail_uses_canonical_registry_source_for_display_source() {
     let seen_files_path = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -14765,6 +14792,96 @@ async fn skill_store_detail_uses_canonical_registry_source_for_display_source() 
         seen_files_path.lock().expect("seen files path").as_deref(),
         Some("/api/skills/larksuite/cli/lark-note/files")
     );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn skill_store_import_preview_fetches_unique_github_skill() {
+    let app = axum::Router::new()
+        .route(
+            "/repos/owner/repo/git/trees/main",
+            axum::routing::get(|| async {
+                Json(json!({
+                    "tree": [
+                        { "type": "blob", "path": "skills/gitmemo/SKILL.md" },
+                        { "type": "blob", "path": "skills/gitmemo/support/prompts.md" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/owner/repo/main/skills/gitmemo/SKILL.md",
+            axum::routing::get(|| async {
+                "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+            }),
+        )
+        .route(
+            "/owner/repo/main/skills/gitmemo/support/prompts.md",
+            axum::routing::get(|| async { "Remember the useful bits." }),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind import preview fixture");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _env_guard = skill_store_env_guard(&format!("http://{addr}")).await;
+
+    let Json(response) = skill_store_import_preview(Json(SkillStoreImportPreviewRequest {
+        input: "https://github.com/owner/repo".to_string(),
+    }))
+    .await
+    .expect("import preview response");
+    let value = serde_json::to_value(response).expect("serialize import preview response");
+
+    assert_eq!(value.get("id").and_then(Value::as_str), Some("gitmemo"));
+    assert_eq!(
+        value.get("source").and_then(Value::as_str),
+        Some("owner/repo")
+    );
+    assert_eq!(
+        value
+            .get("files")
+            .and_then(Value::as_array)
+            .and_then(|files| files.first())
+            .and_then(|file| file.get("path"))
+            .and_then(Value::as_str),
+        Some("SKILL.md")
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn skill_store_import_preview_rejects_ambiguous_github_repo() {
+    let app = axum::Router::new().route(
+        "/repos/owner/repo/git/trees/main",
+        axum::routing::get(|| async {
+            Json(json!({
+                "tree": [
+                    { "type": "blob", "path": "skills/alpha/SKILL.md" },
+                    { "type": "blob", "path": "skills/beta/SKILL.md" }
+                ]
+            }))
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind ambiguous import preview fixture");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _env_guard = skill_store_env_guard(&format!("http://{addr}")).await;
+
+    let error = skill_store_import_preview(Json(SkillStoreImportPreviewRequest {
+        input: "https://github.com/owner/repo".to_string(),
+    }))
+    .await
+    .expect_err("ambiguous repo should fail");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message().contains("multiple SKILL.md"));
     server_task.abort();
 }
 
@@ -16050,6 +16167,8 @@ struct SkillStoreEnvGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     skills_api_base_url: Option<String>,
     skills_sh_base_url: Option<String>,
+    skills_store_github_api_base_url: Option<String>,
+    skills_store_github_raw_base_url: Option<String>,
     skills_sh_token: Option<String>,
     vercel_oidc_token: Option<String>,
 }
@@ -16062,6 +16181,8 @@ async fn skill_store_env_guard(skills_api_base_url: &str) -> SkillStoreEnvGuard 
         _lock: guard,
         skills_api_base_url: env::var("SKILLS_API_BASE_URL").ok(),
         skills_sh_base_url: env::var("SKILLS_SH_BASE_URL").ok(),
+        skills_store_github_api_base_url: env::var("SKILLS_STORE_GITHUB_API_BASE_URL").ok(),
+        skills_store_github_raw_base_url: env::var("SKILLS_STORE_GITHUB_RAW_BASE_URL").ok(),
         skills_sh_token: env::var("SKILLS_SH_TOKEN").ok(),
         vercel_oidc_token: env::var("VERCEL_OIDC_TOKEN").ok(),
     };
@@ -16069,6 +16190,8 @@ async fn skill_store_env_guard(skills_api_base_url: &str) -> SkillStoreEnvGuard 
     unsafe {
         env::set_var("SKILLS_API_BASE_URL", skills_api_base_url);
         env::set_var("SKILLS_SH_BASE_URL", skills_api_base_url);
+        env::set_var("SKILLS_STORE_GITHUB_API_BASE_URL", skills_api_base_url);
+        env::set_var("SKILLS_STORE_GITHUB_RAW_BASE_URL", skills_api_base_url);
         env::remove_var("SKILLS_SH_TOKEN");
         env::remove_var("VERCEL_OIDC_TOKEN");
     }
@@ -16079,6 +16202,14 @@ impl Drop for SkillStoreEnvGuard {
     fn drop(&mut self) {
         restore_env_var("SKILLS_API_BASE_URL", self.skills_api_base_url.as_deref());
         restore_env_var("SKILLS_SH_BASE_URL", self.skills_sh_base_url.as_deref());
+        restore_env_var(
+            "SKILLS_STORE_GITHUB_API_BASE_URL",
+            self.skills_store_github_api_base_url.as_deref(),
+        );
+        restore_env_var(
+            "SKILLS_STORE_GITHUB_RAW_BASE_URL",
+            self.skills_store_github_raw_base_url.as_deref(),
+        );
         restore_env_var("SKILLS_SH_TOKEN", self.skills_sh_token.as_deref());
         restore_env_var("VERCEL_OIDC_TOKEN", self.vercel_oidc_token.as_deref());
     }

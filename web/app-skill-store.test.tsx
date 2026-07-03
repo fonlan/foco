@@ -142,6 +142,38 @@ describe("skill store app surface", () => {
     ).toBeInTheDocument();
   });
 
+  it("previews a pasted npx GitHub skill import", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    changeInput(
+      await screen.findByRole("textbox", { name: "Import skill URL" }),
+      "npx skills add https://github.com/foco/html-ppt --skill html-ppt",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) => url === "/api/skill-store/import-preview" && init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    const importCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/skill-store/import-preview" && init?.method === "POST",
+    );
+    expect(JSON.parse(String(importCall?.[1]?.body))).toEqual({
+      input: "npx skills add https://github.com/foco/html-ppt --skill html-ppt",
+    });
+    const detailPane = await screen.findByRole("region", { name: "Skill details" });
+    expect(await within(detailPane).findByRole("heading", { level: 2, name: "HTML PPT" })).toBeInTheDocument();
+    expect(within(detailPane).getByText("foco/html-ppt")).toBeInTheDocument();
+    expect(
+      within(await screen.findByRole("region", { name: "Skill list" })).getByText("HTML PPT"),
+    ).toBeInTheDocument();
+  });
+
   it("searches and installs a skill through the backend proxy", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
