@@ -1987,6 +1987,47 @@ pub(crate) async fn refresh_skills(
     settings_response(&state, &config).await
 }
 
+pub(crate) async fn delete_skill(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteSettingsItemRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("skill id must not be empty"));
+    }
+
+    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let skill = discovery
+        .skills
+        .iter()
+        .find(|skill| skill.key == id)
+        .ok_or_else(|| ApiError::bad_request(format!("skill was not found: {id}")))?;
+    let roots = skill_search_roots(&state.user_profile_dir, &config.workspaces);
+    let skill_dir =
+        deletable_skill_directory_for_path(&skill.path, &roots).map_err(ApiError::bad_request)?;
+
+    std::fs::remove_dir_all(&skill_dir).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to delete skill directory {}: {}",
+            skill_dir.display(),
+            source
+        ))
+    })?;
+
+    config.skills.disabled.retain(|key| key != &skill.key);
+    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    config.skills.detected = discovery.skills;
+    config.skills.disabled =
+        merge_disabled_skill_keys(config.skills.disabled.clone(), &discovery.required_disabled);
+    refresh_derived_enabled_skills(&mut config);
+
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
 pub(crate) async fn test_provider(
     State(state): State<AppState>,
     Json(request): Json<TestProviderRequest>,

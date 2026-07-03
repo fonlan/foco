@@ -384,6 +384,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/skills/refresh",
             post(crate::http::settings::refresh_skills),
         )
+        .route(
+            "/api/skills/delete",
+            post(crate::http::settings::delete_skill),
+        )
         .route("/api/ai-statistics", get(crate::http::chat::ai_statistics))
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/enable",

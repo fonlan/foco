@@ -388,6 +388,64 @@ pub(crate) fn skill_search_roots(
     roots
 }
 
+pub(crate) fn deletable_skill_directory_for_path(
+    skill_path: &Path,
+    roots: &[SkillSearchRoot],
+) -> Result<PathBuf, String> {
+    if skill_path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return Err(format!(
+            "skill path is not a SKILL.md file: {}",
+            skill_path.display()
+        ));
+    }
+
+    let skill_dir = skill_path.parent().ok_or_else(|| {
+        format!(
+            "skill path has no parent directory: {}",
+            skill_path.display()
+        )
+    })?;
+    if !skill_dir.join("SKILL.md").is_file() {
+        return Err(format!(
+            "skill directory does not contain SKILL.md: {}",
+            skill_dir.display()
+        ));
+    }
+
+    for root in roots {
+        if skill_dir == root.directory {
+            return Err(format!(
+                "skill '{}' is defined directly in a skills root; delete it manually",
+                skill_path.display()
+            ));
+        }
+
+        if skill_dir.parent() == Some(root.directory.as_path()) {
+            reject_symlink(&root.directory, "skills root")?;
+            reject_symlink(skill_dir, "skill directory")?;
+            return Ok(skill_dir.to_path_buf());
+        }
+    }
+
+    Err(format!(
+        "skill directory is not a direct child of a configured skills root: {}",
+        skill_dir.display()
+    ))
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| format!("failed to inspect {label} {}: {source}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} is a symlink and must be deleted manually: {}",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn skill_key(root: &SkillSearchRoot, skill_id: &str) -> String {
     match root.scope {
         SKILL_SCOPE_GLOBAL => format!("global:{skill_id}"),
@@ -737,4 +795,75 @@ fn skill_frontmatter_entry(path: &Path, skill: ParsedSkillFile) -> String {
         xml_text_escape(&path.display().to_string()),
         xml_cdata_section("frontmatter", skill.frontmatter.trim())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletable_skill_directory_allows_nested_skill_directory() {
+        let profile = tempfile::tempdir().expect("profile");
+        let roots = skill_search_roots(profile.path(), &[]);
+        let root = &roots[0].directory;
+        let skill_dir = root.join("demo");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: demo\ndescription: demo\n---\nUse demo.",
+        )
+        .expect("skill file");
+
+        let deletable = deletable_skill_directory_for_path(&skill_file, &roots).expect("deletable");
+        assert_eq!(deletable, skill_dir);
+
+        fs::remove_dir_all(&deletable).expect("remove skill dir");
+        assert!(!skill_dir.exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn deletable_skill_directory_rejects_root_level_skill_file() {
+        let profile = tempfile::tempdir().expect("profile");
+        let roots = skill_search_roots(profile.path(), &[]);
+        let root = &roots[0].directory;
+        fs::create_dir_all(root).expect("skills root");
+        let skill_file = root.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: root\ndescription: root\n---\nUse root.",
+        )
+        .expect("skill file");
+
+        let error = deletable_skill_directory_for_path(&skill_file, &roots).expect_err("rejected");
+        assert!(error.contains("defined directly in a skills root"));
+        assert!(root.exists());
+        assert!(skill_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletable_skill_directory_rejects_symlinked_skills_root() {
+        let profile = tempfile::tempdir().expect("profile");
+        let external = tempfile::tempdir().expect("external");
+        let roots = skill_search_roots(profile.path(), &[]);
+        let root = &roots[0].directory;
+        let parent = root.parent().expect("root parent");
+        fs::create_dir_all(parent).expect("skills parent");
+        std::os::unix::fs::symlink(external.path(), root).expect("root symlink");
+
+        let skill_dir = root.join("demo");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: demo\ndescription: demo\n---\nUse demo.",
+        )
+        .expect("skill file");
+
+        let error = deletable_skill_directory_for_path(&skill_file, &roots).expect_err("rejected");
+        assert!(error.contains("skills root is a symlink"));
+        assert!(external.path().join("demo").exists());
+    }
 }
