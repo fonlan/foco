@@ -266,6 +266,7 @@ const REQUEST_STORM_DEDUPE_MS = 400;
 
 type SingleFlightEntry<T> = {
   promise: Promise<T>;
+  queued?: boolean;
   settled: boolean;
   startedAtMs: number;
 };
@@ -1971,6 +1972,10 @@ export function App() {
   const loadActivePlans = useCallback((workspaceId: string, options: { force?: boolean } = {}) => {
     const nowMs = requestStormDedupeNow();
     const existing = activePlansSingleFlightRef.current.get(workspaceId);
+    if (existing && !existing.settled) {
+      existing.queued = true;
+      return existing.promise;
+    }
     if (shouldReuseRequest(existing, nowMs, options.force)) {
       return existing!.promise;
     }
@@ -2004,12 +2009,20 @@ export function App() {
         }
         const current = activePlansSingleFlightRef.current.get(workspaceId);
         if (current?.promise === promise) {
+          const shouldRefreshQueued = current.queued;
           current.settled = true;
-          window.setTimeout(() => {
-            if (activePlansSingleFlightRef.current.get(workspaceId)?.promise === promise) {
-              activePlansSingleFlightRef.current.delete(workspaceId);
-            }
-          }, REQUEST_STORM_DEDUPE_MS);
+          if (shouldRefreshQueued) {
+            activePlansSingleFlightRef.current.delete(workspaceId);
+            // ponytail: workspace-only queue is enough for the current active-plans endpoint;
+            // upgrade to a request key if plan views or page sizes diverge.
+            void loadActivePlans(workspaceId, { force: true });
+          } else {
+            window.setTimeout(() => {
+              if (activePlansSingleFlightRef.current.get(workspaceId)?.promise === promise) {
+                activePlansSingleFlightRef.current.delete(workspaceId);
+              }
+            }, REQUEST_STORM_DEDUPE_MS);
+          }
         }
       }
     })();
@@ -2784,44 +2797,30 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
+    if (!activeWorkspace?.id) {
       return;
     }
-    const intervalId = window.setInterval(() => {
-      if (!isDocumentVisible()) {
-        return;
-      }
-      void loadPlanAutoRunState(activeWorkspace.id);
-      void loadActivePlans(activeWorkspace.id);
-    }, PLAN_AUTO_RUN_REFRESH_MS);
 
-    return () => window.clearInterval(intervalId);
-  }, [
-    activeWorkspace?.id,
-    isPlanAutoRunEnabled,
-    loadActivePlans,
-    loadPlanAutoRunState,
-  ]);
-
-  useEffect(() => {
+    const shouldRefreshAutoRunState = isPlanAutoRunEnabled;
     const shouldRefreshRunningPlans =
-      isPlanAutoRunEnabled ||
-      (isContextPanelOpen && contextPanelTab === "plan");
+      (isPlanAutoRunEnabled || (isContextPanelOpen && contextPanelTab === "plan")) &&
+      activePlans.some(isAutoRunPlanInFlight);
 
-    if (!shouldRefreshRunningPlans || !activeWorkspace?.id) {
-      return;
-    }
-    if (!activePlans.some(isAutoRunPlanInFlight)) {
+    if (!shouldRefreshAutoRunState && !shouldRefreshRunningPlans) {
       return;
     }
 
-    // ponytail: visible Plan panel polling is a fallback for backend phase
-    // advancement; upgrade path is a backend plan subscription.
+    // ponytail: one interval owns Plan polling; split again only if these cadences diverge.
     const intervalId = window.setInterval(() => {
       if (!isDocumentVisible()) {
         return;
       }
-      void loadActivePlans(activeWorkspace.id);
+      if (shouldRefreshAutoRunState) {
+        void loadPlanAutoRunState(activeWorkspace.id);
+      }
+      if (shouldRefreshRunningPlans) {
+        void loadActivePlans(activeWorkspace.id);
+      }
     }, PLAN_AUTO_RUN_REFRESH_MS);
 
     return () => window.clearInterval(intervalId);
@@ -2832,6 +2831,7 @@ export function App() {
     isContextPanelOpen,
     isPlanAutoRunEnabled,
     loadActivePlans,
+    loadPlanAutoRunState,
   ]);
 
   useEffect(() => {

@@ -1088,17 +1088,31 @@ describe("app-panels-stats verification surfaces", () => {
 
   it("single-flights plan and auto-run polling while auto-run is enabled", async () => {
     const user = userEvent.setup();
-    const intervalCallbacks: Array<{ handler: TimerHandler; timeout?: number }> = [];
+    const intervalCallbacks = new Map<number, { handler: TimerHandler; timeout?: number }>();
+    let nextIntervalId = 0;
     let nowMs = 0;
+    let holdPlanRequests = false;
+    const heldPlanResponses: Array<Deferred<Response>> = [];
+    const runningPlan = { ...planFixture, status: "running" };
+    const plansResponse = () =>
+      jsonResponse({
+        page: 1,
+        pageSize: 50,
+        plans: [runningPlan],
+        totalCount: 1,
+        totalPages: 1,
+      });
     const performanceNowSpy = vi.spyOn(performance, "now").mockImplementation(() => nowMs);
     const setIntervalSpy = vi.spyOn(window, "setInterval").mockImplementation(
       ((handler: TimerHandler, timeout?: number) => {
-        intervalCallbacks.push({ handler, timeout });
-        return intervalCallbacks.length;
+        nextIntervalId += 1;
+        intervalCallbacks.set(nextIntervalId, { handler, timeout });
+        return nextIntervalId;
       }) as typeof window.setInterval,
     );
-    const clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
-    const runningPlan = { ...planFixture, status: "running" };
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation((id) => {
+      intervalCallbacks.delete(Number(id));
+    });
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const rawUrl = typeof input === "string" ? input : input.toString();
       const path = new URL(rawUrl, "http://127.0.0.1").pathname;
@@ -1108,13 +1122,12 @@ describe("app-panels-stats verification surfaces", () => {
       }
 
       if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [runningPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
+        if (holdPlanRequests) {
+          const response = deferred<Response>();
+          heldPlanResponses.push(response);
+          return response.promise;
+        }
+        return plansResponse();
       }
 
       return mockFetch(input, init);
@@ -1129,18 +1142,20 @@ describe("app-panels-stats verification surfaces", () => {
       expect(await screen.findByText(runningPlan.title)).toBeInTheDocument();
       await waitFor(() => {
         expect(
-          intervalCallbacks.filter(({ timeout }) => timeout === 3000),
-        ).toHaveLength(2);
+          Array.from(intervalCallbacks.values()).filter(({ timeout }) => timeout === 3000),
+        ).toHaveLength(1);
       });
 
       fetchMock.mockClear();
+      holdPlanRequests = true;
       nowMs = 1000;
+      const poll = Array.from(intervalCallbacks.values()).find((item) => item.timeout === 3000)?.handler;
+      if (typeof poll !== "function") {
+        throw new Error("Expected plan polling interval");
+      }
       await act(async () => {
-        for (const { handler, timeout } of intervalCallbacks.filter((item) => item.timeout === 3000)) {
-          if (typeof handler === "function") {
-            handler();
-          }
-        }
+        poll();
+        poll();
       });
 
       const requestCount = (pathname: string) =>
@@ -1149,8 +1164,21 @@ describe("app-panels-stats verification surfaces", () => {
           return new URL(rawUrl, "http://127.0.0.1").pathname === pathname;
         }).length;
 
+      expect(heldPlanResponses).toHaveLength(1);
       expect(requestCount("/api/workspaces/workspace-1/plans")).toBe(1);
       expect(requestCount("/api/workspaces/workspace-1/plans/auto-run")).toBe(1);
+
+      await act(async () => {
+        heldPlanResponses[0].resolve(plansResponse());
+      });
+      await waitFor(() => {
+        expect(heldPlanResponses).toHaveLength(2);
+      });
+      expect(requestCount("/api/workspaces/workspace-1/plans")).toBe(2);
+
+      await act(async () => {
+        heldPlanResponses[1].resolve(plansResponse());
+      });
     } finally {
       performanceNowSpy.mockRestore();
       setIntervalSpy.mockRestore();
