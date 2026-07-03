@@ -53,12 +53,13 @@ use crate::http::{
         default_plan_mode_system_prompt, filter_provider_model_ids,
     },
     skill_store::{
-        SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreFile, SkillStoreInstallRequest,
-        SkillStoreTranslateRequest, SkillStoreUpdateRequest, ensure_skill_files_valid,
-        install_skill_files_to_target_dir, registry_files_from_value, registry_source_from_value,
-        sanitize_skill_file_path, skill_store_browse, skill_store_hot, skill_store_install,
-        skill_store_translate, skill_store_update, skill_store_update_all,
-        skill_translation_provider_request, validate_skill_slug,
+        SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
+        SkillStoreInstallRequest, SkillStoreTranslateRequest, SkillStoreUpdateRequest,
+        ensure_skill_files_valid, install_skill_files_to_target_dir, registry_files_from_value,
+        registry_source_from_value, sanitize_skill_file_path, skill_store_browse,
+        skill_store_detail, skill_store_hot, skill_store_install, skill_store_translate,
+        skill_store_update, skill_store_update_all, skill_translation_provider_request,
+        validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -14528,6 +14529,98 @@ fn skill_store_registry_detail_prefers_canonical_github_source() {
         registry_source_from_value(&value),
         Some("larksuite/cli".to_string())
     );
+}
+
+#[tokio::test]
+async fn skill_store_detail_uses_canonical_registry_source_for_display_source() {
+    let seen_files_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let app = axum::Router::new()
+        .route(
+            "/api/skills",
+            axum::routing::get(|| async {
+                Json(json!({
+                    "skills": [
+                        {
+                            "id": "lark-note",
+                            "source": "open.feishu.cn"
+                        },
+                        {
+                            "id": "lark-note",
+                            "source": "larksuite/cli"
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/api/skills/{skill_id}",
+            axum::routing::get(|AxumPath(skill_id): AxumPath<String>| async move {
+                Json(json!({
+                    "id": skill_id,
+                    "source": "open.feishu.cn",
+                    "owner": "open.feishu.cn",
+                    "repo": "",
+                    "files": []
+                }))
+            }),
+        )
+        .route(
+            "/api/skills/{owner}/{repo}/{skill_id}/files",
+            axum::routing::get({
+                let seen_files_path = seen_files_path.clone();
+                move |uri: axum::http::Uri,
+                      AxumPath((owner, repo, skill_id)): AxumPath<(String, String, String)>| {
+                    let seen_files_path = seen_files_path.clone();
+                    async move {
+                        *seen_files_path.lock().expect("seen files path") = Some(uri.path().to_string());
+                        assert_eq!((owner.as_str(), repo.as_str(), skill_id.as_str()), ("larksuite", "cli", "lark-note"));
+                        Json(json!({
+                            "files": [
+                                {
+                                    "path": "SKILL.md",
+                                    "content": "---\nname: lark-note\ndescription: Lark notes.\n---\n"
+                                }
+                            ]
+                        }))
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind skill store detail fallback fixture");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _env_guard = skill_store_env_guard(&format!("http://{addr}")).await;
+
+    let Json(response) = skill_store_detail(
+        AxumPath("lark-note".to_string()),
+        Query(SkillStoreDetailQuery { source: None }),
+    )
+    .await
+    .expect("detail response");
+    let value = serde_json::to_value(response).expect("serialize detail response");
+
+    assert_eq!(
+        value.get("source").and_then(Value::as_str),
+        Some("larksuite/cli")
+    );
+    assert_eq!(
+        value
+            .get("files")
+            .and_then(Value::as_array)
+            .and_then(|files| files.first())
+            .and_then(|file| file.get("path"))
+            .and_then(Value::as_str),
+        Some("SKILL.md")
+    );
+    assert_eq!(
+        seen_files_path.lock().expect("seen files path").as_deref(),
+        Some("/api/skills/larksuite/cli/lark-note/files")
+    );
+    server_task.abort();
 }
 
 #[test]

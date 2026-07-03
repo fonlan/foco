@@ -74,7 +74,7 @@ impl SkillStoreBrowseSort {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreDetailQuery {
-    source: Option<String>,
+    pub(crate) source: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -327,6 +327,20 @@ impl SkillStoreClient {
         Ok(list_response_from_value(value, "skills-api:search"))
     }
 
+    async fn canonical_github_source_for_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let skill_id = validate_skill_slug(skill_id)?;
+        let response = self.skills_api_search(&skill_id).await?;
+        Ok(response
+            .skills
+            .into_iter()
+            .filter(|skill| skill.id == skill_id)
+            .filter_map(|skill| skill.source)
+            .find_map(|source| validate_github_source(&source).ok()))
+    }
+
     async fn detail(
         &self,
         skill_id: &str,
@@ -377,13 +391,36 @@ impl SkillStoreClient {
                             return Ok(detail);
                         }
                         Err(error) => {
-                            tracing::warn!(source, error = %error.message(), "skills-api file request failed; trying GitHub fallback");
+                            tracing::warn!(source, error = %error.message(), "skills-api file request failed; trying canonical registry source");
                         }
                     }
 
                     if let Ok(files) = self.github_skill_files(&source, &skill_id).await {
                         detail.files = files;
                         return Ok(detail);
+                    }
+                }
+
+                match self.canonical_github_source_for_skill(&skill_id).await {
+                    Ok(Some(source)) => match self.skills_api_skill_files(&source, &skill_id).await
+                    {
+                        Ok(files) => {
+                            detail.source = Some(source);
+                            detail.files = files;
+                            return Ok(detail);
+                        }
+                        Err(error) => {
+                            tracing::warn!(source, error = %error.message(), "canonical skills-api file request failed; trying GitHub fallback");
+                            if let Ok(files) = self.github_skill_files(&source, &skill_id).await {
+                                detail.source = Some(source);
+                                detail.files = files;
+                                return Ok(detail);
+                            }
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error.message(), "canonical registry source lookup failed; trying GitHub fallback");
                     }
                 }
 
