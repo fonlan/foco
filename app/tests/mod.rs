@@ -53,10 +53,11 @@ use crate::http::{
         default_plan_mode_system_prompt, filter_provider_model_ids,
     },
     skill_store::{
-        SkillStoreFile, SkillStoreInstallRequest, SkillStoreTranslateRequest,
-        SkillStoreUpdateRequest, ensure_skill_files_valid, install_skill_files_to_target_dir,
-        registry_files_from_value, registry_source_from_value, sanitize_skill_file_path,
-        skill_store_install, skill_store_translate, skill_store_update, skill_store_update_all,
+        SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreFile, SkillStoreInstallRequest,
+        SkillStoreTranslateRequest, SkillStoreUpdateRequest, ensure_skill_files_valid,
+        install_skill_files_to_target_dir, registry_files_from_value, registry_source_from_value,
+        sanitize_skill_file_path, skill_store_browse, skill_store_hot, skill_store_install,
+        skill_store_translate, skill_store_update, skill_store_update_all,
         skill_translation_provider_request, validate_skill_slug,
     },
     spec::{
@@ -14552,6 +14553,86 @@ fn skill_store_registry_files_parse_skill_and_support_files() {
     assert_eq!(files[1].path, "support/prompts.md");
     assert_eq!(files[1].content, "Use the calendar API.");
 }
+#[test]
+fn skill_store_browse_sort_is_whitelisted() {
+    assert_eq!(
+        SkillStoreBrowseSort::from_query(None).expect("default sort"),
+        SkillStoreBrowseSort::InstallsDesc
+    );
+    assert_eq!(
+        SkillStoreBrowseSort::from_query(Some("name_asc")).expect("name asc sort"),
+        SkillStoreBrowseSort::NameAsc
+    );
+    assert_eq!(
+        SkillStoreBrowseSort::NameDesc.registry_params(),
+        ("name", "desc")
+    );
+
+    let error =
+        SkillStoreBrowseSort::from_query(Some("latest")).expect_err("unsupported sort should fail");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message().contains("unsupported skill store sort"));
+}
+
+#[tokio::test]
+async fn skill_store_browse_defaults_to_registry_installs_desc() {
+    let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(_response) = skill_store_browse(Query(SkillStoreBrowseQuery { sort: None }))
+        .await
+        .expect("browse response");
+
+    assert_eq!(
+        seen_query
+            .lock()
+            .expect("seen query")
+            .clone()
+            .expect("captured query"),
+        "sortBy=installs&sortOrder=desc"
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn skill_store_browse_uses_name_sort() {
+    let (base_url, seen_query, server_task) = serve_skill_store_browse_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(_response) = skill_store_browse(Query(SkillStoreBrowseQuery {
+        sort: Some("name_asc".to_string()),
+    }))
+    .await
+    .expect("browse response");
+
+    assert_eq!(
+        seen_query
+            .lock()
+            .expect("seen query")
+            .clone()
+            .expect("captured query"),
+        "sortBy=name&sortOrder=asc"
+    );
+    server_task.abort();
+}
+#[tokio::test]
+async fn skill_store_hot_endpoint_still_uses_public_hot_list() {
+    let (base_url, _seen_query, server_task) = serve_skill_store_browse_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+    let Json(response) = skill_store_hot().await.expect("hot response");
+    let value = serde_json::to_value(response).expect("serialize hot response");
+
+    assert_eq!(
+        value.get("source").and_then(Value::as_str),
+        Some("skills.sh:public-hot")
+    );
+    assert_eq!(
+        value.get("skills").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+    server_task.abort();
+}
 
 #[test]
 fn skill_store_translation_request_preserves_target_and_tool_schema() {
@@ -15666,9 +15747,71 @@ async fn serve_skill_store_detail_fixture() -> (String, tokio::task::JoinHandle<
     (format!("http://{addr}"), task)
 }
 
+async fn serve_skill_store_browse_fixture() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen_query = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let app = axum::Router::new()
+        .route(
+            "/api/skills",
+            axum::routing::get({
+                let seen_query_for_handler = seen_query.clone();
+                move |uri: axum::http::Uri| {
+                    let seen_query = seen_query_for_handler.clone();
+                    async move {
+                        *seen_query.lock().expect("seen query") = uri.query().map(str::to_string);
+                        Json(json!({
+                            "skills": [
+                                {
+                                    "id": "browser-scout",
+                                    "name": "Browser Scout",
+                                    "description": "Find useful web references.",
+                                    "source": "foco/browser-scout",
+                                    "installs": 42
+                                }
+                            ],
+                            "total": 1,
+                            "hasMore": false
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/skills/hot/0",
+            axum::routing::get(|| async {
+                Json(json!({
+                    "skills": [
+                        {
+                            "id": "browser-scout",
+                            "name": "Browser Scout",
+                            "description": "Find useful web references.",
+                            "source": "foco/browser-scout",
+                            "installs": 42
+                        }
+                    ],
+                    "total": 1,
+                    "hasMore": false
+                }))
+            }),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind skill store browse fixture server");
+    let addr = listener.local_addr().expect("fixture server address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}"), seen_query, task)
+}
+
 struct SkillStoreEnvGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     skills_api_base_url: Option<String>,
+    skills_sh_base_url: Option<String>,
     skills_sh_token: Option<String>,
     vercel_oidc_token: Option<String>,
 }
@@ -15680,12 +15823,14 @@ async fn skill_store_env_guard(skills_api_base_url: &str) -> SkillStoreEnvGuard 
     let env_guard = SkillStoreEnvGuard {
         _lock: guard,
         skills_api_base_url: env::var("SKILLS_API_BASE_URL").ok(),
+        skills_sh_base_url: env::var("SKILLS_SH_BASE_URL").ok(),
         skills_sh_token: env::var("SKILLS_SH_TOKEN").ok(),
         vercel_oidc_token: env::var("VERCEL_OIDC_TOKEN").ok(),
     };
     // ponytail: tests share process env; the guard serializes only skill-store env mutation.
     unsafe {
         env::set_var("SKILLS_API_BASE_URL", skills_api_base_url);
+        env::set_var("SKILLS_SH_BASE_URL", skills_api_base_url);
         env::remove_var("SKILLS_SH_TOKEN");
         env::remove_var("VERCEL_OIDC_TOKEN");
     }
@@ -15695,6 +15840,7 @@ async fn skill_store_env_guard(skills_api_base_url: &str) -> SkillStoreEnvGuard 
 impl Drop for SkillStoreEnvGuard {
     fn drop(&mut self) {
         restore_env_var("SKILLS_API_BASE_URL", self.skills_api_base_url.as_deref());
+        restore_env_var("SKILLS_SH_BASE_URL", self.skills_sh_base_url.as_deref());
         restore_env_var("SKILLS_SH_TOKEN", self.skills_sh_token.as_deref());
         restore_env_var("VERCEL_OIDC_TOKEN", self.vercel_oidc_token.as_deref());
     }

@@ -87,7 +87,19 @@ type FileTreeNode =
       type: "file";
     };
 
+type SkillStoreSortMode = "installs_desc" | "name_asc" | "name_desc";
+
 const SEARCH_DEBOUNCE_MS = 300;
+const DEFAULT_SORT_MODE: SkillStoreSortMode = "installs_desc";
+const SORT_OPTIONS: Array<{ label: string; value: SkillStoreSortMode }> = [
+  { label: "Total installs", value: "installs_desc" },
+  { label: "Name A-Z", value: "name_asc" },
+  { label: "Name Z-A", value: "name_desc" },
+];
+
+function sortLabel(sortMode: SkillStoreSortMode): string {
+  return SORT_OPTIONS.find((option) => option.value === sortMode)?.label ?? "Total installs";
+}
 
 export function SkillStorePage({
   onSettingsChange,
@@ -98,6 +110,7 @@ export function SkillStorePage({
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [sortMode, setSortMode] = useState<SkillStoreSortMode>(DEFAULT_SORT_MODE);
   const [skills, setSkills] = useState<SkillStoreSkill[]>([]);
   const [listSource, setListSource] = useState("");
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
@@ -155,10 +168,13 @@ export function SkillStorePage({
     setInstallMessage(null);
     try {
       const params = new URLSearchParams();
-      let path = "/api/skill-store/hot";
+      let path: string;
       if (debouncedQuery) {
         params.set("query", debouncedQuery);
         path = `/api/skill-store/search?${params.toString()}`;
+      } else {
+        params.set("sort", sortMode);
+        path = `/api/skill-store/browse?${params.toString()}`;
       }
       const data = await requestJson<SkillStoreListResponse>(path);
       setSkills(data.skills);
@@ -176,7 +192,7 @@ export function SkillStorePage({
     } finally {
       setIsLoadingList(false);
     }
-  }, [debouncedQuery]);
+  }, [debouncedQuery, sortMode]);
 
   useEffect(() => {
     void loadSkills();
@@ -348,7 +364,7 @@ export function SkillStorePage({
       <header className="skill-store-header">
         <div className="min-w-0">
           <h1>{t("Skill Store")}</h1>
-          <p>{t("Browse skills.sh hot skills from the last 24 hours")}</p>
+          <p>{t("Browse registry skills by total installs")}</p>
         </div>
         <button
           aria-label={t("Refresh skills")}
@@ -367,22 +383,39 @@ export function SkillStorePage({
 
       <div className="skill-store-layout">
         <section className="skill-store-list-pane" aria-label={t("Skill list")}>
-          <label className="skill-store-search" htmlFor="skill-store-search">
-            <Search aria-hidden="true" className="size-4" />
-            <input
-              id="skill-store-search"
-              aria-label={t("Search skills")}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t("Search skills")}
-              type="search"
-              value={query}
-            />
-          </label>
+          <div className="skill-store-controls">
+            <label className="skill-store-search" htmlFor="skill-store-search">
+              <Search aria-hidden="true" className="size-4" />
+              <input
+                id="skill-store-search"
+                aria-label={t("Search skills")}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("Search skills")}
+                type="search"
+                value={query}
+              />
+            </label>
+            <label className="skill-store-sort" htmlFor="skill-store-sort">
+              <span>{t("Sort")}</span>
+              <select
+                id="skill-store-sort"
+                aria-label={t("Sort skills")}
+                onChange={(event) =>
+                  setSortMode(event.target.value as SkillStoreSortMode)
+                }
+                value={sortMode}
+              >
+                {SORT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {t(option.label)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <div className="skill-store-list-meta">
             <span>
-              {debouncedQuery
-                ? t("Search results")
-                : t("Hot skills in the last 24h")}
+              {debouncedQuery ? t("Search results") : t(sortLabel(sortMode))}
             </span>
             {listSource ? <code>{listSource}</code> : null}
           </div>

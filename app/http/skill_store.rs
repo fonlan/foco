@@ -39,6 +39,39 @@ pub(crate) struct SkillStoreSearchQuery {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct SkillStoreBrowseQuery {
+    pub(crate) sort: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillStoreBrowseSort {
+    InstallsDesc,
+    NameAsc,
+    NameDesc,
+}
+
+impl SkillStoreBrowseSort {
+    pub(crate) fn from_query(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.unwrap_or("installs_desc") {
+            "installs_desc" => Ok(Self::InstallsDesc),
+            "name_asc" => Ok(Self::NameAsc),
+            "name_desc" => Ok(Self::NameDesc),
+            other => Err(ApiError::bad_request(format!(
+                "unsupported skill store sort '{other}'"
+            ))),
+        }
+    }
+
+    pub(crate) fn registry_params(self) -> (&'static str, &'static str) {
+        match self {
+            Self::InstallsDesc => ("installs", "desc"),
+            Self::NameAsc => ("name", "asc"),
+            Self::NameDesc => ("name", "desc"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreDetailQuery {
     source: Option<String>,
@@ -187,6 +220,27 @@ impl SkillStoreClient {
                         .filter(|value| !value.trim().is_empty())
                 }),
         }
+    }
+    async fn browse(&self, sort: SkillStoreBrowseSort) -> Result<SkillStoreListResponse, ApiError> {
+        let (sort_by, sort_order) = sort.registry_params();
+        let url = format!(
+            "{}?sortBy={}&sortOrder={}",
+            self.skills_api_url("/api/skills"),
+            url_query_value(sort_by),
+            url_query_value(sort_order)
+        );
+        let value = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?
+            .json::<Value>()
+            .await
+            .map_err(network_error)?;
+        Ok(list_response_from_value(value, "skills-api:browse"))
     }
 
     async fn hot(&self) -> Result<SkillStoreListResponse, ApiError> {
@@ -539,6 +593,16 @@ impl SkillStoreClient {
 
 pub(crate) async fn skill_store_hot() -> Result<Json<SkillStoreListResponse>, ApiError> {
     Ok(Json(SkillStoreClient::from_env().hot().await?))
+}
+
+pub(crate) async fn skill_store_browse(
+    Query(query): Query<SkillStoreBrowseQuery>,
+) -> Result<Json<SkillStoreListResponse>, ApiError> {
+    Ok(Json(
+        SkillStoreClient::from_env()
+            .browse(SkillStoreBrowseSort::from_query(query.sort.as_deref())?)
+            .await?,
+    ))
 }
 
 pub(crate) async fn skill_store_search(

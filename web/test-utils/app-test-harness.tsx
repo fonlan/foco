@@ -2616,6 +2616,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  if (path === "/api/skill-store/browse") {
+    return jsonResponse({
+      hasMore: false,
+      skills: skillStoreHotSkills,
+      source: "test-browse",
+      total: skillStoreHotSkills.length,
+    });
+  }
+
   if (path === "/api/skill-store/hot") {
     return jsonResponse({
       hasMore: false,

@@ -91,6 +91,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::skill_store::skill_store_hot),
         )
         .route(
+            "/api/skill-store/browse",
+            get(crate::http::skill_store::skill_store_browse),
+        )
+        .route(
             "/api/skill-store/search",
             get(crate::http::skill_store::skill_store_search),
         )

@@ -15,7 +15,7 @@ import {
 describe("skill store app surface", () => {
   beforeEach(resetAppTestEnvironment);
 
-  it("opens the skill store from the nav and loads the hot list", async () => {
+  it("opens the skill store from the nav and loads the registry list", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -28,8 +28,12 @@ describe("skill store app surface", () => {
       "foco-nav-rail-button-active",
     );
     expect(await screen.findByText("Browser Scout")).toBeInTheDocument();
+    expect(screen.getAllByText("Total installs").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Hot skills in the last 24h")).not.toBeInTheDocument();
     expect(
-      fetchMock.mock.calls.some(([url]) => url === "/api/skill-store/hot"),
+      fetchMock.mock.calls.some(
+        ([url]) => url === "/api/skill-store/browse?sort=installs_desc",
+      ),
     ).toBe(true);
     expect(
       fetchMock.mock.calls.some(([url]) =>
@@ -38,6 +42,27 @@ describe("skill store app surface", () => {
     ).toBe(true);
   });
 
+  it("reloads the registry list when the sort changes", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    expect(await screen.findAllByText("Browser Scout")).not.toHaveLength(0);
+
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Sort skills" }),
+      "name_asc",
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/skill-store/browse?sort=name_asc",
+        ),
+      ).toBe(true),
+    );
+    expect(screen.getAllByText("Name A-Z").length).toBeGreaterThan(0);
+  });
   it("searches and installs a skill through the backend proxy", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
