@@ -4547,6 +4547,23 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("audit count"),
         2
     );
+    let request_id_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_id: Some("request-1"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request id audit rows");
+    assert_eq!(request_id_rows.len(), 1);
+    assert_eq!(request_id_rows[0].id, "request-1");
+    assert_eq!(
+        database
+            .llm_request_audit_count(LlmRequestAuditFilters {
+                request_id: Some("request-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("request id audit count"),
+        1
+    );
     let empty_summary = database
         .llm_request_audit_summary(LlmRequestAuditFilters {
             final_state: Some("missing"),

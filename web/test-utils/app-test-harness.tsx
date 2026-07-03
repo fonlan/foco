@@ -1284,6 +1284,7 @@ export const chatMessages = {
       ],
       metrics: {
         firstTokenLatencyMs: 250,
+        llmRequestIds: ["request-1"],
         modelId: "gpt-test",
         outputTokens: 40,
         providerId: "openai",

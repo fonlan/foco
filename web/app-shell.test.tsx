@@ -296,6 +296,38 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("opens API statistics filtered to the assistant reply request", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const assistantBubble = (await screen.findByText("edit_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    await userEvent.click(
+      within(assistantBubble).getByRole("button", {
+        name: "View API requests for this reply",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/stats");
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get("requestId")).toBe("request-1");
+    });
+    await waitFor(() => {
+      const statsCall = aiStatisticsCallUrlsFromMock(fetchMock).find(
+        (url) => url.searchParams.get("requestId") === "request-1",
+      );
+      expect(statsCall?.searchParams.get("workspaceId")).toBe("workspace-1");
+      expect(statsCall?.searchParams.get("chatId")).toBe("chat-1");
+    });
+  });
+
   it("hides assistant reply metrics while the message is streaming", async () => {
     const streamingMessages = {
       ...chatMessages,
