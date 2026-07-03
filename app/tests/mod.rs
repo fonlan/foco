@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use crate::runtime::agent_run_event_kind;
 use axum::{
@@ -14747,6 +14748,161 @@ async fn skill_store_update_rejects_skill_without_store_metadata() {
 }
 
 #[tokio::test]
+async fn skill_store_update_overwrites_files_and_refreshes_discovery() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-update-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-skill-store-update-workspace-test"));
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    let Json(install) = skill_store_install(
+        State(state.clone()),
+        Json(SkillStoreInstallRequest {
+            skill_id: "gitmemo".to_string(),
+            source: Some("owner/repo".to_string()),
+            target: SKILL_SCOPE_GLOBAL.to_string(),
+            workspace_id: None,
+            overwrite: false,
+            files: vec![
+                SkillStoreFile {
+                    path: "SKILL.md".to_string(),
+                    content:
+                        "---\nname: gitmemo\ndescription: Old project memory.\n---\n\n# GitMemo\n"
+                            .to_string(),
+                },
+                SkillStoreFile {
+                    path: "support/prompts.md".to_string(),
+                    content: "old prompt".to_string(),
+                },
+            ],
+        }),
+    )
+    .await
+    .expect("skill install");
+    let install_path = PathBuf::from(&install.path);
+    let (base_url, server_task) = serve_skill_store_detail_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(response) = skill_store_update(
+        State(state),
+        Json(SkillStoreUpdateRequest {
+            key: "global:gitmemo".to_string(),
+        }),
+    )
+    .await
+    .expect("skill update");
+
+    assert_eq!(response.results.len(), 1);
+    assert!(response.results[0].ok);
+    assert_eq!(
+        fs::read_to_string(install_path.join("support").join("prompts.md"))
+            .expect("updated support file"),
+        "updated prompt"
+    );
+    let skill = response
+        .settings
+        .skills
+        .detected
+        .iter()
+        .find(|skill| skill.key == "global:gitmemo")
+        .expect("updated skill summary");
+    assert_eq!(skill.description, "Updated project memory.");
+    assert!(skill.store.as_ref().is_some_and(|store| store.updateable));
+
+    server_task.abort();
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+}
+
+#[tokio::test]
+async fn skill_store_update_all_keeps_updating_after_single_failure() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-update-all-profile-test"));
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-skill-store-update-all-workspace-test"));
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    for (skill_id, source, description) in [
+        ("gitmemo", "owner/repo", "Old project memory."),
+        ("broken", "owner/broken", "Old broken skill."),
+    ] {
+        let _ = skill_store_install(
+            State(state.clone()),
+            Json(SkillStoreInstallRequest {
+                skill_id: skill_id.to_string(),
+                source: Some(source.to_string()),
+                target: SKILL_SCOPE_GLOBAL.to_string(),
+                workspace_id: None,
+                overwrite: false,
+                files: vec![SkillStoreFile {
+                    path: "SKILL.md".to_string(),
+                    content: format!(
+                        "---\nname: {skill_id}\ndescription: {description}\n---\n\n# {skill_id}\n"
+                    ),
+                }],
+            }),
+        )
+        .await
+        .expect("skill install");
+    }
+    let (base_url, server_task) = serve_skill_store_detail_fixture().await;
+    let _env_guard = skill_store_env_guard(&base_url).await;
+
+    let Json(response) = skill_store_update_all(State(state))
+        .await
+        .expect("update all should report per-skill failures");
+
+    assert_eq!(response.results.len(), 2);
+    let gitmemo = response
+        .results
+        .iter()
+        .find(|result| result.key == "global:gitmemo")
+        .expect("gitmemo result");
+    let broken = response
+        .results
+        .iter()
+        .find(|result| result.key == "global:broken")
+        .expect("broken result");
+    assert!(gitmemo.ok);
+    assert!(!broken.ok);
+    assert!(
+        broken
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert_eq!(
+        fs::read_to_string(
+            profile_dir
+                .join(".agents")
+                .join("skills")
+                .join("gitmemo")
+                .join("support")
+                .join("prompts.md")
+        )
+        .expect("updated support file"),
+        "updated prompt"
+    );
+    assert!(
+        response
+            .settings
+            .skills
+            .detected
+            .iter()
+            .any(|skill| skill.key == "global:broken"
+                && skill.description == "Old broken skill."
+                && skill.store.as_ref().is_some_and(|store| store.updateable))
+    );
+
+    server_task.abort();
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+}
+
+#[tokio::test]
 async fn skill_store_update_all_without_store_skills_returns_empty_results() {
     let profile_dir =
         env::temp_dir().join(unique_id("foco-skill-store-update-all-empty-profile-test"));
@@ -15462,6 +15618,94 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         plan_auto_run_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
+    }
+}
+
+async fn serve_skill_store_detail_fixture() -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route(
+        "/api/skills/{skill_id}",
+        axum::routing::get(|AxumPath(skill_id): AxumPath<String>| async move {
+            let value = match skill_id.as_str() {
+                "gitmemo" => json!({
+                    "id": "gitmemo",
+                    "source": "owner/repo",
+                    "files": [
+                        {
+                            "path": "SKILL.md",
+                            "content": "---\nname: gitmemo\ndescription: Updated project memory.\n---\n\n# GitMemo\n"
+                        },
+                        {
+                            "path": "support/prompts.md",
+                            "content": "updated prompt"
+                        }
+                    ]
+                }),
+                "broken" => json!({
+                    "id": "broken",
+                    "source": "owner/broken",
+                    "files": [
+                        {
+                            "path": "SKILL.md",
+                            "content": "---\nname: not-broken\ndescription: Invalid update.\n---\n"
+                        }
+                    ]
+                }),
+                other => json!({ "id": other, "files": [] }),
+            };
+            (StatusCode::OK, Json(value))
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind skill store fixture server");
+    let addr = listener.local_addr().expect("fixture server address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}"), task)
+}
+
+struct SkillStoreEnvGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    skills_api_base_url: Option<String>,
+    skills_sh_token: Option<String>,
+    vercel_oidc_token: Option<String>,
+}
+
+async fn skill_store_env_guard(skills_api_base_url: &str) -> SkillStoreEnvGuard {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let guard = lock.lock().await;
+    let env_guard = SkillStoreEnvGuard {
+        _lock: guard,
+        skills_api_base_url: env::var("SKILLS_API_BASE_URL").ok(),
+        skills_sh_token: env::var("SKILLS_SH_TOKEN").ok(),
+        vercel_oidc_token: env::var("VERCEL_OIDC_TOKEN").ok(),
+    };
+    // ponytail: tests share process env; the guard serializes only skill-store env mutation.
+    unsafe {
+        env::set_var("SKILLS_API_BASE_URL", skills_api_base_url);
+        env::remove_var("SKILLS_SH_TOKEN");
+        env::remove_var("VERCEL_OIDC_TOKEN");
+    }
+    env_guard
+}
+
+impl Drop for SkillStoreEnvGuard {
+    fn drop(&mut self) {
+        restore_env_var("SKILLS_API_BASE_URL", self.skills_api_base_url.as_deref());
+        restore_env_var("SKILLS_SH_TOKEN", self.skills_sh_token.as_deref());
+        restore_env_var("VERCEL_OIDC_TOKEN", self.vercel_oidc_token.as_deref());
+    }
+}
+
+fn restore_env_var(key: &str, value: Option<&str>) {
+    unsafe {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
     }
 }
 

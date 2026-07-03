@@ -94,6 +94,7 @@ describe("app-settings verification surfaces", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Update all store skills" })).toBeNull();
   });
 
   it("saves the skill translation model without changing enabled skills", async () => {
