@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use crate::{
     ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
     discover_skills, merge_disabled_skill_keys, neutral_text_message, provider_connection_config,
-    refresh_derived_enabled_skills, save_config, skills::parse_skill_markdown, unique_id,
-    workspace_by_id, xml_cdata_section,
+    refresh_derived_enabled_skills, save_config, settings_response, skills::parse_skill_markdown,
+    unique_id, workspace_by_id, xml_cdata_section,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -27,6 +27,7 @@ const DEFAULT_SKILLS_API_BASE_URL: &str = "https://skills-api.deeptoai.com";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 const SKILL_FILE_NAME: &str = "SKILL.md";
+const SKILL_STORE_METADATA_FILE_NAME: &str = ".foco-skill-store.json";
 const SKILL_TRANSLATION_TOOL_NAME: &str = "submit_skill_translation";
 const SKILL_TRANSLATION_TIMEOUT_MS: u64 = 120_000;
 const SKILL_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 16_384;
@@ -42,18 +43,23 @@ pub(crate) struct SkillStoreSearchQuery {
 pub(crate) struct SkillStoreDetailQuery {
     source: Option<String>,
 }
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreInstallRequest {
-    skill_id: String,
-    source: Option<String>,
-    target: String,
-    workspace_id: Option<String>,
+    pub(crate) skill_id: String,
+    pub(crate) source: Option<String>,
+    pub(crate) target: String,
+    pub(crate) workspace_id: Option<String>,
     #[serde(default)]
-    overwrite: bool,
+    pub(crate) overwrite: bool,
     #[serde(default)]
-    files: Vec<SkillStoreFile>,
+    pub(crate) files: Vec<SkillStoreFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreUpdateRequest {
+    pub(crate) key: String,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +74,15 @@ pub(crate) struct SkillStoreTranslateRequest {
 pub(crate) struct SkillStoreFile {
     pub(crate) path: String,
     pub(crate) content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreInstallMetadata {
+    pub(crate) skill_id: String,
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,10 +120,26 @@ pub(crate) struct SkillStoreDetailResponse {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreInstallResponse {
-    target: String,
-    workspace_id: Option<String>,
-    path: String,
-    detected: Vec<SkillSettings>,
+    pub(crate) target: String,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) path: String,
+    pub(crate) detected: Vec<SkillSettings>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreUpdateResult {
+    pub(crate) key: String,
+    pub(crate) ok: bool,
+    pub(crate) path: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillStoreUpdateResponse {
+    pub(crate) results: Vec<SkillStoreUpdateResult>,
+    pub(crate) settings: crate::http::settings::SettingsResponse,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -705,42 +736,260 @@ pub(crate) async fn skill_store_install(
     Json(request): Json<SkillStoreInstallRequest>,
 ) -> Result<Json<SkillStoreInstallResponse>, ApiError> {
     let skill_id = validate_skill_slug(&request.skill_id)?;
-    let files = if request.files.is_empty() {
-        SkillStoreClient::from_env()
+    let (files, source) = if request.files.is_empty() {
+        let detail = SkillStoreClient::from_env()
             .detail(&skill_id, request.source.as_deref())
-            .await?
-            .files
+            .await?;
+        (detail.files, detail.source)
     } else {
-        request.files
+        (request.files, request.source.clone())
     };
     ensure_skill_files_valid(&files)?;
     validate_skill_markdown_matches_slug(&skill_id, &files)?;
+    let source = source.as_deref().map(validate_github_source).transpose()?;
 
     let mut config = config_snapshot(&state)?;
+    let target = request.target.trim().to_string();
     let (target_root, workspace_id) = install_target_root(
         &state.user_profile_dir,
         &config,
-        &request.target,
+        &target,
         request.workspace_id.as_deref(),
     )?;
+    let metadata = source.map(|source| SkillStoreInstallMetadata {
+        skill_id: skill_id.clone(),
+        source,
+        target: target.clone(),
+        workspace_id: workspace_id.clone(),
+    });
     let install_path =
         install_skill_files_to_target_dir(&target_root, &skill_id, &files, request.overwrite)?;
+    if let Some(metadata) = metadata.as_ref() {
+        write_skill_store_metadata(&install_path, metadata)?;
+    }
 
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
-    config.skills.detected = discovery.skills.clone();
-    config.skills.disabled =
-        merge_disabled_skill_keys(config.skills.disabled, &discovery.required_disabled);
-    refresh_derived_enabled_skills(&mut config);
+    let discovery = refresh_skill_discovery(&state, &mut config)?;
     save_config(&state, config)?;
 
     Ok(Json(SkillStoreInstallResponse {
-        target: request.target,
+        target,
         workspace_id,
         path: install_path.display().to_string(),
-        detected: discovery.skills,
+        detected: discovery,
     }))
 }
 
+pub(crate) async fn skill_store_update(
+    State(state): State<AppState>,
+    Json(request): Json<SkillStoreUpdateRequest>,
+) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let skill = discovery
+        .skills
+        .iter()
+        .find(|skill| skill.key == request.key)
+        .ok_or_else(|| ApiError::bad_request(format!("skill was not found: {}", request.key)))?;
+    let metadata = read_skill_store_metadata_for_skill(skill)?.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "skill '{}' was not installed from the skill store with update metadata",
+            request.key
+        ))
+    })?;
+    let path =
+        update_skill_from_store_metadata(&SkillStoreClient::from_env(), skill, &metadata).await?;
+    refresh_skill_discovery(&state, &mut config)?;
+    save_config(&state, config.clone())?;
+    let Json(settings) = settings_response(&state, &config).await?;
+
+    Ok(Json(SkillStoreUpdateResponse {
+        results: vec![SkillStoreUpdateResult {
+            key: request.key,
+            ok: true,
+            path: Some(path.display().to_string()),
+            error: None,
+        }],
+        settings,
+    }))
+}
+
+pub(crate) async fn skill_store_update_all(
+    State(state): State<AppState>,
+) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let client = SkillStoreClient::from_env();
+    let mut results = Vec::new();
+
+    // ponytail: installed store skills are few; keep updates sequential to avoid config/dir write races. Add bounded concurrency only if this becomes slow.
+    for skill in discovery.skills.iter() {
+        let Some(metadata) = skill_store_metadata_for_skill(skill) else {
+            continue;
+        };
+        match update_skill_from_store_metadata(&client, skill, &metadata).await {
+            Ok(path) => results.push(SkillStoreUpdateResult {
+                key: skill.key.clone(),
+                ok: true,
+                path: Some(path.display().to_string()),
+                error: None,
+            }),
+            Err(error) => results.push(SkillStoreUpdateResult {
+                key: skill.key.clone(),
+                ok: false,
+                path: None,
+                error: Some(error.message().to_string()),
+            }),
+        }
+    }
+
+    refresh_skill_discovery(&state, &mut config)?;
+    save_config(&state, config.clone())?;
+    let Json(settings) = settings_response(&state, &config).await?;
+
+    Ok(Json(SkillStoreUpdateResponse { results, settings }))
+}
+
+fn refresh_skill_discovery(
+    state: &AppState,
+    config: &mut GlobalConfig,
+) -> Result<Vec<SkillSettings>, ApiError> {
+    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    config.skills.detected = discovery.skills.clone();
+    config.skills.disabled = merge_disabled_skill_keys(
+        std::mem::take(&mut config.skills.disabled),
+        &discovery.required_disabled,
+    );
+    refresh_derived_enabled_skills(config);
+    Ok(discovery.skills)
+}
+
+async fn update_skill_from_store_metadata(
+    client: &SkillStoreClient,
+    skill: &SkillSettings,
+    metadata: &SkillStoreInstallMetadata,
+) -> Result<PathBuf, ApiError> {
+    let install_dir = installed_skill_dir(skill)?;
+    let target_root = install_dir.parent().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "skill path has no install root: {}",
+            skill.path.display()
+        ))
+    })?;
+    let installed_dir_name = install_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ApiError::bad_request("skill install directory name is invalid"))?;
+    let installed_dir_name = validate_skill_slug(installed_dir_name)?;
+    if metadata.skill_id != installed_dir_name {
+        return Err(ApiError::bad_request(format!(
+            "skill metadata id '{}' does not match installed directory '{}'",
+            metadata.skill_id, installed_dir_name
+        )));
+    }
+
+    let detail = client
+        .detail(&metadata.skill_id, Some(metadata.source.as_str()))
+        .await?;
+    let files = detail.files;
+    ensure_skill_files_valid(&files)?;
+    validate_skill_markdown_matches_slug(&installed_dir_name, &files)?;
+    let install_path =
+        install_skill_files_to_target_dir(target_root, &installed_dir_name, &files, true)?;
+    let next_metadata = SkillStoreInstallMetadata {
+        skill_id: installed_dir_name,
+        source: detail.source.unwrap_or_else(|| metadata.source.clone()),
+        target: metadata.target.clone(),
+        workspace_id: metadata.workspace_id.clone(),
+    };
+    write_skill_store_metadata(&install_path, &next_metadata)?;
+    Ok(install_path)
+}
+
+fn installed_skill_dir(skill: &SkillSettings) -> Result<&Path, ApiError> {
+    if skill.path.file_name().and_then(|name| name.to_str()) != Some(SKILL_FILE_NAME) {
+        return Err(ApiError::bad_request(format!(
+            "skill path must end with {SKILL_FILE_NAME}: {}",
+            skill.path.display()
+        )));
+    }
+    skill.path.parent().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "skill path has no parent: {}",
+            skill.path.display()
+        ))
+    })
+}
+
+pub(crate) fn skill_store_metadata_for_skill(
+    skill: &SkillSettings,
+) -> Option<SkillStoreInstallMetadata> {
+    match read_skill_store_metadata_for_skill(skill) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(skill_key = %skill.key, error = %error.message(), "failed to read skill store metadata");
+            None
+        }
+    }
+}
+
+fn read_skill_store_metadata_for_skill(
+    skill: &SkillSettings,
+) -> Result<Option<SkillStoreInstallMetadata>, ApiError> {
+    let install_dir = installed_skill_dir(skill)?;
+    let path = skill_store_metadata_path(install_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to read skill store metadata {}: {}",
+            path.display(),
+            source
+        ))
+    })?;
+    let metadata: SkillStoreInstallMetadata = serde_json::from_str(&content).map_err(|source| {
+        ApiError::bad_request(format!(
+            "skill store metadata is invalid at {}: {}",
+            path.display(),
+            source
+        ))
+    })?;
+    validate_skill_slug(&metadata.skill_id)?;
+    validate_github_source(&metadata.source)?;
+    if metadata.target != SKILL_SCOPE_GLOBAL && metadata.target != SKILL_SCOPE_WORKSPACE {
+        return Err(ApiError::bad_request(format!(
+            "invalid skill store metadata target: {}",
+            metadata.target
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn write_skill_store_metadata(
+    install_path: &Path,
+    metadata: &SkillStoreInstallMetadata,
+) -> Result<(), ApiError> {
+    validate_skill_slug(&metadata.skill_id)?;
+    validate_github_source(&metadata.source)?;
+    // ponytail: this hidden file is the only update marker; updates re-fetch latest files and do not scan remote versions.
+    let path = skill_store_metadata_path(install_path);
+    let content = serde_json::to_string_pretty(metadata).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize skill store metadata: {source}"
+        ))
+    })?;
+    fs::write(&path, content).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to write skill store metadata {}: {}",
+            path.display(),
+            source
+        ))
+    })
+}
+
+fn skill_store_metadata_path(install_path: &Path) -> PathBuf {
+    install_path.join(SKILL_STORE_METADATA_FILE_NAME)
+}
 pub(crate) fn install_target_root(
     user_profile_dir: &Path,
     config: &foco_store::config::GlobalConfig,

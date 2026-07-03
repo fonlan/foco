@@ -103,6 +103,14 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::skill_store::skill_store_install),
         )
         .route(
+            "/api/skill-store/update",
+            post(crate::http::skill_store::skill_store_update),
+        )
+        .route(
+            "/api/skill-store/update-all",
+            post(crate::http::skill_store::skill_store_update_all),
+        )
+        .route(
             "/api/skill-store/translate",
             post(crate::http::skill_store::skill_store_translate),
         )

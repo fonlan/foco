@@ -575,6 +575,15 @@ pub(crate) struct ConfiguredSkillSummary {
     pub(crate) enabled: bool,
     pub(crate) can_enable: bool,
     pub(crate) warnings: Vec<String>,
+    pub(crate) store: Option<ConfiguredSkillStoreSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredSkillStoreSummary {
+    pub(crate) skill_id: String,
+    pub(crate) source: String,
+    pub(crate) updateable: bool,
 }
 
 #[derive(Serialize)]

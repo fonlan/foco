@@ -18,10 +18,10 @@ use foco_store::{
 use crate::http::settings::{
     ApiAuditSettingsSummary, ApiProxySettingsSummary, ApiProxyTypeSummary, AppLanguageSummary,
     AppThemeSummary, ConfiguredMcpServerSummary, ConfiguredModelSummary, ConfiguredProviderSummary,
-    ConfiguredSkillSummary, ConfiguredWorkspaceSummary, GeneralSettingsSummary,
-    IMAGE_AGENT_SYSTEM_PROMPT_NAME, McpTransportSummary, MemoryDreamSettingsSummary,
-    MemoryExtractionModeSummary, MemorySettingsSummary, NativeToolsSummary,
-    PlanMergeAutomationModeSummary, PlanSettingsSummary, PromptSettingsSummary,
+    ConfiguredSkillStoreSummary, ConfiguredSkillSummary, ConfiguredWorkspaceSummary,
+    GeneralSettingsSummary, IMAGE_AGENT_SYSTEM_PROMPT_NAME, McpTransportSummary,
+    MemoryDreamSettingsSummary, MemoryExtractionModeSummary, MemorySettingsSummary,
+    NativeToolsSummary, PlanMergeAutomationModeSummary, PlanSettingsSummary, PromptSettingsSummary,
     ProviderKindSummary, SettingsResponse, SkillsSettingsSummary, SpecSettingsSummary,
     SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary, WebSearchProviderSummary,
     WebSearchSettingsSummary, WebServerSettingsSummary, WorkspaceCommonCommandSummary,
@@ -519,6 +519,13 @@ pub(crate) fn configured_skill_summary(
     enabled: bool,
     can_enable: bool,
 ) -> ConfiguredSkillSummary {
+    let store = crate::http::skill_store::skill_store_metadata_for_skill(skill).map(|metadata| {
+        ConfiguredSkillStoreSummary {
+            skill_id: metadata.skill_id,
+            source: metadata.source,
+            updateable: true,
+        }
+    });
     ConfiguredSkillSummary {
         key: skill.key.clone(),
         id: skill.id.clone(),
@@ -531,9 +538,9 @@ pub(crate) fn configured_skill_summary(
         enabled,
         can_enable,
         warnings: skill_warnings(skill, enabled, can_enable),
+        store,
     }
 }
-
 pub(crate) fn skill_warnings(
     skill: &SkillSettings,
     enabled: bool,

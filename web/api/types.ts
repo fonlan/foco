@@ -1687,6 +1687,13 @@ export type ConfiguredSkillSummary = {
   enabled: boolean;
   canEnable: boolean;
   warnings: string[];
+  store?: ConfiguredSkillStoreSummary | null;
+};
+
+type ConfiguredSkillStoreSummary = {
+  skillId: string;
+  source: string;
+  updateable: boolean;
 };
 
 type SkillDiscoveryErrorSummary = {

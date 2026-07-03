@@ -52,10 +52,11 @@ use crate::http::{
         default_plan_mode_system_prompt, filter_provider_model_ids,
     },
     skill_store::{
-        SkillStoreFile, SkillStoreTranslateRequest, ensure_skill_files_valid,
-        install_skill_files_to_target_dir, registry_files_from_value, registry_source_from_value,
-        sanitize_skill_file_path, skill_store_translate, skill_translation_provider_request,
-        validate_skill_slug,
+        SkillStoreFile, SkillStoreInstallRequest, SkillStoreTranslateRequest,
+        SkillStoreUpdateRequest, ensure_skill_files_valid, install_skill_files_to_target_dir,
+        registry_files_from_value, registry_source_from_value, sanitize_skill_file_path,
+        skill_store_install, skill_store_translate, skill_store_update, skill_store_update_all,
+        skill_translation_provider_request, validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -14642,6 +14643,156 @@ fn skill_store_install_discovers_written_skill() {
     );
 
     fs::remove_dir_all(profile_dir).expect("remove skill store profile test");
+}
+
+#[tokio::test]
+async fn skill_store_install_writes_update_metadata_and_settings_store_summary() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-metadata-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-skill-store-metadata-workspace-test"));
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let Json(response) = skill_store_install(
+        State(state.clone()),
+        Json(SkillStoreInstallRequest {
+            skill_id: "gitmemo".to_string(),
+            source: Some("owner/repo".to_string()),
+            target: SKILL_SCOPE_GLOBAL.to_string(),
+            workspace_id: None,
+            overwrite: false,
+            files: vec![SkillStoreFile {
+                path: "SKILL.md".to_string(),
+                content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                    .to_string(),
+            }],
+        }),
+    )
+    .await
+    .expect("skill install");
+    let metadata_path = Path::new(&response.path).join(".foco-skill-store.json");
+    let metadata = fs::read_to_string(&metadata_path).expect("metadata content");
+    assert!(metadata.contains("\"skillId\": \"gitmemo\""));
+    assert!(metadata.contains("\"source\": \"owner/repo\""));
+    assert!(metadata.contains("\"target\": \"global\""));
+
+    let summary = skills_settings_summary(&config, &profile_dir);
+    let skill = summary
+        .detected
+        .iter()
+        .find(|skill| skill.key == "global:gitmemo")
+        .expect("detected skill");
+    let store = skill.store.as_ref().expect("store metadata summary");
+    assert_eq!(store.skill_id, "gitmemo");
+    assert_eq!(store.source, "owner/repo");
+    assert!(store.updateable);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove skill store metadata profile test");
+}
+
+#[tokio::test]
+async fn skill_store_update_rejects_skill_without_store_metadata() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-no-metadata-profile-test"));
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-skill-store-no-metadata-workspace-test"));
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let _ = skill_store_install(
+        State(state.clone()),
+        Json(SkillStoreInstallRequest {
+            skill_id: "gitmemo".to_string(),
+            source: None,
+            target: SKILL_SCOPE_GLOBAL.to_string(),
+            workspace_id: None,
+            overwrite: false,
+            files: vec![SkillStoreFile {
+                path: "SKILL.md".to_string(),
+                content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                    .to_string(),
+            }],
+        }),
+    )
+    .await
+    .expect("skill install");
+
+    let summary = skills_settings_summary(&config, &profile_dir);
+    let skill = summary
+        .detected
+        .iter()
+        .find(|skill| skill.key == "global:gitmemo")
+        .expect("detected skill");
+    assert!(skill.store.is_none());
+
+    let error = match skill_store_update(
+        State(state),
+        Json(SkillStoreUpdateRequest {
+            key: "global:gitmemo".to_string(),
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("missing metadata should not update"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message().contains("update metadata"));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+}
+
+#[tokio::test]
+async fn skill_store_update_all_without_store_skills_returns_empty_results() {
+    let profile_dir =
+        env::temp_dir().join(unique_id("foco-skill-store-update-all-empty-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id(
+        "foco-skill-store-update-all-empty-workspace-test",
+    ));
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+    install_skill_files_to_target_dir(
+        &profile_dir.join(".agents").join("skills"),
+        "gitmemo",
+        &[SkillStoreFile {
+            path: "SKILL.md".to_string(),
+            content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                .to_string(),
+        }],
+        false,
+    )
+    .expect("manual skill install");
+
+    let Json(response) = skill_store_update_all(State(state))
+        .await
+        .expect("update all should not fail without store skills");
+
+    assert!(response.results.is_empty());
+    assert!(
+        response
+            .settings
+            .skills
+            .detected
+            .iter()
+            .any(|skill| skill.key == "global:gitmemo" && skill.store.is_none())
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+}
+
+#[test]
+fn skill_store_files_cannot_write_foco_metadata_path() {
+    let error = sanitize_skill_file_path(".foco-skill-store.json")
+        .expect_err("metadata path must be reserved by dotfile sanitizer");
+
+    assert!(error.message().contains("unsafe skill file path"));
 }
 
 #[test]
