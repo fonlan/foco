@@ -2920,7 +2920,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(statusDot()).toHaveClass("session-status-dot-idle");
   });
 
-  it("keeps a close button available on a streaming chat tab", async () => {
+  it("keeps a close button available on a streaming chat tab without stopping the run", async () => {
     window.history.replaceState(
       null,
       "",
@@ -2940,36 +2940,98 @@ describe("app-chat-stream verification surfaces", () => {
       within(tabList).getByRole("button", { name: "Close chat tab Second chat" }),
     ).toBeInTheDocument();
 
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const secondChatButton = within(workspaceList).getByText("Second chat").closest("button");
+    if (!secondChatButton) {
+      throw new Error("Expected Second chat history item button");
+    }
+    const statusDot = () => secondChatButton.querySelector(".session-status-dot");
+
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(
       await within(tabList).findByRole("status", { name: "Chat is running" }),
     ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-running"),
+    );
     const closeButton = within(tabList).getByRole("button", {
       name: "Close chat tab Second chat",
     });
     expect(closeButton).toBeEnabled();
 
-    const runningTabItem = within(tabList).getByRole("tab", { name: /Second chat/ }).closest(".chat-tab-item");
-    expect(runningTabItem).not.toBeNull();
-    fireEvent.contextMenu(runningTabItem as HTMLElement);
-    const menu = await screen.findByRole("menu", { name: "Second chat" });
-    for (const item of [
-      "Close current tab",
-      "Close other tabs",
-      "Close all tabs",
-      "Close tabs to the right",
-      "Close tabs to the left",
-    ]) {
-      expect(within(menu).getByRole("menuitem", { name: item })).toBeEnabled();
-    }
-    fireEvent.keyDown(window, { key: "Escape" });
-
     await userEvent.click(closeButton);
 
     await waitFor(() =>
       expect(within(tabList).queryByRole("tab", { name: /Second chat/ })).not.toBeInTheDocument(),
+    );
+    expect(statusDot()).toHaveClass("session-status-dot-running");
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.includes("/api/workspaces/workspace-1/chat/runs/request-stream/cancel");
+      }),
+    ).toBe(false);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("closes a running chat tab through the tab context menu batch actions", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2&file=workspace-1%2FREADME.md&activeFile=workspace-1%2FREADME.md",
+    );
+    renderApp();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() =>
+      expect(within(tabList).getByRole("tab", { name: /README\.md/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(
+      await within(tabList).findByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const secondChatButton = within(workspaceList).getByText("Second chat").closest("button");
+    if (!secondChatButton) {
+      throw new Error("Expected Second chat history item button");
+    }
+    await waitFor(() =>
+      expect(secondChatButton.querySelector(".session-status-dot")).toHaveClass(
+        "session-status-dot-running",
+      ),
+    );
+
+    const toolRunTabItem = within(tabList).getByRole("tab", { name: /Tool run/ }).closest(".chat-tab-item");
+    expect(toolRunTabItem).not.toBeNull();
+    fireEvent.contextMenu(toolRunTabItem as HTMLElement);
+    const menu = await screen.findByRole("menu", { name: "Tool run" });
+    await userEvent.click(within(menu).getByRole("menuitem", { name: "Close other tabs" }));
+
+    await waitFor(() =>
+      expect(within(tabList).queryByRole("tab", { name: /Second chat/ })).not.toBeInTheDocument(),
+    );
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(secondChatButton.querySelector(".session-status-dot")).toHaveClass(
+      "session-status-dot-running",
     );
     expect(
       vi.mocked(fetch).mock.calls.some(([input]) => {
