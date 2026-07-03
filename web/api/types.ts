@@ -136,6 +136,7 @@ export type WorkspaceSpecJobSummary = {
   createdAt: string;
   startedAt: string | null;
   completedAt: string | null;
+  hasRetry: boolean;
 };
 
 export type WorkspaceSpecResponse = {

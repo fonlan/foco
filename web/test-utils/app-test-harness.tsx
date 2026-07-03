@@ -820,6 +820,7 @@ export const workspaceSpecJob: WorkspaceSpecJobSummary = {
   completedAt: "2026-06-11T03:01:00Z",
   createdAt: "2026-06-11T03:00:00Z",
   errorMessage: null,
+  hasRetry: false,
   id: "workspace-spec-job-1",
   inputSummary: {},
   modelId: "gpt-test",
@@ -2629,13 +2630,19 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       completedAt: null,
       createdAt: "2026-06-11T03:12:00Z",
       errorMessage: null,
+      hasRetry: false,
       id: `${jobId}-retry`,
       output: null,
       startedAt: null,
       status: "queued",
     };
     appTestState.settingsSpecJobsResponse = source
-      ? [{ ...source, job: retryJob }, ...appTestState.settingsSpecJobsResponse]
+      ? [
+        { ...source, job: retryJob },
+        ...appTestState.settingsSpecJobsResponse.map((item) =>
+          item === source ? { ...item, job: { ...item.job, hasRetry: true } } : item,
+        ),
+      ]
       : appTestState.settingsSpecJobsResponse;
     return jsonResponse({ job: retryJob });
   }

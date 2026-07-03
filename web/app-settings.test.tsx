@@ -255,6 +255,52 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("hides Spec retry buttons for failed jobs that already have retry jobs", async () => {
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          hasRetry: true,
+          id: "workspace-spec-job-already-retried",
+        },
+      },
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          hasRetry: false,
+          id: "workspace-spec-job-still-retryable",
+        },
+        workspaceId: "workspace-1",
+        workspaceName: "Default",
+      },
+    ];
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    const retryButtons = await within(specHistorySection).findAllByRole("button", {
+      name: "Retry Spec job",
+    });
+    expect(retryButtons).toHaveLength(1);
+
+    await userEvent.click(retryButtons[0]);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/spec/jobs/workspace-spec-job-still-retryable/retry",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+  });
+
   it("keeps Spec job history retry buttons scoped per failed job", async () => {
     const failedJob = appTestState.settingsSpecJobsResponse[0];
     appTestState.settingsSpecJobsResponse = [

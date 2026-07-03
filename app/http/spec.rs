@@ -126,6 +126,7 @@ pub(crate) struct WorkspaceSpecJobSummary {
     created_at: String,
     started_at: Option<String>,
     completed_at: Option<String>,
+    has_retry: bool,
 }
 
 pub(crate) async fn workspace_spec(
@@ -500,6 +501,7 @@ fn workspace_spec_job_summary(
         created_at: job.created_at,
         started_at: job.started_at,
         completed_at: job.completed_at,
+        has_retry: job.has_retry,
     })
 }
 

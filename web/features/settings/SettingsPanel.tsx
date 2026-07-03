@@ -5421,7 +5421,7 @@ export function SettingsPanel({
                               </td>
                               <td className="px-3 py-2 align-top">
                                 <div className="flex justify-end">
-                                  {job.status === "failed" ? (
+                                  {job.status === "failed" && !job.hasRetry ? (
                                     <button
                                       aria-label={t("Retry Spec job")}
                                       className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"

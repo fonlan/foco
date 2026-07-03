@@ -418,6 +418,7 @@ pub struct WorkspaceSpecJobRecord {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub has_retry: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

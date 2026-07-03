@@ -2061,6 +2061,48 @@ fn workspace_spec_jobs_redact_audit_json_fields() {
 }
 
 #[test]
+fn workspace_spec_job_has_retry_reflects_retry_children() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-failed",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("spec job insert");
+    database
+        .mark_workspace_spec_job_failed("spec-job-failed", "model timed out")
+        .expect("fail job");
+    assert!(
+        !database
+            .workspace_spec_job("spec-job-failed")
+            .expect("source lookup")
+            .expect("source job")
+            .has_retry
+    );
+
+    let retry = database
+        .retry_failed_workspace_spec_job("spec-job-failed", "spec-job-retry", Some("model-2"))
+        .expect("retry job")
+        .expect("created retry");
+    assert!(!retry.has_retry);
+    assert!(
+        database
+            .workspace_spec_job("spec-job-failed")
+            .expect("source lookup")
+            .expect("source job")
+            .has_retry
+    );
+}
+
+#[test]
 fn delete_chat_cascades_spec_snapshot_but_preserves_workspace_spec() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

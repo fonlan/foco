@@ -970,7 +970,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
                 params![old_id],
@@ -1033,7 +1034,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
                 params![new_id],
@@ -1060,7 +1062,8 @@ impl WorkspaceDatabase {
             .prepare(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?1",
@@ -1086,7 +1089,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1
                  ORDER BY created_at DESC, id DESC
@@ -1105,7 +1109,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1
                  ORDER BY created_at ASC, id ASC
@@ -1124,7 +1129,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1 AND trigger_type = ?2
                  ORDER BY created_at ASC, id ASC
@@ -1293,7 +1299,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
                 params![id],
@@ -9729,6 +9736,7 @@ fn workspace_spec_job_from_row(row: &Row<'_>) -> rusqlite::Result<WorkspaceSpecJ
         created_at: row.get(10)?,
         started_at: row.get(11)?,
         completed_at: row.get(12)?,
+        has_retry: row.get::<_, i64>(13)? != 0,
     })
 }
 
