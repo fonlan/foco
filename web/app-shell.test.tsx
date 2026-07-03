@@ -242,6 +242,23 @@ describe("app-shell verification surfaces", () => {
         Boolean(element.textContent?.includes('"oldStr": "hello"')),
       ),
     ).not.toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+
+    expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"oldStr": "hello"')),
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show compact" }));
+
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(Array.from(assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"))).not.toHaveLength(0);
     expect(getAssistantFinalAnswer(assistantBubble)).toBeInTheDocument();
     expect(await screen.findByTestId("mermaid-svg", undefined, { timeout: 5000 })).toBeInTheDocument();
     expect(mermaidMock.render).toHaveBeenCalledWith(
@@ -508,7 +525,7 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   }, 10000);
 
-  it("keeps failed edit_file tool results in the JSON view", async () => {
+  it("keeps failed edit_file errors visible in compact mode", async () => {
     const failedChatMessages = JSON.parse(JSON.stringify(chatMessages));
     const assistantMessage = failedChatMessages.messages[1];
     const failedToolCall = {
@@ -543,6 +560,13 @@ describe("app-shell verification surfaces", () => {
       throw new Error("Expected assistant message bubble");
     }
 
+    expect(within(assistantBubble).getByText("oldStr not found")).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+
     expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
     expect(
@@ -551,7 +575,6 @@ describe("app-shell verification surfaces", () => {
         Boolean(element.textContent?.includes('"oldStr": "hello"')),
       ),
     ).toBeInTheDocument();
-    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
   });
 
   it("shows successful read_file content without the JSON view", async () => {
@@ -603,6 +626,62 @@ describe("app-shell verification surfaces", () => {
         Boolean(element.textContent?.includes('"content": "alpha')),
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows write_file content in compact mode", async () => {
+    const writeFileChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = writeFileChatMessages.messages[1];
+    const writeFileToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { content: "one\ntwo", path: "notes.txt" },
+      name: "write_file",
+      output: { bytes: 7, linesAdded: 2, linesRemoved: 0, path: "notes.txt" },
+    };
+    assistantMessage.toolCalls = [writeFileToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: writeFileToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...writeFileChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByText("write_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" && element.textContent === "one\ntwo",
+      ),
+    ).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+
+    expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"content": "one')),
+      ),
+    ).toBeInTheDocument();
   });
 
   it("localizes completed tool status and uses success color", async () => {

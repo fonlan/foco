@@ -2083,6 +2083,21 @@ type EditFileDiff = {
   lines: EditFileDiffLine[];
 };
 
+type ToolCallViewMode = "compact" | "raw";
+
+const DIRECT_COMPACT_TEXT_FIELDS = ["content", "text", "message", "note", "error"];
+const ARRAY_COMPACT_SUMMARY_FIELDS = [
+  "matches",
+  "entries",
+  "snippets",
+  "symbols",
+  "references",
+  "files",
+  "tasks",
+  "questions",
+  "results",
+];
+
 function successfulEditFileDiff(
   toolCall: ChatToolCallSummary,
   input: JsonValue,
@@ -2090,7 +2105,7 @@ function successfulEditFileDiff(
   if (toolCall.name !== "edit_file" || toolCall.isError || toolCall.status !== "completed") {
     return null;
   }
-  if (input === null || Array.isArray(input) || typeof input !== "object") {
+  if (!isJsonRecord(input)) {
     return null;
   }
 
@@ -2115,15 +2130,157 @@ function successfulEditFileDiff(
   };
 }
 
-function successfulReadFileContent(toolCall: ChatToolCallSummary): string | null {
-  if (toolCall.name !== "read_file" || toolCall.isError || toolCall.status !== "completed") {
-    return null;
+function isJsonRecord(value: JsonValue | null | undefined): value is { [key: string]: JsonValue } {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function nonEmptyText(value: JsonValue | undefined) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function compactRecordText(record: { [key: string]: JsonValue }) {
+  for (const fieldName of DIRECT_COMPACT_TEXT_FIELDS) {
+    const text = nonEmptyText(record[fieldName]);
+    if (text) {
+      return text;
+    }
   }
-  if (toolCall.output === null || Array.isArray(toolCall.output) || typeof toolCall.output !== "object") {
+  return null;
+}
+
+function compactArraySummary(
+  record: { [key: string]: JsonValue },
+  toolName: string,
+  compactJson: (value: JsonValue) => string,
+) {
+  for (const fieldName of ARRAY_COMPACT_SUMMARY_FIELDS) {
+    const value = record[fieldName];
+    if (!Array.isArray(value) || value.length === 0) {
+      continue;
+    }
+
+    const lines = value
+      .map((item) => compactArrayItemText(item, fieldName, toolName, compactJson))
+      .filter(Boolean);
+    if (lines.length) {
+      return lines.join("\n");
+    }
+  }
+  return null;
+}
+
+function compactArrayItemText(
+  item: JsonValue,
+  fieldName: string,
+  toolName: string,
+  compactJson: (value: JsonValue) => string,
+) {
+  if (typeof item === "string") {
+    return item;
+  }
+  if (!isJsonRecord(item)) {
+    return compactJson(item);
+  }
+
+  const snippetContent = nonEmptyText(item.content);
+  if ((fieldName === "snippets" || toolName === "graph_explore") && snippetContent) {
+    return snippetContent;
+  }
+
+  const directText = compactRecordText(item);
+  if (directText) {
+    return directText;
+  }
+
+  const parts = [
+    nonEmptyText(item.path),
+    nonEmptyText(item.file),
+    nonEmptyText(item.name),
+    nonEmptyText(item.title),
+    nonEmptyText(item.symbol),
+    nonEmptyText(item.id),
+    nonEmptyText(item.status),
+    nonEmptyText(item.kind),
+  ].filter(Boolean);
+
+  return parts.length ? parts.join(" | ") : compactJson(item);
+}
+
+function commandOutputText(output: JsonValue | null) {
+  if (typeof output === "string") {
+    return output.trim() ? output : null;
+  }
+  if (!isJsonRecord(output)) {
     return null;
   }
 
-  return typeof toolCall.output.content === "string" ? toolCall.output.content : null;
+  const parts: string[] = [];
+  const stdout = nonEmptyText(output.stdout);
+  const stderr = nonEmptyText(output.stderr);
+  const error = nonEmptyText(output.error);
+  if (stdout) {
+    parts.push(`[stdout]\n${stdout}`);
+  }
+  if (stderr) {
+    parts.push(`[stderr]\n${stderr}`);
+  }
+  if (!parts.length && error) {
+    parts.push(error);
+  }
+
+  return parts.length ? parts.join("\n") : null;
+}
+
+function compactToolCallText(
+  toolCall: ChatToolCallSummary,
+  input: JsonValue,
+  liveOutputText: string | null,
+  compactJson: (value: JsonValue) => string,
+) {
+  const output = toolCall.output;
+
+  // ponytail: UI-side heuristic summary; upgrade to a backend display payload when tool outputs get richer contracts.
+  if (toolCall.isError && isJsonRecord(output)) {
+    const errorText = compactRecordText(output);
+    if (errorText) {
+      return errorText;
+    }
+  }
+
+  if (toolCall.name === "read_file" && isJsonRecord(output)) {
+    const content = typeof output.content === "string" ? output.content : null;
+    if (content !== null) {
+      return content;
+    }
+  }
+
+  if (toolCall.name === "write_file" && isJsonRecord(input)) {
+    const content = typeof input.content === "string" ? input.content : null;
+    if (content !== null) {
+      return content;
+    }
+  }
+
+  if (toolCall.name === "run_command") {
+    return commandOutputText(output) ?? liveOutputText ?? (output === null ? compactJson(input) : compactJson(output));
+  }
+
+  if (typeof output === "string" && output.trim()) {
+    return output;
+  }
+
+  if (isJsonRecord(output)) {
+    const directText = compactRecordText(output);
+    if (directText) {
+      return directText;
+    }
+    const arraySummary = compactArraySummary(output, toolCall.name, compactJson);
+    if (arraySummary) {
+      return arraySummary;
+    }
+  }
+
+  return output === null ? compactJson(input) : compactJson(output);
 }
 
 function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
@@ -2148,6 +2305,82 @@ function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
   );
 }
 
+function RawToolCallView({
+  formatJsonValue,
+  input,
+  liveOutputText,
+  toolCall,
+  t,
+}: {
+  formatJsonValue: (value: JsonValue) => string;
+  input: JsonValue;
+  liveOutputText: string | null;
+  toolCall: ChatToolCallSummary;
+  t: Translate;
+}) {
+  return (
+    <>
+      <div className="min-w-0">
+        <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+        <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+          {formatJsonValue(input)}
+        </pre>
+      </div>
+      {toolCall.output !== null ? (
+        <div className="min-w-0">
+          <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+          <pre
+            className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+              ? "border-rose-200 text-rose-700"
+              : "border-stone-200"
+              }`}
+          >
+            {formatJsonValue(toolCall.output)}
+          </pre>
+        </div>
+      ) : liveOutputText ? (
+        <div className="min-w-0">
+          <div className="mb-1 font-semibold text-stone-500">
+            {t("Live output")}
+          </div>
+          <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
+            {liveOutputText}
+          </pre>
+        </div>
+      ) : null}
+
+    </>
+  );
+}
+
+function CompactToolCallView({
+  compactJson,
+  diff,
+  input,
+  liveOutputText,
+  toolCall,
+}: {
+  compactJson: (value: JsonValue) => string;
+  diff: EditFileDiff | null;
+  input: JsonValue;
+  liveOutputText: string | null;
+  toolCall: ChatToolCallSummary;
+}) {
+  if (diff) {
+    return <EditFileDiffBlock diff={diff} />;
+  }
+
+  const text = compactToolCallText(toolCall, input, liveOutputText, compactJson);
+  return (
+    <pre
+      className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+        ? "border-rose-200 text-rose-700"
+        : "border-stone-200 text-stone-700"
+        }`}
+    >{text}</pre>
+  );
+}
+
 function ToolCallBlock({
   helpers,
   toolCall,
@@ -2158,6 +2391,7 @@ function ToolCallBlock({
   workspaceId: string | null;
 }) {
   const {
+    compactToolJson,
     formatChatCreatedAt,
     formatJsonValue,
     normalizedToolInput,
@@ -2167,15 +2401,16 @@ function ToolCallBlock({
     toolStatusText,
   } = helpers;
   const { t } = useI18n();
+  const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
   const input = normalizedToolInput(toolCall.input);
   const editFileDiff = successfulEditFileDiff(toolCall, input);
-  const readFileContent = successfulReadFileContent(toolCall);
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
   const generatedImages = toolCall.isError
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
+  const toggleLabel = viewMode === "compact" ? "Show raw" : "Show compact";
 
   return (
     <div className="grid min-w-0 gap-2">
@@ -2217,58 +2452,48 @@ function ToolCallBlock({
           </span>
         </summary>
         <div className="mt-2 grid gap-2 text-xs text-stone-600">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-stone-500">
-            <span>
-              <span className="font-semibold text-stone-500">{t("Started")}</span>{" "}
-              <span>{toolCall.startedAt ? formatChatCreatedAt(toolCall.startedAt) : "-"}</span>
-            </span>
-            <span>
-              <span className="font-semibold text-stone-500">{t("Ended")}</span>{" "}
-              <span>{toolCall.completedAt ? formatChatCreatedAt(toolCall.completedAt) : "-"}</span>
-            </span>
+          <div className="flex min-w-0 items-start justify-between gap-2 text-[11px] text-stone-500">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+              <span>
+                <span className="font-semibold text-stone-500">{t("Started")}</span>{" "}
+                <span>{toolCall.startedAt ? formatChatCreatedAt(toolCall.startedAt) : "-"}</span>
+              </span>
+              <span>
+                <span className="font-semibold text-stone-500">{t("Ended")}</span>{" "}
+                <span>{toolCall.completedAt ? formatChatCreatedAt(toolCall.completedAt) : "-"}</span>
+              </span>
+            </div>
+            <button
+              aria-label={toggleLabel}
+              className="shrink-0 rounded border border-stone-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-stone-600 hover:border-stone-300 hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
+              onClick={() => setViewMode(viewMode === "compact" ? "raw" : "compact")}
+              type="button"
+            >
+              {toggleLabel}
+            </button>
           </div>
-          {editFileDiff ? (
-            <EditFileDiffBlock diff={editFileDiff} />
-          ) : readFileContent !== null ? (
-            <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">{readFileContent}</pre>
+          {viewMode === "compact" ? (
+            <CompactToolCallView
+              compactJson={compactToolJson}
+              diff={editFileDiff}
+              input={input}
+              liveOutputText={liveOutputText}
+              toolCall={toolCall}
+            />
           ) : (
-            <>
-              <div className="min-w-0">
-                <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-                <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-                  {formatJsonValue(input)}
-                </pre>
-              </div>
-              {toolCall.output !== null ? (
-                <div className="min-w-0">
-                  <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
-                  <pre
-                    className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
-                      ? "border-rose-200 text-rose-700"
-                      : "border-stone-200"
-                      }`}
-                  >
-                    {formatJsonValue(toolCall.output)}
-                  </pre>
-                </div>
-              ) : liveOutputText ? (
-                <div className="min-w-0">
-                  <div className="mb-1 font-semibold text-stone-500">
-                    {t("Live output")}
-                  </div>
-                  <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
-                    {liveOutputText}
-                  </pre>
-                </div>
-              ) : null}
-            </>
+            <RawToolCallView
+              formatJsonValue={formatJsonValue}
+              input={input}
+              liveOutputText={liveOutputText}
+              toolCall={toolCall}
+              t={t}
+            />
           )}
         </div>
       </details>
     </div>
   );
 }
-
 function GeneratedImageFilesBlock({
   files,
   formatFileSize,
