@@ -302,6 +302,16 @@ const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
+type SkillStoreUpdateResponse = {
+  results: Array<{
+    key: string;
+    ok: boolean;
+    path: string | null;
+    error: string | null;
+  }>;
+  settings: SettingsResponse;
+};
+
 export function SettingsPanel({
   activeSection,
   activeWorkspaceId,
@@ -511,6 +521,8 @@ export function SettingsPanel({
   const [isSavingModelOrder, setIsSavingModelOrder] = useState(false);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
   const [isRefreshingSkills, setIsRefreshingSkills] = useState(false);
+  const [updatingSkillKey, setUpdatingSkillKey] = useState<string | null>(null);
+  const [isUpdatingAllSkills, setIsUpdatingAllSkills] = useState(false);
   const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
   const [modelOrderPreview, setModelOrderPreview] = useState<string[] | null>(
     null,
@@ -708,6 +720,9 @@ export function SettingsPanel({
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
   const skills = settings?.skills;
+  const updateableStoreSkills = (skills?.detected ?? []).filter((skill) =>
+    Boolean(skill.store?.updateable),
+  );
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
@@ -3583,6 +3598,52 @@ export function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsRefreshingSkills(false);
+    }
+  }
+
+  async function updateSkill(skill: ConfiguredSkillSummary) {
+    setUpdatingSkillKey(skill.key);
+    setError(null);
+
+    try {
+      const data = await requestJson<SkillStoreUpdateResponse>("/api/skill-store/update", {
+        body: JSON.stringify({ key: skill.key }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data.settings);
+      onSettingsChange(data.settings);
+      syncSkillsForm(data.settings);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setUpdatingSkillKey(null);
+    }
+  }
+
+  async function updateAllStoreSkills() {
+    setIsUpdatingAllSkills(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SkillStoreUpdateResponse>("/api/skill-store/update-all", {
+        method: "POST",
+      });
+      setSettings(data.settings);
+      onSettingsChange(data.settings);
+      syncSkillsForm(data.settings);
+      const failed = data.results.filter((result) => !result.ok);
+      if (failed.length) {
+        setError(
+          failed
+            .map((result) => `${result.key}: ${result.error ?? t("Update failed")}`)
+            .join("; "),
+        );
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsUpdatingAllSkills(false);
     }
   }
 
@@ -9993,6 +10054,29 @@ export function SettingsPanel({
                     {t("Detected skills")}
                   </h3>
                   <div className="flex items-center gap-2">
+                    {updateableStoreSkills.length ? (
+                      <button
+                        aria-label={t("Update all store skills")}
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={
+                          isUpdatingAllSkills ||
+                          updatingSkillKey !== null ||
+                          isRefreshingSkills
+                        }
+                        onClick={() => void updateAllStoreSkills()}
+                        title={t("Updates overwrite local changes")}
+                        type="button"
+                      >
+                        {isUpdatingAllSkills ? (
+                          <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                        ) : (
+                          <RefreshCw aria-hidden="true" className="size-4" />
+                        )}
+                        <span>
+                          {isUpdatingAllSkills ? t("Updating...") : t("Update all store skills")}
+                        </span>
+                      </button>
+                    ) : null}
                     <CapabilityPill
                       label={t("skills {count}", {
                         count: skills?.detected.length ?? 0,
@@ -10002,7 +10086,9 @@ export function SettingsPanel({
                     <button
                       aria-label={t("Refresh skill discovery")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                      disabled={isRefreshingSkills}
+                      disabled={
+                        isRefreshingSkills || isUpdatingAllSkills || updatingSkillKey !== null
+                      }
                       onClick={() => void refreshSkills()}
                       title={t("Refresh skill discovery")}
                       type="button"
@@ -10019,6 +10105,8 @@ export function SettingsPanel({
                   {skills?.detected.length ? (
                     skills.detected.map((skill) => {
                       const enabled = enabledSkillIds.has(skill.key);
+                      const isStoreUpdateable = Boolean(skill.store?.updateable);
+                      const isUpdatingSkill = updatingSkillKey === skill.key;
 
                       return (
                         <div className="px-4 py-3" key={skill.key}>
@@ -10036,6 +10124,13 @@ export function SettingsPanel({
                                   label={skillScopeLabel(skill, t)}
                                   ok={skill.scope === "global"}
                                 />
+                                {isStoreUpdateable ? (
+                                  <CapabilityPill
+                                    label={t("Store-installed skill")}
+                                    ok={true}
+                                    tone="ok"
+                                  />
+                                ) : null}
                               </div>
                               <div className="mt-1 truncate text-xs font-medium text-stone-500">
                                 {skill.key}
@@ -10048,10 +10143,37 @@ export function SettingsPanel({
                               </div>
                             </div>
                             <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
+                              {isStoreUpdateable ? (
+                                <button
+                                  aria-label={t("Update skill {name}", { name: skill.name })}
+                                  className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  disabled={
+                                    isSavingSkills ||
+                                    isRefreshingSkills ||
+                                    isUpdatingAllSkills ||
+                                    (updatingSkillKey !== null && !isUpdatingSkill)
+                                  }
+                                  onClick={() => void updateSkill(skill)}
+                                  title={t("Updates overwrite local changes")}
+                                  type="button"
+                                >
+                                  {isUpdatingSkill ? (
+                                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                                  ) : (
+                                    <RefreshCw aria-hidden="true" className="size-4" />
+                                  )}
+                                  <span>{isUpdatingSkill ? t("Updating...") : t("Update skill")}</span>
+                                </button>
+                              ) : null}
                               <button
                                 aria-label={t("Delete skill {name}", { name: skill.name })}
                                 className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                                disabled={isSavingSkills || isRefreshingSkills}
+                                disabled={
+                                  isSavingSkills ||
+                                  isRefreshingSkills ||
+                                  isUpdatingAllSkills ||
+                                  updatingSkillKey !== null
+                                }
                                 onClick={() => void deleteSkill(skill)}
                                 title={t("Delete skill")}
                                 type="button"
@@ -10065,7 +10187,13 @@ export function SettingsPanel({
                                   })}
                                   checked={enabled}
                                   className="peer sr-only"
-                                  disabled={isSavingSkills || !skill.canEnable}
+                                  disabled={
+                                    isSavingSkills ||
+                                    isRefreshingSkills ||
+                                    isUpdatingAllSkills ||
+                                    updatingSkillKey !== null ||
+                                    !skill.canEnable
+                                  }
                                   onChange={(event) =>
                                     toggleSkill(skill.key, event.target.checked)
                                   }

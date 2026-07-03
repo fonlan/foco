@@ -1889,7 +1889,13 @@ export const appTestState: {
   chatQueueCounter: number;
   scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]>;
   scheduledTasksResponse: typeof scheduledTasks;
-  settingsResponse: Omit<typeof settings, "workspaces"> & {
+  settingsResponse: Omit<typeof settings, "skills" | "workspaces"> & {
+    skills: {
+      detected: ConfiguredSkillSummary[];
+      directories: string[];
+      errors: { path: string; message: string }[];
+      translationModelId: string | null;
+    };
     workspaces: ConfiguredWorkspaceSummary[];
   };
   workspaceSpecResponse: typeof workspaceSpec;
@@ -2048,6 +2054,35 @@ function deletedSkillSettings(init?: RequestInit) {
   };
 
   return appTestState.settingsResponse;
+}
+
+function skillStoreUpdateSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as { key?: string };
+  return {
+    results: [
+      {
+        error: null,
+        key: body.key ?? "",
+        ok: true,
+        path: "C:\\Users\\fonla\\.agents\\skills\\gitmemo",
+      },
+    ],
+    settings: appTestState.settingsResponse,
+  };
+}
+
+function skillStoreUpdateAllSettings() {
+  return {
+    results: appTestState.settingsResponse.skills.detected
+      .filter((skill) => (skill as ConfiguredSkillSummary).store?.updateable)
+      .map((skill) => ({
+        error: null,
+        key: skill.key,
+        ok: true,
+        path: skill.path.replace(/\\SKILL\.md$/, ""),
+      })),
+    settings: appTestState.settingsResponse,
+  };
 }
 export function savedGeneralSettings(init?: RequestInit) {
   const body =
@@ -3008,6 +3043,14 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/skills/refresh") {
     return jsonResponse(skillStoreRefreshedSettings(null));
+  }
+
+  if (path === "/api/skill-store/update") {
+    return jsonResponse(skillStoreUpdateSettings(init));
+  }
+
+  if (path === "/api/skill-store/update-all") {
+    return jsonResponse(skillStoreUpdateAllSettings());
   }
 
   if (path === "/api/ai-statistics") {

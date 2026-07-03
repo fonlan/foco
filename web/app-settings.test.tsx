@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ConfiguredSkillSummary } from "./api/types";
 import {
   activeMemory,
   agentDefinitions,
@@ -155,6 +156,65 @@ describe("app-settings verification surfaces", () => {
       expect(screen.queryByText("Global skill")).not.toBeInTheDocument();
     });
     confirmSpy.mockRestore();
+  });
+
+  it("shows update actions for store-installed skills", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const localSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      description: "Local only.",
+      id: "local-only",
+      key: "global:local-only",
+      name: "local-only",
+      path: "C:\\Users\\fonla\\.agents\\skills\\local-only\\SKILL.md",
+    };
+    const storeSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      store: {
+        skillId: "gitmemo",
+        source: "owner/repo",
+        updateable: true,
+      },
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      skills: {
+        ...appTestState.settingsResponse.skills,
+        detected: [storeSkill, localSkill],
+      },
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    expect(screen.getByRole("button", { name: "Update all store skills" })).toBeInTheDocument();
+    expect(screen.getByText("Store-installed skill")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Update skill gitmemo" })).toHaveAttribute(
+      "title",
+      "Updates overwrite local changes",
+    );
+    expect(screen.queryByRole("button", { name: "Update skill local-only" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Update skill gitmemo" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/skill-store/update",
+        expect.objectContaining({
+          body: JSON.stringify({ key: "global:gitmemo" }),
+          method: "POST",
+        }),
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Update all store skills" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/skill-store/update-all",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
   });
 
   it("filters plan history by selected workspace", async () => {
