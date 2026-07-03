@@ -2126,6 +2126,11 @@ export type ScheduledTaskView = {
 
 export type ScheduledTasksResponse = {
   tasks: ScheduledTaskView[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  statusCounts: Record<ScheduledTaskStatus, number> & Record<string, number>;
 };
 
 export type ScheduledTaskPreviewNextRunResponse = {
@@ -2168,6 +2173,10 @@ export type ScheduledTaskRunView = {
 
 export type ScheduledTaskRunsResponse = {
   runs: ScheduledTaskRunView[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 export type ScheduledTaskRunResponse = {

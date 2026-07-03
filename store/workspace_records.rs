@@ -261,6 +261,20 @@ pub struct AgentContextSnapshotRecord {
     pub created_at: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskListFilter<'a> {
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskStatusCountRecord {
+    pub status: String,
+    pub count: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewScheduledTask<'a> {
     pub id: &'a str,

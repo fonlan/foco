@@ -46,9 +46,18 @@ import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 
 type ScheduledTasksQuery = {
+  page?: number;
+  pageSize?: number;
   q?: string;
   status?: ScheduledTaskStatus;
   workspaceId?: string;
+};
+
+type ScheduledTaskRunsPageState = {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 type ScheduledTasksPageProps = {
@@ -93,6 +102,10 @@ const TASK_STATUSES: ScheduledTaskStatus[] = [
   "archived",
 ];
 const FORM_TASK_STATUSES: ScheduledTaskStatus[] = ["enabled", "paused"];
+const DEFAULT_TASK_PAGE_SIZE = 25;
+const DEFAULT_RUN_PAGE_SIZE = 20;
+const TASK_PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+const RUN_PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-coordinator";
 const DEFAULT_INTERVAL_SECONDS = 86400;
 const INTERVAL_UNIT_SECONDS: Record<IntervalUnit, number> = {
@@ -114,6 +127,12 @@ export async function listScheduledTasks(query: ScheduledTasksQuery = {}) {
   }
   if (query.q) {
     params.set("q", query.q);
+  }
+  if (query.page) {
+    params.set("page", String(query.page));
+  }
+  if (query.pageSize) {
+    params.set("pageSize", String(query.pageSize));
   }
 
   const search = params.toString();
@@ -137,8 +156,15 @@ export function ScheduledTasksPage({
   const [statusFilter, setStatusFilter] = useState<TaskStatusFilter>("all");
   const [workspaceFilter, setWorkspaceFilter] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [taskPage, setTaskPage] = useState(1);
+  const [taskPageSize, setTaskPageSize] = useState(DEFAULT_TASK_PAGE_SIZE);
+  const [taskTotalCount, setTaskTotalCount] = useState(0);
+  const [taskTotalPages, setTaskTotalPages] = useState(0);
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
   const [formMode, setFormMode] = useState<TaskFormMode | null>(null);
   const [runsByTaskId, setRunsByTaskId] = useState<Record<string, ScheduledTaskRunView[]>>({});
+  const [runsPageByTaskId, setRunsPageByTaskId] = useState<Record<string, ScheduledTaskRunsPageState>>({});
   const [runsLoadingTaskId, setRunsLoadingTaskId] = useState<string | null>(null);
 
   const enabledModels = useMemo(
@@ -151,51 +177,45 @@ export function ScheduledTasksPage({
   const providers = settings?.providers ?? [];
   const thinkingLevels = settings?.thinkingLevels ?? [];
 
-  const statusCounts = useMemo(() => {
-    return tasks.reduce<Record<string, number>>((counts, task) => {
-      counts[task.status] = (counts[task.status] ?? 0) + 1;
-      return counts;
-    }, {});
-  }, [tasks]);
-
-  const filteredTasks = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    return tasks.filter((task) => {
-      if (statusFilter !== "all" && task.status !== statusFilter) {
-        return false;
-      }
-      if (workspaceFilter !== "all" && task.workspaceId !== workspaceFilter) {
-        return false;
-      }
-      if (!query) {
-        return true;
-      }
-      return [
-        task.title,
-        task.description ?? "",
-        task.workspaceName,
-        task.id,
-        actionPrompt(task.action),
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(query);
-    });
-  }, [searchQuery, statusFilter, tasks, workspaceFilter]);
-
   const selectedTask =
-    filteredTasks.find((task) => task.id === selectedTaskId) ??
-    filteredTasks[0] ??
-    tasks.find((task) => task.id === selectedTaskId) ??
-    null;
+    tasks.find((task) => task.id === selectedTaskId) ?? tasks[0] ?? null;
   const selectedRuns = selectedTask ? runsByTaskId[selectedTask.id] ?? [] : [];
+  const selectedRunsPage = selectedTask
+    ? runsPageByTaskId[selectedTask.id] ?? {
+        page: 1,
+        pageSize: DEFAULT_RUN_PAGE_SIZE,
+        totalCount: 0,
+        totalPages: 0,
+      }
+    : { page: 1, pageSize: DEFAULT_RUN_PAGE_SIZE, totalCount: 0, totalPages: 0 };
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery.trim());
+      setTaskPage(1);
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    setTaskPage(1);
+  }, [statusFilter, workspaceFilter, taskPageSize]);
 
   const loadTasks = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const data = await listScheduledTasks();
+      const data = await listScheduledTasks({
+        page: taskPage,
+        pageSize: taskPageSize,
+        q: debouncedSearchQuery || undefined,
+        status: statusFilter === "all" ? undefined : statusFilter,
+        workspaceId: workspaceFilter === "all" ? undefined : workspaceFilter,
+      });
       setTasks(data.tasks);
+      setTaskTotalCount(data.totalCount);
+      setTaskTotalPages(data.totalPages);
+      setStatusCounts(data.statusCounts ?? {});
       setSelectedTaskId((current) =>
         current && data.tasks.some((task) => task.id === current)
           ? current
@@ -206,16 +226,29 @@ export function ScheduledTasksPage({
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [debouncedSearchQuery, statusFilter, taskPage, taskPageSize, workspaceFilter]);
 
-  const loadRuns = useCallback(async (task: ScheduledTaskView) => {
+  const loadRuns = useCallback(async (task: ScheduledTaskView, page = 1, pageSize = DEFAULT_RUN_PAGE_SIZE) => {
     setRunsLoadingTaskId(task.id);
     setError(null);
     try {
+      const params = new URLSearchParams({
+        page: String(page),
+        pageSize: String(pageSize),
+      });
       const data = await requestJson<ScheduledTaskRunsResponse>(
-        `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/runs`,
+        `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/runs?${params.toString()}`,
       );
       setRunsByTaskId((current) => ({ ...current, [task.id]: data.runs }));
+      setRunsPageByTaskId((current) => ({
+        ...current,
+        [task.id]: {
+          page: data.page,
+          pageSize: data.pageSize,
+          totalCount: data.totalCount,
+          totalPages: data.totalPages,
+        },
+      }));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -248,6 +281,7 @@ export function ScheduledTasksPage({
         current.map((item) => (item.id === data.task.id ? data.task : item)),
       );
       setSelectedTaskId(data.task.id);
+      await loadTasks();
       return data.task;
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -261,14 +295,12 @@ export function ScheduledTasksPage({
     setOperationKey(`run:${task.id}`);
     setError(null);
     try {
-      const data = await requestJson<ScheduledTaskRunResponse>(
+      await requestJson<ScheduledTaskRunResponse>(
         `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/run-now`,
         { method: "POST" },
       );
-      setRunsByTaskId((current) => ({
-        ...current,
-        [task.id]: [data.run, ...(current[task.id] ?? [])],
-      }));
+      const pageSize = runsPageByTaskId[task.id]?.pageSize ?? DEFAULT_RUN_PAGE_SIZE;
+      await loadRuns(task, 1, pageSize);
       await loadTasks();
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -285,9 +317,10 @@ export function ScheduledTasksPage({
         `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/duplicate`,
         { method: "POST" },
       );
-      setTasks((current) => [data.task, ...current]);
+      setTaskPage(1);
       setSelectedTaskId(data.task.id);
       setRunsByTaskId((current) => ({ ...current, [data.task.id]: [] }));
+      await loadTasks();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -306,13 +339,18 @@ export function ScheduledTasksPage({
         `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}`,
         { method: "DELETE" },
       );
-      setTasks((current) => current.filter((item) => item.id !== task.id));
       setRunsByTaskId((current) => {
         const next = { ...current };
         delete next[task.id];
         return next;
       });
+      setRunsPageByTaskId((current) => {
+        const next = { ...current };
+        delete next[task.id];
+        return next;
+      });
       setSelectedTaskId((current) => (current === task.id ? null : current));
+      await loadTasks();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -321,19 +359,19 @@ export function ScheduledTasksPage({
   }
 
   async function handleTaskSaved(task: ScheduledTaskView) {
-    setTasks((current) => {
-      const exists = current.some((item) => item.id === task.id);
-      return exists
-        ? current.map((item) => (item.id === task.id ? task : item))
-        : [task, ...current];
-    });
     setSelectedTaskId(task.id);
     setRunsByTaskId((current) => {
       const next = { ...current };
       delete next[task.id];
       return next;
     });
+    setRunsPageByTaskId((current) => {
+      const next = { ...current };
+      delete next[task.id];
+      return next;
+    });
     setFormMode(null);
+    await loadTasks();
   }
 
   return (
@@ -350,7 +388,7 @@ export function ScheduledTasksPage({
                   {t("Scheduled tasks")}
                 </h2>
                 <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                  {t("tasks {count}", { count: tasks.length })}
+                  {t("tasks {count}", { count: taskTotalCount })}
                 </p>
               </div>
             </div>
@@ -418,7 +456,7 @@ export function ScheduledTasksPage({
                 <p className="mt-1 text-xs text-stone-500">
                   {isLoading
                     ? t("Loading...")
-                    : t("tasks {count}", { count: filteredTasks.length })}
+                    : t("tasks {count}", { count: taskTotalCount })}
                 </p>
               </div>
               <label className="relative min-w-48 flex-1 sm:max-w-64">
@@ -449,9 +487,9 @@ export function ScheduledTasksPage({
               </select>
             </div>
             <div className="panel-scroll max-h-[640px] min-w-0 overflow-y-auto">
-              {filteredTasks.length ? (
+              {tasks.length ? (
                 <div className="divide-y divide-stone-100">
-                  {filteredTasks.map((task) => (
+                  {tasks.map((task) => (
                     <button
                       className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left transition ${selectedTask?.id === task.id ? "bg-amber-50" : "hover:bg-amber-50/40"
                         }`}
@@ -494,6 +532,17 @@ export function ScheduledTasksPage({
                 </div>
               )}
             </div>
+            <PaginationControls
+              language={language}
+              onPageChange={setTaskPage}
+              onPageSizeChange={(nextPageSize) => setTaskPageSize(nextPageSize)}
+              page={taskPage}
+              pageSize={taskPageSize}
+              pageSizeOptions={TASK_PAGE_SIZE_OPTIONS}
+              t={t}
+              totalCount={taskTotalCount}
+              totalPages={taskTotalPages}
+            />
           </div>
 
           <TaskDetails
@@ -517,7 +566,13 @@ export function ScheduledTasksPage({
                 `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/pause`,
               )
             }
-            onRefreshRuns={(task) => void loadRuns(task)}
+            onRefreshRuns={(task) =>
+              void loadRuns(
+                task,
+                runsPageByTaskId[task.id]?.page ?? 1,
+                runsPageByTaskId[task.id]?.pageSize ?? DEFAULT_RUN_PAGE_SIZE,
+              )
+            }
             onResume={(task) =>
               void mutateTask(
                 `resume:${task.id}`,
@@ -528,6 +583,9 @@ export function ScheduledTasksPage({
             onRunNow={(task) => void runTaskNow(task)}
             operationKey={operationKey}
             runs={selectedRuns}
+            runsPage={selectedRunsPage}
+            onRunsPageChange={(page) => selectedTask && void loadRuns(selectedTask, page, selectedRunsPage.pageSize)}
+            onRunsPageSizeChange={(pageSize) => selectedTask && void loadRuns(selectedTask, 1, pageSize)}
             task={selectedTask}
             t={t}
           />
@@ -566,6 +624,9 @@ function TaskDetails({
   onRunNow,
   operationKey,
   runs,
+  runsPage,
+  onRunsPageChange,
+  onRunsPageSizeChange,
   task,
   t,
 }: {
@@ -582,6 +643,9 @@ function TaskDetails({
   onRunNow: (task: ScheduledTaskView) => void;
   operationKey: string | null;
   runs: ScheduledTaskRunView[];
+  runsPage: ScheduledTaskRunsPageState;
+  onRunsPageChange: (page: number) => void;
+  onRunsPageSizeChange: (pageSize: number) => void;
   task: ScheduledTaskView | null;
   t: Translate;
 }) {
@@ -760,7 +824,7 @@ function TaskDetails({
           <div>
             <h4 className="text-sm font-semibold text-stone-950">{t("Run history")}</h4>
             <p className="mt-1 text-xs text-stone-500">
-              {t("runs {count}", { count: runs.length })}
+              {t("runs {count}", { count: runsPage.totalCount })}
             </p>
           </div>
           <IconButton
@@ -831,6 +895,17 @@ function TaskDetails({
             </tbody>
           </table>
         </div>
+        <PaginationControls
+          language={language}
+          onPageChange={onRunsPageChange}
+          onPageSizeChange={onRunsPageSizeChange}
+          page={runsPage.page}
+          pageSize={runsPage.pageSize}
+          pageSizeOptions={RUN_PAGE_SIZE_OPTIONS}
+          t={t}
+          totalCount={runsPage.totalCount}
+          totalPages={runsPage.totalPages}
+        />
       </div>
     </div>
   );
@@ -1346,6 +1421,84 @@ function KeyValue({ label, value }: { label: string; value: string }) {
       <dd className="min-w-0 truncate text-stone-800" title={value}>
         {value}
       </dd>
+    </div>
+  );
+}
+
+function PaginationControls({
+  language,
+  onPageChange,
+  onPageSizeChange,
+  page,
+  pageSize,
+  pageSizeOptions,
+  t,
+  totalCount,
+  totalPages,
+}: {
+  language: string;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (pageSize: number) => void;
+  page: number;
+  pageSize: number;
+  pageSizeOptions: number[];
+  t: Translate;
+  totalCount: number;
+  totalPages: number;
+}) {
+  const start = totalCount === 0 ? 0 : (page - 1) * pageSize + 1;
+  const end = Math.min(totalCount, page * pageSize);
+  const effectiveTotalPages = Math.max(totalPages, totalCount === 0 ? 0 : 1);
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 px-4 py-3 text-xs text-stone-500">
+      <div>
+        {t("Showing {start}-{end} of {total}", {
+          start: formatNumber(start, language),
+          end: formatNumber(end, language),
+          total: formatNumber(totalCount, language),
+        })}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="inline-flex items-center gap-2">
+          <span>{t("Page size")}</span>
+          <select
+            className="h-8 rounded-lg border border-stone-300 bg-white px-2 text-xs text-stone-900 outline-none focus:border-amber-700 focus:ring-2 focus:ring-amber-100"
+            onChange={(event) => onPageSizeChange(Number(event.target.value))}
+            value={pageSize}
+          >
+            {pageSizeOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <span>
+          {t("Page {page} of {totalPages}", {
+            page: formatNumber(totalCount === 0 ? 0 : page, language),
+            totalPages: formatNumber(effectiveTotalPages, language),
+          })}
+        </span>
+        <button
+          aria-label={t("Previous page")}
+          className="inline-flex h-8 items-center rounded-lg border border-stone-200 bg-white px-2 font-semibold text-stone-700 hover:border-amber-200 hover:bg-amber-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          disabled={page <= 1}
+          onClick={() => onPageChange(Math.max(1, page - 1))}
+          type="button"
+        >
+          {t("Previous page")}
+        </button>
+        <button
+          aria-label={t("Next page")}
+          className="inline-flex h-8 items-center rounded-lg border border-stone-200 bg-white px-2 font-semibold text-stone-700 hover:border-amber-200 hover:bg-amber-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          disabled={totalPages === 0 || page >= totalPages}
+          onClick={() => onPageChange(page + 1)}
+          type="button"
+        >
+          {t("Next page")}
+        </button>
+      </div>
     </div>
   );
 }

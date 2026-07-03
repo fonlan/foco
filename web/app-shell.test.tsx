@@ -831,7 +831,9 @@ describe("app-shell verification surfaces", () => {
     expect(window.location.pathname).toBe("/scheduled");
     expect(
       fetchMock.mock.calls.some(
-        ([url]) => typeof url === "string" && url === "/api/scheduled-tasks",
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/scheduled-tasks?page=1&pageSize=25",
       ),
     ).toBe(true);
 

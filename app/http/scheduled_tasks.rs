@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
@@ -5,8 +7,8 @@ use axum::{
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        LlmRequestAuditSummaryRow, NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord,
-        ScheduledTaskUpdate, WorkspaceDatabase,
+        LlmRequestAuditSummaryRow, NewScheduledTask, ScheduledTaskListFilter, ScheduledTaskRecord,
+        ScheduledTaskRunRecord, ScheduledTaskUpdate, WorkspaceDatabase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,10 @@ const STATUS_ENABLED: &str = "enabled";
 const STATUS_PAUSED: &str = "paused";
 const STATUS_COMPLETED: &str = "completed";
 const STATUS_ARCHIVED: &str = "archived";
+const DEFAULT_PAGE_SIZE: usize = 25;
+const DEFAULT_RUN_PAGE_SIZE: usize = 20;
+const MAX_PAGE_SIZE: usize = 100;
+const MAX_RUN_PAGE_SIZE: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +40,15 @@ pub(crate) struct ScheduledTasksQuery {
     workspace_id: Option<String>,
     status: Option<String>,
     q: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScheduledTaskRunsQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +80,11 @@ pub(crate) struct UpdateScheduledTaskRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScheduledTasksResponse {
     tasks: Vec<ScheduledTaskView>,
+    page: usize,
+    page_size: usize,
+    total_count: usize,
+    total_pages: usize,
+    status_counts: HashMap<String, usize>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +97,10 @@ pub(crate) struct ScheduledTaskResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScheduledTaskRunsResponse {
     runs: Vec<ScheduledTaskRunView>,
+    page: usize,
+    page_size: usize,
+    total_count: usize,
+    total_pages: usize,
 }
 
 #[derive(Serialize)]
@@ -155,24 +179,116 @@ pub(crate) async fn scheduled_tasks(
         .transpose()?;
     let search = query
         .q
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let mut tasks = Vec::new();
+    let (page, page_size, offset) = pagination(
+        query.page,
+        query.page_size,
+        DEFAULT_PAGE_SIZE,
+        MAX_PAGE_SIZE,
+    )?;
+    let page_window = i64::try_from(offset + page_size)
+        .map_err(|_| ApiError::bad_request("scheduled task pagination window is too large"))?;
+    let mut total_count = 0usize;
+    let mut status_counts: HashMap<String, usize> = HashMap::new();
+    let mut candidates: Vec<(
+        &WorkspaceConfig,
+        WorkspaceDatabase,
+        Vec<ScheduledTaskRecord>,
+    )> = Vec::new();
 
     for workspace in scheduled_task_workspaces(&config, query.workspace_id.as_deref())? {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
-        for task in database
-            .scheduled_tasks(status.as_deref())
+        let workspace_search_matches = search
+            .as_deref()
+            .map(|search| scheduled_workspace_matches_search(workspace, search))
+            .unwrap_or(false);
+        let store_search = if workspace_search_matches {
+            None
+        } else {
+            search.as_deref()
+        };
+        let filter = ScheduledTaskListFilter {
+            status: status.as_deref(),
+            search: store_search,
+            limit: page_window.max(1),
+            offset: 0,
+        };
+        total_count += usize::try_from(
+            database
+                .scheduled_task_count(filter)
+                .map_err(ApiError::from_workspace_error)?,
+        )
+        .map_err(|_| ApiError::internal("scheduled task count is too large"))?;
+        for count in database
+            .scheduled_task_status_counts(store_search)
             .map_err(ApiError::from_workspace_error)?
         {
-            if scheduled_task_matches_search(workspace, &task, search.as_deref()) {
-                tasks.push(scheduled_task_view(workspace, &database, task)?);
-            }
+            *status_counts.entry(count.status).or_insert(0) += usize::try_from(count.count)
+                .map_err(|_| ApiError::internal("scheduled task status count is too large"))?;
+        }
+        let tasks = database
+            .scheduled_tasks_page(filter)
+            .map_err(ApiError::from_workspace_error)?;
+        candidates.push((workspace, database, tasks));
+    }
+
+    let mut tasks_with_workspace = candidates
+        .iter()
+        .flat_map(|(workspace, database, tasks)| {
+            tasks
+                .iter()
+                .cloned()
+                .map(|task| (*workspace, database, task))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    tasks_with_workspace.sort_by(|left, right| compare_scheduled_tasks(&left.2, &right.2));
+
+    let page_tasks = tasks_with_workspace
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .collect::<Vec<_>>();
+    let mut task_ids_by_workspace: HashMap<String, Vec<String>> = HashMap::new();
+    for (workspace, _, task) in &page_tasks {
+        task_ids_by_workspace
+            .entry(workspace.id.clone())
+            .or_default()
+            .push(task.id.clone());
+    }
+    let mut usage_by_workspace: HashMap<String, HashMap<String, LlmRequestAuditSummaryRow>> =
+        HashMap::new();
+    for (workspace, database, _) in &candidates {
+        if let Some(task_ids) = task_ids_by_workspace.get(&workspace.id) {
+            usage_by_workspace.insert(
+                workspace.id.clone(),
+                database
+                    .scheduled_task_usage_summaries(task_ids)
+                    .map_err(ApiError::from_workspace_error)?,
+            );
         }
     }
 
-    Ok(Json(ScheduledTasksResponse { tasks }))
+    let mut tasks = Vec::with_capacity(page_tasks.len());
+    for (workspace, _, task) in page_tasks {
+        let usage = usage_by_workspace
+            .get(&workspace.id)
+            .and_then(|summaries| summaries.get(&task.id))
+            .cloned()
+            .unwrap_or_default();
+        tasks.push(scheduled_task_view_with_usage(workspace, task, usage)?);
+    }
+
+    Ok(Json(ScheduledTasksResponse {
+        tasks,
+        page,
+        page_size,
+        total_count,
+        total_pages: total_pages(total_count, page_size),
+        status_counts,
+    }))
 }
 
 pub(crate) async fn create_scheduled_task(
@@ -393,14 +509,27 @@ pub(crate) async fn run_scheduled_task_now(
 pub(crate) async fn scheduled_task_runs(
     State(state): State<AppState>,
     AxumPath((workspace_id, task_id)): AxumPath<(String, String)>,
+    Query(query): Query<ScheduledTaskRunsQuery>,
 ) -> Result<Json<ScheduledTaskRunsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     require_scheduled_task(&database, &task_id)?;
+    let (page, page_size, offset) = pagination(
+        query.page,
+        query.page_size,
+        DEFAULT_RUN_PAGE_SIZE,
+        MAX_RUN_PAGE_SIZE,
+    )?;
+    let total_count = usize::try_from(
+        database
+            .scheduled_task_run_count(&task_id)
+            .map_err(ApiError::from_workspace_error)?,
+    )
+    .map_err(|_| ApiError::internal("scheduled task run count is too large"))?;
     let runs = database
-        .scheduled_task_runs_for_task(&task_id)
+        .scheduled_task_runs_for_task_page(&task_id, page_size as i64, offset as i64)
         .map_err(ApiError::from_workspace_error)?;
     let mut views = Vec::with_capacity(runs.len());
     for run in runs {
@@ -408,7 +537,13 @@ pub(crate) async fn scheduled_task_runs(
         views.push(scheduled_task_run_view(&workspace.id, run)?);
     }
 
-    Ok(Json(ScheduledTaskRunsResponse { runs: views }))
+    Ok(Json(ScheduledTaskRunsResponse {
+        runs: views,
+        page,
+        page_size,
+        total_count,
+        total_pages: total_pages(total_count, page_size),
+    }))
 }
 
 pub(crate) async fn scheduled_task_run(
@@ -526,6 +661,14 @@ fn scheduled_task_view(
     let usage = database
         .scheduled_task_usage_summary(&task.id)
         .map_err(ApiError::from_workspace_error)?;
+    scheduled_task_view_with_usage(workspace, task, usage)
+}
+
+fn scheduled_task_view_with_usage(
+    workspace: &WorkspaceConfig,
+    task: ScheduledTaskRecord,
+    usage: LlmRequestAuditSummaryRow,
+) -> Result<ScheduledTaskView, ApiError> {
     Ok(ScheduledTaskView {
         id: task.id,
         workspace_id: workspace.id.clone(),
@@ -595,23 +738,48 @@ fn scheduled_task_run_view(
     })
 }
 
-fn scheduled_task_matches_search(
-    workspace: &WorkspaceConfig,
-    task: &ScheduledTaskRecord,
-    search: Option<&str>,
-) -> bool {
-    let Some(search) = search else {
-        return true;
-    };
-    task.id.to_ascii_lowercase().contains(search)
-        || task.title.to_ascii_lowercase().contains(search)
-        || task
-            .description
-            .as_deref()
-            .map(|description| description.to_ascii_lowercase().contains(search))
-            .unwrap_or(false)
-        || workspace.name.to_ascii_lowercase().contains(search)
-        || workspace.id.to_ascii_lowercase().contains(search)
+fn scheduled_workspace_matches_search(workspace: &WorkspaceConfig, search: &str) -> bool {
+    let search = search.to_ascii_lowercase();
+    workspace.id.to_ascii_lowercase().contains(&search)
+        || workspace.name.to_ascii_lowercase().contains(&search)
+}
+
+fn compare_scheduled_tasks(
+    left: &ScheduledTaskRecord,
+    right: &ScheduledTaskRecord,
+) -> std::cmp::Ordering {
+    left.next_run_at
+        .is_none()
+        .cmp(&right.next_run_at.is_none())
+        .then_with(|| left.next_run_at.cmp(&right.next_run_at))
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn pagination(
+    page: Option<usize>,
+    page_size: Option<usize>,
+    default_page_size: usize,
+    max_page_size: usize,
+) -> Result<(usize, usize, usize), ApiError> {
+    let page = page.unwrap_or(1);
+    let page_size = page_size.unwrap_or(default_page_size).min(max_page_size);
+    if page == 0 || page_size == 0 {
+        return Err(ApiError::bad_request("page and pageSize must be positive"));
+    }
+    let offset = page
+        .checked_sub(1)
+        .and_then(|page_index| page_index.checked_mul(page_size))
+        .ok_or_else(|| ApiError::bad_request("pagination offset is too large"))?;
+    Ok((page, page_size, offset))
+}
+
+fn total_pages(total_count: usize, page_size: usize) -> usize {
+    if total_count == 0 {
+        0
+    } else {
+        (total_count + page_size - 1) / page_size
+    }
 }
 
 fn normalize_task_status(field: &str, status: &str) -> Result<String, ApiError> {

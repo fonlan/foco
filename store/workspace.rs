@@ -49,10 +49,11 @@ pub use workspace_records::{
     PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListPage, PlanPatch,
     PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
     PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
+    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
+    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
+    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -5773,43 +5774,193 @@ impl WorkspaceDatabase {
         &self,
         status: Option<&str>,
     ) -> Result<Vec<ScheduledTaskRecord>, WorkspaceDatabaseError> {
-        if let Some(status) = status {
-            validate_scheduled_task_status(status)?;
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT id, title, description, schedule_json, action_json, status,
-                            next_run_at, last_run_at, created_at, updated_at, metadata_json
-                     FROM scheduled_tasks
-                     WHERE status = ?1
-                     ORDER BY
-                        CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
-                        next_run_at ASC,
-                        updated_at DESC,
-                        id ASC",
-                )
-                .map_err(|source| self.sqlite_error(source))?;
-            let rows = statement
-                .query_map(params![status], scheduled_task_from_row)
-                .map_err(|source| self.sqlite_error(source))?;
-            return collect_rows(rows, &self.database_path);
+        let total_count = self.scheduled_task_count(ScheduledTaskListFilter {
+            status,
+            search: None,
+            limit: i64::MAX,
+            offset: 0,
+        })?;
+        self.scheduled_tasks_page(ScheduledTaskListFilter {
+            status,
+            search: None,
+            limit: total_count.max(1),
+            offset: 0,
+        })
+    }
+
+    pub fn scheduled_task_count(
+        &self,
+        filter: ScheduledTaskListFilter<'_>,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        validate_scheduled_task_list_filter(&filter)?;
+        let (where_clause, query_params) = scheduled_task_filter_sql(filter.status, filter.search)?;
+        self.connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM scheduled_tasks{where_clause}"),
+                params_from_iter(query_params),
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn scheduled_task_status_counts(
+        &self,
+        search: Option<&str>,
+    ) -> Result<Vec<ScheduledTaskStatusCountRecord>, WorkspaceDatabaseError> {
+        let (where_clause, query_params) = scheduled_task_filter_sql(None, search)?;
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT status, COUNT(*)
+                 FROM scheduled_tasks{where_clause}
+                 GROUP BY status"
+            ))
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(ScheduledTaskStatusCountRecord {
+                    status: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn scheduled_tasks_page(
+        &self,
+        filter: ScheduledTaskListFilter<'_>,
+    ) -> Result<Vec<ScheduledTaskRecord>, WorkspaceDatabaseError> {
+        validate_scheduled_task_list_filter(&filter)?;
+        let (where_clause, mut query_params) =
+            scheduled_task_filter_sql(filter.status, filter.search)?;
+        let mut query = String::from(
+            "SELECT id, title, description, schedule_json, action_json, status,
+                    next_run_at, last_run_at, created_at, updated_at, metadata_json
+             FROM scheduled_tasks",
+        );
+        query.push_str(&where_clause);
+        query.push_str(
+            " ORDER BY
+                CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
+                next_run_at ASC,
+                updated_at DESC,
+                id ASC
+              LIMIT ? OFFSET ?",
+        );
+        query_params.push(SqlValue::Integer(filter.limit));
+        query_params.push(SqlValue::Integer(filter.offset));
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), scheduled_task_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn scheduled_task_usage_summaries(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, LlmRequestAuditSummaryRow>, WorkspaceDatabaseError> {
+        if task_ids.is_empty() {
+            return Ok(HashMap::new());
         }
 
+        let placeholders = (1..=task_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT
+                runs.task_id,
+                COUNT(requests.id),
+                COUNT(CASE WHEN requests.final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                COALESCE(SUM(COALESCE(requests.input_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(requests.output_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(requests.cache_read_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(requests.cache_write_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(requests.input_tokens, 0) + COALESCE(requests.output_tokens, 0)), 0),
+                COUNT(requests.total_latency_ms),
+                COALESCE(SUM(COALESCE(requests.total_latency_ms, 0)), 0)
+             FROM (
+                SELECT DISTINCT task_id, agent_task_id
+                FROM scheduled_task_runs
+                WHERE task_id IN ({placeholders}) AND agent_task_id IS NOT NULL
+             ) runs
+             JOIN llm_requests requests ON requests.agent_task_id = runs.agent_task_id
+             GROUP BY runs.task_id"
+        );
+        let query_params = task_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    LlmRequestAuditSummaryRow {
+                        total_requests: row.get(1)?,
+                        failed_requests: row.get(2)?,
+                        total_input_tokens: row.get(3)?,
+                        total_output_tokens: row.get(4)?,
+                        total_cache_read_tokens: row.get(5)?,
+                        total_cache_write_tokens: row.get(6)?,
+                        total_tokens: row.get(7)?,
+                        latency_count: row.get(8)?,
+                        latency_sum: row.get(9)?,
+                    },
+                ))
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let pairs = collect_rows(rows, &self.database_path)?;
+        Ok(pairs.into_iter().collect())
+    }
+
+    pub fn scheduled_task_run_count(&self, task_id: &str) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_task_runs WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn scheduled_task_runs_for_task_page(
+        &self,
+        task_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 || offset < 0 {
+            return Err(WorkspaceDatabaseError::InvalidScheduledTaskData {
+                message: "scheduled task run pagination limit must be positive and offset must be non-negative"
+                    .to_string(),
+            });
+        }
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, title, description, schedule_json, action_json, status,
-                        next_run_at, last_run_at, created_at, updated_at, metadata_json
-                 FROM scheduled_tasks
-                 ORDER BY
-                    CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
-                    next_run_at ASC,
-                    updated_at DESC,
-                    id ASC",
+                "SELECT id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                 FROM scheduled_task_runs
+                 WHERE task_id = ?1
+                 ORDER BY scheduled_at DESC, created_at DESC, id DESC
+                 LIMIT ?2 OFFSET ?3",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map([], scheduled_task_from_row)
+            .query_map(params![task_id, limit, offset], scheduled_task_run_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
@@ -10304,6 +10455,52 @@ fn validate_scheduled_task_trigger_reason(
         trigger_reason,
         &["scheduled", "manual", "retry", "misfire_catch_up"],
     )
+}
+
+fn validate_scheduled_task_list_filter(
+    filter: &ScheduledTaskListFilter<'_>,
+) -> Result<(), WorkspaceDatabaseError> {
+    if let Some(status) = filter.status {
+        validate_scheduled_task_status(status)?;
+    }
+    if filter.limit <= 0 || filter.offset < 0 {
+        return Err(WorkspaceDatabaseError::InvalidScheduledTaskData {
+            message:
+                "scheduled task pagination limit must be positive and offset must be non-negative"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn scheduled_task_filter_sql(
+    status: Option<&str>,
+    search: Option<&str>,
+) -> Result<(String, Vec<SqlValue>), WorkspaceDatabaseError> {
+    if let Some(status) = status {
+        validate_scheduled_task_status(status)?;
+    }
+    let mut where_clause = String::from(" WHERE 1 = 1");
+    let mut query_params = Vec::new();
+    if let Some(status) = status {
+        where_clause.push_str(" AND status = ?");
+        query_params.push(SqlValue::Text(status.to_string()));
+    }
+    if let Some(search) = search.map(str::trim).filter(|search| !search.is_empty()) {
+        let pattern = like_contains_pattern(search);
+        where_clause.push_str(
+            " AND (
+                id LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR title LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR COALESCE(description, '') LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR action_json LIKE ? ESCAPE '\\' COLLATE NOCASE
+             )",
+        );
+        for _ in 0..4 {
+            query_params.push(SqlValue::Text(pattern.clone()));
+        }
+    }
+    Ok((where_clause, query_params))
 }
 
 fn validate_scheduled_task_value(

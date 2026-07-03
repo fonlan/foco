@@ -22,14 +22,14 @@ use foco_store::{
         NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent,
         NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
         NewWorkspaceSpecJob, PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch,
-        ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        prune_workspace_database_backups, workspace_database_path,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -3125,7 +3125,53 @@ fn scheduled_task_records_round_trip_and_list_runs() {
     assert_eq!(usage.total_tokens, 130);
     assert_eq!(usage.latency_count, 1);
     assert_eq!(usage.latency_sum, 2000);
+    let usage_by_task = database
+        .scheduled_task_usage_summaries(&[
+            "scheduled-task-1".to_string(),
+            "missing-task".to_string(),
+        ])
+        .expect("scheduled task usage summaries");
+    assert_eq!(usage_by_task["scheduled-task-1"].total_requests, 2);
+    assert!(!usage_by_task.contains_key("missing-task"));
 
+    let page = database
+        .scheduled_tasks_page(ScheduledTaskListFilter {
+            status: Some("enabled"),
+            search: Some("summarize"),
+            limit: 1,
+            offset: 0,
+        })
+        .expect("scheduled task page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "scheduled-task-1");
+    assert_eq!(
+        database
+            .scheduled_task_count(ScheduledTaskListFilter {
+                status: Some("enabled"),
+                search: Some("summarize"),
+                limit: 1,
+                offset: 0,
+            })
+            .expect("scheduled task count"),
+        1
+    );
+    let status_counts = database
+        .scheduled_task_status_counts(Some("summarize"))
+        .expect("scheduled task status counts");
+    assert_eq!(status_counts.len(), 1);
+    assert_eq!(status_counts[0].status, "enabled");
+    assert_eq!(status_counts[0].count, 1);
+    assert_eq!(
+        database
+            .scheduled_task_run_count("scheduled-task-1")
+            .expect("scheduled task run count"),
+        2
+    );
+    let run_page = database
+        .scheduled_task_runs_for_task_page("scheduled-task-1", 1, 1)
+        .expect("scheduled task run page");
+    assert_eq!(run_page.len(), 1);
+    assert_eq!(run_page[0].id, "scheduled-run-1");
     assert!(
         database
             .delete_scheduled_task("scheduled-task-1")

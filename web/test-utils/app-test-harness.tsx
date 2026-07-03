@@ -1807,7 +1807,17 @@ const emptyScheduledTaskUsage = {
   totalTokens: 0,
 };
 
-export const scheduledTasks: { tasks: ScheduledTaskFixture[] } = {
+export const scheduledTasks: {
+  page: number;
+  pageSize: number;
+  statusCounts: Record<string, number>;
+  tasks: ScheduledTaskFixture[];
+  totalCount: number;
+  totalPages: number;
+} = {
+  page: 1,
+  pageSize: 25,
+  statusCounts: { enabled: 1, paused: 0, completed: 0, archived: 0 },
   tasks: [
     {
       action: {
@@ -1847,7 +1857,28 @@ export const scheduledTasks: { tasks: ScheduledTaskFixture[] } = {
       workspaceName: "Default",
     },
   ],
+  totalCount: 1,
+  totalPages: 1,
 };
+
+function scheduledTasksEnvelope(
+  tasks: ScheduledTaskFixture[],
+  page = 1,
+  pageSize = 25,
+): typeof scheduledTasks {
+  const statusCounts = tasks.reduce<Record<string, number>>(
+    (counts, task) => ({ ...counts, [task.status]: (counts[task.status] ?? 0) + 1 }),
+    { enabled: 0, paused: 0, completed: 0, archived: 0 },
+  );
+  return {
+    page,
+    pageSize,
+    statusCounts,
+    tasks,
+    totalCount: tasks.length,
+    totalPages: tasks.length ? Math.ceil(tasks.length / pageSize) : 0,
+  };
+}
 
 type ScheduledTaskRunFixture = {
   activeRunId: string | null;
@@ -2342,7 +2373,32 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/scheduled-tasks") {
-    return jsonResponse(appTestState.scheduledTasksResponse);
+    const page = Math.max(1, Number(requestUrl.searchParams.get("page")) || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number(requestUrl.searchParams.get("pageSize")) || 25),
+    );
+    const status = requestUrl.searchParams.get("status");
+    const workspaceId = requestUrl.searchParams.get("workspaceId");
+    const query = (requestUrl.searchParams.get("q") ?? "").toLowerCase();
+    const tasks = appTestState.scheduledTasksResponse.tasks.filter((task) => {
+      if (status && task.status !== status) {
+        return false;
+      }
+      if (workspaceId && task.workspaceId !== workspaceId) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [task.id, task.title, task.description ?? "", task.workspaceName]
+        .join(" ")
+        .toLowerCase()
+        .includes(query);
+    });
+    return jsonResponse(
+      scheduledTasksEnvelope(tasks.slice((page - 1) * pageSize, page * pageSize), page, pageSize),
+    );
   }
 
   if (path === "/api/scheduled-tasks/preview-next-run") {
@@ -2363,8 +2419,18 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   );
   if (scheduledRunsMatch) {
     const taskId = decodeURIComponent(scheduledRunsMatch[2] ?? "");
+    const runs = appTestState.scheduledTaskRunsByTaskId[taskId] ?? [];
+    const page = Math.max(1, Number(requestUrl.searchParams.get("page")) || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number(requestUrl.searchParams.get("pageSize")) || 20),
+    );
     return jsonResponse({
-      runs: appTestState.scheduledTaskRunsByTaskId[taskId] ?? [],
+      page,
+      pageSize,
+      runs: runs.slice((page - 1) * pageSize, page * pageSize),
+      totalCount: runs.length,
+      totalPages: runs.length ? Math.ceil(runs.length / pageSize) : 0,
     });
   }
 
@@ -2402,11 +2468,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       ...appTestState.scheduledTaskRunsByTaskId,
       [taskId]: [run, ...(appTestState.scheduledTaskRunsByTaskId[taskId] ?? [])],
     };
-    appTestState.scheduledTasksResponse = {
-      tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+    appTestState.scheduledTasksResponse = scheduledTasksEnvelope(
+      appTestState.scheduledTasksResponse.tasks.map((task) =>
         task.id === taskId ? { ...task, lastRunAt: now, updatedAt: now } : task,
       ),
-    };
+    );
     return jsonResponse({ run });
   }
 
@@ -2428,11 +2494,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         status,
         updatedAt: "2026-06-22T09:00:00Z",
       };
-      appTestState.scheduledTasksResponse = {
-        tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+      appTestState.scheduledTasksResponse = scheduledTasksEnvelope(
+        appTestState.scheduledTasksResponse.tasks.map((task) =>
           task.id === taskId ? updatedTask! : task,
         ),
-      };
+      );
     }
     return jsonResponse({ task: updatedTask });
   }
@@ -2458,9 +2524,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       title: `${existingTask.title} copy`,
       updatedAt: now,
     };
-    appTestState.scheduledTasksResponse = {
-      tasks: [task, ...appTestState.scheduledTasksResponse.tasks],
-    };
+    appTestState.scheduledTasksResponse = scheduledTasksEnvelope([
+      task,
+      ...appTestState.scheduledTasksResponse.tasks,
+    ]);
     appTestState.scheduledTaskRunsByTaskId = {
       ...appTestState.scheduledTaskRunsByTaskId,
       [task.id]: [],
@@ -2477,11 +2544,9 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       (task) => task.id === taskId,
     );
     if (init?.method === "DELETE") {
-      appTestState.scheduledTasksResponse = {
-        tasks: appTestState.scheduledTasksResponse.tasks.filter(
-          (task) => task.id !== taskId,
-        ),
-      };
+      appTestState.scheduledTasksResponse = scheduledTasksEnvelope(
+        appTestState.scheduledTasksResponse.tasks.filter((task) => task.id !== taskId),
+      );
       return jsonResponse({ task: existingTask });
     }
     if (init?.method === "PATCH" && existingTask) {
@@ -2511,11 +2576,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         title: (body.title as string | undefined) ?? existingTask.title,
         updatedAt: "2026-06-22T09:00:00Z",
       };
-      appTestState.scheduledTasksResponse = {
-        tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+      appTestState.scheduledTasksResponse = scheduledTasksEnvelope(
+        appTestState.scheduledTasksResponse.tasks.map((task) =>
           task.id === taskId ? updatedTask : task,
         ),
-      };
+      );
       return jsonResponse({ task: updatedTask });
     }
   }
@@ -2564,9 +2629,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       workspaceId,
       workspaceName,
     };
-    appTestState.scheduledTasksResponse = {
-      tasks: [task, ...appTestState.scheduledTasksResponse.tasks],
-    };
+    appTestState.scheduledTasksResponse = scheduledTasksEnvelope([
+      task,
+      ...appTestState.scheduledTasksResponse.tasks,
+    ]);
     appTestState.scheduledTaskRunsByTaskId = {
       ...appTestState.scheduledTaskRunsByTaskId,
       [task.id]: [],
