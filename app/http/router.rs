@@ -450,6 +450,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/chat/questions/pending",
+            get(crate::http::chat::pending_questions),
+        )
+        .route(
             "/api/chat/questions/{question_id}/answer",
             post(crate::http::chat::answer_question),
         )

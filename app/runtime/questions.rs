@@ -178,6 +178,21 @@ impl QuestionRegistry {
             .map(|pending| pending.request.clone()))
     }
 
+    pub(crate) fn list_pending(&self) -> Result<Vec<QuestionRequest>, ApiError> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
+
+        let mut requests = pending
+            .values()
+            .map(|pending| (pending.registered_at, pending.request.clone()))
+            .collect::<Vec<_>>();
+        requests.sort_by_key(|(registered_at, _)| *registered_at);
+
+        Ok(requests.into_iter().map(|(_, request)| request).collect())
+    }
+
     #[cfg(test)]
     pub(crate) fn is_pending(&self, question_id: &str) -> Result<bool, ApiError> {
         let pending = self

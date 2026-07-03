@@ -1829,6 +1829,68 @@ fn question_registry_returns_pending_question_for_chat() {
     );
 }
 
+#[tokio::test]
+async fn pending_questions_api_lists_pending_questions_until_answered() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = test_app_state(
+        GlobalConfig::first_run(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    let registration = state
+        .question_registry
+        .register(QuestionRequest {
+            id: "question-3".to_string(),
+            tool_call_id: "tool-call-3".to_string(),
+            workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+            chat_id: "chat-3".to_string(),
+            questions: vec![QuestionItem {
+                id: "question-3-item-1".to_string(),
+                question: "Deploy now?".to_string(),
+                options: vec![QuestionOption {
+                    label: "Yes".to_string(),
+                    value: "yes".to_string(),
+                    description: None,
+                }],
+                allow_free_text: false,
+            }],
+        })
+        .expect("question registration");
+
+    let Json(listed) = crate::http::chat::pending_questions(State(state.clone()))
+        .await
+        .expect("pending questions response");
+    assert_eq!(listed.questions.len(), 1);
+    assert_eq!(listed.questions[0].workspace_id, DEFAULT_WORKSPACE_ID);
+    assert_eq!(listed.questions[0].chat_id, "chat-3");
+    assert_eq!(listed.questions[0].id, "question-3");
+    assert_eq!(listed.questions[0].questions[0].question, "Deploy now?");
+
+    let Json(answered) = crate::http::chat::answer_question(
+        State(state.clone()),
+        AxumPath("question-3".to_string()),
+        Json(QuestionAnswer {
+            answers: vec![QuestionItemAnswer {
+                id: "question-3-item-1".to_string(),
+                answer: "yes".to_string(),
+                selected_option_value: Some("yes".to_string()),
+            }],
+        }),
+    )
+    .await
+    .expect("question answer response");
+    assert!(answered.ok);
+    assert_eq!(answered.question_id, "question-3");
+
+    let received_answer = registration.answer_rx.await.expect("question answer");
+    assert_eq!(received_answer.answers[0].answer, "yes");
+
+    let Json(listed) = crate::http::chat::pending_questions(State(state))
+        .await
+        .expect("pending questions response after answer");
+    assert!(listed.questions.is_empty());
+}
+
 #[test]
 fn new_provider_is_associated_with_matching_local_models() {
     let mut models = vec![

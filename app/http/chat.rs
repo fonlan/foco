@@ -234,6 +234,12 @@ pub(crate) struct ChatMessagesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PendingQuestionsResponse {
+    pub(crate) questions: Vec<QuestionRequest>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ChatMessagesPaginationSummary {
     pub(crate) has_more_before: bool,
     pub(crate) next_before_sequence: Option<i64>,
@@ -1271,6 +1277,14 @@ pub(crate) async fn answer_question(
     Ok(Json(QuestionAnswerResponse {
         ok: true,
         question_id,
+    }))
+}
+
+pub(crate) async fn pending_questions(
+    State(state): State<AppState>,
+) -> Result<Json<PendingQuestionsResponse>, ApiError> {
+    Ok(Json(PendingQuestionsResponse {
+        questions: state.question_registry.list_pending()?,
     }))
 }
 
