@@ -38,12 +38,12 @@ pub use workspace_records::{
     CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
     LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
-    LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRollupFilters,
-    MessageRecord, MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot,
-    NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
-    NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
-    NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun,
-    NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
+    LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRecord,
+    LlmRequestUsageRollupFilters, MessageRecord, MessageRoleCountRecord, NewAgentContextEntry,
+    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
     NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
     NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
     PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListPage, PlanPatch,
@@ -4967,6 +4967,34 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn latest_completed_llm_usage_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<LlmRequestUsageRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                 FROM llm_requests
+                 WHERE chat_id = ?1
+                   AND final_state IN ('succeeded', 'completed')
+                   AND input_tokens IS NOT NULL
+                   AND output_tokens IS NOT NULL
+                 ORDER BY request_started_at DESC, id DESC
+                 LIMIT 1",
+                params![chat_id],
+                |row| {
+                    Ok(LlmRequestUsageRecord {
+                        input_tokens: row.get(0)?,
+                        output_tokens: row.get(1)?,
+                        cache_read_tokens: row.get(2)?,
+                        cache_write_tokens: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn insert_llm_request_event(

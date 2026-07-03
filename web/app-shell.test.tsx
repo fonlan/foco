@@ -1343,6 +1343,59 @@ describe("app-shell verification surfaces", () => {
     ).toBe(false);
   });
 
+  it("restores context usage for completed historical chats from stored latest usage", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            activeRun: null,
+            latestResponseUsage: {
+              cacheReadTokens: 1200,
+              cacheWriteTokens: 300,
+              inputTokens: 70000,
+              outputTokens: 900,
+            },
+          }),
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+    const usageCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCall).toBeDefined();
+    expect(JSON.parse(String(usageCall?.[1]?.body))).toMatchObject({
+      latestResponseUsage: {
+        cacheReadTokens: 1200,
+        cacheWriteTokens: 300,
+        inputTokens: 70000,
+        outputTokens: 900,
+      },
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/chat/runs/"),
+      ),
+    ).toBe(false);
+  });
+
   it("does not estimate context usage for opened chats or composer drafts", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

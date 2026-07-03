@@ -542,6 +542,7 @@ export type ChatMessagesResponse = {
   };
   activeRun?: ActiveChatRunSummary | null;
   pendingQuestion?: QuestionRequestSummary | null;
+  latestResponseUsage?: ChatUsage | null;
 };
 
 export type QuestionOptionSummary = {

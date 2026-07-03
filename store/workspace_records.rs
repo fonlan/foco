@@ -846,6 +846,14 @@ pub struct LlmRequestMetricsRecord {
     pub output_tokens: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmRequestUsageRecord {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LlmRequestAuditFilters<'a> {
     pub request_ids: &'a [String],

@@ -4579,6 +4579,7 @@ export function App() {
         chatMessagesByKeyRef.current[chatKey] ?? [],
       );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      const latestResponseUsage = parseNullableChatUsage(data.latestResponseUsage);
       const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
       const pagination = normalizeChatMessagesPagination(data.pagination);
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
@@ -4618,6 +4619,17 @@ export function App() {
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
         clearWorkspaceChatActiveRun(workspaceId, chatId);
+        if (latestResponseUsage && selectedModelId && selectedProviderId) {
+          void refreshContextUsage({
+            chatId,
+            latestResponseUsage,
+            modelId: selectedModelId,
+            providerId: selectedProviderId,
+            skillIds: selectedSkillIds,
+            thinkingLevel: selectedThinkingLevel,
+            workspaceId,
+          });
+        }
       }
     } catch (requestError) {
       if (activeChatKeyRef.current === chatKey) {

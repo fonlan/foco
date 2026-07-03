@@ -15,8 +15,8 @@ use foco_store::{
     memory::MemoryDatabase,
     workspace::{
         LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
-        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestUsageRollupFilters,
-        TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
+        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestUsageRecord,
+        LlmRequestUsageRollupFilters, TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -232,6 +232,28 @@ pub(crate) struct ChatMessagesResponse {
     pub(crate) pagination: ChatMessagesPaginationSummary,
     pub(crate) active_run: Option<ActiveChatRunSummary>,
     pub(crate) pending_question: Option<QuestionRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latest_response_usage: Option<ChatUsageSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatUsageSummary {
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_read_tokens: Option<i64>,
+    pub(crate) cache_write_tokens: Option<i64>,
+}
+
+impl From<LlmRequestUsageRecord> for ChatUsageSummary {
+    fn from(record: LlmRequestUsageRecord) -> Self {
+        Self {
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cache_read_tokens: record.cache_read_tokens,
+            cache_write_tokens: record.cache_write_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1733,6 +1755,10 @@ pub(crate) async fn chat_messages(
     let pending_question = state
         .question_registry
         .pending_for_chat(workspace_id, chat_id)?;
+    let latest_response_usage = database
+        .latest_completed_llm_usage_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .map(ChatUsageSummary::from);
 
     Ok(Json(ChatMessagesResponse {
         chat: Some(chat_summary),
@@ -1740,6 +1766,7 @@ pub(crate) async fn chat_messages(
         pagination,
         active_run,
         pending_question,
+        latest_response_usage,
     }))
 }
 

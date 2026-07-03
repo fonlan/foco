@@ -8658,6 +8658,191 @@ fn add_memory_reference_tables(connection: &Connection) {
         .expect("memory references migration fixture schema");
 }
 
+#[test]
+fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-usage", "Usage chat")
+        .expect("chat insert");
+    database
+        .insert_chat("other-chat", "Other chat")
+        .expect("other chat insert");
+
+    for request in [
+        NewLlmRequest {
+            id: "request-running-latest",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-usage"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:05Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(999),
+            output_tokens: Some(999),
+            cache_read_tokens: Some(9),
+            cache_write_tokens: Some(9),
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        },
+        NewLlmRequest {
+            id: "request-empty-tokens",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-usage"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:04Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-03T10:00:05Z"),
+            input_tokens: None,
+            output_tokens: Some(7),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "completed",
+            request_body_json: None,
+            response_body_json: None,
+        },
+        NewLlmRequest {
+            id: "request-failed",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-usage"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:03Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-03T10:00:04Z"),
+            input_tokens: Some(888),
+            output_tokens: Some(888),
+            cache_read_tokens: Some(8),
+            cache_write_tokens: Some(8),
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(500),
+            final_state: "failed",
+            request_body_json: None,
+            response_body_json: None,
+        },
+        NewLlmRequest {
+            id: "request-selected-b",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-usage"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:02Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-03T10:00:03Z"),
+            input_tokens: Some(120),
+            output_tokens: Some(40),
+            cache_read_tokens: Some(12),
+            cache_write_tokens: Some(4),
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json: None,
+        },
+        NewLlmRequest {
+            id: "request-selected-a",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-usage"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:02Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-03T10:00:03Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(1),
+            cache_write_tokens: Some(1),
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "completed",
+            request_body_json: None,
+            response_body_json: None,
+        },
+        NewLlmRequest {
+            id: "request-other-chat",
+            workspace_id: "workspace-1",
+            chat_id: Some("other-chat"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-07-03T10:00:06Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-03T10:00:07Z"),
+            input_tokens: Some(777),
+            output_tokens: Some(777),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json: None,
+        },
+    ] {
+        database
+            .insert_llm_request(request)
+            .expect("llm request insert");
+    }
+
+    let usage = database
+        .latest_completed_llm_usage_for_chat("chat-usage")
+        .expect("latest usage")
+        .expect("usage");
+    assert_eq!(usage.input_tokens, 120);
+    assert_eq!(usage.output_tokens, 40);
+    assert_eq!(usage.cache_read_tokens, Some(12));
+    assert_eq!(usage.cache_write_tokens, Some(4));
+    assert!(
+        database
+            .latest_completed_llm_usage_for_chat("missing-chat")
+            .expect("missing usage")
+            .is_none()
+    );
+}
+
 fn table_count(connection: &Connection, table: &str) -> i64 {
     connection
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
