@@ -4568,6 +4568,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
 
     let filtered_rows = database
         .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_id: Some("request-1"),
             workspace_id: Some("workspace-1"),
             chat_id: Some("chat-1"),
             provider_id: Some("openai-responses"),
@@ -4585,6 +4586,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert_eq!(
         database
             .llm_request_audit_count(LlmRequestAuditFilters {
+                request_id: Some("request-1"),
                 workspace_id: Some("workspace-1"),
                 chat_id: Some("chat-1"),
                 provider_id: Some("openai-responses"),

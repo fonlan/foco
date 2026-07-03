@@ -17,6 +17,7 @@ export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
     page: String(positivePage(page)),
     pageSize: "20",
     providerId: "",
+    requestId: "",
     startedAfter: "",
     startedBefore: "",
     status: "",
@@ -242,6 +243,7 @@ function aiStatsQuery(filters: AiStatsFilterState) {
   const params = new URLSearchParams();
   const entries: [keyof AiStatsFilterState, string][] = [
     ["workspaceId", filters.workspaceId],
+    ["requestId", filters.requestId],
     ["chatId", filters.chatId],
     ["providerId", filters.providerId],
     ["modelId", filters.modelId],

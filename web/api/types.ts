@@ -381,6 +381,7 @@ export type ChatReplyMetrics = {
   totalLatencyMs: number | null;
   firstTokenLatencyMs: number | null;
   outputTokens: number | null;
+  llmRequestIds: string[];
 };
 
 export type ChatMemoryUsedSummary = {
@@ -1907,6 +1908,7 @@ export type AiRequestDetailResponse = {
 
 export type AiStatsFilterState = {
   workspaceId: string;
+  requestId: string;
   chatId: string;
   providerId: string;
   modelId: string;

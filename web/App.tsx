@@ -13777,6 +13777,8 @@ function parseChatReplyMetrics(
     "first_token_latency_ms",
   );
   const outputTokens = fieldValue(value, "outputTokens", "output_tokens");
+  const llmRequestIds =
+    stringArrayField(value, "llmRequestIds", "llm_request_ids") ?? [];
 
   if (
     !modelId ||
@@ -13790,6 +13792,7 @@ function parseChatReplyMetrics(
 
   return {
     firstTokenLatencyMs,
+    llmRequestIds,
     modelId,
     outputTokens,
     providerId,

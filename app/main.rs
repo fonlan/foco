@@ -1710,6 +1710,7 @@ struct ChatReplyMetrics {
     total_latency_ms: Option<i64>,
     first_token_latency_ms: Option<i64>,
     output_tokens: Option<i64>,
+    llm_request_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2049,6 +2050,7 @@ pub(crate) struct CapturedAuditEvent {
 
 struct NormalizedAiStatisticsFilters {
     workspace_id: Option<String>,
+    request_id: Option<String>,
     chat_id: Option<String>,
     provider_id: Option<String>,
     model_id: Option<String>,
@@ -3267,6 +3269,7 @@ impl PreparedChatContext {
                                         turn_total_latency_ms,
                                         turn_first_token_latency_ms,
                                         usage.as_ref(),
+                                        vec![turn_llm_request_id.clone()],
                                     );
                                     if let Some(usage) = usage {
                                         let event = ChatSseEvent::Usage { usage };
@@ -3371,6 +3374,11 @@ impl PreparedChatContext {
                                             total_latency_ms: Some(total_latency_ms),
                                             first_token_latency_ms,
                                             output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+                                            llm_request_ids: self
+                                                .captured_llm_requests
+                                                .iter()
+                                                .map(|request| request.id.clone())
+                                                .collect(),
                                         };
                                         let complete_event = ChatSseEvent::Complete {
                                             chat_id: self.chat_id.clone(),
@@ -5414,6 +5422,7 @@ fn turn_reply_metrics(
     total_latency_ms: i64,
     first_token_latency_ms: Option<i64>,
     usage: Option<&NeutralUsage>,
+    llm_request_ids: Vec<String>,
 ) -> ChatReplyMetrics {
     ChatReplyMetrics {
         model_id: model_id.to_string(),
@@ -5421,6 +5430,7 @@ fn turn_reply_metrics(
         total_latency_ms: Some(total_latency_ms),
         first_token_latency_ms,
         output_tokens: usage.and_then(|usage| usage.output_tokens),
+        llm_request_ids,
     }
 }
 
@@ -7256,6 +7266,7 @@ fn normalized_ai_statistics_query(
 
     Ok(NormalizedAiStatisticsFilters {
         workspace_id: optional_trimmed_string(query.workspace_id),
+        request_id: optional_trimmed_string(query.request_id),
         chat_id: optional_trimmed_string(query.chat_id),
         provider_id: optional_trimmed_string(query.provider_id),
         model_id: optional_trimmed_string(query.model_id),
@@ -9653,6 +9664,7 @@ fn chat_reply_metrics_from_requests(requests: &[LlmRequestMetricsRecord]) -> Cha
         total_latency_ms: sum_optional_i64(requests.iter().map(|request| request.total_latency_ms)),
         first_token_latency_ms: first_request.first_token_latency_ms,
         output_tokens: sum_optional_i64(requests.iter().map(|request| request.output_tokens)),
+        llm_request_ids: requests.iter().map(|request| request.id.clone()).collect(),
     }
 }
 

@@ -753,6 +753,7 @@ function chatReplyMetrics(value: JsonValue | undefined): ChatReplyMetrics | null
     totalLatencyMs: nullableJsonNumber(record.totalLatencyMs),
     firstTokenLatencyMs: nullableJsonNumber(record.firstTokenLatencyMs),
     outputTokens: nullableJsonNumber(record.outputTokens),
+    llmRequestIds: jsonStringArray(record, "llmRequestIds", "llm_request_ids"),
   };
 }
 
@@ -835,6 +836,13 @@ function jsonStringField(record: Record<string, JsonValue>, ...keys: string[]) {
 function jsonRawStringField(record: Record<string, JsonValue>, ...keys: string[]) {
   const value = jsonField(record, ...keys);
   return typeof value === "string" ? value : null;
+}
+
+function jsonStringArray(record: Record<string, JsonValue>, ...keys: string[]) {
+  const value = jsonField(record, ...keys);
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : [];
 }
 
 function jsonBooleanField(record: Record<string, JsonValue>, ...keys: string[]) {

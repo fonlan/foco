@@ -816,6 +816,7 @@ pub struct LlmRequestMetricsRecord {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LlmRequestAuditFilters<'a> {
+    pub request_id: Option<&'a str>,
     pub workspace_id: Option<&'a str>,
     pub chat_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,

@@ -11539,6 +11539,9 @@ fn append_llm_request_audit_where_clause(
         has_where = true;
     };
 
+    if let Some(value) = filters.request_id {
+        push_condition("id = ?", value);
+    }
     if let Some(value) = filters.workspace_id {
         push_condition("workspace_id = ?", value);
     }

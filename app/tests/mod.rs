@@ -334,6 +334,7 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
                 total_latency_ms: Some(1),
                 first_token_latency_ms: Some(1),
                 output_tokens: Some(1),
+                llm_request_ids: vec!["request-1".to_string()],
             },
             memories_used: Vec::new(),
         },
@@ -4427,6 +4428,7 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
                     total_latency_ms: Some(1_000),
                     first_token_latency_ms: Some(100),
                     output_tokens: Some(5),
+                    llm_request_ids: vec!["request-1".to_string()],
                 },
                 memories_used: Vec::new(),
             },
@@ -7181,6 +7183,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             total_latency_ms: Some(1_000),
             first_token_latency_ms: Some(100),
             output_tokens: Some(5),
+            llm_request_ids: vec!["request-1".to_string()],
         },
         memories_used: Vec::new(),
     });
