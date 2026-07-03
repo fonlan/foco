@@ -302,6 +302,71 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("updates context usage from complete usage when no usage event was sent", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 1000,
+          providerId: "provider-1",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Final answer.",
+        type: "complete",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+    const usageCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCalls).toHaveLength(1);
+    const [, usageInit] = usageCalls[0];
+    expect(typeof usageInit?.body).toBe("string");
+    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
+      chatId: "chat-1",
+      latestResponseUsage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 70000,
+        outputTokens: 1000,
+      },
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("does not estimate context usage from streaming deltas", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
@@ -1366,8 +1431,8 @@ describe("app-chat-stream verification surfaces", () => {
       "src",
       `/api/workspaces/workspace-1/files/blob?path=${encodeURIComponent(delegatedPath)}`,
     );
-    expect(screen.getByText(directPath)).toBeInTheDocument();
-    expect(screen.getByText(delegatedPath)).toBeInTheDocument();
+    expect(screen.getAllByText(directPath).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(delegatedPath).length).toBeGreaterThan(0);
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

@@ -7104,7 +7104,16 @@ export function App() {
           const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
           activeReasoningStartedAtMs = null;
           stopLiveReasoningDuration();
-          const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
+          const liveStatisticsUsage =
+            streamEvent.usage &&
+              streamEvent.usage.inputTokens !== null &&
+              streamEvent.usage.outputTokens !== null
+              ? streamEvent.usage
+              : latestResponseUsage;
+          if (!latestResponseUsage && liveStatisticsUsage) {
+            latestResponseUsage = liveStatisticsUsage;
+            refreshRunContextUsage();
+          }
           updateLiveChatStatistics(chatKey, {
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,
@@ -8104,7 +8113,16 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
+          const liveStatisticsUsage =
+            streamEvent.usage &&
+              streamEvent.usage.inputTokens !== null &&
+              streamEvent.usage.outputTokens !== null
+              ? streamEvent.usage
+              : latestResponseUsage;
+          if (!latestResponseUsage && liveStatisticsUsage) {
+            latestResponseUsage = liveStatisticsUsage;
+            refreshRunContextUsage();
+          }
           updateLiveChatStatistics(runMessagesKey, {
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,
