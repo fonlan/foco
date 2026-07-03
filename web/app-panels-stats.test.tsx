@@ -2517,12 +2517,15 @@ describe("app-panels-stats verification surfaces", () => {
     });
     statsScroller.scrollTop = 0;
     fireEvent.touchStart(tableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
-    fireEvent.touchMove(tableScroller, { touches: [{ clientX: 24, clientY: 90 }] });
-    expect(statsScroller.scrollTop).toBe(50);
-    fireEvent.touchEnd(tableScroller);
-    statsScroller.scrollTop = 0;
-    fireEvent.touchStart(tableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
-    fireEvent.touchMove(tableScroller, { touches: [{ clientX: 90, clientY: 110 }] });
+    const verticalTouchMove = new Event("touchmove", {
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(verticalTouchMove, "touches", {
+      value: [{ clientX: 24, clientY: 90 }],
+    });
+    tableScroller.dispatchEvent(verticalTouchMove);
+    expect(verticalTouchMove.defaultPrevented).toBe(false);
     expect(statsScroller.scrollTop).toBe(0);
     fireEvent.touchEnd(tableScroller);
     await waitFor(() =>

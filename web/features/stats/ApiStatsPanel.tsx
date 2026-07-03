@@ -25,7 +25,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -43,12 +42,7 @@ import type {
 } from "../../api/types";
 import { type AiStatsColumnId } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
-import {
-  findVerticalScrollAncestor,
-  forwardVerticalTouchDrag,
-  startVerticalTouchDragForward,
-  type VerticalTouchDragState,
-} from "../../shared/scroll-forwarding";
+import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
 import {
   readAiStatsVisibleColumnIds,
   writeAiStatsVisibleColumnIds,
@@ -106,7 +100,6 @@ export function ApiStatsPanel({
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
-  const touchDragRef = useRef<VerticalTouchDragState | null>(null);
   const requests = stats?.requests ?? [];
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const totalCount = stats?.totalCount ?? summary.totalRequests;
@@ -614,34 +607,7 @@ export function ApiStatsPanel({
           </div>
 
           <div
-            className="panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
-            onTouchCancel={() => {
-              touchDragRef.current = null;
-            }}
-            onTouchEnd={() => {
-              touchDragRef.current = null;
-            }}
-            onTouchMove={(event) => {
-              const touch = event.touches[0];
-              if (!touch) {
-                return;
-              }
-              if (
-                forwardVerticalTouchDrag(
-                  touchDragRef.current,
-                  touch,
-                  event.currentTarget,
-                )
-              ) {
-                event.preventDefault();
-              }
-            }}
-            onTouchStart={(event) => {
-              const touch = event.touches[0];
-              touchDragRef.current = touch
-                ? startVerticalTouchDragForward(touch)
-                : null;
-            }}
+            className="api-stats-audit-table-scroll panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
             onWheel={(event) => {
               // Keep desktop trackpad/wheel vertical motion flowing to the
               // page scroller while horizontal table swipes stay native.

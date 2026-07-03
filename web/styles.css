@@ -252,6 +252,12 @@ summary:focus-visible {
   overscroll-behavior: contain;
 }
 
+.api-stats-audit-table-scroll {
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+  touch-action: auto;
+}
+
 .panel-scroll::-webkit-scrollbar {
   height: 0.75rem;
   width: 0.75rem;
