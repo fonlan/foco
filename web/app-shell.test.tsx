@@ -243,7 +243,7 @@ describe("app-shell verification surfaces", () => {
       ),
     ).not.toBeInTheDocument();
 
-    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
 
     expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
@@ -254,7 +254,7 @@ describe("app-shell verification surfaces", () => {
       ),
     ).toBeInTheDocument();
 
-    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show compact" }));
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Compact" }));
 
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
@@ -294,6 +294,33 @@ describe("app-shell verification surfaces", () => {
     expect(
       await screen.findByPlaceholderText(sideProjectComposerPlaceholder),
     ).toBeInTheDocument();
+  });
+
+  it("localizes the tool call raw toggle label", async () => {
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      general: {
+        ...appTestState.settingsResponse.general,
+        language: "zh-CN",
+      },
+    };
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    const assistantBubble = (await screen.findByText("edit_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    const rawButton = within(assistantBubble).getByRole("button", { name: "原始" });
+    expect(rawButton).toHaveTextContent("原始");
+
+    await userEvent.click(rawButton);
+
+    expect(within(assistantBubble).getByRole("button", { name: "精简" })).toHaveTextContent(
+      "精简",
+    );
   });
 
   it("opens API statistics filtered to the assistant reply request", async () => {
@@ -597,7 +624,7 @@ describe("app-shell verification surfaces", () => {
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
     expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
 
-    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
 
     expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
@@ -704,7 +731,7 @@ describe("app-shell verification surfaces", () => {
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
 
-    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Show raw" }));
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
 
     expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();

@@ -2490,7 +2490,7 @@ function ToolCallBlock({
   const generatedImages = toolCall.isError
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
-  const toggleLabel = viewMode === "compact" ? "Show raw" : "Show compact";
+  const toggleLabel = viewMode === "compact" ? t("Raw") : t("Compact");
   const ToolIcon = TOOL_CALL_ICONS[toolCall.name] ?? Wrench;
 
   return (
