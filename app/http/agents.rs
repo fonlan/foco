@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
 };
 use foco_agent::{
     AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
@@ -14,8 +14,9 @@ use foco_store::workspace::{
     RunEventRecord, WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -118,6 +119,52 @@ pub(crate) struct AgentTeamSnapshotResponse {
     mutation_lease_owners: Vec<AgentMutationLeaseOwnerView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree_action: Option<serde_json::Value>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentTranscriptQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentTranscriptResponse {
+    items: Vec<AgentTranscriptItemView>,
+    page: usize,
+    page_size: usize,
+    total_count: usize,
+    total_pages: usize,
+    has_more: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentTranscriptItemView {
+    pub(crate) id: String,
+    pub(crate) author: String,
+    pub(crate) role: AgentTranscriptRole,
+    pub(crate) kind: String,
+    pub(crate) created_at: String,
+    pub(crate) task_status: Option<AgentTaskStatus>,
+    pub(crate) content: String,
+    pub(crate) parts: Vec<ChatMessagePart>,
+    pub(crate) metrics: Option<ChatReplyMetrics>,
+    pub(crate) status: Option<AgentTranscriptItemStatus>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AgentTranscriptRole {
+    Assistant,
+    User,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AgentTranscriptItemStatus {
+    Error,
+    Streaming,
 }
 
 #[derive(Serialize)]
@@ -400,6 +447,51 @@ pub(crate) async fn agent_team_snapshot(
         &database,
         &team.id,
     )?))
+}
+
+pub(crate) async fn agent_instance_transcript(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, instance_id)): AxumPath<(String, String)>,
+    Query(query): Query<AgentTranscriptQuery>,
+) -> Result<Json<AgentTranscriptResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let instance_id = AgentInstanceId::new(instance_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let instance = database
+        .agent_instance(&instance_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent instance '{instance_id}' was not found"))
+        })?;
+    let team = database
+        .agent_team(&instance.team_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent team '{}' was not found", instance.team_id))
+        })?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
+    let items = agent_instance_transcript_items(&database, &team, &instance)?;
+    let total_count = items.len();
+    let total_pages = total_count.div_ceil(page_size).max(1);
+    let offset = (page - 1).saturating_mul(page_size);
+    let page_items = items
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .collect::<Vec<_>>();
+
+    Ok(Json(AgentTranscriptResponse {
+        items: page_items,
+        page,
+        page_size,
+        total_count,
+        total_pages,
+        has_more: page < total_pages,
+    }))
 }
 
 pub(crate) async fn create_agent_instances(
@@ -1179,6 +1271,574 @@ fn agent_team_snapshot_from_database(
         mutation_lease_owners,
         worktree_action: None,
     })
+}
+
+pub(crate) fn agent_instance_transcript_items(
+    database: &WorkspaceDatabase,
+    team: &AgentTeamRecord,
+    instance: &AgentInstanceRecord,
+) -> Result<Vec<AgentTranscriptItemView>, ApiError> {
+    let instances = database
+        .agent_instances_for_team(&team.id)
+        .map_err(ApiError::from_workspace_error)?;
+    let instances_by_id = instances
+        .iter()
+        .map(|current| (current.id.clone(), current))
+        .collect::<HashMap<_, _>>();
+    let tasks = database
+        .agent_tasks_for_team(&team.id)
+        .map_err(ApiError::from_workspace_error)?;
+    let tasks_by_id = tasks
+        .iter()
+        .map(|task| (task.id.clone(), task))
+        .collect::<HashMap<_, _>>();
+    let mut messages = Vec::new();
+    for current in &instances {
+        messages.extend(
+            database
+                .agent_messages_after(&current.id, -1)
+                .map_err(ApiError::from_workspace_error)?,
+        );
+    }
+    let incoming_message_task_ids = messages
+        .iter()
+        .filter(|message| message.receiver_instance_id == instance.id)
+        .filter_map(|message| message.related_task_id.clone())
+        .collect::<HashSet<_>>();
+
+    let mut items = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.owner_instance_id == instance.id)
+    {
+        let input = parse_json_value(&task.input_json, "Agent task input")?;
+        if !incoming_message_task_ids.contains(&task.id) {
+            items.push(AgentTranscriptItemView {
+                id: format!("task:{}:input", task.id),
+                author: agent_instance_display_name(
+                    team,
+                    &instances_by_id,
+                    task.origin_instance_id.as_ref(),
+                ),
+                role: AgentTranscriptRole::User,
+                kind: "Task input".to_string(),
+                created_at: task.created_at.clone(),
+                task_status: Some(task.status),
+                content: agent_task_input_content(&input),
+                parts: Vec::new(),
+                metrics: None,
+                status: None,
+            });
+        }
+
+        let events = database
+            .run_events_for_run(task.id.as_str())
+            .map_err(ApiError::from_workspace_error)?;
+        if let Some(run_item) =
+            agent_task_run_transcript_item(task, &events, &instance.definition_snapshot.name)?
+        {
+            items.push(run_item);
+        } else if let Some(output) = agent_task_output_content(task)? {
+            items.push(AgentTranscriptItemView {
+                id: format!("task:{}:output", task.id),
+                author: instance.definition_snapshot.name.clone(),
+                role: AgentTranscriptRole::Assistant,
+                kind: output.kind,
+                created_at: task
+                    .completed_at
+                    .clone()
+                    .unwrap_or_else(|| task.updated_at.clone()),
+                task_status: Some(task.status),
+                content: output.content,
+                parts: Vec::new(),
+                metrics: None,
+                status: None,
+            });
+        }
+    }
+
+    for message in messages {
+        if message.sender_instance_id.as_ref() != Some(&instance.id)
+            && message.receiver_instance_id != instance.id
+        {
+            continue;
+        }
+        let is_outgoing = message.sender_instance_id.as_ref() == Some(&instance.id);
+        let related_task_status = message
+            .related_task_id
+            .as_ref()
+            .and_then(|task_id| tasks_by_id.get(task_id))
+            .map(|task| task.status);
+        items.push(AgentTranscriptItemView {
+            id: format!("message:{}", message.id),
+            author: if is_outgoing {
+                instance.definition_snapshot.name.clone()
+            } else {
+                agent_instance_display_name(
+                    team,
+                    &instances_by_id,
+                    message.sender_instance_id.as_ref(),
+                )
+            },
+            role: if is_outgoing {
+                AgentTranscriptRole::Assistant
+            } else {
+                AgentTranscriptRole::User
+            },
+            kind: if message.kind == foco_agent::AgentMessageKind::Reply {
+                "Reply".to_string()
+            } else {
+                "Message".to_string()
+            },
+            created_at: message.created_at,
+            task_status: related_task_status,
+            content: redact_agent_text_or_json(&message.content),
+            parts: Vec::new(),
+            metrics: None,
+            status: None,
+        });
+    }
+
+    items.sort_by(compare_agent_transcript_items);
+    Ok(items)
+}
+
+struct AgentTaskOutputContent {
+    kind: String,
+    content: String,
+}
+
+fn agent_task_run_transcript_item(
+    task: &AgentTaskRecord,
+    events: &[RunEventRecord],
+    author: &str,
+) -> Result<Option<AgentTranscriptItemView>, ApiError> {
+    if events.is_empty() {
+        if task.status != AgentTaskStatus::Running {
+            return Ok(None);
+        }
+        return Ok(Some(AgentTranscriptItemView {
+            id: format!("task:{}:run", task.id),
+            author: author.to_string(),
+            role: AgentTranscriptRole::Assistant,
+            kind: "Task run".to_string(),
+            created_at: task
+                .started_at
+                .clone()
+                .unwrap_or_else(|| task.updated_at.clone()),
+            task_status: Some(task.status),
+            content: String::new(),
+            parts: Vec::new(),
+            metrics: None,
+            status: Some(AgentTranscriptItemStatus::Streaming),
+        }));
+    }
+
+    let mut sorted_events = events.to_vec();
+    sorted_events.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then(left.created_at.cmp(&right.created_at))
+            .then(left.id.cmp(&right.id))
+    });
+    let mut content = String::new();
+    let mut parts = Vec::new();
+    let mut metrics = None;
+    let mut status =
+        (task.status == AgentTaskStatus::Running).then_some(AgentTranscriptItemStatus::Streaming);
+
+    for event in &sorted_events {
+        let payload = parse_json_value(&event.payload_json, "Agent run event payload")?;
+        let event_type =
+            string_json_field(&payload, "type", "type").unwrap_or(event.event_type.as_str());
+        match event_type {
+            "textDelta" | "text_delta" => {
+                if let Some(delta) = string_json_field(&payload, "delta", "delta") {
+                    content.push_str(delta);
+                    push_text_part(&mut parts, delta);
+                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                }
+            }
+            "reasoningDelta" | "reasoning_delta" => {
+                if let Some(delta) = string_json_field(&payload, "delta", "delta") {
+                    push_reasoning_part(&mut parts, delta);
+                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                }
+            }
+            "toolCall" | "tool_call" => {
+                if let Some(tool_call) = payload
+                    .get("toolCall")
+                    .or_else(|| payload.get("tool_call"))
+                    .and_then(agent_tool_call_summary_from_value)
+                {
+                    upsert_agent_tool_call_part(&mut parts, tool_call);
+                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                }
+            }
+            "toolResult" | "tool_result" => {
+                let tool_call_id = string_json_field(&payload, "toolCallId", "tool_call_id");
+                if let (Some(tool_call_id), Some(output)) = (tool_call_id, payload.get("output")) {
+                    apply_agent_tool_result_to_parts(
+                        &mut parts,
+                        tool_call_id,
+                        redact_agent_json(output.clone()),
+                        bool_json_field(&payload, "isError", "is_error").unwrap_or(false),
+                        string_json_field(&payload, "startedAt", "started_at"),
+                        string_json_field(&payload, "completedAt", "completed_at"),
+                    );
+                }
+            }
+            "toolOutputDelta" | "tool_output_delta" => {
+                let tool_call_id = string_json_field(&payload, "toolCallId", "tool_call_id");
+                let stream = string_json_field(&payload, "stream", "stream");
+                let delta = string_json_field(&payload, "delta", "delta").unwrap_or_default();
+                if let (Some(tool_call_id), Some(stream)) = (tool_call_id, stream)
+                    && matches!(stream, "stdout" | "stderr")
+                {
+                    apply_agent_tool_output_delta_to_parts(&mut parts, tool_call_id, stream, delta);
+                }
+            }
+            "streamReset" | "stream_reset" => {
+                content = string_json_field(&payload, "text", "text")
+                    .unwrap_or_default()
+                    .to_string();
+                parts = parts_from_agent_run_snapshot(
+                    &content,
+                    nullable_string_json_field(&payload, "reasoning", "reasoning"),
+                    payload
+                        .get("toolCalls")
+                        .or_else(|| payload.get("tool_calls"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(agent_tool_call_summary_from_value)
+                        .collect(),
+                );
+                status = Some(AgentTranscriptItemStatus::Streaming);
+            }
+            "complete" | "completion" => {
+                let final_text = string_json_field(&payload, "text", "text").unwrap_or(&content);
+                append_missing_reasoning(
+                    &mut parts,
+                    nullable_string_json_field(&payload, "reasoning", "reasoning"),
+                );
+                append_missing_text(&mut parts, &content, final_text);
+                content = final_text.to_string();
+                metrics = payload.get("metrics").and_then(|value| {
+                    serde_json::from_value::<ChatReplyMetrics>(value.clone()).ok()
+                });
+                status = None;
+            }
+            "error" => {
+                push_error_part(
+                    &mut parts,
+                    string_json_field(&payload, "message", "message").unwrap_or("Unknown error"),
+                );
+                status = Some(AgentTranscriptItemStatus::Error);
+            }
+            _ => {}
+        }
+    }
+
+    let terminal_output = if task.status == AgentTaskStatus::Running {
+        None
+    } else {
+        agent_task_output_content(task)?
+    };
+    match terminal_output.as_ref().map(|output| output.kind.as_str()) {
+        Some("Task error")
+            if !parts
+                .iter()
+                .any(|part| matches!(part, ChatMessagePart::Error { .. })) =>
+        {
+            if let Some(output) = terminal_output {
+                push_error_part(&mut parts, &output.content);
+                status = Some(AgentTranscriptItemStatus::Error);
+            }
+        }
+        Some("Task result") if content.is_empty() => {
+            if let Some(output) = terminal_output {
+                content = output.content;
+                push_text_part(&mut parts, &content);
+            }
+        }
+        _ => {}
+    }
+
+    if parts.is_empty() && content.is_empty() && task.status != AgentTaskStatus::Running {
+        return Ok(None);
+    }
+
+    Ok(Some(AgentTranscriptItemView {
+        id: format!("task:{}:run", task.id),
+        author: author.to_string(),
+        role: AgentTranscriptRole::Assistant,
+        kind: match status {
+            Some(AgentTranscriptItemStatus::Streaming) => "Task run",
+            Some(AgentTranscriptItemStatus::Error) => "Task error",
+            None => "Task result",
+        }
+        .to_string(),
+        created_at: sorted_events
+            .first()
+            .map(|event| event.created_at.clone())
+            .or_else(|| task.started_at.clone())
+            .unwrap_or_else(|| task.updated_at.clone()),
+        task_status: Some(task.status),
+        content,
+        parts,
+        metrics,
+        status,
+    }))
+}
+
+fn agent_task_input_content(input: &Value) -> String {
+    input
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(str::trim)
+        .map(ToString::to_string)
+        .or_else(|| input.get("delegatedInput").map(format_json_value))
+        .unwrap_or_else(|| format_json_value(input))
+}
+
+fn agent_task_output_content(
+    task: &AgentTaskRecord,
+) -> Result<Option<AgentTaskOutputContent>, ApiError> {
+    if let Some(error) = &task.error_json {
+        let value = redact_agent_json(parse_json_value(error, "Agent task error")?);
+        return Ok(Some(AgentTaskOutputContent {
+            kind: "Task error".to_string(),
+            content: json_message_text(&value).unwrap_or_else(|| format_json_value(&value)),
+        }));
+    }
+
+    let Some(result) = &task.result_json else {
+        return Ok(None);
+    };
+    let value = redact_agent_json(parse_json_value(result, "Agent task result")?);
+    Ok(Some(AgentTaskOutputContent {
+        kind: "Task result".to_string(),
+        content: json_message_text(&value).unwrap_or_else(|| format_json_value(&value)),
+    }))
+}
+
+fn agent_instance_display_name(
+    team: &AgentTeamRecord,
+    instances_by_id: &HashMap<AgentInstanceId, &AgentInstanceRecord>,
+    instance_id: Option<&AgentInstanceId>,
+) -> String {
+    let Some(instance_id) = instance_id else {
+        return "Main agent".to_string();
+    };
+    instances_by_id
+        .get(instance_id)
+        .map(|instance| {
+            if instance.id == team.coordinator_instance_id
+                && instance.definition_snapshot.name.is_empty()
+            {
+                "Main agent".to_string()
+            } else if instance.definition_snapshot.name.is_empty() {
+                instance.id.to_string()
+            } else {
+                instance.definition_snapshot.name.clone()
+            }
+        })
+        .unwrap_or_else(|| instance_id.to_string())
+}
+
+fn compare_agent_transcript_items(
+    left: &AgentTranscriptItemView,
+    right: &AgentTranscriptItemView,
+) -> std::cmp::Ordering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then(left.id.cmp(&right.id))
+}
+
+fn agent_tool_call_summary_from_value(value: &Value) -> Option<ChatToolCallSummary> {
+    let id = string_json_field(value, "id", "callId")
+        .or_else(|| string_json_field(value, "call_id", "callId"))?;
+    let name = string_json_field(value, "name", "name")?;
+    let live_output = value.get("liveOutput").or_else(|| value.get("live_output"));
+    Some(ChatToolCallSummary {
+        id: id.to_string(),
+        name: name.to_string(),
+        status: string_json_field(value, "status", "status")
+            .unwrap_or("running")
+            .to_string(),
+        input: value
+            .get("input")
+            .cloned()
+            .map(redact_agent_json)
+            .unwrap_or_else(|| json!({})),
+        output: value.get("output").cloned().map(redact_agent_json),
+        is_error: bool_json_field(value, "isError", "is_error").unwrap_or(false),
+        started_at: string_json_field(value, "startedAt", "started_at").map(ToString::to_string),
+        completed_at: string_json_field(value, "completedAt", "completed_at")
+            .map(ToString::to_string),
+        live_output: live_output.and_then(agent_tool_live_output_from_value),
+    })
+}
+
+fn agent_tool_live_output_from_value(value: &Value) -> Option<ChatToolLiveOutput> {
+    let stdout = string_json_field(value, "stdout", "stdout").unwrap_or_default();
+    let stderr = string_json_field(value, "stderr", "stderr").unwrap_or_default();
+    (!stdout.is_empty() || !stderr.is_empty()).then(|| ChatToolLiveOutput {
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
+    })
+}
+
+fn upsert_agent_tool_call_part(
+    parts: &mut Vec<ChatMessagePart>,
+    next_tool_call: ChatToolCallSummary,
+) {
+    if let Some(ChatMessagePart::ToolCall { tool_call }) = parts.iter_mut().find(|part| {
+        matches!(part, ChatMessagePart::ToolCall { tool_call } if tool_call.id == next_tool_call.id)
+    }) {
+        let live_output = next_tool_call
+            .live_output
+            .clone()
+            .or_else(|| tool_call.live_output.clone());
+        *tool_call = ChatToolCallSummary {
+            live_output,
+            ..next_tool_call
+        };
+    } else {
+        parts.push(ChatMessagePart::ToolCall {
+            tool_call: next_tool_call,
+        });
+    }
+}
+
+fn apply_agent_tool_result_to_parts(
+    parts: &mut [ChatMessagePart],
+    tool_call_id: &str,
+    output: Value,
+    is_error: bool,
+    started_at: Option<&str>,
+    completed_at: Option<&str>,
+) {
+    for part in parts {
+        if let ChatMessagePart::ToolCall { tool_call } = part
+            && tool_call.id == tool_call_id
+        {
+            tool_call.output = Some(output.clone());
+            tool_call.is_error = is_error;
+            tool_call.status = if is_error { "error" } else { "completed" }.to_string();
+            if let Some(started_at) = started_at {
+                tool_call.started_at = Some(started_at.to_string());
+            }
+            if let Some(completed_at) = completed_at {
+                tool_call.completed_at = Some(completed_at.to_string());
+            }
+            tool_call.live_output = None;
+        }
+    }
+}
+
+fn apply_agent_tool_output_delta_to_parts(
+    parts: &mut [ChatMessagePart],
+    tool_call_id: &str,
+    stream: &str,
+    delta: &str,
+) {
+    for part in parts {
+        if let ChatMessagePart::ToolCall { tool_call } = part
+            && tool_call.id == tool_call_id
+            && tool_call.output.is_none()
+        {
+            let mut live_output = tool_call.live_output.clone().unwrap_or_default();
+            if stream == "stdout" {
+                live_output.stdout.push_str(delta);
+            } else {
+                live_output.stderr.push_str(delta);
+            }
+            tool_call.live_output = Some(live_output);
+        }
+    }
+}
+
+fn parts_from_agent_run_snapshot(
+    text: &str,
+    reasoning: Option<&str>,
+    tool_calls: Vec<ChatToolCallSummary>,
+) -> Vec<ChatMessagePart> {
+    let mut parts = Vec::new();
+    if let Some(reasoning) = reasoning {
+        push_reasoning_part(&mut parts, reasoning);
+    }
+    push_text_part(&mut parts, text);
+    parts.extend(
+        tool_calls
+            .into_iter()
+            .map(|tool_call| ChatMessagePart::ToolCall { tool_call }),
+    );
+    parts
+}
+
+fn append_missing_text(parts: &mut Vec<ChatMessagePart>, current: &str, final_text: &str) {
+    if let Some(suffix) = final_text.strip_prefix(current)
+        && !suffix.is_empty()
+    {
+        push_text_part(parts, suffix);
+    }
+}
+
+fn append_missing_reasoning(parts: &mut Vec<ChatMessagePart>, final_reasoning: Option<&str>) {
+    let Some(final_reasoning) = final_reasoning else {
+        return;
+    };
+    let existing = parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatMessagePart::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if let Some(suffix) = final_reasoning.strip_prefix(&existing)
+        && !suffix.is_empty()
+    {
+        push_reasoning_part(parts, suffix);
+    }
+}
+
+fn json_message_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| string_json_field(value, "text", "text").map(ToString::to_string))
+        .or_else(|| string_json_field(value, "message", "message").map(ToString::to_string))
+        .or_else(|| string_json_field(value, "content", "content").map(ToString::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_error_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    match parts.last_mut() {
+        Some(ChatMessagePart::Error { text: existing }) => existing.push_str(text),
+        _ => parts.push(ChatMessagePart::Error {
+            text: text.to_string(),
+        }),
+    }
+}
+
+fn format_json_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value)
+        .map(|value| format!("```json\n{value}\n```"))
+        .unwrap_or_else(|_| "```json\nnull\n```".to_string())
+}
+
+fn bool_json_field(value: &Value, primary: &str, alternate: &str) -> Option<bool> {
+    value
+        .get(primary)
+        .or_else(|| value.get(alternate))
+        .and_then(Value::as_bool)
 }
 
 fn workspace_mutation_lock() -> ToolResourceLock {

@@ -708,6 +708,74 @@ export const agentTeamSnapshot = {
   },
   workload: { queuedTasks: 0, runningTasks: 1, waitingTasks: 0 },
 };
+export const agentTranscriptResponse = {
+  hasMore: false,
+  items: [
+    {
+      author: "Coordinator",
+      content: "Worker, inspect the current task.",
+      createdAt: "2026-06-05T10:00:01Z",
+      id: "message:agent-message-1",
+      kind: "Message",
+      metrics: null,
+      parts: [],
+      role: "user",
+      status: null,
+      taskStatus: "completed",
+    },
+    {
+      author: "Worker",
+      content: "Inspection complete.",
+      createdAt: "2026-06-05T10:00:02Z",
+      id: "task:agent-task-1:run",
+      kind: "Task result",
+      metrics: {
+        firstTokenLatencyMs: 1,
+        llmRequestIds: ["request-1"],
+        modelId: "gpt-test",
+        outputTokens: 3,
+        providerId: "openai",
+        totalLatencyMs: 10,
+      },
+      parts: [
+        { type: "reasoning", text: "Checking workspace state." },
+        { type: "text", text: "Inspection complete." },
+        {
+          type: "toolCall",
+          toolCall: {
+            completedAt: "2026-06-05T10:00:04Z",
+            id: "tool-read-file",
+            input: { path: "notes.md" },
+            isError: false,
+            name: "read_file",
+            output: { content: "workspace notes" },
+            startedAt: "2026-06-05T10:00:03Z",
+            status: "completed",
+          },
+        },
+      ],
+      role: "assistant",
+      status: null,
+      taskStatus: "completed",
+    },
+    {
+      author: "Worker",
+      content: "Found the issue in the workspace notes.",
+      createdAt: "2026-06-05T10:00:04Z",
+      id: "message:agent-message-2",
+      kind: "Reply",
+      metrics: null,
+      parts: [],
+      role: "assistant",
+      status: null,
+      taskStatus: "completed",
+    },
+  ],
+  page: 1,
+  pageSize: 25,
+  totalCount: 3,
+  totalPages: 1,
+};
 
 export const activeMemory = {
   chatId: null,
@@ -2890,6 +2958,13 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
     return jsonResponse(agentTeamSnapshot);
+  }
+
+  const agentTranscriptMatch = path.match(
+    /^\/api\/workspaces\/workspace-1\/agent-team\/instances\/([^/]+)\/transcript$/,
+  );
+  if (agentTranscriptMatch) {
+    return jsonResponse(agentTranscriptResponse);
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team/enable") {

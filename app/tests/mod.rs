@@ -264,6 +264,203 @@ fn insert_waiting_coordinator_task(
         .expect("suspend waiting task");
     task_id
 }
+#[test]
+fn agent_transcript_items_replay_run_parts_and_task_error() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-transcript-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-transcript").expect("definition id"),
+        revision: 1,
+        name: "Transcript worker".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Work.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 2,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    let team_id = foco_agent::AgentTeamId::new("agent-team-transcript").expect("team id");
+    let coordinator_id =
+        foco_agent::AgentInstanceId::new("agent-instance-transcript-coordinator").expect("id");
+    let worker_id =
+        foco_agent::AgentInstanceId::new("agent-instance-transcript-worker").expect("id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-transcript-run").expect("task id");
+    let failed_task_id =
+        foco_agent::AgentTaskId::new("agent-task-transcript-failed").expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-transcript-run").expect("attempt id");
+    let failed_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-transcript-failed").expect("attempt id");
+    let message_id = foco_agent::AgentMessageId::new("agent-message-transcript-input").expect("id");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    database
+        .insert_chat("chat-transcript", "Transcript")
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id: "chat-transcript",
+            coordinator_instance_id: &coordinator_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .create_agent_instances_with_limits(
+            &[foco_store::workspace::NewAgentInstance {
+                id: &worker_id,
+                team_id: &team_id,
+                definition: &definition,
+                role: foco_agent::AgentRole::Worker,
+                execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            2,
+            2,
+        )
+        .expect("worker create");
+    let input_json = json!({ "message": "Inspect transcript" }).to_string();
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: None,
+            input_json: &input_json,
+        })
+        .expect("enqueue task");
+    database
+        .insert_agent_message(foco_store::workspace::NewAgentMessage {
+            id: &message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&coordinator_id),
+            receiver_instance_id: &worker_id,
+            related_task_id: Some(&task_id),
+            reply_to_message_id: None,
+            kind: foco_agent::AgentMessageKind::Notification,
+            content: "Inspect transcript",
+        })
+        .expect("insert message");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim task");
+    for (sequence, payload) in [
+        json!({ "type": "reasoningDelta", "delta": "Think. " }),
+        json!({ "type": "textDelta", "delta": "Read. " }),
+        json!({ "type": "toolCall", "toolCall": { "id": "tool-1", "name": "read_file", "status": "running", "input": { "path": "notes.md" }, "output": null, "isError": false } }),
+        json!({ "type": "toolOutputDelta", "toolCallId": "tool-1", "stream": "stdout", "delta": "chunk" }),
+        json!({ "type": "toolResult", "toolCallId": "tool-1", "output": { "content": "done" }, "isError": false, "startedAt": "2026-07-03T08:00:00Z", "completedAt": "2026-07-03T08:00:01Z" }),
+        json!({ "type": "complete", "text": "Read. Done.", "reasoning": "Think. More.", "metrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 10, "firstTokenLatencyMs": 1, "outputTokens": 2, "llmRequestIds": ["request-1"] } }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event_id = format!("agent-task-transcript-run-event-{sequence}");
+        database
+            .insert_run_event(NewRunEvent {
+                id: &event_id,
+                chat_id: "chat-transcript",
+                run_id: task_id.as_str(),
+                sequence: sequence as i64,
+                event_type: payload["type"].as_str().expect("type"),
+                payload_json: &payload.to_string(),
+            })
+            .expect("insert run event");
+    }
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: foco_agent::AgentTaskStatus::Running,
+            transition: foco_agent::AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"Read. Done."}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete task");
+
+    let failed_input_json = json!({ "message": "Fail clearly" }).to_string();
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &failed_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: &failed_input_json,
+        })
+        .expect("enqueue failed task");
+    database
+        .claim_runnable_agent_task(&team_id, &failed_task_id, &failed_attempt_id)
+        .expect("claim failed task");
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &failed_task_id,
+            expected_status: foco_agent::AgentTaskStatus::Running,
+            transition: foco_agent::AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(r#"{"message":"boom"}"#),
+            interruption_reason: None,
+        })
+        .expect("fail task");
+
+    let team = database.agent_team(&team_id).expect("team").expect("team");
+    let worker = database
+        .agent_instance(&worker_id)
+        .expect("worker")
+        .expect("worker");
+    let items = crate::http::agents::agent_instance_transcript_items(&database, &team, &worker)
+        .expect("transcript");
+    let run_item = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-run:run")
+        .expect("run item");
+    assert_eq!(run_item.content, "Read. Done.");
+    assert!(matches!(
+        run_item.parts[0],
+        ChatMessagePart::Reasoning { .. }
+    ));
+    assert!(matches!(run_item.parts[1], ChatMessagePart::Text { .. }));
+    let tool_call = match &run_item.parts[2] {
+        ChatMessagePart::ToolCall { tool_call } => tool_call,
+        other => panic!("expected tool call part, got {other:?}"),
+    };
+    assert_eq!(tool_call.name, "read_file");
+    assert_eq!(tool_call.status, "completed");
+    assert_eq!(
+        tool_call.output.as_ref().expect("output")["content"],
+        json!("done")
+    );
+    assert_eq!(
+        run_item.metrics.as_ref().expect("metrics").output_tokens,
+        Some(2)
+    );
+    let failed_input = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-failed:input")
+        .expect("failed input item");
+    assert_eq!(failed_input.content, "Fail clearly");
+    let failed_output = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-failed:output")
+        .expect("failed output item");
+    assert_eq!(failed_output.kind, "Task error");
+    assert_eq!(failed_output.content, "boom");
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
 
 struct FixtureAgentRunTask {
     events: Vec<ChatSseEvent>,
@@ -310,6 +507,7 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
                 is_error: false,
                 started_at: None,
                 completed_at: None,
+                live_output: None,
             },
         },
         ChatSseEvent::ToolResult {
@@ -4035,6 +4233,7 @@ fn active_chat_run_private_output_records_events_without_main_chat_draft() {
                     is_error: false,
                     started_at: None,
                     completed_at: None,
+                    live_output: None,
                 },
             },
         )
@@ -4117,6 +4316,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 is_error: false,
                 started_at: None,
                 completed_at: None,
+                live_output: None,
             },
         },
         ChatSseEvent::StreamReset {
@@ -4138,6 +4338,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 is_error: false,
                 started_at: None,
                 completed_at: None,
+                live_output: None,
             },
         },
         ChatSseEvent::ToolResult {
@@ -4160,6 +4361,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
                 is_error: false,
                 started_at: None,
                 completed_at: None,
+                live_output: None,
             },
         },
     ] {
@@ -4290,6 +4492,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             is_error: false,
             started_at: None,
             completed_at: None,
+            live_output: None,
         },
     };
     let tool_result_event = ChatSseEvent::ToolResult {
@@ -4590,6 +4793,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         is_error: false,
         started_at: Some("2026-06-29T08:00:00Z".to_string()),
         completed_at: Some("2026-06-29T08:00:01Z".to_string()),
+        live_output: None,
     };
     let events = [
         (

@@ -1661,6 +1661,13 @@ struct QueuedMessageRunSummary {
     assistant_sequence: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatToolLiveOutput {
+    stdout: String,
+    stderr: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatToolCallSummary {
@@ -1672,12 +1679,17 @@ struct ChatToolCallSummary {
     is_error: bool,
     started_at: Option<String>,
     completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_output: Option<ChatToolLiveOutput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatMessagePart {
     Text {
+        text: String,
+    },
+    Error {
         text: String,
     },
     Reasoning {
@@ -1712,7 +1724,7 @@ enum StoredChatMessagePart {
 const STORED_CHAT_PARTS_VERSION: i64 = 3;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatReplyMetrics {
     model_id: String,
@@ -7850,6 +7862,7 @@ fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary
         is_error: false,
         started_at: None,
         completed_at: None,
+        live_output: None,
     }
 }
 
@@ -7868,6 +7881,7 @@ fn executed_tool_call_summary(tool_call: &ExecutedToolCall) -> ChatToolCallSumma
         is_error: tool_call.is_error,
         started_at: Some(tool_call.started_at.clone()),
         completed_at: Some(tool_call.completed_at.clone()),
+        live_output: None,
     }
 }
 
@@ -10235,6 +10249,9 @@ fn stored_chat_message_parts(
         .into_iter()
         .map(|part| match part {
             ChatMessagePart::Text { text } => Ok(StoredChatMessagePart::Text { text }),
+            ChatMessagePart::Error { .. } => Err(ApiError::internal(
+                "assistant message history parts must not contain error parts",
+            )),
             ChatMessagePart::Reasoning { text, duration_ms } => {
                 Ok(StoredChatMessagePart::Reasoning { text, duration_ms })
             }
@@ -10326,6 +10343,7 @@ fn chat_tool_call_summary(
         is_error,
         started_at: Some(record.started_at),
         completed_at: record.completed_at,
+        live_output: None,
     })
 }
 

@@ -1,9 +1,12 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, waitForElementToBeRemoved, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { AgentTranscriptResponse } from "./api/types";
+
 import {
   agentDefinitions as agentDefinitionFixtures,
+  agentTranscriptResponse,
   agentTeamSnapshot,
   appTestState,
   defaultComposerPlaceholder,
@@ -428,6 +431,70 @@ describe("app agents verification surfaces", () => {
       "true",
     );
   });
+  it("loads Agent transcript items from the instance transcript API", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([url]) =>
+          String(url).includes(
+            "/api/workspaces/workspace-1/agent-team/instances/agent-instance-worker/transcript?page=1&pageSize=25",
+          ),
+        ),
+      ).toBe(true);
+    });
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
+    expect(screen.getByText("read_file")).toBeInTheDocument();
+  });
+
+  it("refreshes empty Agent transcripts without replaying snapshot events", async () => {
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse({
+            ...agentTranscriptResponse,
+            hasMore: false,
+            items: [],
+            totalCount: 0,
+            totalPages: 1,
+          });
+        }
+        return mockFetch(input, init);
+      },
+    );
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+
+    expect(await screen.findByText("No agent messages yet.")).toBeInTheDocument();
+    const transcriptRegion = screen
+      .getByText("No agent messages yet.")
+      .closest(".chat-panel");
+    expect(transcriptRegion).not.toBeNull();
+    await userEvent.click(
+      within(transcriptRegion as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    await waitFor(() => {
+      const transcriptCalls = fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/agent-instance-worker/transcript"),
+      );
+      expect(transcriptCalls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
 
   it("renders worker LLM run events while the Agent task is still running", async () => {
     const firstSnapshot = {
@@ -493,6 +560,49 @@ describe("app agents verification surfaces", () => {
       ],
     };
     let snapshot = firstSnapshot;
+    const firstTranscriptResponse: AgentTranscriptResponse = {
+      ...agentTranscriptResponse,
+      items: [
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "",
+          kind: "Task run",
+          parts: [
+            { type: "reasoning" as const, text: "Checking workspace state." },
+            {
+              type: "toolCall" as const,
+              toolCall: {
+                completedAt: null,
+                id: "tool-read-file",
+                input: { path: "notes.md" },
+                isError: false,
+                name: "read_file",
+                output: null,
+                startedAt: "2026-06-05T10:00:03Z",
+                status: "running",
+              },
+            },
+          ],
+          status: "streaming" as const,
+          role: "assistant",
+          taskStatus: "running",
+        },
+      ],
+    };
+    const secondTranscriptResponse = {
+      ...firstTranscriptResponse,
+      items: [
+        {
+          ...firstTranscriptResponse.items[0]!,
+          content: "Still inspecting.",
+          parts: [
+            ...firstTranscriptResponse.items[0]!.parts,
+            { type: "text" as const, text: "Still inspecting." },
+          ],
+        },
+      ],
+    };
+    let transcriptResponse = firstTranscriptResponse;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -502,6 +612,9 @@ describe("app agents verification surfaces", () => {
           : url.split("?")[0];
         if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
           return jsonResponse(snapshot);
+        }
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(transcriptResponse);
         }
         return mockFetch(input, init);
       }),
@@ -522,8 +635,23 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("read_file")).toBeInTheDocument();
     expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
 
+    transcriptResponse = secondTranscriptResponse;
     snapshot = secondSnapshot;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        instanceId: "agent-instance-worker",
+        reason: "task_updated",
+        revealPanel: false,
+        teamId: "agent-team-1",
+        type: "agentTeamRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
 
+    await waitForElementToBeRemoved(() => screen.queryByText("Inspection complete."), {
+      timeout: 2500,
+    }).catch(() => undefined);
     await waitFor(
       () => expect(screen.getByText("Still inspecting.")).toBeInTheDocument(),
       { timeout: 2500 },

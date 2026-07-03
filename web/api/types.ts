@@ -1149,6 +1149,27 @@ export type AgentObservabilityView = {
   interruptedTasks: number;
   failuresByType: AgentFailureClassView[];
 };
+export type AgentTranscriptItemView = {
+  id: string;
+  author: string;
+  role: "assistant" | "user";
+  kind: string;
+  createdAt: string;
+  taskStatus: string | null;
+  content: string;
+  parts: ChatMessagePart[];
+  metrics: ChatReplyMetrics | null;
+  status?: "error" | "streaming" | null;
+};
+
+export type AgentTranscriptResponse = {
+  items: AgentTranscriptItemView[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  hasMore: boolean;
+};
 
 export type AgentTeamSnapshotResponse = {
   team: AgentTeamView;
