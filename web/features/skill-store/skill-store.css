@@ -125,6 +125,8 @@
   padding: 0.45rem 0.55rem;
   color: var(--foco-text);
   font-size: 0.84rem;
+  text-align: center;
+  text-align-last: center;
 }
 
 .skill-store-list-meta {
@@ -568,13 +570,21 @@
     align-items: flex-start;
   }
 
-
   .skill-store-controls {
     flex-direction: column;
   }
 
   .skill-store-sort {
     flex-basis: auto;
+  }
+
+  .skill-store-import {
+    flex-direction: column;
+  }
+
+  .skill-store-import .skill-store-secondary-button {
+    flex: 0 0 auto;
+    width: 100%;
   }
 
   .skill-store-install-targets label,
