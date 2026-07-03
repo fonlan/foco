@@ -344,11 +344,11 @@ describe("app-shell verification surfaces", () => {
     await waitFor(() => {
       expect(window.location.pathname).toBe("/stats");
       const params = new URLSearchParams(window.location.search);
-      expect(params.get("requestId")).toBe("request-1");
+      expect(params.get("requestId")).toBe("request-1,request-2");
     });
     await waitFor(() => {
       const statsCall = aiStatisticsCallUrlsFromMock(fetchMock).find(
-        (url) => url.searchParams.get("requestId") === "request-1",
+        (url) => url.searchParams.get("requestId") === "request-1,request-2",
       );
       expect(statsCall?.searchParams.get("workspaceId")).toBe("workspace-1");
       expect(statsCall?.searchParams.get("chatId")).toBe("chat-1");

@@ -218,8 +218,17 @@ export function ApiStatsPanel({
       cellClassName: "px-4 py-3 font-medium text-stone-900",
       id: "requestTime",
       label: t("Request time"),
-      render: (request) =>
-        formatAuditDate(request.requestStartedAt, language),
+      render: (request) => {
+        const parts = formatAuditDateParts(request.requestStartedAt, language);
+        return parts ? (
+          <div className="space-y-1">
+            <div>{parts.date}</div>
+            <div className="text-xs text-stone-500">{parts.time}</div>
+          </div>
+        ) : (
+          request.requestStartedAt
+        );
+      },
     },
     {
       cellClassName: "min-w-[14rem] px-4 py-3 text-stone-700",
@@ -1512,21 +1521,31 @@ function jsonContainerSummary(kind: "array" | "object", count: number) {
   return kind === "array" ? `... ${count} items ` : `... ${count} keys `;
 }
 
-function formatAuditDate(value: string, language: AppLanguageId = "en") {
+function formatAuditDateParts(value: string, language: AppLanguageId = "en") {
   const date = new Date(value);
 
   if (Number.isNaN(date.getTime())) {
-    return value;
+    return null;
   }
 
-  return new Intl.DateTimeFormat(language, {
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "short",
-    second: "2-digit",
-    year: "numeric",
-  }).format(date);
+  return {
+    date: new Intl.DateTimeFormat(language, {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }).format(date),
+    time: new Intl.DateTimeFormat(language, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(date),
+  };
+}
+
+function formatAuditDate(value: string, language: AppLanguageId = "en") {
+  const parts = formatAuditDateParts(value, language);
+
+  return parts ? `${parts.date} ${parts.time}` : value;
 }
 
 function formatNullableNumber(

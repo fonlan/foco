@@ -12,16 +12,16 @@ const FILE_TAB_QUERY_PARAM = "file";
 const ACTIVE_FILE_QUERY_PARAM = "activeFile";
 const STATS_PAGE_QUERY_PARAM = "page";
 const STATS_FILTER_QUERY_PARAMS = [
-  "workspaceId",
-  "requestId",
-  "chatId",
-  "providerId",
-  "modelId",
-  "status",
-  "startedAfter",
-  "startedBefore",
-  "pageSize",
-] as const satisfies readonly (keyof AiStatsFilterState)[];
+  ["workspaceId", "workspaceId"],
+  ["requestIds", "requestId"],
+  ["chatId", "chatId"],
+  ["providerId", "providerId"],
+  ["modelId", "modelId"],
+  ["status", "status"],
+  ["startedAfter", "startedAfter"],
+  ["startedBefore", "startedBefore"],
+  ["pageSize", "pageSize"],
+] as const satisfies readonly (readonly [keyof AiStatsFilterState, string])[];
 
 export function currentBrowserRoute(): BrowserRoute {
   if (typeof window === "undefined") {
@@ -167,8 +167,8 @@ function statsFiltersFromSearch(search: string): Partial<AiStatsFilterState> | u
   const params = new URLSearchParams(search);
   const filters: Partial<AiStatsFilterState> = {};
 
-  for (const key of STATS_FILTER_QUERY_PARAMS) {
-    const value = params.get(key)?.trim() ?? "";
+  for (const [key, paramName] of STATS_FILTER_QUERY_PARAMS) {
+    const value = params.get(paramName)?.trim() ?? "";
     if (value) {
       filters[key] = value;
     }
@@ -185,10 +185,10 @@ function appendStatsFiltersSearch(
     return;
   }
 
-  for (const key of STATS_FILTER_QUERY_PARAMS) {
+  for (const [key, paramName] of STATS_FILTER_QUERY_PARAMS) {
     const value = filters[key]?.trim() ?? "";
-    if (value) {
-      params.set(key, value);
+    if (value && !(key === "pageSize" && value === "20")) {
+      params.set(paramName, value);
     }
   }
 }

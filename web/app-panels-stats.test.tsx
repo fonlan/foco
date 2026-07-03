@@ -2903,6 +2903,10 @@ describe("app-panels-stats verification surfaces", () => {
       ).toBe(true),
     );
     const table = screen.getByRole("table");
+    const requestTimeCell = table.querySelector("tbody tr td");
+    const requestTimeLines = requestTimeCell?.querySelectorAll("div.space-y-1 > div");
+    expect(requestTimeLines).toHaveLength(2);
+    expect(requestTimeLines?.[0].textContent).toContain("2026");
     const tableScroller = table.parentElement;
     const statsScroller = table.closest(".overflow-y-auto") as HTMLElement | null;
     expect(tableScroller).toHaveClass("panel-scroll");
@@ -2932,16 +2936,16 @@ describe("app-panels-stats verification surfaces", () => {
     expect(statsScroller.scrollTop).toBe(0);
     fireEvent.touchEnd(tableScroller);
     await waitFor(() =>
-      expect(within(table).getByText("openai")).toBeInTheDocument(),
+      expect(within(table).getByText("OpenAI")).toBeInTheDocument(),
     );
-    expect(within(table).getByText("gpt-test")).toBeInTheDocument();
+    expect(within(table).getByText("GPT Test")).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Request audit pagination" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Go to page 2" })).toBeInTheDocument();
     expect(screen.getByLabelText("Page size")).toHaveValue(20);
 
     await userEvent.click(screen.getByText("Columns"));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Provider" }));
-    expect(within(table).queryByText("openai")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Provider / model" }));
+    expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
 
@@ -3205,16 +3209,16 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
     const table = await screen.findByRole("table");
-    expect(within(table).getByText("openai")).toBeInTheDocument();
+    expect(within(table).getByText("OpenAI")).toBeInTheDocument();
 
     await userEvent.click(screen.getByText("Columns"));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Provider" }));
-    expect(within(table).queryByText("openai")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Provider / model" }));
+    expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
     await waitFor(() => {
       const savedColumns = JSON.parse(
         window.localStorage.getItem("foco.aiStats.visibleColumns") ?? "[]",
       );
-      expect(savedColumns).not.toContain("provider");
+      expect(savedColumns).not.toContain("providerModel");
     });
 
     unmount();
@@ -3223,9 +3227,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
     const reloadedTable = await screen.findByRole("table");
-    expect(within(reloadedTable).queryByText("openai")).not.toBeInTheDocument();
+    expect(within(reloadedTable).queryByText("OpenAI")).not.toBeInTheDocument();
     await userEvent.click(screen.getByText("Columns"));
-    expect(screen.getByRole("checkbox", { name: "Provider" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Provider / model" })).not.toBeChecked();
   });
 
 

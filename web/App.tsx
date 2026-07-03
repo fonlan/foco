@@ -6772,15 +6772,15 @@ export function App() {
 
   const handleOpenMessageApiRequests = useCallback(
     (message: ShellMessage) => {
-      const requestId = message.metrics?.llmRequestIds[0];
-      if (!requestId) {
+      const requestIds = message.metrics?.llmRequestIds.filter(Boolean) ?? [];
+      if (!requestIds.length) {
         return;
       }
 
       const filters: Partial<AiStatsFilterState> = {
         chatId: activeChatId && !isPendingChatId(activeChatId) ? activeChatId : "",
         page: "1",
-        requestId,
+        requestIds: requestIds.join(","),
         workspaceId: activeWorkspace?.id ?? activeWorkspaceId,
       };
       setStatsRoutePage(1);

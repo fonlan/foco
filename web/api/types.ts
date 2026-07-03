@@ -1942,7 +1942,7 @@ export type AiRequestDetailResponse = {
 
 export type AiStatsFilterState = {
   workspaceId: string;
-  requestId: string;
+  requestIds: string;
   chatId: string;
   providerId: string;
   modelId: string;

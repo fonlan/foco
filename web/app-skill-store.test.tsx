@@ -30,6 +30,8 @@ describe("skill store app surface", () => {
     expect(await screen.findByText("Browser Scout")).toBeInTheDocument();
     expect(screen.getAllByText("Total installs").length).toBeGreaterThan(0);
     expect(screen.queryByText("Hot skills in the last 24h")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Import" })).toBeInTheDocument();
+    expect(screen.queryByText("Sort")).not.toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(
         ([url]) => url === "/api/skill-store/browse?sort=installs_desc",
@@ -151,7 +153,7 @@ describe("skill store app surface", () => {
       await screen.findByRole("textbox", { name: "Import skill URL" }),
       "npx skills add https://github.com/foco/html-ppt --skill html-ppt",
     );
-    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await userEvent.click(screen.getByRole("button", { name: "Import" }));
 
     await waitFor(() =>
       expect(

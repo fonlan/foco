@@ -469,7 +469,6 @@ export function SkillStorePage({
               />
             </label>
             <label className="skill-store-sort" htmlFor="skill-store-sort">
-              <span>{t("Sort")}</span>
               <select
                 id="skill-store-sort"
                 aria-label={t("Sort skills")}
@@ -514,7 +513,7 @@ export function SkillStorePage({
               ) : (
                 <Link2 aria-hidden="true" className="size-4" />
               )}
-              {t("Preview")}
+              {t("Import")}
             </button>
           </form>
           {importError ? (

@@ -1999,8 +1999,8 @@ function ChatReplyMetricsLine({
   ];
 
   return (
-    <div className="flex items-start justify-between gap-2 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
-      <div className="flex min-w-0 flex-1 flex-wrap gap-x-2 gap-y-1">
+    <div className="flex items-center justify-between gap-2 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
         {values.map((value) => (
           <span className="min-w-0 break-words" key={value}>
             {value}

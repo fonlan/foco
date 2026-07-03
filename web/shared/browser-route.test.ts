@@ -124,13 +124,13 @@ describe("browser route chat tabs", () => {
     expect(
       browserRouteFromPathname(
         "/stats",
-        "?page=2&workspaceId=workspace-1&chatId=chat-1&requestId=request-1&pageSize=50",
+        "?page=2&workspaceId=workspace-1&chatId=chat-1&requestId=request-1%2Crequest-2&pageSize=50",
       ),
     ).toEqual({
       filters: {
         chatId: "chat-1",
         pageSize: "50",
-        requestId: "request-1",
+        requestIds: "request-1,request-2",
         workspaceId: "workspace-1",
       },
       page: 2,
@@ -142,14 +142,14 @@ describe("browser route chat tabs", () => {
           chatId: "chat-1",
           page: "2",
           pageSize: "50",
-          requestId: "request-1",
+          requestIds: "request-1,request-2",
           workspaceId: "workspace-1",
         },
         page: 2,
         viewMode: "stats",
       }),
     ).toBe(
-      "/stats?page=2&workspaceId=workspace-1&requestId=request-1&chatId=chat-1&pageSize=50",
+      "/stats?page=2&workspaceId=workspace-1&requestId=request-1%2Crequest-2&chatId=chat-1&pageSize=50",
     );
   });
 
