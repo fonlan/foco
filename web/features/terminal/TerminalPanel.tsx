@@ -407,6 +407,16 @@ function TerminalSessionPane({
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const { clientId } = session;
 
+  const sendTerminalInput = useCallback((data: string) => {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    socket.send(JSON.stringify({ type: "input", data }));
+    return true;
+  }, []);
+
   useEffect(() => {
     tRef.current = t;
   }, [t]);
@@ -426,7 +436,6 @@ function TerminalSessionPane({
     let cancelled = false;
     const terminal = new XTerm({
       allowProposedApi: false,
-      convertEol: true,
       cursorBlink: true,
       fontFamily: "Cascadia Mono, Consolas, monospace",
       fontSize: 13,
@@ -478,10 +487,24 @@ function TerminalSessionPane({
     observer.observe(containerRef.current);
     resizeObserverRef.current = observer;
 
-    const inputDisposable = terminal.onData((data) => {
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "input", data }));
+    terminal.attachCustomKeyEventHandler((event) => {
+      // ponytail: narrow fallback for plain Backspace only; not a custom keymap system.
+      if (
+        event.type === "keydown" &&
+        event.key === "Backspace" &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey
+      ) {
+        sendTerminalInput("\x7f");
+        return false;
       }
+
+      return true;
+    });
+
+    const inputDisposable = terminal.onData((data) => {
+      sendTerminalInput(data);
     });
 
     async function connectTerminal() {
@@ -587,7 +610,7 @@ function TerminalSessionPane({
       fitAddonRef.current = null;
       resizeObserverRef.current = null;
     };
-  }, [clientId, markClosed, onUpdate, workspaceId]);
+  }, [clientId, markClosed, onUpdate, sendTerminalInput, workspaceId]);
 
   useEffect(() => {
     const pendingCommand = session.pendingCommand;
@@ -604,9 +627,9 @@ function TerminalSessionPane({
       return;
     }
 
-    socket.send(JSON.stringify({ type: "input", data: pendingCommand.input }));
+    sendTerminalInput(pendingCommand.input);
     onUpdate(clientId, { pendingCommand: null });
-  }, [clientId, onUpdate, session.pendingCommand]);
+  }, [clientId, onUpdate, sendTerminalInput, session.pendingCommand]);
 
   return (
     <div

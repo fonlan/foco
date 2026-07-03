@@ -366,6 +366,8 @@ fn spawn_terminal(
     let shell_cwd = shell_path(cwd);
 
     command.cwd(&shell_cwd);
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
 
     let child = pair
         .slave
