@@ -54,6 +54,11 @@ pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
 #[cfg(target_os = "macos")]
 pub(crate) fn apply_auto_start_setting(enabled: bool) -> Result<(), ApiError> {
     if enabled {
+        let status = macos_auto_start_status()?;
+        if status.is_enabled() {
+            // ponytail: status matching is enough here; PATH/FOCO_CONFIG_DIR changes won't rewrite until MacosAutoStartStatus learns an environment summary.
+            return Ok(());
+        }
         enable_macos_auto_start()
     } else {
         disable_macos_auto_start()
@@ -177,14 +182,14 @@ fn macos_auto_start_status() -> Result<MacosAutoStartStatus, ApiError> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 struct MacosAutoStartStatus {
     plist_exists: bool,
     executable_path_matches_current_app: bool,
     service_loaded: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl MacosAutoStartStatus {
     fn is_enabled(&self) -> bool {
         self.plist_exists && self.executable_path_matches_current_app && self.service_loaded
@@ -595,9 +600,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        MacosLaunchAgentEnvironment, macos_auto_start_executable_path_from_current_exe,
-        macos_launch_agent_plist, macos_launch_agent_program_argument,
-        macos_launch_agent_program_arguments, windows_auto_start_command,
+        MacosAutoStartStatus, MacosLaunchAgentEnvironment,
+        macos_auto_start_executable_path_from_current_exe, macos_launch_agent_plist,
+        macos_launch_agent_program_argument, macos_launch_agent_program_arguments,
+        windows_auto_start_command,
     };
 
     #[test]
@@ -661,6 +667,36 @@ mod tests {
             macos_launch_agent_program_argument(&plist).as_deref(),
             Some("/Applications/Foco & Tools/foco")
         );
+    }
+
+    #[test]
+    fn macos_auto_start_status_is_enabled_requires_matching_loaded_agent() {
+        let status = MacosAutoStartStatus {
+            plist_exists: true,
+            executable_path_matches_current_app: true,
+            service_loaded: true,
+        };
+        assert!(status.is_enabled());
+
+        for status in [
+            MacosAutoStartStatus {
+                plist_exists: false,
+                executable_path_matches_current_app: true,
+                service_loaded: true,
+            },
+            MacosAutoStartStatus {
+                plist_exists: true,
+                executable_path_matches_current_app: false,
+                service_loaded: true,
+            },
+            MacosAutoStartStatus {
+                plist_exists: true,
+                executable_path_matches_current_app: true,
+                service_loaded: false,
+            },
+        ] {
+            assert!(!status.is_enabled());
+        }
     }
 
     #[test]
