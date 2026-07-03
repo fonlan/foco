@@ -733,7 +733,7 @@ export function ApiStatsPanel({
                       aria-label={t("Go to page {page}", {
                         page: formatNumber(item, language),
                       })}
-                      className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === currentPage
+                      className={`inline-flex h-9 min-w-9 items-center justify-center rounded-lg border px-2 text-sm font-semibold shadow-sm ${item === currentPage
                           ? "border-teal-700 bg-teal-700 text-white"
                           : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                         }`}

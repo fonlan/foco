@@ -2986,6 +2986,37 @@ describe("app-panels-stats verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("lets four-digit API audit page buttons grow with content", async () => {
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(jsonResponse({
+          ...aiStatistics,
+          totalCount: 24680,
+          totalPages: 1234,
+        }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+
+    const lastPageButton = await screen.findByRole("button", {
+      name: "Go to page 1,234",
+    });
+    expect(lastPageButton).toHaveClass("h-9", "min-w-9", "px-2");
+    expect(lastPageButton).not.toHaveClass("size-9");
+  });
+
   it("uses semantic colors for API request status pills", async () => {
     const requests = ["succeeded", "failed", "running", "cancelled"].map(
       (finalState, index) => ({
