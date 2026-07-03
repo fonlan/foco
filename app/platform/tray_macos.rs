@@ -12,6 +12,8 @@ use foco_store::config::load_or_create_global_config;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use tokio::sync::watch;
 
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+use crate::AUTO_START_COMMAND;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use crate::platform::tray::{
     TrayMenuLabels, browser_addr_for_listen_addr, foco_ui_url_for_listen_addr, open_foco_ui,
@@ -35,19 +37,26 @@ const MENU_QUIT_ITEM_ID: &str = "foco-quit";
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 pub(crate) async fn run_macos_menu_bar_entrypoint() -> AppResult<()> {
+    let started_from_auto_start = args_started_from_auto_start(std::env::args().skip(1));
     let loaded_config = load_or_create_global_config()?;
     logging::init(&loaded_config.paths.logs_dir)?;
     crate::platform::macos_environment::apply_macos_gui_environment();
-    run_macos_menu_bar_entrypoint_blocking(loaded_config)
+    run_macos_menu_bar_entrypoint_blocking(loaded_config, started_from_auto_start)
+}
+
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+fn args_started_from_auto_start(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == AUTO_START_COMMAND)
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 fn run_macos_menu_bar_entrypoint_blocking(
     loaded_config: foco_store::config::LoadedGlobalConfig,
+    started_from_auto_start: bool,
 ) -> AppResult<()> {
     let addr = local_addr(&loaded_config.config)?;
     let ui_url = foco_ui_url_for_listen_addr(addr);
-    if open_existing_foco_instance_if_running(addr, &ui_url) {
+    if open_existing_foco_instance_if_running(addr, &ui_url, started_from_auto_start) {
         return Ok(());
     }
 
@@ -295,13 +304,24 @@ fn confirm_menu_bar_shutdown_with_active_runs(active_run_count: usize) -> MenuBa
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+fn should_open_existing_foco_ui(started_from_auto_start: bool) -> bool {
+    !started_from_auto_start
+}
+
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn open_existing_foco_instance_if_running(addr: SocketAddr, ui_url: &str) -> bool {
+fn open_existing_foco_instance_if_running(
+    addr: SocketAddr,
+    ui_url: &str,
+    started_from_auto_start: bool,
+) -> bool {
     if !existing_foco_instance_responds(addr) {
         return false;
     }
 
-    open_foco_ui(ui_url);
+    if should_open_existing_foco_ui(started_from_auto_start) {
+        open_foco_ui(ui_url);
+    }
     true
 }
 
@@ -362,4 +382,23 @@ fn foco_macos_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
     const SIZE: u32 = 18;
     let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/foco-tray-18.rgba"));
     tray_icon::Icon::from_rgba(rgba.to_vec(), SIZE, SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{args_started_from_auto_start, should_open_existing_foco_ui};
+
+    #[test]
+    fn args_started_from_auto_start_detects_internal_flag() {
+        assert!(args_started_from_auto_start([
+            "--ignored".to_string(),
+            "--auto-start".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn existing_instance_open_policy_is_silent_for_auto_start() {
+        assert!(!should_open_existing_foco_ui(true));
+        assert!(should_open_existing_foco_ui(false));
+    }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ApiError;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::AUTO_START_COMMAND;
 #[cfg(any(target_os = "macos", test))]
 use foco_store::config::FOCO_CONFIG_DIR_ENV;
@@ -400,6 +400,7 @@ fn macos_launch_agent_plist(
     <key>ProgramArguments</key>\n\
     <array>\n\
         <string>{}</string>\n\
+        <string>{}</string>\n\
     </array>\n\
     <key>EnvironmentVariables</key>\n\
     <dict>\n\
@@ -411,19 +412,45 @@ fn macos_launch_agent_plist(
 </plist>\n",
         xml_escape(MACOS_LAUNCH_AGENT_LABEL),
         xml_escape(executable_path),
+        xml_escape(AUTO_START_COMMAND),
         environment_entries
     )
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn macos_launch_agent_program_argument(plist: &str) -> Option<String> {
-    let program_arguments_index = plist.find("<key>ProgramArguments</key>")?;
+    macos_launch_agent_program_arguments(plist)
+        .into_iter()
+        .next()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_launch_agent_program_arguments(plist: &str) -> Vec<String> {
+    let Some(program_arguments_index) = plist.find("<key>ProgramArguments</key>") else {
+        return Vec::new();
+    };
     let program_arguments = &plist[program_arguments_index..];
-    let array_index = program_arguments.find("<array>")?;
-    let array = &program_arguments[array_index..];
-    let string_start = array.find("<string>")? + "<string>".len();
-    let string_end = array[string_start..].find("</string>")? + string_start;
-    Some(xml_unescape(&array[string_start..string_end]))
+    let Some(array_start) = program_arguments.find("<array>") else {
+        return Vec::new();
+    };
+    let array = &program_arguments[array_start + "<array>".len()..];
+    let Some(array_end) = array.find("</array>") else {
+        return Vec::new();
+    };
+    let mut remaining = &array[..array_end];
+    let mut arguments = Vec::new();
+
+    while let Some(string_start) = remaining.find("<string>") {
+        let value_start = string_start + "<string>".len();
+        let Some(value_end) = remaining[value_start..].find("</string>") else {
+            break;
+        };
+        let value_end = value_start + value_end;
+        arguments.push(xml_unescape(&remaining[value_start..value_end]));
+        remaining = &remaining[value_end + "</string>".len()..];
+    }
+
+    arguments
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -569,7 +596,8 @@ mod tests {
 
     use super::{
         MacosLaunchAgentEnvironment, macos_auto_start_executable_path_from_current_exe,
-        macos_launch_agent_plist, macos_launch_agent_program_argument, windows_auto_start_command,
+        macos_launch_agent_plist, macos_launch_agent_program_argument,
+        macos_launch_agent_program_arguments, windows_auto_start_command,
     };
 
     #[test]
@@ -592,6 +620,14 @@ mod tests {
         assert!(plist.contains("<string>com.foco.app</string>"));
         assert!(plist.contains("<key>ProgramArguments</key>"));
         assert!(plist.contains("<string>/Applications/Foco.app/Contents/MacOS/foco</string>"));
+        assert!(plist.contains("<string>--auto-start</string>"));
+        assert_eq!(
+            macos_launch_agent_program_arguments(&plist),
+            [
+                "/Applications/Foco.app/Contents/MacOS/foco".to_string(),
+                "--auto-start".to_string(),
+            ]
+        );
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin:/bin</string>"));
