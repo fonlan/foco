@@ -535,7 +535,11 @@ async fn run_coordinator_task_inner(
     )
     .await?;
     chat_context.tool_workspace_path = match instance.execution_workspace_mode {
-        AgentExecutionWorkspaceMode::Shared => workspace.path.clone(),
+        AgentExecutionWorkspaceMode::Shared => instance
+            .execution_root_path
+            .as_deref()
+            .map(|root_path| resolve_agent_worktree_path(&workspace.path, root_path))
+            .unwrap_or_else(|| workspace.path.clone()),
         AgentExecutionWorkspaceMode::IsolatedWorktree => {
             agent_instance_execution_root(&workspace.path, &instance)
         }

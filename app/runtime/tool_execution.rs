@@ -784,11 +784,11 @@ pub(crate) async fn execute_tool(
         let tool_name = tool_name.to_string();
         let worker_tool_name = tool_name.clone();
         let worker_tool_call_id = tool_call_id.to_string();
-        let workspace_path = workspace_path.to_path_buf();
+        let tool_workspace_path = tool_workspace_path.to_path_buf();
         let worker = tokio::task::spawn_blocking(move || {
             execute_agent_tool(
                 &agent_tool_context,
-                &workspace_path,
+                &tool_workspace_path,
                 &worker_tool_name,
                 &worker_tool_call_id,
                 arguments,
@@ -1144,7 +1144,7 @@ struct AgentCreateInstancesInput {
 
 fn execute_agent_tool(
     context: &AgentToolContext,
-    _workspace_path: &Path,
+    tool_workspace_path: &Path,
     tool_name: &str,
     tool_call_id: &str,
     arguments: Value,
@@ -1167,7 +1167,7 @@ fn execute_agent_tool(
         }
         AGENT_TRANSFER_TASK_TOOL => execute_agent_transfer_task(context, workspace_path, arguments),
         AGENT_CREATE_INSTANCES_TOOL => {
-            execute_agent_create_instances(context, workspace_path, arguments)
+            execute_agent_create_instances(context, workspace_path, tool_workspace_path, arguments)
         }
         _ => Err(agent_tool_error(
             "unknown_tool",
@@ -1783,6 +1783,7 @@ fn execute_agent_transfer_task(
 fn execute_agent_create_instances(
     context: &AgentToolContext,
     workspace_path: &Path,
+    tool_workspace_path: &Path,
     arguments: Value,
 ) -> Result<Value, String> {
     let input =
@@ -1857,11 +1858,19 @@ fn execute_agent_create_instances(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let worktree_root_paths = worktrees
-        .iter()
-        .map(|worktree| agent_worktree_relative_path(workspace_path, &worktree.root_path))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| agent_tool_error("worktree_error", source.message))?;
+    let worktree_root_paths = match input.execution_workspace_mode {
+        AgentExecutionWorkspaceMode::Shared if tool_workspace_path != workspace_path => {
+            let shared_root_path =
+                agent_worktree_relative_path(workspace_path, tool_workspace_path)
+                    .map_err(|source| agent_tool_error("worktree_error", source.message))?;
+            vec![shared_root_path; instance_ids.len()]
+        }
+        _ => worktrees
+            .iter()
+            .map(|worktree| agent_worktree_relative_path(workspace_path, &worktree.root_path))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| agent_tool_error("worktree_error", source.message))?,
+    };
     let new_instances = instance_ids
         .iter()
         .enumerate()
@@ -3870,6 +3879,59 @@ mod tests {
                 .expect("instances")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn agent_create_instances_shared_worker_inherits_current_execution_root() {
+        let mut worker_definition =
+            test_agent_definition("tool-test-review", AgentPermissions::default());
+        worker_definition.max_instances = 2;
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone()],
+            ..AgentPermissions::default()
+        };
+        let (workspace, mut context, team_id, _instance_id, _task_id) =
+            create_agent_tool_fixture(permissions);
+        context.agent_definitions = vec![worker_definition.clone()];
+        let phase_worktree_path = workspace
+            .path()
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("phase-worktree");
+        std::fs::create_dir_all(&phase_worktree_path).expect("phase worktree dir");
+
+        let created = execute_agent_tool(
+            &context,
+            &phase_worktree_path,
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-create-review-worker",
+            json!({
+                "definitionId": worker_definition.id.to_string(),
+                "count": 1,
+                "executionWorkspaceMode": "shared",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("shared worker creation should inherit current execution root");
+
+        assert_eq!(created["count"], json!(1));
+        let instances = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database")
+            .agent_instances_for_team(&team_id)
+            .expect("instances");
+        let worker = instances
+            .iter()
+            .find(|instance| instance.definition_id == worker_definition.id)
+            .expect("created worker");
+        assert_eq!(
+            worker.execution_workspace_mode,
+            AgentExecutionWorkspaceMode::Shared
+        );
+        assert_eq!(
+            worker.execution_root_path.as_deref(),
+            Some(".foco/agent-worktrees/phase-worktree")
         );
     }
 

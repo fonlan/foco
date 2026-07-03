@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+#[cfg(test)]
+use foco_store::workspace::PlanAutoRunCandidateRecord;
 use foco_store::{
     config::WorkspaceConfig,
-    workspace::{PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, WorkspaceDatabase},
+    workspace::{PlanAutoRunStateRecord, WorkspaceDatabase},
 };
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
@@ -178,6 +180,7 @@ pub(crate) fn set_plan_auto_run_enabled(
         .map_err(ApiError::from_workspace_error)
 }
 
+#[cfg(test)]
 pub(crate) fn choose_plan_auto_run_candidate(
     plans: &[foco_store::workspace::PlanRecord],
 ) -> Option<PlanAutoRunCandidateRecord> {
