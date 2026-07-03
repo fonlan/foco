@@ -21,6 +21,7 @@ import type {
   WorkspaceSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import { fallbackTerminalInputForKeyEvent } from "./terminal-key-events";
 
 function TerminalCommandButton({
   commands,
@@ -489,14 +490,9 @@ function TerminalSessionPane({
 
     terminal.attachCustomKeyEventHandler((event) => {
       // ponytail: narrow fallback for plain Backspace only; not a custom keymap system.
-      if (
-        event.type === "keydown" &&
-        event.key === "Backspace" &&
-        !event.altKey &&
-        !event.ctrlKey &&
-        !event.metaKey
-      ) {
-        sendTerminalInput("\x7f");
+      const fallbackInput = fallbackTerminalInputForKeyEvent(event);
+      if (fallbackInput !== null) {
+        sendTerminalInput(fallbackInput);
         return false;
       }
 
