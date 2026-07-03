@@ -716,6 +716,56 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("uses specific tool icons and keeps unknown tools on the wrench fallback", async () => {
+    const iconChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = iconChatMessages.messages[1];
+    const runCommandToolCall = {
+      ...assistantMessage.toolCalls[0],
+      id: "tool-run-command",
+      input: { args: ["status"], command: "git" },
+      name: "run_command",
+      output: { status: 0, stdout: "clean", stderr: "" },
+    };
+    const unknownToolCall = {
+      ...assistantMessage.toolCalls[0],
+      id: "tool-unknown",
+      input: { query: "mystery" },
+      name: "mystery_tool",
+      output: { message: "unknown result" },
+    };
+    assistantMessage.toolCalls = [runCommandToolCall, unknownToolCall];
+    assistantMessage.parts = assistantMessage.parts.flatMap((part: { type: string }) =>
+      part.type === "toolCall"
+        ? [
+            { ...part, toolCall: runCommandToolCall },
+            { ...part, toolCall: unknownToolCall },
+          ]
+        : [part],
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...iconChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const runCommandSummary = (await screen.findByText("run_command")).closest("summary");
+    const unknownSummary = (await screen.findByText("mystery_tool")).closest("summary");
+
+    expect(runCommandSummary?.querySelector("svg.lucide-terminal")).toBeInTheDocument();
+    expect(unknownSummary?.querySelector("svg.lucide-wrench")).toBeInTheDocument();
+  });
+
   it("localizes completed tool status and uses success color", async () => {
     const zhSettings = {
       ...settings,

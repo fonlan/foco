@@ -8,6 +8,7 @@ import {
   Copy,
   FileText,
   GitBranch,
+  Globe,
   ListChecks,
   LoaderCircle,
   Plus,
@@ -15,6 +16,8 @@ import {
   Send,
   Server,
   SlidersHorizontal,
+  Search,
+  Terminal,
   User,
   Wrench,
   X,
@@ -69,6 +72,55 @@ const COMPOSER_EDITOR_KEY_STEP_PX = 24;
 const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
 const CHAT_TOP_LOAD_THRESHOLD_PX = 64;
 const MAX_GENERATED_IMAGE_PREVIEWS = 16;
+
+const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
+  agent_cancel_task: Server,
+  agent_create_instances: Server,
+  agent_delegate_task: Server,
+  agent_get_task: Server,
+  agent_list: Server,
+  agent_send_message: Server,
+  agent_transfer_task: Server,
+  agent_wait_tasks: Server,
+  create_plan: ListChecks,
+  create_todo_graph: ListChecks,
+  delete_plan: ListChecks,
+  edit_file: FileText,
+  finance: Globe,
+  find: Search,
+  find_files: Search,
+  get_plans: ListChecks,
+  get_todo_graph: ListChecks,
+  git_branch: GitBranch,
+  git_status: GitBranch,
+  graph_explore: Search,
+  graph_find_callees: Search,
+  graph_find_callers: Search,
+  graph_find_references: Search,
+  graph_find_symbols: Search,
+  graph_related_files: Search,
+  image_gen: FileText,
+  image_query: Search,
+  memory_search: Brain,
+  memory_write: Brain,
+  "mcp__context7__query-docs": Globe,
+  "mcp__context7__resolve-library-id": Globe,
+  open: Globe,
+  read_file: FileText,
+  read_spec: FileText,
+  run_command: Terminal,
+  screenshot: Globe,
+  search_query: Search,
+  search_text: Search,
+  sports: Globe,
+  time: Globe,
+  update_plan: ListChecks,
+  update_plan_step: ListChecks,
+  update_spec: FileText,
+  weather: Globe,
+  web_fetch: Globe,
+  write_file: FileText,
+};
 
 type ToolCallChangeStats = {
   linesAdded: number;
@@ -2439,6 +2491,7 @@ function ToolCallBlock({
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
   const toggleLabel = viewMode === "compact" ? "Show raw" : "Show compact";
+  const ToolIcon = TOOL_CALL_ICONS[toolCall.name] ?? Wrench;
 
   return (
     <div className="grid min-w-0 gap-2">
@@ -2449,7 +2502,7 @@ function ToolCallBlock({
       />
       <details className="tool-call-block group min-w-0">
         <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
-          <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+          <ToolIcon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
           <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
           {changeStats ? (
             <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
