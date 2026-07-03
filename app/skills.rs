@@ -782,7 +782,7 @@ pub(crate) fn enabled_skill_frontmatter_messages(
     Ok(vec![neutral_text_message(
         NeutralChatRole::Developer,
         format!(
-            "<skills_instructions>\n<source>{}</source>\n{}\n</skills_instructions>",
+            "<skills_instructions>\n<source>{}</source>\n<usage>\nAt the start of a new user task, treat the enabled skill frontmatter below as a lightweight skill routing table.\nFirst compare the user's task against each skill's name and description. If there is a clear match, use read_file on that skill's path to load its SKILL.md before applying it.\nDo not pre-load every skill's SKILL.md or read all skill full instructions speculatively; only read matched skills. If no skill clearly matches, continue silently with the normal workflow.\n</usage>\n{}\n</skills_instructions>",
             xml_text_escape(ENABLED_SKILLS_MESSAGE_PREFIX),
             entries.join("\n")
         ),

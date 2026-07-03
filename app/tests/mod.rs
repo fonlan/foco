@@ -1542,6 +1542,26 @@ Search memory before repo work.
     assert!(
         messages[0]
             .content
+            .contains("lightweight skill routing table")
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("read_file on that skill's path")
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("Do not pre-load every skill's SKILL.md")
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("If no skill clearly matches, continue silently")
+    );
+    assert!(
+        messages[0]
+            .content
             .contains(&format!("<skill path=\"{}\">", skill_file.display()))
     );
     assert!(
@@ -12236,6 +12256,25 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
     let profile_dir = env::temp_dir().join(unique_id("foco-plan-mode-tools-profile-test"));
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let skill_dir = profile_dir
+        .join(".agents")
+        .join("skills")
+        .join("plan-router");
+    let skill_file = skill_dir.join("SKILL.md");
+    fs::create_dir_all(&skill_dir).expect("skill test directory");
+    fs::write(
+        &skill_file,
+        "---
+name: plan-router
+description: Helps draft focused plans.
+---
+
+# Plan Router
+
+Use this only after reading the skill file.
+",
+    )
+    .expect("skill file write");
 
     let mut config = prompt_test_config(workspace_dir.clone());
     config.memory.enabled = true;
@@ -12354,6 +12393,50 @@ async fn prepare_prompt_context_plan_mode_exposes_read_plan_memory_search_and_mc
         !context.provider_request.messages[0]
             .content
             .contains("Review Foco system prompt.")
+    );
+
+    let skill_message = context
+        .provider_request
+        .messages
+        .iter()
+        .find(|message| message.content.contains("<skills_instructions>"))
+        .expect("plan mode skill instructions message");
+    assert_eq!(skill_message.role, NeutralChatRole::Developer);
+    assert!(
+        skill_message
+            .content
+            .contains("lightweight skill routing table")
+    );
+    assert!(
+        skill_message
+            .content
+            .contains("read_file on that skill's path")
+    );
+    assert!(
+        skill_message
+            .content
+            .contains("Do not pre-load every skill's SKILL.md")
+    );
+    assert!(
+        skill_message
+            .content
+            .contains("If no skill clearly matches, continue silently")
+    );
+    assert!(
+        skill_message
+            .content
+            .contains(&format!("<skill path=\"{}\">", skill_file.display()))
+    );
+    assert!(skill_message.content.contains("name: plan-router"));
+    assert!(
+        skill_message
+            .content
+            .contains("description: Helps draft focused plans.")
+    );
+    assert!(
+        !skill_message
+            .content
+            .contains("Use this only after reading")
     );
 
     let available_tools_message = context
