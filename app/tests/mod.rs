@@ -958,6 +958,120 @@ async fn tool_resource_registry_keeps_memory_locks_global() {
         .expect("global memory read waiter should not panic");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_database_gate_survives_plan_stats_and_run_event_burst() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let config = prompt_test_config(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let chat_id = "storm-chat";
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat(chat_id, "Storm chat")
+            .expect("chat insert");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "storm-plan",
+                title: "Storm plan",
+                overview: "Concurrent read pressure should not cancel writes.",
+                status: "ready",
+                source_chat_id: Some(chat_id),
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "storm-phase",
+                    title: "Phase",
+                    summary: "Exercise plan listing.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "storm-step",
+                        title: "Step",
+                        detail: "Read plans while events write.",
+                        acceptance: vec!["no sqlite open failure".to_string()],
+                    }],
+                }],
+            })
+            .expect("plan insert");
+        database
+            .set_plan_auto_run_enabled(true)
+            .expect("enable auto-run");
+    }
+    MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+        .expect("global memory database");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(81));
+    let handles = (0..80)
+        .map(|index| {
+            let barrier = barrier.clone();
+            let state = state.clone();
+            let workspace_path = workspace.path().to_path_buf();
+            let workspace_id = workspace_id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                match index % 4 {
+                    0 => crate::http::plans::plans(
+                        State(state),
+                        AxumPath(workspace_id),
+                        Query(
+                            serde_json::from_value(json!({ "view": "active", "limit": 50 }))
+                                .expect("plans query"),
+                        ),
+                    )
+                    .await
+                    .map(|_| ()),
+                    1 => crate::http::plans::plan_auto_run(State(state), AxumPath(workspace_id))
+                        .await
+                        .map(|_| ()),
+                    2 => crate::http::chat::chat_statistics(
+                        State(state),
+                        AxumPath((workspace_id, chat_id.to_string())),
+                    )
+                    .await
+                    .map(|_| ()),
+                    _ => open_workspace_database(&workspace_path).and_then(|mut database| {
+                        database
+                            .insert_run_event(NewRunEvent {
+                                id: &format!("storm-event-{index}"),
+                                chat_id,
+                                run_id: "storm-run",
+                                sequence: i64::from(index),
+                                event_type: "delta",
+                                payload_json: "{}",
+                            })
+                            .map_err(ApiError::from_workspace_error)
+                    }),
+                }
+                .map_err(|error| error.message)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait().await;
+
+    let mut errors = Vec::new();
+    for handle in handles {
+        if let Err(error) = handle.await.expect("storm worker should not panic") {
+            errors.push(error);
+        }
+    }
+
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("unable to open database file")),
+        "sqlite open failed during burst: {errors:#?}"
+    );
+    assert!(errors.is_empty(), "burst requests failed: {errors:#?}");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database reopen");
+    assert_eq!(
+        database
+            .run_events_for_run("storm-run")
+            .expect("run events")
+            .len(),
+        20
+    );
+}
+
 #[tokio::test]
 async fn tool_resource_lock_wait_respects_tool_timeout() {
     let registry = ToolResourceLockRegistry::default();
