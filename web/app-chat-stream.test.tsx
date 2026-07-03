@@ -2919,13 +2919,24 @@ describe("app-chat-stream verification surfaces", () => {
     expect(statusDot()).toHaveClass("session-status-dot-idle");
   });
 
-  it("shows a running spinner instead of a close button on a streaming chat tab", async () => {
+  it("keeps a close button available on a streaming chat tab", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2&file=workspace-1%2FREADME.md&activeFile=workspace-1%2FREADME.md",
+    );
     renderApp();
 
-    await userEvent.click(await screen.findByText("Tool run"));
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() =>
+      expect(within(tabList).getByRole("tab", { name: /README\.md/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
     expect(
-      within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
+      within(tabList).getByRole("button", { name: "Close chat tab Second chat" }),
     ).toBeInTheDocument();
 
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
@@ -2934,9 +2945,37 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await within(tabList).findByRole("status", { name: "Chat is running" }),
     ).toBeInTheDocument();
+    const closeButton = within(tabList).getByRole("button", {
+      name: "Close chat tab Second chat",
+    });
+    expect(closeButton).toBeEnabled();
+
+    const runningTabItem = within(tabList).getByRole("tab", { name: /Second chat/ }).closest(".chat-tab-item");
+    expect(runningTabItem).not.toBeNull();
+    fireEvent.contextMenu(runningTabItem as HTMLElement);
+    const menu = await screen.findByRole("menu", { name: "Second chat" });
+    for (const item of [
+      "Close current tab",
+      "Close other tabs",
+      "Close all tabs",
+      "Close tabs to the right",
+      "Close tabs to the left",
+    ]) {
+      expect(within(menu).getByRole("menuitem", { name: item })).toBeEnabled();
+    }
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await userEvent.click(closeButton);
+
+    await waitFor(() =>
+      expect(within(tabList).queryByRole("tab", { name: /Second chat/ })).not.toBeInTheDocument(),
+    );
     expect(
-      within(tabList).queryByRole("button", { name: "Close chat tab Tool run" }),
-    ).not.toBeInTheDocument();
+      vi.mocked(fetch).mock.calls.some(([input]) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.includes("/api/workspaces/workspace-1/chat/runs/request-stream/cancel");
+      }),
+    ).toBe(false);
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

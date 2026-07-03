@@ -4927,11 +4927,7 @@ export function App() {
       }
       return true;
     });
-    const tabsToClose = candidates.filter(
-      (tab) =>
-        tab.type !== "chat" ||
-        !runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId)),
-    );
+    const tabsToClose = candidates;
     if (!tabsToClose.length) {
       return;
     }
@@ -5055,9 +5051,6 @@ export function App() {
 
   function closeChatTab(workspaceId: string, chatId: string) {
     const chatKey = chatRunKey(workspaceId, chatId);
-    if (runningChatKeys.has(chatKey)) {
-      return;
-    }
 
     const tabIndex = mainTabs.findIndex(
       (tab) => tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId,
@@ -10454,10 +10447,6 @@ function MainTabBar({
     onCloseTabs(scope, tab);
   }
 
-  function canCloseTab(tab: MainTabSummary) {
-    return tab.type !== "chat" || !runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId));
-  }
-
   function hasClosableTabs(scope: MainTabCloseScope, anchorTab: MainTabSummary) {
     const anchorIndex = tabs.findIndex((tab) => mainTabKey(tab) === mainTabKey(anchorTab));
     if (anchorIndex < 0) {
@@ -10465,9 +10454,6 @@ function MainTabBar({
     }
 
     return tabs.some((tab, index) => {
-      if (!canCloseTab(tab)) {
-        return false;
-      }
       if (scope === "current") {
         return index === anchorIndex;
       }
@@ -10586,6 +10572,14 @@ function MainTabBar({
                     {tab.type === "agent" ? (
                       <Bot aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
                     ) : null}
+                    {isRunning ? (
+                      <span aria-label={t("Chat is running")} className="inline-flex shrink-0" role="status">
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="chat-tab-running-spinner size-3.5 animate-spin text-teal-700"
+                        />
+                      </span>
+                    ) : null}
                     <span className="min-w-0 truncate">{title}</span>
                   </span>
                   <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
@@ -10598,24 +10592,15 @@ function MainTabBar({
                   </span>
                 </button>
                 <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
-                  {isRunning ? (
-                    <span aria-label={t("Chat is running")} role="status">
-                      <LoaderCircle
-                        aria-hidden="true"
-                        className="chat-tab-running-spinner size-4 animate-spin text-teal-700"
-                      />
-                    </span>
-                  ) : (
-                    <button
-                      aria-label={t("Close chat tab {title}", { title })}
-                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
-                      onClick={() => onCloseTab(tab)}
-                      title={t("Close")}
-                      type="button"
-                    >
-                      <X aria-hidden="true" className="size-3.5" />
-                    </button>
-                  )}
+                  <button
+                    aria-label={t("Close chat tab {title}", { title })}
+                    className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
+                    onClick={() => onCloseTab(tab)}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-3.5" />
+                  </button>
                 </span>
               </div>
             );
