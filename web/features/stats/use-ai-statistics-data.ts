@@ -45,6 +45,7 @@ export function useAiStatisticsData(
   const statsRef = useRef<AiStatisticsResponse | null>(null);
   const isStatsRequestInFlightRef = useRef(false);
   const shouldReloadStatsAfterCurrentRequestRef = useRef(false);
+  const copiedTimerRef = useRef<number | null>(null);
 
   filtersRef.current = filters;
   statsRef.current = stats;
@@ -168,6 +169,14 @@ export function useAiStatisticsData(
     };
   }, [loadStats]);
 
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+    };
+  }, []);
+
   const updateAuditFilters = useCallback((update: Partial<AiStatsFilterState>) => {
     setFilters((current) => ({
       ...current,
@@ -206,8 +215,12 @@ export function useAiStatisticsData(
     try {
       await navigator.clipboard.writeText(text);
       setCopiedKey(key);
-      window.setTimeout(() => {
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+      copiedTimerRef.current = window.setTimeout(() => {
         setCopiedKey((current) => (current === key ? null : current));
+        copiedTimerRef.current = null;
       }, 1600);
     } catch (copyError) {
       setDetailError(errorMessage(copyError));
