@@ -173,6 +173,48 @@ pub(super) fn git_branches_response(
     })
 }
 
+pub(super) fn resolve_git_worktree_target(
+    workspace_path: &Path,
+    worktree_path: &str,
+) -> Result<PathBuf, ApiError> {
+    let requested = worktree_path.trim();
+    if requested.is_empty() {
+        return Ok(workspace_path.to_path_buf());
+    }
+
+    let requested_path = Path::new(requested);
+    let requested_path = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workspace_path.join(requested_path)
+    }
+    .canonicalize()
+    .map_err(|source| {
+        ApiError::bad_request(format!("failed to resolve git worktree target: {source}"))
+    })?;
+    let requested_path_text = path_to_slash_string(&requested_path);
+    let workspace_root = workspace_path.canonicalize().map_err(|source| {
+        ApiError::internal(format!("failed to resolve workspace path: {source}"))
+    })?;
+
+    if requested_path == workspace_root {
+        return Ok(workspace_root);
+    }
+
+    let repo = open_repo(workspace_path)?;
+    if git_worktrees(&repo, None)?
+        .iter()
+        .any(|worktree| worktree.path == requested_path_text)
+    {
+        return Ok(requested_path);
+    }
+
+    Err(ApiError::bad_request(format!(
+        "unknown git worktree target: {}",
+        requested_path.display()
+    )))
+}
+
 fn git_worktrees(
     repo: &gix::Repository,
     current_worktree_path: Option<&Path>,
@@ -1484,6 +1526,48 @@ fn phase12_agent_worktrees_isolate_delete_and_merge_changes() {
         validate_agent_worktree_path(workspace_path, workspace_path).is_err(),
         "managed deletion must reject paths outside Foco agent worktrees"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn git_worktree_target_resolves_only_registered_worktrees() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    stage_git_file(workspace_path, "README.md").expect("stage base file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-target-test").expect("worktree");
+    assert_eq!(
+        resolve_git_worktree_target(workspace_path, worktree.root_path.to_str().expect("path"))
+            .expect("known worktree"),
+        worktree
+            .root_path
+            .canonicalize()
+            .expect("canonical worktree")
+    );
+    assert_eq!(
+        resolve_git_worktree_target(workspace_path, ".").expect("main workspace"),
+        workspace_path.canonicalize().expect("canonical workspace")
+    );
+
+    let unknown = workspace_path.join("unregistered-worktree");
+    fs::create_dir(&unknown).expect("unknown dir");
+    let error = resolve_git_worktree_target(workspace_path, unknown.to_str().expect("path"))
+        .expect_err("unknown target must fail");
+    assert!(error.message.contains("unknown git worktree target"));
 }
 
 #[cfg(test)]

@@ -121,6 +121,9 @@ const ContextPanel = memo(function ContextPanel({
   files,
   gitCommitMessage,
   gitOperationKey,
+  sourceControlTargetKey,
+  sourceControlTargetLabel,
+  sourceControlTargets,
   expandedFileTreePaths,
   isLoadingChatStatistics,
   isLoadingContextMemories,
@@ -146,6 +149,7 @@ const ContextPanel = memo(function ContextPanel({
   onPlanAction,
   onPlanAutoRunToggle,
   onPlanOrderChange,
+  onSourceControlTargetChange,
   onPlanPhaseRetry,
   onOpenPlanPhaseChat,
   onPlanPhaseRetryWithOverride,
@@ -194,6 +198,9 @@ const ContextPanel = memo(function ContextPanel({
   files: GitStatusFileSummary[];
   gitCommitMessage: string;
   gitOperationKey: string | null;
+  sourceControlTargetKey: string;
+  sourceControlTargetLabel: string;
+  sourceControlTargets: { key: string; label: string; description: string }[];
   expandedFileTreePaths: Set<string>;
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
@@ -219,6 +226,7 @@ const ContextPanel = memo(function ContextPanel({
   onPlanAction: (planId: string, action: PlanAction) => void;
   onPlanAutoRunToggle: (enabled: boolean) => void;
   onPlanOrderChange: (planIds: string[]) => void;
+  onSourceControlTargetChange: (targetKey: string) => void;
   onPlanPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -354,6 +362,9 @@ const ContextPanel = memo(function ContextPanel({
               files={files}
               gitCommitMessage={gitCommitMessage}
               gitOperationKey={gitOperationKey}
+              sourceControlTargetKey={sourceControlTargetKey}
+              sourceControlTargetLabel={sourceControlTargetLabel}
+              sourceControlTargets={sourceControlTargets}
               isLoading={isLoadingDiff}
               onCommit={onGitCommit}
               onGenerateCommitMessage={onGenerateGitCommitMessage}
@@ -361,6 +372,7 @@ const ContextPanel = memo(function ContextPanel({
               onFileOperation={onGitFileOperation}
               onRefresh={onRefreshDiff}
               onSelectFile={onSelectDiffFile}
+              onTargetChange={onSourceControlTargetChange}
               selectedPath={selectedPath}
             />
           </div>
@@ -2554,12 +2566,16 @@ function SourceControlPanel({
   gitCommitMessage,
   gitOperationKey,
   isLoading,
+  sourceControlTargetKey,
+  sourceControlTargetLabel,
+  sourceControlTargets,
   onCommit,
   onGenerateCommitMessage,
   onCommitMessageChange,
   onFileOperation,
   onRefresh,
   onSelectFile,
+  onTargetChange,
   selectedPath,
 }: {
   diffError: string | null;
@@ -2568,12 +2584,16 @@ function SourceControlPanel({
   gitCommitMessage: string;
   gitOperationKey: string | null;
   isLoading: boolean;
+  sourceControlTargetKey: string;
+  sourceControlTargetLabel: string;
+  sourceControlTargets: { key: string; label: string; description: string }[];
   onCommit: (event: FormEvent<HTMLFormElement>) => void;
   onGenerateCommitMessage: () => void;
   onCommitMessageChange: (message: string) => void;
   onFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onRefresh: () => void;
   onSelectFile: (path: string | null) => void;
+  onTargetChange: (targetKey: string) => void;
   selectedPath: string | null;
 }) {
   const { t } = useI18n();
@@ -2593,24 +2613,40 @@ function SourceControlPanel({
           <div className="min-w-0">
             <span className="foco-eyebrow">{t("Source Control")}</span>
             <h2 className="truncate text-sm font-semibold text-stone-950">
-              {selectedPath ?? t("Workspace changes")}
+              {selectedPath ?? sourceControlTargetLabel}
             </h2>
           </div>
         </div>
-        <button
-          aria-label={t("Refresh diff")}
-          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
-          disabled={isLoading}
-          onClick={onRefresh}
-          title={t("Refresh diff")}
-          type="button"
-        >
-          <RefreshCw
-            aria-hidden="true"
-            className="context-refresh-icon size-4"
-            data-loading={isLoading ? "true" : undefined}
-          />
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <select
+            aria-label={t("Source Control target")}
+            className="max-w-40 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs font-medium text-stone-700 shadow-sm outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+            disabled={sourceControlTargets.length <= 1 || isLoading}
+            onChange={(event) => onTargetChange(event.target.value)}
+            title={t("Source Control target")}
+            value={sourceControlTargetKey}
+          >
+            {sourceControlTargets.map((target) => (
+              <option key={target.key} title={target.description} value={target.key}>
+                {target.label}
+              </option>
+            ))}
+          </select>
+          <button
+            aria-label={t("Refresh diff")}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+            disabled={isLoading}
+            onClick={onRefresh}
+            title={t("Refresh diff")}
+            type="button"
+          >
+            <RefreshCw
+              aria-hidden="true"
+              className="context-refresh-icon size-4"
+              data-loading={isLoading ? "true" : undefined}
+            />
+          </button>
+        </div>
       </div>
 
       {diffError ? (

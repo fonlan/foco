@@ -595,6 +595,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     cancelled: "已取消",
     "Git diff": "Git diff",
     "Source Control": "源码管理",
+    "Source Control target": "源码管理目标",
     "Workspace changes": "工作区变更",
     "Refresh diff": "刷新 diff",
     "Commit message": "提交消息",

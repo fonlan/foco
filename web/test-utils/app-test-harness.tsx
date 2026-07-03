@@ -2020,10 +2020,12 @@ export const appTestState: {
   };
   workspaceSpecResponse: typeof workspaceSpec;
   settingsSpecJobsResponse: SettingsWorkspaceSpecJobSummary[];
+  agentTeamSnapshotResponse: typeof agentTeamSnapshot;
   workspaceSpecSaveConflict: boolean;
   workspaceSpecGenerateCompletes: boolean;
   workspaceGitBranchesResponses: GitBranchesResponse[];
   workspaceGitDiffResponse: typeof gitDiff;
+  workspaceGitDiffResponsesByWorktreePath: Record<string, typeof gitDiff>;
   pendingQuestionsResponse: QuestionRequestSummary[];
   answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
@@ -2040,10 +2042,12 @@ export const appTestState: {
   settingsResponse: settings,
   workspaceSpecResponse: clonedWorkspaceSpec(),
   settingsSpecJobsResponse: clonedSettingsSpecJobs(),
+  agentTeamSnapshotResponse: agentTeamSnapshot,
   workspaceSpecSaveConflict: false,
   workspaceSpecGenerateCompletes: false,
   workspaceGitBranchesResponses: [],
   workspaceGitDiffResponse: gitDiff,
+  workspaceGitDiffResponsesByWorktreePath: {},
   pendingQuestionsResponse: [],
   answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
@@ -2312,10 +2316,12 @@ export function resetAppTestEnvironment() {
   appTestState.settingsResponse = settings;
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
   appTestState.settingsSpecJobsResponse = clonedSettingsSpecJobs();
+  appTestState.agentTeamSnapshotResponse = agentTeamSnapshot;
   appTestState.workspaceSpecSaveConflict = false;
   appTestState.workspaceSpecGenerateCompletes = false;
   appTestState.workspaceGitBranchesResponses = [];
   appTestState.workspaceGitDiffResponse = gitDiff;
+  appTestState.workspaceGitDiffResponsesByWorktreePath = {};
   appTestState.pendingQuestionsResponse = [];
   appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
@@ -2958,7 +2964,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
-    return jsonResponse(agentTeamSnapshot);
+    return jsonResponse(appTestState.agentTeamSnapshotResponse);
   }
 
   const agentTranscriptMatch = path.match(
@@ -3346,26 +3352,31 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/workspaces/workspace-1/git/diff") {
     const selectedPath = requestUrl.searchParams.get("path");
+    const worktreePath = requestUrl.searchParams.get("worktreePath");
+    const targetResponse =
+      worktreePath && appTestState.workspaceGitDiffResponsesByWorktreePath[worktreePath]
+        ? appTestState.workspaceGitDiffResponsesByWorktreePath[worktreePath]
+        : appTestState.workspaceGitDiffResponse;
     if (!selectedPath) {
-      return jsonResponse(appTestState.workspaceGitDiffResponse);
+      return jsonResponse(targetResponse);
     }
 
-    const file = appTestState.workspaceGitDiffResponse.files.find(
+    const file = targetResponse.files.find(
       (summary) => summary.path === selectedPath,
     );
     const escapedPath = selectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const sectionMatch = appTestState.workspaceGitDiffResponse.diff.match(
+    const sectionMatch = targetResponse.diff.match(
       new RegExp(`diff --git a/${escapedPath} b/${escapedPath}[\\s\\S]*?(?=diff --git a/|$)`),
     );
 
     return jsonResponse({
-      ...appTestState.workspaceGitDiffResponse,
+      ...targetResponse,
       diff: sectionMatch?.[0] ?? "",
-      files: appTestState.workspaceGitDiffResponse.files,
+      files: targetResponse.files,
       path: selectedPath,
       status: file
         ? `${file.indexStatus}${file.worktreeStatus} ${file.path}\n`
-        : appTestState.workspaceGitDiffResponse.status,
+        : targetResponse.status,
     });
   }
 

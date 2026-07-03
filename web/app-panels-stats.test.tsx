@@ -58,6 +58,173 @@ describe("app-panels-stats verification surfaces", () => {
       .filter((url) => url.pathname === "/api/ai-statistics");
   }
 
+  function fetchCallUrls() {
+    return vi.mocked(fetch).mock.calls.map((call) => {
+      const rawPath =
+        typeof call[0] === "string"
+          ? call[0]
+          : call[0] instanceof URL
+            ? call[0].toString()
+            : call[0].url;
+
+      return new URL(rawPath, "http://localhost");
+    });
+  }
+
+  it("defaults Source Control diff to the active isolated coordinator worktree", async () => {
+    const worktreePath = `${workspace.path}\\.foco\\agent-worktrees\\agent-instance-coordinator`;
+    appTestState.agentTeamSnapshotResponse = {
+      ...agentTeamSnapshot,
+      instances: agentTeamSnapshot.instances.map((instance) =>
+        instance.id === agentTeamSnapshot.team.coordinatorInstanceId
+          ? {
+              ...instance,
+              executionRootPath: worktreePath,
+              executionWorkspaceMode: "isolated_worktree",
+              worktreeBaseRevision: "base-revision",
+              worktreeBranch: "foco/agent-worktrees/agent-instance-coordinator",
+              worktreeStatus: "active",
+            }
+          : instance,
+      ),
+    };
+    const branchesResponse = {
+      branches: ["main", "foco/agent-worktrees/agent-instance-coordinator"],
+      currentBranch: "main",
+      isGitRepository: true,
+      worktrees: [
+        {
+          branch: "main",
+          isCurrent: true,
+          name: "workspace",
+          path: workspace.path,
+        },
+        {
+          branch: "foco/agent-worktrees/agent-instance-coordinator",
+          isCurrent: false,
+          name: "agent-instance-coordinator",
+          path: worktreePath,
+        },
+      ],
+    };
+    appTestState.workspaceGitBranchesResponses = [branchesResponse, branchesResponse];
+    appTestState.workspaceGitDiffResponsesByWorktreePath[worktreePath] = generatedGitDiff;
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
+    expect(
+      await screen.findAllByText("foco/agent-worktrees/agent-instance-coordinator"),
+    ).not.toHaveLength(0);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Source Control target" }),
+      ).toHaveValue(`worktree:${worktreePath}`),
+    );
+    await waitFor(() =>
+      expect(
+        fetchCallUrls().some(
+          (url) =>
+            url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+            url.searchParams.get("worktreePath") === worktreePath,
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("switches Source Control targets without calling branch switch", async () => {
+    const firstWorktreePath = `${workspace.path}\\.foco\\agent-worktrees\\agent-instance-coordinator`;
+    const secondWorktreePath = `${workspace.path}\\.foco\\agent-worktrees\\agent-instance-review`;
+    appTestState.agentTeamSnapshotResponse = {
+      ...agentTeamSnapshot,
+      instances: agentTeamSnapshot.instances.map((instance) =>
+        instance.id === agentTeamSnapshot.team.coordinatorInstanceId
+          ? {
+              ...instance,
+              executionRootPath: firstWorktreePath,
+              executionWorkspaceMode: "isolated_worktree",
+              worktreeBaseRevision: "base-revision",
+              worktreeBranch: "foco/agent-worktrees/agent-instance-coordinator",
+              worktreeStatus: "active",
+            }
+          : instance,
+      ),
+    };
+    const branchesResponse = {
+      branches: [
+        "main",
+        "foco/agent-worktrees/agent-instance-coordinator",
+        "foco/agent-worktrees/agent-instance-review",
+      ],
+      currentBranch: "main",
+      isGitRepository: true,
+      worktrees: [
+        {
+          branch: "main",
+          isCurrent: true,
+          name: "workspace",
+          path: workspace.path,
+        },
+        {
+          branch: "foco/agent-worktrees/agent-instance-coordinator",
+          isCurrent: false,
+          name: "agent-instance-coordinator",
+          path: firstWorktreePath,
+        },
+        {
+          branch: "foco/agent-worktrees/agent-instance-review",
+          isCurrent: false,
+          name: "agent-instance-review",
+          path: secondWorktreePath,
+        },
+      ],
+    };
+    appTestState.workspaceGitBranchesResponses = [branchesResponse, branchesResponse];
+    appTestState.workspaceGitDiffResponsesByWorktreePath[firstWorktreePath] = generatedGitDiff;
+    appTestState.workspaceGitDiffResponsesByWorktreePath[secondWorktreePath] = {
+      ...generatedGitDiff,
+      diff: [
+        "diff --git a/review.md b/review.md",
+        "--- /dev/null",
+        "+++ b/review.md",
+        "@@ -0,0 +1 @@",
+        "+review",
+        "",
+      ].join("\n"),
+      files: [{ indexStatus: " ", path: "review.md", worktreeStatus: "M" }],
+      status: " M review.md\n",
+    };
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Source Control target" }),
+      ).toHaveValue(`worktree:${firstWorktreePath}`),
+    );
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Source Control target" }),
+      `worktree:${secondWorktreePath}`,
+    );
+
+    await screen.findByText("review.md");
+    expect(
+      fetchCallUrls().some(
+        (url) => url.pathname === "/api/workspaces/workspace-1/git/branches/switch",
+      ),
+    ).toBe(false);
+    expect(
+      fetchCallUrls().some(
+        (url) =>
+          url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+          url.searchParams.get("worktreePath") === secondWorktreePath,
+      ),
+    ).toBe(true);
+  });
+
   function setDocumentVisibility(visibilityState: DocumentVisibilityState) {
     Object.defineProperty(document, "hidden", {
       configurable: true,

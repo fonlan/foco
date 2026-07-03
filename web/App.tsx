@@ -97,6 +97,7 @@ import type {
   GitDiffLineStats,
   GitDiffResponse,
   GitStatusFileSummary,
+  GitWorktreeSummary,
   HookNotificationSummary,
   InstallRipgrepResponse,
   JsonValue,
@@ -525,6 +526,132 @@ const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
 const EMPTY_GIT_STATUS_FILES: GitStatusFileSummary[] = [];
 
+type SourceControlTarget = {
+  kind: "workspace" | "worktree";
+  path: string | null;
+  label: string;
+};
+
+function sourceControlTargetKey(target: SourceControlTarget | null) {
+  return target?.kind === "worktree" && target.path
+    ? `worktree:${target.path}`
+    : "workspace";
+}
+
+function pathBasename(path: string) {
+  const normalized = path.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).at(-1) ?? normalized;
+}
+
+function sourceControlLabelForWorktree(worktree: Pick<GitWorktreeSummary, "branch" | "name">) {
+  return worktree.branch ?? worktree.name;
+}
+
+function worktreeMatchesExecutionRoot(worktreePath: string, executionRootPath: string) {
+  const normalize = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const left = normalize(worktreePath);
+  const right = normalize(executionRootPath);
+  return left === right || left.endsWith(`/${right}`) || right.endsWith(`/${left}`);
+}
+
+function sourceControlDefaultTarget(
+  workspacePath: string | null | undefined,
+  gitBranches: GitBranchesResponse | null,
+  coordinatorInstance: AgentInstanceView | null,
+): SourceControlTarget | null {
+  const workspaceTarget: SourceControlTarget = {
+    kind: "workspace",
+    label: gitBranches?.currentBranch ?? (workspacePath ? pathBasename(workspacePath) : "Workspace"),
+    path: null,
+  };
+
+  if (
+    coordinatorInstance?.executionWorkspaceMode !== "isolated_worktree" ||
+    coordinatorInstance.worktreeStatus === "deleted"
+  ) {
+    return workspaceTarget;
+  }
+
+  const byPath = coordinatorInstance.executionRootPath
+    ? gitBranches?.worktrees.find((worktree) =>
+        worktreeMatchesExecutionRoot(worktree.path, coordinatorInstance.executionRootPath!),
+      ) ?? null
+    : null;
+  const byBranch = coordinatorInstance.worktreeBranch
+    ? gitBranches?.worktrees.find(
+        (worktree) => worktree.branch === coordinatorInstance.worktreeBranch,
+      ) ?? null
+    : null;
+  const worktree = byPath ?? byBranch;
+  if (worktree) {
+    return {
+      kind: "worktree",
+      label: sourceControlLabelForWorktree(worktree),
+      path: worktree.path,
+    };
+  }
+  if (coordinatorInstance.executionRootPath) {
+    return {
+      kind: "worktree",
+      label: coordinatorInstance.worktreeBranch ?? pathBasename(coordinatorInstance.executionRootPath),
+      path: coordinatorInstance.executionRootPath,
+    };
+  }
+
+  return workspaceTarget;
+}
+
+function sourceControlTargets(
+  workspacePath: string | null | undefined,
+  gitBranches: GitBranchesResponse | null,
+): SourceControlTarget[] {
+  const targets: SourceControlTarget[] = [
+    {
+      kind: "workspace",
+      label: gitBranches?.currentBranch ?? (workspacePath ? pathBasename(workspacePath) : "Workspace"),
+      path: null,
+    },
+  ];
+
+  for (const worktree of gitBranches?.worktrees ?? []) {
+    if (workspacePath && worktreeMatchesExecutionRoot(worktree.path, workspacePath)) {
+      continue;
+    }
+    targets.push({
+      kind: "worktree",
+      label: sourceControlLabelForWorktree(worktree),
+      path: worktree.path,
+    });
+  }
+
+  return targets;
+}
+
+function sourceControlTargetFromKey(
+  targets: SourceControlTarget[],
+  key: string,
+) {
+  return targets.find((target) => sourceControlTargetKey(target) === key) ?? null;
+}
+
+function appendGitTargetParams(
+  params: URLSearchParams,
+  target: SourceControlTarget | null,
+) {
+  if (target?.kind === "worktree" && target.path) {
+    params.set("worktreePath", target.path);
+  }
+}
+
+function gitTargetRequestBody<T extends Record<string, unknown>>(
+  body: T,
+  target: SourceControlTarget | null,
+) {
+  return target?.kind === "worktree" && target.path
+    ? { ...body, worktreePath: target.path }
+    : body;
+}
+
 function deferStreamSideUpdate(update: () => void) {
   // ponytail: transition is enough for sparse side events; add a real queue only
   // if profiler shows usage/tool/context storms.
@@ -791,6 +918,10 @@ export function App() {
   >(() => new Set());
   const [gitDiff, setGitDiff] = useState<GitDiffResponse | null>(null);
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
+  const [selectedSourceControlTarget, setSelectedSourceControlTarget] =
+    useState<SourceControlTarget | null>(null);
+  const [selectedSourceControlTargetScope, setSelectedSourceControlTargetScope] = useState("");
+  const [isSourceControlTargetManual, setIsSourceControlTargetManual] = useState(false);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [gitCommitMessage, setGitCommitMessage] = useState("");
@@ -1116,6 +1247,38 @@ export function App() {
       liveChatStatistics,
     ],
   );
+  const activeChatCoordinatorInstance =
+    agentTeamSnapshot?.team.chatId === activeChatId
+      ? agentTeamSnapshot.instances.find(
+          (instance) => instance.id === agentTeamSnapshot.team.coordinatorInstanceId,
+        ) ?? null
+      : null;
+  const activeChatWorktreeBranch =
+    activeChatCoordinatorInstance?.executionWorkspaceMode === "isolated_worktree" &&
+    activeChatCoordinatorInstance.worktreeStatus !== "deleted"
+      ? activeChatCoordinatorInstance.worktreeBranch
+      : null;
+  const availableSourceControlTargets = useMemo(
+    () => sourceControlTargets(activeWorkspace?.path, gitBranches),
+    [activeWorkspace?.path, gitBranches],
+  );
+  const defaultSourceControlTarget = useMemo(
+    () =>
+      sourceControlDefaultTarget(
+        activeWorkspace?.path,
+        gitBranches,
+        activeChatCoordinatorInstance,
+      ),
+    [activeChatCoordinatorInstance, activeWorkspace?.path, gitBranches],
+  );
+  const sourceControlTargetScope = activeWorkspace?.id && activeChatId
+    ? `${activeWorkspace.id}:${activeChatId}`
+    : "";
+  const sourceControlTarget =
+    isSourceControlTargetManual && selectedSourceControlTargetScope === sourceControlTargetScope
+      ? selectedSourceControlTarget ?? defaultSourceControlTarget
+      : defaultSourceControlTarget;
+  const sourceControlTargetKeyValue = sourceControlTargetKey(sourceControlTarget);
   const isLoadingContextUsage = activeContextUsageKey
     ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
     : false;
@@ -1888,26 +2051,35 @@ export function App() {
     [],
   );
 
-  const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
-    setIsLoadingDiff(true);
-    setDiffError(null);
+  const loadGitDiff = useCallback(
+    async (workspaceId: string, path: string | null, target?: SourceControlTarget | null) => {
+      setIsLoadingDiff(true);
+      setDiffError(null);
 
-    try {
-      const query = path ? `?path=${encodeURIComponent(path)}` : "";
-      const data = await requestJson<GitDiffResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
-      );
-      setGitDiff(data);
-      setSelectedDiffPath(path && data.files.some((file) => file.path === path) ? path : null);
-      return data;
-    } catch (requestError) {
-      setGitDiff(null);
-      setDiffError(errorMessage(requestError));
-      return null;
-    } finally {
-      setIsLoadingDiff(false);
-    }
-  }, []);
+      try {
+        const params = new URLSearchParams();
+        if (path) {
+          params.set("path", path);
+        }
+        appendGitTargetParams(params, target ?? null);
+        const queryString = params.toString();
+        const query = queryString ? `?${queryString}` : "";
+        const data = await requestJson<GitDiffResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
+        );
+        setGitDiff(data);
+        setSelectedDiffPath(path && data.files.some((file) => file.path === path) ? path : null);
+        return data;
+      } catch (requestError) {
+        setGitDiff(null);
+        setDiffError(errorMessage(requestError));
+        return null;
+      } finally {
+        setIsLoadingDiff(false);
+      }
+    },
+    [],
+  );
 
   const loadContextMemories = useCallback(async (workspaceId: string) => {
     setIsLoadingContextMemories(true);
@@ -2669,9 +2841,30 @@ export function App() {
   ]);
 
   useEffect(() => {
+    setSelectedSourceControlTarget(null);
+    setIsSourceControlTargetManual(false);
+  }, [activeWorkspace?.id, activeChatId]);
+
+  useEffect(() => {
+    if (
+      isSourceControlTargetManual &&
+      !sourceControlTargetFromKey(availableSourceControlTargets, sourceControlTargetKeyValue)
+    ) {
+      setSelectedSourceControlTarget(null);
+      setIsSourceControlTargetManual(false);
+    }
+  }, [
+    availableSourceControlTargets,
+    isSourceControlTargetManual,
+    sourceControlTargetKeyValue,
+  ]);
+
+  useEffect(() => {
     if (!activeWorkspace?.id) {
       setGitDiff(null);
       setSelectedDiffPath(null);
+      setSelectedSourceControlTarget(null);
+      setIsSourceControlTargetManual(false);
       setDiffError(null);
       return;
     }
@@ -2680,14 +2873,14 @@ export function App() {
       return;
     }
 
-    void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+    void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
   }, [
     activeWorkspace?.id,
-    activeChatId,
     contextPanelTab,
     isContextPanelOpen,
     loadGitDiff,
     selectedDiffPath,
+    sourceControlTargetKeyValue,
   ]);
 
   useEffect(() => {
@@ -5667,7 +5860,7 @@ export function App() {
           : current,
       );
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
       }
     } catch (requestError) {
       setWorkspaceFilesError(errorMessage(requestError));
@@ -5735,7 +5928,7 @@ export function App() {
       const data = await requestJson<GitDiffResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/${action}`,
         {
-          body: JSON.stringify({ path }),
+          body: JSON.stringify(gitTargetRequestBody({ path }, sourceControlTarget)),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -5774,7 +5967,7 @@ export function App() {
       const data = await requestJson<GitDiffResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit`,
         {
-          body: JSON.stringify({ message }),
+          body: JSON.stringify(gitTargetRequestBody({ message }, sourceControlTarget)),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -5809,10 +6002,15 @@ export function App() {
       const data = await requestJson<GitCommitMessageResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit-message`,
         {
-          body: JSON.stringify({
-            modelId: selectedModelId,
-            providerId: selectedProviderId,
-          }),
+          body: JSON.stringify(
+            gitTargetRequestBody(
+              {
+                modelId: selectedModelId,
+                providerId: selectedProviderId,
+              },
+              sourceControlTarget,
+            ),
+          ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -5861,7 +6059,7 @@ export function App() {
       setSelectedGitBranch(data.currentBranch ?? "");
 
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
       }
     } catch (requestError) {
       setBranchError(errorMessage(requestError));
@@ -5902,7 +6100,7 @@ export function App() {
       setIsBranchDialogOpen(false);
 
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
       }
     } catch (requestError) {
       setBranchError(errorMessage(requestError));
@@ -7536,7 +7734,7 @@ export function App() {
 
         if (streamEvent.type === "gitDiffRefresh") {
           if (isContextPanelOpen && contextPanelTab === "git") {
-            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
+            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath, sourceControlTarget);
           }
           deferStreamSideUpdate(() => {
             updateLiveChatStatistics(chatKey, {
@@ -8551,7 +8749,7 @@ export function App() {
 
         if (streamEvent.type === "gitDiffRefresh") {
           if (isContextPanelOpen && contextPanelTab === "git") {
-            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
+            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath, sourceControlTarget);
           }
           deferStreamSideUpdate(() => {
             updateLiveChatStatistics(runMessagesKey, {
@@ -9062,17 +9260,6 @@ export function App() {
     handleWithdrawQueuedMessage,
   );
   const providersForChatPanel = settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
-  const activeChatCoordinatorInstance =
-    agentTeamSnapshot?.team.chatId === activeChatId
-      ? agentTeamSnapshot.instances.find(
-          (instance) => instance.id === agentTeamSnapshot.team.coordinatorInstanceId,
-        ) ?? null
-      : null;
-  const activeChatWorktreeBranch =
-    activeChatCoordinatorInstance?.executionWorkspaceMode === "isolated_worktree" &&
-    activeChatCoordinatorInstance.worktreeStatus !== "deleted"
-      ? activeChatCoordinatorInstance.worktreeBranch
-      : null;
   const refreshAgentPanelForContextPanel = useStableCallback(async () => {
     if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
       await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
@@ -9114,6 +9301,28 @@ export function App() {
   const handleGenerateGitCommitMessageForContextPanel = useStableCallback(
     () => void handleGenerateGitCommitMessage(),
   );
+  const sourceControlTargetOptions = useMemo(
+    () =>
+      availableSourceControlTargets.map((target) => ({
+        description: target.path ?? activeWorkspace?.path ?? "",
+        key: sourceControlTargetKey(target),
+        label: target.label,
+      })),
+    [activeWorkspace?.path, availableSourceControlTargets],
+  );
+  const handleSourceControlTargetChange = useStableCallback((targetKey: string) => {
+    if (targetKey === sourceControlTargetKeyValue) {
+      return;
+    }
+    const target = sourceControlTargetFromKey(availableSourceControlTargets, targetKey);
+    if (!target) {
+      return;
+    }
+    setIsSourceControlTargetManual(true);
+    setSelectedSourceControlTargetScope(sourceControlTargetScope);
+    setSelectedSourceControlTarget(target);
+    setSelectedDiffPath(null);
+  });
   const handleGitFileOperationForContextPanel = useStableCallback(
     (action: "stage" | "unstage" | "discard", path: string) =>
       void handleGitFileOperation(action, path),
@@ -9143,7 +9352,7 @@ export function App() {
   );
   const handleRefreshDiffForContextPanel = useStableCallback(() => {
     if (activeWorkspace?.id) {
-      void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+      void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
     }
   });
   const handleForgetContextMemoryForContextPanel = useStableCallback(
@@ -10062,6 +10271,9 @@ export function App() {
                 files={contextPanelFiles}
                 gitCommitMessage={gitCommitMessage}
                 gitOperationKey={gitOperationKey}
+                sourceControlTargetKey={sourceControlTargetKeyValue}
+                sourceControlTargetLabel={sourceControlTarget?.label ?? t("Workspace changes")}
+                sourceControlTargets={sourceControlTargetOptions}
                 expandedFileTreePaths={expandedFileTreePaths}
                 isLoadingChatStatistics={isLoadingChatStatistics}
                 isLoadingDiff={isLoadingDiff}
@@ -10079,6 +10291,7 @@ export function App() {
                 onGenerateGitCommitMessage={handleGenerateGitCommitMessageForContextPanel}
                 onGitCommitMessageChange={setGitCommitMessage}
                 onGitFileOperation={handleGitFileOperationForContextPanel}
+                onSourceControlTargetChange={handleSourceControlTargetChange}
                 onRefreshWorkspaceFiles={handleRefreshWorkspaceFilesForContextPanel}
                 onToggleFileTreePath={toggleWorkspaceFileTreePath}
                 onOpenWorkspaceFile={handleOpenWorkspaceFileForContextPanel}
