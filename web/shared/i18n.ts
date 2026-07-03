@@ -562,13 +562,6 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Editor toolbar": "编辑器工具栏",
     "Saving...": "正在保存...",
     Copied: "已复制",
-    "Copy {label}": "复制 {label}",
-    "Collapse all": "全部收起",
-    "Expand all": "全部展开",
-    "Collapse all {label}": "收起全部 {label}",
-    "Expand all {label}": "展开全部 {label}",
-    "Collapse JSON node": "收起 JSON 节点",
-    "Expand JSON node": "展开 JSON 节点",
     "Resize git diff panel": "调整 Git diff 面板宽度",
     "Resize todo graph and git diff panels": "调整待办事项和 Git diff 面板高度",
     "Code changes +{additions} -{deletions}":
