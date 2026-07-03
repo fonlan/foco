@@ -392,7 +392,6 @@ export function SkillStorePage({
         "/api/skill-store/install",
         {
           body: JSON.stringify({
-            files: detail.files,
             overwrite,
             skillId: detail.id,
             source: detail.source ?? selectedSkill?.source ?? undefined,

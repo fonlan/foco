@@ -238,6 +238,17 @@ describe("skill store app surface", () => {
         ),
       ).toBe(true),
     );
+    const installCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/skill-store/install" && init?.method === "POST",
+    );
+    const installBody = JSON.parse(String(installCall?.[1]?.body));
+    expect(installBody).toEqual({
+      overwrite: false,
+      skillId: "browser-scout",
+      source: "foco/browser-scout",
+      target: "global",
+    });
+    expect(installBody.files).toBeUndefined();
     expect(
       fetchMock.mock.calls.some(
         ([url, init]) => url === "/api/skills/refresh" && init?.method === "POST",
