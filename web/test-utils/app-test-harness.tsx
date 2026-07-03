@@ -2033,6 +2033,22 @@ function savedSkillsSettings(init?: RequestInit) {
 
   return appTestState.settingsResponse;
 }
+
+function deletedSkillSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as { id?: string };
+
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    skills: {
+      ...appTestState.settingsResponse.skills,
+      detected: appTestState.settingsResponse.skills.detected.filter(
+        (skill) => skill.key !== body.id,
+      ),
+    },
+  };
+
+  return appTestState.settingsResponse;
+}
 export function savedGeneralSettings(init?: RequestInit) {
   const body =
     typeof init?.body === "string"
@@ -2984,6 +3000,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/skills/manual") {
     return jsonResponse(savedSkillsSettings(init));
+  }
+
+  if (path === "/api/skills/delete") {
+    return jsonResponse(deletedSkillSettings(init));
   }
 
   if (path === "/api/skills/refresh") {

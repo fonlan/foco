@@ -3544,6 +3544,30 @@ export function SettingsPanel({
     }
   }
 
+  async function deleteSkill(skill: ConfiguredSkillSummary) {
+    if (!window.confirm(t("Delete skill confirmation"))) {
+      return;
+    }
+
+    setIsSavingSkills(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/skills/delete", {
+        body: JSON.stringify({ id: skill.key }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncSkillsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSkills(false);
+    }
+  }
+
   async function refreshSkills() {
     setIsRefreshingSkills(true);
     setError(null);
@@ -10023,22 +10047,34 @@ export function SettingsPanel({
                                 {skill.path}
                               </div>
                             </div>
-                            <label className="relative inline-flex cursor-pointer items-center justify-self-start md:justify-self-end">
-                              <input
-                                aria-label={t("Enable skill {name}", {
-                                  name: skill.name,
-                                })}
-                                checked={enabled}
-                                className="peer sr-only"
-                                disabled={isSavingSkills || !skill.canEnable}
-                                onChange={(event) =>
-                                  toggleSkill(skill.key, event.target.checked)
-                                }
-                                type="checkbox"
-                              />
-                              <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                              <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
-                            </label>
+                            <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
+                              <button
+                                aria-label={t("Delete skill {name}", { name: skill.name })}
+                                className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                disabled={isSavingSkills || isRefreshingSkills}
+                                onClick={() => void deleteSkill(skill)}
+                                title={t("Delete skill")}
+                                type="button"
+                              >
+                                <Trash2 aria-hidden="true" className="size-4" />
+                              </button>
+                              <label className="relative inline-flex cursor-pointer items-center">
+                                <input
+                                  aria-label={t("Enable skill {name}", {
+                                    name: skill.name,
+                                  })}
+                                  checked={enabled}
+                                  className="peer sr-only"
+                                  disabled={isSavingSkills || !skill.canEnable}
+                                  onChange={(event) =>
+                                    toggleSkill(skill.key, event.target.checked)
+                                  }
+                                  type="checkbox"
+                                />
+                                <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                                <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                              </label>
+                            </div>
                           </div>
                           <Warnings warnings={skill.warnings} />
                         </div>

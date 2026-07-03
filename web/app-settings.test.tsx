@@ -120,6 +120,43 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("confirms before deleting a detected skill", async () => {
+    const confirmSpy = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    const deleteButton = await screen.findByRole("button", { name: "Delete skill gitmemo" });
+    await userEvent.click(deleteButton);
+
+    expect(confirmSpy).toHaveBeenCalledWith("Delete skill confirmation");
+    expect(fetchMock.mock.calls.some(([url]) => url === "/api/skills/delete")).toBe(
+      false,
+    );
+
+    await userEvent.click(deleteButton);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/skills/delete",
+        expect.objectContaining({
+          body: JSON.stringify({ id: "global:gitmemo" }),
+          method: "POST",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Global skill")).not.toBeInTheDocument();
+    });
+    confirmSpy.mockRestore();
+  });
+
   it("filters plan history by selected workspace", async () => {
     appTestState.settingsResponse = {
       ...settings,
