@@ -397,8 +397,7 @@ impl ActiveChatRunRegistration {
         self.next_sequence += 1;
 
         {
-            let mut database = WorkspaceDatabase::open_or_create(workspace_path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(workspace_path)?;
             let id = format!("{}-event-{}", self.run_id, event_frame.sequence);
             database
                 .insert_run_event(NewRunEvent {
@@ -611,9 +610,7 @@ impl ActiveChatRunRegistration {
             && self.assistant_draft.status == StreamingAssistantStatus::Streaming
         {
             self.assistant_draft.status = StreamingAssistantStatus::Pending;
-            match WorkspaceDatabase::open_or_create(workspace_path)
-                .map_err(ApiError::from_workspace_error)
-            {
+            match open_workspace_database(workspace_path) {
                 Ok(mut database) => self.persist_assistant_draft(&mut database, chat_id),
                 Err(error) => Err(error),
             }

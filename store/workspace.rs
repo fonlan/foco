@@ -1931,6 +1931,13 @@ impl WorkspaceDatabase {
             trigger,
             PlanPhaseAttemptTrigger::Retry | PlanPhaseAttemptTrigger::ModelOverrideRetry
         ) && phase.status != "failed"
+            && !(phase.status == "running"
+                && phase.attempts.iter().any(|attempt| {
+                    matches!(
+                        attempt.status.as_str(),
+                        "failed" | "cancelled" | "interrupted"
+                    )
+                }))
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan phase '{}' is not failed", phase.id),
@@ -10828,7 +10835,15 @@ impl fmt::Display for WorkspaceDatabaseError {
                 write!(formatter, "path must be valid UTF-8: {}", path.display())
             }
             Self::Sqlite { path, source } => {
-                write!(formatter, "{} SQLite error: {}", path.display(), source)
+                write!(formatter, "{} SQLite error: {}", path.display(), source)?;
+                if let Some(error) = source.sqlite_error() {
+                    write!(
+                        formatter,
+                        " (code={:?}, extended_code={}, extended_message={})",
+                        error.code, error.extended_code, error
+                    )?;
+                }
+                Ok(())
             }
             Self::TodoGraphJson { source } => {
                 write!(formatter, "invalid todo graph JSON: {source}")

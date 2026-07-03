@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -81,7 +81,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::time::timeout;
 
 use crate::http::assets::verify_frontend_assets;
@@ -379,6 +379,83 @@ pub(crate) struct AppState {
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
+}
+
+static WORKSPACE_DATABASE_GATES: LazyLock<Mutex<HashMap<PathBuf, Arc<Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const WORKSPACE_DATABASE_MAX_CONCURRENT_OPENS: usize = 2;
+const WORKSPACE_DATABASE_GATE_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKSPACE_DATABASE_GATE_POLL: Duration = Duration::from_millis(10);
+
+pub(crate) struct WorkspaceDatabaseHandle {
+    database: WorkspaceDatabase,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for WorkspaceDatabaseHandle {
+    type Target = WorkspaceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
+    }
+}
+
+impl std::ops::DerefMut for WorkspaceDatabaseHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.database
+    }
+}
+
+pub(crate) fn open_workspace_database(
+    workspace_path: impl AsRef<Path>,
+) -> Result<WorkspaceDatabaseHandle, ApiError> {
+    let workspace_path = workspace_path.as_ref();
+    let permit = acquire_workspace_database_permit(workspace_path)?;
+    let database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(WorkspaceDatabaseHandle {
+        database,
+        _permit: permit,
+    })
+}
+
+fn acquire_workspace_database_permit(
+    workspace_path: &Path,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    let key = fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+    let gate = {
+        let mut gates = WORKSPACE_DATABASE_GATES
+            .lock()
+            .map_err(|_| ApiError::internal("workspace database gate lock is poisoned"))?;
+        gates
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(WORKSPACE_DATABASE_MAX_CONCURRENT_OPENS)))
+            .clone()
+    };
+    let started_at = Instant::now();
+
+    loop {
+        match gate.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ApiError::internal(format!(
+                    "workspace database gate is closed: {}",
+                    key.display()
+                )));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                if started_at.elapsed() >= WORKSPACE_DATABASE_GATE_TIMEOUT {
+                    return Err(ApiError::internal(format!(
+                        "workspace database concurrency limit reached for {} after {} ms",
+                        key.display(),
+                        WORKSPACE_DATABASE_GATE_TIMEOUT.as_millis()
+                    )));
+                }
+                // ponytail: process-local backpressure only; cross-process pressure stays with SQLite/OS. Upgrade path is a pooled workspace DB runtime.
+                std::thread::sleep(WORKSPACE_DATABASE_GATE_POLL);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]

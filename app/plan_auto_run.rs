@@ -4,7 +4,7 @@ use std::time::Duration;
 use foco_store::workspace::PlanAutoRunCandidateRecord;
 use foco_store::{
     config::WorkspaceConfig,
-    workspace::{PlanAutoRunStateRecord, WorkspaceDatabase},
+    workspace::{PlanAutoRunStateRecord, PlanPatch},
 };
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
@@ -109,8 +109,7 @@ async fn dispatch_next_plan_auto_run(
     workspace: &WorkspaceConfig,
 ) -> Result<PlanAutoRunDispatch, ApiError> {
     let candidate = {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         if !database
             .plan_auto_run_state()
             .map_err(ApiError::from_workspace_error)?
@@ -148,9 +147,44 @@ async fn dispatch_next_plan_auto_run(
     .await
     {
         Ok(_) => Ok(PlanAutoRunDispatch::Dispatched),
+        Err(error) if error.message.starts_with("invalid plan:") => {
+            let mut database = open_workspace_database(&workspace.path)?;
+            let error_message = format!("Plan auto-run skipped invalid item: {}", error.message);
+            match database.update_plan(
+                &candidate.plan_id,
+                PlanPatch {
+                    title: None,
+                    overview: None,
+                    status: Some("failed"),
+                    error_message: Some(Some(&error_message)),
+                },
+            ) {
+                Ok(_) => {
+                    tracing::warn!(
+                        workspace_id = %workspace.id,
+                        plan_id = %candidate.plan_id,
+                        error = %error.message,
+                        "Plan auto-run marked invalid candidate failed"
+                    );
+                    Ok(PlanAutoRunDispatch::Blocked)
+                }
+                Err(mark_error) => {
+                    database
+                        .set_plan_auto_run_enabled(false)
+                        .map_err(ApiError::from_workspace_error)?;
+                    tracing::warn!(
+                        workspace_id = %workspace.id,
+                        plan_id = %candidate.plan_id,
+                        error = %error.message,
+                        mark_error = %mark_error,
+                        "Plan auto-run disabled after invalid candidate could not be marked failed"
+                    );
+                    Err(error)
+                }
+            }
+        }
         Err(error) => {
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .set_plan_auto_run_enabled(false)
                 .map_err(ApiError::from_workspace_error)?;
@@ -162,8 +196,7 @@ async fn dispatch_next_plan_auto_run(
 pub(crate) fn plan_auto_run_state(
     workspace: &WorkspaceConfig,
 ) -> Result<PlanAutoRunStateRecord, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
     database
         .plan_auto_run_state()
         .map_err(ApiError::from_workspace_error)
@@ -173,8 +206,7 @@ pub(crate) fn set_plan_auto_run_enabled(
     workspace: &WorkspaceConfig,
     enabled: bool,
 ) -> Result<PlanAutoRunStateRecord, ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     database
         .set_plan_auto_run_enabled(enabled)
         .map_err(ApiError::from_workspace_error)

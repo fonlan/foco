@@ -1018,15 +1018,19 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
             input_json: "{}",
         })
         .expect("enqueue task");
-    database
-        .attach_plan_phase_run(
+    let first_attempt = database
+        .begin_plan_phase_attempt(
             "plan-restart-failed-phase",
             "plan-restart-failed-phase-1",
-            "chat-plan-restart",
-            &team_id,
-            &task_id,
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-a"),
+            Some("model-a"),
+            None,
         )
-        .expect("attach phase");
+        .expect("begin first attempt");
+    database
+        .attach_plan_phase_attempt_run(&first_attempt.id, "chat-plan-restart", &team_id, &task_id)
+        .expect("attach phase attempt");
 
     let failed = database
         .fail_plan_phase_run(&task_id, "provider failed")
@@ -1068,6 +1072,18 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
     assert!(phase.completed_at.is_none());
     assert_eq!(phase.steps[0].status, "pending");
     assert!(phase.steps[0].checked_at.is_none());
+
+    let retry_attempt = database
+        .begin_plan_phase_attempt(
+            "plan-restart-failed-phase",
+            "plan-restart-failed-phase-1",
+            PlanPhaseAttemptTrigger::Retry,
+            Some("provider-a"),
+            Some("model-a"),
+            None,
+        )
+        .expect("begin retry for restarted failed phase");
+    assert_eq!(retry_attempt.trigger, "retry");
 }
 
 #[test]

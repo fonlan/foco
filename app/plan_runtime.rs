@@ -87,8 +87,7 @@ pub(crate) async fn transition_plan_action(
     if !matches!(action, "start" | "resume") {
         let config = config_snapshot(state)?;
         let workspace = workspace_by_id(&config, workspace_id)?;
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         return database
             .transition_plan(plan_id, action)
             .map_err(ApiError::from_workspace_error);
@@ -98,8 +97,7 @@ pub(crate) async fn transition_plan_action(
     let _selection = plan_runner_model_selection(&config)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
     let plan = {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         database
             .transition_plan(plan_id, action)
             .map_err(ApiError::from_workspace_error)?
@@ -122,8 +120,7 @@ pub(crate) async fn retry_plan_merge(
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
     let plan = {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         database
             .plan(plan_id)
             .map_err(ApiError::from_workspace_error)?
@@ -141,8 +138,7 @@ pub(crate) async fn retry_plan_merge(
         )));
     }
     finalize_plan_worktree(state, &workspace, &plan).await?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
     database
         .plan(plan_id)
         .map_err(ApiError::from_workspace_error)?
@@ -159,8 +155,7 @@ pub(crate) async fn retry_plan_phase(
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
     let (attempt_id, plan, selection) = {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         let plan = database
             .plan(plan_id)
             .map_err(ApiError::from_workspace_error)?
@@ -231,8 +226,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
     task_id: &AgentTaskId,
 ) -> Result<(), ApiError> {
     let (phase, task, instance) = {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         let phase = database
             .plan_phase_for_agent_task(task_id)
             .map_err(ApiError::from_workspace_error)?;
@@ -267,8 +261,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
             let commit_id = match commit_plan_phase_to_worktree(workspace, &phase, &instance) {
                 Ok(commit_id) => commit_id,
                 Err(error) => {
-                    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                        .map_err(ApiError::from_workspace_error)?;
+                    let mut database = open_workspace_database(&workspace.path)?;
                     database
                         .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
                         .map_err(ApiError::from_workspace_error)?;
@@ -276,8 +269,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
                 }
             };
             let plan = {
-                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let mut database = open_workspace_database(&workspace.path)?;
                 database
                     .complete_plan_phase_run(task_id, commit_id.as_deref())
                     .map_err(ApiError::from_workspace_error)?
@@ -288,8 +280,7 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
             let message = agent_task_error_message(&task);
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_run(task_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
@@ -311,8 +302,7 @@ async fn sync_plan_merge_task(
     match task.status {
         AgentTaskStatus::Completed => {
             let phase = {
-                let database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let database = open_workspace_database(&workspace.path)?;
                 database
                     .plan(&target.plan_id)
                     .map_err(ApiError::from_workspace_error)?
@@ -342,8 +332,7 @@ async fn sync_plan_merge_task(
                     {
                         delete_instance_worktree(workspace, instance, true)?;
                     }
-                    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                        .map_err(ApiError::from_workspace_error)?;
+                    let mut database = open_workspace_database(&workspace.path)?;
                     if is_shared_workspace_dirty_merge_error(&error) {
                         database
                             .block_plan_phase_merge(
@@ -369,8 +358,7 @@ async fn sync_plan_merge_task(
                 None => shared_workspace_head_commit_id(&workspace.path)?,
             };
             let plan = {
-                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let mut database = open_workspace_database(&workspace.path)?;
                 database
                     .complete_plan_phase_by_id(
                         &target.plan_id,
@@ -390,8 +378,7 @@ async fn sync_plan_merge_task(
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
             let message = agent_task_error_message(task);
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_by_id(&target.plan_id, &target.phase_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
@@ -425,8 +412,7 @@ async fn dispatch_plan_merge(
         }
     };
     {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         if !database
             .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
             .map_err(ApiError::from_workspace_error)?
@@ -464,8 +450,7 @@ async fn dispatch_plan_merge(
     let queued = match queued {
         Ok(queued) => queued,
         Err(error) => {
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
@@ -476,8 +461,7 @@ async fn dispatch_plan_merge(
         (Some(team_id), Some(task_id)) => (team_id, task_id),
         (None, _) => {
             let error = ApiError::internal("plan merge queue did not create an Agent team");
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
@@ -485,8 +469,7 @@ async fn dispatch_plan_merge(
         }
         (_, None) => {
             let error = ApiError::internal("plan merge queue did not create an Agent task");
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
@@ -494,8 +477,7 @@ async fn dispatch_plan_merge(
         }
     };
     {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         database
             .attach_plan_phase_merge_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
             .map_err(ApiError::from_workspace_error)?;
@@ -503,8 +485,7 @@ async fn dispatch_plan_merge(
     if source_instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
         && source_instance.worktree_status.as_deref() == Some("active")
     {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         database
             .update_agent_instance_worktree_status(&source_instance.id, "kept")
             .map_err(ApiError::from_workspace_error)?;
@@ -538,8 +519,7 @@ fn fail_plan_phase_dispatch_error(
     let Some(phase_id) = plan.active_phase_id.as_deref() else {
         return Ok(());
     };
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     database
         .fail_plan_phase_start(&plan.id, phase_id, &error.message)
         .map_err(ApiError::from_workspace_error)?;
@@ -590,8 +570,7 @@ async fn dispatch_plan_phase(
                 plan_runner_model_selection(&config)?
             };
             let workspace = workspace_by_id(&config, workspace_id)?;
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             let attempt = database
                 .begin_plan_phase_attempt(
                     &plan.id,
@@ -611,8 +590,7 @@ async fn dispatch_plan_phase(
     };
     let workspace = workspace_by_id(&config, workspace_id)?;
     let (coordinator_worktree, previous_conclusions) = {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         (
             plan_worktree_info(workspace, &database, &plan)?,
             previous_plan_phase_conclusions(&database, &plan, phase)
@@ -654,8 +632,7 @@ async fn dispatch_plan_phase(
         .agent_task_id
         .as_ref()
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let plan = if let Some(attempt_id) = attempt_id.as_deref() {
         database
             .attach_plan_phase_attempt_run(attempt_id, &queued.chat_id, team_id, task_id)
@@ -675,8 +652,7 @@ async fn finalize_plan_worktree(
     plan: &PlanRecord,
 ) -> Result<(), ApiError> {
     let (phase, instance) = {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         let Some(source) = plan_worktree_source(&database, plan)? else {
             return Ok(());
         };
@@ -696,8 +672,7 @@ async fn finalize_plan_worktree(
     ) {
         Ok(_) => {
             let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace.path)?;
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let mut database = open_workspace_database(&workspace.path)?;
             database
                 .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
                 .map_err(ApiError::from_workspace_error)?;
@@ -705,8 +680,7 @@ async fn finalize_plan_worktree(
         }
         Err(error) => {
             if is_shared_workspace_dirty_merge_error(&error) {
-                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let mut database = open_workspace_database(&workspace.path)?;
                 database
                     .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
@@ -717,8 +691,7 @@ async fn finalize_plan_worktree(
             {
                 Ok(())
             } else {
-                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let mut database = open_workspace_database(&workspace.path)?;
                 database
                     .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
@@ -796,8 +769,7 @@ fn merge_and_commit_plan_phase(
     })?;
     let merge = merge_agent_worktree(&workspace.path, &root_path, base_revision)?;
     if merge.changed_paths.is_empty() {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&workspace.path)?;
         database
             .update_agent_instance_worktree_status(&instance.id, "kept")
             .map_err(ApiError::from_workspace_error)?;
@@ -810,8 +782,7 @@ fn merge_and_commit_plan_phase(
         &workspace.path,
         format!("plan: implement {}", phase.title.trim()),
     )?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     database
         .update_agent_instance_worktree_status(&instance.id, "kept")
         .map_err(ApiError::from_workspace_error)?;
@@ -974,8 +945,7 @@ fn delete_plan_worktrees(
     plan: &PlanRecord,
     allow_changes: bool,
 ) -> Result<(), ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let instances = plan_worktree_instances(&database, plan)?;
     let mut deleted_roots = BTreeSet::new();
     for instance in instances {
@@ -998,8 +968,7 @@ fn delete_instance_worktree(
 ) -> Result<(), ApiError> {
     let root_path = plan_instance_worktree_path(workspace, instance);
     delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     database
         .switch_agent_instance_to_shared_workspace(&instance.id)
         .map_err(ApiError::from_workspace_error)?;
@@ -1714,7 +1683,7 @@ mod tests {
     #[test]
     fn previous_plan_phase_conclusions_use_last_non_empty_assistant_message() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let mut database = open_workspace_database(workspace.path()).expect("database");
         let mut plan = database
             .create_plan(foco_store::workspace::NewPlan {
                 id: "plan-previous-conclusions",

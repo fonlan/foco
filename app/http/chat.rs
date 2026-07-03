@@ -458,8 +458,7 @@ pub(crate) async fn queue_chat_message_internal(
         origin,
     } = input;
     let mut team = if let Some(chat_id) = chat_id.as_deref() {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         database
             .agent_team_for_chat(chat_id)
             .map_err(ApiError::from_workspace_error)?
@@ -467,8 +466,7 @@ pub(crate) async fn queue_chat_message_internal(
         None
     };
     let mut coordinator = if let Some(team) = team.as_ref() {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         let instance = database
             .agent_instance(&team.coordinator_instance_id)
             .map_err(ApiError::from_workspace_error)?
@@ -527,8 +525,7 @@ pub(crate) async fn queue_chat_message_internal(
             size_bytes: attachment.size_bytes,
         })
         .collect::<Vec<_>>();
-    let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&prompt_context.workspace_path)?;
     let user_message_id = unique_id("msg-user");
     let assistant_message_id = unique_id("msg-assistant");
     let assistant_sequence = prompt_context.next_message_sequence + 1;
@@ -881,8 +878,7 @@ pub(crate) async fn stream_chat_response(
         request.queued_user_message_id.as_deref(),
     ) {
         let workspace = workspace_by_id(&config, &workspace_id)?;
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         if let Some(team) = database
             .agent_team_for_chat(chat_id)
             .map_err(ApiError::from_workspace_error)?
@@ -1012,9 +1008,7 @@ fn team_chat_task_event_stream(
                 last_run_event_sequence = last_run_event_sequence.max(last_sequence);
             }
 
-            let database = match WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)
-            {
+            let database = match open_workspace_database(&workspace.path) {
                 Ok(database) => database,
                 Err(error) => {
                     yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
@@ -1357,8 +1351,7 @@ fn load_ai_statistics_response(
             workspace_path = %workspace.path.display(),
             "AI statistics workspace database open started"
         );
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&workspace.path)?;
         tracing::info!(
             workspace_id = %workspace.id,
             database_path = %database.database_path().display(),
@@ -1681,8 +1674,7 @@ pub(crate) async fn ai_statistics_detail(
         return Err(ApiError::bad_request("request id must not be empty"));
     }
 
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
     let request = database
         .llm_request(request_id)
         .map_err(ApiError::from_workspace_error)?
@@ -1714,8 +1706,7 @@ pub(crate) async fn chat_messages(
         .iter()
         .find(|workspace| workspace.id == workspace_id)
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
 
     let chat = database
         .chat(chat_id)
@@ -1810,8 +1801,7 @@ pub(crate) async fn chat_todo_graph(
     let workspace_id = workspace_id.trim();
     let chat_id = chat_id.trim();
     let workspace = workspace_by_id(&config, workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
 
     if database
         .chat(chat_id)
@@ -1847,8 +1837,7 @@ pub(crate) async fn chat_statistics(
     let workspace_id = workspace_id.trim();
     let chat_id = chat_id.trim();
     let workspace = workspace_by_id(&config, workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
 
     if database
         .chat(chat_id)
@@ -1939,8 +1928,7 @@ pub(crate) async fn delete_chat(
         return Err(ApiError::bad_request("chat id must not be empty"));
     }
 
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
 
     if !database
         .delete_chat(chat_id)

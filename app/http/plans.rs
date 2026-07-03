@@ -5,7 +5,6 @@ use axum::{
 use foco_store::workspace::{
     NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanPhaseAttemptRecord,
     PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
-    WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -269,8 +268,7 @@ pub(crate) async fn plans(
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
     let page_record = database
         .plans(PlanListFilter {
             view: view.trim(),
@@ -300,8 +298,7 @@ pub(crate) async fn save_plan_order(
 ) -> Result<Json<PlansResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     database
         .reorder_active_plans(&request.plan_ids)
         .map_err(ApiError::from_workspace_error)?;
@@ -362,8 +359,7 @@ pub(crate) async fn create_plan(
 ) -> Result<Json<PlanResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let phase_storage = request
         .phases
         .into_iter()
@@ -434,8 +430,7 @@ pub(crate) async fn update_plan(
 ) -> Result<Json<PlanResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let error_message = request.error_message.as_deref().map(|message| {
         if message.trim().is_empty() {
             None
@@ -466,8 +461,7 @@ pub(crate) async fn delete_plan(
 ) -> Result<Json<DeletePlanResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let deleted = database
         .delete_plan(&plan_id)
         .map_err(ApiError::from_workspace_error)?;
@@ -487,8 +481,7 @@ pub(crate) async fn plan_worktree_audit(
 ) -> Result<Json<PlanWorktreeAuditResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database(&workspace.path)?;
     let records = database
         .plan_worktree_audit()
         .map_err(ApiError::from_workspace_error)?;
@@ -515,8 +508,7 @@ pub(crate) async fn cleanup_plan_worktree(
     }
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let instance_id = request.agent_instance_id.trim();
     let record = database
         .plan_worktree_audit()
@@ -624,8 +616,7 @@ pub(crate) async fn plan_step_action(
     };
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&workspace.path)?;
     let plan = database
         .update_plan_step(
             &plan_id,
