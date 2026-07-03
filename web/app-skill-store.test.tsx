@@ -63,6 +63,85 @@ describe("skill store app surface", () => {
     );
     expect(screen.getAllByText("Name A-Z").length).toBeGreaterThan(0);
   });
+  it("keeps duplicate skill ids selected by source", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+      const path = requestUrl.pathname;
+
+      if (path === "/api/skill-store/browse") {
+        return jsonResponse({
+          hasMore: false,
+          skills: [
+            {
+              change: 4,
+              description: "Mirror listing for note workflows.",
+              id: "lark-note",
+              installs: 20,
+              installsYesterday: 16,
+              name: "Lark Note",
+              official: false,
+              source: "open.feishu.cn",
+            },
+            {
+              change: 3,
+              description: "Canonical GitHub listing for note workflows.",
+              id: "lark-note",
+              installs: 18,
+              installsYesterday: 15,
+              name: "Lark Note",
+              official: true,
+              source: "larksuite/cli",
+            },
+          ],
+          source: "test-browse",
+          total: 2,
+        });
+      }
+
+      if (path === "/api/skill-store/skills/lark-note") {
+        const source = requestUrl.searchParams.get("source");
+        return jsonResponse({
+          description:
+            source === "larksuite/cli"
+              ? "Canonical GitHub listing for note workflows."
+              : "Mirror listing for note workflows.",
+          files: [{ path: "SKILL.md", content: "# Lark Note" }],
+          id: "lark-note",
+          name: source === "larksuite/cli" ? "Lark Note Canonical" : "Lark Note Mirror",
+          source,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
+    const listPane = await screen.findByRole("region", { name: "Skill list" });
+    expect(await within(listPane).findByText("open.feishu.cn")).toBeInTheDocument();
+    const canonicalRow = within(listPane).getByText("larksuite/cli").closest("button");
+    expect(canonicalRow).not.toBeNull();
+
+    const callsBeforeClick = fetchMock.mock.calls.length;
+    await userEvent.click(canonicalRow as HTMLElement);
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls
+          .slice(callsBeforeClick)
+          .some(([url]) => url === "/api/skill-store/skills/lark-note?source=larksuite%2Fcli"),
+      ).toBe(true),
+    );
+    expect(
+      await within(await screen.findByRole("region", { name: "Skill details" })).findByRole(
+        "heading",
+        { name: "Lark Note Canonical" },
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("searches and installs a skill through the backend proxy", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

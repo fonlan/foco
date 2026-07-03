@@ -101,6 +101,10 @@ function sortLabel(sortMode: SkillStoreSortMode): string {
   return SORT_OPTIONS.find((option) => option.value === sortMode)?.label ?? "Total installs";
 }
 
+function skillSelectionKey(skill: Pick<SkillStoreSkill, "id" | "source">): string {
+  return `${skill.source ?? ""}\u0000${skill.id}`;
+}
+
 export function SkillStorePage({
   onSettingsChange,
   onWorkspacesChange,
@@ -113,7 +117,7 @@ export function SkillStorePage({
   const [sortMode, setSortMode] = useState<SkillStoreSortMode>(DEFAULT_SORT_MODE);
   const [skills, setSkills] = useState<SkillStoreSkill[]>([]);
   const [listSource, setListSource] = useState("");
-  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [selectedSkillKey, setSelectedSkillKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<SkillStoreDetailResponse | null>(null);
   const [isLoadingList, setIsLoadingList] = useState(true);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
@@ -144,8 +148,8 @@ export function SkillStorePage({
   }, [configuredWorkspaces, workspaces]);
 
   const selectedSkill = useMemo(
-    () => skills.find((skill) => skill.id === selectedSkillId) ?? null,
-    [selectedSkillId, skills],
+    () => skills.find((skill) => skillSelectionKey(skill) === selectedSkillKey) ?? null,
+    [selectedSkillKey, skills],
   );
 
   useEffect(() => {
@@ -179,14 +183,14 @@ export function SkillStorePage({
       const data = await requestJson<SkillStoreListResponse>(path);
       setSkills(data.skills);
       setListSource(data.source);
-      setSelectedSkillId((current) =>
-        current && data.skills.some((skill) => skill.id === current)
+      setSelectedSkillKey((current) =>
+        current && data.skills.some((skill) => skillSelectionKey(skill) === current)
           ? current
-          : data.skills[0]?.id ?? null,
+          : data.skills[0] ? skillSelectionKey(data.skills[0]) : null,
       );
     } catch (requestError) {
       setSkills([]);
-      setSelectedSkillId(null);
+      setSelectedSkillKey(null);
       setListSource("");
       setListError(errorMessage(requestError));
     } finally {
@@ -435,11 +439,11 @@ export function SkillStorePage({
                 <li key={`${skill.source ?? "skills"}/${skill.id}`}>
                   <button
                     className={
-                      selectedSkillId === skill.id
+                      selectedSkillKey === skillSelectionKey(skill)
                         ? "skill-store-row skill-store-row-active"
                         : "skill-store-row"
                     }
-                    onClick={() => setSelectedSkillId(skill.id)}
+                    onClick={() => setSelectedSkillKey(skillSelectionKey(skill))}
                     type="button"
                   >
                     <span className="skill-store-rank">#{index + 1}</span>
