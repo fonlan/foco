@@ -262,6 +262,33 @@ const SkillStorePage = lazy(() =>
 
 const PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS = 3000;
 const PLAN_AUTO_RUN_REFRESH_MS = 3000;
+const REQUEST_STORM_DEDUPE_MS = 400;
+
+type SingleFlightEntry<T> = {
+  promise: Promise<T>;
+  settled: boolean;
+  startedAtMs: number;
+};
+
+function requestStormDedupeNow() {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
+}
+
+function isDocumentVisible() {
+  return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
+function shouldReuseRequest<T>(
+  entry: SingleFlightEntry<T> | undefined,
+  nowMs: number,
+  force = false,
+) {
+  if (!entry) {
+    return false;
+  }
+
+  return !entry.settled || (!force && nowMs - entry.startedAtMs < REQUEST_STORM_DEDUPE_MS);
+}
 
 type ViewMode = BrowserRoute["viewMode"];
 type PendingPlanPhaseRetryRefresh = {
@@ -880,6 +907,15 @@ export function App() {
     new Map(),
   );
   const todoGraphRequestIdRef = useRef(0);
+  const activePlansSingleFlightRef = useRef<
+    Map<string, SingleFlightEntry<PlansResponse | null>>
+  >(new Map());
+  const planAutoRunSingleFlightRef = useRef<
+    Map<string, SingleFlightEntry<PlanAutoRunResponse | null>>
+  >(new Map());
+  const chatStatisticsSingleFlightRef = useRef<
+    Map<string, SingleFlightEntry<void>>
+  >(new Map());
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
@@ -941,23 +977,52 @@ export function App() {
     [],
   );
   const loadPlanAutoRunState = useCallback(
-    async (workspaceId: string) => {
+    (workspaceId: string, options: { force?: boolean } = {}) => {
       if (!workspaceId) {
-        return null;
+        return Promise.resolve(null);
       }
-      try {
-        const autoRun = await requestJson<PlanAutoRunResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/auto-run`,
-        );
-        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+
+      const nowMs = requestStormDedupeNow();
+      const existing = planAutoRunSingleFlightRef.current.get(workspaceId);
+      if (shouldReuseRequest(existing, nowMs, options.force)) {
+        return existing!.promise;
+      }
+
+      let promise: Promise<PlanAutoRunResponse | null> = Promise.resolve(null);
+      promise = (async () => {
+        try {
+          const autoRun = await requestJson<PlanAutoRunResponse>(
+            `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/auto-run`,
+          );
+          if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+            return null;
+          }
+          setPlanAutoRunStateForWorkspace(workspaceId, autoRun);
+          return autoRun;
+        } catch (requestError) {
+          if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
+            setActivePlansError(errorMessage(requestError));
+          }
           return null;
+        } finally {
+          const current = planAutoRunSingleFlightRef.current.get(workspaceId);
+          if (current?.promise === promise) {
+            current.settled = true;
+            window.setTimeout(() => {
+              if (planAutoRunSingleFlightRef.current.get(workspaceId)?.promise === promise) {
+                planAutoRunSingleFlightRef.current.delete(workspaceId);
+              }
+            }, REQUEST_STORM_DEDUPE_MS);
+          }
         }
-        setPlanAutoRunStateForWorkspace(workspaceId, autoRun);
-        return autoRun;
-      } catch (requestError) {
-        setActivePlansError(errorMessage(requestError));
-        return null;
-      }
+      })();
+      // ponytail: per-tab single-flight only; cross-tab leader can use BroadcastChannel later.
+      planAutoRunSingleFlightRef.current.set(workspaceId, {
+        promise,
+        settled: false,
+        startedAtMs: nowMs,
+      });
+      return promise;
     },
     [setPlanAutoRunStateForWorkspace],
   );
@@ -1903,31 +1968,58 @@ export function App() {
     }
   }, []);
 
-  const loadActivePlans = useCallback(async (workspaceId: string) => {
+  const loadActivePlans = useCallback((workspaceId: string, options: { force?: boolean } = {}) => {
+    const nowMs = requestStormDedupeNow();
+    const existing = activePlansSingleFlightRef.current.get(workspaceId);
+    if (shouldReuseRequest(existing, nowMs, options.force)) {
+      return existing!.promise;
+    }
+
     setIsLoadingActivePlans(true);
     setActivePlansError(null);
 
-    try {
-      const data = await requestJson<PlansResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/plans?view=active&limit=50`,
-      );
-      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+    let promise: Promise<PlansResponse | null> = Promise.resolve(null);
+    promise = (async () => {
+      try {
+        const data = await requestJson<PlansResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans?view=active&limit=50`,
+        );
+        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+          return null;
+        }
+        setActivePlans(data.plans);
+        setLoadedActivePlansWorkspaceId(workspaceId);
+        return data;
+      } catch (requestError) {
+        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+          return null;
+        }
+        setActivePlans([]);
+        setLoadedActivePlansWorkspaceId(null);
+        setActivePlansError(errorMessage(requestError));
         return null;
+      } finally {
+        if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
+          setIsLoadingActivePlans(false);
+        }
+        const current = activePlansSingleFlightRef.current.get(workspaceId);
+        if (current?.promise === promise) {
+          current.settled = true;
+          window.setTimeout(() => {
+            if (activePlansSingleFlightRef.current.get(workspaceId)?.promise === promise) {
+              activePlansSingleFlightRef.current.delete(workspaceId);
+            }
+          }, REQUEST_STORM_DEDUPE_MS);
+        }
       }
-      setActivePlans(data.plans);
-      setLoadedActivePlansWorkspaceId(workspaceId);
-      return data;
-    } catch (requestError) {
-      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
-        return null;
-      }
-      setActivePlans([]);
-      setLoadedActivePlansWorkspaceId(null);
-      setActivePlansError(errorMessage(requestError));
-      return null;
-    } finally {
-      setIsLoadingActivePlans(false);
-    }
+    })();
+    // ponytail: per-tab single-flight only; cross-tab leader can use BroadcastChannel later.
+    activePlansSingleFlightRef.current.set(workspaceId, {
+      promise,
+      settled: false,
+      startedAtMs: nowMs,
+    });
+    return promise;
   }, []);
 
   const savePlanOrder = useCallback(
@@ -1968,7 +2060,7 @@ export function App() {
 
       setContextPanelTab("plan");
       setIsContextPanelOpen(true);
-      void loadActivePlans(event.workspaceId);
+      void loadActivePlans(event.workspaceId, { force: true });
     },
     [loadActivePlans],
   );
@@ -1988,7 +2080,7 @@ export function App() {
             method: "POST",
           },
         );
-        const plansResponse = await loadActivePlans(workspaceId);
+        const plansResponse = await loadActivePlans(workspaceId, { force: true });
         await refreshWorkspaces();
         const plan =
           plansResponse?.plans.find((candidate) => candidate.id === planId) ??
@@ -2046,7 +2138,7 @@ export function App() {
             method: "POST",
           },
         );
-        const plansResponse = await loadActivePlans(workspaceId);
+        const plansResponse = await loadActivePlans(workspaceId, { force: true });
         const plan =
           plansResponse?.plans.find((candidate) => candidate.id === planId) ??
           response.plan;
@@ -2089,7 +2181,7 @@ export function App() {
           `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}`,
           { method: "DELETE" },
         );
-        await loadActivePlans(workspaceId);
+        await loadActivePlans(workspaceId, { force: true });
         await refreshWorkspaces();
       } catch (requestError) {
         setActivePlansError(errorMessage(requestError));
@@ -2123,7 +2215,7 @@ export function App() {
             method: "POST",
           },
         );
-        await loadActivePlans(workspaceId);
+        await loadActivePlans(workspaceId, { force: true });
         await refreshWorkspaces();
       } catch (requestError) {
         setActivePlansError(errorMessage(requestError));
@@ -2376,31 +2468,56 @@ export function App() {
   );
 
   const loadChatStatistics = useCallback(
-    async (workspaceId: string, chatId: string) => {
+    (workspaceId: string, chatId: string) => {
       const requestedChatKey = chatRunKey(workspaceId, chatId);
+      const nowMs = requestStormDedupeNow();
+      const existing = chatStatisticsSingleFlightRef.current.get(requestedChatKey);
+      if (shouldReuseRequest(existing, nowMs)) {
+        return existing!.promise;
+      }
+
       setIsLoadingChatStatistics(true);
       setChatStatisticsError(null);
 
-      try {
-        const data = await requestJson<ChatStatisticsResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
-        );
-        if (activeChatKeyRef.current === requestedChatKey) {
-          setChatStatistics(data);
-          if (!runningChatKeysRef.current.has(requestedChatKey)) {
-            clearLiveChatStatistics(requestedChatKey);
+      let promise: Promise<void> = Promise.resolve();
+      promise = (async () => {
+        try {
+          const data = await requestJson<ChatStatisticsResponse>(
+            `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
+          );
+          if (activeChatKeyRef.current === requestedChatKey) {
+            setChatStatistics(data);
+            if (!runningChatKeysRef.current.has(requestedChatKey)) {
+              clearLiveChatStatistics(requestedChatKey);
+            }
+          }
+        } catch (requestError) {
+          if (activeChatKeyRef.current === requestedChatKey) {
+            setChatStatistics(null);
+            setChatStatisticsError(errorMessage(requestError));
+          }
+        } finally {
+          if (activeChatKeyRef.current === requestedChatKey) {
+            setIsLoadingChatStatistics(false);
+          }
+          const current = chatStatisticsSingleFlightRef.current.get(requestedChatKey);
+          if (current?.promise === promise) {
+            current.settled = true;
+            window.setTimeout(() => {
+              if (chatStatisticsSingleFlightRef.current.get(requestedChatKey)?.promise === promise) {
+                chatStatisticsSingleFlightRef.current.delete(requestedChatKey);
+              }
+            }, REQUEST_STORM_DEDUPE_MS);
           }
         }
-      } catch (requestError) {
-        if (activeChatKeyRef.current === requestedChatKey) {
-          setChatStatistics(null);
-          setChatStatisticsError(errorMessage(requestError));
-        }
-      } finally {
-        if (activeChatKeyRef.current === requestedChatKey) {
-          setIsLoadingChatStatistics(false);
-        }
-      }
+      })();
+      // ponytail: per-tab single-flight only; cross-tab leader can use BroadcastChannel later.
+      chatStatisticsSingleFlightRef.current.set(requestedChatKey, {
+        promise,
+        settled: false,
+        startedAtMs: nowMs,
+      });
+      return promise;
     },
     [],
   );
@@ -2671,6 +2788,9 @@ export function App() {
       return;
     }
     const intervalId = window.setInterval(() => {
+      if (!isDocumentVisible()) {
+        return;
+      }
       void loadPlanAutoRunState(activeWorkspace.id);
       void loadActivePlans(activeWorkspace.id);
     }, PLAN_AUTO_RUN_REFRESH_MS);
@@ -2698,6 +2818,9 @@ export function App() {
     // ponytail: visible Plan panel polling is a fallback for backend phase
     // advancement; upgrade path is a backend plan subscription.
     const intervalId = window.setInterval(() => {
+      if (!isDocumentVisible()) {
+        return;
+      }
       void loadActivePlans(activeWorkspace.id);
     }, PLAN_AUTO_RUN_REFRESH_MS);
 
@@ -2738,6 +2861,9 @@ export function App() {
     }
 
     const intervalId = window.setInterval(() => {
+      if (!isDocumentVisible()) {
+        return;
+      }
       void refreshRetryPhase();
     }, PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS);
 
