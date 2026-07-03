@@ -11923,17 +11923,28 @@ fn append_llm_request_audit_where_clause(
     query_params: &mut Vec<SqlValue>,
     filters: LlmRequestAuditFilters<'_>,
 ) {
-    let mut has_where = false;
-    let mut push_condition = |condition: &str, value: &str| {
-        query.push_str(if has_where { " AND " } else { " WHERE " });
+    fn append_condition(query: &mut String, has_where: &mut bool, condition: &str) {
+        query.push_str(if *has_where { " AND " } else { " WHERE " });
         query.push_str(condition);
+        *has_where = true;
+    }
+
+    let mut has_where = false;
+    if !filters.request_ids.is_empty() {
+        let placeholders = vec!["?"; filters.request_ids.len()].join(", ");
+        append_condition(query, &mut has_where, &format!("id IN ({placeholders})"));
+        query_params.extend(
+            filters
+                .request_ids
+                .iter()
+                .map(|value| SqlValue::Text(value.to_string())),
+        );
+    }
+    let mut push_condition = |condition: &str, value: &str| {
+        append_condition(query, &mut has_where, condition);
         query_params.push(SqlValue::Text(value.to_string()));
-        has_where = true;
     };
 
-    if let Some(value) = filters.request_id {
-        push_condition("id = ?", value);
-    }
     if let Some(value) = filters.workspace_id {
         push_condition("workspace_id = ?", value);
     }

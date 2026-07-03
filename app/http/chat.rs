@@ -176,6 +176,7 @@ pub(crate) struct ContextUsageResponse {
 pub(crate) struct AiStatisticsQuery {
     pub(crate) workspace_id: Option<String>,
     pub(crate) request_id: Option<String>,
+    pub(crate) request_ids: Option<String>,
     pub(crate) chat_id: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) model_id: Option<String>,
@@ -1318,7 +1319,7 @@ fn load_ai_statistics_response(
         workspace_filter,
         workspace_count = workspaces.len(),
         chat_filter = filters.chat_id.as_deref().unwrap_or("<none>"),
-        request_filter = filters.request_id.as_deref().unwrap_or("<none>"),
+        request_filters = ?filters.request_ids,
         provider_filter = filters.provider_id.as_deref().unwrap_or("<none>"),
         model_filter = filters.model_id.as_deref().unwrap_or("<none>"),
         status_filter = filters.status.as_deref().unwrap_or("<none>"),
@@ -1359,7 +1360,7 @@ fn load_ai_statistics_response(
             "AI statistics workspace database opened"
         );
         let audit_filters = LlmRequestAuditFilters {
-            request_id: filters.request_id.as_deref(),
+            request_ids: &filters.request_ids,
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
             provider_id: filters.provider_id.as_deref(),
@@ -1574,7 +1575,7 @@ fn merge_ai_statistics_aggregates(
 
 fn ai_statistics_can_use_rollup(filters: &NormalizedAiStatisticsFilters) -> bool {
     // ponytail: rollup is date-bucketed and has no request_id/chat_id; exact filters stay on facts.
-    filters.request_id.is_none()
+    filters.request_ids.is_empty()
         && filters.chat_id.is_none()
         && filters.started_after.is_none()
         && filters.started_before.is_none()

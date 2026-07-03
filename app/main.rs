@@ -2151,7 +2151,7 @@ pub(crate) struct CapturedAuditEvent {
 
 struct NormalizedAiStatisticsFilters {
     workspace_id: Option<String>,
-    request_id: Option<String>,
+    request_ids: Vec<String>,
     chat_id: Option<String>,
     provider_id: Option<String>,
     model_id: Option<String>,
@@ -7356,8 +7356,28 @@ fn optional_trimmed_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn optional_trimmed_csv(value: Option<String>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn normalized_request_ids(query: &mut AiStatisticsQuery) -> Vec<String> {
+    let mut request_ids = optional_trimmed_csv(query.request_ids.take());
+    request_ids.extend(optional_trimmed_csv(query.request_id.take()));
+    request_ids
+}
+
 fn normalized_ai_statistics_query(
-    query: AiStatisticsQuery,
+    mut query: AiStatisticsQuery,
 ) -> Result<NormalizedAiStatisticsFilters, ApiError> {
     let page = query.page.unwrap_or(1);
     let page_size = query.page_size.or(query.limit).unwrap_or(20);
@@ -7380,8 +7400,8 @@ fn normalized_ai_statistics_query(
         .ok_or_else(|| ApiError::bad_request("AI statistics page offset is too large"))?;
 
     Ok(NormalizedAiStatisticsFilters {
+        request_ids: normalized_request_ids(&mut query),
         workspace_id: optional_trimmed_string(query.workspace_id),
-        request_id: optional_trimmed_string(query.request_id),
         chat_id: optional_trimmed_string(query.chat_id),
         provider_id: optional_trimmed_string(query.provider_id),
         model_id: optional_trimmed_string(query.model_id),

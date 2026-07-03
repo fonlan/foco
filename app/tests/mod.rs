@@ -11610,6 +11610,30 @@ fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
 }
 
 #[test]
+fn ai_statistics_query_accepts_multiple_request_ids_and_legacy_request_id() {
+    let filters = normalized_ai_statistics_query(AiStatisticsQuery {
+        workspace_id: None,
+        request_id: Some(" legacy-1,legacy-2 ".to_string()),
+        request_ids: Some(" request-1, ,request-2 ".to_string()),
+        chat_id: None,
+        provider_id: None,
+        model_id: None,
+        status: None,
+        started_after: None,
+        started_before: None,
+        page: None,
+        page_size: None,
+        limit: None,
+    })
+    .expect("normalized filters");
+
+    assert_eq!(
+        filters.request_ids,
+        vec!["request-1", "request-2", "legacy-1", "legacy-2"]
+    );
+}
+
+#[test]
 fn pack_neutral_messages_keeps_saved_tool_state_group_together() {
     let messages = vec![
         neutral_text_message(NeutralChatRole::System, "system".to_string()),

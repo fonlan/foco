@@ -4731,9 +4731,10 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("audit count"),
         2
     );
+    let request_ids = vec!["request-1".to_string()];
     let request_id_rows = database
         .llm_request_audit_rows(LlmRequestAuditFilters {
-            request_id: Some("request-1"),
+            request_ids: &request_ids,
             ..LlmRequestAuditFilters::default()
         })
         .expect("request id audit rows");
@@ -4742,12 +4743,62 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert_eq!(
         database
             .llm_request_audit_count(LlmRequestAuditFilters {
-                request_id: Some("request-1"),
+                request_ids: &request_ids,
                 ..LlmRequestAuditFilters::default()
             })
             .expect("request id audit count"),
         1
     );
+
+    let request_ids = vec!["request-1".to_string(), "request-2".to_string()];
+    let request_id_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_ids: &request_ids,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request ids audit rows");
+    assert_eq!(request_id_rows.len(), 2);
+    assert_eq!(request_id_rows[0].id, "request-2");
+    assert_eq!(request_id_rows[1].id, "request-1");
+    assert_eq!(
+        database
+            .llm_request_audit_count(LlmRequestAuditFilters {
+                request_ids: &request_ids,
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("request ids audit count"),
+        2
+    );
+    let request_ids_summary = database
+        .llm_request_audit_summary(LlmRequestAuditFilters {
+            request_ids: &request_ids,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request ids audit summary");
+    assert_eq!(request_ids_summary.total_requests, 2);
+    assert_eq!(request_ids_summary.total_tokens, 139);
+    let request_ids_trend = database
+        .llm_request_audit_trend_breakdown(LlmRequestAuditFilters {
+            request_ids: &request_ids,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request ids audit trend");
+    assert_eq!(request_ids_trend.len(), 1);
+    assert_eq!(request_ids_trend[0].request_count, 2);
+    let request_ids_models = database
+        .llm_request_audit_model_breakdown(LlmRequestAuditFilters {
+            request_ids: &request_ids,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request ids audit model breakdown");
+    assert_eq!(request_ids_models.len(), 2);
+    let request_ids_providers = database
+        .llm_request_audit_provider_breakdown(LlmRequestAuditFilters {
+            request_ids: &request_ids,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request ids audit provider breakdown");
+    assert_eq!(request_ids_providers.len(), 2);
     let empty_summary = database
         .llm_request_audit_summary(LlmRequestAuditFilters {
             final_state: Some("missing"),
@@ -4769,7 +4820,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
 
     let filtered_rows = database
         .llm_request_audit_rows(LlmRequestAuditFilters {
-            request_id: Some("request-1"),
+            request_ids: &request_ids,
             workspace_id: Some("workspace-1"),
             chat_id: Some("chat-1"),
             provider_id: Some("openai-responses"),
@@ -4788,7 +4839,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert_eq!(
         database
             .llm_request_audit_count(LlmRequestAuditFilters {
-                request_id: Some("request-1"),
+                request_ids: &request_ids,
                 workspace_id: Some("workspace-1"),
                 chat_id: Some("chat-1"),
                 provider_id: Some("openai-responses"),
