@@ -2285,6 +2285,7 @@ fn infers_runtime_tool_state_compression_from_saved_request_bodies() {
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
                 first_token_latency_ms: None,
                 total_latency_ms: None,
                 status_code: None,
@@ -3052,6 +3053,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             output_tokens: Some(20),
             cache_read_tokens: Some(5),
             cache_write_tokens: Some(7),
+            reasoning_tokens: None,
             first_token_latency_ms: Some(1000),
             total_latency_ms: Some(2000),
             status_code: Some(200),
@@ -3078,6 +3080,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             output_tokens: Some(0),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: Some(500),
@@ -3104,6 +3107,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             output_tokens: Some(999),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: Some(999),
             status_code: Some(200),
@@ -3660,6 +3664,7 @@ fn repository_helpers_round_trip_core_records() {
             output_tokens: Some(5),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: Some(200),
@@ -3798,6 +3803,7 @@ fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
             output_tokens: Some(5),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: Some(200),
@@ -4527,6 +4533,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             output_tokens: Some(25),
             cache_read_tokens: Some(40),
             cache_write_tokens: Some(10),
+            reasoning_tokens: Some(3),
             first_token_latency_ms: Some(250),
             total_latency_ms: Some(1500),
             status_code: Some(200),
@@ -4600,6 +4607,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert_eq!(request.total_latency_ms, Some(1500));
     assert_eq!(request.status_code, Some(200));
     assert_eq!(request.final_state, "completed");
+    assert_eq!(request.reasoning_tokens, Some(3));
     assert_eq!(request.cache_ratio, Some(0.4));
 
     let request_body = request
@@ -4650,6 +4658,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             output_tokens: Some(2),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: Some(250),
             status_code: None,
@@ -4668,6 +4677,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
                 output_tokens: Some(4),
                 cache_read_tokens: Some(2),
                 cache_write_tokens: Some(1),
+                reasoning_tokens: Some(6),
                 first_token_latency_ms: Some(50),
                 total_latency_ms: Some(300),
                 status_code: Some(200),
@@ -4682,6 +4692,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         .expect("updated request");
     assert_eq!(updated_request.final_state, "succeeded");
     assert_eq!(updated_request.status_code, Some(200));
+    assert_eq!(updated_request.reasoning_tokens, Some(6));
     assert_eq!(updated_request.cache_ratio, Some(0.2));
     assert!(
         updated_request
@@ -4696,6 +4707,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         .expect("audit rows");
     assert_eq!(all_rows.len(), 2);
     assert_eq!(all_rows[0].id, "request-2");
+    assert_eq!(all_rows[0].reasoning_tokens, Some(6));
     assert_eq!(all_rows[1].id, "request-1");
     assert_eq!(
         database
@@ -4755,6 +4767,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         .expect("filtered audit rows");
     assert_eq!(filtered_rows.len(), 1);
     assert_eq!(filtered_rows[0].id, "request-1");
+    assert_eq!(filtered_rows[0].reasoning_tokens, Some(3));
     assert_eq!(filtered_rows[0].cache_ratio, Some(0.4));
     assert_eq!(
         database
@@ -4798,6 +4811,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,
@@ -4827,6 +4841,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
                 output_tokens: Some(4),
                 cache_read_tokens: Some(2),
                 cache_write_tokens: Some(1),
+                reasoning_tokens: None,
                 first_token_latency_ms: Some(50),
                 total_latency_ms: Some(120),
                 status_code: Some(200),
@@ -4846,6 +4861,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
                 output_tokens: Some(5),
                 cache_read_tokens: Some(3),
                 cache_write_tokens: Some(2),
+                reasoning_tokens: None,
                 first_token_latency_ms: Some(50),
                 total_latency_ms: Some(150),
                 status_code: Some(200),
@@ -4873,6 +4889,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             output_tokens: Some(7),
             cache_read_tokens: None,
             cache_write_tokens: Some(5),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: Some(200),
             status_code: Some(500),
@@ -4900,6 +4917,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             output_tokens: Some(100),
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,
@@ -5080,6 +5098,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             output_tokens: Some(5),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: Some(100),
             total_latency_ms: Some(1000),
             status_code: Some(200),
@@ -5128,6 +5147,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             output_tokens: Some(3),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,
@@ -5192,6 +5212,7 @@ fn vacuum_reclaims_workspace_database_freelist_pages() {
             output_tokens: Some(5),
             cache_read_tokens: Some(0),
             cache_write_tokens: Some(0),
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,
@@ -8206,6 +8227,7 @@ fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,

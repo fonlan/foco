@@ -59,13 +59,14 @@ use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, MIGRATION_026, Migration,
+    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, MIGRATION_026, MIGRATION_027,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 26;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 27;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -226,6 +227,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 26,
         sql: MIGRATION_026,
+    },
+    Migration {
+        version: 27,
+        sql: MIGRATION_027,
     },
 ];
 
@@ -4672,12 +4677,12 @@ impl WorkspaceDatabase {
                         id, workspace_id, chat_id, agent_team_id, agent_instance_id,
                         agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
                         first_token_at, completed_at, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, cache_ratio,
+                        cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                         first_token_latency_ms, total_latency_ms, status_code, final_state,
                         request_body_json, response_body_json
                     )
                  VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     request.id,
                     request.workspace_id,
@@ -4695,6 +4700,7 @@ impl WorkspaceDatabase {
                     request.output_tokens,
                     request.cache_read_tokens,
                     request.cache_write_tokens,
+                    request.reasoning_tokens,
                     cache_ratio,
                     request.first_token_latency_ms,
                     request.total_latency_ms,
@@ -4743,6 +4749,7 @@ impl WorkspaceDatabase {
             outcome.output_tokens,
             outcome.cache_read_tokens,
             outcome.cache_write_tokens,
+            outcome.reasoning_tokens,
         )?;
 
         let cache_ratio = calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)?;
@@ -4766,12 +4773,13 @@ impl WorkspaceDatabase {
                      output_tokens = ?5,
                      cache_read_tokens = ?6,
                      cache_write_tokens = ?7,
-                     cache_ratio = ?8,
-                     first_token_latency_ms = ?9,
-                     total_latency_ms = ?10,
-                     status_code = ?11,
-                     final_state = ?12,
-                     response_body_json = ?13
+                     reasoning_tokens = ?8,
+                     cache_ratio = ?9,
+                     first_token_latency_ms = ?10,
+                     total_latency_ms = ?11,
+                     status_code = ?12,
+                     final_state = ?13,
+                     response_body_json = ?14
                  WHERE id = ?1",
                 params![
                     id,
@@ -4781,6 +4789,7 @@ impl WorkspaceDatabase {
                     outcome.output_tokens,
                     outcome.cache_read_tokens,
                     outcome.cache_write_tokens,
+                    outcome.reasoning_tokens,
                     cache_ratio,
                     outcome.first_token_latency_ms,
                     outcome.total_latency_ms,
@@ -4883,7 +4892,7 @@ impl WorkspaceDatabase {
                     id, workspace_id, chat_id, agent_team_id, agent_instance_id,
                     agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
                     first_token_at, completed_at, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, cache_ratio,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
                     request_body_json, response_body_json
                  FROM llm_requests
@@ -4907,13 +4916,14 @@ impl WorkspaceDatabase {
                         output_tokens: row.get(13)?,
                         cache_read_tokens: row.get(14)?,
                         cache_write_tokens: row.get(15)?,
-                        cache_ratio: row.get(16)?,
-                        first_token_latency_ms: row.get(17)?,
-                        total_latency_ms: row.get(18)?,
-                        status_code: row.get(19)?,
-                        final_state: row.get(20)?,
-                        request_body_json: row.get(21)?,
-                        response_body_json: row.get(22)?,
+                        reasoning_tokens: row.get(16)?,
+                        cache_ratio: row.get(17)?,
+                        first_token_latency_ms: row.get(18)?,
+                        total_latency_ms: row.get(19)?,
+                        status_code: row.get(20)?,
+                        final_state: row.get(21)?,
+                        request_body_json: row.get(22)?,
+                        response_body_json: row.get(23)?,
                     })
                 },
             )
@@ -5169,7 +5179,7 @@ impl WorkspaceDatabase {
             "SELECT
                 id, workspace_id, chat_id, provider_id, model_id, request_started_at,
                 first_token_at, completed_at, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, cache_ratio,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state
              FROM llm_requests",
         );
@@ -5197,11 +5207,12 @@ impl WorkspaceDatabase {
                     output_tokens: row.get(9)?,
                     cache_read_tokens: row.get(10)?,
                     cache_write_tokens: row.get(11)?,
-                    cache_ratio: row.get(12)?,
-                    first_token_latency_ms: row.get(13)?,
-                    total_latency_ms: row.get(14)?,
-                    status_code: row.get(15)?,
-                    final_state: row.get(16)?,
+                    reasoning_tokens: row.get(12)?,
+                    cache_ratio: row.get(13)?,
+                    first_token_latency_ms: row.get(14)?,
+                    total_latency_ms: row.get(15)?,
+                    status_code: row.get(16)?,
+                    final_state: row.get(17)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -11355,7 +11366,7 @@ fn select_llm_request_record(
                 id, workspace_id, chat_id, agent_team_id, agent_instance_id,
                 agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
                 first_token_at, completed_at, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, cache_ratio,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
                 request_body_json, response_body_json
              FROM llm_requests
@@ -11384,13 +11395,14 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         output_tokens: row.get(13)?,
         cache_read_tokens: row.get(14)?,
         cache_write_tokens: row.get(15)?,
-        cache_ratio: row.get(16)?,
-        first_token_latency_ms: row.get(17)?,
-        total_latency_ms: row.get(18)?,
-        status_code: row.get(19)?,
-        final_state: row.get(20)?,
-        request_body_json: row.get(21)?,
-        response_body_json: row.get(22)?,
+        reasoning_tokens: row.get(16)?,
+        cache_ratio: row.get(17)?,
+        first_token_latency_ms: row.get(18)?,
+        total_latency_ms: row.get(19)?,
+        status_code: row.get(20)?,
+        final_state: row.get(21)?,
+        request_body_json: row.get(22)?,
+        response_body_json: row.get(23)?,
     })
 }
 
@@ -12046,6 +12058,23 @@ fn run_migrations(
         .iter()
         .filter(|migration| migration.version > current_version)
     {
+        if migration.version == 27
+            && table_has_column(
+                &transaction,
+                database_path,
+                "llm_requests",
+                "reasoning_tokens",
+            )?
+        {
+            transaction
+                .pragma_update(None, "user_version", migration.version)
+                .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                    path: database_path.to_path_buf(),
+                    source,
+                })?;
+            continue;
+        }
+
         transaction.execute_batch(migration.sql).map_err(|source| {
             WorkspaceDatabaseError::Sqlite {
                 path: database_path.to_path_buf(),
@@ -12070,6 +12099,27 @@ fn run_migrations(
     Ok(())
 }
 
+fn table_has_column(
+    connection: &Connection,
+    database_path: &Path,
+    table: &str,
+    column: &str,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    for row in rows {
+        if row.map_err(|source| sqlite_error(database_path, source))? == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
 fn schema_version(
     connection: &Connection,
     database_path: &Path,
@@ -12239,6 +12289,7 @@ fn validate_llm_request_tokens(request: &NewLlmRequest<'_>) -> Result<(), Worksp
         request.output_tokens,
         request.cache_read_tokens,
         request.cache_write_tokens,
+        request.reasoning_tokens,
     )
 }
 
@@ -12247,12 +12298,14 @@ fn validate_llm_token_values(
     output_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
 ) -> Result<(), WorkspaceDatabaseError> {
     for (name, value) in [
         ("input_tokens", input_tokens),
         ("output_tokens", output_tokens),
         ("cache_read_tokens", cache_read_tokens),
         ("cache_write_tokens", cache_write_tokens),
+        ("reasoning_tokens", reasoning_tokens),
     ] {
         if let Some(value) = value
             && value < 0

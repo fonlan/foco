@@ -93,6 +93,7 @@ CREATE TABLE llm_requests (
     output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
     cache_read_tokens INTEGER CHECK (cache_read_tokens IS NULL OR cache_read_tokens >= 0),
     cache_write_tokens INTEGER CHECK (cache_write_tokens IS NULL OR cache_write_tokens >= 0),
+    reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
     first_token_latency_ms INTEGER CHECK (first_token_latency_ms IS NULL OR first_token_latency_ms >= 0),
     total_latency_ms INTEGER CHECK (total_latency_ms IS NULL OR total_latency_ms >= 0),
     status_code INTEGER,
@@ -1228,6 +1229,11 @@ ON chats (updated_at DESC, created_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS chats_title_nocase_idx
 ON chats (title COLLATE NOCASE);
+"#;
+
+pub(crate) const MIGRATION_027: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0);
 "#;
 
 #[cfg(test)]

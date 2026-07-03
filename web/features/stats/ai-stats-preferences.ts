@@ -17,7 +17,14 @@ export function readAiStatsVisibleColumnIds(): Set<AiStatsColumnId> {
   }
 
   const visibleIds = savedIds.filter(isAiStatsColumnId);
-  return new Set(visibleIds.length ? visibleIds : DEFAULT_AI_STATS_COLUMN_IDS);
+  const hasCombinedColumn = visibleIds.some((columnId) =>
+    AI_STATS_COMBINED_COLUMN_IDS.has(columnId),
+  );
+  return new Set(
+    visibleIds.length && hasCombinedColumn
+      ? visibleIds
+      : DEFAULT_AI_STATS_COLUMN_IDS,
+  );
 }
 
 export function writeAiStatsVisibleColumnIds(
@@ -31,6 +38,14 @@ export function writeAiStatsVisibleColumnIds(
     JSON.stringify(savedIds),
   );
 }
+
+const AI_STATS_COMBINED_COLUMN_IDS = new Set<AiStatsColumnId>([
+  "session",
+  "providerModel",
+  "input",
+  "output",
+  "duration",
+]);
 
 function isAiStatsColumnId(value: unknown): value is AiStatsColumnId {
   return (

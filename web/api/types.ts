@@ -1894,6 +1894,7 @@ export type AiRequestAuditSummary = {
   outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheWriteTokens: number | null;
+  reasoningTokens: number | null;
   cacheRatio: number | null;
   firstTokenLatencyMs: number | null;
   totalLatencyMs: number | null;

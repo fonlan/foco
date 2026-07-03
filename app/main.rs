@@ -1511,6 +1511,7 @@ struct AiRequestAuditSummary {
     output_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
     cache_ratio: Option<f64>,
     first_token_latency_ms: Option<i64>,
     total_latency_ms: Option<i64>,
@@ -1535,6 +1536,7 @@ struct AiRequestAuditDetail {
     output_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
     cache_ratio: Option<f64>,
     first_token_latency_ms: Option<i64>,
     total_latency_ms: Option<i64>,
@@ -2239,6 +2241,7 @@ struct ChatAuditOutcome {
     output_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
     status_code: Option<i64>,
     final_state: &'static str,
     response_body_json: Option<String>,
@@ -2304,6 +2307,7 @@ fn persist_completed_llm_request(
                 output_tokens: request.outcome.output_tokens,
                 cache_read_tokens: request.outcome.cache_read_tokens,
                 cache_write_tokens: request.outcome.cache_write_tokens,
+                reasoning_tokens: request.outcome.reasoning_tokens,
                 first_token_latency_ms: request.outcome.first_token_latency_ms,
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,
@@ -3265,6 +3269,9 @@ impl PreparedChatContext {
                                             cache_write_tokens: usage
                                                 .as_ref()
                                                 .and_then(|usage| usage.cache_write_tokens),
+                                            reasoning_tokens: usage
+                                                .as_ref()
+                                                .and_then(|usage| usage.reasoning_tokens),
                                             status_code: Some(200),
                                             final_state: "succeeded",
                                             response_body_json: Some(json!({
@@ -3439,6 +3446,7 @@ impl PreparedChatContext {
                                             output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
                                             cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
                                             cache_write_tokens: final_usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                                            reasoning_tokens: final_usage.as_ref().and_then(|usage| usage.reasoning_tokens),
                                             status_code: Some(200),
                                             final_state: "succeeded",
                                             response_body_json: Some(json!({
@@ -4768,6 +4776,7 @@ pub(crate) async fn audited_provider_tool_request(
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
                 first_token_latency_ms: None,
                 total_latency_ms: None,
                 status_code: None,
@@ -4834,6 +4843,9 @@ pub(crate) async fn audited_provider_tool_request(
                             cache_write_tokens: usage
                                 .as_ref()
                                 .and_then(|usage| usage.cache_write_tokens),
+                            reasoning_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.reasoning_tokens),
                             first_token_latency_ms,
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: Some(200),
@@ -4866,6 +4878,7 @@ pub(crate) async fn audited_provider_tool_request(
                             output_tokens: None,
                             cache_read_tokens: None,
                             cache_write_tokens: None,
+                            reasoning_tokens: None,
                             first_token_latency_ms: None,
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: error.status_code,
@@ -5601,6 +5614,7 @@ fn merge_usage(total: &mut NeutralUsage, next: &NeutralUsage) {
     add_usage_tokens(&mut total.output_tokens, next.output_tokens);
     add_usage_tokens(&mut total.cache_read_tokens, next.cache_read_tokens);
     add_usage_tokens(&mut total.cache_write_tokens, next.cache_write_tokens);
+    add_usage_tokens(&mut total.reasoning_tokens, next.reasoning_tokens);
 }
 
 fn add_usage_tokens(total: &mut Option<i64>, next: Option<i64>) {
@@ -5619,6 +5633,7 @@ fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome 
         output_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         status_code: None,
         final_state: "failed",
         response_body_json: Some(json!({ "error": message }).to_string()),
@@ -5725,6 +5740,7 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
         output_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         status_code: None,
         final_state: "cancelled",
         response_body_json: Some(json!({ "cancelled": message }).to_string()),
@@ -7614,6 +7630,7 @@ fn ai_request_audit_summary(
         output_tokens: row.output_tokens,
         cache_read_tokens: row.cache_read_tokens,
         cache_write_tokens: row.cache_write_tokens,
+        reasoning_tokens: row.reasoning_tokens,
         cache_ratio: row.cache_ratio,
         first_token_latency_ms: row.first_token_latency_ms,
         total_latency_ms: row.total_latency_ms,
@@ -7645,6 +7662,7 @@ fn ai_request_audit_detail(
         output_tokens: request.output_tokens,
         cache_read_tokens: request.cache_read_tokens,
         cache_write_tokens: request.cache_write_tokens,
+        reasoning_tokens: request.reasoning_tokens,
         cache_ratio: request.cache_ratio,
         first_token_latency_ms: request.first_token_latency_ms,
         total_latency_ms: request.total_latency_ms,

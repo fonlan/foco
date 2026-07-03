@@ -15,11 +15,11 @@ describe("AI statistics column preferences", () => {
   });
 
   it("persists only known visible columns", () => {
-    writeAiStatsVisibleColumnIds(new Set(["provider", "model"]));
+    writeAiStatsVisibleColumnIds(new Set(["providerModel", "output"]));
     expect(JSON.parse(window.localStorage.getItem(AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY) ?? "[]")).toEqual([
-      "provider",
-      "model",
+      "providerModel",
+      "output",
     ]);
-    expect([...readAiStatsVisibleColumnIds()]).toEqual(["provider", "model"]);
+    expect([...readAiStatsVisibleColumnIds()]).toEqual(["providerModel", "output"]);
   });
 });

@@ -49,18 +49,11 @@ export const MEMORY_KIND_OPTIONS = [
 ];
 export const AI_STATS_COLUMN_IDS = [
   "requestTime",
-  "workspace",
-  "chat",
-  "provider",
-  "model",
-  "inputTokens",
-  "outputTokens",
-  "cacheRead",
-  "cacheWrite",
-  "cacheRatio",
-  "latency",
-  "firstToken",
-  "statusCode",
+  "session",
+  "providerModel",
+  "input",
+  "output",
+  "duration",
   "status",
   "details",
 ] as const;

@@ -222,101 +222,101 @@ export function ApiStatsPanel({
         formatAuditDate(request.requestStartedAt, language),
     },
     {
-      cellClassName: "max-w-[10rem] truncate px-4 py-3 text-stone-700",
-      id: "workspace",
-      label: t("Workspace"),
-      render: (request) => request.workspaceName,
+      cellClassName: "min-w-[14rem] px-4 py-3 text-stone-700",
+      id: "session",
+      label: t("Session"),
+      render: (request) => (
+        <div className="space-y-1">
+          <div className="flex min-w-0 items-center gap-2 font-medium text-stone-900">
+            <Bot aria-hidden="true" className="size-4 shrink-0 text-teal-700" />
+            <span className="truncate">{request.workspaceName}</span>
+          </div>
+          <div className="truncate text-xs text-stone-500">
+            {request.chatTitle ?? request.chatId ?? "n/a"}
+          </div>
+        </div>
+      ),
     },
     {
-      cellClassName: "max-w-[12rem] truncate px-4 py-3 text-stone-600",
-      id: "chat",
-      label: t("Chat"),
-      render: (request) => request.chatTitle ?? request.chatId ?? "n/a",
-    },
-    {
-      cellClassName:
-        "max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-stone-700",
-      id: "provider",
-      label: t("Provider"),
-      render: (request) => request.providerId,
-    },
-    {
-      cellClassName:
-        "max-w-[14rem] truncate px-4 py-3 font-mono text-xs text-stone-700",
-      id: "model",
-      label: t("Model"),
-      render: (request) => request.modelId,
-    },
-    {
-      cellClassName: "px-4 py-3 text-right font-mono",
-      headerClassName: "text-right",
-      id: "inputTokens",
-      label: t("Input tokens"),
-      render: (request) =>
-        formatNullableCompactNumber(request.inputTokens, language),
+      cellClassName: "min-w-[13rem] px-4 py-3 font-mono text-xs text-stone-700",
+      id: "providerModel",
+      label: t("Provider / model"),
+      render: (request) => (
+        <div className="space-y-1">
+          <div className="truncate font-medium text-stone-800">
+            {providerLabels.get(request.providerId) ?? request.providerId}
+          </div>
+          <div className="truncate text-stone-500">
+            {modelLabels.get(request.modelId) ?? request.modelId}
+          </div>
+        </div>
+      ),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
       headerClassName: "text-right",
-      id: "outputTokens",
-      label: t("Output tokens"),
-      render: (request) =>
-        formatNullableCompactNumber(request.outputTokens, language),
+      id: "input",
+      label: t("Input"),
+      render: (request) => (
+        <div className="space-y-1">
+          <div className="text-stone-900">
+            {formatNullableCompactNumber(request.inputTokens, language)} (
+            {formatNullableCompactNumber(request.cacheReadTokens, language)})
+          </div>
+          <div className="text-xs text-stone-500">
+            {formatPercent(request.cacheRatio, language)}
+          </div>
+        </div>
+      ),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
       headerClassName: "text-right",
-      id: "cacheRead",
-      label: t("Cache read"),
-      render: (request) =>
-        formatNullableCompactNumber(request.cacheReadTokens, language),
+      id: "output",
+      label: t("Output"),
+      render: (request) => (
+        <div className="space-y-1">
+          <div className="text-stone-900">
+            {formatNullableCompactNumber(request.outputTokens, language)} (
+            {formatNullableCompactNumber(request.cacheWriteTokens, language)})
+          </div>
+          <div className="text-xs text-stone-500">
+            {t("Reasoning")}: {formatNullableCompactNumber(request.reasoningTokens, language)}
+          </div>
+        </div>
+      ),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
       headerClassName: "text-right",
-      id: "cacheWrite",
-      label: t("Cache write"),
-      render: (request) =>
-        formatNullableCompactNumber(request.cacheWriteTokens, language),
-    },
-    {
-      cellClassName: "px-4 py-3 text-right font-mono",
-      headerClassName: "text-right",
-      id: "cacheRatio",
-      label: t("Cache ratio"),
-      render: (request) => formatPercent(request.cacheRatio, language),
-    },
-    {
-      cellClassName: "px-4 py-3 text-right font-mono",
-      headerClassName: "text-right",
-      id: "latency",
-      label: t("Latency"),
-      render: (request) =>
-        formatNullableLatencySeconds(request.totalLatencyMs, language),
-    },
-    {
-      cellClassName: "px-4 py-3 text-right font-mono",
-      headerClassName: "text-right",
-      id: "firstToken",
-      label: t("First token"),
-      render: (request) =>
-        formatNullableLatencySeconds(request.firstTokenLatencyMs, language),
-    },
-    {
-      cellClassName: "px-4 py-3 text-right font-mono",
-      headerClassName: "text-right",
-      id: "statusCode",
-      label: t("Status code"),
-      render: (request) => formatNullableNumber(request.statusCode, language),
+      id: "duration",
+      label: t("Duration"),
+      render: (request) => (
+        <div className="space-y-1">
+          <div className="text-stone-900">
+            {formatNullableLatencySeconds(request.firstTokenLatencyMs, language)}
+          </div>
+          <div className="text-xs text-stone-500">
+            {formatNullableLatencySeconds(request.totalLatencyMs, language)}
+          </div>
+        </div>
+      ),
     },
     {
       cellClassName: "px-4 py-3",
       id: "status",
       label: t("Status"),
       render: (request) => (
-        <span className={auditStatusClass(request.finalState)}>
-          {auditStatusText(request.finalState, t)}
-        </span>
+        <div className="space-y-1">
+          <div>
+            <span className={auditStatusClass(request.finalState)}>
+              {auditStatusText(request.finalState, t)}
+            </span>
+          </div>
+          <div className="font-mono text-xs text-stone-500">
+            {formatNullableNumber(request.statusCode, language)}
+          </div>
+        </div>
       ),
     },
     {

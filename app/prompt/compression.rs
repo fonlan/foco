@@ -639,6 +639,9 @@ async fn llm_context_compression_summary(
             cache_write_tokens: final_usage
                 .as_ref()
                 .and_then(|usage| usage.cache_write_tokens),
+            reasoning_tokens: final_usage
+                .as_ref()
+                .and_then(|usage| usage.reasoning_tokens),
             status_code: Some(200),
             final_state: "succeeded",
             response_body_json,
@@ -1610,6 +1613,7 @@ pub(crate) fn persist_running_llm_request(
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             first_token_latency_ms: None,
             total_latency_ms: None,
             status_code: None,
@@ -1642,6 +1646,7 @@ fn persist_llm_request(
                     output_tokens: request.outcome.output_tokens,
                     cache_read_tokens: request.outcome.cache_read_tokens,
                     cache_write_tokens: request.outcome.cache_write_tokens,
+                    reasoning_tokens: request.outcome.reasoning_tokens,
                     first_token_latency_ms: request.outcome.first_token_latency_ms,
                     total_latency_ms: Some(request.outcome.total_latency_ms),
                     status_code: request.outcome.status_code,
@@ -1683,6 +1688,7 @@ fn persist_llm_request(
                 output_tokens: request.outcome.output_tokens,
                 cache_read_tokens: request.outcome.cache_read_tokens,
                 cache_write_tokens: request.outcome.cache_write_tokens,
+                reasoning_tokens: request.outcome.reasoning_tokens,
                 first_token_latency_ms: request.outcome.first_token_latency_ms,
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,

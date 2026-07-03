@@ -611,6 +611,7 @@ pub struct NeutralUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
 }
 
 pub struct NeutralChatStream {
@@ -1292,6 +1293,11 @@ fn neutral_usage(usage: &Usage) -> NeutralUsage {
             .prompt_tokens_details
             .as_ref()
             .and_then(|details| details.cache_creation_tokens)
+            .map(i64::from),
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
             .map(i64::from),
     }
 }
