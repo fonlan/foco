@@ -15,6 +15,7 @@ import {
   type Deferred,
   chatMemory,
   chatMessages,
+  chatStatistics,
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
@@ -2488,6 +2489,86 @@ describe("app-panels-stats verification surfaces", () => {
       appTestState.activeChatStreamController?.close();
     });
     performanceNowSpy.mockRestore();
+  });
+
+  it("aborts active streams and chat message loads on app unmount", async () => {
+    const user = userEvent.setup();
+    const observedSignals: { loading: AbortSignal | null; stream: AbortSignal | null } = {
+      loading: null,
+      stream: null,
+    };
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+      if (path === "/api/workspaces/workspace-1/chat/stream") {
+        observedSignals.stream = init?.signal ?? null;
+      }
+      if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+        observedSignals.loading = init?.signal ?? null;
+        return new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("The operation was aborted.", "AbortError")),
+            { once: true },
+          );
+        });
+      }
+      return mockFetch(input, init);
+    });
+
+    const { unmount } = renderApp();
+    await user.click(await screen.findByText("Tool run"));
+    await user.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(observedSignals.stream).not.toBeNull());
+    await user.click(await screen.findByText("Second chat"));
+    await waitFor(() => expect(observedSignals.loading).not.toBeNull());
+
+    unmount();
+
+    expect(observedSignals.stream?.aborted).toBe(true);
+    expect(observedSignals.loading?.aborted).toBe(true);
+  });
+
+  it("ignores stale chat statistics after switching chats", async () => {
+    const user = userEvent.setup();
+    const staleStats = deferred<Response>();
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/statistics") {
+        return staleStats.promise;
+      }
+      if (path === "/api/workspaces/workspace-1/chats/chat-2/statistics") {
+        return jsonResponse({
+          ...chatStatistics,
+          chatId: "chat-2",
+          messageCount: 4,
+          totalTokens: 42000,
+        });
+      }
+      return mockFetch(input, init);
+    });
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Stats" }));
+    await waitFor(() => expect(staleStats.resolve).toBeDefined());
+    await user.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("42K")).toBeInTheDocument();
+
+    await act(async () => {
+      staleStats.resolve(jsonResponse(chatStatistics));
+      await staleStats.promise;
+    });
+
+    expect(screen.getByText("42K")).toBeInTheDocument();
+    expect(screen.queryByText("17.6K")).not.toBeInTheDocument();
   });
 
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {

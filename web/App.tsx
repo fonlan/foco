@@ -917,6 +917,9 @@ export function App() {
   const chatStatisticsSingleFlightRef = useRef<
     Map<string, SingleFlightEntry<void>>
   >(new Map());
+  const chatStatisticsRequestIdByChatKeyRef = useRef<Map<string, number>>(
+    new Map(),
+  );
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
@@ -1420,6 +1423,22 @@ export function App() {
         abortController.abort();
       }
       contextUsageAbortByChatKeyRef.current.clear();
+    },
+    [],
+  );
+
+  useEffect(
+    () => () => {
+      for (const abortController of activeRunAbortByChatKeyRef.current.values()) {
+        abortController.abort();
+      }
+      activeRunAbortByChatKeyRef.current.clear();
+
+      for (const abortController of loadingChatControllersRef.current.values()) {
+        abortController.abort();
+      }
+      loadingChatControllersRef.current.clear();
+      loadingChatKeysRef.current.clear();
     },
     [],
   );
@@ -2489,6 +2508,13 @@ export function App() {
         return existing!.promise;
       }
 
+      const requestId =
+        (chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) ?? 0) + 1;
+      chatStatisticsRequestIdByChatKeyRef.current.set(requestedChatKey, requestId);
+      const isCurrentStatisticsRequest = () =>
+        chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) === requestId &&
+        activeChatKeyRef.current === requestedChatKey;
+
       setIsLoadingChatStatistics(true);
       setChatStatisticsError(null);
 
@@ -2498,20 +2524,23 @@ export function App() {
           const data = await requestJson<ChatStatisticsResponse>(
             `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
           );
-          if (activeChatKeyRef.current === requestedChatKey) {
+          if (isCurrentStatisticsRequest()) {
             setChatStatistics(data);
             if (!runningChatKeysRef.current.has(requestedChatKey)) {
               clearLiveChatStatistics(requestedChatKey);
             }
           }
         } catch (requestError) {
-          if (activeChatKeyRef.current === requestedChatKey) {
+          if (isCurrentStatisticsRequest()) {
             setChatStatistics(null);
             setChatStatisticsError(errorMessage(requestError));
           }
         } finally {
-          if (activeChatKeyRef.current === requestedChatKey) {
+          if (isCurrentStatisticsRequest()) {
             setIsLoadingChatStatistics(false);
+          }
+          if (chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) === requestId) {
+            chatStatisticsRequestIdByChatKeyRef.current.delete(requestedChatKey);
           }
           const current = chatStatisticsSingleFlightRef.current.get(requestedChatKey);
           if (current?.promise === promise) {
