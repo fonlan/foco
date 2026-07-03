@@ -1249,7 +1249,7 @@ const MessageRow = memo(function MessageRow({
               <ExtractedMemoriesBlock memories={message.extractedMemories} />
             ) : null}
             {!isUser ? <SpecUpdatesBlock updates={message.specUpdates} /> : null}
-            {!isUser && message.metrics ? (
+            {!isUser && message.metrics && message.status !== "streaming" ? (
               <ChatReplyMetricsLine helpers={helpers} metrics={message.metrics} />
             ) : null}
           </div>

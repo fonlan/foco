@@ -279,6 +279,47 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("hides assistant reply metrics while the message is streaming", async () => {
+    const streamingMessages = {
+      ...chatMessages,
+      messages: chatMessages.messages.map((message) =>
+        message.id === "message-assistant"
+          ? { ...message, status: "streaming" }
+          : message,
+      ),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...streamingMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    const assistantBubble = (await screen.findByText("edit_file"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(assistantBubble.querySelector(".message-model-id")).toHaveTextContent(
+      "gpt-test",
+    );
+    expect(within(assistantBubble).queryByText("Model: gpt-test")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Total time: 2 s")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("tokens/s: 20")).not.toBeInTheDocument();
+    expect(screen.getByText("Need file context. Then answer.")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Memories used")).toBeInTheDocument();
+  });
+
   it("renders a plan mode badge only on plan user messages", async () => {
     const planModeMessages = {
       ...chatMessages,
