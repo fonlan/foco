@@ -3084,7 +3084,7 @@ function primaryPlanAction(status: PlanStatus): PlanAction | null {
 }
 
 function isRetryablePlanPhase(phase: PlanPhase) {
-  return phase.status === "failed";
+  return phase.status === "failed" || phase.status === "cancelled";
 }
 
 function isPlanReorderable(plan: Plan) {

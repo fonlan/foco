@@ -1920,7 +1920,8 @@ impl WorkspaceDatabase {
                     plan.id
                 ),
             })?;
-        if (phase.status != "failed" && phase.agent_task_id.is_some())
+        if (!matches!(phase.status.as_str(), "failed" | "cancelled")
+            && phase.agent_task_id.is_some())
             || self.phase_has_active_attempt(&phase.id)?
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
@@ -1930,7 +1931,7 @@ impl WorkspaceDatabase {
         if matches!(
             trigger,
             PlanPhaseAttemptTrigger::Retry | PlanPhaseAttemptTrigger::ModelOverrideRetry
-        ) && phase.status != "failed"
+        ) && !matches!(phase.status.as_str(), "failed" | "cancelled")
             && !(phase.status == "running"
                 && phase.attempts.iter().any(|attempt| {
                     matches!(
@@ -1940,7 +1941,7 @@ impl WorkspaceDatabase {
                 }))
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan phase '{}' is not failed", phase.id),
+                message: format!("plan phase '{}' is not retryable", phase.id),
             });
         }
 
@@ -1981,7 +1982,7 @@ impl WorkspaceDatabase {
                    AND phase_id = ?2
                    AND EXISTS (
                        SELECT 1 FROM plan_phases
-                       WHERE plan_id = ?1 AND id = ?2 AND status = 'failed'
+                       WHERE plan_id = ?1 AND id = ?2 AND status IN ('failed', 'cancelled')
                    )",
                 params![plan.id.as_str(), phase.id.as_str(), now],
             )
@@ -1994,9 +1995,9 @@ impl WorkspaceDatabase {
                      agent_team_id = NULL,
                      agent_task_id = NULL,
                      commit_id = NULL,
-                     merge_attempt_count = CASE WHEN status = 'failed' THEN 0 ELSE merge_attempt_count END,
+                     merge_attempt_count = CASE WHEN status IN ('failed', 'cancelled') THEN 0 ELSE merge_attempt_count END,
                      error_message = NULL,
-                     started_at = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(started_at, ?3) END,
+                     started_at = CASE WHEN status IN ('failed', 'cancelled') THEN ?3 ELSE COALESCE(started_at, ?3) END,
                      completed_at = NULL,
                      updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",
@@ -2563,15 +2564,33 @@ impl WorkspaceDatabase {
         self.fail_plan_phase_record(phase, error_message).map(Some)
     }
 
+    pub fn cancel_plan_phase_run(
+        &mut self,
+        agent_task_id: &AgentTaskId,
+        error_message: &str,
+    ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
+            return Ok(None);
+        };
+        self.update_attempt_for_task(
+            agent_task_id,
+            PlanPhaseAttemptStatus::Cancelled,
+            None,
+            Some(error_message),
+        )?;
+        self.cancel_plan_phase_record(phase, error_message)
+            .map(Some)
+    }
+
     pub fn fail_running_plan_phases_for_terminal_agent_tasks(
         &mut self,
         error_message: &str,
     ) -> Result<usize, WorkspaceDatabaseError> {
-        let task_ids = {
+        let tasks = {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT DISTINCT task.id
+                    "SELECT DISTINCT task.id, task.status, task.error_json
                      FROM plan_phases AS phase
                      JOIN agent_tasks AS task ON task.id = phase.agent_task_id
                      WHERE phase.status = 'running'
@@ -2579,13 +2598,35 @@ impl WorkspaceDatabase {
                 )
                 .map_err(|source| self.sqlite_error(source))?;
             let rows = statement
-                .query_map([], |row| agent_id_from_row::<AgentTaskId>(row, 0))
+                .query_map([], |row| {
+                    Ok((
+                        agent_id_from_row::<AgentTaskId>(row, 0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
                 .map_err(|source| self.sqlite_error(source))?;
             collect_rows(rows, &self.database_path)?
         };
-        let count = task_ids.len();
-        for task_id in task_ids {
-            self.fail_plan_phase_run(&task_id, error_message)?;
+        let count = tasks.len();
+        for (task_id, status, task_error_json) in tasks {
+            if status == AgentTaskStatus::Cancelled.as_str() {
+                let task_error_message = task_error_json
+                    .as_deref()
+                    .and_then(|error_json| serde_json::from_str::<Value>(error_json).ok())
+                    .and_then(|value| {
+                        value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                self.cancel_plan_phase_run(
+                    &task_id,
+                    task_error_message.as_deref().unwrap_or(error_message),
+                )?;
+            } else {
+                self.fail_plan_phase_run(&task_id, error_message)?;
+            }
         }
         Ok(count)
     }
@@ -2719,6 +2760,89 @@ impl WorkspaceDatabase {
             Some(error_message),
         )?;
         self.fail_plan_phase_record(phase, error_message)
+    }
+
+    pub fn cancel_plan_phase_by_id(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        self.update_latest_active_attempt_for_phase(
+            plan_id,
+            phase_id,
+            PlanPhaseAttemptStatus::Cancelled,
+            Some(error_message),
+        )?;
+        self.cancel_plan_phase_record(phase, error_message)
+    }
+
+    fn cancel_plan_phase_record(
+        &mut self,
+        phase: PlanPhaseRecord,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan =
+            self.plan(&phase.plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found: {}", phase.plan_id),
+                })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Ok(plan);
+        }
+        let now = now_timestamp();
+        let error_message = match error_message.trim() {
+            "" => "Plan phase run was cancelled",
+            message => message,
+        };
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'cancelled',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
+                params![phase.plan_id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'cancelled',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = ?3,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![phase.plan_id.as_str(), error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(&phase.plan_id).and_then(|plan| {
+            plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan was not found after phase cancellation: {}",
+                    phase.plan_id
+                ),
+            })
+        })
     }
 
     fn fail_plan_phase_record(
@@ -2938,7 +3062,7 @@ impl WorkspaceDatabase {
                    AND phase_id = ?2
                    AND EXISTS (
                        SELECT 1 FROM plan_phases
-                       WHERE plan_id = ?1 AND id = ?2 AND status = 'failed'
+                       WHERE plan_id = ?1 AND id = ?2 AND status IN ('failed', 'cancelled')
                    )",
                 params![plan.id.as_str(), next_phase_id.as_str(), now],
             )
@@ -2947,13 +3071,13 @@ impl WorkspaceDatabase {
             .execute(
                 "UPDATE plan_phases
                  SET status = 'running',
-                     implementation_chat_id = CASE WHEN status = 'failed' THEN NULL ELSE implementation_chat_id END,
-                     agent_team_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_team_id END,
-                     agent_task_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_task_id END,
-                     commit_id = CASE WHEN status = 'failed' THEN NULL ELSE commit_id END,
-                     merge_attempt_count = CASE WHEN status = 'failed' THEN 0 ELSE merge_attempt_count END,
+                     implementation_chat_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE implementation_chat_id END,
+                     agent_team_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE agent_team_id END,
+                     agent_task_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE agent_task_id END,
+                     commit_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE commit_id END,
+                     merge_attempt_count = CASE WHEN status IN ('failed', 'cancelled') THEN 0 ELSE merge_attempt_count END,
                      error_message = NULL,
-                     started_at = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(started_at, ?3) END,
+                     started_at = CASE WHEN status IN ('failed', 'cancelled') THEN ?3 ELSE COALESCE(started_at, ?3) END,
                      completed_at = NULL,
                      updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",

@@ -1244,11 +1244,139 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
 }
 
 #[test]
-fn terminal_agent_task_reconciliation_fails_stale_running_plan_phase() {
-    for (suffix, transition, expected_attempt_status) in [
-        ("failed", AgentTaskTransition::Fail, "failed"),
-        ("cancelled", AgentTaskTransition::Cancel, "cancelled"),
-        ("interrupted", AgentTaskTransition::Interrupt, "interrupted"),
+fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-cancelled-phase-run",
+            title: "Cancelled phase run",
+            overview: "A user-cancelled Agent task should leave a retryable phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-cancelled-phase-run-1",
+                title: "Phase one",
+                summary: "Gets cancelled by the user.",
+                steps: vec![NewPlanStep {
+                    id: "plan-cancelled-phase-run-step-1",
+                    title: "Do work",
+                    detail: "Complete change.",
+                    acceptance: vec!["retryable cancellation".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    database
+        .transition_plan("plan-cancelled-phase-run", "start")
+        .expect("start phase");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-cancelled-phase-run",
+            "plan-cancelled-phase-run-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-a"),
+            Some("model-a"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-plan-cancelled-phase",
+        "plan-cancelled-phase",
+    );
+    let task_id = AgentTaskId::new("agent-task-plan-cancelled-phase").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-plan-cancelled-phase", &team_id, &task_id)
+        .expect("attach attempt");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &task_id,
+            &AgentAttemptId::new("agent-attempt-plan-cancelled-phase").expect("attempt id"),
+        )
+        .expect("claim task")
+        .expect("claimed task");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Cancel,
+            result_json: None,
+            error_json: Some(r#"{"message":"user cancelled the run"}"#),
+            interruption_reason: None,
+        })
+        .expect("cancel task");
+
+    let cancelled = database
+        .cancel_plan_phase_run(&task_id, "user cancelled the run")
+        .expect("cancel phase run")
+        .expect("cancelled plan");
+
+    assert_eq!(cancelled.status, "failed");
+    assert!(cancelled.active_phase_id.is_none());
+    assert_eq!(
+        cancelled.error_message.as_deref(),
+        Some("user cancelled the run")
+    );
+    assert_eq!(cancelled.phases[0].status, "cancelled");
+    assert_eq!(
+        cancelled.phases[0].error_message.as_deref(),
+        Some("user cancelled the run")
+    );
+    assert_eq!(cancelled.phases[0].steps[0].status, "cancelled");
+
+    let attempts = database
+        .plan_phase_attempts_for_phase("plan-cancelled-phase-run-1")
+        .expect("attempts");
+    assert_eq!(attempts[0].status, "cancelled");
+    assert_eq!(
+        attempts[0].error_message.as_deref(),
+        Some("user cancelled the run")
+    );
+    assert!(
+        database
+            .begin_plan_phase_attempt(
+                "plan-cancelled-phase-run",
+                "plan-cancelled-phase-run-1",
+                PlanPhaseAttemptTrigger::Retry,
+                Some("provider-a"),
+                Some("model-a"),
+                None,
+            )
+            .is_ok(),
+        "cancelled phase can retry"
+    );
+}
+
+#[test]
+fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
+    for (suffix, transition, expected_phase_status, expected_attempt_status) in [
+        ("failed", AgentTaskTransition::Fail, "failed", "failed"),
+        (
+            "cancelled",
+            AgentTaskTransition::Cancel,
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            "interrupted",
+            AgentTaskTransition::Interrupt,
+            "failed",
+            "interrupted",
+        ),
     ] {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
@@ -1348,13 +1476,17 @@ fn terminal_agent_task_reconciliation_fails_stale_running_plan_phase() {
             )
             .expect("repair stale phase");
         assert_eq!(repaired, 1);
-        let failed = database
+        let repaired_plan = database
             .plan(&plan_id)
-            .expect("failed plan")
-            .expect("failed plan");
-        assert_eq!(failed.status, "failed");
-        assert_eq!(failed.phases[0].status, "failed");
-        assert_eq!(failed.phases[0].steps[0].status, "failed");
+            .expect("repaired plan")
+            .expect("repaired plan");
+        assert_eq!(repaired_plan.status, "failed");
+        assert_eq!(repaired_plan.phases[0].status, expected_phase_status);
+        assert_eq!(
+            repaired_plan.phases[0].steps[0].status,
+            expected_phase_status
+        );
+        assert!(repaired_plan.active_phase_id.is_none());
         let attempts = database
             .plan_phase_attempts_for_phase(&phase_id)
             .expect("phase attempts");

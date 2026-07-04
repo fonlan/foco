@@ -173,9 +173,9 @@ pub(crate) async fn retry_plan_phase(
                     plan.id
                 ))
             })?;
-        if phase.status != "failed" {
+        if !matches!(phase.status.as_str(), "failed" | "cancelled") {
             return Err(ApiError::bad_request(format!(
-                "plan phase '{}' is not failed",
+                "plan phase '{}' is not retryable",
                 phase.id
             )));
         }
@@ -278,11 +278,18 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
                 continue_plan_if_ready(state, workspace, plan).await?;
             }
         }
-        AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
+        AgentTaskStatus::Failed | AgentTaskStatus::Interrupted => {
             let message = agent_task_error_message(&task);
             let mut database = open_workspace_database(&workspace.path)?;
             database
                 .fail_plan_phase_run(task_id, &message)
+                .map_err(ApiError::from_workspace_error)?;
+        }
+        AgentTaskStatus::Cancelled => {
+            let message = agent_task_error_message(&task);
+            let mut database = open_workspace_database(&workspace.path)?;
+            database
+                .cancel_plan_phase_run(task_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
         }
         AgentTaskStatus::Queued | AgentTaskStatus::Running | AgentTaskStatus::Waiting => {}
