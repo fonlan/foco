@@ -489,6 +489,38 @@ impl RemoteWorkspaceManager {
         Ok(self.get_status(server_id, None)?.map(|status| status.state))
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_fake_session_for_test(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+        remote_path: &str,
+        local_port: u16,
+        token: &str,
+    ) {
+        let session = Arc::new(RemoteWorkspaceSession {
+            server_id: server_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            remote_path: remote_path.to_string(),
+            target: "linux-x64".to_string(),
+            local_port,
+            remote_port: local_port,
+            token: token.to_string(),
+            started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            sidecar: AsyncMutex::new(None),
+            tunnel: AsyncMutex::new(None),
+            control_task: AsyncMutex::new(None),
+            health_task: AsyncMutex::new(None),
+            status: Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Ready,
+                None,
+            ))),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut sessions = self.sessions.lock().expect("remote sessions");
+        sessions.insert(session_key(server_id, workspace_id), session);
+    }
+
     fn session(&self, key: &str) -> Result<Option<Arc<RemoteWorkspaceSession>>, ApiError> {
         let sessions = self
             .sessions
@@ -3131,7 +3163,7 @@ pub(crate) async fn proxy_sidecar_json_request(
         )));
     };
     let url = format!(
-        "{}api/remote/workspace/{}",
+        "{}/api/remote/workspace/{}",
         base.trim_end_matches('/'),
         suffix.trim_start_matches('/')
     );
@@ -5324,5 +5356,58 @@ mod tests {
             remote_idempotency_key(&json!({ "idempotencyKey": "client-key" }), "fallback"),
             "client-key"
         );
+    }
+
+    #[tokio::test]
+    async fn llm_stream_broker_rpc_round_trips_through_pending_channel() {
+        let (broker_tx, mut broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
+        let state = RemoteSidecarState {
+            token: "token".to_string(),
+            last_config_hash: Arc::new(Mutex::new(None)),
+            code_graph_watcher: Arc::new(Mutex::new(None)),
+            ws_count: Arc::new(AtomicUsize::new(1)),
+            active_run_count: Arc::new(AtomicUsize::new(0)),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+            broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            broker_tx,
+            shutdown_tx: default_shutdown_tx(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: "/tmp/workspace".to_string(),
+        };
+
+        let mut response_rx = remote_sidecar_broker_request(
+            &state,
+            "llm.stream",
+            json!({ "providerId": "provider", "modelId": "model", "messages": [] }),
+        )
+        .await
+        .expect("broker request");
+        let request = broker_rx.recv().await.expect("broker envelope");
+        assert_eq!(request.message_type, "request");
+        assert_eq!(request.method.as_deref(), Some("llm.stream"));
+        assert_eq!(request.payload["providerId"], "provider");
+
+        let id = request.id.clone().expect("request id");
+        let pending = state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({ "ok": true }),
+                timestamp: None,
+            })
+            .expect("send broker response");
+
+        let response = response_rx.recv().await.expect("broker response");
+        assert_eq!(response.message_type, "response");
+        assert_eq!(response.payload["ok"], true);
     }
 }

@@ -3116,6 +3116,77 @@ mod tests {
     }
 
     #[test]
+    fn config_loads_remote_servers_locations_and_mcp_execution_hosts() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        let local_path = profile.path().join("local");
+        let legacy_path = profile.path().join("legacy");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        fs::write(
+            &paths.config_file,
+            format!(
+                r#"{{
+  "schema_version": 1,
+  "app": {{ "active_workspace_id": "local" }},
+  "providers": [],
+  "models": [],
+  "remoteServers": [
+    {{
+      "id": "srv",
+      "name": "Build Server",
+      "hostAlias": "build-box",
+      "defaultRemoteRoot": "/work",
+      "lastKnownTarget": "linux-x64",
+      "sidecarInstallState": "available"
+    }}
+  ],
+  "mcp": {{
+    "servers": [
+      {{ "id": "auto", "name": "Auto", "enabled": true, "transport": "stdio", "command": "tool", "args": [] }},
+      {{ "id": "local", "name": "Local", "enabled": true, "transport": "streamable-http", "url": "http://127.0.0.1:3000/mcp", "args": [], "executionHost": "local" }},
+      {{ "id": "workspace", "name": "Workspace", "enabled": true, "transport": "stdio", "command": "tool", "args": [], "executionHost": "workspace" }}
+    ]
+  }},
+  "skills": {{ "directories": [], "detected": [], "enabled": [] }},
+  "workspaces": [
+    {{ "id": "legacy", "name": "Legacy Path", "path": {:?} }},
+    {{ "id": "local", "name": "Local", "path": {:?}, "location": {{ "type": "local" }} }},
+    {{ "id": "ssh", "name": "SSH", "path": "", "location": {{ "type": "ssh", "serverId": "srv", "remotePath": "/work/repo" }} }}
+  ]
+}}"#,
+                legacy_path, local_path
+            ),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("remote config should load");
+
+        assert_eq!(loaded.remote_servers.len(), 1);
+        assert_eq!(loaded.remote_servers[0].host_alias, "build-box");
+        assert_eq!(loaded.workspaces[0].location, WorkspaceLocation::Local);
+        assert_eq!(
+            loaded.workspaces[0].local_path(),
+            Some(legacy_path.as_path())
+        );
+        assert_eq!(loaded.workspaces[1].location, WorkspaceLocation::Local);
+        assert_eq!(
+            loaded.workspaces[1].local_path(),
+            Some(local_path.as_path())
+        );
+        assert_eq!(loaded.workspaces[2].server_id(), Some("srv"));
+        assert_eq!(loaded.workspaces[2].remote_path(), Some("/work/repo"));
+        assert_eq!(loaded.mcp.servers[0].execution_host, McpExecutionHost::Auto);
+        assert_eq!(
+            loaded.mcp.servers[1].execution_host,
+            McpExecutionHost::Local
+        );
+        assert_eq!(
+            loaded.mcp.servers[2].execution_host,
+            McpExecutionHost::Workspace
+        );
+    }
+
+    #[test]
     fn ssh_workspace_rejects_relative_remote_path() {
         let workspace_dir = tempfile::tempdir().expect("workspace");
         let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());

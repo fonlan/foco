@@ -11759,6 +11759,7 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
             path: new_workspace_dir.display().to_string(),
             server_id: None,
             remote_path: None,
+            terminal_shell: None,
             content_base64: Some(
                 general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ),
@@ -11824,6 +11825,7 @@ async fn add_workspace_allows_empty_logo_content() {
             path: new_workspace_dir.display().to_string(),
             server_id: None,
             remote_path: None,
+            terminal_shell: None,
             content_base64: Some(String::new()),
         }),
     )
@@ -16642,6 +16644,190 @@ fn restore_env_var(key: &str, value: Option<&str>) {
             None => env::remove_var(key),
         }
     }
+}
+
+#[tokio::test]
+async fn fake_sidecar_http_and_websocket_proxy_forward_bearer_token() {
+    use futures_util::SinkExt;
+    use tungstenite::client::IntoClientRequest;
+
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir);
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    config.workspaces.push(WorkspaceConfig {
+        id: "remote".to_string(),
+        name: "Remote".to_string(),
+        path: PathBuf::new(),
+        location: WorkspaceLocation::Ssh {
+            server_id: "srv".to_string(),
+            remote_path: "/srv/project".to_string(),
+        },
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let (sidecar_base, seen_auth, sidecar_task) =
+        serve_fake_sidecar_proxy_fixture("sidecar-token").await;
+    let direct_unauthorized = reqwest::get(format!("{sidecar_base}api/remote/workspace/files"))
+        .await
+        .expect("direct fake sidecar request");
+    assert_eq!(direct_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let sidecar_port = sidecar_base
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .expect("sidecar port")
+        .parse::<u16>()
+        .expect("sidecar port number");
+    state.remote_workspace_manager.insert_fake_session_for_test(
+        "srv",
+        "remote",
+        "/srv/project",
+        sidecar_port,
+        "sidecar-token",
+    );
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind app fixture server");
+    let app_addr = listener.local_addr().expect("app fixture address");
+    let app = crate::http::router::app_router(state);
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/files?depth=1"
+    ))
+    .await
+    .expect("proxied files request");
+    assert_eq!(http_response.status(), StatusCode::OK);
+    let body = http_response.json::<Value>().await.expect("proxy json");
+    assert_eq!(body["proxied"], true);
+    assert_eq!(body["query"], "depth=1");
+
+    let mut ws_request = format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws")
+        .into_client_request()
+        .expect("websocket request");
+    ws_request.headers_mut().insert(
+        header::CONNECTION,
+        "Upgrade".parse().expect("connection header"),
+    );
+    let (mut websocket, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("proxied websocket");
+    websocket
+        .send(tungstenite::Message::Text("ping".into()))
+        .await
+        .expect("send websocket message");
+    let reply = websocket
+        .next()
+        .await
+        .expect("websocket reply")
+        .expect("websocket frame");
+    assert_eq!(reply.into_text().expect("text reply"), "echo:ping");
+
+    let auth_values = seen_auth.lock().expect("auth values").clone();
+    assert!(auth_values.iter().any(|value| value == "<none>"));
+    assert!(
+        auth_values
+            .iter()
+            .filter(|value| value.as_str() == "Bearer sidecar-token")
+            .count()
+            >= 2
+    );
+
+    app_task.abort();
+    sidecar_task.abort();
+}
+
+async fn serve_fake_sidecar_proxy_fixture(
+    token: &str,
+) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let expected_http = format!("Bearer {token}");
+    let expected_ws = expected_http.clone();
+    let seen_auth = Arc::new(Mutex::new(Vec::new()));
+    let http_seen = seen_auth.clone();
+    let ws_seen = seen_auth.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/remote/workspace/files",
+            axum::routing::get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                let expected = expected_http.clone();
+                let seen = http_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({
+                        "proxied": true,
+                        "query": uri.query().unwrap_or_default(),
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/terminal/{session_id}/ws",
+            axum::routing::get(
+                move |headers: HeaderMap, ws: axum::extract::WebSocketUpgrade| {
+                    let expected = expected_ws.clone();
+                    let seen = ws_seen.clone();
+                    async move {
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        seen.lock().expect("seen auth").push(auth.clone());
+                        if auth != expected {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        ws.on_upgrade(|mut socket| async move {
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if let axum::extract::ws::Message::Text(text) = message {
+                                    let _ = socket
+                                        .send(axum::extract::ws::Message::Text(
+                                            format!("echo:{text}").into(),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        })
+                        .into_response()
+                    }
+                },
+            ),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind fake sidecar");
+    let addr = listener.local_addr().expect("fake sidecar address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/"), seen_auth, task)
 }
 
 struct PromptStateFixture {

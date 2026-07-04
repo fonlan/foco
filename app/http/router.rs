@@ -639,7 +639,7 @@ async fn remote_workspace_proxy_middleware(
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let proxy_url = format!(
-        "{}api/remote/workspace/{suffix}{query}",
+        "{}/api/remote/workspace/{suffix}{query}",
         base.trim_end_matches('/')
     );
 
