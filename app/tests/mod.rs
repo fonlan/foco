@@ -14,7 +14,7 @@ use foco_agent::{
     AgentRunInput, AgentRunOutcome, AgentRunTask, ToolResource, ToolResourceAccess,
     ToolResourceLock, build_default_system_prompt, context_compression_trigger_tokens,
 };
-use foco_providers::OPENAI_CHAT_KIND;
+use foco_providers::{OPENAI_CHAT_KIND, ProviderModelRedirect, redirected_provider_model_ids};
 use foco_store::{
     config::{
         DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME, PromptSettings,
@@ -628,6 +628,7 @@ fn test_prepared_chat_context(
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -1176,6 +1177,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         },
         &WebSearchSettings::default(),
         QuestionRegistry::default(),
@@ -2293,6 +2295,43 @@ fn provider_model_refresh_removes_stale_local_model_associations() {
 }
 
 #[test]
+fn provider_model_refresh_associates_redirected_model_ids_only() {
+    let provider = ProviderSettings {
+        id: "redirected-provider".to_string(),
+        name: "Redirected".to_string(),
+        kind: "openai-chat".to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: true,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: vec![ProviderModelRedirect {
+            from: "qwen/qwen3.6-35b-a3b".to_string(),
+            to: "qwen3.6-35b-a3b".to_string(),
+        }],
+        api_proxy: ApiProxySettings::default(),
+    };
+    let mut models = vec![
+        test_model_settings("qwen/qwen3.6-35b-a3b"),
+        test_model_settings("qwen3.6-35b-a3b"),
+    ];
+    let provider_models = redirected_provider_model_ids(
+        vec!["qwen/qwen3.6-35b-a3b".to_string()],
+        &provider.model_redirects,
+    )
+    .expect("redirect provider models");
+    let provider_models = filter_provider_model_ids(&provider, provider_models)
+        .expect("filter redirected provider models");
+
+    associate_provider_with_local_models(&mut models, &provider.id, &provider_models);
+
+    assert_eq!(provider_models, vec!["qwen3.6-35b-a3b"]);
+    assert!(models[0].provider_ids.is_empty());
+    assert_eq!(models[1].provider_ids, vec!["redirected-provider"]);
+}
+
+#[test]
 fn provider_model_sync_filter_regex_limits_association_changes() {
     let provider = ProviderSettings {
         id: "filtered-provider".to_string(),
@@ -2304,6 +2343,7 @@ fn provider_model_sync_filter_regex_limits_association_changes() {
         auto_sync_models: true,
         model_sync_filter_regex: Some("^gpt-4".to_string()),
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     };
     let mut models = vec![
@@ -2340,6 +2380,7 @@ fn provider_model_sync_filter_regex_supports_negative_lookahead() {
         auto_sync_models: true,
         model_sync_filter_regex: Some("^(?!gpt).*".to_string()),
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     };
 
@@ -7668,6 +7709,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -8463,6 +8505,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -8812,6 +8855,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -12186,6 +12230,7 @@ Search memory before repo work.
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -12466,6 +12511,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -12587,6 +12633,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -12681,6 +12728,7 @@ Use the existing product UI conventions.
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -12772,6 +12820,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -13172,6 +13221,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -13386,6 +13436,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -13496,6 +13547,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -13974,6 +14026,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -14192,6 +14245,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -14469,6 +14523,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -14683,6 +14738,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -14971,6 +15027,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -15107,6 +15164,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -16655,6 +16713,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         auto_sync_models: false,
         model_sync_filter_regex: None,
         request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {

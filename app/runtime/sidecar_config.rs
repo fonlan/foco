@@ -170,6 +170,7 @@ mod tests {
             auto_sync_models: false,
             model_sync_filter_regex: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: Default::default(),
         });
 

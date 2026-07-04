@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use futures_util::StreamExt;
 use genai::{
@@ -325,6 +325,107 @@ impl ProviderRequestOverride {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModelRedirect {
+    pub from: String,
+    pub to: String,
+}
+
+impl ProviderModelRedirect {
+    pub fn validate(&self) -> Result<(), ProviderConfigError> {
+        self.normalized_from()?;
+        self.normalized_to()?;
+        Ok(())
+    }
+
+    fn normalized_from(&self) -> Result<&str, ProviderConfigError> {
+        normalized_model_redirect_value("from", &self.from)
+    }
+
+    fn normalized_to(&self) -> Result<&str, ProviderConfigError> {
+        normalized_model_redirect_value("to", &self.to)
+    }
+}
+
+fn normalized_model_redirect_value<'a>(
+    field: &str,
+    value: &'a str,
+) -> Result<&'a str, ProviderConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "model redirect {field} must not be empty"
+        )));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "model redirect {field} must not contain whitespace: {value}"
+        )));
+    }
+    Ok(value)
+}
+
+pub fn validate_model_redirects(
+    redirects: &[ProviderModelRedirect],
+) -> Result<(), ProviderConfigError> {
+    let mut sources = HashSet::new();
+    let mut targets = HashSet::new();
+    for redirect in redirects {
+        redirect.validate()?;
+        let source = redirect.normalized_from()?;
+        if !sources.insert(source) {
+            return Err(ProviderConfigError::InvalidRequest(format!(
+                "duplicate model redirect source '{source}'"
+            )));
+        }
+        let target = redirect.normalized_to()?;
+        if !targets.insert(target) {
+            return Err(ProviderConfigError::InvalidRequest(format!(
+                "duplicate model redirect target '{target}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn redirected_provider_model_ids(
+    models: Vec<String>,
+    redirects: &[ProviderModelRedirect],
+) -> Result<Vec<String>, ProviderConfigError> {
+    validate_model_redirects(redirects)?;
+    let mut redirected = Vec::with_capacity(models.len());
+    for model in models {
+        let trimmed = model.trim();
+        let model_id = redirects
+            .iter()
+            .find_map(|redirect| {
+                (redirect.normalized_from().ok()? == trimmed)
+                    .then(|| redirect.normalized_to().ok())
+                    .flatten()
+            })
+            .unwrap_or(trimmed);
+        redirected.push(model_id.to_string());
+    }
+    Ok(unique_sorted_model_ids(redirected))
+}
+
+pub fn upstream_provider_model_id<'a>(
+    model_id: &'a str,
+    redirects: &'a [ProviderModelRedirect],
+) -> Result<&'a str, ProviderConfigError> {
+    validate_model_redirects(redirects)?;
+    let trimmed = model_id.trim();
+    Ok(redirects
+        .iter()
+        .find_map(|redirect| {
+            (redirect.normalized_to().ok()? == trimmed)
+                .then(|| redirect.normalized_from().ok())
+                .flatten()
+        })
+        .unwrap_or(model_id))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderConnectionConfig {
     pub kind: ProviderKind,
@@ -332,6 +433,7 @@ pub struct ProviderConnectionConfig {
     pub api_key: Option<String>,
     pub proxy_url: Option<String>,
     pub request_overrides: Vec<ProviderRequestOverride>,
+    pub model_redirects: Vec<ProviderModelRedirect>,
 }
 impl ProviderConnectionConfig {
     fn provider_error_context(
@@ -416,17 +518,19 @@ impl ProviderConnectionConfig {
 pub async fn fetch_provider_model_ids(
     config: &ProviderConnectionConfig,
 ) -> Result<Vec<String>, ProviderConfigError> {
-    match fetch_provider_model_ids_once(config, "models").await {
-        Ok(models) => Ok(models),
+    let models = match fetch_provider_model_ids_once(config, "models").await {
+        Ok(models) => models,
         Err(source) if should_retry_model_list_with_v1_endpoint(config, &source) => {
             let Some(retry_config) = model_list_v1_retry_config(config)? else {
                 return Err(source);
             };
 
-            fetch_provider_model_ids_once(&retry_config, "v1/models").await
+            fetch_provider_model_ids_once(&retry_config, "v1/models").await?
         }
-        Err(source) => Err(source),
-    }
+        Err(source) => return Err(source),
+    };
+
+    redirected_provider_model_ids(models, &config.model_redirects)
 }
 
 async fn fetch_provider_model_ids_once(
@@ -640,10 +744,11 @@ pub async fn stream_chat(
 ) -> Result<NeutralChatStream, ProviderConfigError> {
     let client = config.genai_client()?;
     let chat_request = genai_chat_request(&request)?;
+    let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
     let error_context =
-        config.provider_error_context("opening provider stream", &request.model_id)?;
+        config.provider_error_context("opening provider stream", upstream_model_id)?;
     let options = genai_chat_options(config, &request)?;
-    let model = genai::ModelIden::new(config.kind.adapter_kind(), request.model_id.clone());
+    let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let response = client
         .exec_chat_stream(model, chat_request, Some(&options))
         .await
@@ -1060,8 +1165,9 @@ fn genai_chat_options(
     config: &ProviderConnectionConfig,
     request: &NeutralChatRequest,
 ) -> Result<ChatOptions, ProviderConfigError> {
+    let model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
     // ponytail: model-id heuristic; add provider metadata if non-Claude ids ever contain "claude".
-    let is_claude = request.model_id.to_ascii_lowercase().contains("claude");
+    let is_claude = model_id.to_ascii_lowercase().contains("claude");
     let temperature = if is_claude { 1.0 } else { 0.0 };
     let mut options = ChatOptions::default()
         .with_temperature(temperature)
@@ -1531,6 +1637,74 @@ mod tests {
     }
 
     #[test]
+    fn redirects_provider_model_ids_to_local_ids() {
+        let models = redirected_provider_model_ids(
+            vec![
+                "qwen/qwen3.6-35b-a3b".to_string(),
+                "qwen3.6-35b-a3b".to_string(),
+                "  ".to_string(),
+            ],
+            &[ProviderModelRedirect {
+                from: "qwen/qwen3.6-35b-a3b".to_string(),
+                to: "qwen3.6-35b-a3b".to_string(),
+            }],
+        )
+        .expect("redirect model ids");
+
+        assert_eq!(models, vec!["qwen3.6-35b-a3b"]);
+    }
+
+    #[test]
+    fn maps_local_model_id_to_upstream_provider_id() {
+        let redirects = [ProviderModelRedirect {
+            from: "qwen/qwen3.6-35b-a3b".to_string(),
+            to: "qwen3.6-35b-a3b".to_string(),
+        }];
+
+        assert_eq!(
+            upstream_provider_model_id("qwen3.6-35b-a3b", &redirects)
+                .expect("redirected upstream model id"),
+            "qwen/qwen3.6-35b-a3b"
+        );
+        assert_eq!(
+            upstream_provider_model_id("gpt-4o", &redirects).expect("unchanged upstream model id"),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_model_redirect_targets() {
+        let error = validate_model_redirects(&[
+            ProviderModelRedirect {
+                from: "first/full".to_string(),
+                to: "short".to_string(),
+            },
+            ProviderModelRedirect {
+                from: "second/full".to_string(),
+                to: "short".to_string(),
+            },
+        ])
+        .expect_err("duplicate redirect target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate model redirect target")
+        );
+    }
+
+    #[test]
+    fn rejects_model_redirect_values_with_whitespace() {
+        let error = validate_model_redirects(&[ProviderModelRedirect {
+            from: "qwen/qwen3.6 35b".to_string(),
+            to: "qwen3.6-35b-a3b".to_string(),
+        }])
+        .expect_err("whitespace in redirect should fail");
+
+        assert!(error.to_string().contains("must not contain whitespace"));
+    }
+
+    #[test]
     fn inserts_nested_body_request_override() {
         let mut body = Map::new();
 
@@ -1663,6 +1837,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
 
         let endpoint = config
@@ -1681,6 +1856,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
 
         let endpoint = config
@@ -1699,6 +1875,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
 
         let retry_config = model_list_v1_retry_config(&config)
@@ -1719,6 +1896,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
 
         assert_eq!(
@@ -1752,6 +1930,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: Some("http://127.0.0.1:7890".to_string()),
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
 
         let context = config
@@ -2135,6 +2314,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
         let options = genai_chat_options(&config, &request).expect("chat options");
 
@@ -2165,6 +2345,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
         let options = genai_chat_options(&config, &request).expect("chat options");
 
@@ -2190,6 +2371,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
         };
         let error =
             genai_chat_options(&config, &request).expect_err("unsupported retention should fail");

@@ -12,8 +12,8 @@ use axum::{
 use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
-    ProviderConfigError, fetch_provider_model_ids, normalized_base_url, parse_provider_kind,
-    test_provider_connection,
+    ProviderConfigError, ProviderModelRedirect, fetch_provider_model_ids, normalized_base_url,
+    parse_provider_kind, test_provider_connection, validate_model_redirects,
 };
 use foco_store::{
     config::{
@@ -233,7 +233,10 @@ pub(crate) struct ManualProviderRequest {
     #[serde(default)]
     pub(crate) auto_sync_models: bool,
     pub(crate) model_sync_filter_regex: Option<String>,
+    #[serde(default)]
     pub(crate) request_overrides: Vec<ProviderRequestOverride>,
+    #[serde(default, alias = "model_redirects")]
+    pub(crate) model_redirects: Vec<ProviderModelRedirect>,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +543,7 @@ pub(crate) struct ConfiguredProviderSummary {
     pub(crate) auto_sync_models: bool,
     pub(crate) model_sync_filter_regex: Option<String>,
     pub(crate) request_overrides: Vec<ProviderRequestOverride>,
+    pub(crate) model_redirects: Vec<ProviderModelRedirect>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -1605,6 +1609,8 @@ pub(crate) async fn save_manual_provider(
             .validate()
             .map_err(|source| ApiError::bad_request(source.to_string()))?;
     }
+    validate_model_redirects(&request.model_redirects)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
     let provider = ProviderSettings {
         id: id.to_string(),
         name: name.to_string(),
@@ -1615,6 +1621,7 @@ pub(crate) async fn save_manual_provider(
         auto_sync_models: request.auto_sync_models,
         model_sync_filter_regex,
         request_overrides: request.request_overrides,
+        model_redirects: request.model_redirects,
         api_proxy,
     };
 

@@ -3282,6 +3282,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 proxy_url: None,
                 request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
             },
             &WebSearchSettings::default(),
             QuestionRegistry::default(),

@@ -7046,6 +7046,7 @@ pub(crate) fn provider_connection_config(
             .enabled
             .then(|| provider.api_proxy.url.clone()),
         request_overrides: provider.request_overrides.clone(),
+        model_redirects: provider.model_redirects.clone(),
     })
 }
 

@@ -485,6 +485,7 @@ pub(crate) fn configured_provider_summary(
         auto_sync_models: provider.auto_sync_models,
         model_sync_filter_regex: provider.model_sync_filter_regex.clone(),
         request_overrides: provider.request_overrides.clone(),
+        model_redirects: provider.model_redirects.clone(),
         warnings: provider_warnings(provider),
     }
 }

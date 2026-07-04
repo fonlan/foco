@@ -9,8 +9,8 @@ use fancy_regex::Regex;
 use foco_agent::{AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions};
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
-    HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
-    normalized_proxy_url, parse_provider_kind,
+    HTTP_PROXY_KIND, ProviderModelRedirect, ProviderRequestOverride, SOCKS_PROXY_KIND,
+    normalized_base_url, normalized_proxy_url, parse_provider_kind, validate_model_redirects,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -478,6 +478,12 @@ impl GlobalConfig {
                         message: source.to_string(),
                     })?;
             }
+            validate_model_redirects(&provider.model_redirects).map_err(|source| {
+                ConfigError::Validation {
+                    path: config_path.map(Path::to_path_buf),
+                    message: source.to_string(),
+                }
+            })?;
             validate_provider_model_sync_filter(
                 config_path,
                 &provider.id,
@@ -1174,6 +1180,8 @@ pub struct ProviderSettings {
     pub model_sync_filter_regex: Option<String>,
     #[serde(default)]
     pub request_overrides: Vec<ProviderRequestOverride>,
+    #[serde(default, alias = "modelRedirects")]
+    pub model_redirects: Vec<ProviderModelRedirect>,
     #[serde(default)]
     pub api_proxy: ApiProxySettings,
 }
@@ -3044,6 +3052,71 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_redirects_default_and_alias_deserialize() {
+        let snake: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "id": "qwen",
+            "name": "Qwen",
+            "kind": "openai-chat",
+            "enabled": true,
+            "base_url": null,
+            "api_key": null
+        }))
+        .expect("provider without redirects should deserialize");
+        assert!(snake.model_redirects.is_empty());
+
+        let camel: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "id": "qwen",
+            "name": "Qwen",
+            "kind": "openai-chat",
+            "enabled": true,
+            "base_url": null,
+            "api_key": null,
+            "modelRedirects": [
+                { "from": "qwen/qwen3.6-35b-a3b", "to": "qwen3.6-35b-a3b" }
+            ]
+        }))
+        .expect("provider camelCase redirects should deserialize");
+        assert_eq!(camel.model_redirects[0].to, "qwen3.6-35b-a3b");
+    }
+
+    #[test]
+    fn provider_model_redirects_are_validated() {
+        let mut config = GlobalConfig::first_run(PathBuf::from("/tmp/workspace"));
+        config.providers.push(ProviderSettings {
+            id: "qwen".to_string(),
+            name: "Qwen".to_string(),
+            kind: "openai-chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: vec![
+                ProviderModelRedirect {
+                    from: "qwen/one".to_string(),
+                    to: "qwen".to_string(),
+                },
+                ProviderModelRedirect {
+                    from: "qwen/two".to_string(),
+                    to: "qwen".to_string(),
+                },
+            ],
+            api_proxy: ApiProxySettings::default(),
+        });
+
+        let error = config
+            .validate(None)
+            .expect_err("duplicate redirect target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate model redirect target")
+        );
+    }
+
+    #[test]
     fn config_dir_paths_do_not_add_nested_foco_directory() {
         let profile = PathBuf::from("/tmp/foco-profile");
         let config_dir = PathBuf::from("/tmp/foco-dev");
@@ -3464,6 +3537,7 @@ mod tests {
             auto_sync_models: false,
             model_sync_filter_regex: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings {
                 enabled: true,
                 proxy_type: HTTP_PROXY_KIND.to_string(),
@@ -3510,6 +3584,7 @@ mod tests {
             auto_sync_models: true,
             model_sync_filter_regex: Some("(".to_string()),
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
 
@@ -3540,6 +3615,7 @@ mod tests {
             auto_sync_models: true,
             model_sync_filter_regex: Some("^(?!gpt).*".to_string()),
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
 
@@ -3827,6 +3903,7 @@ mod tests {
             auto_sync_models: false,
             model_sync_filter_regex: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
 
@@ -4231,6 +4308,7 @@ mod tests {
             auto_sync_models: false,
             model_sync_filter_regex: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
         config.models.push(ModelSettings {
@@ -4306,6 +4384,7 @@ mod tests {
             auto_sync_models: false,
             model_sync_filter_regex: None,
             request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
         config.models.push(ModelSettings {
