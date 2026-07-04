@@ -162,6 +162,7 @@ mod plan_auto_run;
 mod plan_runtime;
 mod platform;
 mod prompt;
+mod remote_workspace;
 mod runtime;
 mod scheduled_tasks;
 mod settings_runtime;
@@ -377,6 +378,7 @@ pub(crate) struct AppState {
     plan_auto_run_scheduler: PlanAutoRunScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
+    remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
     remote_server_connections: Arc<Mutex<HashSet<String>>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
@@ -501,6 +503,9 @@ async fn main() {
 
 async fn run_entrypoint() -> AppResult<()> {
     if print_latest_memory_dream_job_if_requested()? {
+        return Ok(());
+    }
+    if crate::remote_workspace::run_remote_sidecar_command_if_requested().await? {
         return Ok(());
     }
 
@@ -757,6 +762,7 @@ async fn run_server_until_shutdown(
         plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
+        remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
@@ -6752,7 +6758,7 @@ pub(crate) fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError
     Ok(config.clone())
 }
 
-fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
+pub(crate) fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
     save_global_config(&state.config_file, &config).map_err(ApiError::from_config_error)?;
 
     let mut stored_config = state

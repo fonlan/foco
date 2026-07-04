@@ -16468,6 +16468,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         plan_auto_run_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
+        remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
     }
 }

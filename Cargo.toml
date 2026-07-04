@@ -30,6 +30,8 @@ fancy-regex = "0.18.0"
 futures-util = { version = "0.3.31", features = ["sink"] }
 genai = { version = "0.6.4", default-features = true }
 getrandom = "0.3.4"
+tokio-tungstenite = "0.29.0"
+tungstenite = "0.29.0"
 gix = { version = "0.84.0", default-features = false, features = ["sha1", "status", "worktree-mutation"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks"] }

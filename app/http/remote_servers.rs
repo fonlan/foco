@@ -232,6 +232,7 @@ pub(crate) async fn delete_remote_server(
     }
     save_config(&state, config)?;
     disconnect_remote_server_id(&state, id)?;
+    state.remote_workspace_manager.disconnect_server(id).await?;
     Ok(Json(DeleteRemoteServerResponse {
         deleted,
         references,
@@ -257,6 +258,10 @@ pub(crate) async fn disconnect_remote_server(
     AxumPath(server_id): AxumPath<String>,
 ) -> Result<Json<RemoteServerResponse>, ApiError> {
     disconnect_remote_server_id(&state, &server_id)?;
+    state
+        .remote_workspace_manager
+        .disconnect_server(&server_id)
+        .await?;
     let config = config_snapshot(&state)?;
     let server = remote_server_by_id(&config, &server_id)?.clone();
     let connected_ids = connected_remote_server_ids(&state)?;
@@ -320,11 +325,13 @@ pub(crate) fn remote_server_summary(
 }
 
 pub(crate) fn connected_remote_server_ids(state: &AppState) -> Result<HashSet<String>, ApiError> {
-    let connections = state
+    let mut connections = state
         .remote_server_connections
         .lock()
-        .map_err(|_| ApiError::internal("remote server connection lock is poisoned"))?;
-    Ok(connections.clone())
+        .map_err(|_| ApiError::internal("remote server connection lock is poisoned"))?
+        .clone();
+    connections.extend(state.remote_workspace_manager.server_ids_with_sessions()?);
+    Ok(connections)
 }
 
 pub(crate) fn remote_server_workspace_references(
@@ -788,6 +795,21 @@ async fn run_ssh(
     batch_mode: bool,
 ) -> Result<Output, String> {
     let timeout_ms = server.connect_timeout_ms.max(1);
+    let args = remote_server_ssh_args(server, extra_args, batch_mode);
+
+    let child = Command::new("ssh").args(&args).output();
+    timeout(Duration::from_millis(timeout_ms + 1_000), child)
+        .await
+        .map_err(|_| format!("ssh command timed out after {timeout_ms}ms"))?
+        .map_err(|source| format!("failed to run ssh: {source}"))
+}
+
+pub(crate) fn remote_server_ssh_args(
+    server: &RemoteServerProfile,
+    extra_args: &[&str],
+    batch_mode: bool,
+) -> Vec<String> {
+    let timeout_ms = server.connect_timeout_ms.max(1);
     let mut args = Vec::new();
     if batch_mode {
         args.push("-o".to_string());
@@ -818,12 +840,7 @@ async fn run_ssh(
         args.push(server.host_alias.clone());
         args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
     }
-
-    let child = Command::new("ssh").args(&args).output();
-    timeout(Duration::from_millis(timeout_ms + 1_000), child)
-        .await
-        .map_err(|_| format!("ssh command timed out after {timeout_ms}ms"))?
-        .map_err(|source| format!("failed to run ssh: {source}"))
+    args
 }
 
 fn classify_ssh_failure(output: &Output) -> &'static str {
@@ -854,7 +871,7 @@ fn classify_ssh_failure(output: &Output) -> &'static str {
     }
 }
 
-fn normalize_target(uname_output: &str) -> Result<String, String> {
+pub(crate) fn normalize_target(uname_output: &str) -> Result<String, String> {
     let mut lines = uname_output
         .lines()
         .map(str::trim)
@@ -877,12 +894,13 @@ fn normalize_target(uname_output: &str) -> Result<String, String> {
     }
 }
 
-struct SelectedSidecarAsset {
-    version: String,
-    path: PathBuf,
+pub(crate) struct SelectedSidecarAsset {
+    pub(crate) version: String,
+    pub(crate) target: String,
+    pub(crate) path: PathBuf,
 }
 
-fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset, String> {
+pub(crate) fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset, String> {
     for root in sidecar_roots() {
         let manifest_path = root.join("manifest.json");
         if !manifest_path.exists() {
@@ -915,6 +933,7 @@ fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset, String> {
         }
         return Ok(SelectedSidecarAsset {
             version: manifest.version,
+            target: target.to_string(),
             path: asset_path,
         });
     }

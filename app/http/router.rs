@@ -72,6 +72,18 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::remote_servers::remote_server_status),
         )
         .route(
+            "/api/remote-servers/{server_id}/sessions",
+            get(crate::remote_workspace::remote_workspace_sessions),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/workspaces/{workspace_id}/connect",
+            post(crate::remote_workspace::connect_remote_workspace),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/workspaces/{workspace_id}/disconnect",
+            post(crate::remote_workspace::disconnect_remote_workspace),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chats",
             get(crate::http::workspaces::workspace_chats),
         )
