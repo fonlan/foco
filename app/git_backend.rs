@@ -1246,6 +1246,9 @@ fn mutable_index(repo: &gix::Repository) -> Result<gix::index::File, ApiError> {
 }
 
 fn write_index(mut index: gix::index::File) -> Result<(), ApiError> {
+    // ponytail: gix preserves cache-tree extensions on write; drop it after our
+    // manual entry edits so native Git and gix don't disagree about staged files.
+    index.remove_tree();
     index
         .write(Default::default())
         .map_err(|source| ApiError::internal(format!("failed to write git index: {source}")))
@@ -1454,6 +1457,54 @@ fn agent_instance_worktree_path_is_derived_from_current_workspace() {
         agent_instance_worktree_path(first_workspace, &instance_id),
         agent_instance_worktree_path(second_workspace, &instance_id),
         "worktree execution paths must follow the current workspace instead of a persisted absolute path"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn write_index_drops_stale_cache_tree_extension() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("tracked.txt"), "base\n").expect("tracked file");
+    stage_git_file(workspace_path, "tracked.txt").expect("stage tracked file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .arg("write-tree")
+        .output()
+        .expect("run git write-tree");
+    assert!(
+        output.status.success(),
+        "git write-tree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.open_index()
+            .expect("index with cache tree")
+            .tree()
+            .is_some(),
+        "native git write-tree should populate the cache-tree extension"
+    );
+
+    let mut index = repo.open_index().expect("cached index");
+    write_index(index).expect("rewrite index");
+    index = repo.open_index().expect("rewritten index");
+    assert!(
+        index.tree().is_none(),
+        "Foco index writes must drop stale cache-tree data before mutating entries"
     );
 }
 
