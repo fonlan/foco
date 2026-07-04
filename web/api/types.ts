@@ -1286,6 +1286,11 @@ export type ProviderRequestOverride = {
   value: boolean | number | string;
 };
 
+export type ProviderModelRedirect = {
+  from: string;
+  to: string;
+};
+
 export type ProviderRequestOverrideFormState = {
   target: ProviderRequestOverrideTarget;
   name: string;
@@ -1304,6 +1309,7 @@ export type ConfiguredProviderSummary = {
   hasApiKey: boolean;
   autoSyncModels: boolean;
   modelSyncFilterRegex: string | null;
+  modelRedirects: ProviderModelRedirect[];
   requestOverrides: ProviderRequestOverride[];
   warnings: string[];
 };
@@ -1320,6 +1326,7 @@ export type ProviderFormState = {
   kind: string;
   autoSyncModels: boolean;
   modelSyncFilterRegex: string;
+  modelRedirects: ProviderModelRedirect[];
   name: string;
   requestOverrides: ProviderRequestOverrideFormState[];
   serviceId: string;

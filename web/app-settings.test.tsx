@@ -1969,6 +1969,101 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("saves provider model redirects from the provider form", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...settings,
+      providers: [
+        {
+          ...settings.providers[0],
+          modelRedirects: [
+            { from: "qwen/qwen3.6-35b-a3b", to: "qwen3.6-35b-a3b" },
+          ],
+        },
+        settings.providers[1],
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+
+    expect(screen.getByText("qwen/qwen3.6-35b-a3b -> qwen3.6-35b-a3b")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+    expect(screen.getByLabelText("Upstream model")).toHaveValue("qwen/qwen3.6-35b-a3b");
+    expect(screen.getByLabelText("Local model")).toHaveValue("qwen3.6-35b-a3b");
+
+    await userEvent.click(screen.getByRole("button", { name: "Add redirect" }));
+    const upstreamInputs = screen.getAllByLabelText("Upstream model");
+    const localInputs = screen.getAllByLabelText("Local model");
+    changeInput(upstreamInputs[1], "deepseek/deepseek-r1");
+    expect(screen.getByRole("button", { name: "Save provider" })).toBeDisabled();
+    changeInput(localInputs[1], "deepseek-r1");
+    await userEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/providers/manual",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toMatchObject({
+        modelRedirects: [
+          { from: "qwen/qwen3.6-35b-a3b", to: "qwen3.6-35b-a3b" },
+          { from: "deepseek/deepseek-r1", to: "deepseek-r1" },
+        ],
+      });
+    });
+  });
+
+  it("saves full provider model candidates without developer prefix trimming", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/providers/models") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { providerId?: string };
+        return jsonResponse({
+          providerId: body.providerId,
+          models: body.providerId === "openai" ? ["qwen/qwen3.6-35b-a3b"] : [],
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Load provider models for OpenAI" }),
+    );
+    await screen.findByText("qwen/qwen3.6-35b-a3b");
+
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+    const modelIdSelect = screen.getByLabelText("Model id");
+    expect(
+      within(modelIdSelect).getByRole("option", { name: "qwen/qwen3.6-35b-a3b" }),
+    ).toBeInTheDocument();
+    await userEvent.selectOptions(modelIdSelect, "qwen/qwen3.6-35b-a3b");
+    changeInput(screen.getByLabelText("Display name"), "Qwen 3.6 35B");
+    await userEvent.click(screen.getByRole("button", { name: "Save model" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/models/manual",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toMatchObject({
+        activeProviderId: "openai",
+        modelId: "qwen/qwen3.6-35b-a3b",
+        providerIds: ["openai"],
+      });
+    });
+  });
+
   it("saves provider, model, MCP server, and skill settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

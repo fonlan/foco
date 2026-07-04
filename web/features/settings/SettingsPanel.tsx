@@ -112,6 +112,7 @@ import type {
   ProviderFormState,
   ProviderModelsRefreshResponse,
   ProviderModelsResponse,
+  ProviderModelRedirect,
   ProviderRequestOverrideFormState,
   ProviderRequestOverrideTarget,
   ProviderRequestOverrideValueType,
@@ -616,6 +617,23 @@ export function SettingsPanel({
         value: modelIdForDeveloper(model, selectedModelDeveloper),
       })),
     [developerModels, selectedModelDeveloper],
+  );
+  const providerModelOptions = useMemo(
+    () => loadedProviderModelIds(providerModelLists),
+    [providerModelLists],
+  );
+  const modelIdOptions = useMemo(
+    () => [
+      ...developerModelOptions.map((model) => ({
+        key: `metadata:${model.key}`,
+        value: model.value,
+      })),
+      ...providerModelOptions.map((modelId) => ({
+        key: `provider:${modelId}`,
+        value: modelId,
+      })),
+    ].filter(uniqueByValue),
+    [developerModelOptions, providerModelOptions],
   );
   const modelOutputsText = form.outputModalities.includes("text");
   const enabledNeedsLimits =
@@ -1545,7 +1563,8 @@ export function SettingsPanel({
   }
 
   function updateModelId(modelId: string) {
-    const model = modelMetadataForInput(modelId);
+    const isProviderRawModelId = providerModelOptions.includes(modelId) && modelId.includes("/");
+    const model = isProviderRawModelId ? null : modelMetadataForInput(modelId);
     setSelectedMetadataKey(model?.key ?? "");
     if (model) {
       setSelectedModelDeveloper(model.providerId);
@@ -1553,9 +1572,17 @@ export function SettingsPanel({
 
     setForm((current) => {
       if (!model) {
+        const providerIds = matchedProviderIdsForModel(modelId);
+        const nextProviderIds = providerIds.length ? providerIds : current.providerIds;
+        const activeProviderId = nextProviderIds.includes(current.activeProviderId)
+          ? current.activeProviderId
+          : nextProviderIds[0] ?? "";
+
         return {
           ...current,
           modelId,
+          providerIds: nextProviderIds,
+          activeProviderId,
           thinkingLevel: "",
         };
       }
@@ -1614,6 +1641,10 @@ export function SettingsPanel({
       kind: provider.kind,
       autoSyncModels: provider.autoSyncModels,
       modelSyncFilterRegex: provider.modelSyncFilterRegex ?? "",
+      modelRedirects: (provider.modelRedirects ?? []).map((redirect) => ({
+        from: redirect.from,
+        to: redirect.to,
+      })),
       name: provider.name,
       requestOverrides: provider.requestOverrides.map((overrideRule) => ({
         target: overrideRule.target,
@@ -3421,6 +3452,37 @@ export function SettingsPanel({
     setWorkspaceOrderPreview(null);
   }
 
+  function addProviderModelRedirect() {
+    setProviderForm((current) => ({
+      ...current,
+      modelRedirects: [
+        ...current.modelRedirects,
+        { from: "", to: "" },
+      ],
+    }));
+  }
+
+  function updateProviderModelRedirect(
+    index: number,
+    patch: Partial<ProviderModelRedirect>,
+  ) {
+    setProviderForm((current) => ({
+      ...current,
+      modelRedirects: current.modelRedirects.map((redirect, redirectIndex) =>
+        redirectIndex === index ? { ...redirect, ...patch } : redirect,
+      ),
+    }));
+  }
+
+  function deleteProviderModelRedirect(index: number) {
+    setProviderForm((current) => ({
+      ...current,
+      modelRedirects: current.modelRedirects.filter(
+        (_redirect, redirectIndex) => redirectIndex !== index,
+      ),
+    }));
+  }
+
   function addProviderRequestOverride() {
     setProviderForm((current) => ({
       ...current,
@@ -3491,6 +3553,10 @@ export function SettingsPanel({
             kind: providerForm.kind,
             autoSyncModels: providerForm.autoSyncModels,
             modelSyncFilterRegex: providerForm.modelSyncFilterRegex || null,
+            modelRedirects: providerForm.modelRedirects.map((redirect) => ({
+              from: redirect.from,
+              to: redirect.to,
+            })),
             name: providerForm.name,
             requestOverrides: providerForm.requestOverrides.map((overrideRule) => ({
               ...overrideRule,
@@ -9526,6 +9592,69 @@ export function SettingsPanel({
                       <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
+                            <RefreshCw aria-hidden="true" className="size-4 text-teal-700" />
+                            <h4 className="text-sm font-semibold text-stone-950">
+                              {t("Model redirects")}
+                            </h4>
+                          </div>
+                          <button
+                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            onClick={addProviderModelRedirect}
+                            type="button"
+                          >
+                            <Plus aria-hidden="true" className="size-3.5" />
+                            {t("Add redirect")}
+                          </button>
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-stone-500">
+                          {t("Expose provider model IDs under local model IDs.")}
+                        </p>
+                        <div className="mt-3 space-y-3">
+                          {providerForm.modelRedirects.length ? (
+                            providerForm.modelRedirects.map((redirect, redirectIndex) => (
+                              <div
+                                className="rounded-lg border border-stone-200 bg-white p-3"
+                                key={redirectIndex}
+                              >
+                                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.5rem]">
+                                  <TextField
+                                    label={t("Upstream model")}
+                                    onChange={(value) =>
+                                      updateProviderModelRedirect(redirectIndex, { from: value })
+                                    }
+                                    placeholder="qwen/qwen3.6-35b-a3b"
+                                    value={redirect.from}
+                                  />
+                                  <TextField
+                                    label={t("Local model")}
+                                    onChange={(value) =>
+                                      updateProviderModelRedirect(redirectIndex, { to: value })
+                                    }
+                                    placeholder="qwen3.6-35b-a3b"
+                                    value={redirect.to}
+                                  />
+                                  <button
+                                    aria-label={t("Delete redirect")}
+                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 hover:bg-rose-50"
+                                    onClick={() => deleteProviderModelRedirect(redirectIndex)}
+                                    title={t("Delete redirect")}
+                                    type="button"
+                                  >
+                                    <Trash2 aria-hidden="true" className="size-4" />
+                                  </button>
+                                </div>
+                              </div>
+                            ))
+                          ) : (
+                            <p className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-3 text-xs text-stone-500">
+                              {t("No model redirects configured.")}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2">
                             <SlidersHorizontal aria-hidden="true" className="size-4 text-teal-700" />
                             <h4 className="text-sm font-semibold text-stone-950">
                               {t("Request overrides")}
@@ -9661,6 +9790,9 @@ export function SettingsPanel({
                                 String(overrideRule.value).trim() === "") ||
                               (overrideRule.valueType === "number" &&
                                 Number.isNaN(Number(overrideRule.value))),
+                          ) ||
+                          providerForm.modelRedirects.some(
+                            (redirect) => !redirect.from.trim() || !redirect.to.trim(),
                           )
                         }
                         title={t("Save provider")}
@@ -9786,6 +9918,13 @@ export function SettingsPanel({
                                     {t("sync regex {pattern}", {
                                       pattern: provider.modelSyncFilterRegex,
                                     })}
+                                  </div>
+                                ) : null}
+                                {provider.modelRedirects?.length ? (
+                                  <div className="mt-1 truncate font-mono text-xs text-stone-500">
+                                    {provider.modelRedirects
+                                      .map((redirect) => `${redirect.from} -> ${redirect.to}`)
+                                      .join(", ")}
                                   </div>
                                 ) : null}
                                 {provider.baseUrl ? (
@@ -10685,19 +10824,19 @@ export function SettingsPanel({
                             </span>
                             <select
                               className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                              disabled={!selectedModelDeveloper && !editingModel}
+                              disabled={!modelIdOptions.length && !editingModel}
                               onChange={(event) => updateModelId(event.target.value)}
                               value={form.modelId}
                             >
                               <option value="">{t("Select model id")}</option>
-                              {developerModelOptions.map((model) => (
+                              {modelIdOptions.map((model) => (
                                 <option key={model.key} value={model.value}>
                                   {model.value}
                                 </option>
                               ))}
                               {editingModel &&
                                 form.modelId &&
-                                !developerModelOptions.some(
+                                !modelIdOptions.some(
                                   (model) => model.value === form.modelId,
                                 ) ? (
                                 <option value={form.modelId}>{form.modelId}</option>
@@ -10984,7 +11123,6 @@ export function SettingsPanel({
                           disabled={
                             isSaving ||
                             enabledNeedsLimits ||
-                            (!editingModel && !selectedModelDeveloper) ||
                             !form.modelId.trim() ||
                             !form.displayName.trim()
                           }
@@ -11961,6 +12099,7 @@ function emptyProviderForm(): ProviderFormState {
     kind: "",
     autoSyncModels: false,
     modelSyncFilterRegex: "",
+    modelRedirects: [],
     name: "",
     requestOverrides: [],
     serviceId: "",
@@ -12872,6 +13011,17 @@ function modelIdForDeveloper(model: ModelMetadataRecord, developer: string) {
       : model.modelId,
     developer,
   );
+}
+
+function loadedProviderModelIds(modelLists: Record<string, ProviderModelListState>) {
+  return Object.values(modelLists)
+    .filter((modelList) => modelList.status === "ok")
+    .flatMap((modelList) => modelList.models)
+    .filter(uniqueString);
+}
+
+function uniqueByValue<T extends { value: string }>(item: T, index: number, values: T[]) {
+  return values.findIndex((value) => value.value === item.value) === index;
 }
 
 function stripDeveloperPrefix(modelId: string, developer: string) {
