@@ -1986,10 +1986,7 @@ mod tests {
     fn moves_leading_system_messages_to_genai_system() {
         let mut request = neutral_request(vec![
             neutral_text_message(NeutralChatRole::System, "Core prompt."),
-            neutral_text_message(
-                NeutralChatRole::System,
-                "<skills_instructions>name: html-ppt</skills_instructions>",
-            ),
+            neutral_text_message(NeutralChatRole::System, "Tool guidance."),
             neutral_text_message(NeutralChatRole::User, "Do it."),
         ]);
         request.tools.push(NeutralToolDefinition {
@@ -2003,7 +2000,7 @@ mod tests {
 
         assert_eq!(
             chat_request.system.as_deref(),
-            Some("Core prompt.\n\n<skills_instructions>name: html-ppt</skills_instructions>")
+            Some("Core prompt.\n\nTool guidance.")
         );
         assert_eq!(chat_request.messages.len(), 1);
         assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);

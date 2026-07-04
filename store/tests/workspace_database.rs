@@ -1362,6 +1362,84 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
 }
 
 #[test]
+fn completed_running_plan_phase_agent_tasks_finds_stale_completed_tasks() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-stale-completed-task",
+            title: "Plan stale completed task",
+            overview: "A completed Agent task should be resynced if the phase is still running.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-stale-completed-task-phase",
+                title: "Phase one",
+                summary: "Leaves a stale running phase.",
+                steps: vec![NewPlanStep {
+                    id: "plan-stale-completed-task-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["task discovered".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-stale-completed-task", "start")
+        .expect("start plan");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-stale-completed-task",
+        "stale-completed-task",
+    );
+    let task_id = AgentTaskId::new("agent-task-stale-completed-task").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            "plan-stale-completed-task",
+            "plan-stale-completed-task-phase",
+            "chat-stale-completed-task",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase task");
+    let attempt_id = AgentAttemptId::new("agent-attempt-stale-completed-task").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim task");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete task without syncing phase");
+
+    assert_eq!(
+        database
+            .completed_running_plan_phase_agent_tasks()
+            .expect("stale completed tasks"),
+        vec![task_id]
+    );
+}
+
+#[test]
 fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
     for (suffix, transition, expected_phase_status, expected_attempt_status) in [
         ("failed", AgentTaskTransition::Fail, "failed", "failed"),

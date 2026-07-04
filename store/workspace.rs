@@ -2582,6 +2582,25 @@ impl WorkspaceDatabase {
             .map(Some)
     }
 
+    pub fn completed_running_plan_phase_agent_tasks(
+        &self,
+    ) -> Result<Vec<AgentTaskId>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT task.id
+                 FROM plan_phases AS phase
+                 JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                 WHERE phase.status = 'running'
+                   AND task.status = 'completed'",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| agent_id_from_row::<AgentTaskId>(row, 0))
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn fail_running_plan_phases_for_terminal_agent_tasks(
         &mut self,
         error_message: &str,

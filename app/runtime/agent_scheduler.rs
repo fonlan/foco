@@ -303,6 +303,15 @@ async fn schedule_runnable_tasks(
             let Ok(permit) = permits.clone().try_acquire_owned() else {
                 break 'scan;
             };
+            let database = open_workspace_database(&workspace.path)?;
+            let completed_plan_tasks = database
+                .completed_running_plan_phase_agent_tasks()
+                .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            for task_id in completed_plan_tasks {
+                crate::plan_runtime::sync_plan_phase_for_agent_task(state, workspace, &task_id)
+                    .await?;
+            }
             let mut database = open_workspace_database(&workspace.path)?;
             for recovered_task in database
                 .recover_interrupted_agent_wait_tasks(
