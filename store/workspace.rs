@@ -2504,6 +2504,11 @@ impl WorkspaceDatabase {
             return Ok(plan);
         }
         let commit_id = commit_id.map(str::trim).filter(|value| !value.is_empty());
+        // ponytail: infer an out-of-band merge completion from a commit reported for an already blocked implemented plan; replace with an explicit outer-merge callback when Foco has one.
+        let record_shared_merge_commit = plan.status == "implemented"
+            && plan.shared_merge_commit_id.is_none()
+            && plan.error_message.is_some()
+            && commit_id.is_some();
         let now = now_timestamp();
         self.connection
             .execute(
@@ -2547,6 +2552,26 @@ impl WorkspaceDatabase {
                     })
                 })
                 .map(|plan| plan);
+        }
+        if record_shared_merge_commit {
+            self.connection
+                .execute(
+                    "UPDATE plans
+                     SET shared_merge_commit_id = ?2,
+                         error_message = NULL,
+                         updated_at = ?3
+                     WHERE id = ?1",
+                    params![phase.plan_id.as_str(), commit_id, now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            return self.plan(&phase.plan_id).and_then(|plan| {
+                plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!(
+                        "plan was not found after shared merge update: {}",
+                        phase.plan_id
+                    ),
+                })
+            });
         }
         Ok(refreshed)
     }

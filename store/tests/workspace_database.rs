@@ -921,6 +921,98 @@ fn phase_commit_does_not_mark_plan_shared_merged() {
 }
 
 #[test]
+fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-blocked-merge-complete",
+            title: "Blocked merge complete",
+            overview: "A later merge commit should clear the blocked state.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-blocked-merge-complete-phase-1",
+                title: "Phase one",
+                summary: "Produces an isolated commit.",
+                steps: vec![NewPlanStep {
+                    id: "plan-blocked-merge-complete-step-1",
+                    title: "Do work",
+                    detail: "Complete the phase.",
+                    acceptance: vec!["phase committed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-blocked-merge-complete", "start")
+        .expect("start phase");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-plan-blocked-merge-complete",
+        "plan-blocked-merge-complete",
+    );
+    let task_id = AgentTaskId::new("agent-task-plan-blocked-merge-complete").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            "plan-blocked-merge-complete",
+            "plan-blocked-merge-complete-phase-1",
+            "chat-plan-blocked-merge-complete",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase");
+
+    let completed = database
+        .complete_plan_phase_run(&task_id, Some("phase-worktree-commit"))
+        .expect("complete phase")
+        .expect("completed plan");
+    assert_eq!(completed.status, "implemented");
+    assert!(completed.shared_merge_commit_id.is_none());
+    let blocked = database
+        .block_plan_phase_merge(
+            "plan-blocked-merge-complete",
+            "plan-blocked-merge-complete-phase-1",
+            "cannot merge Agent worktree while shared workspace has uncommitted changes",
+        )
+        .expect("block merge");
+    assert!(blocked.error_message.is_some());
+    assert!(blocked.phases[0].error_message.is_some());
+
+    let merged = database
+        .complete_plan_phase_by_id(
+            "plan-blocked-merge-complete",
+            "plan-blocked-merge-complete-phase-1",
+            Some("shared-merge-commit"),
+        )
+        .expect("complete merge phase");
+
+    assert_eq!(merged.status, "implemented");
+    assert_eq!(
+        merged.shared_merge_commit_id.as_deref(),
+        Some("shared-merge-commit")
+    );
+    assert!(merged.error_message.is_none());
+    assert_eq!(
+        merged.phases[0].commit_id.as_deref(),
+        Some("shared-merge-commit")
+    );
+    assert!(merged.phases[0].error_message.is_none());
+}
+
+#[test]
 fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
