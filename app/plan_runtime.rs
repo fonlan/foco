@@ -138,6 +138,7 @@ pub(crate) async fn retry_plan_merge(
         )));
     }
     finalize_plan_worktree(state, &workspace, &plan).await?;
+    state.plan_auto_run_scheduler.wake()?;
     let database = open_workspace_database(&workspace.path)?;
     database
         .plan(plan_id)
