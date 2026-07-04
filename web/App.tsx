@@ -2329,8 +2329,14 @@ export function App() {
         const plansResponse = await loadActivePlans(workspaceId, { force: true });
         await refreshWorkspaces();
         const plan =
-          plansResponse?.plans.find((candidate) => candidate.id === planId) ??
-          response.plan;
+          action === "retry_merge"
+            ? response.plan
+            : plansResponse?.plans.find((candidate) => candidate.id === planId) ?? response.plan;
+        if (action === "retry_merge") {
+          setActivePlans((current) =>
+            current.map((candidate) => (candidate.id === planId ? plan : candidate)),
+          );
+        }
         const implementationChatId =
           action === "start" || action === "resume"
             ? plan.phases.find((phase) => phase.id === plan.activePhaseId)
@@ -3023,6 +3029,27 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (
+      !activeWorkspace?.id ||
+      !isContextPanelOpen ||
+      contextPanelTab !== "plan" ||
+      !isPlanAutoRunEnabled ||
+      !isPlanAutoRunBusy
+    ) {
+      return;
+    }
+
+    void loadActivePlans(activeWorkspace.id, { force: true });
+  }, [
+    activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
+    isPlanAutoRunBusy,
+    isPlanAutoRunEnabled,
+    loadActivePlans,
+  ]);
+
+  useEffect(() => {
     setContextMemoryPages({
       global: { page: 1, pageSize: 10 },
       workspace: { page: 1, pageSize: 10 },
@@ -3068,7 +3095,7 @@ export function App() {
     const shouldRefreshAutoRunState = isPlanAutoRunEnabled;
     const shouldRefreshRunningPlans =
       (isPlanAutoRunEnabled || (isContextPanelOpen && contextPanelTab === "plan")) &&
-      activePlans.some(isAutoRunPlanInFlight);
+      (isPlanAutoRunBusy || activePlans.some(isAutoRunPlanInFlight));
 
     if (!shouldRefreshAutoRunState && !shouldRefreshRunningPlans) {
       return;
@@ -3093,6 +3120,7 @@ export function App() {
     activeWorkspace?.id,
     contextPanelTab,
     isContextPanelOpen,
+    isPlanAutoRunBusy,
     isPlanAutoRunEnabled,
     loadActivePlans,
     loadPlanAutoRunState,

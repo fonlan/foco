@@ -1254,6 +1254,71 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("Auto running")).toBeInTheDocument();
   });
 
+  it("refreshes active plans when backend auto-run becomes busy", async () => {
+    const user = userEvent.setup();
+    const readyPlan: Plan = {
+      ...planFixture,
+      activePhaseId: null,
+      phases: planFixture.phases.map((phase) => ({ ...phase, status: "pending" })),
+      status: "ready",
+      title: "Auto-run refresh target",
+    };
+    const runningPlan: Plan = {
+      ...readyPlan,
+      activePhaseId: readyPlan.phases[0]?.id ?? null,
+      phases: readyPlan.phases.map((phase, index) => ({
+        ...phase,
+        status: index === 0 ? "running" : phase.status,
+      })),
+      status: "running",
+    };
+    let planRequestCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+          : {};
+        return jsonResponse({ busy: body.enabled ?? false, enabled: body.enabled ?? false });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        planRequestCount += 1;
+        const plan = planRequestCount === 1 ? readyPlan : runningPlan;
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [plan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Auto-run refresh target")).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: /Auto run plans/ }));
+
+    await waitFor(() => {
+      expect(planRequestCount).toBeGreaterThanOrEqual(2);
+    });
+    const planArticle = screen.getByText("Auto-run refresh target").closest("article");
+    if (!planArticle) {
+      throw new Error("Expected plan article");
+    }
+    expect(within(planArticle).getAllByText("Running").length).toBeGreaterThan(0);
+  });
+
   it("single-flights plan and auto-run polling while auto-run is enabled", async () => {
     const user = userEvent.setup();
     const intervalCallbacks = new Map<number, { handler: TimerHandler; timeout?: number }>();
@@ -1738,6 +1803,74 @@ describe("app-panels-stats verification surfaces", () => {
       "title",
       "Merged into shared workspace",
     );
+    expect(screen.queryByRole("button", { name: "Retry Merge" })).not.toBeInTheDocument();
+  });
+
+  it("keeps retry merge action response visible when the refresh returns stale plan data", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-04T12:20:00Z";
+    const blockedPlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: "cannot merge Agent worktree while shared workspace has uncommitted changes",
+      sharedMergeCommitId: null,
+      id: "plan-merge-stale-refresh",
+      overview: "Retry should show that merge work has started.",
+      pauseRequestedAt: null,
+      phases: [],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "implemented",
+      title: "Stale retry merge plan",
+      updatedAt: timestamp,
+    };
+    const runningPlan = {
+      ...blockedPlan,
+      completedAt: null,
+      errorMessage: null,
+      status: "running",
+      updatedAt: "2026-07-04T12:21:00Z",
+    };
+    let didRetryMerge = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [blockedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans/plan-merge-stale-refresh/action") {
+        didRetryMerge = true;
+        return jsonResponse({ plan: runningPlan });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(screen.getByRole("tab", { name: "Plan" }));
+    const retryButton = await screen.findByRole("button", { name: "Retry Merge" });
+
+    await user.click(retryButton);
+
+    await waitFor(() => {
+      expect(didRetryMerge).toBe(true);
+      expect(screen.getByText("Running")).toBeInTheDocument();
+    });
     expect(screen.queryByRole("button", { name: "Retry Merge" })).not.toBeInTheDocument();
   });
 
