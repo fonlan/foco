@@ -32,6 +32,7 @@ pub const DEFAULT_LLM_REQUEST_RETRY_COUNT: u32 = 3;
 pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
 pub const DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS: u32 = 3;
 pub const DEFAULT_TERMINAL_SHELL: &str = default_terminal_shell_for_current_platform();
+pub const DEFAULT_REMOTE_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
 pub const WEB_SEARCH_PROVIDER_TAVILY: &str = "tavily";
@@ -323,6 +324,8 @@ pub struct GlobalConfig {
     pub agent_definitions: Vec<AgentDefinitionSettings>,
     pub mcp: McpConfig,
     pub skills: SkillConfig,
+    #[serde(default, rename = "remoteServers")]
+    pub remote_servers: Vec<RemoteServerProfile>,
     pub workspaces: Vec<WorkspaceConfig>,
 }
 
@@ -359,10 +362,12 @@ impl GlobalConfig {
                 enabled: Vec::new(),
                 translation_model_id: None,
             },
+            remote_servers: Vec::new(),
             workspaces: vec![WorkspaceConfig {
                 id: DEFAULT_WORKSPACE_ID.to_string(),
                 name: DEFAULT_WORKSPACE_NAME.to_string(),
                 path: default_workspace_path,
+                location: WorkspaceLocation::Local,
                 pinned: false,
                 terminal_shell: default_terminal_shell(),
                 common_commands: Vec::new(),
@@ -399,22 +404,23 @@ impl GlobalConfig {
         validate_plan_settings(config_path, &self.plan)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
+        let mut remote_server_ids = HashSet::new();
+        for server in &self.remote_servers {
+            validate_remote_server_profile(config_path, server)?;
+            if !remote_server_ids.insert(server.id.as_str()) {
+                return invalid_config(
+                    config_path,
+                    format!("duplicate remote server id '{}'", server.id),
+                );
+            }
+        }
+
         let mut workspace_ids = HashSet::new();
 
         for workspace in &self.workspaces {
             validate_id(config_path, "workspace.id", &workspace.id)?;
             require_non_empty(config_path, "workspace.name", &workspace.name)?;
-
-            if !workspace.path.is_absolute() {
-                return invalid_config(
-                    config_path,
-                    format!(
-                        "workspace '{}' path must be absolute: {}",
-                        workspace.id,
-                        workspace.path.display()
-                    ),
-                );
-            }
+            validate_workspace_location(config_path, workspace, &remote_server_ids)?;
             validate_terminal_shell(
                 config_path,
                 "workspace.terminal_shell",
@@ -1303,17 +1309,174 @@ pub struct SkillSettings {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteServerProfile {
+    pub id: String,
+    pub name: String,
+    pub host_alias: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_remote_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foco_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
+    #[serde(default = "default_remote_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sidecar_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<String>,
+}
+
+impl Default for RemoteServerProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            host_alias: String::new(),
+            user: None,
+            port: None,
+            identity_file: None,
+            default_remote_root: None,
+            foco_command: None,
+            terminal_shell: None,
+            connect_timeout_ms: DEFAULT_REMOTE_CONNECT_TIMEOUT_MS,
+            last_known_target: None,
+            last_sidecar_version: None,
+            last_checked_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "path_is_empty")]
     pub path: PathBuf,
+    #[serde(default = "default_workspace_location")]
+    pub location: WorkspaceLocation,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default = "default_terminal_shell")]
     pub terminal_shell: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub common_commands: Vec<WorkspaceCommonCommand>,
+}
+
+impl WorkspaceConfig {
+    pub fn is_remote(&self) -> bool {
+        self.location.is_remote()
+    }
+
+    pub fn display_path(&self, server: Option<&RemoteServerProfile>) -> String {
+        self.location.display_path(&self.path, server)
+    }
+
+    pub fn local_path(&self) -> Option<&Path> {
+        self.location.local_path(&self.path)
+    }
+
+    pub fn remote_path(&self) -> Option<&str> {
+        self.location.remote_path()
+    }
+
+    pub fn server_id(&self) -> Option<&str> {
+        self.location.server_id()
+    }
+
+    pub fn workspace_key(&self) -> String {
+        self.location.workspace_key(&self.path)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum WorkspaceLocation {
+    Local,
+    Ssh {
+        #[serde(rename = "serverId")]
+        server_id: String,
+        #[serde(rename = "remotePath")]
+        remote_path: String,
+    },
+}
+
+impl WorkspaceLocation {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Ssh { .. })
+    }
+
+    pub fn display_path(&self, legacy_path: &Path, server: Option<&RemoteServerProfile>) -> String {
+        match self {
+            Self::Local => display_config_path(legacy_path),
+            Self::Ssh {
+                server_id,
+                remote_path,
+            } => {
+                let server_name = server
+                    .map(|server| server.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        server
+                            .map(|server| server.host_alias.trim())
+                            .filter(|alias| !alias.is_empty())
+                    })
+                    .unwrap_or(server_id);
+                format!("{server_name}:{remote_path}")
+            }
+        }
+    }
+
+    pub fn local_path<'a>(&'a self, legacy_path: &'a Path) -> Option<&'a Path> {
+        match self {
+            Self::Local => Some(legacy_path),
+            Self::Ssh { .. } => None,
+        }
+    }
+
+    pub fn remote_path(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { remote_path, .. } => Some(remote_path),
+        }
+    }
+
+    pub fn server_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { server_id, .. } => Some(server_id),
+        }
+    }
+
+    pub fn workspace_key(&self, legacy_path: &Path) -> String {
+        match self {
+            Self::Local => format!("local:{}", display_config_path(legacy_path)),
+            Self::Ssh {
+                server_id,
+                remote_path,
+            } => format!("ssh:{server_id}:{remote_path}"),
+        }
+    }
+}
+
+impl Default for WorkspaceLocation {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+fn default_workspace_location() -> WorkspaceLocation {
+    WorkspaceLocation::Local
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1458,6 +1621,18 @@ fn default_terminal_shell() -> String {
     default_terminal_shell_for_current_platform().to_string()
 }
 
+fn default_remote_connect_timeout_ms() -> u64 {
+    DEFAULT_REMOTE_CONNECT_TIMEOUT_MS
+}
+
+fn display_config_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn path_is_empty(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
 fn validate_skill_scope(config_path: Option<&Path>, scope: &str) -> Result<(), ConfigError> {
     match scope {
         SKILL_SCOPE_GLOBAL | SKILL_SCOPE_WORKSPACE => Ok(()),
@@ -1480,16 +1655,112 @@ fn validate_workspace_directories(
     config_path: &Path,
 ) -> Result<(), ConfigError> {
     for workspace in &config.workspaces {
-        if !workspace.path.is_dir() {
+        let Some(path) = workspace.local_path() else {
+            continue;
+        };
+        if !path.is_dir() {
             return invalid_config(
                 Some(config_path),
                 format!(
                     "workspace '{}' path does not exist or is not a directory: {}",
                     workspace.id,
-                    workspace.path.display()
+                    path.display()
                 ),
             );
         }
+    }
+
+    Ok(())
+}
+
+fn validate_remote_server_profile(
+    config_path: Option<&Path>,
+    server: &RemoteServerProfile,
+) -> Result<(), ConfigError> {
+    validate_id(config_path, "remoteServers.id", &server.id)?;
+    require_non_empty(config_path, "remoteServers.name", &server.name)?;
+    require_non_empty(config_path, "remoteServers.hostAlias", &server.host_alias)?;
+    if let Some(user) = &server.user {
+        require_non_empty(config_path, "remoteServers.user", user)?;
+    }
+    if server.port == Some(0) {
+        return invalid_config(config_path, "remoteServers.port must be greater than 0");
+    }
+    if let Some(root) = &server.default_remote_root {
+        require_remote_absolute_path(config_path, "remoteServers.defaultRemoteRoot", root)?;
+    }
+    if let Some(command) = &server.foco_command {
+        require_non_empty(config_path, "remoteServers.focoCommand", command)?;
+    }
+    if let Some(shell) = &server.terminal_shell {
+        validate_terminal_shell(config_path, "remoteServers.terminalShell", shell)?;
+    }
+    if server.connect_timeout_ms == 0 {
+        return invalid_config(
+            config_path,
+            "remoteServers.connectTimeoutMs must be greater than 0",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_workspace_location(
+    config_path: Option<&Path>,
+    workspace: &WorkspaceConfig,
+    remote_server_ids: &HashSet<&str>,
+) -> Result<(), ConfigError> {
+    match &workspace.location {
+        WorkspaceLocation::Local => {
+            if !workspace.path.is_absolute() {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "workspace '{}' path must be absolute: {}",
+                        workspace.id,
+                        workspace.path.display()
+                    ),
+                );
+            }
+        }
+        WorkspaceLocation::Ssh {
+            server_id,
+            remote_path,
+        } => {
+            if !remote_server_ids.contains(server_id.as_str()) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "workspace '{}' remote server was not found: {}",
+                        workspace.id, server_id
+                    ),
+                );
+            }
+            require_remote_absolute_path(
+                config_path,
+                "workspace.location.remotePath",
+                remote_path,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn require_remote_absolute_path(
+    config_path: Option<&Path>,
+    field: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return invalid_config(config_path, format!("{field} must not be empty"));
+    }
+    if !value.starts_with('/') {
+        return invalid_config(
+            config_path,
+            format!("{field} must be an absolute remote path: {value}"),
+        );
     }
 
     Ok(())
@@ -2755,6 +3026,82 @@ mod tests {
             PathBuf::from("/tmp/foco-dev/memory.sqlite")
         );
         assert_eq!(paths.logs_dir, PathBuf::from("/tmp/foco-dev/logs"));
+    }
+
+    #[test]
+    fn remote_server_profile_and_ssh_workspace_validate_without_secrets() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "prod".to_string(),
+            name: "Prod".to_string(),
+            host_alias: "prod-box".to_string(),
+            user: Some("deploy".to_string()),
+            port: Some(22),
+            identity_file: None,
+            default_remote_root: Some("/srv".to_string()),
+            foco_command: Some("foco".to_string()),
+            terminal_shell: Some("bash".to_string()),
+            connect_timeout_ms: DEFAULT_REMOTE_CONNECT_TIMEOUT_MS,
+            last_known_target: Some("linux-x64".to_string()),
+            last_sidecar_version: Some("0.1.0".to_string()),
+            last_checked_at: Some("2026-07-04T00:00:00Z".to_string()),
+        });
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: PathBuf::new(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "prod".to_string(),
+                remote_path: "/srv/project".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        });
+
+        config.validate(None).expect("remote config validates");
+        assert!(config.workspaces[1].is_remote());
+        assert_eq!(config.workspaces[1].server_id(), Some("prod"));
+        assert_eq!(config.workspaces[1].remote_path(), Some("/srv/project"));
+        assert_eq!(
+            config.workspaces[1].display_path(Some(&config.remote_servers[0])),
+            "Prod:/srv/project"
+        );
+        let serialized = serde_json::to_string(&config.remote_servers).expect("serialize servers");
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("privateKey"));
+        assert!(!serialized.contains("apiKey"));
+    }
+
+    #[test]
+    fn ssh_workspace_rejects_relative_remote_path() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "prod".to_string(),
+            name: "Prod".to_string(),
+            host_alias: "prod-box".to_string(),
+            connect_timeout_ms: DEFAULT_REMOTE_CONNECT_TIMEOUT_MS,
+            ..RemoteServerProfile::default()
+        });
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: PathBuf::new(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "prod".to_string(),
+                remote_path: "relative/project".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        });
+
+        let error = config
+            .validate(None)
+            .expect_err("relative remote path fails");
+        assert!(error.to_string().contains("absolute remote path"));
     }
 
     #[test]

@@ -632,6 +632,7 @@ pub(crate) async fn add_workspace(
             id,
             name,
             path,
+            location: WorkspaceLocation::Local,
             pinned: false,
             terminal_shell: default_terminal_shell_for_current_platform().to_string(),
             common_commands: Vec::new(),

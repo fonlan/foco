@@ -193,7 +193,12 @@ pub(crate) async fn settings_response(
         workspaces: config
             .workspaces
             .iter()
-            .map(configured_workspace_summary)
+            .map(|workspace| {
+                configured_workspace_summary(
+                    workspace,
+                    remote_server_for_workspace(config, workspace),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
         terminal_shells: terminal_shell_summaries(),
         provider_kinds: supported_provider_kinds()
@@ -307,17 +312,29 @@ fn settings_system_prompt_summaries(
 
 pub(crate) fn configured_workspace_summary(
     workspace: &WorkspaceConfig,
+    server: Option<&foco_store::config::RemoteServerProfile>,
 ) -> Result<ConfiguredWorkspaceSummary, ApiError> {
     Ok(ConfiguredWorkspaceSummary {
         id: workspace.id.clone(),
         name: workspace.name.clone(),
-        path: display_path(&workspace.path),
+        path: workspace.display_path(server),
         logo_url: workspace_logo_url(workspace)?,
         pinned: workspace.pinned,
         terminal_shell: workspace.terminal_shell.clone(),
         common_commands: workspace_common_command_summaries(&workspace.common_commands),
         is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
     })
+}
+
+fn remote_server_for_workspace<'a>(
+    config: &'a GlobalConfig,
+    workspace: &WorkspaceConfig,
+) -> Option<&'a foco_store::config::RemoteServerProfile> {
+    let server_id = workspace.server_id()?;
+    config
+        .remote_servers
+        .iter()
+        .find(|server| server.id == server_id)
 }
 
 pub(crate) fn workspace_common_command_summaries(
@@ -595,6 +612,32 @@ pub(crate) fn workspace_response_from_config(
             workspace_path = %workspace.path.display(),
             "workspace summary build started"
         );
+        if workspace.is_remote() {
+            let server = remote_server_for_workspace(config, workspace);
+            workspaces.push(WorkspaceSummary {
+                id: workspace.id.clone(),
+                name: workspace.name.clone(),
+                path: workspace.display_path(server),
+                logo_url: None,
+                pinned: workspace.pinned,
+                terminal_shell: workspace.terminal_shell.clone(),
+                common_commands: workspace_common_command_summaries(&workspace.common_commands),
+                chats: Vec::new(),
+                chat_pagination: WorkspaceChatPagination {
+                    total: 0,
+                    limit: WORKSPACE_CHAT_PAGE_LIMIT,
+                    has_more: false,
+                    next_cursor: None,
+                },
+            });
+            tracing::debug!(
+                workspace_id = %workspace.id,
+                elapsed_ms = workspace_started_at.elapsed().as_millis() as u64,
+                "remote workspace summary deferred to sidecar"
+            );
+            continue;
+        }
+
         let database_started_at = Instant::now();
         tracing::debug!(
             workspace_id = %workspace.id,
@@ -672,10 +715,11 @@ pub(crate) fn workspace_response_from_config(
             "workspace summary logo lookup completed"
         );
 
+        let server = remote_server_for_workspace(config, workspace);
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
-            path: display_path(&workspace.path),
+            path: workspace.display_path(server),
             logo_url,
             pinned: workspace.pinned,
             terminal_shell: workspace.terminal_shell.clone(),

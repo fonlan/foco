@@ -40,10 +40,10 @@ pub(crate) struct SkillSearchRoot {
 #[derive(Debug)]
 pub(crate) struct ParsedSkillFile {
     pub(crate) id: String,
-    name: String,
+    pub(crate) name: String,
     description: String,
     frontmatter: String,
-    markdown: String,
+    pub(crate) markdown: String,
 }
 
 pub(crate) fn message_with_selected_skills(

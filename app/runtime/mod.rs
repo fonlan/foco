@@ -5,6 +5,7 @@ mod code_graph;
 mod image_tools;
 mod native_tools;
 mod questions;
+mod sidecar_config;
 mod subscriptions;
 mod tool_events;
 mod tool_execution;

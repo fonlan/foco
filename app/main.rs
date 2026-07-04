@@ -42,7 +42,7 @@ use foco_store::{
         ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
         SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
         SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, default_agent_execution_workspace_modes,
+        WorkspaceConfig, WorkspaceLocation, default_agent_execution_workspace_modes,
         default_terminal_shell_for_current_platform, load_global_config,
         load_or_create_global_config, save_global_config,
         validate_agent_definition_tool_references,
@@ -6284,7 +6284,10 @@ fn optional_workspace_logo_request_bytes(
 }
 
 pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
-    Ok(workspace_logo_file(&workspace.path)?.map(|logo| {
+    let Some(path) = workspace.local_path() else {
+        return Ok(None);
+    };
+    Ok(workspace_logo_file(path)?.map(|logo| {
         format!(
             "/api/workspaces/{}/logo/thumbnail?v={}",
             workspace.id, logo.version
