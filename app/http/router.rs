@@ -596,12 +596,12 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Middleware that proxies workspace-scoped API requests to the remote sidecar
-/// when the target workspace has an active SSH sidecar session.
+/// Proxies workspace-scoped API requests to the remote sidecar when the target
+/// workspace is remote.
 ///
-/// Only proxies routes that operate on workspace-local resources (files, git,
-/// terminal, spec, plans, code graph).  Chat, settings, memory, and other
-/// routes that involve global state or provider secrets stay local.
+/// Only proxies routes that operate on workspace-local resources: files, git,
+/// terminal, spec, plans, code graph, chat/runtime state, agents, schedules, and
+/// workspace statistics. Settings and provider secrets stay local.
 ///
 /// ponytail: v1 reads the entire request body, proxies, and returns the full
 /// response body in memory.  This is fine for the localhost SSH tunnel but
@@ -621,7 +621,12 @@ async fn remote_workspace_proxy_middleware(
         return next.run(request).await;
     };
 
-    // Check if this workspace is remote and has an active sidecar session
+    // Check if this workspace is remote and has an active sidecar session.
+    if let Err(error) =
+        crate::remote_workspace::ensure_remote_workspace_connected(&state, &workspace_id).await
+    {
+        return error.into_response();
+    }
     let (base, token) = match crate::remote_workspace::sidecar_proxy_target(&state, &workspace_id) {
         Ok(Some(target)) => target,
         _ => return next.run(request).await,
@@ -725,14 +730,27 @@ async fn proxy_websocket_upgrade(request: Request, proxy_url: String, token: Str
 /// after the workspace_id segment.  Returns None for routes that should stay local.
 fn proxy_workspace_route_path(path: &str) -> Option<&str> {
     // Match /api/workspaces/{id}/files, /api/workspaces/{id}/git, /api/workspaces/{id}/terminal,
-    // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, /api/workspaces/{id}/logo
+    // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, chat/runtime, scheduled tasks.
     let rest = path.strip_prefix("/api/workspaces/")?;
     let after_id = rest.split_once('/')?.1;
     let prefix = after_id.split('/').next().unwrap_or("");
     match prefix {
-        "files" | "git" | "terminal" | "spec" | "plans" | "logo" | "code-graph" | "graph" => {
-            Some(after_id)
-        }
+        "files"
+        | "git"
+        | "terminal"
+        | "spec"
+        | "plans"
+        | "logo"
+        | "code-graph"
+        | "graph"
+        | "chats"
+        | "chat"
+        | "context-usage"
+        | "agent-team"
+        | "agent-tasks"
+        | "ai-statistics"
+        | "scheduled-tasks"
+        | "scheduled-task-runs" => Some(after_id),
         _ => None,
     }
 }

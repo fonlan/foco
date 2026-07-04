@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     io,
     net::SocketAddr,
     path::Path,
@@ -18,12 +19,16 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::{StatusCode, header},
-    response::IntoResponse,
-    routing::{get, patch, post, put},
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{any, get, patch, post, put},
 };
 use chrono::{SecondsFormat, Utc};
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRequest, NeutralChatStreamEvent, NeutralUsage, stream_chat,
+    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent, NeutralUsage,
+    stream_chat,
 };
 use foco_store::{
     config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation},
@@ -31,7 +36,7 @@ use foco_store::{
         MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
         NewMemorySource,
     },
-    workspace::workspace_database_path,
+    workspace::{NewMessage, NewRunEvent, WorkspaceDatabase, workspace_database_path},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -40,7 +45,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::{Child, Command},
-    sync::{Mutex as AsyncMutex, oneshot},
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -77,6 +82,18 @@ pub(crate) struct RemoteWorkspaceSessionSummary {
     pub(crate) remote_port: u16,
     pub(crate) started_at: String,
     pub(crate) status: String,
+    pub(crate) active_runs: Vec<RemoteActiveRunSummary>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteActiveRunSummary {
+    pub(crate) run_id: String,
+    pub(crate) chat_id: String,
+    pub(crate) last_sequence: Option<i64>,
+    pub(crate) accepting_guidance: bool,
+    pub(crate) broker_status: String,
+    pub(crate) updated_at: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -132,6 +149,7 @@ impl RemoteWorkspaceManager {
             None,
             Utc::now().timestamp_millis().max(0) as u64,
         )?;
+        let active_runs = Arc::new(Mutex::new(Vec::new()));
         let control_task = connect_control_ws(
             state.clone(),
             local_port,
@@ -139,6 +157,7 @@ impl RemoteWorkspaceManager {
             bundle,
             server_id,
             workspace_id,
+            active_runs.clone(),
         )
         .await?;
 
@@ -154,6 +173,7 @@ impl RemoteWorkspaceManager {
             sidecar: AsyncMutex::new(Some(sidecar)),
             tunnel: AsyncMutex::new(Some(tunnel)),
             control_task: AsyncMutex::new(Some(control_task)),
+            active_runs,
         });
         let summary = session.summary();
         let mut sessions = self
@@ -283,6 +303,7 @@ pub(crate) async fn disconnect_remote_workspace(
             remote_port: 0,
             started_at: String::new(),
             status: "disconnected".to_string(),
+            active_runs: Vec::new(),
         }),
     }))
 }
@@ -312,10 +333,16 @@ struct RemoteWorkspaceSession {
     sidecar: AsyncMutex<Option<Child>>,
     tunnel: AsyncMutex<Option<Child>>,
     control_task: AsyncMutex<Option<JoinHandle<()>>>,
+    active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
 }
 
 impl RemoteWorkspaceSession {
     fn summary(&self) -> RemoteWorkspaceSessionSummary {
+        let active_runs = self
+            .active_runs
+            .lock()
+            .map(|runs| runs.clone())
+            .unwrap_or_default();
         RemoteWorkspaceSessionSummary {
             server_id: self.server_id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -325,6 +352,7 @@ impl RemoteWorkspaceSession {
             remote_port: self.remote_port,
             started_at: self.started_at.clone(),
             status: "connected".to_string(),
+            active_runs,
         }
     }
 
@@ -432,6 +460,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let shutdown_tx = default_shutdown_tx();
     let ws_count = Arc::new(AtomicUsize::new(0));
     let active_run_count = Arc::new(AtomicUsize::new(0));
+    let active_runs = Arc::new(Mutex::new(Vec::new()));
     let state = RemoteSidecarState {
         token: options.token,
         workspace_id: options.workspace_id.clone(),
@@ -439,9 +468,13 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         last_config_hash: Arc::new(Mutex::new(None)),
         code_graph_watcher: Arc::new(Mutex::new(None)),
         ws_count: ws_count.clone(),
+        active_run_count: active_run_count.clone(),
+        active_runs: active_runs.clone(),
+        broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
         broker_tx,
     };
 
+    let heartbeat_state = state.clone();
     let app = Router::new()
         .route(CONTROL_WS_PATH, get(remote_control_ws))
         // ponytail: workspace-scoped HTTP routes proxied from local main.
@@ -500,6 +533,79 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/hooks/runs/{hook_run_id}",
             get(remote_sidecar_hook_run_detail),
+        )
+        .route(
+            "/api/remote/workspace/chats",
+            get(remote_sidecar_workspace_chats),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/messages",
+            get(remote_sidecar_chat_messages),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/statistics",
+            get(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/todo-graph",
+            get(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/delete",
+            post(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chat/queue",
+            post(remote_sidecar_chat_queue),
+        )
+        .route(
+            "/api/remote/workspace/chat/stream",
+            post(remote_sidecar_chat_stream),
+        )
+        .route(
+            "/api/remote/workspace/chat/runs/{run_id}/stream",
+            get(remote_sidecar_chat_run_stream),
+        )
+        .route(
+            "/api/remote/workspace/chat/runs/{run_id}/stream-events",
+            get(remote_sidecar_chat_run_events_stream),
+        )
+        .route(
+            "/api/remote/workspace/chat/runs/{run_id}/cancel",
+            post(remote_sidecar_chat_run_cancel),
+        )
+        .route(
+            "/api/remote/workspace/chat/guidance",
+            post(remote_sidecar_chat_guidance),
+        )
+        .route(
+            "/api/remote/workspace/context-usage",
+            post(remote_sidecar_context_usage),
+        )
+        .route(
+            "/api/remote/workspace/agent-team/{*path}",
+            any(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/agent-tasks/{*path}",
+            any(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/ai-statistics/{request_id}",
+            get(remote_sidecar_ai_statistics_detail),
+        )
+        .route(
+            "/api/remote/workspace/scheduled-tasks",
+            get(remote_sidecar_passthrough_unavailable)
+                .post(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/scheduled-tasks/{*path}",
+            any(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/scheduled-task-runs/{*path}",
+            any(remote_sidecar_passthrough_unavailable),
         )
         .route(
             "/api/remote/workspace/git/status",
@@ -617,6 +723,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     }
 
     let shutdown = async move {
+        tokio::spawn(remote_sidecar_heartbeat_loop(heartbeat_state));
         tokio::spawn(idle_shutdown_watch(shutdown_tx, ws_count, active_run_count));
         let _ = rx.await;
     };
@@ -650,12 +757,66 @@ async fn idle_shutdown_watch(
     }
 }
 
+async fn remote_sidecar_heartbeat_loop(state: RemoteSidecarState) {
+    loop {
+        remote_sidecar_send_heartbeat(&state);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn remote_sidecar_send_heartbeat(state: &RemoteSidecarState) {
+    let active_runs = state
+        .active_runs
+        .lock()
+        .map(|runs| runs.clone())
+        .unwrap_or_default();
+    let envelope = ControlEnvelope {
+        version: 1,
+        message_type: "heartbeat".to_string(),
+        id: None,
+        method: Some("sidecar.heartbeat".to_string()),
+        payload: json!({
+            "workspaceId": state.workspace_id,
+            "activeRuns": active_runs,
+            "brokerStatus": if state.ws_count.load(Ordering::Relaxed) > 0 { "connected" } else { "brokerUnavailable" },
+        }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = state.broker_tx.send(envelope);
+}
+
+fn remote_sidecar_set_active_run(state: &RemoteSidecarState, run: RemoteActiveRunSummary) {
+    if let Ok(mut runs) = state.active_runs.lock() {
+        if let Some(existing) = runs
+            .iter_mut()
+            .find(|existing| existing.run_id == run.run_id)
+        {
+            *existing = run;
+        } else {
+            runs.push(run);
+        }
+        state.active_run_count.store(runs.len(), Ordering::Relaxed);
+    }
+    remote_sidecar_send_heartbeat(state);
+}
+
+fn remote_sidecar_remove_active_run(state: &RemoteSidecarState, run_id: &str) {
+    if let Ok(mut runs) = state.active_runs.lock() {
+        runs.retain(|run| run.run_id != run_id);
+        state.active_run_count.store(runs.len(), Ordering::Relaxed);
+    }
+    remote_sidecar_send_heartbeat(state);
+}
+
 #[derive(Clone)]
 struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
     code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
     ws_count: Arc<AtomicUsize>,
+    active_run_count: Arc<AtomicUsize>,
+    active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
+    broker_pending: Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<ControlEnvelope>>>>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
     workspace_id: String,
     workspace_path: String,
@@ -705,6 +866,18 @@ async fn remote_control_ws(
                     let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
                         continue;
                     };
+                    if matches!(envelope.message_type.as_str(), "response" | "error" | "stream") {
+                        if let Some(id) = envelope.id.clone() {
+                            if let Some(tx) = state.broker_pending.lock().await.get(&id).cloned() {
+                                let terminal = envelope.message_type == "response" || envelope.message_type == "error";
+                                let _ = tx.send(envelope);
+                                if terminal {
+                                    state.broker_pending.lock().await.remove(&id);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Handle inbound config sync from local main
                     if envelope.message_type == "config"
                         && envelope.method.as_deref() == Some("config.sync")
@@ -1211,6 +1384,7 @@ async fn connect_control_ws(
     bundle: crate::runtime::SidecarRuntimeConfigBundle,
     server_id: &str,
     workspace_id: &str,
+    active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
 ) -> Result<JoinHandle<()>, ApiError> {
     let url = format!("ws://127.0.0.1:{local_port}{CONTROL_WS_PATH}");
     let mut last_error = None;
@@ -1242,6 +1416,9 @@ async fn connect_control_ws(
                                     continue;
                                 };
                                 match envelope.message_type.as_str() {
+                                    "heartbeat" => {
+                                        update_remote_active_runs(&active_runs, &envelope.payload);
+                                    }
                                     "request" => {
                                         let request_id = envelope.id.clone();
                                         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -2347,6 +2524,63 @@ fn remote_error(
     ApiError::bad_request(format!("{prefix}: {}", message.into()))
 }
 
+fn remote_active_run_from_value(value: &Value) -> Option<RemoteActiveRunSummary> {
+    Some(RemoteActiveRunSummary {
+        run_id: value.get("runId")?.as_str()?.to_string(),
+        chat_id: value.get("chatId")?.as_str()?.to_string(),
+        last_sequence: value.get("lastSequence").and_then(Value::as_i64),
+        accepting_guidance: value
+            .get("acceptingGuidance")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        broker_status: value
+            .get("brokerStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("connected")
+            .to_string(),
+        updated_at: value
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn update_remote_active_runs(
+    active_runs: &Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
+    payload: &Value,
+) {
+    let Some(runs) = payload.get("activeRuns").and_then(Value::as_array) else {
+        return;
+    };
+    let summaries = runs
+        .iter()
+        .filter_map(remote_active_run_from_value)
+        .collect::<Vec<_>>();
+    if let Ok(mut active_runs) = active_runs.lock() {
+        *active_runs = summaries;
+    }
+}
+
+pub(crate) async fn ensure_remote_workspace_connected(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(), ApiError> {
+    if sidecar_proxy_target(state, workspace_id)?.is_some() {
+        return Ok(());
+    }
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let Some(server_id) = workspace.server_id().map(str::to_string) else {
+        return Ok(());
+    };
+    state
+        .remote_workspace_manager
+        .connect_workspace(state.clone(), &server_id, workspace_id)
+        .await?;
+    Ok(())
+}
+
 /// Return the local tunnel base URL and bearer token for a remote workspace's
 /// sidecar session, or None if the workspace is local or its sidecar is not connected.
 pub(crate) fn sidecar_proxy_target(
@@ -2542,6 +2776,589 @@ fn ensure_sidecar_code_graph(state: &RemoteSidecarState) -> Result<(), axum::res
         *lock = Some(watcher);
     }
     Ok(())
+}
+
+fn sidecar_workspace_database(
+    state: &RemoteSidecarState,
+) -> Result<WorkspaceDatabase, axum::response::Response> {
+    WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())
+}
+
+fn remote_chat_parts(content: &str, reasoning: Option<&str>) -> Vec<Value> {
+    let mut parts = Vec::new();
+    if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
+        parts.push(json!({ "type": "reasoning", "text": reasoning }));
+    }
+    if !content.is_empty() {
+        parts.push(json!({ "type": "text", "text": content }));
+    }
+    parts
+}
+
+fn remote_message_summary(message: foco_store::workspace::MessageRecord) -> Value {
+    let metadata =
+        serde_json::from_str::<Value>(&message.metadata_json).unwrap_or_else(|_| json!({}));
+    let reasoning = metadata.get("reasoning").and_then(Value::as_str);
+    json!({
+        "id": message.id,
+        "role": message.role,
+        "content": message.content,
+        "createdAt": message.created_at,
+        "reasoning": reasoning,
+        "sessionMode": metadata.get("sessionMode").or_else(|| metadata.get("session_mode")),
+        "pendingMode": metadata.get("pendingMode"),
+        "queuedRun": metadata.get("queuedRun"),
+        "toolCalls": [],
+        "parts": remote_chat_parts(&message.content, reasoning),
+        "metrics": metadata.get("metrics"),
+        "memoriesUsed": [],
+        "extractedMemories": [],
+        "specUpdates": [],
+    })
+}
+
+fn remote_chat_active_run(state: &RemoteSidecarState, chat_id: &str) -> Option<Value> {
+    state
+        .active_runs
+        .lock()
+        .ok()?
+        .iter()
+        .find(|run| run.chat_id == chat_id)
+        .map(|run| {
+            json!({
+                "runId": run.run_id,
+                "workspaceId": state.workspace_id,
+                "chatId": run.chat_id,
+                "lastSequence": run.last_sequence,
+                "acceptingGuidance": run.accepting_guidance,
+            })
+        })
+}
+
+async fn remote_sidecar_workspace_chats(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .clamp(1, 100);
+    let database = sidecar_workspace_database(&state)?;
+    let page = database
+        .chat_page(limit, None)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let chat_ids = page
+        .chats
+        .iter()
+        .map(|chat| chat.id.clone())
+        .collect::<Vec<_>>();
+    let code_change_stats = database
+        .code_change_stats_for_chats(&chat_ids)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let chats = page
+        .chats
+        .into_iter()
+        .map(|chat| {
+            json!({
+                "id": chat.id,
+                "title": chat.title,
+                "createdAt": chat.created_at,
+                "updatedAt": chat.updated_at,
+                "codeChangeStats": code_change_stats.get(&chat.id).cloned().unwrap_or_default(),
+                "activeRun": remote_chat_active_run(&state, &chat.id),
+                "queuedRun": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "chats": chats,
+        "total": page.total_count,
+        "limit": limit,
+        "hasMore": page.has_more,
+        "nextCursor": null,
+    })))
+}
+
+async fn remote_sidecar_chat_messages(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(500)
+        .clamp(1, 500);
+    let before = query
+        .get("beforeSequence")
+        .and_then(|value| value.parse::<i64>().ok());
+    let database = sidecar_workspace_database(&state)?;
+    let chat = database
+        .chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
+        })?;
+    let messages = database
+        .messages_for_chat_page(&chat_id, before, limit)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let has_more_before = messages.len() == limit;
+    let next_before_sequence = messages.first().map(|message| message.sequence);
+    Ok(Json(json!({
+        "chat": {
+            "id": chat.id,
+            "title": chat.title,
+            "kind": null,
+            "readOnly": false,
+        },
+        "messages": messages.into_iter().map(remote_message_summary).collect::<Vec<_>>(),
+        "pagination": {
+            "hasMoreBefore": has_more_before,
+            "nextBeforeSequence": next_before_sequence,
+        },
+        "activeRun": remote_chat_active_run(&state, &chat_id),
+        "pendingQuestion": null,
+        "latestResponseUsage": null,
+    })))
+}
+
+fn remote_required_text(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<String, axum::response::Response> {
+    let text = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request(format!("{field} is required")).into_response())?;
+    Ok(text.to_string())
+}
+
+fn remote_optional_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+async fn remote_sidecar_chat_queue(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let message = remote_required_text(payload.get("message"), "message")?;
+    let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
+    let provider_id = remote_optional_string(payload.get("providerId"));
+    let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let session_mode = remote_optional_string(payload.get("sessionMode"));
+    let mut database = sidecar_workspace_database(&state)?;
+    let chat_id =
+        remote_optional_string(payload.get("chatId")).unwrap_or_else(|| unique_id("chat"));
+    let chat = match database
+        .chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    {
+        Some(chat) => chat,
+        None => {
+            let title = message
+                .lines()
+                .next()
+                .unwrap_or("New chat")
+                .chars()
+                .take(80)
+                .collect::<String>();
+            database
+                .insert_chat_with_metadata(&chat_id, &title, "{}")
+                .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+            database
+                .chat(&chat_id)
+                .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+                .ok_or_else(|| {
+                    ApiError::internal("queued chat was not persisted").into_response()
+                })?
+        }
+    };
+    let user_sequence = database
+        .next_message_sequence_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let assistant_sequence = user_sequence + 1;
+    let user_message_id = unique_id("msg-user");
+    let assistant_message_id = unique_id("msg-assistant");
+    let queued_run = json!({
+        "status": "queued",
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": assistant_sequence,
+        "modelId": model_id,
+        "providerId": provider_id,
+        "thinkingLevel": thinking_level,
+        "skillIds": payload.get("skillIds").cloned().unwrap_or_else(|| json!([])),
+        "sessionMode": session_mode,
+    });
+    let user_metadata = json!({
+        "parts": remote_chat_parts(&message, None),
+        "queuedRun": queued_run,
+    });
+    database
+        .insert_message(NewMessage {
+            id: &user_message_id,
+            chat_id: &chat_id,
+            role: "user",
+            content: &message,
+            sequence: user_sequence,
+            metadata_json: Some(&user_metadata.to_string()),
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    database
+        .insert_message(NewMessage {
+            id: &assistant_message_id,
+            chat_id: &chat_id,
+            role: "assistant",
+            content: "",
+            sequence: assistant_sequence,
+            metadata_json: Some("{}"),
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({
+        "chatId": chat_id,
+        "chatTitle": chat.title,
+        "createdAt": chat.created_at,
+        "updatedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "content": message,
+        "parts": remote_chat_parts(&message, None),
+        "sessionMode": session_mode,
+    })))
+}
+
+async fn remote_sidecar_broker_request(
+    state: &RemoteSidecarState,
+    method: &str,
+    payload: Value,
+) -> Result<mpsc::UnboundedReceiver<ControlEnvelope>, axum::response::Response> {
+    let id = unique_id("broker-request");
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.broker_pending.lock().await.insert(id.clone(), tx);
+    let envelope = ControlEnvelope {
+        version: 1,
+        message_type: "request".to_string(),
+        id: Some(id.clone()),
+        method: Some(method.to_string()),
+        payload,
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    if state.broker_tx.send(envelope).is_err() {
+        state.broker_pending.lock().await.remove(&id);
+        return Err(ApiError::bad_gateway("remote broker is unavailable").into_response());
+    }
+    Ok(rx)
+}
+
+fn remote_sse_json_event(sequence: i64, event: Value) -> Event {
+    Event::default()
+        .id(sequence.to_string())
+        .data(event.to_string())
+}
+
+fn neutral_role_for_message(role: &str) -> NeutralChatRole {
+    match role {
+        "assistant" => NeutralChatRole::Assistant,
+        "tool" => NeutralChatRole::Tool,
+        "system" => NeutralChatRole::System,
+        "developer" => NeutralChatRole::Developer,
+        _ => NeutralChatRole::User,
+    }
+}
+
+async fn remote_sidecar_chat_stream(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    axum::response::Response,
+> {
+    let chat_id = remote_required_text(payload.get("chatId"), "chatId")?;
+    let queued_user_message_id =
+        remote_required_text(payload.get("queuedUserMessageId"), "queuedUserMessageId")?;
+    let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
+    let provider_id =
+        remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
+    let database = sidecar_workspace_database(&state)?;
+    let user_message = database
+        .message(&queued_user_message_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request("queued user message was not found").into_response()
+        })?;
+    let assistant_message_id = payload
+        .get("visibleAssistantMessageId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            let metadata = serde_json::from_str::<Value>(&user_message.metadata_json).ok()?;
+            metadata
+                .get("queuedRun")
+                .and_then(|run| run.get("assistantMessageId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| unique_id("msg-assistant"));
+    let run_id = unique_id("remote-run");
+    let messages = database
+        .messages_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .filter(|message| message.role != "assistant" || message.id != assistant_message_id)
+        .map(|message| NeutralChatMessage {
+            role: neutral_role_for_message(&message.role),
+            content: message.content,
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        })
+        .collect::<Vec<_>>();
+    let run = RemoteActiveRunSummary {
+        run_id: run_id.clone(),
+        chat_id: chat_id.clone(),
+        last_sequence: Some(0),
+        accepting_guidance: true,
+        broker_status: "connected".to_string(),
+        updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    };
+    remote_sidecar_set_active_run(&state, run);
+    let broker_rx = remote_sidecar_broker_request(
+        &state,
+        "llm.stream",
+        json!({
+            "providerId": provider_id,
+            "modelId": model_id,
+            "messages": messages,
+            "thinkingLevel": payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+        }),
+    )
+    .await?;
+    let stream_state = state.clone();
+    let stream = async_stream::stream! {
+        let mut broker_rx = broker_rx;
+        let mut sequence = 0_i64;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        yield Ok(remote_sse_json_event(sequence, json!({
+            "type": "start",
+            "chatId": chat_id,
+            "userMessageId": queued_user_message_id,
+            "assistantMessageId": assistant_message_id,
+            "llmRequestId": run_id,
+            "memoriesUsed": [],
+        })));
+        loop {
+            let Some(envelope) = broker_rx.recv().await else { break };
+            match envelope.message_type.as_str() {
+                "stream" => {
+                    let kind = envelope.payload.get("kind").and_then(Value::as_str).unwrap_or("");
+                    let delta = envelope.payload.get("delta").and_then(Value::as_str).unwrap_or("");
+                    if kind == "textDelta" {
+                        text.push_str(delta);
+                        sequence += 1;
+                        yield Ok(remote_sse_json_event(sequence, json!({
+                            "type": "textDelta",
+                            "assistantMessageId": assistant_message_id,
+                            "delta": delta,
+                        })));
+                    } else if kind == "reasoningDelta" {
+                        reasoning.push_str(delta);
+                        sequence += 1;
+                        yield Ok(remote_sse_json_event(sequence, json!({
+                            "type": "reasoningDelta",
+                            "assistantMessageId": assistant_message_id,
+                            "delta": delta,
+                        })));
+                    } else if kind == "usageDelta" {
+                        sequence += 1;
+                        yield Ok(remote_sse_json_event(sequence, json!({
+                            "type": "usage",
+                            "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                        })));
+                    }
+                    remote_sidecar_set_active_run(&stream_state, RemoteActiveRunSummary {
+                        run_id: run_id.clone(),
+                        chat_id: chat_id.clone(),
+                        last_sequence: Some(sequence),
+                        accepting_guidance: true,
+                        broker_status: "connected".to_string(),
+                        updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    });
+                }
+                "response" => {
+                    let mut database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
+                        Ok(database) => database,
+                        Err(error) => {
+                            sequence += 1;
+                            yield Ok(remote_sse_json_event(sequence, json!({ "type": "error", "message": error.to_string() })));
+                            break;
+                        }
+                    };
+                    let metadata = json!({
+                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                        "parts": remote_chat_parts(&text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                    });
+                    let assistant_sequence = database
+                        .message(&assistant_message_id)
+                        .ok()
+                        .flatten()
+                        .map(|message| message.sequence)
+                        .unwrap_or_else(|| database.next_message_sequence_for_chat(&chat_id).unwrap_or(0));
+                    let _ = database.upsert_message_content(NewMessage {
+                        id: &assistant_message_id,
+                        chat_id: &chat_id,
+                        role: "assistant",
+                        content: &text,
+                        sequence: assistant_sequence,
+                        metadata_json: Some(&metadata.to_string()),
+                    });
+                    let _ = database.insert_run_event(NewRunEvent {
+                        id: &unique_id("run-event"),
+                        chat_id: &chat_id,
+                        run_id: &run_id,
+                        sequence,
+                        event_type: "completion",
+                        payload_json: &json!({ "type": "complete", "chatId": chat_id, "assistantMessageId": assistant_message_id }).to_string(),
+                    });
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({
+                        "type": "complete",
+                        "chatId": chat_id,
+                        "assistantMessageId": assistant_message_id,
+                        "text": text,
+                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                        "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                        "stopReason": null,
+                        "metrics": { "startedAt": null, "completedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true), "durationMs": null },
+                        "memoriesUsed": [],
+                    })));
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    break;
+                }
+                "error" => {
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({
+                        "type": "error",
+                        "message": envelope.payload.get("message").and_then(Value::as_str).unwrap_or("remote broker unavailable"),
+                    })));
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        remote_sidecar_remove_active_run(&stream_state, &run_id);
+    };
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    ))
+}
+
+async fn remote_sidecar_chat_run_stream(
+    State(_state): State<RemoteSidecarState>,
+    AxumPath(_run_id): AxumPath<String>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    axum::response::Response,
+> {
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().data(json!({
+            "type": "error",
+            "message": "remote run is not active in this sidecar session; reload chat messages to recover persisted state",
+        }).to_string()));
+        yield Ok(Event::default().data(json!({ "type": "streamEnd" }).to_string()));
+    };
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    ))
+}
+
+async fn remote_sidecar_chat_run_events_stream(
+    State(_state): State<RemoteSidecarState>,
+    AxumPath(_run_id): AxumPath<String>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    axum::response::Response,
+> {
+    remote_sidecar_chat_run_stream(State(_state), AxumPath(_run_id)).await
+}
+
+async fn remote_sidecar_chat_run_cancel(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(run_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let cancel = ControlEnvelope {
+        version: 1,
+        message_type: "cancel".to_string(),
+        id: Some(run_id.clone()),
+        method: None,
+        payload: json!({}),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = state.broker_tx.send(cancel);
+    remote_sidecar_remove_active_run(&state, &run_id);
+    Ok(Json(json!({ "ok": true, "runId": run_id })))
+}
+
+async fn remote_sidecar_chat_guidance(
+    State(_state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    Ok(Json(json!({
+        "id": unique_id("msg-guidance"),
+        "content": payload.get("message").and_then(Value::as_str).unwrap_or_default(),
+        "parts": remote_chat_parts(payload.get("message").and_then(Value::as_str).unwrap_or_default(), None),
+        "brokerStatus": "queuedUntilRunResumes",
+    })))
+}
+
+async fn remote_sidecar_context_usage(
+    State(_state): State<RemoteSidecarState>,
+    Json(_payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    Ok(Json(json!({
+        "usedMessageTokens": 0,
+        "availableMessageTokens": 0,
+        "memoryContextTokens": 0,
+        "memoryBudgetTokens": 0,
+        "usagePercent": 0,
+        "compressionTriggerTokens": 0,
+        "compressionTriggerPercent": 0,
+        "willCompressOnNextSend": false,
+        "tokenBreakdown": {},
+        "remoteApproximation": true,
+    })))
+}
+
+async fn remote_sidecar_ai_statistics_detail(
+    State(_state): State<RemoteSidecarState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    Err(ApiError::bad_request(format!(
+        "remote AI statistics detail is unavailable while offline or uncached: {request_id}"
+    ))
+    .into_response())
+}
+
+async fn remote_sidecar_passthrough_unavailable() -> Result<Json<Value>, axum::response::Response> {
+    Err(
+        ApiError::bad_gateway("remote sidecar runtime endpoint is not available in this build")
+            .into_response(),
+    )
 }
 
 async fn remote_sidecar_file_tree(
@@ -3883,5 +4700,28 @@ mod tests {
         let error = RemoteSidecarOptions::parse(&["--server-id".to_string(), "srv".to_string()])
             .unwrap_err();
         assert!(error.to_string().contains("--workspace-id"));
+    }
+
+    #[test]
+    fn remote_active_run_heartbeats_replace_local_cache() {
+        let active_runs = Arc::new(Mutex::new(Vec::new()));
+        update_remote_active_runs(
+            &active_runs,
+            &json!({
+                "activeRuns": [{
+                    "runId": "run-1",
+                    "chatId": "chat-1",
+                    "lastSequence": 7,
+                    "acceptingGuidance": true,
+                    "brokerStatus": "brokerUnavailable",
+                    "updatedAt": "2026-07-04T00:00:00Z",
+                }],
+            }),
+        );
+        let runs = active_runs.lock().expect("active runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "run-1");
+        assert_eq!(runs[0].last_sequence, Some(7));
+        assert_eq!(runs[0].broker_status, "brokerUnavailable");
     }
 }
