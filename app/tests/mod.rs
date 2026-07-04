@@ -1857,13 +1857,18 @@ Search memory before repo work.
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(messages[0].role, NeutralChatRole::System);
     assert!(messages[0].content.contains("<skills_instructions>"));
     assert!(messages[0].content.contains(ENABLED_SKILLS_MESSAGE_PREFIX));
     assert!(
         messages[0]
             .content
             .contains("lightweight skill routing table")
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("answer questions about available skills")
     );
     assert!(
         messages[0]
@@ -1880,22 +1885,79 @@ Search memory before repo work.
             .content
             .contains("If no skill clearly matches, continue silently")
     );
-    assert!(
-        messages[0]
-            .content
-            .contains(&format!("<skill path=\"{}\">", skill_file.display()))
-    );
-    assert!(
-        messages[0]
-            .content
-            .contains("<frontmatter><![CDATA[\nname: gitmemo")
-    );
+    assert!(messages[0].content.contains("name: gitmemo"));
     assert!(messages[0].content.contains("description: Project memory."));
-    assert!(messages[0].content.contains("\n]]></frontmatter>"));
+    assert!(
+        messages[0]
+            .content
+            .contains(&format!("path: {}", skill_file.display()))
+    );
+    assert!(!messages[0].content.contains("<frontmatter>"));
+    assert!(!messages[0].content.contains("CDATA"));
     assert!(messages[0].content.contains("</skills_instructions>"));
-    assert!(!messages[0].content.contains("Search memory"));
+}
 
-    fs::remove_dir_all(profile_dir).expect("remove skill test profile");
+#[test]
+fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-mixed-scope-skill-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-mixed-scope-skill-workspace-test"));
+
+    for (root, skill_id, description) in [
+        (
+            &profile_dir.join(".agents").join("skills"),
+            "global-one",
+            "Global one.",
+        ),
+        (
+            &profile_dir.join(".agents").join("skills"),
+            "global-two",
+            "Global two.",
+        ),
+        (
+            &workspace_dir.join(".agents").join("skills"),
+            "workspace-one",
+            "Workspace one.",
+        ),
+        (
+            &workspace_dir.join(".agents").join("skills"),
+            "workspace-two",
+            "Workspace two.",
+        ),
+    ] {
+        let skill_dir = root.join(skill_id);
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_id}\ndescription: {description}\n---\n\n# {skill_id}\n\nFull instructions for {skill_id}.\n"
+            ),
+        )
+        .expect("skill file write");
+    }
+
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let messages =
+        enabled_skill_frontmatter_messages(&profile_dir, &config, &config.workspaces[0].id)
+            .expect("enabled skill frontmatter messages");
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, NeutralChatRole::System);
+    for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
+        assert!(messages[0].content.contains(&format!("name: {skill_id}")));
+        assert!(
+            messages[0]
+                .content
+                .contains(&format!("{skill_id}{}SKILL.md", std::path::MAIN_SEPARATOR))
+        );
+        assert!(
+            !messages[0]
+                .content
+                .contains(&format!("Full instructions for {skill_id}"))
+        );
+    }
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 #[test]
@@ -6400,7 +6462,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
 }
 
 #[tokio::test]
-async fn queued_new_chat_persists_skills_for_scheduler_replay() {
+async fn queued_new_chat_regenerates_skills_for_scheduler_replay() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-queued-skills-workspace-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-queued-skills-profile-test"));
     let skill_dir = profile_dir
@@ -6463,12 +6525,12 @@ Only load this when matched.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<skills_instructions>")
+                .contains("<environment_context>")
         );
         assert!(
-            context_injections[0]
+            !context_injections[0]
                 .messages_json
-                .contains("name: queuedmemo")
+                .contains("<skills_instructions>")
         );
         assert_eq!(context_injections[0].memory_keys_json, "[]");
     }
@@ -6502,11 +6564,16 @@ Only load this when matched.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
     assert!(
         skill_messages[0]
             .content
             .contains("description: Queued skill routing.")
+    );
+    assert!(
+        !skill_messages[0]
+            .content
+            .contains("Only load this when matched")
     );
     assert!(
         scheduler_context
@@ -6525,7 +6592,7 @@ Only load this when matched.
 }
 
 #[tokio::test]
-async fn queued_new_chat_persists_skills_when_memory_is_deferred() {
+async fn queued_new_chat_regenerates_skills_when_memory_is_deferred() {
     let workspace_dir =
         env::temp_dir().join(unique_id("foco-queued-deferred-skills-workspace-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-queued-deferred-skills-profile-test"));
@@ -6590,12 +6657,12 @@ Only load this when matched.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<skills_instructions>")
+                .contains("<environment_context>")
         );
         assert!(
-            context_injections[0]
+            !context_injections[0]
                 .messages_json
-                .contains("name: deferredmemo")
+                .contains("<skills_instructions>")
         );
         assert_eq!(context_injections[0].memory_keys_json, "[]");
     }
@@ -12326,7 +12393,7 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
     assert!(skill_messages[0].content.contains("name: gitmemo"));
     assert!(
         skill_messages[0]
@@ -12377,7 +12444,12 @@ Search memory before repo work.
                 .contains("<environment_context>")
         );
         assert!(
-            context_injections[0]
+            !context_injections[0]
+                .messages_json
+                .contains("<skills_instructions>")
+        );
+        assert!(
+            !context_injections[0]
                 .messages_json
                 .contains("\"role\":\"developer\"")
         );
@@ -12389,7 +12461,19 @@ Search memory before repo work.
     }
 
     config.prompts.extra_text = "Updated extra configured prompt.\n".to_string();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---
+name: gitmemo
+description: Updated project memory.
+---
 
+# GitMemo
+
+Updated full instructions.
+",
+    )
+    .expect("updated skill file write");
     let existing_context = prepare_chat_context(
         &state,
         &config,
@@ -12459,10 +12543,16 @@ Search memory before repo work.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
-    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
-    assert_eq!(
-        existing_skill_messages[0].content,
-        skill_messages[0].content
+    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::System);
+    assert!(
+        existing_skill_messages[0]
+            .content
+            .contains("description: Updated project memory.")
+    );
+    assert!(
+        !existing_skill_messages[0]
+            .content
+            .contains("Updated full instructions")
     );
     let existing_environment_messages = existing_context
         .provider_request
@@ -12956,7 +13046,7 @@ Use this only after reading the skill file.
         command: Some("test-mcp-server".to_string()),
         args: Vec::new(),
         url: None,
-        execution_host: Default::default(),
+        execution_host: foco_store::config::McpExecutionHost::Local,
     });
     let mcp_tool_name = "mcp__docs__search";
     let state = test_app_state(config.clone(), profile_dir.clone());
@@ -13061,11 +13151,16 @@ Use this only after reading the skill file.
         .iter()
         .find(|message| message.content.contains("<skills_instructions>"))
         .expect("plan mode skill instructions message");
-    assert_eq!(skill_message.role, NeutralChatRole::Developer);
+    assert_eq!(skill_message.role, NeutralChatRole::System);
     assert!(
         skill_message
             .content
             .contains("lightweight skill routing table")
+    );
+    assert!(
+        skill_message
+            .content
+            .contains("answer questions about available skills")
     );
     assert!(
         skill_message
@@ -13085,7 +13180,7 @@ Use this only after reading the skill file.
     assert!(
         skill_message
             .content
-            .contains(&format!("<skill path=\"{}\">", skill_file.display()))
+            .contains(&format!("path: {}", skill_file.display()))
     );
     assert!(skill_message.content.contains("name: plan-router"));
     assert!(
@@ -13093,6 +13188,7 @@ Use this only after reading the skill file.
             .content
             .contains("description: Helps draft focused plans.")
     );
+    assert!(!skill_message.content.contains("CDATA"));
     assert!(
         !skill_message
             .content

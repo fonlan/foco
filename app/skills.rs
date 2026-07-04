@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
@@ -42,7 +43,6 @@ pub(crate) struct ParsedSkillFile {
     pub(crate) id: String,
     pub(crate) name: String,
     description: String,
-    frontmatter: String,
     pub(crate) markdown: String,
 }
 
@@ -288,7 +288,7 @@ fn discover_skills_in_roots(roots: impl IntoIterator<Item = SkillSearchRoot>) ->
         };
 
         for path in candidates {
-            match parse_skill_file(&path) {
+            match parse_skill_file_frontmatter(&path) {
                 Ok(parsed) => {
                     let key = skill_key(&root, &parsed.id);
                     if !seen_keys.insert(key.clone()) {
@@ -606,6 +606,50 @@ pub(crate) fn parse_skill_file(path: &Path) -> Result<ParsedSkillFile, String> {
     parse_skill_markdown(path, &content)
 }
 
+fn parse_skill_file_frontmatter(path: &Path) -> Result<ParsedSkillFile, String> {
+    let file = fs::File::open(path)
+        .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
+    let mut lines = BufReader::new(file).lines();
+    let first_line = lines
+        .next()
+        .transpose()
+        .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
+
+    if first_line.as_deref().map(str::trim) != Some("---") {
+        return Err(format!(
+            "skill file {} must start with YAML frontmatter delimiter '---'",
+            path.display()
+        ));
+    }
+
+    let mut frontmatter = Vec::new();
+    for line in lines {
+        let line = line.map_err(|source| {
+            format!("failed to read skill file {}: {}", path.display(), source)
+        })?;
+        if line.trim() == "---" {
+            let id = skill_frontmatter_field(path, &frontmatter, "name")?;
+            validate_skill_id(&id)
+                .map_err(|error| format!("skill file {}: {}", path.display(), error))?;
+            let description = skill_frontmatter_field(path, &frontmatter, "description")?;
+
+            return Ok(ParsedSkillFile {
+                id: id.clone(),
+                name: id,
+                description,
+                markdown: String::new(),
+            });
+        }
+
+        frontmatter.push(line);
+    }
+
+    Err(format!(
+        "skill file {} is missing closing YAML frontmatter delimiter '---'",
+        path.display()
+    ))
+}
+
 fn parse_skill_file_id(path: &Path) -> Result<String, String> {
     let content = fs::read_to_string(path)
         .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
@@ -658,7 +702,6 @@ pub(crate) fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedS
         id: id.clone(),
         name: id,
         description,
-        frontmatter: frontmatter.join("\n"),
         markdown: content.to_string(),
     })
 }
@@ -692,13 +735,13 @@ fn parse_skill_markdown_id(path: &Path, content: &str) -> Result<String, String>
     ))
 }
 
-fn skill_frontmatter_field(
+fn skill_frontmatter_field<T: AsRef<str>>(
     path: &Path,
-    frontmatter: &[&str],
+    frontmatter: &[T],
     field: &str,
 ) -> Result<String, String> {
     for line in frontmatter {
-        let trimmed = line.trim();
+        let trimmed = line.as_ref().trim();
 
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -786,43 +829,37 @@ pub(crate) fn enabled_skill_frontmatter_messages(
         .map(String::as_str)
         .collect::<HashSet<_>>();
 
-    let mut entries = Vec::new();
-    for skill in discovery.skills.iter().filter(|skill| {
-        skill_applies_to_workspace(skill, workspace_id)
-            && !skill_is_disabled(skill, &disabled_ids)
-            && !skill_is_required_disabled(skill, &required_disabled_ids)
-    }) {
-        let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
-
-        if parsed.id != skill.id {
-            return Err(ApiError::bad_request(format!(
-                "enabled skill '{}' file now declares skill id '{}'",
-                skill.key, parsed.id
-            )));
-        }
-
-        entries.push(skill_frontmatter_entry(&skill.path, parsed));
-    }
+    let entries = discovery
+        .skills
+        .iter()
+        .filter(|skill| {
+            skill_applies_to_workspace(skill, workspace_id)
+                && !skill_is_disabled(skill, &disabled_ids)
+                && !skill_is_required_disabled(skill, &required_disabled_ids)
+        })
+        .map(skill_frontmatter_entry)
+        .collect::<Vec<_>>();
 
     if entries.is_empty() {
         return Ok(Vec::new());
     }
 
     Ok(vec![neutral_text_message(
-        NeutralChatRole::Developer,
+        NeutralChatRole::System,
         format!(
-            "<skills_instructions>\n<source>{}</source>\n<usage>\nAt the start of a new user task, treat the enabled skill frontmatter below as a lightweight skill routing table.\nFirst compare the user's task against each skill's name and description. If there is a clear match, use read_file on that skill's path to load its SKILL.md before applying it.\nDo not pre-load every skill's SKILL.md or read all skill full instructions speculatively; only read matched skills. If no skill clearly matches, continue silently with the normal workflow.\n</usage>\n{}\n</skills_instructions>",
+            "<skills_instructions>\n<source>{}</source>\n<usage>\nEnabled skill frontmatter is already loaded below as a lightweight skill routing table. Use it to answer questions about available skills and to route tasks by comparing the user's task to each skill's name and description.\nWhen a skill clearly matches, use read_file on that skill's path to load the full SKILL.md before applying it.\nDo not pre-load every skill's SKILL.md or read all skill full instructions speculatively; only read matched skills. If no skill clearly matches, continue silently with the normal workflow.\n</usage>\n<skills>\n{}\n</skills>\n</skills_instructions>",
             xml_text_escape(ENABLED_SKILLS_MESSAGE_PREFIX),
             entries.join("\n")
         ),
     )])
 }
 
-fn skill_frontmatter_entry(path: &Path, skill: ParsedSkillFile) -> String {
+fn skill_frontmatter_entry(skill: &SkillSettings) -> String {
     format!(
-        "<skill path=\"{}\">\n{}\n</skill>",
-        xml_text_escape(&path.display().to_string()),
-        xml_cdata_section("frontmatter", skill.frontmatter.trim())
+        "<skill>\nname: {}\ndescription: {}\npath: {}\n</skill>",
+        xml_text_escape(&skill.name),
+        xml_text_escape(&skill.description),
+        xml_text_escape(&skill.path.display().to_string())
     )
 }
 

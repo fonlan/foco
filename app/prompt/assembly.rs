@@ -285,6 +285,8 @@ pub(crate) async fn prepare_prompt_context(
         .map(|_| build_project_spec_prompt_section());
     let memory_prompt_section = config.memory.enabled.then(build_memory_prompt_section);
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
+    let skill_messages =
+        enabled_skill_frontmatter_messages(&state.user_profile_dir, config, &workspace.id)?;
     let system_prompt_tokens = estimate_text_tokens(&system_prompt)
         + project_spec_prompt_section
             .as_ref()
@@ -297,7 +299,11 @@ pub(crate) async fn prepare_prompt_context(
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
-            .unwrap_or(0);
+            .unwrap_or(0)
+        + skill_messages
+            .iter()
+            .map(|message| estimate_text_tokens(&message.content))
+            .sum::<u64>();
     let context_budget = calculate_context_budget(
         limits.context_window,
         limits.max_output_tokens,
@@ -319,11 +325,6 @@ pub(crate) async fn prepare_prompt_context(
     };
     let environment_messages = if is_new_chat {
         vec![environment_context_message(&workspace.path)?]
-    } else {
-        Vec::new()
-    };
-    let skill_messages = if is_new_chat {
-        enabled_skill_frontmatter_messages(&state.user_profile_dir, config, &workspace.id)?
     } else {
         Vec::new()
     };
@@ -383,7 +384,6 @@ pub(crate) async fn prepare_prompt_context(
         messages.extend(agents_messages);
         messages.extend(configured_prompt_messages);
         messages.extend(environment_messages);
-        messages.extend(skill_messages);
         messages
     } else {
         existing_stable_context_messages
@@ -427,6 +427,7 @@ pub(crate) async fn prepare_prompt_context(
             + usize::from(memory_prompt_section.is_some())
             + existing_turn_memory_messages.len()
             + current_turn_memory_messages.len()
+            + skill_messages.len()
             + usize::from(assistant_draft.is_some() || assistant_draft_reasoning.is_some())
             + 2,
     );
@@ -456,6 +457,11 @@ pub(crate) async fn prepare_prompt_context(
             NeutralChatRole::System,
             available_tools_prompt,
         ));
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::ReservedPrompt);
+    }
+    for skill_message in skill_messages {
+        neutral_messages.push(skill_message);
         message_source_sequences.push(None);
         message_context_sources.push(PromptContextSource::ReservedPrompt);
     }
