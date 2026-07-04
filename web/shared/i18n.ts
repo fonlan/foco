@@ -1128,6 +1128,14 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "manual sync": "手动同步",
     "sync regex {pattern}": "同步正则 {pattern}",
     "Save provider": "保存供应商",
+    "Model redirects": "模型名称重定向",
+    "Add redirect": "添加重定向",
+    "Expose provider model IDs under local model IDs.":
+      "把供应商原始模型 ID 暴露为本地模型 ID。",
+    "Upstream model": "上游模型",
+    "Local model": "本地模型",
+    "Delete redirect": "删除重定向",
+    "No model redirects configured.": "暂无模型名称重定向。",
     "Request overrides": "请求字段覆写",
     "Add override": "添加覆写",
     "Override top-level request headers or body fields for this provider.":

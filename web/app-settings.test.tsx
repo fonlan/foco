@@ -546,6 +546,47 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByRole("button", { name: "保存 Spec 设置" })).toBeInTheDocument();
   });
 
+  it("localizes provider model redirect controls", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" },
+      providers: [
+        {
+          ...settings.providers[0],
+          modelRedirects: [
+            { from: "qwen/qwen3.6-35b-a3b", to: "qwen3.6-35b-a3b" },
+          ],
+        },
+        settings.providers[1],
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse(zhSettings)
+          : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "设置" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "设置" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "供应商" }));
+
+    expect(await screen.findByText("qwen/qwen3.6-35b-a3b -> qwen3.6-35b-a3b")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "编辑供应商 OpenAI" }));
+    expect(screen.getByRole("heading", { name: "模型名称重定向" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "添加重定向" })).toBeInTheDocument();
+    expect(screen.getByLabelText("上游模型")).toHaveValue("qwen/qwen3.6-35b-a3b");
+    expect(screen.getByLabelText("本地模型")).toHaveValue("qwen3.6-35b-a3b");
+  });
+
   it("refreshes configured provider model support", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
