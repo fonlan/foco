@@ -549,15 +549,10 @@ export function SettingsPanel({
   const [isRefreshingProviderModels, setIsRefreshingProviderModels] =
     useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
-  const [isSavingModelOrder, setIsSavingModelOrder] = useState(false);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
   const [isRefreshingSkills, setIsRefreshingSkills] = useState(false);
   const [updatingSkillKey, setUpdatingSkillKey] = useState<string | null>(null);
   const [isUpdatingAllSkills, setIsUpdatingAllSkills] = useState(false);
-  const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
-  const [modelOrderPreview, setModelOrderPreview] = useState<string[] | null>(
-    null,
-  );
   const [draggedWorkspaceId, setDraggedWorkspaceId] = useState<string | null>(
     null,
   );
@@ -787,26 +782,7 @@ export function SettingsPanel({
     (settings?.general.webServer.passwordEnabled && !isEditingGeneralPassword
       ? SAVED_PASSWORD_MASK
       : "");
-  const orderedConfiguredModels = useMemo(() => {
-    const sortedConfiguredModels = [...configuredModels].sort((left, right) =>
-      left.displayName.localeCompare(right.displayName),
-    );
 
-    if (!modelOrderPreview) {
-      return sortedConfiguredModels;
-    }
-
-    const modelsById = new Map(
-      sortedConfiguredModels.map((model) => [model.id, model]),
-    );
-    const previewModels = modelOrderPreview
-      .map((modelId) => modelsById.get(modelId))
-      .filter((model): model is ConfiguredModelSummary => Boolean(model));
-
-    return previewModels.length === sortedConfiguredModels.length
-      ? previewModels
-      : sortedConfiguredModels;
-  }, [configuredModels, modelOrderPreview]);
   const orderedWorkspaces = useMemo(() => {
     if (!workspaceOrderPreview) {
       return workspaces;
@@ -1036,8 +1012,6 @@ export function SettingsPanel({
       setHookWorkspaceId((current) => current || data.workspaces[0]?.id || "");
       setDraggedWorkspaceId(null);
       setWorkspaceOrderPreview(null);
-      setDraggedModelId(null);
-      setModelOrderPreview(null);
       syncGeneralForm(data);
       syncWebSearchForm(data);
       syncPromptSettingsForm(data);
@@ -1058,7 +1032,6 @@ export function SettingsPanel({
         ...current,
         transport: current.transport || data.mcpTransports[0]?.transport || "stdio",
       }));
-      syncSkillsForm(data);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -3025,27 +2998,6 @@ export function SettingsPanel({
     }
   }
 
-  async function saveModelOrder(modelIds: string[]) {
-    setIsSavingModelOrder(true);
-    setError(null);
-
-    try {
-      const data = await requestJson<SettingsResponse>("/api/models/order", {
-        body: JSON.stringify({ modelIds }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
-      setSettings(data);
-      onSettingsChange(data);
-      setDraggedModelId(null);
-      setModelOrderPreview(null);
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-      await loadSettings();
-    } finally {
-      setIsSavingModelOrder(false);
-    }
-  }
 
   async function saveRemoteServer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -4342,53 +4294,6 @@ export function SettingsPanel({
     void saveSkills(currentEnabledSkillIds, modelId || null);
   }
 
-  function handleModelDragStart(
-    event: ReactDragEvent<HTMLDivElement>,
-    modelId: string,
-  ) {
-    setDraggedModelId(modelId);
-    setModelOrderPreview(orderedConfiguredModels.map((model) => model.id));
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", modelId);
-  }
-
-  function handleModelDragOver(
-    event: ReactDragEvent<HTMLDivElement>,
-    targetModelId: string,
-  ) {
-    event.preventDefault();
-
-    const sourceModelId = draggedModelId;
-    if (!sourceModelId || sourceModelId === targetModelId) {
-      return;
-    }
-
-    const modelIds = moveItemId(
-      modelOrderPreview ?? orderedConfiguredModels.map((model) => model.id),
-      sourceModelId,
-      targetModelId,
-    );
-    setModelOrderPreview(modelIds);
-  }
-
-  async function handleModelDrop(event: ReactDragEvent<HTMLDivElement>) {
-    event.preventDefault();
-
-    const modelIds = modelOrderPreview;
-    setDraggedModelId(null);
-
-    if (!modelIds || sameStringList(modelIds, configuredModels.map((model) => model.id))) {
-      setModelOrderPreview(null);
-      return;
-    }
-
-    await saveModelOrder(modelIds);
-  }
-
-  function handleModelDragEnd() {
-    setDraggedModelId(null);
-    setModelOrderPreview(null);
-  }
 
   return (
     <div className="settings-shell panel-scroll min-h-0 flex-1 overflow-y-auto">
@@ -10593,43 +10498,12 @@ export function SettingsPanel({
                   </div>
                 </div>
                 <div className="divide-y divide-stone-100">
-                  {orderedConfiguredModels.length ? (
-                    orderedConfiguredModels.map((model) => (
+                  {configuredModelsByName.length ? (
+                    configuredModelsByName.map((model) => (
                       <div
-                        className={`grid grid-cols-1 items-center gap-3 px-4 py-2.5 transition sm:grid-cols-[auto_minmax(0,1fr)_auto] ${draggedModelId === model.id
-                            ? "bg-teal-50/70 opacity-80"
-                            : "bg-white/0"
-                          }`}
-                        draggable={!isSavingModelOrder}
+                        className="grid grid-cols-1 items-center gap-3 px-4 py-2.5 transition sm:grid-cols-[minmax(0,1fr)_auto]"
                         key={model.id}
-                        onDragEnd={handleModelDragEnd}
-                        onDragOver={(event) => handleModelDragOver(event, model.id)}
-                        onDragStart={(event) => handleModelDragStart(event, model.id)}
-                        onDrop={(event) => void handleModelDrop(event)}
                       >
-                        <div className="hidden items-center sm:flex">
-                          <span
-                            aria-label={t("Reorder model {name}", {
-                              name: model.displayName,
-                            })}
-                            className={`inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-400 shadow-sm ${isSavingModelOrder
-                                ? "cursor-not-allowed opacity-60"
-                                : "cursor-grab hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                              }`}
-                            title={t("Reorder model {name}", {
-                              name: model.displayName,
-                            })}
-                          >
-                            {isSavingModelOrder && draggedModelId === model.id ? (
-                              <LoaderCircle
-                                aria-hidden="true"
-                                className="size-4 animate-spin"
-                              />
-                            ) : (
-                              <GripVertical aria-hidden="true" className="size-4" />
-                            )}
-                          </span>
-                        </div>
                         <div className="min-w-0 space-y-1.5 overflow-hidden sm:flex sm:items-center sm:gap-2 sm:space-y-0">
                           <div className="flex min-w-0 items-baseline gap-2 overflow-hidden">
                             <span

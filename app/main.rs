@@ -7122,61 +7122,6 @@ fn normalize_modalities(modalities: impl IntoIterator<Item = String>) -> Vec<Str
     normalized
 }
 
-fn reorder_models(models: &mut Vec<ModelSettings>, model_ids: Vec<String>) -> Result<(), ApiError> {
-    if model_ids.len() != models.len() {
-        return Err(ApiError::bad_request(format!(
-            "model order must contain exactly {} model ids",
-            models.len()
-        )));
-    }
-
-    let mut seen = HashSet::new();
-    let stored_model_ids = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<HashSet<_>>();
-    let mut normalized_model_ids = Vec::with_capacity(model_ids.len());
-
-    for raw_model_id in model_ids {
-        let model_id = raw_model_id.trim().to_string();
-
-        if model_id.is_empty() {
-            return Err(ApiError::bad_request("model id must not be empty"));
-        }
-
-        if !seen.insert(model_id.clone()) {
-            return Err(ApiError::bad_request(format!(
-                "model order contains duplicate id: {model_id}"
-            )));
-        }
-
-        if !stored_model_ids.contains(&model_id) {
-            return Err(ApiError::bad_request(format!(
-                "model was not found: {model_id}"
-            )));
-        }
-
-        normalized_model_ids.push(model_id);
-    }
-
-    let mut stored_models = models
-        .drain(..)
-        .map(|model| (model.id.clone(), model))
-        .collect::<HashMap<_, _>>();
-    let reordered_models = normalized_model_ids
-        .into_iter()
-        .map(|model_id| {
-            stored_models
-                .remove(&model_id)
-                .expect("model id was validated before reorder")
-        })
-        .collect();
-
-    *models = reordered_models;
-
-    Ok(())
-}
-
 fn reorder_workspaces(
     workspaces: &mut Vec<WorkspaceConfig>,
     workspace_ids: Vec<String>,

@@ -3168,40 +3168,6 @@ fn agent_definition_tool_validation_rejects_unknown_ids() {
 }
 
 #[test]
-fn reorder_models_requires_complete_unique_existing_ids() {
-    let mut models = vec![
-        test_model_settings("low"),
-        test_model_settings("high"),
-        test_model_settings("medium"),
-    ];
-
-    reorder_models(
-        &mut models,
-        vec!["high".to_string(), "medium".to_string(), "low".to_string()],
-    )
-    .expect("reordered models");
-    assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
-
-    let duplicate_error = reorder_models(
-        &mut models,
-        vec!["high".to_string(), "high".to_string(), "low".to_string()],
-    )
-    .expect_err("duplicate model ids should fail");
-    assert_eq!(duplicate_error.status, StatusCode::BAD_REQUEST);
-    assert!(duplicate_error.message.contains("duplicate"));
-    assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
-
-    let missing_error = reorder_models(
-        &mut models,
-        vec!["high".to_string(), "missing".to_string(), "low".to_string()],
-    )
-    .expect_err("unknown model ids should fail");
-    assert_eq!(missing_error.status, StatusCode::BAD_REQUEST);
-    assert!(missing_error.message.contains("not found"));
-    assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
-}
-
-#[test]
 fn reorder_workspaces_requires_complete_unique_existing_ids() {
     let mut workspaces = vec![
         test_workspace_config("default"),
@@ -16282,10 +16248,6 @@ fn test_model_settings(id: &str) -> ModelSettings {
         input_modalities: vec!["text".to_string()],
         output_modalities: vec!["text".to_string()],
     }
-}
-
-fn model_ids(models: &[ModelSettings]) -> Vec<&str> {
-    models.iter().map(|model| model.id.as_str()).collect()
 }
 
 fn test_workspace_config(id: &str) -> WorkspaceConfig {

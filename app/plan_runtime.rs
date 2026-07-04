@@ -4,7 +4,8 @@ use std::{
 };
 
 use foco_agent::{
-    AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId, AgentTaskStatus, AgentTeamId,
+    AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId,
+    AgentTaskStatus, AgentTeamId,
 };
 use foco_store::{
     config::{
@@ -29,9 +30,9 @@ use crate::{
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
     *,
 };
-
 const PLAN_MERGE_CORRELATION_PREFIX: &str = "plan_merge:";
 const PLAN_MERGE_DIFF_MAX_CHARS: usize = 60_000;
+const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 // ponytail: fixed char cap keeps phase prompts bounded for now; ceiling is rough prompt sizing, upgrade to token-aware summaries if long plans need it.
 const PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS: usize = 12_000;
 
@@ -986,31 +987,25 @@ fn delete_instance_worktree(
 fn plan_runner_model_selection(
     config: &GlobalConfig,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
-    for model in &config.models {
-        if !model.enabled || !model_outputs_text(model) {
-            continue;
-        }
-        let Some(provider_id) = model.active_provider_id.as_deref() else {
-            continue;
-        };
-        let Some(provider) = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-        else {
-            continue;
-        };
-        if provider.enabled {
-            return Ok(PlanRunnerModelSelection {
-                model_id: model.id.clone(),
-                provider_id: provider_id.to_string(),
-                thinking_level: model.thinking_level.clone(),
-            });
-        }
-    }
-    Err(ApiError::bad_request(
-        "plan runner requires an enabled text-output model with an enabled active provider",
-    ))
+    let default_id = AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID)
+        .expect("default agent definition id is valid");
+    let definition = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == default_id)
+        .ok_or_else(|| {
+            ApiError::bad_request("plan runner requires the default agent definition")
+        })?;
+    let mut selection =
+        validate_plan_model_selection(config, &definition.provider_id, &definition.model_id)
+            .map_err(|error| {
+                ApiError::bad_request(format!(
+                    "plan runner default agent model selection is unavailable: {}",
+                    error.message()
+                ))
+            })?;
+    selection.thinking_level = definition.model_options.thinking_level.clone();
+    Ok(selection)
 }
 
 fn plan_retry_model_selection(
@@ -1426,7 +1421,10 @@ fn agent_task_error_message(task: &AgentTaskRecord) -> String {
 mod tests {
     use super::*;
     use foco_store::{
-        config::{ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, ModelLimits, ProviderSettings},
+        config::{
+            AgentDefinitionSettings, AgentModelOptions, ApiProxySettings,
+            DEFAULT_SYSTEM_PROMPT_NAME, ModelLimits, ProviderSettings,
+        },
         workspace::PlanPhaseAttemptRecord,
     };
 
@@ -1437,6 +1435,7 @@ mod tests {
             "Build plan runner UI - Wire start action"
         );
     }
+
     #[test]
     fn plan_merge_block_helpers_classify_dirty_workspace() {
         let dirty = ApiError::bad_request(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE);
@@ -1502,6 +1501,42 @@ mod tests {
         assert_eq!(selection.provider_id, "provider-b");
         assert_eq!(selection.model_id, "model-b");
         assert_eq!(selection.thinking_level.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn plan_runner_model_selection_uses_default_agent_definition_not_model_order() {
+        let config = retry_selection_config();
+
+        let selection = plan_runner_model_selection(&config).expect("selection");
+
+        assert_eq!(selection.provider_id, "provider-b");
+        assert_eq!(selection.model_id, "model-b");
+        assert_eq!(selection.thinking_level.as_deref(), Some("high"));
+
+        let fallback = plan_retry_model_selection(
+            &config,
+            &phase_record_for_prompt(),
+            &PlanPhaseRetryRequest::default(),
+        )
+        .expect("fallback selection");
+        assert_eq!(fallback, selection);
+    }
+
+    #[test]
+    fn plan_runner_model_selection_reports_unavailable_default_agent_model() {
+        let mut config = retry_selection_config();
+        config.providers[1].enabled = false;
+
+        let error =
+            plan_runner_model_selection(&config).expect_err("disabled provider should fail");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message().contains("plan runner default agent"));
+        assert!(
+            error
+                .message()
+                .contains("provider 'provider-b' is disabled")
+        );
     }
 
     fn plan_record_for_prompt(phase: PlanPhaseRecord) -> PlanRecord {
@@ -1638,6 +1673,23 @@ mod tests {
             }),
             input_modalities: vec!["text".to_string()],
             output_modalities: vec!["text".to_string()],
+        });
+        config.agent_definitions.push(AgentDefinitionSettings {
+            id: AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID).expect("definition id"),
+            revision: 1,
+            name: "Default".to_string(),
+            description: String::new(),
+            provider_id: "provider-b".to_string(),
+            model_id: "model-b".to_string(),
+            model_options: AgentModelOptions {
+                thinking_level: Some("high".to_string()),
+                max_output_tokens: None,
+            },
+            system_prompt: "Default.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
         });
         config
     }

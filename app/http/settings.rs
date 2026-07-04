@@ -215,12 +215,6 @@ pub(crate) struct ManualModelRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ModelOrderRequest {
-    pub(crate) model_ids: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct ManualProviderRequest {
     pub(crate) api_proxy: Option<ManualApiProxySettingsRequest>,
     pub(crate) id: String,
@@ -2411,16 +2405,4 @@ pub(crate) async fn delete_model(
         &config,
         &state.model_metadata_file,
     )))
-}
-
-pub(crate) async fn save_model_order(
-    State(state): State<AppState>,
-    Json(request): Json<ModelOrderRequest>,
-) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
-
-    reorder_models(&mut config.models, request.model_ids)?;
-    save_config(&state, config.clone())?;
-
-    settings_response(&state, &config).await
 }

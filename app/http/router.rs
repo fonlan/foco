@@ -431,10 +431,6 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::settings::delete_model),
         )
         .route(
-            "/api/models/order",
-            post(crate::http::settings::save_model_order),
-        )
-        .route(
             "/api/mcp/servers/manual",
             post(crate::http::settings::save_mcp_server),
         )
