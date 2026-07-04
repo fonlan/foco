@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux-sidecars:
+    name: Build Linux sidecars
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cross
+      - run: npm ci
+      - run: npm run build -w web
+      - name: Build sidecars
+        run: |
+          cross build --release -p foco-app --target x86_64-unknown-linux-musl
+          node scripts/sidecars.mjs manifest \
+            --target linux-x64 \
+            --binary target/x86_64-unknown-linux-musl/release/foco \
+            --out sidecars
+          cross build --release -p foco-app --target aarch64-unknown-linux-musl
+          node scripts/sidecars.mjs manifest \
+            --target linux-arm64 \
+            --binary target/aarch64-unknown-linux-musl/release/foco \
+            --out sidecars
+      - name: Upload sidecars
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecars
+          path: sidecars/
+          if-no-files-found: error
+
+  macos-release:
+    name: Package macOS release
+    needs: linux-sidecars
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Download sidecars
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecars
+          path: sidecars
+      - name: Verify sidecars
+        run: node scripts/sidecars.mjs verify --root sidecars
+      - name: Build dmg
+        run: npm run build:macos
+      - name: Upload dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: Foco-macos-dmg
+          path: dist/macos/Foco.dmg
+          if-no-files-found: error
+
+  windows-release:
+    name: Package Windows release
+    needs: linux-sidecars
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Download sidecars
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecars
+          path: sidecars
+      - name: Verify sidecars
+        run: node scripts/sidecars.mjs verify --root sidecars
+      - name: Build Windows release
+        run: npm run build:release -- --bundle-sidecars
+      - name: Upload Windows release
+        uses: actions/upload-artifact@v4
+        with:
+          name: Foco-windows
+          path: |
+            target/release/foco.exe
+            target/release/resources/sidecars/**
+          if-no-files-found: error

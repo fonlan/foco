@@ -12,19 +12,22 @@ if (process.platform !== "win32") {
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const buildTargetDir = await mkdtemp(path.join(tmpdir(), "foco-release-target-"));
 const releaseExe = path.join(buildTargetDir, "release", "foco.exe");
+const releaseSidecars = path.join(buildTargetDir, "release", "resources", "sidecars");
 const profileDir = await mkdtemp(path.join(tmpdir(), "foco-release-smoke-"));
 const port = String(await freePort());
 let appProcess = null;
 let isStopping = false;
 
 try {
-  await run("cmd.exe", ["/d", "/s", "/c", "npm.cmd", "run", "build:release"], {
+  await run("cmd.exe", ["/d", "/s", "/c", "npm.cmd", "run", "build:release", "--", "--bundle-sidecars"], {
     CARGO_TARGET_DIR: buildTargetDir,
   });
 
   if (!existsSync(releaseExe)) {
     throw new Error(`release executable was not created: ${releaseExe}`);
   }
+
+  await run(process.execPath, ["scripts/sidecars.mjs", "verify", "--root", releaseSidecars]);
 
   appProcess = spawn(releaseExe, [], {
     cwd: repoRoot,

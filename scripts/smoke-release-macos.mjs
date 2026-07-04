@@ -40,6 +40,7 @@ const mountDir = await mkdtemp(path.join(tmpdir(), "foco-macos-release-dmg-"));
 const releaseDmg = path.join(repoRoot, "dist", "macos", "Foco.dmg");
 const releaseApp = path.join(mountDir, "Foco.app");
 const releaseExecutable = path.join(releaseApp, "Contents", "MacOS", "foco");
+const releaseSidecars = path.join(releaseApp, "Contents", "Resources", "sidecars");
 const port = String(await freePort());
 let appProcess = null;
 let appExit = null;
@@ -64,6 +65,8 @@ try {
   if (!existsSync(releaseExecutable)) {
     throw new Error(`release executable was not created: ${releaseExecutable}`);
   }
+
+  await run(process.execPath, ["scripts/sidecars.mjs", "verify", "--root", releaseSidecars]);
 
   appProcess = spawn(releaseExecutable, [], {
     cwd: repoRoot,

@@ -130,11 +130,17 @@ Use `cargo test --workspace` when you want the default Rust harness concurrency,
 npm run build:release
 ```
 
-This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource.
+This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource. Official remote-workspace releases also bundle Linux sidecars produced by CI; local development builds do not require them.
+
+### Remote Sidecar Release Artifacts
+
+Remote SSH workspaces use Linux sidecars bundled with the desktop release. The CI release workflow builds `linux-x64` and `linux-arm64` sidecars with `cross`, writes `sidecars/manifest.json`, and records the `sha256` for each binary. macOS packaging copies verified sidecars into `Foco.app/Contents/Resources/sidecars/`; Windows release bundling copies them into `resources/sidecars/` beside the executable.
+
+Users only need to install local Foco. On first connection to a remote workspace, Foco selects the packaged sidecar for the server target, verifies the manifest hash, and uploads it over SSH stdin to `~/.foco/sidecars/<version>/<target>/foco`. Advanced server profiles can set `focoCommand` to skip upload and use an existing Foco command on the remote server. Remote cleanup keeps the latest two sidecar versions and removes older versions after a newer sidecar starts successfully.
 
 ### macOS Pre-Support
 
-macOS pre-support currently covers the runtime integration points only: release startup as a menu bar background app, Open Foco in the default browser, Quit handling, user LaunchAgent auto-start, native file and directory pickers, zsh as the default macOS shell, and zsh defaults for newly created workspaces. It does not include a macOS distribution pipeline: no `.app`, `.dmg`, codesigning, notarization, or CI build/release support is provided yet.
+macOS pre-support currently covers the runtime integration points: release startup as a menu bar background app, Open Foco in the default browser, Quit handling, user LaunchAgent auto-start, native file and directory pickers, zsh as the default macOS shell, and zsh defaults for newly created workspaces. The release workflow now builds a `.app`/`.dmg` with bundled sidecars; codesigning and notarization are still not provided yet.
 
 Validated-on-mac checklist for the next macOS pass:
 

@@ -77,6 +77,7 @@ async function buildAppBundle() {
 
   await writeIcns();
   await writeInfoPlist(await cargoPackageVersion());
+  runNode(["scripts/sidecars.mjs", "copy", "--dest", path.join(resourcesDir, "sidecars")]);
 }
 
 async function writeIcns() {
@@ -218,6 +219,10 @@ function runCargo(args) {
   run("cargo", args, {
     MACOSX_DEPLOYMENT_TARGET: process.env.MACOSX_DEPLOYMENT_TARGET ?? "13.0",
   });
+}
+
+function runNode(args) {
+  run(process.execPath, args);
 }
 
 function run(command, args, extraEnv = {}) {

@@ -17,6 +17,9 @@ try {
         ? ["build", "--profile", "dist", "-p", "foco-app"]
         : ["build", "--release", "-p", "foco-app"],
     );
+    if (options.bundleSidecars) {
+      runNode(["scripts/sidecars.mjs", "copy", "--dest", windowsSidecarsDestination(options.profile)]);
+    }
   }
 } catch (error) {
   console.error(`[release] ${errorMessage(error)}`);
@@ -25,7 +28,7 @@ try {
 
 function parseArgs(args) {
   const unknown = args.filter(
-    (arg) => arg !== "--dist" && arg !== "--check-only",
+    (arg) => arg !== "--dist" && arg !== "--check-only" && arg !== "--bundle-sidecars",
   );
 
   if (unknown.length > 0) {
@@ -33,6 +36,7 @@ function parseArgs(args) {
   }
 
   return {
+    bundleSidecars: args.includes("--bundle-sidecars"),
     checkOnly: args.includes("--check-only"),
     profile: args.includes("--dist") ? "dist" : "release",
   };
@@ -95,6 +99,15 @@ function runNpm(args) {
 
 function runCargo(args) {
   run(process.platform === "win32" ? "cargo.exe" : "cargo", args);
+}
+
+function runNode(args) {
+  run(process.execPath, args);
+}
+
+function windowsSidecarsDestination(profile) {
+  const targetRoot = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
+  return path.join(targetRoot, profile, "resources", "sidecars");
 }
 
 function run(command, args, extraEnv = {}) {

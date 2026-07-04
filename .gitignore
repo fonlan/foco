@@ -13,6 +13,7 @@ macos-support-implementation-plan.md
 openspec/
 target/
 dist/
+sidecars/
 node_modules/
 web/dist/
 *.tsbuildinfo
