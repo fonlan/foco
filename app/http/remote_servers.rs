@@ -144,7 +144,7 @@ pub(crate) async fn list_remote_servers(
     let config = config_snapshot(&state)?;
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServersResponse {
-        servers: remote_server_summaries(&config, &connected_ids),
+        servers: remote_server_summaries(&config, &connected_ids, Some(&state)),
     }))
 }
 
@@ -166,7 +166,7 @@ pub(crate) async fn create_remote_server(
     save_config(&state, config.clone())?;
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
-        server: remote_server_summary(&config, &server, &connected_ids),
+        server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
     }))
 }
 
@@ -199,7 +199,7 @@ pub(crate) async fn update_remote_server(
     save_config(&state, config.clone())?;
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
-        server: remote_server_summary(&config, &server, &connected_ids),
+        server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
     }))
 }
 
@@ -266,7 +266,7 @@ pub(crate) async fn disconnect_remote_server(
     let server = remote_server_by_id(&config, &server_id)?.clone();
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
-        server: remote_server_summary(&config, &server, &connected_ids),
+        server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
     }))
 }
 
@@ -278,18 +278,19 @@ pub(crate) async fn remote_server_status(
     let server = remote_server_by_id(&config, &server_id)?.clone();
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
-        server: remote_server_summary(&config, &server, &connected_ids),
+        server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
     }))
 }
 
 pub(crate) fn remote_server_summaries(
     config: &GlobalConfig,
     connected_ids: &HashSet<String>,
+    state: Option<&AppState>,
 ) -> Vec<RemoteServerSummary> {
     config
         .remote_servers
         .iter()
-        .map(|server| remote_server_summary(config, server, connected_ids))
+        .map(|server| remote_server_summary(config, server, connected_ids, state))
         .collect()
 }
 
@@ -297,6 +298,7 @@ pub(crate) fn remote_server_summary(
     config: &GlobalConfig,
     server: &RemoteServerProfile,
     connected_ids: &HashSet<String>,
+    state: Option<&AppState>,
 ) -> RemoteServerSummary {
     RemoteServerSummary {
         id: server.id.clone(),
@@ -312,7 +314,16 @@ pub(crate) fn remote_server_summary(
         foco_command: server.foco_command.clone(),
         terminal_shell: server.terminal_shell.clone(),
         connect_timeout_ms: server.connect_timeout_ms,
-        status: remote_server_status_value(server, connected_ids),
+        status: state
+            .and_then(|state| {
+                state
+                    .remote_workspace_manager
+                    .server_state(&server.id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|state| state.as_str().to_string())
+            .unwrap_or_else(|| remote_server_status_value(server, connected_ids)),
         last_error: server.last_error.clone(),
         last_known_target: server.last_known_target.clone(),
         sidecar_install_state: server
@@ -381,7 +392,7 @@ async fn run_remote_server_diagnostic_api(
 
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerDiagnosticResponse {
-        server: remote_server_summary(&config, &updated, &connected_ids),
+        server: remote_server_summary(&config, &updated, &connected_ids, Some(&state)),
         result,
     }))
 }
@@ -816,6 +827,10 @@ pub(crate) fn remote_server_ssh_args(
         args.push("BatchMode=yes".to_string());
     }
     args.push("-o".to_string());
+    args.push("ServerAliveInterval=15".to_string());
+    args.push("-o".to_string());
+    args.push("ServerAliveCountMax=3".to_string());
+    args.push("-o".to_string());
     args.push(format!("ConnectTimeout={}", timeout_ms.div_ceil(1_000)));
     if let Some(user) = server
         .user
@@ -1079,7 +1094,8 @@ mod tests {
             common_commands: Vec::new(),
         });
 
-        let summary = remote_server_summary(&config, &config.remote_servers[0], &HashSet::new());
+        let summary =
+            remote_server_summary(&config, &config.remote_servers[0], &HashSet::new(), None);
         assert_eq!(summary.workspace_count, 1);
         assert_eq!(summary.status, REMOTE_SERVER_STATUS_UNKNOWN);
     }

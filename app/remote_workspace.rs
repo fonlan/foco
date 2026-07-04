@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    io,
+    fs, io,
     net::SocketAddr,
     path::Path,
     process::Stdio,
@@ -41,6 +41,7 @@ use foco_store::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -63,6 +64,67 @@ const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
 const SIDECAR_BINARY_NAME: &str = "foco";
 const CONTROL_WS_PATH: &str = "/api/remote/control/ws";
 const SIDECAR_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CONTROL_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
+const CONTROL_WS_READ_TIMEOUT: Duration = Duration::from_secs(45);
+const SIDECAR_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
+const SIDECAR_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
+const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RemoteConnectionState {
+    Disconnected,
+    Checking,
+    Connecting,
+    Installing,
+    Starting,
+    Tunneling,
+    BrokerConnecting,
+    Ready,
+    Degraded,
+    Reconnecting,
+    Offline,
+    FailedAuth,
+}
+
+impl RemoteConnectionState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Checking => "checking",
+            Self::Connecting => "connecting",
+            Self::Installing => "installing",
+            Self::Starting => "starting",
+            Self::Tunneling => "tunneling",
+            Self::BrokerConnecting => "brokerConnecting",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Reconnecting => "reconnecting",
+            Self::Offline => "offline",
+            Self::FailedAuth => "failedAuth",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RemoteSessionStatus {
+    state: RemoteConnectionState,
+    last_error: Option<String>,
+    updated_at: String,
+}
+
+impl RemoteSessionStatus {
+    fn new(state: RemoteConnectionState, last_error: Option<String>) -> Self {
+        Self {
+            state,
+            last_error,
+            updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        }
+    }
+}
 
 type BrokerWsWrite = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -82,6 +144,8 @@ pub(crate) struct RemoteWorkspaceSessionSummary {
     pub(crate) remote_port: u16,
     pub(crate) started_at: String,
     pub(crate) status: String,
+    pub(crate) last_error: Option<String>,
+    pub(crate) status_updated_at: String,
     pub(crate) active_runs: Vec<RemoteActiveRunSummary>,
 }
 
@@ -99,10 +163,63 @@ pub(crate) struct RemoteActiveRunSummary {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RemoteWorkspaceManager {
     sessions: Arc<Mutex<HashMap<String, Arc<RemoteWorkspaceSession>>>>,
+    statuses: Arc<Mutex<HashMap<String, RemoteSessionStatus>>>,
 }
 
 impl RemoteWorkspaceManager {
     pub(crate) async fn connect_workspace(
+        &self,
+        state: AppState,
+        server_id: &str,
+        workspace_id: &str,
+    ) -> Result<RemoteWorkspaceSessionSummary, ApiError> {
+        match self
+            .connect_workspace_inner(state, server_id, workspace_id)
+            .await
+        {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                let message = error.message().to_string();
+                let state = if is_auth_error_message(&message) {
+                    RemoteConnectionState::FailedAuth
+                } else {
+                    RemoteConnectionState::Offline
+                };
+                let _ = self.set_status(server_id, Some(workspace_id), state, Some(message));
+                Err(error)
+            }
+        }
+    }
+
+    fn set_status(
+        &self,
+        server_id: &str,
+        workspace_id: Option<&str>,
+        state: RemoteConnectionState,
+        last_error: Option<String>,
+    ) -> Result<(), ApiError> {
+        let key = status_key(server_id, workspace_id);
+        let mut statuses = self
+            .statuses
+            .lock()
+            .map_err(|_| ApiError::internal("remote workspace status lock is poisoned"))?;
+        statuses.insert(key, RemoteSessionStatus::new(state, last_error));
+        Ok(())
+    }
+
+    fn get_status(
+        &self,
+        server_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<RemoteSessionStatus>, ApiError> {
+        let statuses = self
+            .statuses
+            .lock()
+            .map_err(|_| ApiError::internal("remote workspace status lock is poisoned"))?;
+        Ok(statuses.get(&status_key(server_id, workspace_id)).cloned())
+    }
+
+    async fn connect_workspace_inner(
         &self,
         state: AppState,
         server_id: &str,
@@ -120,14 +237,49 @@ impl RemoteWorkspaceManager {
         let workspace = workspace_by_id(&config, workspace_id)?.clone();
         let remote_path = workspace_remote_path(&workspace, server_id)?;
         let key = session_key(server_id, workspace_id);
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Checking,
+            None,
+        )?;
+        self.set_status(server_id, None, RemoteConnectionState::Checking, None)?;
         if let Some(existing) = self.session(&key)? {
             return Ok(existing.summary());
         }
 
         let target = detect_or_cached_target(&server, server_id, workspace_id).await?;
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Installing,
+            None,
+        )?;
+        self.set_status(server_id, None, RemoteConnectionState::Installing, None)?;
         let command =
             ensure_sidecar_command(&state, &server, server_id, workspace_id, &target).await?;
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Connecting,
+            None,
+        )?;
         let token = random_token()?;
+        let session_file = ensure_remote_session_file(
+            &server,
+            server_id,
+            workspace_id,
+            &remote_path,
+            &target,
+            &token,
+        )
+        .await?;
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Starting,
+            None,
+        )?;
         let mut sidecar = launch_remote_sidecar(
             &server,
             server_id,
@@ -136,10 +288,17 @@ impl RemoteWorkspaceManager {
             &target,
             &token,
             &command,
+            &session_file,
         )
         .await?;
         let bootstrap = read_bootstrap(&mut sidecar, server_id, workspace_id).await?;
         validate_bootstrap(&bootstrap, server_id, workspace_id, &target)?;
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Tunneling,
+            None,
+        )?;
         let (local_port, tunnel) =
             start_local_forward(&server, bootstrap.port, server_id, workspace_id).await?;
         let bundle = build_sidecar_runtime_config_bundle(
@@ -150,6 +309,22 @@ impl RemoteWorkspaceManager {
             Utc::now().timestamp_millis().max(0) as u64,
         )?;
         let active_runs = Arc::new(Mutex::new(Vec::new()));
+        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::BrokerConnecting,
+            None,
+        )));
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::BrokerConnecting,
+            None,
+        )?;
+        self.set_status(
+            server_id,
+            None,
+            RemoteConnectionState::BrokerConnecting,
+            None,
+        )?;
         let control_task = connect_control_ws(
             state.clone(),
             local_port,
@@ -158,6 +333,7 @@ impl RemoteWorkspaceManager {
             server_id,
             workspace_id,
             active_runs.clone(),
+            status.clone(),
         )
         .await?;
 
@@ -168,13 +344,26 @@ impl RemoteWorkspaceManager {
             target,
             local_port,
             remote_port: bootstrap.port,
-            token,
+            token: token.clone(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             sidecar: AsyncMutex::new(Some(sidecar)),
             tunnel: AsyncMutex::new(Some(tunnel)),
             control_task: AsyncMutex::new(Some(control_task)),
+            health_task: AsyncMutex::new(Some(start_sidecar_health_ping(
+                local_port,
+                token.clone(),
+                status.clone(),
+            ))),
+            status,
             active_runs,
         });
+        self.set_status(
+            server_id,
+            Some(workspace_id),
+            RemoteConnectionState::Ready,
+            None,
+        )?;
+        self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
         let summary = session.summary();
         let mut sessions = self
             .sessions
@@ -198,8 +387,20 @@ impl RemoteWorkspaceManager {
         };
         if let Some(session) = session {
             session.stop().await;
+            self.set_status(
+                server_id,
+                Some(workspace_id),
+                RemoteConnectionState::Disconnected,
+                None,
+            )?;
             Ok(true)
         } else {
+            self.set_status(
+                server_id,
+                Some(workspace_id),
+                RemoteConnectionState::Disconnected,
+                None,
+            )?;
             Ok(false)
         }
     }
@@ -220,8 +421,15 @@ impl RemoteWorkspaceManager {
                 .collect::<Vec<_>>()
         };
         for session in removed {
+            self.set_status(
+                &session.server_id,
+                Some(&session.workspace_id),
+                RemoteConnectionState::Disconnected,
+                None,
+            )?;
             session.stop().await;
         }
+        self.set_status(server_id, None, RemoteConnectionState::Disconnected, None)?;
         Ok(())
     }
 
@@ -249,6 +457,36 @@ impl RemoteWorkspaceManager {
             .filter(|session| session.server_id == server_id)
             .map(|session| session.summary())
             .collect())
+    }
+
+    pub(crate) fn workspace_state(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<RemoteConnectionState>, ApiError> {
+        if let Some(session) = self.session(&session_key(server_id, workspace_id))? {
+            return Ok(Some(session.status_snapshot().state));
+        }
+        Ok(self
+            .get_status(server_id, Some(workspace_id))?
+            .map(|status| status.state))
+    }
+
+    pub(crate) fn server_state(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<RemoteConnectionState>, ApiError> {
+        let sessions = self.session_summaries_for_server(server_id)?;
+        if sessions.iter().any(|session| session.status == "ready") {
+            return Ok(Some(RemoteConnectionState::Ready));
+        }
+        if sessions
+            .iter()
+            .any(|session| session.status == "reconnecting" || session.status == "degraded")
+        {
+            return Ok(Some(RemoteConnectionState::Degraded));
+        }
+        Ok(self.get_status(server_id, None)?.map(|status| status.state))
     }
 
     fn session(&self, key: &str) -> Result<Option<Arc<RemoteWorkspaceSession>>, ApiError> {
@@ -302,7 +540,9 @@ pub(crate) async fn disconnect_remote_workspace(
             local_port: 0,
             remote_port: 0,
             started_at: String::new(),
-            status: "disconnected".to_string(),
+            status: RemoteConnectionState::Disconnected.as_str().to_string(),
+            last_error: None,
+            status_updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             active_runs: Vec::new(),
         }),
     }))
@@ -333,6 +573,8 @@ struct RemoteWorkspaceSession {
     sidecar: AsyncMutex<Option<Child>>,
     tunnel: AsyncMutex<Option<Child>>,
     control_task: AsyncMutex<Option<JoinHandle<()>>>,
+    health_task: AsyncMutex<Option<JoinHandle<()>>>,
+    status: Arc<Mutex<RemoteSessionStatus>>,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
 }
 
@@ -343,6 +585,7 @@ impl RemoteWorkspaceSession {
             .lock()
             .map(|runs| runs.clone())
             .unwrap_or_default();
+        let status = self.status_snapshot();
         RemoteWorkspaceSessionSummary {
             server_id: self.server_id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -351,15 +594,34 @@ impl RemoteWorkspaceSession {
             local_port: self.local_port,
             remote_port: self.remote_port,
             started_at: self.started_at.clone(),
-            status: "connected".to_string(),
+            status: status.state.as_str().to_string(),
+            last_error: status.last_error,
+            status_updated_at: status.updated_at,
             active_runs,
         }
     }
 
+    fn status_snapshot(&self) -> RemoteSessionStatus {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| {
+                RemoteSessionStatus::new(
+                    RemoteConnectionState::Degraded,
+                    Some("remote workspace status lock is poisoned".to_string()),
+                )
+            })
+    }
+
     async fn stop(&self) {
+        set_session_status(&self.status, RemoteConnectionState::Disconnected, None);
         if let Some(task) = self.control_task.lock().await.take() {
             task.abort();
         }
+        if let Some(task) = self.health_task.lock().await.take() {
+            task.abort();
+        }
+        let _ = shutdown_remote_sidecar(self.local_port, &self.token).await;
         if let Some(mut tunnel) = self.tunnel.lock().await.take() {
             let _ = tunnel.kill().await;
         }
@@ -472,11 +734,14 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         active_runs: active_runs.clone(),
         broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
         broker_tx,
+        shutdown_tx: shutdown_tx.clone(),
     };
 
     let heartbeat_state = state.clone();
     let app = Router::new()
         .route(CONTROL_WS_PATH, get(remote_control_ws))
+        .route("/api/remote/health", get(remote_sidecar_health))
+        .route("/api/remote/shutdown", post(remote_sidecar_shutdown))
         // ponytail: workspace-scoped HTTP routes proxied from local main.
         // Sidecar handles files, git, terminal, spec, and plan routes that hit
         // the remote workspace path.  Query/path params match the local main
@@ -728,9 +993,13 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         let _ = rx.await;
     };
 
-    axum::serve(listener, app)
+    let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    if let Some(session_file) = options.session_file.as_deref() {
+        let _ = fs::remove_file(session_file);
+    }
+    server_result?;
     Ok(())
 }
 
@@ -818,6 +1087,7 @@ struct RemoteSidecarState {
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
     broker_pending: Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<ControlEnvelope>>>>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
+    shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     workspace_id: String,
     workspace_path: String,
 }
@@ -843,6 +1113,25 @@ async fn sidecar_bearer_auth(
         }
     }
     next.run(request).await
+}
+
+async fn remote_sidecar_health(State(state): State<RemoteSidecarState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "workspaceId": state.workspace_id,
+        "brokerConnected": state.ws_count.load(Ordering::Relaxed) > 0,
+        "activeRunCount": state.active_run_count.load(Ordering::Relaxed),
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    }))
+}
+
+async fn remote_sidecar_shutdown(State(state): State<RemoteSidecarState>) -> Json<Value> {
+    if let Ok(mut tx) = state.shutdown_tx.lock() {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    Json(json!({ "ok": true }))
 }
 
 async fn remote_control_ws(
@@ -933,6 +1222,7 @@ struct RemoteSidecarOptions {
     workspace_path: String,
     target: String,
     token: String,
+    session_file: Option<String>,
 }
 
 impl RemoteSidecarOptions {
@@ -942,6 +1232,7 @@ impl RemoteSidecarOptions {
         let mut workspace_path = None;
         let mut target = None;
         let mut token = None;
+        let mut session_file = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let slot = match arg.as_str() {
@@ -950,6 +1241,7 @@ impl RemoteSidecarOptions {
                 "--workspace-path" => &mut workspace_path,
                 "--target" => &mut target,
                 "--token" => &mut token,
+                "--session-file" => &mut session_file,
                 other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -971,6 +1263,7 @@ impl RemoteSidecarOptions {
             workspace_path: required_arg(workspace_path, "--workspace-path")?,
             target: required_arg(target, "--target")?,
             token: required_arg(token, "--token")?,
+            session_file,
         })
     }
 }
@@ -1191,6 +1484,69 @@ async fn verify_remote_command(
     Ok(())
 }
 
+async fn ensure_remote_session_file(
+    server: &RemoteServerProfile,
+    server_id: &str,
+    workspace_id: &str,
+    remote_path: &str,
+    target: &str,
+    token: &str,
+) -> Result<String, ApiError> {
+    let mut hasher = Sha256::new();
+    hasher.update(server_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(remote_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(target.as_bytes());
+    let session_name = format!("{}.json", hex_bytes(&hasher.finalize()));
+    let session_payload = json!({
+        "version": 1,
+        "serverId": server_id,
+        "workspaceId": workspace_id,
+        "workspacePath": remote_path,
+        "target": target,
+        "token": token,
+        "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    })
+    .to_string();
+    let script = format!(
+        "set -e; dir=\"$HOME/.foco/remote-sessions\"; mkdir -p \"$dir\"; chmod 700 \"$dir\"; path=\"$dir/{session_name}\"; tmp=\"$path.tmp.$$\"; cat > \"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" \"$path\"; printf '%s\\n' \"$path\"",
+    );
+    let output = run_ssh_with_stdin(
+        server,
+        &[script.as_str()],
+        session_payload.as_bytes(),
+        server_id,
+        Some(workspace_id),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(remote_error(
+            server_id,
+            Some(workspace_id),
+            format!(
+                "failed to write remote session file: {}",
+                output_text(&output)
+            ),
+        ));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(remote_error(
+            server_id,
+            Some(workspace_id),
+            "remote session file path was empty",
+        ));
+    }
+    Ok(path)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn update_sidecar_cache(
     state: &AppState,
     server_id: &str,
@@ -1220,9 +1576,10 @@ async fn launch_remote_sidecar(
     target: &str,
     token: &str,
     command: &str,
+    session_file: &str,
 ) -> Result<Child, ApiError> {
     let remote_command = format!(
-        "{command} {sidecar} --server-id {server_id} --workspace-id {workspace_id} --workspace-path {workspace_path} --target {target} --token {token}",
+        "{command} {sidecar} --server-id {server_id} --workspace-id {workspace_id} --workspace-path {workspace_path} --target {target} --token {token} --session-file {session_file}",
         command = command,
         sidecar = REMOTE_SIDECAR_COMMAND,
         server_id = shell_quote(server_id),
@@ -1230,6 +1587,7 @@ async fn launch_remote_sidecar(
         workspace_path = shell_quote(remote_path),
         target = shell_quote(target),
         token = shell_quote(token),
+        session_file = shell_quote(session_file),
     );
     let args = remote_server_ssh_args(server, &[remote_command.as_str()], true);
     let child = Command::new("ssh")
@@ -1385,96 +1743,136 @@ async fn connect_control_ws(
     server_id: &str,
     workspace_id: &str,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
+    status: Arc<Mutex<RemoteSessionStatus>>,
 ) -> Result<JoinHandle<()>, ApiError> {
     let url = format!("ws://127.0.0.1:{local_port}{CONTROL_WS_PATH}");
-    let mut last_error = None;
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
     let token = token.to_string();
     let log_server_id = server_id.to_string();
     let log_workspace_id = workspace_id.to_string();
     let handle = tokio::spawn(async move {
         let mut ready_tx = Some(ready_tx);
-        for _ in 0..30 {
+        let mut attempt = 0_u32;
+        loop {
+            let connection_state = if attempt == 0 {
+                RemoteConnectionState::BrokerConnecting
+            } else {
+                RemoteConnectionState::Reconnecting
+            };
+            set_session_status(&status, connection_state, None);
             match connect_control_ws_once(&url, &token, &bundle).await {
                 Ok((write, mut read)) => {
+                    set_session_status(&status, RemoteConnectionState::Ready, None);
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Ok(()));
                     }
+                    attempt = 0;
                     let write = Arc::new(AsyncMutex::new(write));
                     let cancellations: BrokerCancelRegistry =
                         Arc::new(AsyncMutex::new(HashMap::new()));
-                    // Main broker loop: process incoming sidecar request and cancel messages.
-                    while let Some(message) = read.next().await {
-                        match message {
-                            Ok(tungstenite::Message::Ping(bytes)) => {
+                    let mut ping_interval = tokio::time::interval(CONTROL_WS_PING_INTERVAL);
+                    loop {
+                        tokio::select! {
+                            _ = ping_interval.tick() => {
                                 let mut write = write.lock().await;
-                                let _ = write.send(tungstenite::Message::Pong(bytes)).await;
-                            }
-                            Ok(tungstenite::Message::Text(text)) => {
-                                let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text)
-                                else {
-                                    continue;
-                                };
-                                match envelope.message_type.as_str() {
-                                    "heartbeat" => {
-                                        update_remote_active_runs(&active_runs, &envelope.payload);
-                                    }
-                                    "request" => {
-                                        let request_id = envelope.id.clone();
-                                        let (cancel_tx, cancel_rx) = oneshot::channel();
-                                        if let Some(id) = request_id.clone() {
-                                            cancellations.lock().await.insert(id, cancel_tx);
-                                        }
-                                        let task_state = state.clone();
-                                        let task_write = write.clone();
-                                        let task_cancellations = cancellations.clone();
-                                        let task_server_id = log_server_id.clone();
-                                        let task_workspace_id = log_workspace_id.clone();
-                                        tokio::spawn(async move {
-                                            handle_broker_request(
-                                                &task_state,
-                                                task_write,
-                                                &task_server_id,
-                                                &task_workspace_id,
-                                                envelope,
-                                                Some(cancel_rx),
-                                            )
-                                            .await;
-                                            if let Some(id) = request_id {
-                                                task_cancellations.lock().await.remove(&id);
-                                            }
-                                        });
-                                    }
-                                    "cancel" => {
-                                        if let Some(id) = envelope.id {
-                                            if let Some(tx) = cancellations.lock().await.remove(&id)
-                                            {
-                                                let _ = tx.send(());
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                                if write.send(tungstenite::Message::Ping(Vec::new().into())).await.is_err() {
+                                    break;
                                 }
                             }
-                            Ok(_) => {}
-                            Err(_) => break,
+                            message = timeout(CONTROL_WS_READ_TIMEOUT, read.next()) => {
+                                let message = match message {
+                                    Ok(Some(message)) => message,
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        set_session_status(
+                                            &status,
+                                            RemoteConnectionState::Degraded,
+                                            Some("control WebSocket heartbeat timed out".to_string()),
+                                        );
+                                        break;
+                                    }
+                                };
+                                match message {
+                                    Ok(tungstenite::Message::Ping(bytes)) => {
+                                        let mut write = write.lock().await;
+                                        let _ = write.send(tungstenite::Message::Pong(bytes)).await;
+                                    }
+                                    Ok(tungstenite::Message::Pong(_)) => {}
+                                    Ok(tungstenite::Message::Text(text)) => {
+                                        let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
+                                            continue;
+                                        };
+                                        match envelope.message_type.as_str() {
+                                            "heartbeat" => {
+                                                update_remote_active_runs(&active_runs, &envelope.payload);
+                                                set_session_status(&status, RemoteConnectionState::Ready, None);
+                                            }
+                                            "request" => {
+                                                let request_id = envelope.id.clone();
+                                                let (cancel_tx, cancel_rx) = oneshot::channel();
+                                                if let Some(id) = request_id.clone() {
+                                                    cancellations.lock().await.insert(id, cancel_tx);
+                                                }
+                                                let task_state = state.clone();
+                                                let task_write = write.clone();
+                                                let task_cancellations = cancellations.clone();
+                                                let task_server_id = log_server_id.clone();
+                                                let task_workspace_id = log_workspace_id.clone();
+                                                tokio::spawn(async move {
+                                                    handle_broker_request(
+                                                        &task_state,
+                                                        task_write,
+                                                        &task_server_id,
+                                                        &task_workspace_id,
+                                                        envelope,
+                                                        Some(cancel_rx),
+                                                    )
+                                                    .await;
+                                                    if let Some(id) = request_id {
+                                                        task_cancellations.lock().await.remove(&id);
+                                                    }
+                                                });
+                                            }
+                                            "cancel" => {
+                                                if let Some(id) = envelope.id {
+                                                    if let Some(tx) = cancellations.lock().await.remove(&id) {
+                                                        let _ = tx.send(());
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Ok(tungstenite::Message::Close(_)) => break,
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        set_session_status(
+                                            &status,
+                                            RemoteConnectionState::Degraded,
+                                            Some(format!("control WebSocket read failed: {error}")),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
-                    return;
                 }
-
                 Err(error) => {
-                    last_error = Some(error);
-                    sleep(Duration::from_millis(100)).await;
+                    set_session_status(&status, RemoteConnectionState::Reconnecting, Some(error));
                 }
             }
+            attempt = attempt.saturating_add(1);
+            let delay = reconnect_delay(attempt);
+            tracing::warn!(
+                %log_server_id,
+                %log_workspace_id,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                "remote control WebSocket reconnect scheduled"
+            );
+            sleep(delay).await;
         }
-        if let Some(tx) = ready_tx.take() {
-            let _ = tx.send(Err(
-                last_error.unwrap_or_else(|| "control WebSocket failed".to_string())
-            ));
-        }
-        tracing::warn!(%log_server_id, %log_workspace_id, "remote control WebSocket exited before readiness");
     });
 
     match timeout(Duration::from_secs(5), ready_rx).await {
@@ -2489,6 +2887,110 @@ fn session_key(server_id: &str, workspace_id: &str) -> String {
     format!("{server_id}:{workspace_id}")
 }
 
+fn status_key(server_id: &str, workspace_id: Option<&str>) -> String {
+    workspace_id
+        .map(|workspace_id| session_key(server_id, workspace_id))
+        .unwrap_or_else(|| server_id.to_string())
+}
+
+fn set_session_status(
+    status: &Arc<Mutex<RemoteSessionStatus>>,
+    state: RemoteConnectionState,
+    last_error: Option<String>,
+) {
+    if let Ok(mut status) = status.lock() {
+        *status = RemoteSessionStatus::new(state, last_error);
+    }
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let base_ms = REMOTE_RECONNECT_BASE_DELAY.as_millis() as u64;
+    let max_ms = REMOTE_RECONNECT_MAX_DELAY.as_millis() as u64;
+    let capped = base_ms.saturating_mul(1_u64 << shift).min(max_ms);
+    let jitter = random_jitter_ms(capped / 4);
+    Duration::from_millis((capped + jitter).min(max_ms))
+}
+
+fn start_sidecar_health_ping(
+    local_port: u16,
+    token: String,
+    status: Arc<Mutex<RemoteSessionStatus>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{local_port}/api/remote/health");
+        loop {
+            sleep(SIDECAR_HEALTH_INTERVAL).await;
+            let result = timeout(
+                SIDECAR_HEALTH_TIMEOUT,
+                client.get(&url).bearer_auth(&token).send(),
+            )
+            .await;
+            match result {
+                Ok(Ok(response)) if response.status().is_success() => {
+                    if !matches!(
+                        status.lock().map(|status| status.state).ok(),
+                        Some(RemoteConnectionState::Reconnecting | RemoteConnectionState::Offline)
+                    ) {
+                        set_session_status(&status, RemoteConnectionState::Ready, None);
+                    }
+                }
+                Ok(Ok(response)) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    set_session_status(
+                        &status,
+                        RemoteConnectionState::FailedAuth,
+                        Some("sidecar health authentication failed".to_string()),
+                    );
+                }
+                Ok(Ok(response)) => {
+                    set_session_status(
+                        &status,
+                        RemoteConnectionState::Degraded,
+                        Some(format!("sidecar health returned {}", response.status())),
+                    );
+                }
+                Ok(Err(error)) => {
+                    set_session_status(
+                        &status,
+                        RemoteConnectionState::Reconnecting,
+                        Some(format!("sidecar health failed: {error}")),
+                    );
+                }
+                Err(_) => {
+                    set_session_status(
+                        &status,
+                        RemoteConnectionState::Degraded,
+                        Some("sidecar health timed out".to_string()),
+                    );
+                }
+            }
+        }
+    })
+}
+
+async fn shutdown_remote_sidecar(local_port: u16, token: &str) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{local_port}/api/remote/shutdown");
+    let _ = timeout(
+        SIDECAR_HEALTH_TIMEOUT,
+        client.post(url).bearer_auth(token).send(),
+    )
+    .await;
+    Ok(())
+}
+
+fn random_jitter_ms(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes) % (max_ms + 1)
+}
+
 fn random_token() -> Result<String, ApiError> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|source| {
@@ -2499,6 +3001,14 @@ fn random_token() -> Result<String, ApiError> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn is_auth_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("authentication failed")
+        || lower.contains("publickey")
+        || lower.contains("failedauth")
 }
 
 fn output_text(output: &std::process::Output) -> String {
@@ -2943,6 +3453,21 @@ fn remote_optional_string(value: Option<&Value>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn remote_idempotency_key(payload: &Value, fallback: &str) -> String {
+    remote_optional_string(payload.get("idempotencyKey")).unwrap_or_else(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(fallback.as_bytes());
+        format!("sha256:{}", hex_bytes(&hasher.finalize()))
+    })
+}
+
+fn remote_message_queued_run(metadata_json: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(metadata_json)
+        .ok()?
+        .get("queuedRun")
+        .cloned()
+}
+
 async fn remote_sidecar_chat_queue(
     State(state): State<RemoteSidecarState>,
     Json(payload): Json<Value>,
@@ -2979,6 +3504,41 @@ async fn remote_sidecar_chat_queue(
                 })?
         }
     };
+    let idempotency_key = remote_idempotency_key(
+        &payload,
+        &format!(
+            "queue:{}:{}:{}:{}:{}",
+            chat_id,
+            message,
+            model_id,
+            provider_id.as_deref().unwrap_or(""),
+            session_mode.as_deref().unwrap_or("")
+        ),
+    );
+    for existing in database
+        .messages_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    {
+        let Some(queued_run) = remote_message_queued_run(&existing.metadata_json) else {
+            continue;
+        };
+        if queued_run.get("idempotencyKey").and_then(Value::as_str)
+            == Some(idempotency_key.as_str())
+        {
+            return Ok(Json(json!({
+                "chatId": chat_id,
+                "chatTitle": chat.title,
+                "createdAt": chat.created_at,
+                "updatedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "userMessageId": existing.id,
+                "assistantMessageId": queued_run.get("assistantMessageId").and_then(Value::as_str).unwrap_or(""),
+                "content": existing.content,
+                "parts": remote_chat_parts(&message, None),
+                "sessionMode": session_mode,
+                "idempotencyKey": idempotency_key,
+            })));
+        }
+    }
     let user_sequence = database
         .next_message_sequence_for_chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
@@ -2995,6 +3555,7 @@ async fn remote_sidecar_chat_queue(
         "thinkingLevel": thinking_level,
         "skillIds": payload.get("skillIds").cloned().unwrap_or_else(|| json!([])),
         "sessionMode": session_mode,
+        "idempotencyKey": idempotency_key,
     });
     let user_metadata = json!({
         "parts": remote_chat_parts(&message, None),
@@ -3030,6 +3591,7 @@ async fn remote_sidecar_chat_queue(
         "content": message,
         "parts": remote_chat_parts(&message, None),
         "sessionMode": session_mode,
+        "idempotencyKey": idempotency_key,
     })))
 }
 
@@ -3039,6 +3601,16 @@ async fn remote_sidecar_broker_request(
     payload: Value,
 ) -> Result<mpsc::UnboundedReceiver<ControlEnvelope>, axum::response::Response> {
     let id = unique_id("broker-request");
+    let deadline = tokio::time::Instant::now() + BROKER_OFFLINE_RUN_TIMEOUT;
+    while state.ws_count.load(Ordering::Relaxed) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::bad_gateway(
+                "remote broker is unavailable; active run can be retried after reconnect",
+            )
+            .into_response());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     state.broker_pending.lock().await.insert(id.clone(), tx);
     let envelope = ControlEnvelope {
@@ -3156,7 +3728,20 @@ async fn remote_sidecar_chat_stream(
             "memoriesUsed": [],
         })));
         loop {
-            let Some(envelope) = broker_rx.recv().await else { break };
+            let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
+                Ok(Some(envelope)) => envelope,
+                Ok(None) => break,
+                Err(_) => {
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({
+                        "type": "error",
+                        "message": "remote broker request timed out; retry to resume from persisted messages",
+                    })));
+                    sequence += 1;
+                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    break;
+                }
+            };
             match envelope.message_type.as_str() {
                 "stream" => {
                     let kind = envelope.payload.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -4723,5 +5308,21 @@ mod tests {
         assert_eq!(runs[0].run_id, "run-1");
         assert_eq!(runs[0].last_sequence, Some(7));
         assert_eq!(runs[0].broker_status, "brokerUnavailable");
+    }
+
+    #[test]
+    fn remote_idempotency_key_is_stable_without_client_key() {
+        let first = remote_idempotency_key(&json!({}), "queue:chat:hello:model::");
+        let second = remote_idempotency_key(&json!({}), "queue:chat:hello:model::");
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn remote_idempotency_key_prefers_client_key() {
+        assert_eq!(
+            remote_idempotency_key(&json!({ "idempotencyKey": "client-key" }), "fallback"),
+            "client-key"
+        );
     }
 }

@@ -1967,5 +1967,9 @@ pub(crate) async fn delete_chat(
         )));
     }
 
-    workspace_response_from_config(&config, &state.active_chat_runs)
+    workspace_response_from_config(
+        &config,
+        &state.active_chat_runs,
+        Some(&state.remote_workspace_manager),
+    )
 }

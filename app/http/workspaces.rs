@@ -425,7 +425,11 @@ pub(crate) async fn workspaces(
         "workspaces API config snapshot loaded"
     );
 
-    let response = workspace_response_from_config(&config, &state.active_chat_runs)?;
+    let response = workspace_response_from_config(
+        &config,
+        &state.active_chat_runs,
+        Some(&state.remote_workspace_manager),
+    )?;
     tracing::info!(
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "workspaces API request completed"
@@ -512,7 +516,11 @@ pub(crate) async fn search_workspace_chats(
                 .iter()
                 .find(|server| server.id == server_id)
         });
-        let remote = settings_runtime::remote_workspace_fields(workspace, server);
+        let remote = settings_runtime::remote_workspace_fields(
+            workspace,
+            server,
+            Some(&state.remote_workspace_manager),
+        );
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
@@ -684,7 +692,11 @@ pub(crate) async fn add_workspace(
         .await
         .map_err(ApiError::from_mcp_error)?;
 
-    workspace_response_from_config(&config, &state.active_chat_runs)
+    workspace_response_from_config(
+        &config,
+        &state.active_chat_runs,
+        Some(&state.remote_workspace_manager),
+    )
 }
 
 async fn add_remote_workspace(
@@ -749,7 +761,11 @@ async fn add_remote_workspace(
         .await
         .map_err(ApiError::from_mcp_error)?;
 
-    workspace_response_from_config(&config, &state.active_chat_runs)
+    workspace_response_from_config(
+        &config,
+        &state.active_chat_runs,
+        Some(&state.remote_workspace_manager),
+    )
 }
 
 fn validate_remote_workspace_path(path: &str) -> Result<(), ApiError> {

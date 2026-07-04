@@ -203,6 +203,7 @@ pub(crate) async fn settings_response(
         remote_servers: crate::http::remote_servers::remote_server_summaries(
             config,
             &crate::http::remote_servers::connected_remote_server_ids(state)?,
+            Some(state),
         ),
         terminal_shells: terminal_shell_summaries(),
         provider_kinds: supported_provider_kinds()
@@ -318,7 +319,7 @@ pub(crate) fn configured_workspace_summary(
     workspace: &WorkspaceConfig,
     server: Option<&foco_store::config::RemoteServerProfile>,
 ) -> Result<ConfiguredWorkspaceSummary, ApiError> {
-    let remote = remote_workspace_fields(workspace, server);
+    let remote = remote_workspace_fields(workspace, server, None);
     Ok(ConfiguredWorkspaceSummary {
         id: workspace.id.clone(),
         name: workspace.name.clone(),
@@ -348,24 +349,36 @@ pub(crate) struct RemoteWorkspaceResponseFields {
 pub(crate) fn remote_workspace_fields(
     workspace: &WorkspaceConfig,
     server: Option<&foco_store::config::RemoteServerProfile>,
+    remote_manager: Option<&crate::remote_workspace::RemoteWorkspaceManager>,
 ) -> RemoteWorkspaceResponseFields {
+    let live_state = workspace.server_id().and_then(|server_id| {
+        remote_manager.and_then(|manager| {
+            manager
+                .workspace_state(server_id, &workspace.id)
+                .ok()
+                .flatten()
+        })
+    });
     RemoteWorkspaceResponseFields {
         server_id: workspace.server_id().map(str::to_string),
         server_name: server.map(remote_server_display_name),
         remote_path: workspace.remote_path().map(str::to_string),
-        connection_status: server
-            .map(|server| {
-                if server
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    "error"
-                } else if server.last_checked_at.is_some() {
-                    "ready"
-                } else {
-                    "unknown"
-                }
+        connection_status: live_state
+            .map(|state| state.as_str())
+            .or_else(|| {
+                server.map(|server| {
+                    if server
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        "offline"
+                    } else if server.last_checked_at.is_some() {
+                        "ready"
+                    } else {
+                        "disconnected"
+                    }
+                })
             })
             .unwrap_or(if workspace.is_remote() {
                 "missingServer"
@@ -664,6 +677,7 @@ pub(crate) const WORKSPACE_CHAT_PAGE_LIMIT: usize = 5;
 pub(crate) fn workspace_response_from_config(
     config: &GlobalConfig,
     active_chat_runs: &ActiveChatRunRegistry,
+    remote_manager: Option<&crate::remote_workspace::RemoteWorkspaceManager>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
     let response_started_at = Instant::now();
     tracing::debug!(
@@ -681,7 +695,7 @@ pub(crate) fn workspace_response_from_config(
         );
         if workspace.is_remote() {
             let server = remote_server_for_workspace(config, workspace);
-            let remote = remote_workspace_fields(workspace, server);
+            let remote = remote_workspace_fields(workspace, server, remote_manager);
             workspaces.push(WorkspaceSummary {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
@@ -790,7 +804,7 @@ pub(crate) fn workspace_response_from_config(
         );
 
         let server = remote_server_for_workspace(config, workspace);
-        let remote = remote_workspace_fields(workspace, server);
+        let remote = remote_workspace_fields(workspace, server, remote_manager);
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
