@@ -28,13 +28,13 @@ const iconPath = path.join(resourcesDir, `${APP_NAME}.icns`);
 const dmgPath = path.join(distRoot, `${APP_NAME}.dmg`);
 
 try {
-  parseArgs(process.argv.slice(2));
+  const options = parseArgs(process.argv.slice(2));
   assertMacosHost();
 
   runNpm(["run", "build", "-w", "web"]);
   runCargo(["build", "--release", "-p", "foco-app"]);
 
-  await buildAppBundle();
+  await buildAppBundle(options);
   try {
     await buildDmg();
   } finally {
@@ -48,9 +48,14 @@ try {
 }
 
 function parseArgs(args) {
-  if (args.length > 0) {
-    throw new Error(`unknown argument: ${args[0]}`);
+  const unknown = args.filter((arg) => arg !== "--no-sidecars");
+  if (unknown.length > 0) {
+    throw new Error(`unknown argument: ${unknown[0]}`);
   }
+
+  return {
+    bundleSidecars: !args.includes("--no-sidecars"),
+  };
 }
 
 function assertMacosHost() {
@@ -59,7 +64,7 @@ function assertMacosHost() {
   }
 }
 
-async function buildAppBundle() {
+async function buildAppBundle(options) {
   const targetRoot = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
   const releaseExecutable = path.join(targetRoot, "release", EXECUTABLE_NAME);
 
@@ -77,7 +82,12 @@ async function buildAppBundle() {
 
   await writeIcns();
   await writeInfoPlist(await cargoPackageVersion());
-  runNode(["scripts/sidecars.mjs", "copy", "--dest", path.join(resourcesDir, "sidecars")]);
+  if (options.bundleSidecars) {
+    runNode(["scripts/sidecars.mjs", "copy", "--dest", path.join(resourcesDir, "sidecars")]);
+  } else {
+    // ponytail: local-only DMGs can skip SSH remote-workspace sidecars; release CI keeps the default bundled path.
+    console.warn("[macos] skipped sidecars; remote SSH workspaces will require a custom focoCommand.");
+  }
 }
 
 async function writeIcns() {
