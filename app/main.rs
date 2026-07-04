@@ -2102,6 +2102,33 @@ struct PendingPromptContextInjection {
     memory_keys: Vec<String>,
 }
 
+fn pending_stable_prompt_context_injection_from_prompt_context(
+    context: &PreparedPromptContext,
+) -> Option<PendingPromptContextInjection> {
+    let stable_messages = context
+        .provider_request
+        .messages
+        .iter()
+        .zip(context.message_context_sources.iter())
+        .filter_map(|(message, source)| {
+            matches!(source, PromptContextSource::StableInjection).then(|| message.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if stable_messages.is_empty() {
+        return None;
+    }
+
+    Some(PendingPromptContextInjection {
+        kind: "stable",
+        sequence: None,
+        messages: stable_messages,
+        // ponytail: queued chat only backfills non-memory stable context here;
+        // deferred memory stays on resolve_pending_memory's existing path.
+        memory_keys: Vec::new(),
+    })
+}
+
 struct PendingChatSpecSnapshot {
     revision: u64,
     content_markdown: String,

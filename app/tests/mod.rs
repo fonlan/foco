@@ -6359,6 +6359,246 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
 }
 
 #[tokio::test]
+async fn queued_new_chat_persists_skills_for_scheduler_replay() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-queued-skills-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-queued-skills-profile-test"));
+    let skill_dir = profile_dir
+        .join(".agents")
+        .join("skills")
+        .join("queuedmemo");
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&skill_dir).expect("skill directory");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---
+name: queuedmemo
+description: Queued skill routing.
+---
+
+# QueuedMemo
+
+Only load this when matched.
+",
+    )
+    .expect("skill file write");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            chat_title_override: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Use the queued skill".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+            agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
+            correlation_id: None,
+            origin: crate::http::chat::QueuedChatMessageOrigin::User,
+        },
+    )
+    .await
+    .expect("queue message");
+
+    {
+        let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let context_injections = database
+            .prompt_context_injections_for_chat(&queued.chat_id)
+            .expect("context injections");
+        assert_eq!(context_injections.len(), 1);
+        assert_eq!(context_injections[0].kind, "stable");
+        assert!(
+            context_injections[0]
+                .messages_json
+                .contains("<skills_instructions>")
+        );
+        assert!(
+            context_injections[0]
+                .messages_json
+                .contains("name: queuedmemo")
+        );
+        assert_eq!(context_injections[0].memory_keys_json, "[]");
+    }
+
+    let scheduler_context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: Some(queued.user_message_id.clone()),
+            run_id_override: Some(queued.agent_task_id.expect("agent task id").to_string()),
+            visible_assistant_message_id: Some(queued.assistant_message_id.clone()),
+            visible_assistant_sequence: Some(1),
+            chat_id: Some(queued.chat_id.clone()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Use the queued skill".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("scheduler chat context");
+
+    let skill_messages = scheduler_context
+        .provider_request
+        .messages
+        .iter()
+        .filter(|message| message.content.contains("<skills_instructions>"))
+        .collect::<Vec<_>>();
+    assert_eq!(skill_messages.len(), 1);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert!(
+        skill_messages[0]
+            .content
+            .contains("description: Queued skill routing.")
+    );
+    assert!(
+        scheduler_context
+            .request_body_json
+            .contains("<skills_instructions>")
+    );
+    assert!(
+        scheduler_context
+            .request_body_json
+            .contains("name: queuedmemo")
+    );
+
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn queued_new_chat_persists_skills_when_memory_is_deferred() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-queued-deferred-skills-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-queued-deferred-skills-profile-test"));
+    let skill_dir = profile_dir
+        .join(".agents")
+        .join("skills")
+        .join("deferredmemo");
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&skill_dir).expect("skill directory");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---
+name: deferredmemo
+description: Deferred memory skill routing.
+---
+
+# DeferredMemo
+
+Only load this when matched.
+",
+    )
+    .expect("skill file write");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.memory.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            chat_title_override: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Use deferred memory skill".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+            agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
+            correlation_id: None,
+            origin: crate::http::chat::QueuedChatMessageOrigin::User,
+        },
+    )
+    .await
+    .expect("queue message");
+
+    {
+        let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let context_injections = database
+            .prompt_context_injections_for_chat(&queued.chat_id)
+            .expect("context injections");
+        assert_eq!(context_injections.len(), 1);
+        assert_eq!(context_injections[0].kind, "stable");
+        assert!(
+            context_injections[0]
+                .messages_json
+                .contains("<skills_instructions>")
+        );
+        assert!(
+            context_injections[0]
+                .messages_json
+                .contains("name: deferredmemo")
+        );
+        assert_eq!(context_injections[0].memory_keys_json, "[]");
+    }
+
+    let scheduler_context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: Some(queued.user_message_id.clone()),
+            run_id_override: Some(queued.agent_task_id.expect("agent task id").to_string()),
+            visible_assistant_message_id: Some(queued.assistant_message_id.clone()),
+            visible_assistant_sequence: Some(1),
+            chat_id: Some(queued.chat_id.clone()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Use deferred memory skill".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("scheduler chat context");
+
+    assert!(scheduler_context.pending_memory_retrieval.is_some());
+    assert!(
+        scheduler_context
+            .request_body_json
+            .contains("<skills_instructions>")
+    );
+    assert!(
+        scheduler_context
+            .request_body_json
+            .contains("name: deferredmemo")
+    );
+
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_plan_phase_reuses_existing_worktree_relative_path() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-profile"));

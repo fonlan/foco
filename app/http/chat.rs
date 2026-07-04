@@ -607,6 +607,23 @@ pub(crate) async fn queue_chat_message_internal(
         &chat_id,
         prompt_context.pending_spec_snapshot.as_ref(),
     )?;
+    if prompt_context.is_new_chat {
+        let fallback_pending_context_injections;
+        let pending_context_injections = if prompt_context.pending_context_injections.is_empty() {
+            fallback_pending_context_injections =
+                pending_stable_prompt_context_injection_from_prompt_context(&prompt_context)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            fallback_pending_context_injections.as_slice()
+        } else {
+            prompt_context.pending_context_injections.as_slice()
+        };
+        persist_pending_prompt_context_injections(
+            &mut database,
+            &chat_id,
+            pending_context_injections,
+        )?;
+    }
 
     if team.is_none() {
         let definition = match agent_definition_id.as_deref() {
