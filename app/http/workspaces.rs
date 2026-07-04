@@ -1019,11 +1019,13 @@ pub(crate) async fn install_ripgrep(
     }))
 }
 
-fn workspace_file_tree_response(workspace_root: &Path) -> Result<WorkspaceFileTreeNode, ApiError> {
+pub(crate) fn workspace_file_tree_response(
+    workspace_root: &Path,
+) -> Result<WorkspaceFileTreeNode, ApiError> {
     workspace_file_tree(workspace_root, workspace_root, true, 1, true)
 }
 
-fn workspace_file_tree_children(
+pub(crate) fn workspace_file_tree_children(
     workspace_root: &Path,
     path: &Path,
     depth: usize,
@@ -1167,7 +1169,7 @@ fn workspace_file_parent_path(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn workspace_file_list_path(
+pub(crate) fn workspace_file_list_path(
     workspace_root: &Path,
     input: &str,
 ) -> Result<std::path::PathBuf, ApiError> {
@@ -1179,7 +1181,10 @@ fn workspace_file_list_path(
     Ok(workspace_root.join(relative_path))
 }
 
-fn workspace_file_path(workspace_root: &Path, input: &str) -> Result<std::path::PathBuf, ApiError> {
+pub(crate) fn workspace_file_path(
+    workspace_root: &Path,
+    input: &str,
+) -> Result<std::path::PathBuf, ApiError> {
     let relative_path = normalize_workspace_relative_path(input)?;
     let path = workspace_root.join(relative_path);
 
@@ -1190,7 +1195,7 @@ fn workspace_file_path(workspace_root: &Path, input: &str) -> Result<std::path::
     Ok(path)
 }
 
-fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str, ApiError> {
+pub(crate) fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str, ApiError> {
     if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
         return Ok("image/png");
     }

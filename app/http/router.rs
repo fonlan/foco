@@ -2,9 +2,11 @@ use std::time::Instant;
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
-    middleware,
-    response::Response,
+    body::Body,
+    extract::{DefaultBodyLimit, FromRequestParts, Request, State, WebSocketUpgrade},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, patch, post, put},
 };
 
@@ -583,11 +585,166 @@ pub(crate) fn app_router(state: AppState) -> Router {
         )
         .fallback(static_asset)
         .layer(middleware::from_fn_with_state(
+            state.clone(),
+            remote_workspace_proxy_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
             auth_state,
             crate::http::auth::require_auth,
         ))
         .layer(middleware::from_fn(log_http_request))
         .with_state(state)
+}
+
+/// Middleware that proxies workspace-scoped API requests to the remote sidecar
+/// when the target workspace has an active SSH sidecar session.
+///
+/// Only proxies routes that operate on workspace-local resources (files, git,
+/// terminal, spec, plans, code graph).  Chat, settings, memory, and other
+/// routes that involve global state or provider secrets stay local.
+///
+/// ponytail: v1 reads the entire request body, proxies, and returns the full
+/// response body in memory.  This is fine for the localhost SSH tunnel but
+/// should stream for large file blobs.
+async fn remote_workspace_proxy_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+
+    // Only proxy specific workspace-scoped route prefixes
+    let Some(suffix) = proxy_workspace_route_path(path) else {
+        return next.run(request).await;
+    };
+    let Some(workspace_id) = extract_workspace_id_from_path(path) else {
+        return next.run(request).await;
+    };
+
+    // Check if this workspace is remote and has an active sidecar session
+    let (base, token) = match crate::remote_workspace::sidecar_proxy_target(&state, &workspace_id) {
+        Ok(Some(target)) => target,
+        _ => return next.run(request).await,
+    };
+
+    // Build the proxied URL - map /api/workspaces/{id}/foo to /api/remote/workspace/foo
+    let query = request
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let proxy_url = format!(
+        "{}api/remote/workspace/{suffix}{query}",
+        base.trim_end_matches('/')
+    );
+
+    if is_websocket_request(&request) {
+        return proxy_websocket_upgrade(request, proxy_url, token).await;
+    }
+
+    let is_code_graph_request = suffix.starts_with("code-graph") || suffix.starts_with("graph");
+
+    // Read the request body
+    let method = request.method().clone();
+    let bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("failed to read request body for proxy"))
+                .expect("valid response");
+        }
+    };
+
+    // Proxy to sidecar
+    let client = reqwest::Client::new();
+    let mut req = client
+        .request(method, &proxy_url)
+        .bearer_auth(&token)
+        .body(bytes.to_vec());
+    if is_code_graph_request {
+        req = req.header("x-foco-ensure-code-graph", "1");
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body_bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from("failed to read sidecar proxy response"))
+                        .expect("valid response");
+                }
+            };
+            let mut builder = Response::builder().status(status);
+            for (name, value) in headers.iter() {
+                if name == header::TRANSFER_ENCODING || name == header::CONNECTION {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(Body::from(body_bytes.to_vec()))
+                .expect("valid proxy response")
+        }
+        Err(source) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("sidecar proxy failed: {source}")))
+            .expect("valid error response"),
+    }
+}
+
+fn is_websocket_request(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
+async fn proxy_websocket_upgrade(request: Request, proxy_url: String, token: String) -> Response {
+    let mut parts = request.into_parts().0;
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => upgrade
+            .on_upgrade(move |client_socket| async move {
+                crate::remote_workspace::proxy_websocket_to_sidecar(
+                    client_socket,
+                    proxy_url,
+                    token,
+                )
+                .await;
+            })
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// If the request path matches a proxied workspace route, return the path suffix
+/// after the workspace_id segment.  Returns None for routes that should stay local.
+fn proxy_workspace_route_path(path: &str) -> Option<&str> {
+    // Match /api/workspaces/{id}/files, /api/workspaces/{id}/git, /api/workspaces/{id}/terminal,
+    // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, /api/workspaces/{id}/logo
+    let rest = path.strip_prefix("/api/workspaces/")?;
+    let after_id = rest.split_once('/')?.1;
+    let prefix = after_id.split('/').next().unwrap_or("");
+    match prefix {
+        "files" | "git" | "terminal" | "spec" | "plans" | "logo" | "code-graph" | "graph" => {
+            Some(after_id)
+        }
+        _ => None,
+    }
+}
+
+/// Extract workspace_id from /api/workspaces/{workspace_id}/... paths.
+fn extract_workspace_id_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/api/workspaces/")?;
+    let workspace_id = rest.split('/').next()?;
+    if workspace_id.is_empty() || workspace_id.contains('?') {
+        return None;
+    }
+    Some(workspace_id.to_string())
 }
 
 async fn log_http_request(request: axum::extract::Request, next: middleware::Next) -> Response {

@@ -60,6 +60,9 @@ pub(crate) fn recently_active_code_graph_workspaces(
     let mut active_workspaces = Vec::new();
 
     for workspace in workspaces {
+        if workspace.is_remote() {
+            continue;
+        }
         let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
         if database.has_user_message_since(&since)? {
             active_workspaces.push(workspace.clone());
@@ -156,6 +159,10 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
     state: &AppState,
     workspace: &WorkspaceConfig,
 ) {
+    if workspace.is_remote() {
+        // ponytail: local main never watches remote paths; sidecar owns remote graph index and watcher lifecycle.
+        return;
+    }
     if !state
         .code_graph_indexes
         .lock()

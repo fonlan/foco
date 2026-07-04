@@ -13,10 +13,13 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State, WebSocketUpgrade, ws::Message},
+    extract::{
+        Path as AxumPath, Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::{StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, patch, post, put},
 };
 use chrono::{SecondsFormat, Utc};
 use foco_providers::{
@@ -145,6 +148,7 @@ impl RemoteWorkspaceManager {
             target,
             local_port,
             remote_port: bootstrap.port,
+            token,
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             sidecar: AsyncMutex::new(Some(sidecar)),
             tunnel: AsyncMutex::new(Some(tunnel)),
@@ -302,6 +306,7 @@ struct RemoteWorkspaceSession {
     target: String,
     local_port: u16,
     remote_port: u16,
+    token: String,
     started_at: String,
     sidecar: AsyncMutex<Option<Child>>,
     tunnel: AsyncMutex<Option<Child>>,
@@ -428,15 +433,147 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let active_run_count = Arc::new(AtomicUsize::new(0));
     let state = RemoteSidecarState {
         token: options.token,
+        workspace_path: options.workspace_path.clone(),
         last_config_hash: Arc::new(Mutex::new(None)),
+        code_graph_watcher: Arc::new(Mutex::new(None)),
         ws_count: ws_count.clone(),
         broker_tx,
     };
 
     let app = Router::new()
-        // ponytail: all HTTP routes need bearer auth; add more workspace-scoped
-        // routes (files, git, terminal proxy) behind the same middleware later.
         .route(CONTROL_WS_PATH, get(remote_control_ws))
+        // ponytail: workspace-scoped HTTP routes proxied from local main.
+        // Sidecar handles files, git, terminal, spec, and plan routes that hit
+        // the remote workspace path.  Query/path params match the local main
+        // route convention so the proxy can forward as-is.
+        .route("/api/remote/workspace/files", get(remote_sidecar_file_tree))
+        .route(
+            "/api/remote/workspace/files/children",
+            get(remote_sidecar_file_children),
+        )
+        .route(
+            "/api/remote/workspace/files/content",
+            post(remote_sidecar_file_content),
+        )
+        .route(
+            "/api/remote/workspace/files/blob",
+            get(remote_sidecar_file_blob),
+        )
+        .route(
+            "/api/remote/workspace/files/save",
+            post(remote_sidecar_file_save),
+        )
+        .route(
+            "/api/remote/workspace/files/delete",
+            post(remote_sidecar_file_delete),
+        )
+        .route(
+            "/api/remote/workspace/files/rename",
+            post(remote_sidecar_file_rename),
+        )
+        .route(
+            "/api/remote/workspace/git/status",
+            get(remote_sidecar_git_status),
+        )
+        .route(
+            "/api/remote/workspace/git/diff",
+            get(remote_sidecar_git_diff),
+        )
+        .route(
+            "/api/remote/workspace/git/stage",
+            post(remote_sidecar_git_stage),
+        )
+        .route(
+            "/api/remote/workspace/git/unstage",
+            post(remote_sidecar_git_unstage),
+        )
+        .route(
+            "/api/remote/workspace/git/discard",
+            post(remote_sidecar_git_discard),
+        )
+        .route(
+            "/api/remote/workspace/git/commit",
+            post(remote_sidecar_git_commit),
+        )
+        .route(
+            "/api/remote/workspace/git/branches",
+            get(remote_sidecar_git_branches),
+        )
+        .route(
+            "/api/remote/workspace/git/branches/switch",
+            post(remote_sidecar_git_branch_switch),
+        )
+        .route(
+            "/api/remote/workspace/git/branches/create",
+            post(remote_sidecar_git_branch_create),
+        )
+        .route(
+            "/api/remote/workspace/terminal/session",
+            post(remote_sidecar_terminal_session),
+        )
+        .route(
+            "/api/remote/workspace/terminal/{session_id}/ws",
+            get(remote_sidecar_terminal_ws),
+        )
+        // ponytail: spec and plan routes use workspace DB on the sidecar.
+        // LLM-dependent operations (spec generation, plan phase actions) are
+        // not proxied — they go through the broker channel or error gracefully.
+        .route(
+            "/api/remote/workspace/spec",
+            get(remote_sidecar_spec_get).put(remote_sidecar_spec_put),
+        )
+        .route(
+            "/api/remote/workspace/spec/settings",
+            put(remote_sidecar_spec_settings),
+        )
+        .route(
+            "/api/remote/workspace/spec/generate",
+            post(remote_sidecar_spec_generate),
+        )
+        .route(
+            "/api/remote/workspace/spec/jobs",
+            get(remote_sidecar_spec_jobs),
+        )
+        .route(
+            "/api/remote/workspace/spec/jobs/{job_id}/retry",
+            post(remote_sidecar_spec_jobs_retry),
+        )
+        .route(
+            "/api/remote/workspace/plans",
+            get(remote_sidecar_plans_list).post(remote_sidecar_plans_create),
+        )
+        .route(
+            "/api/remote/workspace/plans/auto-run",
+            get(remote_sidecar_plans_auto_run).put(remote_sidecar_plans_auto_run_set),
+        )
+        .route(
+            "/api/remote/workspace/plans/order",
+            post(remote_sidecar_plans_order),
+        )
+        .route(
+            "/api/remote/workspace/plans/worktrees/audit",
+            get(remote_sidecar_plans_worktree_audit),
+        )
+        .route(
+            "/api/remote/workspace/plans/worktrees/cleanup",
+            post(remote_sidecar_plans_worktree_cleanup),
+        )
+        .route(
+            "/api/remote/workspace/plans/{plan_id}",
+            patch(remote_sidecar_plans_update).delete(remote_sidecar_plans_delete),
+        )
+        .route(
+            "/api/remote/workspace/plans/{plan_id}/action",
+            post(remote_sidecar_plans_action),
+        )
+        .route(
+            "/api/remote/workspace/plans/{plan_id}/phases/{phase_id}/retry",
+            post(remote_sidecar_plans_phase_retry),
+        )
+        .route(
+            "/api/remote/workspace/plans/{plan_id}/steps/{step_id}/action",
+            post(remote_sidecar_plans_step_action),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             sidecar_bearer_auth,
@@ -487,8 +624,10 @@ async fn idle_shutdown_watch(
 struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
+    code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
     ws_count: Arc<AtomicUsize>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
+    workspace_path: String,
 }
 
 /// Bearer token middleware for all sidecar HTTP routes.
@@ -505,6 +644,11 @@ async fn sidecar_bearer_auth(
         .is_some_and(|token| token == state.token);
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.headers().contains_key("x-foco-ensure-code-graph") {
+        if let Err(response) = ensure_sidecar_code_graph(&state) {
+            return response;
+        }
     }
     next.run(request).await
 }
@@ -2170,6 +2314,1202 @@ fn remote_error(
         prefix.push_str(&format!(" workspaceId={workspace_id}"));
     }
     ApiError::bad_request(format!("{prefix}: {}", message.into()))
+}
+
+/// Return the local tunnel base URL and bearer token for a remote workspace's
+/// sidecar session, or None if the workspace is local or its sidecar is not connected.
+pub(crate) fn sidecar_proxy_target(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<Option<(String, String)>, ApiError> {
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let WorkspaceLocation::Ssh { server_id, .. } = &workspace.location else {
+        return Ok(None);
+    };
+    let sessions = state
+        .remote_workspace_manager
+        .sessions
+        .lock()
+        .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+    let key = session_key(server_id, workspace_id);
+    if let Some(session) = sessions.get(&key) {
+        Ok(Some((
+            format!("http://127.0.0.1:{}/", session.local_port),
+            session.token.clone(),
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn proxy_websocket_to_sidecar(
+    client_socket: WebSocket,
+    proxy_url: String,
+    token: String,
+) {
+    let ws_url = proxy_url
+        .strip_prefix("http://")
+        .map(|rest| format!("ws://{rest}"))
+        .unwrap_or(proxy_url);
+    let mut request = match ws_url.into_client_request() {
+        Ok(request) => request,
+        Err(source) => {
+            tracing::warn!(error = %source, "invalid remote sidecar websocket proxy request");
+            return;
+        }
+    };
+    let Ok(auth) = format!("Bearer {token}").parse() else {
+        tracing::warn!("invalid remote sidecar websocket auth header");
+        return;
+    };
+    request.headers_mut().insert(header::AUTHORIZATION, auth);
+
+    let (sidecar_socket, _) = match connect_async(request).await {
+        Ok(connection) => connection,
+        Err(source) => {
+            tracing::warn!(error = %source, "failed to open remote sidecar websocket");
+            return;
+        }
+    };
+    let (mut client_sender, mut client_receiver) = client_socket.split();
+    let (mut sidecar_sender, mut sidecar_receiver) = sidecar_socket.split();
+
+    loop {
+        tokio::select! {
+            client_message = client_receiver.next() => {
+                let Some(Ok(message)) = client_message else { break; };
+                let message = match message {
+                    Message::Text(text) => tungstenite::Message::Text(text.as_str().to_string().into()),
+                    Message::Binary(bytes) => tungstenite::Message::Binary(bytes),
+                    Message::Ping(bytes) => tungstenite::Message::Ping(bytes),
+                    Message::Pong(bytes) => tungstenite::Message::Pong(bytes),
+                    Message::Close(_) => {
+                        let _ = sidecar_sender.send(tungstenite::Message::Close(None)).await;
+                        break;
+                    }
+                };
+                if sidecar_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            sidecar_message = sidecar_receiver.next() => {
+                let Some(Ok(message)) = sidecar_message else { break; };
+                let message = match message {
+                    tungstenite::Message::Text(text) => Message::Text(text.as_str().to_string().into()),
+                    tungstenite::Message::Binary(bytes) => Message::Binary(bytes),
+                    tungstenite::Message::Ping(bytes) => Message::Ping(bytes),
+                    tungstenite::Message::Pong(bytes) => Message::Pong(bytes),
+                    tungstenite::Message::Close(_) => {
+                        let _ = client_sender.send(Message::Close(None)).await;
+                        break;
+                    }
+                    tungstenite::Message::Frame(_) => continue,
+                };
+                if client_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Sidecar workspace-scoped HTTP route handlers
+
+fn sidecar_workspace_path(state: &RemoteSidecarState) -> &Path {
+    Path::new(&state.workspace_path)
+}
+
+fn ensure_sidecar_code_graph(state: &RemoteSidecarState) -> Result<(), axum::response::Response> {
+    if state
+        .code_graph_watcher
+        .lock()
+        .map_err(|_| {
+            ApiError::internal("remote code graph watcher lock is poisoned").into_response()
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    // ponytail: first code-graph touch indexes under a short global lock; upgrade to per-workspace async init if remote repos make this slow.
+    let workspace_path = sidecar_workspace_path(state).to_path_buf();
+    let report = foco_graph::index_workspace(&workspace_path).map_err(|e| {
+        ApiError::internal(format!("failed to index remote code graph: {e}")).into_response()
+    })?;
+    let watcher = foco_graph::start_code_graph_watcher(&workspace_path).map_err(|e| {
+        ApiError::internal(format!("failed to watch remote code graph: {e}")).into_response()
+    })?;
+    tracing::info!(
+        workspace_path = %workspace_path.display(),
+        scanned_files = report.scanned_files,
+        indexed_files = report.indexed_files,
+        "initialized remote sidecar code graph"
+    );
+    let mut lock = state.code_graph_watcher.lock().map_err(|_| {
+        ApiError::internal("remote code graph watcher lock is poisoned").into_response()
+    })?;
+    if lock.is_none() {
+        *lock = Some(watcher);
+    }
+    Ok(())
+}
+
+async fn remote_sidecar_file_tree(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let root =
+        crate::http::workspaces::workspace_file_tree_response(sidecar_workspace_path(&state))
+            .map_err(|e| e.into_response())?;
+    Ok(Json(serde_json::to_value(root).map_err(|e| {
+        ApiError::internal(e.to_string()).into_response()
+    })?))
+}
+
+async fn remote_sidecar_file_children(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let path = query.get("path").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let list_path = crate::http::workspaces::workspace_file_list_path(ws_path, path)
+        .map_err(|e| e.into_response())?;
+    let children =
+        crate::http::workspaces::workspace_file_tree_children(ws_path, &list_path, 0, false)
+            .map_err(|e| e.into_response())?;
+    Ok(Json(
+        serde_json::json!({ "path": path, "children": children }),
+    ))
+}
+
+async fn remote_sidecar_file_content(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let rel_path = payload.get("path").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let abs_path = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    let content = std::fs::read_to_string(&abs_path).map_err(|source| {
+        ApiError::bad_request(format!("failed to read remote file {rel_path}: {source}"))
+            .into_response()
+    })?;
+    Ok(Json(
+        serde_json::json!({ "content": content, "path": rel_path }),
+    ))
+}
+
+async fn remote_sidecar_file_save(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let rel_path = payload.get("path").map(String::as_str).unwrap_or("");
+    let content = payload.get("content").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let abs_path = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    std::fs::write(&abs_path, content.as_bytes()).map_err(|source| {
+        ApiError::internal(format!("failed to save remote file {rel_path}: {source}"))
+            .into_response()
+    })?;
+    Ok(Json(
+        serde_json::json!({ "content": content, "path": rel_path }),
+    ))
+}
+
+async fn remote_sidecar_file_delete(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let rel_path = payload.get("path").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let abs_path = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    let meta = std::fs::metadata(&abs_path).map_err(|source| {
+        ApiError::bad_request(format!("remote file not found {rel_path}: {source}")).into_response()
+    })?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(&abs_path).map_err(|source| {
+            ApiError::internal(format!("failed to delete remote dir {rel_path}: {source}"))
+                .into_response()
+        })?;
+    } else {
+        std::fs::remove_file(&abs_path).map_err(|source| {
+            ApiError::internal(format!("failed to delete remote file {rel_path}: {source}"))
+                .into_response()
+        })?;
+    }
+    let parent = rel_path
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let list_path = crate::http::workspaces::workspace_file_list_path(ws_path, &parent)
+        .map_err(|e| e.into_response())?;
+    let children =
+        crate::http::workspaces::workspace_file_tree_children(ws_path, &list_path, 0, false)
+            .map_err(|e| e.into_response())?;
+    Ok(Json(
+        serde_json::json!({ "path": parent, "children": children }),
+    ))
+}
+
+async fn remote_sidecar_file_rename(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let rel_path = payload.get("path").map(String::as_str).unwrap_or("");
+    let new_name = payload.get("newName").map(String::as_str).unwrap_or("");
+    if new_name.is_empty() {
+        return Err(ApiError::bad_request("newName must not be empty").into_response());
+    }
+    let ws_path = sidecar_workspace_path(&state);
+    let src = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    let dst = src
+        .parent()
+        .ok_or_else(|| ApiError::bad_request("workspace root cannot be renamed").into_response())?
+        .join(new_name);
+    if dst.exists() {
+        return Err(
+            ApiError::bad_request(format!("target already exists: {}", dst.display()))
+                .into_response(),
+        );
+    }
+    std::fs::rename(&src, &dst).map_err(|source| {
+        ApiError::internal(format!("failed to rename remote file {rel_path}: {source}"))
+            .into_response()
+    })?;
+    let parent = rel_path
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let list_path = crate::http::workspaces::workspace_file_list_path(ws_path, &parent)
+        .map_err(|e| e.into_response())?;
+    let children =
+        crate::http::workspaces::workspace_file_tree_children(ws_path, &list_path, 0, false)
+            .map_err(|e| e.into_response())?;
+    Ok(Json(
+        serde_json::json!({ "path": parent, "children": children }),
+    ))
+}
+
+async fn remote_sidecar_file_blob(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let rel_path = query.get("path").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let abs_path = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    let bytes = std::fs::read(&abs_path).map_err(|source| {
+        ApiError::bad_request(format!("failed to read remote file {rel_path}: {source}"))
+            .into_response()
+    })?;
+    let content_type = crate::http::workspaces::workspace_image_content_type(&bytes)
+        .map_err(|e| e.into_response())?;
+    Ok(axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=60")
+        .body(axum::body::Body::from(bytes))
+        .expect("sidecar blob response is valid"))
+}
+
+async fn remote_sidecar_git_command(
+    state: &RemoteSidecarState,
+    args: &[&str],
+) -> Result<std::process::Output, ApiError> {
+    let ws_path = sidecar_workspace_path(state);
+    tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(ws_path)
+        .output()
+        .await
+        .map_err(|source| ApiError::internal(format!("remote git command failed: {source}")))
+}
+
+async fn remote_sidecar_git_status(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let output = remote_sidecar_git_command(&state, &["status", "--porcelain"])
+        .await
+        .map_err(|e| e.into_response())?;
+    let is_git = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 3 { return None; }
+            let ix = line.as_bytes()[0] as char;
+            let wx = line.as_bytes()[1] as char;
+            let path = line[3..].trim().to_string();
+            if path.is_empty() { return None; }
+            Some(serde_json::json!({ "path": path, "indexStatus": ix.to_string(), "worktreeStatus": wx.to_string() }))
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "isGitRepository": is_git,
+        "status": if is_git { "ok".to_string() } else { "not_a_repository".to_string() },
+        "files": files,
+    })))
+}
+
+async fn remote_sidecar_git_diff(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let path_filter = query.get("path").map(String::as_str);
+    let mut args = vec!["diff", "--no-color"];
+    if let Some(path) = path_filter.filter(|p| !p.is_empty()) {
+        args.push("--");
+        args.push(path);
+    }
+    let diff = remote_sidecar_git_command(&state, &args)
+        .await
+        .map_err(|e| e.into_response())?;
+    let staged = remote_sidecar_git_command(&state, &["diff", "--cached", "--no-color"])
+        .await
+        .map_err(|e| e.into_response())?;
+    let porcelain = remote_sidecar_git_command(&state, &["status", "--porcelain"])
+        .await
+        .map_err(|e| e.into_response())?;
+    let files: Vec<serde_json::Value> = String::from_utf8_lossy(&porcelain.stdout)
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 3 { return None; }
+            let ix = line.as_bytes()[0] as char;
+            let wx = line.as_bytes()[1] as char;
+            let path = line[3..].trim();
+            if path.is_empty() { return None; }
+            Some(serde_json::json!({ "path": path, "indexStatus": ix.to_string(), "worktreeStatus": wx.to_string() }))
+        })
+        .collect();
+    let staged_files: Vec<serde_json::Value> = files
+        .iter()
+        .filter(|f| {
+            f["indexStatus"]
+                .as_str()
+                .map(|s| s != " " && s != "?")
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    Ok(Json(serde_json::json!({
+        "path": path_filter,
+        "status": "ok",
+        "diff": String::from_utf8_lossy(&diff.stdout),
+        "stagedDiff": String::from_utf8_lossy(&staged.stdout),
+        "files": files,
+        "stagedFiles": staged_files,
+    })))
+}
+
+async fn remote_sidecar_git_stage(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let path = payload.get("path").map(String::as_str).unwrap_or(".");
+    remote_sidecar_git_command(&state, &["add", path])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+}
+
+async fn remote_sidecar_git_unstage(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let path = payload.get("path").map(String::as_str).unwrap_or(".");
+    remote_sidecar_git_command(&state, &["reset", "HEAD", "--", path])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+}
+
+async fn remote_sidecar_git_discard(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let path = payload.get("path").map(String::as_str).unwrap_or(".");
+    remote_sidecar_git_command(&state, &["checkout", "--", path])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+}
+
+async fn remote_sidecar_git_commit(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let message = payload.get("message").map(String::as_str).unwrap_or("");
+    if message.is_empty() {
+        return Err(ApiError::bad_request("commit message must not be empty").into_response());
+    }
+    remote_sidecar_git_command(&state, &["commit", "-m", message])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+}
+
+async fn remote_sidecar_git_branches(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let ws_path = sidecar_workspace_path(&state);
+    let is_git = ws_path.join(".git").exists();
+    if !is_git {
+        return Ok(Json(serde_json::json!({
+            "isGitRepository": false,
+            "currentBranch": null,
+            "branches": [],
+            "worktrees": [],
+        })));
+    }
+    let branch_out = remote_sidecar_git_command(&state, &["branch"])
+        .await
+        .map_err(|e| e.into_response())?;
+    let current = String::from_utf8_lossy(&branch_out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("* ").map(str::to_string));
+    let branches: Vec<String> = String::from_utf8_lossy(&branch_out.stdout)
+        .lines()
+        .map(|line| line.trim_start_matches("* ").to_string())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "isGitRepository": true,
+        "currentBranch": current,
+        "branches": branches,
+        "worktrees": [],
+    })))
+}
+
+async fn remote_sidecar_git_branch_switch(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let name = payload.get("name").map(String::as_str).unwrap_or("");
+    if name.is_empty() {
+        return Err(ApiError::bad_request("branch name must not be empty").into_response());
+    }
+    remote_sidecar_git_command(&state, &["checkout", name])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_branches(State(state)).await
+}
+
+async fn remote_sidecar_git_branch_create(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let name = payload.get("name").map(String::as_str).unwrap_or("");
+    if name.is_empty() {
+        return Err(ApiError::bad_request("branch name must not be empty").into_response());
+    }
+    remote_sidecar_git_command(&state, &["checkout", "-b", name])
+        .await
+        .map_err(|e| e.into_response())?;
+    remote_sidecar_git_branches(State(state)).await
+}
+
+async fn remote_sidecar_terminal_session(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let _shell = payload.get("shell").map(String::as_str).unwrap_or("bash");
+    let ws_path = sidecar_workspace_path(&state);
+    let session_id = format!(
+        "remote-term-{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        std::process::id(),
+    );
+    let mut db = foco_store::workspace::WorkspaceDatabase::open_or_create(ws_path)
+        .map_err(|e| ApiError::internal(e.to_string()).into_response())?;
+    db.upsert_terminal_session(foco_store::workspace::NewTerminalSession {
+        id: &session_id,
+        name: "Remote Terminal",
+        working_directory: &ws_path.display().to_string(),
+        metadata_json: None,
+    })
+    .map_err(|e| ApiError::internal(e.to_string()).into_response())?;
+    Ok(Json(serde_json::json!({
+        "sessionId": session_id,
+        "workingDirectory": ws_path.display().to_string(),
+    })))
+}
+
+async fn remote_sidecar_terminal_ws(
+    ws: axum::extract::WebSocketUpgrade,
+    State(state): State<RemoteSidecarState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> axum::response::Response {
+    let ws_path = sidecar_workspace_path(&state).to_path_buf();
+    ws.on_upgrade(move |socket| async move {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        crate::terminal::handle_terminal_socket(
+            socket,
+            shutdown_tx.subscribe(),
+            crate::terminal::TerminalRegistry::default(),
+            ws_path,
+            "bash".to_string(),
+            foco_store::workspace::TerminalSessionRecord {
+                id: session_id.clone(),
+                name: String::new(),
+                working_directory: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                closed_at: None,
+                metadata_json: String::new(),
+            },
+            80,
+            24,
+        )
+        .await;
+    })
+}
+
+async fn remote_sidecar_spec_get(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(remote_sidecar_spec_response(&database)?))
+}
+
+async fn remote_sidecar_spec_settings(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let inject_enabled = payload
+        .get("injectEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    database
+        .upsert_workspace_spec_settings(enabled, inject_enabled)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(remote_sidecar_spec_response(&database)?))
+}
+
+async fn remote_sidecar_spec_put(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let expected_revision = payload
+        .get("expectedRevision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ApiError::bad_request("expectedRevision is required").into_response())?;
+    let content_markdown = payload
+        .get("contentMarkdown")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("contentMarkdown is required").into_response())?;
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    database
+        .update_workspace_spec_content(expected_revision, content_markdown)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::conflict("workspace spec revision changed; reload and retry").into_response()
+        })?;
+    Ok(Json(remote_sidecar_spec_response(&database)?))
+}
+
+async fn remote_sidecar_spec_generate(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let spec = database
+        .workspace_spec()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .filter(|spec| spec.enabled)
+        .ok_or_else(|| ApiError::bad_request("workspace spec is disabled").into_response())?;
+    if let Some(job) = database
+        .running_workspace_spec_job()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    {
+        return Err(ApiError::conflict(format!(
+            "workspace spec job is already running: {}",
+            job.id
+        ))
+        .into_response());
+    }
+    let model_id = payload.get("modelId").and_then(Value::as_str);
+    let trigger_type = if spec.content_markdown.trim().is_empty() {
+        "manual_initial"
+    } else {
+        "manual_refresh"
+    };
+    let job_id = unique_id("workspace-spec-job");
+    let input_summary = json!({ "remoteSidecarQueued": true });
+    let job = database
+        .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+            id: &job_id,
+            trigger_type,
+            chat_id: None,
+            run_id: None,
+            model_id,
+            base_revision: Some(spec.revision),
+            input_summary_json: Some(&input_summary.to_string()),
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
+}
+
+async fn remote_sidecar_spec_jobs(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let jobs = database
+        .workspace_spec_jobs(limit)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .map(remote_sidecar_spec_job_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+async fn remote_sidecar_spec_jobs_retry(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(job_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let model_id = payload.get("modelId").and_then(Value::as_str);
+    let retry_id = unique_id("workspace-spec-job");
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let job = database
+        .retry_failed_workspace_spec_job(&job_id, &retry_id, model_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("workspace spec job cannot be retried: {job_id}"))
+                .into_response()
+        })?;
+    Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
+}
+
+fn remote_sidecar_spec_response(
+    database: &foco_store::workspace::WorkspaceDatabase,
+) -> Result<Value, axum::response::Response> {
+    let spec = database
+        .workspace_spec()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let latest_job = database
+        .workspace_spec_jobs(1)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .next()
+        .map(remote_sidecar_spec_job_json)
+        .transpose()?;
+    let (enabled, inject_enabled, content_markdown, revision, generated_at, updated_at) = match spec
+    {
+        Some(spec) => (
+            spec.enabled,
+            spec.inject_enabled,
+            spec.content_markdown,
+            spec.revision,
+            spec.generated_at,
+            Some(spec.updated_at),
+        ),
+        None => (false, false, String::new(), 0, None, None),
+    };
+    Ok(json!({
+        "settings": { "enabled": enabled, "injectEnabled": inject_enabled },
+        "contentMarkdown": content_markdown,
+        "revision": revision,
+        "generatedAt": generated_at,
+        "updatedAt": updated_at,
+        "latestJob": latest_job,
+    }))
+}
+
+fn remote_sidecar_spec_job_json(
+    job: foco_store::workspace::WorkspaceSpecJobRecord,
+) -> Result<Value, axum::response::Response> {
+    let input_summary = serde_json::from_str::<Value>(&job.input_summary_json).map_err(|e| {
+        ApiError::internal(format!("workspace spec input_summary_json is invalid: {e}"))
+            .into_response()
+    })?;
+    let output = job
+        .output_json
+        .as_deref()
+        .map(|value| serde_json::from_str::<Value>(value))
+        .transpose()
+        .map_err(|e| {
+            ApiError::internal(format!("workspace spec output_json is invalid: {e}"))
+                .into_response()
+        })?;
+    Ok(json!({
+        "id": job.id,
+        "triggerType": job.trigger_type,
+        "status": job.status,
+        "chatId": job.chat_id,
+        "runId": job.run_id,
+        "modelId": job.model_id,
+        "baseRevision": job.base_revision,
+        "inputSummary": input_summary,
+        "output": output,
+        "errorMessage": job.error_message,
+        "createdAt": job.created_at,
+        "startedAt": job.started_at,
+        "completedAt": job.completed_at,
+        "hasRetry": job.has_retry,
+    }))
+}
+
+async fn remote_sidecar_plans_list(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let page_size = query
+        .get("pageSize")
+        .or_else(|| query.get("page_size"))
+        .or_else(|| query.get("limit"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let view = query.get("view").map(String::as_str).unwrap_or("active");
+    let status = query
+        .get("status")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let plans = database
+        .plans(foco_store::workspace::PlanListFilter {
+            view,
+            status,
+            limit: page_size,
+            offset: (page - 1) * page_size,
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let total_pages = if plans.total_count == 0 {
+        0
+    } else {
+        (plans.total_count + page_size - 1) / page_size
+    };
+    Ok(Json(json!({
+        "plans": plans.plans,
+        "page": page,
+        "pageSize": page_size,
+        "totalCount": plans.total_count,
+        "totalPages": total_pages,
+    })))
+}
+
+async fn remote_sidecar_plans_create(
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let plan_id = request
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| unique_id("plan"));
+    let title = request.get("title").and_then(Value::as_str).unwrap_or("");
+    let overview = request
+        .get("overview")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let status = request
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("ready");
+    let source_chat_id = request.get("sourceChatId").and_then(Value::as_str);
+    struct OwnedStep {
+        id: String,
+        title: String,
+        detail: String,
+        acceptance: Vec<String>,
+    }
+    struct OwnedPhase {
+        id: String,
+        title: String,
+        summary: String,
+        steps: Vec<OwnedStep>,
+    }
+
+    let owned_phases = request
+        .get("phases")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .map(|phase| OwnedPhase {
+            id: phase
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| unique_id("plan-phase")),
+            title: phase
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            summary: phase
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            steps: phase
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .map(|step| OwnedStep {
+                    id: step
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| unique_id("plan-step")),
+                    title: step
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    detail: step
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    acceptance: step
+                        .get("acceptance")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let phases = owned_phases
+        .iter()
+        .map(|phase| foco_store::workspace::NewPlanPhase {
+            id: &phase.id,
+            title: &phase.title,
+            summary: &phase.summary,
+            steps: phase
+                .steps
+                .iter()
+                .map(|step| foco_store::workspace::NewPlanStep {
+                    id: &step.id,
+                    title: &step.title,
+                    detail: &step.detail,
+                    acceptance: step.acceptance.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let plan = database
+        .create_plan(foco_store::workspace::NewPlan {
+            id: &plan_id,
+            title,
+            overview,
+            status,
+            source_chat_id,
+            phases,
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "plan": plan })))
+}
+
+async fn remote_sidecar_plans_auto_run(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let value = database
+        .plan_auto_run_state()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(
+        json!({ "enabled": value.enabled, "busy": value.busy }),
+    ))
+}
+
+async fn remote_sidecar_plans_auto_run_set(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let value = database
+        .set_plan_auto_run_enabled(enabled)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(
+        json!({ "enabled": value.enabled, "busy": value.busy }),
+    ))
+}
+
+async fn remote_sidecar_plans_order(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let plan_ids = payload
+        .get("planIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad_request("planIds is required").into_response())?
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    database
+        .reorder_active_plans(&plan_ids)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn remote_sidecar_plans_update(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(plan_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let error_message = if payload.get("errorMessage").is_some() {
+        Some(payload.get("errorMessage").and_then(Value::as_str))
+    } else {
+        None
+    };
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let plan = database
+        .update_plan(
+            &plan_id,
+            foco_store::workspace::PlanPatch {
+                title: payload.get("title").and_then(Value::as_str),
+                overview: payload.get("overview").and_then(Value::as_str),
+                status: payload.get("status").and_then(Value::as_str),
+                error_message,
+            },
+        )
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "plan": plan })))
+}
+
+async fn remote_sidecar_plans_delete(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(plan_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let deleted = database
+        .delete_plan(&plan_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+async fn remote_sidecar_plans_action(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(plan_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("action is required").into_response())?;
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let plan = database
+        .transition_plan(&plan_id, action)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "plan": plan })))
+}
+
+async fn remote_sidecar_plans_phase_retry(
+    State(state): State<RemoteSidecarState>,
+    AxumPath((plan_id, phase_id)): AxumPath<(String, String)>,
+    Json(_payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let plan = database
+        .fail_plan_phase_start(&plan_id, &phase_id, "remote phase retry queued on sidecar")
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "plan": plan })))
+}
+
+async fn remote_sidecar_plans_step_action(
+    State(state): State<RemoteSidecarState>,
+    AxumPath((plan_id, step_id)): AxumPath<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let status = payload.get("status").and_then(Value::as_str).or_else(|| {
+        payload
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| match action {
+                "complete" => "completed",
+                "cancel" => "cancelled",
+                other => other,
+            })
+    });
+    let mut database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let plan = database
+        .update_plan_step(
+            &plan_id,
+            &step_id,
+            foco_store::workspace::PlanStepPatch {
+                title: payload.get("title").and_then(Value::as_str),
+                detail: payload.get("detail").and_then(Value::as_str),
+                acceptance: payload
+                    .get("acceptance")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    }),
+                status,
+            },
+        )
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({ "plan": plan })))
+}
+
+async fn remote_sidecar_plans_worktree_audit(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let items = database
+        .plan_worktree_audit()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .map(|item| {
+            json!({
+                "planId": item.plan_id,
+                "planStatus": item.plan_status,
+                "phaseId": item.phase_id,
+                "phaseStatus": item.phase_status,
+                "implementationChatId": item.implementation_chat_id,
+                "agentTaskId": item.agent_task_id,
+                "agentTaskStatus": item.agent_task_status,
+                "agentInstanceId": item.agent_instance_id.to_string(),
+                "worktreePath": item.worktree_path,
+                "baseRevision": item.base_revision,
+                "branch": item.branch,
+                "worktreeStatus": item.worktree_status,
+                "planErrorMessage": item.plan_error_message,
+                "phaseErrorMessage": item.phase_error_message,
+                "taskErrorMessage": item.task_error_message,
+                "commitId": item.commit_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "items": items,
+        "recoveryNote": "Remote sidecar reports worktrees from the remote workspace DB.",
+    })))
+}
+
+async fn remote_sidecar_plans_worktree_cleanup(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let confirm = payload
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err(ApiError::bad_request("cleanup requires confirm=true").into_response());
+    }
+    let instance_id = payload
+        .get("agentInstanceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("agentInstanceId is required").into_response())?;
+    let workspace_path = sidecar_workspace_path(&state).to_path_buf();
+    let mut database = foco_store::workspace::WorkspaceDatabase::open_or_create(&workspace_path)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let record = database
+        .plan_worktree_audit()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .find(|item| item.agent_instance_id.as_str() == instance_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "plan worktree audit item was not found: {instance_id}"
+            ))
+            .into_response()
+        })?;
+    let instance = database
+        .agent_instance(&record.agent_instance_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent instance was not found: {instance_id}"))
+                .into_response()
+        })?;
+    if instance.execution_workspace_mode
+        != foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree
+        || instance.worktree_status.as_deref() == Some("deleted")
+    {
+        return Err(
+            ApiError::bad_request("Agent instance no longer has an isolated worktree")
+                .into_response(),
+        );
+    }
+    let root_path =
+        crate::git_backend::resolve_agent_worktree_path(&workspace_path, &record.worktree_path);
+    crate::git_backend::delete_agent_worktree(&workspace_path, &root_path, true)
+        .map_err(|e| e.into_response())?;
+    database
+        .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(
+        json!({ "deleted": true, "item": { "agentInstanceId": instance_id } }),
+    ))
 }
 
 #[cfg(test)]
