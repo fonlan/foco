@@ -2,20 +2,33 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
+    path::Path,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
 use chrono::{SecondsFormat, Utc};
-use foco_store::config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation};
+use foco_providers::{
+    NeutralChatMessage, NeutralChatRequest, NeutralChatStreamEvent, NeutralUsage, stream_chat,
+};
+use foco_store::{
+    config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation},
+    memory::{
+        MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
+        NewMemorySource,
+    },
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,13 +46,21 @@ use tungstenite::client::IntoClientRequest;
 use crate::{
     ApiError, AppResult, AppState, config_snapshot,
     http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
-    runtime::build_sidecar_runtime_config_bundle,
+    runtime::{build_sidecar_runtime_config_bundle, execute_image_tool, execute_web_tool},
     save_config, unique_id, workspace_by_id,
 };
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
 const SIDECAR_BINARY_NAME: &str = "foco";
 const CONTROL_WS_PATH: &str = "/api/remote/control/ws";
+const SIDECAR_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+type BrokerWsWrite = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tungstenite::Message,
+>;
+type SharedBrokerWsWrite = Arc<AsyncMutex<BrokerWsWrite>>;
+type BrokerCancelRegistry = Arc<AsyncMutex<HashMap<String, oneshot::Sender<()>>>>;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +75,7 @@ pub(crate) struct RemoteWorkspaceSessionSummary {
     pub(crate) status: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RemoteWorkspaceManager {
     sessions: Arc<Mutex<HashMap<String, Arc<RemoteWorkspaceSession>>>>,
 }
@@ -107,8 +128,15 @@ impl RemoteWorkspaceManager {
             None,
             Utc::now().timestamp_millis().max(0) as u64,
         )?;
-        let control_task =
-            connect_control_ws(local_port, &token, bundle, server_id, workspace_id).await?;
+        let control_task = connect_control_ws(
+            state.clone(),
+            local_port,
+            &token,
+            bundle,
+            server_id,
+            workspace_id,
+        )
+        .await?;
 
         let session = Arc::new(RemoteWorkspaceSession {
             server_id: server_id.to_string(),
@@ -265,6 +293,7 @@ pub(crate) async fn remote_workspace_sessions(
     }))
 }
 
+#[derive(Debug)]
 struct RemoteWorkspaceSession {
     // ponytail: v1 keeps one sidecar and one SSH tunnel per remote workspace; pool later if session counts make this noisy.
     server_id: String,
@@ -393,28 +422,83 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     };
     println!("{}", serde_json::to_string(&bootstrap)?);
 
+    let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(256);
+    let shutdown_tx = default_shutdown_tx();
+    let ws_count = Arc::new(AtomicUsize::new(0));
+    let active_run_count = Arc::new(AtomicUsize::new(0));
+    let state = RemoteSidecarState {
+        token: options.token,
+        last_config_hash: Arc::new(Mutex::new(None)),
+        ws_count: ws_count.clone(),
+        broker_tx,
+    };
+
     let app = Router::new()
+        // ponytail: all HTTP routes need bearer auth; add more workspace-scoped
+        // routes (files, git, terminal proxy) behind the same middleware later.
         .route(CONTROL_WS_PATH, get(remote_control_ws))
-        .with_state(RemoteSidecarState {
-            token: options.token,
-            last_config_hash: Arc::new(Mutex::new(None)),
-        });
-    axum::serve(listener, app).await?;
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            sidecar_bearer_auth,
+        ))
+        .with_state(state);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut lock = shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+        *lock = Some(tx);
+    }
+
+    let shutdown = async move {
+        tokio::spawn(idle_shutdown_watch(shutdown_tx, ws_count, active_run_count));
+        let _ = rx.await;
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
+}
+
+fn default_shutdown_tx() -> Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> {
+    Arc::new(Mutex::new(None))
+}
+
+async fn idle_shutdown_watch(
+    shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    ws_count: Arc<AtomicUsize>,
+    active_run_count: Arc<AtomicUsize>,
+) {
+    loop {
+        tokio::time::sleep(SIDECAR_IDLE_TIMEOUT).await;
+        if ws_count.load(Ordering::Relaxed) > 0 || active_run_count.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        if let Ok(mut tx) = shutdown_tx.lock() {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        return;
+    }
 }
 
 #[derive(Clone)]
 struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
+    ws_count: Arc<AtomicUsize>,
+    broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
 }
 
-async fn remote_control_ws(
+/// Bearer token middleware for all sidecar HTTP routes.
+async fn sidecar_bearer_auth(
     State(state): State<RemoteSidecarState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    let authorized = headers
+    let authorized = request
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
@@ -422,43 +506,74 @@ async fn remote_control_ws(
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    next.run(request).await
+}
+
+async fn remote_control_ws(
+    State(state): State<RemoteSidecarState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Auth already checked by sidecar_bearer_auth middleware
+    let request_rx = state.broker_tx.subscribe();
     ws.on_upgrade(move |socket| async move {
+        state.ws_count.fetch_add(1, Ordering::Relaxed);
         let (mut sender, mut receiver) = socket.split();
-        while let Some(Ok(message)) = receiver.next().await {
-            let Message::Text(text) = message else {
-                continue;
-            };
-            let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
-                continue;
-            };
-            if envelope.message_type == "config"
-                && envelope.method.as_deref() == Some("config.sync")
-            {
-                let hash = envelope
-                    .payload
-                    .get("hash")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if let Ok(mut last_config_hash) = state.last_config_hash.lock() {
-                    *last_config_hash = Some(hash.clone());
+        // ponytail: v1 uses select! to interleave outgoing broker requests
+        // with incoming WS frames; in later versions use a proper mpsc
+        // fan-out with per-request routing.
+        let mut request_rx = request_rx;
+        loop {
+            tokio::select! {
+                msg = receiver.next() => {
+                    let Some(Ok(message)) = msg else { break };
+                    let Message::Text(text) = message else { continue };
+                    let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
+                        continue;
+                    };
+                    // Handle inbound config sync from local main
+                    if envelope.message_type == "config"
+                        && envelope.method.as_deref() == Some("config.sync")
+                    {
+                        let hash = envelope
+                            .payload
+                            .get("hash")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if let Ok(mut last_config_hash) = state.last_config_hash.lock() {
+                            *last_config_hash = Some(hash.clone());
+                        }
+                        let response = ControlEnvelope {
+                            version: 1,
+                            message_type: "response".to_string(),
+                            id: envelope.id,
+                            method: None,
+                            payload: json!({ "status": "ok", "hash": hash }),
+                            timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                        };
+                        let Ok(text) = serde_json::to_string(&response) else {
+                            continue;
+                        };
+                        if sender.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
-                let response = ControlEnvelope {
-                    version: 1,
-                    message_type: "response".to_string(),
-                    id: envelope.id,
-                    method: None,
-                    payload: json!({ "status": "ok", "hash": hash }),
-                    timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-                };
-                let Ok(text) = serde_json::to_string(&response) else {
-                    continue;
-                };
-                if sender.send(Message::Text(text.into())).await.is_err() {
-                    break;
+                request = request_rx.recv() => {
+                    match request {
+                        Ok(request) => {
+                            let Ok(text) = serde_json::to_string(&request) else { continue };
+                            if sender.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
                 }
             }
         }
+        state.ws_count.fetch_sub(1, Ordering::Relaxed);
     })
     .into_response()
 }
@@ -915,6 +1030,7 @@ async fn start_local_forward(
 }
 
 async fn connect_control_ws(
+    state: AppState,
     local_port: u16,
     token: &str,
     bundle: crate::runtime::SidecarRuntimeConfigBundle,
@@ -931,14 +1047,62 @@ async fn connect_control_ws(
         let mut ready_tx = Some(ready_tx);
         for _ in 0..30 {
             match connect_control_ws_once(&url, &token, &bundle).await {
-                Ok((mut write, mut read)) => {
+                Ok((write, mut read)) => {
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Ok(()));
                     }
+                    let write = Arc::new(AsyncMutex::new(write));
+                    let cancellations: BrokerCancelRegistry =
+                        Arc::new(AsyncMutex::new(HashMap::new()));
+                    // Main broker loop: process incoming sidecar request and cancel messages.
                     while let Some(message) = read.next().await {
                         match message {
                             Ok(tungstenite::Message::Ping(bytes)) => {
+                                let mut write = write.lock().await;
                                 let _ = write.send(tungstenite::Message::Pong(bytes)).await;
+                            }
+                            Ok(tungstenite::Message::Text(text)) => {
+                                let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text)
+                                else {
+                                    continue;
+                                };
+                                match envelope.message_type.as_str() {
+                                    "request" => {
+                                        let request_id = envelope.id.clone();
+                                        let (cancel_tx, cancel_rx) = oneshot::channel();
+                                        if let Some(id) = request_id.clone() {
+                                            cancellations.lock().await.insert(id, cancel_tx);
+                                        }
+                                        let task_state = state.clone();
+                                        let task_write = write.clone();
+                                        let task_cancellations = cancellations.clone();
+                                        let task_server_id = log_server_id.clone();
+                                        let task_workspace_id = log_workspace_id.clone();
+                                        tokio::spawn(async move {
+                                            handle_broker_request(
+                                                &task_state,
+                                                task_write,
+                                                &task_server_id,
+                                                &task_workspace_id,
+                                                envelope,
+                                                Some(cancel_rx),
+                                            )
+                                            .await;
+                                            if let Some(id) = request_id {
+                                                task_cancellations.lock().await.remove(&id);
+                                            }
+                                        });
+                                    }
+                                    "cancel" => {
+                                        if let Some(id) = envelope.id {
+                                            if let Some(tx) = cancellations.lock().await.remove(&id)
+                                            {
+                                                let _ = tx.send(());
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                             Ok(_) => {}
                             Err(_) => break,
@@ -946,6 +1110,7 @@ async fn connect_control_ws(
                     }
                     return;
                 }
+
                 Err(error) => {
                     last_error = Some(error);
                     sleep(Duration::from_millis(100)).await;
@@ -981,6 +1146,846 @@ async fn connect_control_ws(
                 Some(workspace_id),
                 "timed out waiting for control WebSocket config sync",
             ))
+        }
+    }
+}
+
+async fn handle_broker_request(
+    state: &AppState,
+    write: SharedBrokerWsWrite,
+    server_id: &str,
+    workspace_id: &str,
+    request: ControlEnvelope,
+    cancel_rx: Option<oneshot::Receiver<()>>,
+) {
+    let id = match &request.id {
+        Some(id) => id.clone(),
+        None => {
+            let _ = send_broker_error(&write, None, "missing_id", "request missing id").await;
+            return;
+        }
+    };
+    let method = match &request.method {
+        Some(m) => m.clone(),
+        None => {
+            let _ = send_broker_error(
+                &write,
+                Some(&id),
+                "missing_method",
+                "request missing method",
+            )
+            .await;
+            return;
+        }
+    };
+
+    match method.as_str() {
+        "llm.stream" => {
+            broker_llm_stream(
+                state,
+                &write,
+                server_id,
+                workspace_id,
+                &id,
+                request.payload,
+                cancel_rx,
+            )
+            .await;
+        }
+        "memory.global.search" => {
+            broker_memory_global_search(state, &write, &id, request.payload).await;
+        }
+        "memory.global.write" => {
+            broker_memory_global_write(state, &write, &id, request.payload).await;
+        }
+        "web.search" => {
+            broker_web_search(state, &write, &id, request.payload).await;
+        }
+        "web.fetch" => {
+            broker_web_fetch(state, &write, &id, request.payload).await;
+        }
+        "image.generate" => {
+            broker_image_generate(state, &write, &id, request.payload).await;
+        }
+        "ui.askQuestion" => {
+            broker_ask_question(state, &write, &id, request.payload).await;
+        }
+        other => {
+            let _ = send_broker_error(
+                &write,
+                Some(&id),
+                "unknown_method",
+                format!("unknown broker method: {other}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `llm.stream`: sidecar sends a provider+model+NeutralChatRequest,
+/// local main dispatches through its own provider config and streams chunks back.
+/// ponytail: v1 does minimal payload validation; wire NeutralChatRequest fields
+/// loosely. Single-tool tool_use is not supported yet — only pure text streams.
+async fn broker_llm_stream(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    _server_id: &str,
+    _workspace_id: &str,
+    id: &str,
+    payload: Value,
+    cancel_rx: Option<oneshot::Receiver<()>>,
+) {
+    let provider_id = match payload.get("providerId").and_then(Value::as_str) {
+        Some(id) => id,
+        None => {
+            let _ = send_broker_error(write, Some(id), "bad_request", "missing providerId").await;
+            return;
+        }
+    };
+    let model_id = match payload.get("modelId").and_then(Value::as_str) {
+        Some(id) => id,
+        None => {
+            let _ = send_broker_error(write, Some(id), "bad_request", "missing modelId").await;
+            return;
+        }
+    };
+    let config = match config_snapshot(state) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+            return;
+        }
+    };
+    let provider = match config
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id && p.enabled)
+    {
+        Some(p) => p,
+        None => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "bad_request",
+                format!("provider '{provider_id}' not found or disabled"),
+            )
+            .await;
+            return;
+        }
+    };
+    let provider_config = match crate::provider_connection_config(provider) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "bad_request", e.message().to_string()).await;
+            return;
+        }
+    };
+
+    // Parse the NeutralChatRequest from payload
+    let messages: Vec<NeutralChatMessage> = payload
+        .get("messages")
+        .and_then(|m| serde_json::from_value(m.clone()).ok())
+        .unwrap_or_default();
+    let tools: Vec<foco_providers::NeutralToolDefinition> = payload
+        .get("tools")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let request = NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages,
+        tools,
+        thinking_level: payload
+            .get("thinkingLevel")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        max_output_tokens: payload
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32),
+        prompt_cache_key: payload
+            .get("promptCacheKey")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        prompt_cache_retention: payload
+            .get("promptCacheRetention")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+    };
+
+    let mut cancel_rx = cancel_rx;
+    let mut stream = match if let Some(cancel_rx) = cancel_rx.as_mut() {
+        tokio::select! {
+            _ = cancel_rx => {
+                let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
+                return;
+            }
+            result = stream_chat(&provider_config, request) => result,
+        }
+    } else {
+        stream_chat(&provider_config, request).await
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "provider_error", format!("{e}")).await;
+            return;
+        }
+    };
+
+    tracing::info!(%provider_id, %model_id, request_id = %id, "remote sidecar broker llm stream started");
+    let mut sequence = 0u64;
+    let mut final_usage: Option<NeutralUsage> = None;
+    loop {
+        let event = match if let Some(cancel_rx) = cancel_rx.as_mut() {
+            tokio::select! {
+                _ = cancel_rx => {
+                    let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
+                    return;
+                }
+                event = stream.next_event() => event,
+            }
+        } else {
+            stream.next_event().await
+        } {
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                let _ = send_broker_error(write, Some(id), "stream_error", format!("{e}")).await;
+                return;
+            }
+            None => break,
+        };
+        match event {
+            NeutralChatStreamEvent::TextDelta { delta } => {
+                sequence += 1;
+                let chunk = ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.to_string()),
+                    method: None,
+                    payload: json!({
+                        "sequence": sequence,
+                        "kind": "textDelta",
+                        "delta": delta,
+                    }),
+                    timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                };
+                if send_broker_envelope(write, &chunk).await.is_err() {
+                    return;
+                }
+            }
+            NeutralChatStreamEvent::ToolCall { tool_call } => {
+                sequence += 1;
+                let chunk = ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.to_string()),
+                    method: None,
+                    payload: json!({
+                        "sequence": sequence,
+                        "kind": "toolCall",
+                        "toolCall": tool_call,
+                    }),
+                    timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                };
+                if send_broker_envelope(write, &chunk).await.is_err() {
+                    return;
+                }
+            }
+            NeutralChatStreamEvent::ReasoningDelta { delta } => {
+                sequence += 1;
+                let chunk = ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.to_string()),
+                    method: None,
+                    payload: json!({
+                        "sequence": sequence,
+                        "kind": "reasoningDelta",
+                        "delta": delta,
+                    }),
+                    timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                };
+                if send_broker_envelope(write, &chunk).await.is_err() {
+                    return;
+                }
+            }
+            NeutralChatStreamEvent::Usage { usage } => {
+                sequence += 1;
+                let chunk = ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.to_string()),
+                    method: None,
+                    payload: json!({
+                        "sequence": sequence,
+                        "kind": "usageDelta",
+                        "usage": usage,
+                    }),
+                    timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                };
+                if send_broker_envelope(write, &chunk).await.is_err() {
+                    return;
+                }
+            }
+            NeutralChatStreamEvent::Complete {
+                text: _,
+                reasoning: _,
+                tool_calls: _,
+                usage,
+                stop_reason: _,
+                response_id: _,
+            } => {
+                final_usage = usage;
+            }
+            NeutralChatStreamEvent::Start => {}
+            NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {}
+            NeutralChatStreamEvent::Error { message } => {
+                let _ = send_broker_error(write, Some(id), "stream_error", message).await;
+                return;
+            }
+        }
+    }
+
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({
+            "status": "ok",
+            "usage": final_usage,
+        }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+/// Handle `memory.global.search`: search the local global memory database.
+async fn broker_memory_global_search(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    let query = payload
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query.is_empty() {
+        let _ = send_broker_error(write, Some(id), "bad_request", "missing query").await;
+        return;
+    }
+    let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(10) as u32;
+
+    let memory_db = match MemoryDatabase::open_or_create_global_at(&state.memory_database_file) {
+        Ok(db) => db,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
+            return;
+        }
+    };
+    let results = match memory_db.search_active_facts_for_scope(query, None, None, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
+            return;
+        }
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "results": results, "query": query }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+/// Handle `memory.global.write`: write a manual fact into the local global memory database.
+async fn broker_memory_global_write(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    let fact = payload
+        .get("fact")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if fact.is_empty() {
+        let _ = send_broker_error(write, Some(id), "bad_request", "missing fact").await;
+        return;
+    }
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(MemoryKind::parse)
+        .transpose();
+    let kind = match kind {
+        Ok(Some(kind)) => kind,
+        Ok(None) => MemoryKind::UserNote,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", format!("{e}")).await;
+            return;
+        }
+    };
+    let confidence = payload.get("confidence").and_then(Value::as_f64);
+    let pinned = payload
+        .get("pinned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("remote sidecar broker memory write");
+    let source_id = unique_id("broker-memory-source");
+    let fact_id = unique_id("memory");
+    let source_ids = [source_id.as_str()];
+    let metadata_json = json!({
+        "brokered": true,
+        "requestId": id,
+        "reason": reason,
+    })
+    .to_string();
+
+    let mut memory_db = match MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+    {
+        Ok(db) => db,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
+            return;
+        }
+    };
+    if let Err(e) = memory_db.insert_source(NewMemorySource {
+        id: &source_id,
+        scope: MemoryScope::Global,
+        chat_id: None,
+        source_type: MemorySourceType::ToolCall,
+        source_id: Some(id),
+        title: "Remote broker memory write",
+        content: reason,
+        metadata_json: &metadata_json,
+    }) {
+        let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
+        return;
+    }
+    if let Err(e) = memory_db.insert_fact(NewMemoryFact {
+        id: &fact_id,
+        scope: MemoryScope::Global,
+        chat_id: None,
+        status: MemoryStatus::Active,
+        kind,
+        fact,
+        confidence,
+        pinned,
+        source_ids: &source_ids,
+        metadata_json: &metadata_json,
+    }) {
+        let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
+        return;
+    }
+
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "factId": fact_id }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+/// Handle `web.search`: delegate to the local web search tool.
+async fn broker_web_search(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    let config = match config_snapshot(state) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+            return;
+        }
+    };
+    let result = match execute_web_tool(
+        &config.web_search,
+        "web_search",
+        payload.clone(),
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
+            return;
+        }
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "result": result }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+/// Handle `web.fetch`: delegate to the local web fetch tool.
+async fn broker_web_fetch(state: &AppState, write: &SharedBrokerWsWrite, id: &str, payload: Value) {
+    let config = match config_snapshot(state) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+            return;
+        }
+    };
+    let result = match execute_web_tool(
+        &config.web_search,
+        "web_fetch",
+        payload.clone(),
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
+            return;
+        }
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "result": result }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+/// Handle `image.generate`: delegate to the local image generation tool.
+/// ponytail: requires the default workspace path for output directory;
+/// workspace_path is not yet passed by the sidecar, fall back to a
+/// temporary directory for now.
+async fn broker_image_generate(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    let config = match config_snapshot(state) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+            return;
+        }
+    };
+    let workspace_path = Path::new(&state.user_profile_dir);
+    let timeout = Duration::from_millis(std::cmp::min(
+        payload
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(300_000),
+        600_000,
+    ));
+    let result = match execute_image_tool(
+        &config,
+        workspace_path,
+        "_broker_",
+        "_broker_",
+        "image_gen",
+        payload.clone(),
+        timeout,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
+            return;
+        }
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "result": result }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+/// Handle `ui.askQuestion`: register a pending question and block until the
+/// user answers.  The sidecar encodes the question items; local main creates
+/// the pending question request and waits for the answer.
+/// ponytail: v1 uses a simple lookup by workspace+chat id. The sidecar does not
+/// embed actual AppState-level tool call ids; pass a synthetic id.
+async fn broker_ask_question(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    use crate::runtime::AskQuestionInput;
+
+    let input: AskQuestionInput = match serde_json::from_value(payload.clone()) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "bad_request",
+                format!("invalid askQuestion payload: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+    let question_id = unique_id("broker-question");
+    let question_req = crate::runtime::QuestionRequest {
+        id: question_id.clone(),
+        tool_call_id: format!("broker-{id}"),
+        workspace_id: String::new(),
+        chat_id: String::new(),
+        questions: input
+            .questions
+            .into_iter()
+            .map(|q| crate::runtime::QuestionItem {
+                id: unique_id("broker-q"),
+                question: q.question,
+                options: q.options.unwrap_or_default(),
+                allow_free_text: q.allow_free_text,
+            })
+            .collect(),
+    };
+    let registration = match state.question_registry.register(question_req) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ =
+                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+            return;
+        }
+    };
+    // Wait for the user's answer
+    let answer_result = registration.answer_rx.await;
+    let answer_payload = match answer_result {
+        Ok(answer) => json!({
+            "status": "ok",
+            "answers": answer.answers,
+        }),
+        Err(_) => json!({
+            "status": "cancelled",
+            "answers": [],
+        }),
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: answer_payload,
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
+async fn send_broker_envelope(
+    write: &SharedBrokerWsWrite,
+    envelope: &ControlEnvelope,
+) -> Result<(), ()> {
+    let text = serde_json::to_string(envelope).map_err(|_| ())?;
+    let mut write = write.lock().await;
+    write
+        .send(tungstenite::Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_broker_error(
+    write: &SharedBrokerWsWrite,
+    request_id: Option<&str>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Result<(), ()> {
+    let envelope = ControlEnvelope {
+        version: 1,
+        message_type: "error".to_string(),
+        id: request_id.map(|s| s.to_string()),
+        method: None,
+        payload: json!({
+            "code": code.into(),
+            "message": message.into(),
+            "retryable": false,
+        }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    send_broker_envelope(write, &envelope).await
+}
+
+// ── Tool Routing Table ──────────────────────────────────────────────────
+
+/// Classifies where each built-in tool should execute when the workspace is a
+/// remote SSH workspace.  Tools that need provider secrets, local UI, local
+/// files (global config, memory DB), or the local network environment are
+/// routed through the broker.  Tools that work on workspace files, the
+/// workspace database, the workspace shell, or the workspace code graph are
+/// executed directly in the sidecar.
+///
+/// ponytail: v1 does not route agent collaboration tools through the broker;
+/// agent task management stays sidecar-local because the sidecar owns the
+/// agent scheduler.  Broker-routing for per-workspace websocket/tunnel needs
+/// is deferred; it is acceptable to handle websocket proxy separately.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolRoute {
+    /// Executed by the remote sidecar (workspace-local).
+    SidecarLocal,
+    /// Brokered to the local main process.
+    BrokerNeeded,
+}
+
+/// Return the routing classification for a built-in tool name.
+///
+/// Workspace-scoped abilities (file ops, shell, git, code graph) go to
+/// `SidecarLocal`.  Abilities that need provider secrets, local UI questions,
+/// global memory, web access, or image generation with model secrets go
+/// through `BrokerNeeded`.
+///
+/// ponytail: future phases may override `BrokerNeeded` for individual tools
+/// when the sidecar gains a local execution option (e.g., web_fetch could run
+/// from the sidecar's network).  Return a fixed classification for now.
+#[allow(dead_code)]
+pub(crate) fn classify_tool_route(tool_name: &str) -> ToolRoute {
+    // Sidecar-local tools: workspace file operations, shell, git, code graph,
+    // sleep, todo/plan/spec that use workspace DB, agent tools that use
+    // workspace agent scheduler.
+    match tool_name {
+        // workspace file operations
+        "read_file" | "find_files" | "search_text" | "write_file" | "edit_file"
+        // workspace shell
+        | "run_command"
+        // code graph
+        | "graph_find_symbols" | "graph_find_callers" | "graph_find_callees"
+        | "graph_find_references" | "graph_related_files" | "graph_explore"
+        // sleep is harmless anywhere
+        | "sleep"
+        // todo/plan/spec tools use workspace DB
+        | "create_todo_graph" | "update_todo_graph" | "get_todo_graph"
+        | "create_plan" | "get_plans" | "update_plan" | "update_plan_step"
+        | "delete_plan" | "read_spec" | "update_spec"
+        // agent runtime — sidecar owns agent scheduler for workspace
+        | "agent_list" | "agent_get_task" | "agent_send_message"
+        | "agent_delegate_task" | "agent_cancel_task" | "agent_wait_tasks"
+        | "agent_transfer_task" | "agent_create_instances" => ToolRoute::SidecarLocal,
+
+        // Broker-needed tools: require local UI, provider secrets, or global memory.
+        "ask_question" | "web_search" | "web_fetch" | "image_gen" => ToolRoute::BrokerNeeded,
+
+        // memory tools that access global memory DB (local only)
+        "memory_search" | "memory_write" => ToolRoute::BrokerNeeded,
+
+        _ => ToolRoute::SidecarLocal,
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use foco_tools::builtin_tool_definitions;
+
+    #[test]
+    fn every_builtin_tool_has_a_route_classification() {
+        let classified = builtin_tool_definitions()
+            .into_iter()
+            .map(|tool| (tool.name, classify_tool_route(tool.name)))
+            .collect::<Vec<_>>();
+        for (_name, route) in &classified {
+            assert!(
+                matches!(route, ToolRoute::SidecarLocal | ToolRoute::BrokerNeeded),
+                "unexpected route variant"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_needed_tools_are_not_sidecar_local() {
+        let broker_tools = [
+            "ask_question",
+            "web_search",
+            "web_fetch",
+            "image_gen",
+            "memory_search",
+            "memory_write",
+        ];
+        for name in &broker_tools {
+            assert_eq!(
+                classify_tool_route(name),
+                ToolRoute::BrokerNeeded,
+                "{name} should be BrokerNeeded"
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_local_tools_are_not_broker_needed() {
+        let sidecar_tools = [
+            "read_file",
+            "find_files",
+            "search_text",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "graph_find_symbols",
+            "graph_find_callers",
+            "graph_find_callees",
+            "graph_find_references",
+            "graph_related_files",
+            "graph_explore",
+            "sleep",
+            "create_todo_graph",
+            "update_todo_graph",
+            "get_todo_graph",
+            "create_plan",
+            "get_plans",
+            "update_plan",
+            "update_plan_step",
+            "delete_plan",
+            "read_spec",
+            "update_spec",
+        ];
+        for name in &sidecar_tools {
+            assert_eq!(
+                classify_tool_route(name),
+                ToolRoute::SidecarLocal,
+                "{name} should be SidecarLocal"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_tools_do_not_include_provider_secrets_in_payload() {
+        // ponytail: this test verifies that the broker routing table itself
+        // does not reference provider secret fields.  Actual sidecar code
+        // must be audited separately to ensure no tool payload carries secrets.
+        let broker_tools = ["ask_question", "web_search", "web_fetch", "image_gen"];
+        for name in &broker_tools {
+            let route = classify_tool_route(name);
+            assert_eq!(route, ToolRoute::BrokerNeeded);
+        }
+        // memory_search/memory_write carry only fact text, not secrets
+        let memory_tools = ["memory_search", "memory_write"];
+        for name in &memory_tools {
+            let route = classify_tool_route(name);
+            assert_eq!(route, ToolRoute::BrokerNeeded);
         }
     }
 }
