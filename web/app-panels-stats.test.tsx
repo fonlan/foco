@@ -723,7 +723,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
   });
 
-  it("retries a failed plan phase through the phase retry endpoint", async () => {
+  it.each(["failed", "cancelled"] as const)("retries a %s plan phase through the phase retry endpoint", async (phaseStatus) => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";
     const failedStep = {
@@ -758,7 +758,7 @@ describe("app-panels-stats verification surfaces", () => {
           providerId: "openai",
           sequence: 0,
           startedAt: timestamp,
-          status: "failed",
+          status: phaseStatus,
           thinkingLevel: null,
           trigger: "start",
           updatedAt: timestamp,
@@ -774,7 +774,7 @@ describe("app-panels-stats verification surfaces", () => {
       planId: "plan-failed",
       sequence: 0,
       startedAt: timestamp,
-      status: "failed",
+      status: phaseStatus,
       steps: [failedStep],
       summary: "The model request failed.",
       title: "Failed phase",
