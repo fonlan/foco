@@ -11389,7 +11389,9 @@ function RemoteServersSettingsSection({
                       </td>
                       <td className="px-4 py-3 text-xs text-stone-600">
                         <div>{server.sidecarVersion ?? "-"}</div>
-                        <div className="mt-1 text-stone-400">{server.sidecarInstallState}</div>
+                        <div className="mt-1 text-stone-400">
+                          {remoteSidecarInstallStateLabel(server.sidecarInstallState, t)}
+                        </div>
                       </td>
                       <td className="px-4 py-3 text-xs font-semibold text-stone-700">
                         {server.workspaceCount}
@@ -11532,11 +11534,17 @@ function remoteStatusLabel(status: string, t: Translate) {
   if (normalized === "checking" || normalized === "connecting") {
     return t("Checking");
   }
-  if (normalized === "failedauth") {
+  if (normalized === "failed" || normalized === "failedauth") {
     return t("Failed");
   }
-  if (normalized === "failed" || normalized === "offline") {
-    return normalized === "offline" ? t("Offline") : t("Failed");
+  if (normalized === "offline") {
+    return t("Offline");
+  }
+  if (normalized === "error") {
+    return t("Error");
+  }
+  if (normalized === "unknown") {
+    return t("Unknown");
   }
   return status;
 }
@@ -11549,7 +11557,7 @@ function remoteStatusTone(status: string): CapabilityPillTone {
   if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
     return "active";
   }
-  if (normalized === "failed" || normalized === "failedauth") {
+  if (normalized === "failed" || normalized === "failedauth" || normalized === "error") {
     return "danger";
   }
   return "muted";
@@ -11579,6 +11587,23 @@ function remoteStageDotClass(status: string) {
     return "bg-stone-300";
   }
   return "bg-amber-500";
+}
+
+function remoteSidecarInstallStateLabel(state: string, t: Translate) {
+  switch (state) {
+    case "available":
+      return t("Sidecar available");
+    case "customCommand":
+      return t("Custom command");
+    case "missingAsset":
+      return t("Sidecar asset missing");
+    case "notInstalled":
+      return t("Sidecar not installed");
+    case "unknown":
+      return t("Unknown");
+    default:
+      return state;
+  }
 }
 
 function remoteDiagnosticStageLabel(stage: string, t: Translate) {
