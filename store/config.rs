@@ -1243,6 +1243,30 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpExecutionHost {
+    Auto,
+    Local,
+    Workspace,
+}
+
+impl Default for McpExecutionHost {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl From<McpExecutionHost> for foco_mcp::McpExecutionHost {
+    fn from(value: McpExecutionHost) -> Self {
+        match value {
+            McpExecutionHost::Auto => Self::Auto,
+            McpExecutionHost::Local => Self::Local,
+            McpExecutionHost::Workspace => Self::Workspace,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -1253,6 +1277,8 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub url: Option<String>,
+    #[serde(default, rename = "executionHost")]
+    pub execution_host: McpExecutionHost,
 }
 
 impl McpServerConfig {
@@ -1265,6 +1291,7 @@ impl McpServerConfig {
             command: self.command.clone(),
             args: self.args.clone(),
             url: self.url.clone(),
+            execution_host: self.execution_host.into(),
         })
     }
 }

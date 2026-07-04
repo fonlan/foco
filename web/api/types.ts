@@ -1751,6 +1751,7 @@ export type ConfiguredMcpServerSummary = {
   enabled: boolean;
   transport: string;
   transportLabel: string;
+  executionHost: "auto" | "local" | "workspace";
   command: string | null;
   args: string[];
   url: string | null;
@@ -1767,6 +1768,7 @@ export type McpServerFormState = {
   id: string;
   name: string;
   transport: string;
+  executionHost: "auto" | "local" | "workspace";
   url: string;
 };
 

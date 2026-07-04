@@ -1655,6 +1655,7 @@ export function SettingsPanel({
       id: server.id,
       name: server.name,
       transport: server.transport,
+      executionHost: server.executionHost,
       url: server.url ?? "",
     });
     setIsMcpDialogOpen(true);
@@ -3417,6 +3418,7 @@ export function SettingsPanel({
               nextMcpServerId(mcpForm.name, mcpForm.transport, mcpServers),
             name: mcpForm.name,
             transport: mcpForm.transport,
+            executionHost: mcpForm.executionHost,
             url: mcpForm.url || null,
           }),
           headers: { "Content-Type": "application/json" },
@@ -9851,6 +9853,25 @@ export function SettingsPanel({
                           ))}
                         </select>
                       </label>
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Execution host")}
+                        </span>
+                        <select
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            setMcpForm((current) => ({
+                              ...current,
+                              executionHost: event.target.value as McpServerFormState["executionHost"],
+                            }))
+                          }
+                          value={mcpForm.executionHost}
+                        >
+                          <option value="auto">{t("Auto")}</option>
+                          <option value="local">{t("Local")}</option>
+                          <option value="workspace">{t("Workspace")}</option>
+                        </select>
+                      </label>
                       {mcpForm.transport === "streamable-http" ? (
                         <TextField
                           label={t("URL")}
@@ -11530,6 +11551,7 @@ function emptyMcpServerForm(): McpServerFormState {
     argsText: "",
     command: "",
     enabled: true,
+    executionHost: "auto",
     id: "",
     name: "",
     transport: "",

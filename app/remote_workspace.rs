@@ -31,6 +31,7 @@ use foco_store::{
         MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
         NewMemorySource,
     },
+    workspace::workspace_database_path,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -433,6 +434,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let active_run_count = Arc::new(AtomicUsize::new(0));
     let state = RemoteSidecarState {
         token: options.token,
+        workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         last_config_hash: Arc::new(Mutex::new(None)),
         code_graph_watcher: Arc::new(Mutex::new(None)),
@@ -470,6 +472,34 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/files/rename",
             post(remote_sidecar_file_rename),
+        )
+        .route(
+            "/api/remote/workspace/memory",
+            get(remote_sidecar_memory_list),
+        )
+        .route(
+            "/api/remote/workspace/memory/manual",
+            post(remote_sidecar_memory_manual),
+        )
+        .route(
+            "/api/remote/workspace/skills/install",
+            post(remote_sidecar_skill_install),
+        )
+        .route(
+            "/api/remote/workspace/skills/discover",
+            get(remote_sidecar_skills_discover),
+        )
+        .route(
+            "/api/remote/workspace/hooks/settings",
+            get(remote_sidecar_hooks_settings).post(remote_sidecar_hooks_save),
+        )
+        .route(
+            "/api/remote/workspace/hooks/runs",
+            get(remote_sidecar_hook_runs),
+        )
+        .route(
+            "/api/remote/workspace/hooks/runs/{hook_run_id}",
+            get(remote_sidecar_hook_run_detail),
         )
         .route(
             "/api/remote/workspace/git/status",
@@ -627,6 +657,7 @@ struct RemoteSidecarState {
     code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
     ws_count: Arc<AtomicUsize>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
+    workspace_id: String,
     workspace_path: String,
 }
 
@@ -2343,6 +2374,64 @@ pub(crate) fn sidecar_proxy_target(
     }
 }
 
+pub(crate) async fn proxy_sidecar_json_request(
+    state: &AppState,
+    workspace_id: &str,
+    method: reqwest::Method,
+    suffix: &str,
+    payload: Option<Value>,
+) -> Result<Value, ApiError> {
+    let Some((base, token)) = sidecar_proxy_target(state, workspace_id)? else {
+        return Err(ApiError::conflict(format!(
+            "remote workspace sidecar is not connected: {workspace_id}"
+        )));
+    };
+    let url = format!(
+        "{}api/remote/workspace/{}",
+        base.trim_end_matches('/'),
+        suffix.trim_start_matches('/')
+    );
+    let client = reqwest::Client::new();
+    let mut request = client.request(method, url).bearer_auth(token);
+    if let Some(payload) = payload {
+        request = request.json(&payload);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|source| ApiError::bad_gateway(format!("sidecar proxy failed: {source}")))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|source| {
+        ApiError::bad_gateway(format!("failed to read sidecar proxy response: {source}"))
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::from_status_message(status, text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|source| ApiError::bad_gateway(format!("invalid sidecar JSON response: {source}")))
+}
+
+pub(crate) async fn install_remote_workspace_skill(
+    state: &AppState,
+    workspace_id: &str,
+    request: crate::http::skill_store::SkillStoreInstallRequest,
+) -> Result<Json<crate::http::skill_store::SkillStoreInstallResponse>, ApiError> {
+    let payload = serde_json::to_value(request).map_err(|source| {
+        ApiError::internal(format!("failed to serialize skill install: {source}"))
+    })?;
+    let value = proxy_sidecar_json_request(
+        state,
+        workspace_id,
+        reqwest::Method::POST,
+        "skills/install",
+        Some(payload),
+    )
+    .await?;
+    serde_json::from_value(value).map(Json).map_err(|source| {
+        ApiError::bad_gateway(format!("invalid sidecar skill install response: {source}"))
+    })
+}
+
 pub(crate) async fn proxy_websocket_to_sidecar(
     client_socket: WebSocket,
     proxy_url: String,
@@ -2591,6 +2680,274 @@ async fn remote_sidecar_file_rename(
     Ok(Json(
         serde_json::json!({ "path": parent, "children": children }),
     ))
+}
+
+async fn remote_sidecar_memory_list(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let scope = MemoryScope::parse(
+        query
+            .get("scope")
+            .map(String::as_str)
+            .unwrap_or("workspace"),
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    if scope == MemoryScope::Global {
+        return Err(
+            ApiError::bad_request("global memory stays in the local broker").into_response(),
+        );
+    }
+    let chat_id = query
+        .get("chatId")
+        .or_else(|| query.get("chat_id"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if scope == MemoryScope::Chat && chat_id.is_none() {
+        return Err(ApiError::bad_request("chat memory listing requires chatId").into_response());
+    }
+    let status = MemoryStatus::parse(query.get("status").map(String::as_str).unwrap_or("active"))
+        .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("pageSize")
+        .or_else(|| query.get("page_size"))
+        .or_else(|| query.get("limit"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let query_text = query.get("query").map(String::as_str);
+    let database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(sidecar_workspace_path(&state)))
+            .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let total_count = database
+        .count_facts_for_scope(chat_id.as_deref(), status, None, query_text)
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let memories = database
+        .list_facts_for_scope_page(
+            chat_id.as_deref(),
+            status,
+            None,
+            query_text,
+            page_size,
+            offset,
+        )
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    Ok(Json(json!({
+        "memories": memories,
+        "extractionJobs": [],
+        "remote": { "status": "available" },
+        "page": page,
+        "pageSize": page_size,
+        "totalCount": total_count,
+        "totalPages": if total_count == 0 { 0 } else { total_count.div_ceil(page_size) },
+    })))
+}
+
+async fn remote_sidecar_memory_manual(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let scope = MemoryScope::parse(
+        payload
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("workspace"),
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    if scope == MemoryScope::Global {
+        return Err(
+            ApiError::bad_request("global memory stays in the local broker").into_response(),
+        );
+    }
+    let kind = MemoryKind::parse(
+        payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("project_fact"),
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    let fact = payload
+        .get("fact")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("memory fact must not be empty").into_response())?;
+    let chat_id = payload
+        .get("chatId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if scope == MemoryScope::Chat && chat_id.is_none() {
+        return Err(ApiError::bad_request("chat memory requires chatId").into_response());
+    }
+    let mut database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(sidecar_workspace_path(&state)))
+            .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let source_id = unique_id("remote-memory-source");
+    let memory_id = unique_id("remote-memory-fact");
+    database
+        .insert_source(NewMemorySource {
+            id: &source_id,
+            scope,
+            chat_id,
+            source_type: MemorySourceType::ManualNote,
+            source_id: None,
+            title: "Remote manual memory",
+            content: fact,
+            metadata_json: "{}",
+        })
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    database
+        .insert_fact(NewMemoryFact {
+            id: &memory_id,
+            scope,
+            chat_id,
+            status: MemoryStatus::Active,
+            kind,
+            fact,
+            confidence: payload.get("confidence").and_then(Value::as_f64),
+            pinned: payload
+                .get("pinned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            source_ids: &[source_id.as_str()],
+            metadata_json: "{}",
+        })
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let memory = database
+        .fact(&memory_id)
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    Ok(Json(json!({ "memory": memory })))
+}
+
+async fn remote_sidecar_skill_install(
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<crate::http::skill_store::SkillStoreInstallRequest>,
+) -> Result<Json<crate::http::skill_store::SkillStoreInstallResponse>, axum::response::Response> {
+    let install_path = crate::http::skill_store::install_skill_files_to_target_dir(
+        &sidecar_workspace_path(&state)
+            .join(".agents")
+            .join("skills"),
+        &request.skill_id,
+        &request.files,
+        request.overwrite,
+    )
+    .map_err(|e| e.into_response())?;
+    let discovery = crate::skills::discover_workspace_skills_for_path(
+        &state.workspace_id,
+        &state.workspace_id,
+        sidecar_workspace_path(&state),
+    );
+    Ok(Json(crate::http::skill_store::SkillStoreInstallResponse {
+        target: foco_store::config::SKILL_SCOPE_WORKSPACE.to_string(),
+        workspace_id: Some(state.workspace_id),
+        path: install_path.display().to_string(),
+        detected: discovery.skills,
+    }))
+}
+
+async fn remote_sidecar_skills_discover(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let discovery = crate::skills::discover_workspace_skills_for_path(
+        &state.workspace_id,
+        &state.workspace_id,
+        sidecar_workspace_path(&state),
+    );
+    Ok(Json(json!({
+        "detected": discovery.skills,
+        "errors": discovery.errors,
+        "requiredDisabled": discovery.required_disabled,
+    })))
+}
+
+async fn remote_sidecar_hooks_settings(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let config = foco_store::config::load_workspace_hook_config(sidecar_workspace_path(&state))
+        .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    Ok(Json(json!({
+        "workspace": {
+            "source": "workspace",
+            "path": foco_store::config::workspace_hook_config_path(sidecar_workspace_path(&state)).display().to_string(),
+            "workspaceId": state.workspace_id,
+            "config": config,
+        }
+    })))
+}
+
+async fn remote_sidecar_hooks_save(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let config_value = payload.get("config").cloned().unwrap_or(payload);
+    let config: foco_store::config::HookConfig = serde_json::from_value(config_value)
+        .map_err(|e| ApiError::bad_request(format!("invalid hook config: {e}")).into_response())?;
+    foco_store::config::save_workspace_hook_config(sidecar_workspace_path(&state), &config)
+        .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    Ok(Json(json!({
+        "workspace": {
+            "source": "workspace",
+            "path": foco_store::config::workspace_hook_config_path(sidecar_workspace_path(&state)).display().to_string(),
+            "workspaceId": state.workspace_id,
+            "config": config,
+        }
+    })))
+}
+
+async fn remote_sidecar_hook_runs(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let runs =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+            .hook_runs(limit)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+            .into_iter()
+            .filter(|record| record.workspace_id == state.workspace_id)
+            .map(crate::hook_run_summary_row)
+            .collect::<Vec<_>>();
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn remote_sidecar_hook_run_detail(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(hook_run_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let hook_run_id = hook_run_id.trim();
+    if hook_run_id.is_empty() {
+        return Err(ApiError::bad_request("hook run id must not be empty").into_response());
+    }
+    let run =
+        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+            .hook_run(hook_run_id)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("hook run was not found: {hook_run_id}"))
+                    .into_response()
+            })?;
+    if run.workspace_id != state.workspace_id {
+        return Err(ApiError::bad_request(format!(
+            "hook run '{}' does not belong to workspace '{}'",
+            run.id, state.workspace_id
+        ))
+        .into_response());
+    }
+    let run = crate::hook_run_detail_from_record(run).map_err(|error| error.into_response())?;
+    Ok(Json(json!({ "run": run })))
 }
 
 async fn remote_sidecar_file_blob(

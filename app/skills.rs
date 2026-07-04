@@ -243,13 +243,39 @@ pub(crate) fn discover_skills(
     user_profile_dir: &Path,
     workspaces: &[WorkspaceConfig],
 ) -> SkillDiscovery {
+    discover_skills_in_roots(skill_search_roots(user_profile_dir, workspaces))
+}
+
+pub(crate) fn discover_workspace_skills_for_path(
+    workspace_id: &str,
+    workspace_name: &str,
+    workspace_path: &Path,
+) -> SkillDiscovery {
+    let roots = [
+        SkillSearchRoot {
+            directory: workspace_path.join(".agents").join("skills"),
+            scope: SKILL_SCOPE_WORKSPACE,
+            workspace_id: Some(workspace_id.to_string()),
+            workspace_name: Some(workspace_name.to_string()),
+        },
+        SkillSearchRoot {
+            directory: workspace_path.join(".claude").join("skills"),
+            scope: SKILL_SCOPE_WORKSPACE,
+            workspace_id: Some(workspace_id.to_string()),
+            workspace_name: Some(workspace_name.to_string()),
+        },
+    ];
+    discover_skills_in_roots(roots)
+}
+
+fn discover_skills_in_roots(roots: impl IntoIterator<Item = SkillSearchRoot>) -> SkillDiscovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
     let mut invalid_skills = Vec::new();
     let mut required_disabled = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    for root in skill_search_roots(user_profile_dir, workspaces) {
+    for root in roots {
         let candidates = match skill_file_candidates(&root.directory) {
             Ok(candidates) => candidates,
             Err(message) => {
@@ -372,9 +398,12 @@ pub(crate) fn skill_search_roots(
     });
 
     for workspace in workspaces {
+        let Some(workspace_path) = workspace.local_path() else {
+            continue;
+        };
         for directory in [
-            workspace.path.join(".agents").join("skills"),
-            workspace.path.join(".claude").join("skills"),
+            workspace_path.join(".agents").join("skills"),
+            workspace_path.join(".claude").join("skills"),
         ] {
             roots.push(SkillSearchRoot {
                 directory,

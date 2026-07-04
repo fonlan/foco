@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use foco_store::config::{
-    AgentDefinitionSettings, GlobalConfig, HookConfig, McpConfig, MemorySettings, ModelSettings,
-    PlanSettings, PromptSettings, SpecSettings,
+    AgentDefinitionSettings, GlobalConfig, HookConfig, McpConfig, McpExecutionHost, MemorySettings,
+    ModelSettings, PlanSettings, PromptSettings, SKILL_SCOPE_GLOBAL, SpecSettings,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,7 +57,7 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         prompts: config.prompts.clone(),
         models: config.models.clone(),
         hooks: config.hooks.clone(),
-        mcp: config.mcp.clone(),
+        mcp: sidecar_mcp_config(&config.mcp),
         memory: config.memory.clone(),
         spec: config.spec.clone(),
         plan: config.plan.clone(),
@@ -78,6 +78,18 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         hash,
         payload,
     })
+}
+
+fn sidecar_mcp_config(config: &McpConfig) -> McpConfig {
+    let mut config = config.clone();
+    config.servers.retain(|server| {
+        server.enabled
+            && matches!(
+                server.execution_host,
+                McpExecutionHost::Auto | McpExecutionHost::Workspace
+            )
+    });
+    config
 }
 
 fn selected_skill_content(
@@ -133,11 +145,9 @@ fn selected_skill_content(
 
 fn skill_applies_to_workspace(
     skill: &foco_store::config::SkillSettings,
-    workspace_id: &str,
+    _workspace_id: &str,
 ) -> bool {
-    skill.scope == foco_store::config::SKILL_SCOPE_GLOBAL
-        || (skill.scope == foco_store::config::SKILL_SCOPE_WORKSPACE
-            && skill.workspace_id.as_deref() == Some(workspace_id))
+    skill.scope == SKILL_SCOPE_GLOBAL
 }
 
 #[cfg(test)]

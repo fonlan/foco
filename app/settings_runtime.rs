@@ -530,6 +530,12 @@ pub(crate) fn configured_mcp_server_summary(
         enabled: server.enabled,
         transport: server.transport.clone(),
         transport_label: mcp_transport_label(&server.transport),
+        execution_host: match server.execution_host {
+            foco_store::config::McpExecutionHost::Auto => "auto",
+            foco_store::config::McpExecutionHost::Local => "local",
+            foco_store::config::McpExecutionHost::Workspace => "workspace",
+        }
+        .to_string(),
         command: server.command.clone(),
         args: server.args.clone(),
         url: server.url.clone(),

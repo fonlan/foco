@@ -246,6 +246,7 @@ pub(crate) struct ManualMcpServerRequest {
     pub(crate) command: Option<String>,
     pub(crate) args: Option<Vec<String>>,
     pub(crate) url: Option<String>,
+    pub(crate) execution_host: Option<foco_store::config::McpExecutionHost>,
 }
 
 #[derive(Deserialize)]
@@ -550,6 +551,7 @@ pub(crate) struct ConfiguredMcpServerSummary {
     pub(crate) enabled: bool,
     pub(crate) transport: String,
     pub(crate) transport_label: &'static str,
+    pub(crate) execution_host: String,
     pub(crate) command: Option<String>,
     pub(crate) args: Vec<String>,
     pub(crate) url: Option<String>,
@@ -1903,6 +1905,7 @@ pub(crate) async fn save_mcp_server(
         command: optional_trimmed_string(request.command),
         args: request.args.unwrap_or_default(),
         url: optional_trimmed_string(request.url),
+        execution_host: request.execution_host.unwrap_or_default(),
     };
     let definition = server
         .to_definition()

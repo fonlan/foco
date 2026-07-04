@@ -6154,6 +6154,20 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn from_status_message(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -6195,7 +6209,7 @@ impl ApiError {
         }
     }
 
-    fn from_memory_error(error: MemoryDatabaseError) -> Self {
+    pub(crate) fn from_memory_error(error: MemoryDatabaseError) -> Self {
         match error {
             MemoryDatabaseError::InvalidMemoryInput { .. }
             | MemoryDatabaseError::InvalidMemoryJson { .. } => Self::bad_request(error.to_string()),

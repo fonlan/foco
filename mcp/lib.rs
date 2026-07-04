@@ -55,6 +55,32 @@ impl McpTransportKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpExecutionHost {
+    Auto,
+    Local,
+    Workspace,
+}
+
+impl Default for McpExecutionHost {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl McpServerDefinition {
+    pub fn effective_execution_host(&self) -> McpExecutionHost {
+        match self.execution_host {
+            McpExecutionHost::Auto => match self.transport {
+                McpTransportKind::Stdio => McpExecutionHost::Workspace,
+                McpTransportKind::StreamableHttp => McpExecutionHost::Local,
+            },
+            host => host,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerDefinition {
@@ -65,6 +91,8 @@ pub struct McpServerDefinition {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub execution_host: McpExecutionHost,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,7 +153,12 @@ impl McpRegistry {
         workspace_path: &Path,
         definitions: &[McpServerDefinition],
     ) -> Result<(), McpError> {
-        validate_server_definitions(definitions)?;
+        let definitions = definitions
+            .iter()
+            .filter(|definition| definition.effective_execution_host() == McpExecutionHost::Local)
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_server_definitions(&definitions)?;
         let desired_ids = definitions
             .iter()
             .map(|definition| definition.id.clone())

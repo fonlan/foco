@@ -119,7 +119,7 @@ pub(crate) struct SkillStoreImportTarget {
     pub(crate) source: String,
     pub(crate) skill_id: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreInstallRequest {
     pub(crate) skill_id: String,
@@ -193,7 +193,7 @@ pub(crate) struct SkillStoreDetailResponse {
     files: Vec<SkillStoreFile>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillStoreInstallResponse {
     pub(crate) target: String,
@@ -1017,6 +1017,27 @@ pub(crate) async fn skill_store_install(
 
     let mut config = config_snapshot(&state)?;
     let target = request.target.trim().to_string();
+    if target == SKILL_SCOPE_WORKSPACE {
+        let workspace_id = request.workspace_id.as_deref().ok_or_else(|| {
+            ApiError::bad_request("workspaceId is required when target is workspace")
+        })?;
+        let workspace = workspace_by_id(&config, workspace_id)?;
+        if workspace.is_remote() {
+            return crate::remote_workspace::install_remote_workspace_skill(
+                &state,
+                workspace_id,
+                SkillStoreInstallRequest {
+                    skill_id: skill_id.clone(),
+                    source: source.clone(),
+                    target,
+                    workspace_id: Some(workspace_id.to_string()),
+                    overwrite: request.overwrite,
+                    files,
+                },
+            )
+            .await;
+        }
+    }
     let (target_root, workspace_id) = install_target_root(
         &state.user_profile_dir,
         &config,
@@ -1270,8 +1291,13 @@ pub(crate) fn install_target_root(
                 ApiError::bad_request("workspaceId is required when target is workspace")
             })?;
             let workspace = workspace_by_id(config, workspace_id)?;
+            let workspace_path = workspace.local_path().ok_or_else(|| {
+                ApiError::bad_request(
+                    "installing skills into a remote workspace must be routed through its sidecar",
+                )
+            })?;
             Ok((
-                workspace.path.join(".agents").join("skills"),
+                workspace_path.join(".agents").join("skills"),
                 Some(workspace.id.clone()),
             ))
         }

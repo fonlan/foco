@@ -2643,6 +2643,7 @@ async fn agent_definitions_api_creates_default_agent_with_current_known_tools() 
             command: Some("test-mcp-server".to_string()),
             args: Vec::new(),
             url: None,
+            execution_host: Default::default(),
         });
     });
     let state = fixture.state.clone();
@@ -12664,6 +12665,7 @@ Use this only after reading the skill file.
         command: Some("test-mcp-server".to_string()),
         args: Vec::new(),
         url: None,
+        execution_host: Default::default(),
     });
     let mcp_tool_name = "mcp__docs__search";
     let state = test_app_state(config.clone(), profile_dir.clone());
