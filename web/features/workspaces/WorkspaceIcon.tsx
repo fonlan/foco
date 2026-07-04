@@ -1,13 +1,15 @@
-import { Folder } from "lucide-react";
+import { Folder, Server } from "lucide-react";
 import { useState } from "react";
 
 export function WorkspaceIcon({
   className = "size-4 shrink-0 rounded object-cover",
   fallbackClassName = "size-4 shrink-0",
+  isRemote = false,
   logoUrl,
 }: {
   className?: string;
   fallbackClassName?: string;
+  isRemote?: boolean;
   logoUrl: string | null | undefined;
 }) {
   const [failedLogoUrl, setFailedLogoUrl] = useState<string | null>(null);
@@ -25,5 +27,6 @@ export function WorkspaceIcon({
     );
   }
 
-  return <Folder aria-hidden="true" className={fallbackClassName} />;
+  const Icon = isRemote ? Server : Folder;
+  return <Icon aria-hidden="true" className={fallbackClassName} />;
 }

@@ -35,6 +35,8 @@ pub(crate) struct WorkspacePathRequest {
     #[serde(default)]
     pub(crate) remote_path: Option<String>,
     #[serde(default)]
+    pub(crate) terminal_shell: Option<String>,
+    #[serde(default)]
     pub(crate) content_base64: Option<String>,
 }
 
@@ -629,11 +631,6 @@ pub(crate) async fn add_workspace(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
     {
-        if request.content_base64.is_some() {
-            return Err(ApiError::bad_request(
-                "remote workspace icon upload is not supported yet",
-            ));
-        }
         return add_remote_workspace(state, request).await;
     }
 
@@ -734,19 +731,47 @@ async fn add_remote_workspace(
     }
     reject_registered_remote_workspace(&config, server_id, remote_path, None)?;
 
-    let terminal_shell = config
-        .remote_servers
-        .iter()
-        .find(|server| server.id == server_id)
-        .and_then(|server| server.terminal_shell.clone())
+    let terminal_shell = request
+        .terminal_shell
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            config
+                .remote_servers
+                .iter()
+                .find(|server| server.id == server_id)
+                .and_then(|server| server.terminal_shell.clone())
+        })
         .unwrap_or_else(|| default_terminal_shell_for_current_platform().to_string());
     let id = unique_workspace_id(&config, name);
+    let logo = if let Some(bytes) =
+        optional_workspace_logo_request_bytes(request.content_base64.as_deref())?
+    {
+        let kind = workspace_logo_kind(&bytes)?;
+        Some((bytes, kind))
+    } else {
+        None
+    };
+    let local_logo_path = state
+        .user_profile_dir
+        .join(".foco")
+        .join("remote-workspace-logos")
+        .join(&id);
+    if let Some((bytes, kind)) = logo.as_ref() {
+        save_workspace_logo_file(&local_logo_path, bytes, *kind)?;
+    }
     config.workspaces.insert(
         0,
         WorkspaceConfig {
             id,
             name: name.to_string(),
-            path: PathBuf::new(),
+            path: if logo.is_some() {
+                local_logo_path
+            } else {
+                PathBuf::new()
+            },
             location: WorkspaceLocation::Ssh {
                 server_id: server_id.to_string(),
                 remote_path: remote_path.to_string(),
@@ -865,7 +890,9 @@ pub(crate) async fn save_workspace_settings(
                 ApiError::bad_request(format!("workspace was not found: {workspace_id}"))
             })?;
         workspace.name = name.to_string();
-        workspace.path = PathBuf::new();
+        if !workspace.is_remote() {
+            workspace.path = PathBuf::new();
+        }
         workspace.location = WorkspaceLocation::Ssh {
             server_id: server_id.to_string(),
             remote_path: remote_path.to_string(),
@@ -966,7 +993,17 @@ pub(crate) async fn workspace_logo_thumbnail(
 ) -> Result<Response, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let Some(logo) = workspace_logo_file(&workspace.path)? else {
+    let Some(logo_path) = workspace
+        .local_path()
+        .or_else(|| workspace.is_remote().then_some(workspace.path.as_path()))
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("workspace logo was not found"))
+            .expect("workspace logo thumbnail response is valid"));
+    };
+    let Some(logo) = workspace_logo_file(logo_path)? else {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("workspace logo was not found"))

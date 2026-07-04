@@ -6312,7 +6312,10 @@ fn optional_workspace_logo_request_bytes(
 }
 
 pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
-    let Some(path) = workspace.local_path() else {
+    let path = workspace
+        .local_path()
+        .or_else(|| workspace.is_remote().then_some(workspace.path.as_path()));
+    let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
         return Ok(None);
     };
     Ok(workspace_logo_file(path)?.map(|logo| {

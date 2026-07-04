@@ -21,6 +21,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Server,
   Settings,
   ShoppingBag,
   SquareTerminal,
@@ -120,6 +121,9 @@ import type {
   QuestionOptionSummary,
   QuestionRequestSummary,
   RetryRunRequest,
+  RemoteServerDiagnosticResponse,
+  RemoteServerDiagnosticStage,
+  RemoteServerResponse,
   ScheduledWorkspaceRun,
   SettingsResponse,
   SettingsSection,
@@ -543,6 +547,33 @@ function pathBasename(path: string) {
   return normalized.split("/").filter(Boolean).at(-1) ?? normalized;
 }
 
+function remoteWorkspacePathBasename(path: string) {
+  const normalized = path.replace(/\/+$/, "");
+  return normalized.split("/").filter(Boolean).at(-1) ?? normalized;
+}
+
+function remoteWorkspacePendingStages(t: Translate): RemoteServerDiagnosticStage[] {
+  return [
+    { details: null, errorKind: null, message: t("Checking SSH"), stage: "ssh", status: "running" },
+    { details: null, errorKind: null, message: t("Detecting target"), stage: "target", status: "pending" },
+    { details: null, errorKind: null, message: t("Installing sidecar"), stage: "sidecarAsset", status: "pending" },
+    {
+      details: null,
+      errorKind: null,
+      message: t("Starting sidecar"),
+      stage: "remoteInstallDirWritable",
+      status: "pending",
+    },
+    {
+      details: null,
+      errorKind: null,
+      message: t("Syncing config"),
+      stage: "focoCommandVersion",
+      status: "pending",
+    },
+  ];
+}
+
 function sourceControlLabelForWorktree(worktree: Pick<GitWorktreeSummary, "branch" | "name">) {
   return worktree.branch ?? worktree.name;
 }
@@ -766,8 +797,19 @@ export function App() {
   statsRouteFiltersRef.current = statsRouteFilters;
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
+  const [workspaceMode, setWorkspaceMode] = useState<"local" | "ssh">("local");
+  const [workspaceServerId, setWorkspaceServerId] = useState("");
+  const [workspaceTestStages, setWorkspaceTestStages] = useState<
+    RemoteServerDiagnosticResponse["result"]["stages"]
+  >([]);
+  const [isTestingWorkspaceConnection, setIsTestingWorkspaceConnection] = useState(false);
+  const [inlineRemoteServerName, setInlineRemoteServerName] = useState("");
+  const [inlineRemoteServerHost, setInlineRemoteServerHost] = useState("");
+  const [isCreatingInlineRemoteServer, setIsCreatingInlineRemoteServer] = useState(false);
+  const [retryingRemoteWorkspaceId, setRetryingRemoteWorkspaceId] = useState<string | null>(null);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceTerminalShell, setWorkspaceTerminalShell] = useState("");
   const [workspaceSpecEnabled, setWorkspaceSpecEnabled] = useState(false);
   const [workspaceIconDraft, setWorkspaceIconDraft] =
     useState<WorkspaceIconDraft | null>(null);
@@ -3460,10 +3502,14 @@ export function App() {
     setError(null);
 
     try {
+      const isRemoteWorkspace = workspaceMode === "ssh";
       const data = await requestJson<WorkspacesResponse>("/api/workspaces/add", {
         body: JSON.stringify({
           name: workspaceName,
-          path: workspacePath,
+          path: isRemoteWorkspace ? workspacePath : workspacePath,
+          remotePath: isRemoteWorkspace ? workspacePath : null,
+          serverId: isRemoteWorkspace ? workspaceServerId : null,
+          terminalShell: workspaceTerminalShell || null,
           contentBase64: workspaceIconDraft?.contentBase64 ?? null,
         }),
         headers: { "Content-Type": "application/json" },
@@ -3492,12 +3538,127 @@ export function App() {
       }
       setWorkspaceName("");
       setWorkspacePath("");
+      setWorkspaceTerminalShell("");
+      setWorkspaceServerId("");
+      setWorkspaceMode("local");
+      setWorkspaceTestStages([]);
       setWorkspaceSpecEnabled(false);
       closeWorkspaceDialog();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsSavingWorkspace(false);
+    }
+  }
+
+  async function testWorkspaceRemoteConnection() {
+    if (!workspaceServerId) {
+      setError(t("Select a remote server first."));
+      return;
+    }
+
+    setIsTestingWorkspaceConnection(true);
+    setError(null);
+    setWorkspaceTestStages(remoteWorkspacePendingStages(t));
+
+    try {
+      const response = await requestJson<RemoteServerDiagnosticResponse>(
+        `/api/remote-servers/${encodeURIComponent(workspaceServerId)}/connect`,
+        { method: "POST" },
+      );
+      setWorkspaceTestStages([
+        ...response.result.stages,
+        {
+          details: null,
+          errorKind: response.result.ok ? null : response.result.errorKind,
+          message: response.result.message ?? (response.result.ok ? t("Ready") : t("Failed")),
+          stage: "ready",
+          status: response.result.ok ? "success" : "failed",
+        },
+      ]);
+      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(nextSettings);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setWorkspaceTestStages((current) => [
+        ...current.filter((stage) => stage.stage !== "ready"),
+        {
+          details: null,
+          errorKind: "request_failed",
+          message: errorMessage(requestError),
+          stage: "ready",
+          status: "failed",
+        },
+      ]);
+    } finally {
+      setIsTestingWorkspaceConnection(false);
+    }
+  }
+
+  async function createInlineRemoteServer() {
+    if (!inlineRemoteServerName.trim() || !inlineRemoteServerHost.trim()) {
+      setError(t("Remote server name and host are required."));
+      return;
+    }
+
+    setIsCreatingInlineRemoteServer(true);
+    setError(null);
+
+    try {
+      const response = await requestJson<RemoteServerResponse>("/api/remote-servers/create", {
+        body: JSON.stringify({
+          hostAlias: inlineRemoteServerHost.trim(),
+          name: inlineRemoteServerName.trim(),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(nextSettings);
+      setWorkspaceServerId(response.server.id);
+      if (!workspacePath.trim() && response.server.defaultRemoteRoot) {
+        setWorkspaceRemotePath(response.server.defaultRemoteRoot);
+      }
+      setInlineRemoteServerName("");
+      setInlineRemoteServerHost("");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsCreatingInlineRemoteServer(false);
+    }
+  }
+
+  function setWorkspaceRemoteServer(serverId: string) {
+    setWorkspaceServerId(serverId);
+    const server = settings?.remoteServers.find((item) => item.id === serverId);
+    if (server?.defaultRemoteRoot && !workspacePath.trim()) {
+      setWorkspaceRemotePath(server.defaultRemoteRoot);
+    }
+  }
+
+  function setWorkspaceRemotePath(path: string) {
+    setWorkspacePath(path);
+    setWorkspaceName((current) => current.trim() ? current : remoteWorkspacePathBasename(path));
+  }
+
+  async function retryRemoteWorkspace(workspace: WorkspaceSummary) {
+    if (!workspace.serverId) {
+      return;
+    }
+
+    setRetryingRemoteWorkspaceId(workspace.id);
+    setError(null);
+
+    try {
+      await requestJson(
+        `/api/remote-servers/${encodeURIComponent(workspace.serverId)}/workspaces/${encodeURIComponent(workspace.id)}/connect`,
+        { method: "POST" },
+      );
+      await refreshWorkspaces();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setRetryingRemoteWorkspaceId(null);
     }
   }
 
@@ -9102,6 +9263,13 @@ export function App() {
     setWorkspaceName("");
     setWorkspacePath("");
     setWorkspaceIconDraft(null);
+    setWorkspaceSpecEnabled(false);
+    setWorkspaceTerminalShell("");
+    setWorkspaceMode("local");
+    setWorkspaceServerId(settings?.remoteServers[0]?.id ?? "");
+    setWorkspaceTestStages([]);
+    setInlineRemoteServerName("");
+    setInlineRemoteServerHost("");
     setError(null);
     setWorkspaceDialogRevision((current) => current + 1);
     setIsWorkspaceDialogOpen(true);
@@ -9109,6 +9277,7 @@ export function App() {
 
   function closeWorkspaceDialog() {
     setWorkspaceIconDraft(null);
+    setWorkspaceTestStages([]);
     setIsWorkspaceDialogOpen(false);
   }
 
@@ -9783,13 +9952,24 @@ export function App() {
                                   className="workspace-expand-icon"
                                 />
                               )}
-                              <WorkspaceIcon
-                                className="size-4 shrink-0 rounded object-cover"
-                                fallbackClassName="size-4 shrink-0"
-                                logoUrl={workspace.logoUrl}
-                              />
-                              <span className="min-w-0 flex-1 truncate text-left">
-                                {workspace.name}
+                              <span className="relative inline-flex shrink-0">
+                                <WorkspaceIcon
+                                  className="size-4 shrink-0 rounded object-cover"
+                                  fallbackClassName="size-4 shrink-0"
+                                  isRemote={Boolean(workspace.serverId)}
+                                  logoUrl={workspace.logoUrl}
+                                />
+                                {workspace.serverId ? (
+                                  <span className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`} />
+                                ) : null}
+                              </span>
+                              <span className="min-w-0 flex-1 text-left">
+                                <span className="block truncate">{workspace.name}</span>
+                                {workspace.serverId ? (
+                                  <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
+                                    {workspace.displayPath}
+                                  </span>
+                                ) : null}
                               </span>
                             </button>
                             <button
@@ -9797,13 +9977,43 @@ export function App() {
                                 name: workspace.name,
                               })}
                               className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
-                              onClick={() => startNewWorkspaceChat(workspace.id)}
-                              title={t("New chat")}
+                              disabled={workspace.serverId !== null && !workspaceConnectionLooksReady(workspace.connectionStatus)}
+                              onClick={() => {
+                                if (workspace.serverId && !workspaceConnectionLooksReady(workspace.connectionStatus)) {
+                                  setError(t("Remote workspace is offline. Retry the connection before opening remote operations."));
+                                  return;
+                                }
+                                startNewWorkspaceChat(workspace.id);
+                              }}
+                              title={workspace.serverId && !workspaceConnectionLooksReady(workspace.connectionStatus) ? t("Remote workspace is offline") : t("New chat")}
                               type="button"
                             >
                               <Plus aria-hidden="true" className="size-4" />
                             </button>
                           </div>
+                          {workspace.serverId ? (
+                            <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-stone-500">
+                              <span className="min-w-0 flex-1 truncate">
+                                {workspaceConnectionLabel(workspace.connectionStatus, t)}
+                                {workspace.lastRemoteError ? `: ${workspace.lastRemoteError}` : ""}
+                              </span>
+                              {!workspaceConnectionLooksReady(workspace.connectionStatus) ? (
+                                <button
+                                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-stone-200 bg-white px-2 font-semibold text-teal-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                  disabled={retryingRemoteWorkspaceId === workspace.id}
+                                  onClick={() => void retryRemoteWorkspace(workspace)}
+                                  type="button"
+                                >
+                                  {retryingRemoteWorkspaceId === workspace.id ? (
+                                    <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                                  ) : (
+                                    <RefreshCw aria-hidden="true" className="size-3" />
+                                  )}
+                                  {t("Retry")}
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
                           {isExpanded ? (
                             <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3 pr-1.5">
                               {visibleChats.length > 0 ? (
@@ -10412,19 +10622,41 @@ export function App() {
             canUseNativePicker={canUseNativePicker}
             iconDraft={workspaceIconDraft}
             iconInputRef={workspaceIconInputRef}
+            inlineServerHost={inlineRemoteServerHost}
+            inlineServerName={inlineRemoteServerName}
+            isCreatingInlineServer={isCreatingInlineRemoteServer}
             isSelectingPath={isSelectingWorkspacePath}
             isSaving={isSavingWorkspace}
+            isTestingConnection={isTestingWorkspaceConnection}
+            mode={workspaceMode}
             name={workspaceName}
             onClearIcon={clearWorkspaceIconDraft}
             onClose={closeWorkspaceDialog}
+            onCreateInlineServer={() => void createInlineRemoteServer()}
             onIconFileChange={handleWorkspaceIconFileChange}
+            onInlineServerHostChange={setInlineRemoteServerHost}
+            onInlineServerNameChange={setInlineRemoteServerName}
+            onModeChange={(nextMode) => {
+              setWorkspaceMode(nextMode);
+              setWorkspaceTestStages([]);
+              if (nextMode === "ssh" && !workspaceServerId) {
+                setWorkspaceRemoteServer(settings?.remoteServers[0]?.id ?? "");
+              }
+            }}
             onNameChange={setWorkspaceName}
-            onPathChange={setWorkspacePath}
+            onPathChange={workspaceMode === "ssh" ? setWorkspaceRemotePath : setWorkspacePath}
             onSelectPath={handleSelectWorkspacePath}
+            onServerChange={setWorkspaceRemoteServer}
             onSpecEnabledChange={setWorkspaceSpecEnabled}
             onSubmit={handleWorkspaceSubmit}
+            onTerminalShellChange={setWorkspaceTerminalShell}
+            onTestConnection={() => void testWorkspaceRemoteConnection()}
             path={workspacePath}
+            remoteServers={settings?.remoteServers ?? []}
+            selectedServerId={workspaceServerId}
             specEnabled={workspaceSpecEnabled}
+            terminalShell={workspaceTerminalShell}
+            testStages={workspaceTestStages}
           />
         ) : null}
         {isBranchDialogOpen ? (
@@ -11421,6 +11653,7 @@ function ApiOverviewPanel({
           <WorkspaceIcon
             className="size-16 rounded-xl object-cover"
             fallbackClassName="size-10"
+            isRemote={Boolean(selectedWorkspace?.serverId)}
             logoUrl={selectedWorkspace?.logoUrl}
           />
         </span>
@@ -11433,6 +11666,45 @@ function ApiOverviewPanel({
       </div>
     </section>
   );
+}
+
+function workspaceConnectionLooksReady(status: string) {
+  const normalized = status.toLowerCase();
+  return normalized === "connected" || normalized === "ready" || normalized === "degraded";
+}
+
+function workspaceConnectionLabel(status: string, t: Translate) {
+  const normalized = status.toLowerCase();
+  if (normalized === "connected" || normalized === "ready") {
+    return t("Connected");
+  }
+  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
+    return t("Checking");
+  }
+  if (normalized === "failed" || normalized === "failedauth") {
+    return t("Failed");
+  }
+  if (normalized === "offline" || normalized === "disconnected") {
+    return t("Offline");
+  }
+  return status;
+}
+
+function workspaceConnectionDotClass(status: string) {
+  const normalized = status.toLowerCase();
+  if (normalized === "connected" || normalized === "ready") {
+    return "bg-emerald-500";
+  }
+  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
+    return "bg-amber-500";
+  }
+  if (normalized === "failed" || normalized === "failedauth") {
+    return "bg-rose-500";
+  }
+  if (normalized === "degraded") {
+    return "bg-yellow-500";
+  }
+  return "bg-stone-300";
 }
 
 function PanelLoadingFallback() {

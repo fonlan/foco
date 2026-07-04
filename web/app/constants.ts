@@ -31,6 +31,7 @@ export const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "plan",
   "web-search",
   "workspaces",
+  "remote-servers",
   "hooks",
   "memory",
   "providers",

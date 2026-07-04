@@ -9,6 +9,7 @@ export type SettingsSection =
   | "spec"
   | "plan"
   | "web-search"
+  | "remote-servers"
   | "hooks"
   | "memory"
   | "mcp"
@@ -850,6 +851,7 @@ export type RemoteServerSummary = {
   status: string;
   lastError: string | null;
   lastKnownTarget: string | null;
+  sidecarVersion: string | null;
   sidecarInstallState: string;
   workspaceCount: number;
   lastCheckedAt: string | null;
@@ -945,6 +947,8 @@ export type WorkspaceFormState = {
   id: string;
   name: string;
   path: string;
+  serverId?: string | null;
+  remotePath?: string | null;
   pinned: boolean;
   specEnabled: boolean;
   specInjectEnabled: boolean;

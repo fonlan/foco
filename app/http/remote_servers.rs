@@ -67,6 +67,7 @@ pub(crate) struct RemoteServerSummary {
     pub(crate) status: String,
     pub(crate) last_error: Option<String>,
     pub(crate) last_known_target: Option<String>,
+    pub(crate) sidecar_version: Option<String>,
     pub(crate) sidecar_install_state: String,
     pub(crate) workspace_count: usize,
     pub(crate) last_checked_at: Option<String>,
@@ -326,6 +327,7 @@ pub(crate) fn remote_server_summary(
             .unwrap_or_else(|| remote_server_status_value(server, connected_ids)),
         last_error: server.last_error.clone(),
         last_known_target: server.last_known_target.clone(),
+        sidecar_version: server.last_sidecar_version.clone(),
         sidecar_install_state: server
             .sidecar_install_state
             .clone()

@@ -117,6 +117,10 @@ import type {
   ProviderRequestOverrideValueType,
   ProviderTestResponse,
   ProviderTestState,
+  RemoteServerDiagnosticResponse,
+  RemoteServerResponse,
+  RemoteServerSummary,
+  RemoteServerWorkspaceReference,
   RetryWorkspaceSpecJobResponse,
   SettingsResponse,
   SettingsSection,
@@ -312,6 +316,21 @@ type SkillStoreUpdateResponse = {
   settings: SettingsResponse;
 };
 
+type RemoteServerFormState = {
+  id: string;
+  name: string;
+  hostAlias: string;
+  user: string;
+  port: string;
+  identityFile: string;
+  defaultRemoteRoot: string;
+  focoCommand: string;
+  terminalShell: string;
+  connectTimeoutMs: string;
+};
+
+type RemoteServerOperation = "test" | "connect" | "disconnect" | "delete" | "save";
+
 export function SettingsPanel({
   activeSection,
   activeWorkspaceId,
@@ -360,6 +379,17 @@ export function SettingsPanel({
 }) {
   const { language, t } = useI18n();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
+  const [isRemoteServerDialogOpen, setIsRemoteServerDialogOpen] = useState(false);
+  const [remoteServerForm, setRemoteServerForm] = useState<RemoteServerFormState>(() =>
+    emptyRemoteServerForm(),
+  );
+  const [remoteServerOperationKey, setRemoteServerOperationKey] = useState<string | null>(null);
+  const [remoteServerReferences, setRemoteServerReferences] = useState<
+    RemoteServerWorkspaceReference[]
+  >([]);
+  const [remoteServerDiagnostics, setRemoteServerDiagnostics] = useState<
+    Record<string, RemoteServerDiagnosticResponse["result"]>
+  >({});
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false);
@@ -594,6 +624,7 @@ export function SettingsPanel({
     (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
+  const remoteServers = settings?.remoteServers ?? [];
   const workspaces = settings?.workspaces ?? [];
   const memoryWorkspace =
     workspaces.find((workspace) => workspace.id === memoryFilter.workspaceId) ??
@@ -1661,12 +1692,31 @@ export function SettingsPanel({
     setIsMcpDialogOpen(true);
   }
 
+  function editConfiguredRemoteServer(server: RemoteServerSummary) {
+    setRemoteServerReferences([]);
+    setRemoteServerForm(remoteServerFormFromSummary(server));
+    setIsRemoteServerDialogOpen(true);
+  }
+
+  function startAddingRemoteServer() {
+    setRemoteServerReferences([]);
+    setRemoteServerForm(emptyRemoteServerForm());
+    setIsRemoteServerDialogOpen(true);
+  }
+
+  function closeRemoteServerDialog() {
+    setIsRemoteServerDialogOpen(false);
+    setRemoteServerReferences([]);
+  }
+
   async function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
     setWorkspaceForm({
       commonCommands: workspace.commonCommands.map((command) => ({ ...command })),
       id: workspace.id,
       name: workspace.name,
-      path: workspace.path,
+      path: workspace.serverId ? (workspace.remotePath ?? workspace.path) : workspace.path,
+      remotePath: workspace.remotePath ?? null,
+      serverId: workspace.serverId ?? null,
       pinned: workspace.pinned,
       specEnabled: false,
       specInjectEnabled: false,
@@ -2966,6 +3016,85 @@ export function SettingsPanel({
     }
   }
 
+  async function saveRemoteServer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const operation = operationKey("save", remoteServerForm.id || "new");
+    setRemoteServerOperationKey(operation);
+    setError(null);
+
+    try {
+      const data = await requestJson<RemoteServerResponse>(
+        remoteServerForm.id ? "/api/remote-servers/update" : "/api/remote-servers/create",
+        {
+          body: JSON.stringify(remoteServerFormPayload(remoteServerForm)),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(nextSettings);
+      onSettingsChange(nextSettings);
+      setRemoteServerForm(remoteServerFormFromSummary(data.server));
+      setIsRemoteServerDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setRemoteServerOperationKey(null);
+    }
+  }
+
+  async function runRemoteServerOperation(
+    server: RemoteServerSummary,
+    operation: Exclude<RemoteServerOperation, "save">,
+  ) {
+    const key = operationKey(operation, server.id);
+    setRemoteServerOperationKey(key);
+    setRemoteServerReferences([]);
+    setError(null);
+
+    try {
+      if (operation === "delete") {
+        await requestJson<{ deleted: boolean; references: RemoteServerWorkspaceReference[] }>(
+          "/api/remote-servers/delete",
+          {
+            body: JSON.stringify({ id: server.id }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+      } else if (operation === "disconnect") {
+        await requestJson<RemoteServerResponse>(
+          `/api/remote-servers/${encodeURIComponent(server.id)}/disconnect`,
+          { method: "POST" },
+        );
+      } else {
+        const response = await requestJson<RemoteServerDiagnosticResponse>(
+          `/api/remote-servers/${encodeURIComponent(server.id)}/${operation}`,
+          { method: "POST" },
+        );
+        setRemoteServerDiagnostics((current) => ({
+          ...current,
+          [server.id]: response.result,
+        }));
+      }
+
+      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(nextSettings);
+      onSettingsChange(nextSettings);
+      if (operation === "delete") {
+        setIsRemoteServerDialogOpen(false);
+      }
+    } catch (requestError) {
+      const message = errorMessage(requestError);
+      setError(message);
+      if (operation === "delete") {
+        setRemoteServerReferences(remoteServerReferencesForMessage(message, workspaces));
+      }
+    } finally {
+      setRemoteServerOperationKey(null);
+    }
+  }
+
   async function saveWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSavingWorkspace(true);
@@ -2987,7 +3116,9 @@ export function SettingsPanel({
         body: JSON.stringify({
           id: workspaceForm.id,
           name: workspaceForm.name,
-          path: workspaceForm.path,
+          path: workspaceForm.serverId ? (workspaceForm.remotePath ?? workspaceForm.path) : workspaceForm.path,
+          serverId: workspaceForm.serverId ?? null,
+          remotePath: workspaceForm.serverId ? (workspaceForm.remotePath ?? workspaceForm.path) : null,
           pinned: workspaceForm.pinned,
           terminalShell: workspaceForm.terminalShell,
           commonCommands: workspaceForm.commonCommands,
@@ -3094,7 +3225,9 @@ export function SettingsPanel({
         body: JSON.stringify({
           id: workspace.id,
           name: workspace.name,
-          path: workspace.path,
+          path: workspace.serverId ? (workspace.remotePath ?? workspace.path) : workspace.path,
+          serverId: workspace.serverId ?? null,
+          remotePath: workspace.remotePath ?? null,
           pinned,
           terminalShell: workspace.terminalShell,
           commonCommands: workspace.commonCommands,
@@ -4245,6 +4378,12 @@ export function SettingsPanel({
               icon={Folder}
               label={t("Workspaces")}
               onClick={() => onActiveSectionChange("workspaces")}
+            />
+            <SettingsNavButton
+              active={activeSection === "remote-servers"}
+              icon={Server}
+              label={t("Remote Servers")}
+              onClick={() => onActiveSectionChange("remote-servers")}
             />
             <SettingsNavButton
               active={activeSection === "hooks"}
@@ -7639,6 +7778,24 @@ export function SettingsPanel({
             </section>
           ) : null}
 
+          {activeSection === "remote-servers" ? (
+            <RemoteServersSettingsSection
+              diagnostics={remoteServerDiagnostics}
+              form={remoteServerForm}
+              isDialogOpen={isRemoteServerDialogOpen}
+              onCloseDialog={closeRemoteServerDialog}
+              onEdit={editConfiguredRemoteServer}
+              onFormChange={setRemoteServerForm}
+              onRunOperation={runRemoteServerOperation}
+              onSave={saveRemoteServer}
+              onStartAdding={startAddingRemoteServer}
+              operationKey={remoteServerOperationKey}
+              references={remoteServerReferences}
+              servers={remoteServers}
+              t={t}
+            />
+          ) : null}
+
           {activeSection === "workspaces" ? (
             <section className="grid gap-4">
               {isWorkspaceDialogOpen ? (
@@ -10858,6 +11015,451 @@ export function SettingsPanel({
   );
 }
 
+function RemoteServersSettingsSection({
+  diagnostics,
+  form,
+  isDialogOpen,
+  onCloseDialog,
+  onEdit,
+  onFormChange,
+  onRunOperation,
+  onSave,
+  onStartAdding,
+  operationKey: activeOperationKey,
+  references,
+  servers,
+  t,
+}: {
+  diagnostics: Record<string, RemoteServerDiagnosticResponse["result"]>;
+  form: RemoteServerFormState;
+  isDialogOpen: boolean;
+  onCloseDialog: () => void;
+  onEdit: (server: RemoteServerSummary) => void;
+  onFormChange: (updater: (current: RemoteServerFormState) => RemoteServerFormState) => void;
+  onRunOperation: (
+    server: RemoteServerSummary,
+    operation: Exclude<RemoteServerOperation, "save">,
+  ) => Promise<void>;
+  onSave: (event: FormEvent<HTMLFormElement>) => void;
+  onStartAdding: () => void;
+  operationKey: string | null;
+  references: RemoteServerWorkspaceReference[];
+  servers: RemoteServerSummary[];
+  t: Translate;
+}) {
+  const isSaving = activeOperationKey === operationKeyForFormSave(form);
+
+  return (
+    <section className="grid gap-4">
+      {isDialogOpen ? (
+        <>
+          <button
+            aria-label={t("Close remote server configuration backdrop")}
+            className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+            onClick={onCloseDialog}
+            type="button"
+          />
+          <form
+            aria-label={t("Remote server configuration")}
+            className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+            onSubmit={onSave}
+          >
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <Server aria-hidden="true" className="size-5 text-teal-700" />
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {form.id ? t("Edit remote server") : t("Add remote server")}
+                  </h3>
+                </div>
+                <div className="mt-1 truncate text-xs text-stone-500">
+                  {form.hostAlias || t("SSH host alias")}
+                </div>
+              </div>
+              <button
+                aria-label={t("Close remote server configuration")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                onClick={onCloseDialog}
+                title={t("Close")}
+                type="button"
+              >
+                <X aria-hidden="true" className="size-4" />
+              </button>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <TextField
+                label={t("Server name")}
+                onChange={(value) => onFormChange((current) => ({ ...current, name: value }))}
+                placeholder={t("Server name")}
+                value={form.name}
+              />
+              <TextField
+                label={t("SSH host alias")}
+                onChange={(value) => onFormChange((current) => ({ ...current, hostAlias: value }))}
+                placeholder="prod-box"
+                value={form.hostAlias}
+              />
+              <TextField
+                label={t("SSH user")}
+                onChange={(value) => onFormChange((current) => ({ ...current, user: value }))}
+                placeholder="deploy"
+                value={form.user}
+              />
+              <TextField
+                inputMode="numeric"
+                label={t("SSH port")}
+                onChange={(value) => onFormChange((current) => ({ ...current, port: value }))}
+                placeholder="22"
+                value={form.port}
+              />
+              <div className="sm:col-span-2">
+                <TextField
+                  label={t("Identity file")}
+                  onChange={(value) => onFormChange((current) => ({ ...current, identityFile: value }))}
+                  placeholder="~/.ssh/id_ed25519"
+                  value={form.identityFile}
+                />
+              </div>
+              <TextField
+                label={t("Default remote root")}
+                onChange={(value) => onFormChange((current) => ({ ...current, defaultRemoteRoot: value }))}
+                placeholder="~/workspaces"
+                value={form.defaultRemoteRoot}
+              />
+              <TextField
+                label={t("Terminal shell override")}
+                onChange={(value) => onFormChange((current) => ({ ...current, terminalShell: value }))}
+                placeholder="/bin/bash"
+                value={form.terminalShell}
+              />
+              <TextField
+                label={t("Foco command")}
+                onChange={(value) => onFormChange((current) => ({ ...current, focoCommand: value }))}
+                placeholder="foco"
+                value={form.focoCommand}
+              />
+              <TextField
+                inputMode="numeric"
+                label={t("Connect timeout ms")}
+                onChange={(value) => onFormChange((current) => ({ ...current, connectTimeoutMs: value }))}
+                placeholder="10000"
+                value={form.connectTimeoutMs}
+              />
+            </div>
+            {references.length ? (
+              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                <div className="font-semibold">{t("Server is used by workspaces")}</div>
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  {references.map((reference) => (
+                    <CapabilityPill
+                      key={reference.id}
+                      label={`${reference.name}: ${reference.remotePath}`}
+                      ok={false}
+                      tone="active"
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                aria-label={t("Cancel remote server configuration")}
+                className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                onClick={onCloseDialog}
+                title={t("Cancel")}
+                type="button"
+              >
+                <X aria-hidden="true" className="size-4" />
+              </button>
+              <button
+                aria-label={t("Save remote server")}
+                className="inline-flex size-10 items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={isSaving || !form.name.trim() || !form.hostAlias.trim()}
+                title={t("Save remote server")}
+                type="submit"
+              >
+                {isSaving ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
+          </form>
+        </>
+      ) : null}
+
+      <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <h3 className="text-sm font-semibold text-stone-950">
+            {t("Remote server list")}
+          </h3>
+          <button
+            aria-label={t("Add remote server")}
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+            onClick={onStartAdding}
+            title={t("Add remote server")}
+            type="button"
+          >
+            <Plus aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+        {servers.length ? (
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-stone-100 text-left text-sm">
+              <thead className="bg-stone-50/80 text-xs font-semibold uppercase text-stone-500">
+                <tr>
+                  <th className="px-4 py-2">{t("Server")}</th>
+                  <th className="px-4 py-2">{t("Status")}</th>
+                  <th className="px-4 py-2">{t("Target")}</th>
+                  <th className="px-4 py-2">{t("Sidecar")}</th>
+                  <th className="px-4 py-2">{t("Workspaces")}</th>
+                  <th className="px-4 py-2">{t("Last checked")}</th>
+                  <th className="px-4 py-2 text-right">{t("Actions")}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {servers.map((server) => {
+                  const diagnostic = diagnostics[server.id];
+                  const isBusy = Boolean(activeOperationKey?.endsWith(`:${server.id}`));
+                  return (
+                    <tr key={server.id} className="align-top">
+                      <td className="px-4 py-3">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="relative inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-teal-700">
+                            <Server aria-hidden="true" className="size-4" />
+                            <span className={`absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-white ${remoteStatusDotClass(server.status)}`} />
+                          </span>
+                          <div className="min-w-0">
+                            <div className="truncate font-semibold text-stone-900">{server.name}</div>
+                            <div className="truncate text-xs text-stone-500">{remoteServerDisplayTarget(server)}</div>
+                            {server.lastError ? (
+                              <div className="mt-1 line-clamp-2 text-xs text-rose-700">{server.lastError}</div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <CapabilityPill
+                          label={remoteStatusLabel(server.status, t)}
+                          ok={server.status === "connected" || server.status === "ready"}
+                          tone={remoteStatusTone(server.status)}
+                        />
+                      </td>
+                      <td className="px-4 py-3 text-xs text-stone-600">
+                        {server.lastKnownTarget ?? "-"}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-stone-600">
+                        <div>{server.sidecarVersion ?? "-"}</div>
+                        <div className="mt-1 text-stone-400">{server.sidecarInstallState}</div>
+                      </td>
+                      <td className="px-4 py-3 text-xs font-semibold text-stone-700">
+                        {server.workspaceCount}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-stone-600">
+                        {server.lastCheckedAt ?? "-"}
+                        {diagnostic ? (
+                          <div className="mt-2 grid gap-1">
+                            {diagnostic.stages.map((stage) => (
+                              <div key={stage.stage} className="flex items-center gap-1.5">
+                                <span className={`size-2 rounded-full ${remoteStageDotClass(stage.status)}`} />
+                                <span className="truncate" title={stage.message}>
+                                  {remoteDiagnosticStageLabel(stage.stage, t)}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex justify-end gap-1.5">
+                          <IconActionButton
+                            disabled={isBusy}
+                            icon={RefreshCw}
+                            label={t("Test remote server")}
+                            loading={activeOperationKey === operationKey("test", server.id)}
+                            onClick={() => void onRunOperation(server, "test")}
+                          />
+                          <IconActionButton
+                            disabled={isBusy}
+                            icon={Play}
+                            label={t("Connect remote server")}
+                            loading={activeOperationKey === operationKey("connect", server.id)}
+                            onClick={() => void onRunOperation(server, "connect")}
+                          />
+                          <IconActionButton
+                            disabled={isBusy}
+                            icon={CircleAlert}
+                            label={t("Disconnect remote server")}
+                            loading={activeOperationKey === operationKey("disconnect", server.id)}
+                            onClick={() => void onRunOperation(server, "disconnect")}
+                          />
+                          <IconActionButton
+                            disabled={isBusy}
+                            icon={Pencil}
+                            label={t("Edit remote server")}
+                            onClick={() => onEdit(server)}
+                          />
+                          <IconActionButton
+                            disabled={isBusy}
+                            icon={Trash2}
+                            label={t("Delete remote server")}
+                            loading={activeOperationKey === operationKey("delete", server.id)}
+                            onClick={() => void onRunOperation(server, "delete")}
+                            tone="danger"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="px-4 py-6 text-sm text-stone-500">
+            {t("No remote servers")}
+          </div>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function operationKeyForFormSave(form: RemoteServerFormState) {
+  return operationKey("save", form.id || "new");
+}
+
+function IconActionButton({
+  disabled,
+  icon: Icon,
+  label,
+  loading = false,
+  onClick,
+  tone = "default",
+}: {
+  disabled?: boolean;
+  icon: LucideIcon;
+  label: string;
+  loading?: boolean;
+  onClick: () => void;
+  tone?: "danger" | "default";
+}) {
+  return (
+    <button
+      aria-label={label}
+      className={`inline-flex size-8 items-center justify-center rounded-lg border shadow-sm disabled:cursor-not-allowed disabled:text-stone-300 ${tone === "danger"
+          ? "border-stone-200 bg-white text-stone-600 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+          : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+        }`}
+      disabled={disabled}
+      onClick={onClick}
+      title={label}
+      type="button"
+    >
+      {loading ? (
+        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+      ) : (
+        <Icon aria-hidden="true" className="size-3.5" />
+      )}
+    </button>
+  );
+}
+
+function remoteServerReferencesForMessage(
+  message: string,
+  workspaces: ConfiguredWorkspaceSummary[],
+): RemoteServerWorkspaceReference[] {
+  const names = message.includes(":")
+    ? message
+      .slice(message.indexOf(":") + 1)
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean)
+    : [];
+  return workspaces
+    .filter((workspace) => workspace.serverId && names.includes(workspace.name))
+    .map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      remotePath: workspace.remotePath ?? workspace.path,
+    }));
+}
+
+function remoteStatusLabel(status: string, t: Translate) {
+  const normalized = status.toLowerCase();
+  if (normalized === "connected" || normalized === "ready") {
+    return t("Connected");
+  }
+  if (normalized === "checking" || normalized === "connecting") {
+    return t("Checking");
+  }
+  if (normalized === "failedauth") {
+    return t("Failed");
+  }
+  if (normalized === "failed" || normalized === "offline") {
+    return normalized === "offline" ? t("Offline") : t("Failed");
+  }
+  return status;
+}
+
+function remoteStatusTone(status: string): CapabilityPillTone {
+  const normalized = status.toLowerCase();
+  if (normalized === "connected" || normalized === "ready") {
+    return "success";
+  }
+  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
+    return "active";
+  }
+  if (normalized === "failed" || normalized === "failedauth") {
+    return "danger";
+  }
+  return "muted";
+}
+
+function remoteStatusDotClass(status: string) {
+  switch (remoteStatusTone(status)) {
+    case "success":
+      return "bg-emerald-500";
+    case "active":
+      return "bg-amber-500";
+    case "danger":
+      return "bg-rose-500";
+    default:
+      return "bg-stone-300";
+  }
+}
+
+function remoteStageDotClass(status: string) {
+  if (status === "success") {
+    return "bg-emerald-500";
+  }
+  if (status === "failed") {
+    return "bg-rose-500";
+  }
+  if (status === "skipped") {
+    return "bg-stone-300";
+  }
+  return "bg-amber-500";
+}
+
+function remoteDiagnosticStageLabel(stage: string, t: Translate) {
+  switch (stage) {
+    case "ssh":
+      return t("Checking SSH");
+    case "target":
+      return t("Detecting target");
+    case "sidecarAsset":
+      return t("Installing sidecar");
+    case "remoteInstallDirWritable":
+      return t("Starting sidecar");
+    case "focoCommandVersion":
+      return t("Syncing config");
+    default:
+      return stage;
+  }
+}
+
 function settingsSectionTitle(section: SettingsSection, t: Translate) {
   if (section === "general") {
     return t("General settings");
@@ -10885,6 +11487,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
 
   if (section === "web-search") {
     return t("Web search settings");
+  }
+
+  if (section === "remote-servers") {
+    return t("Remote server settings");
   }
 
   if (section === "hooks") {
@@ -10937,6 +11543,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "web-search") {
     return t("Search API credentials and runtime web tools");
+  }
+
+  if (section === "remote-servers") {
+    return t("Reusable SSH connection profiles");
   }
 
   if (section === "hooks") {
@@ -11539,11 +12149,75 @@ function emptyWorkspaceForm(): WorkspaceFormState {
     id: "",
     name: "",
     path: "",
+    remotePath: null,
+    serverId: null,
     pinned: false,
     specEnabled: false,
     specInjectEnabled: false,
     terminalShell: "",
   };
+}
+
+function emptyRemoteServerForm(): RemoteServerFormState {
+  return {
+    connectTimeoutMs: "10000",
+    defaultRemoteRoot: "",
+    focoCommand: "",
+    hostAlias: "",
+    id: "",
+    identityFile: "",
+    name: "",
+    port: "",
+    terminalShell: "",
+    user: "",
+  };
+}
+
+function remoteServerFormFromSummary(server: RemoteServerSummary): RemoteServerFormState {
+  return {
+    connectTimeoutMs: String(server.connectTimeoutMs),
+    defaultRemoteRoot: server.defaultRemoteRoot ?? "",
+    focoCommand: server.focoCommand ?? "",
+    hostAlias: server.hostAlias,
+    id: server.id,
+    identityFile: server.identityFile ?? "",
+    name: server.name,
+    port: server.port ? String(server.port) : "",
+    terminalShell: server.terminalShell ?? "",
+    user: server.user ?? "",
+  };
+}
+
+function remoteServerFormPayload(form: RemoteServerFormState) {
+  const trimmedPort = form.port.trim();
+  const trimmedTimeout = form.connectTimeoutMs.trim();
+  return {
+    connectTimeoutMs: trimmedTimeout ? Number(trimmedTimeout) : undefined,
+    defaultRemoteRoot: nullableTrimmed(form.defaultRemoteRoot),
+    focoCommand: nullableTrimmed(form.focoCommand),
+    hostAlias: form.hostAlias.trim(),
+    id: form.id.trim() || undefined,
+    identityFile: nullableTrimmed(form.identityFile),
+    name: form.name.trim(),
+    port: trimmedPort ? Number(trimmedPort) : null,
+    terminalShell: nullableTrimmed(form.terminalShell),
+    user: nullableTrimmed(form.user),
+  };
+}
+
+function nullableTrimmed(value: string) {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function operationKey(operation: RemoteServerOperation, id: string) {
+  return `${operation}:${id}`;
+}
+
+function remoteServerDisplayTarget(server: RemoteServerSummary) {
+  const user = server.user ? `${server.user}@` : "";
+  const port = server.port ? `:${server.port}` : "";
+  return `${user}${server.hostAlias}${port}`;
 }
 
 function emptyMcpServerForm(): McpServerFormState {
