@@ -377,6 +377,7 @@ pub(crate) struct AppState {
     plan_auto_run_scheduler: PlanAutoRunScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
+    remote_server_connections: Arc<Mutex<HashSet<String>>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
@@ -756,6 +757,7 @@ async fn run_server_until_shutdown(
         plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
+        remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
@@ -1474,6 +1476,12 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) path: String,
+    pub(crate) display_path: String,
+    pub(crate) server_id: Option<String>,
+    pub(crate) server_name: Option<String>,
+    pub(crate) remote_path: Option<String>,
+    pub(crate) connection_status: String,
+    pub(crate) last_remote_error: Option<String>,
     pub(crate) logo_url: Option<String>,
     pub(crate) pinned: bool,
     pub(crate) terminal_shell: String,
@@ -10502,7 +10510,10 @@ fn reject_registered_workspace_path(
             continue;
         }
 
-        let registered_path = canonical_workspace_path(&workspace.path)?;
+        let Some(local_path) = workspace.local_path() else {
+            continue;
+        };
+        let registered_path = canonical_workspace_path(local_path)?;
 
         if registered_path == path {
             return Err(ApiError::bad_request(format!(

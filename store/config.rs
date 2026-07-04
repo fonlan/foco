@@ -1334,6 +1334,10 @@ pub struct RemoteServerProfile {
     pub last_sidecar_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_checked_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_install_state: Option<String>,
 }
 
 impl Default for RemoteServerProfile {
@@ -1352,6 +1356,8 @@ impl Default for RemoteServerProfile {
             last_known_target: None,
             last_sidecar_version: None,
             last_checked_at: None,
+            last_error: None,
+            sidecar_install_state: None,
         }
     }
 }
@@ -1700,6 +1706,12 @@ fn validate_remote_server_profile(
             config_path,
             "remoteServers.connectTimeoutMs must be greater than 0",
         );
+    }
+    if let Some(error) = &server.last_error {
+        require_non_empty(config_path, "remoteServers.lastError", error)?;
+    }
+    if let Some(state) = &server.sidecar_install_state {
+        require_non_empty(config_path, "remoteServers.sidecarInstallState", state)?;
     }
 
     Ok(())
@@ -3046,6 +3058,8 @@ mod tests {
             last_known_target: Some("linux-x64".to_string()),
             last_sidecar_version: Some("0.1.0".to_string()),
             last_checked_at: Some("2026-07-04T00:00:00Z".to_string()),
+            last_error: None,
+            sidecar_install_state: Some("available".to_string()),
         });
         config.workspaces.push(WorkspaceConfig {
             id: "remote".to_string(),

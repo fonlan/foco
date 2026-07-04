@@ -40,6 +40,38 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::workspaces::save_workspace_order),
         )
         .route(
+            "/api/remote-servers",
+            get(crate::http::remote_servers::list_remote_servers),
+        )
+        .route(
+            "/api/remote-servers/create",
+            post(crate::http::remote_servers::create_remote_server),
+        )
+        .route(
+            "/api/remote-servers/update",
+            post(crate::http::remote_servers::update_remote_server),
+        )
+        .route(
+            "/api/remote-servers/delete",
+            post(crate::http::remote_servers::delete_remote_server),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/test",
+            post(crate::http::remote_servers::test_remote_server),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/connect",
+            post(crate::http::remote_servers::connect_remote_server),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/disconnect",
+            post(crate::http::remote_servers::disconnect_remote_server),
+        )
+        .route(
+            "/api/remote-servers/{server_id}/status",
+            get(crate::http::remote_servers::remote_server_status),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chats",
             get(crate::http::workspaces::workspace_chats),
         )

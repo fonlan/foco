@@ -200,6 +200,10 @@ pub(crate) async fn settings_response(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?,
+        remote_servers: crate::http::remote_servers::remote_server_summaries(
+            config,
+            &crate::http::remote_servers::connected_remote_server_ids(state)?,
+        ),
         terminal_shells: terminal_shell_summaries(),
         provider_kinds: supported_provider_kinds()
             .iter()
@@ -314,16 +318,73 @@ pub(crate) fn configured_workspace_summary(
     workspace: &WorkspaceConfig,
     server: Option<&foco_store::config::RemoteServerProfile>,
 ) -> Result<ConfiguredWorkspaceSummary, ApiError> {
+    let remote = remote_workspace_fields(workspace, server);
     Ok(ConfiguredWorkspaceSummary {
         id: workspace.id.clone(),
         name: workspace.name.clone(),
         path: workspace.display_path(server),
+        display_path: workspace.display_path(server),
+        server_id: remote.server_id,
+        server_name: remote.server_name,
+        remote_path: remote.remote_path,
+        connection_status: remote.connection_status,
+        last_remote_error: remote.last_remote_error,
         logo_url: workspace_logo_url(workspace)?,
         pinned: workspace.pinned,
         terminal_shell: workspace.terminal_shell.clone(),
         common_commands: workspace_common_command_summaries(&workspace.common_commands),
         is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
     })
+}
+
+pub(crate) struct RemoteWorkspaceResponseFields {
+    pub(crate) server_id: Option<String>,
+    pub(crate) server_name: Option<String>,
+    pub(crate) remote_path: Option<String>,
+    pub(crate) connection_status: String,
+    pub(crate) last_remote_error: Option<String>,
+}
+
+pub(crate) fn remote_workspace_fields(
+    workspace: &WorkspaceConfig,
+    server: Option<&foco_store::config::RemoteServerProfile>,
+) -> RemoteWorkspaceResponseFields {
+    RemoteWorkspaceResponseFields {
+        server_id: workspace.server_id().map(str::to_string),
+        server_name: server.map(remote_server_display_name),
+        remote_path: workspace.remote_path().map(str::to_string),
+        connection_status: server
+            .map(|server| {
+                if server
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    "error"
+                } else if server.last_checked_at.is_some() {
+                    "ready"
+                } else {
+                    "unknown"
+                }
+            })
+            .unwrap_or(if workspace.is_remote() {
+                "missingServer"
+            } else {
+                "local"
+            })
+            .to_string(),
+        last_remote_error: server.and_then(|server| server.last_error.clone()),
+    }
+}
+
+pub(crate) fn remote_server_display_name(
+    server: &foco_store::config::RemoteServerProfile,
+) -> String {
+    let name = server.name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    server.host_alias.clone()
 }
 
 fn remote_server_for_workspace<'a>(
@@ -614,10 +675,17 @@ pub(crate) fn workspace_response_from_config(
         );
         if workspace.is_remote() {
             let server = remote_server_for_workspace(config, workspace);
+            let remote = remote_workspace_fields(workspace, server);
             workspaces.push(WorkspaceSummary {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
                 path: workspace.display_path(server),
+                display_path: workspace.display_path(server),
+                server_id: remote.server_id,
+                server_name: remote.server_name,
+                remote_path: remote.remote_path,
+                connection_status: remote.connection_status,
+                last_remote_error: remote.last_remote_error,
                 logo_url: None,
                 pinned: workspace.pinned,
                 terminal_shell: workspace.terminal_shell.clone(),
@@ -716,10 +784,17 @@ pub(crate) fn workspace_response_from_config(
         );
 
         let server = remote_server_for_workspace(config, workspace);
+        let remote = remote_workspace_fields(workspace, server);
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
             path: workspace.display_path(server),
+            display_path: workspace.display_path(server),
+            server_id: remote.server_id,
+            server_name: remote.server_name,
+            remote_path: remote.remote_path,
+            connection_status: remote.connection_status,
+            last_remote_error: remote.last_remote_error,
             logo_url,
             pinned: workspace.pinned,
             terminal_shell: workspace.terminal_shell.clone(),

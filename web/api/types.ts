@@ -836,10 +836,69 @@ export type WorkspaceChatPagination = {
   nextCursor: string | null;
 };
 
+export type RemoteServerSummary = {
+  id: string;
+  name: string;
+  hostAlias: string;
+  user: string | null;
+  port: number | null;
+  identityFile: string | null;
+  defaultRemoteRoot: string | null;
+  focoCommand: string | null;
+  terminalShell: string | null;
+  connectTimeoutMs: number;
+  status: string;
+  lastError: string | null;
+  lastKnownTarget: string | null;
+  sidecarInstallState: string;
+  workspaceCount: number;
+  lastCheckedAt: string | null;
+};
+
+export type RemoteServerDiagnosticStage = {
+  stage: string;
+  status: string;
+  errorKind: string | null;
+  message: string;
+  details: string | null;
+};
+
+export type RemoteServerDiagnosticResult = {
+  ok: boolean;
+  errorKind: string | null;
+  message: string | null;
+  stages: RemoteServerDiagnosticStage[];
+};
+
+export type RemoteServerResponse = {
+  server: RemoteServerSummary;
+};
+
+export type RemoteServerDiagnosticResponse = RemoteServerResponse & {
+  result: RemoteServerDiagnosticResult;
+};
+
+export type RemoteServerWorkspaceReference = {
+  id: string;
+  name: string;
+  remotePath: string;
+};
+
+export type DeleteRemoteServerResponse = {
+  deleted: boolean;
+  references: RemoteServerWorkspaceReference[];
+};
+
 export type WorkspaceSummary = {
   id: string;
   name: string;
   path: string;
+  displayPath: string;
+  serverId: string | null;
+  serverName: string | null;
+  remotePath: string | null;
+  connectionStatus: string;
+  lastRemoteError: string | null;
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
@@ -869,6 +928,12 @@ export type ConfiguredWorkspaceSummary = {
   id: string;
   name: string;
   path: string;
+  displayPath?: string;
+  serverId?: string | null;
+  serverName?: string | null;
+  remotePath?: string | null;
+  connectionStatus?: string;
+  lastRemoteError?: string | null;
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
@@ -2160,7 +2225,6 @@ export type ScheduledTaskPreviewNextRunResponse = {
   nextRunAt: string | null;
   nextRuns: string[];
 };
-
 export type ScheduledTaskRunStatus =
   | "pending"
   | "queued"
@@ -2228,6 +2292,7 @@ export type SettingsResponse = {
   plan: PlanSettingsSummary;
   prompts: PromptSettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
+  remoteServers: RemoteServerSummary[];
   terminalShells: TerminalShellSummary[];
   providerKinds: ProviderKindSummary[];
   thinkingLevels: ThinkingLevelSummary[];

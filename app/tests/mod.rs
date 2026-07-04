@@ -11756,6 +11756,8 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
         Json(WorkspacePathRequest {
             name: "New Workspace".to_string(),
             path: new_workspace_dir.display().to_string(),
+            server_id: None,
+            remote_path: None,
             content_base64: Some(
                 general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ),
@@ -11819,6 +11821,8 @@ async fn add_workspace_allows_empty_logo_content() {
         Json(WorkspacePathRequest {
             name: "New Workspace".to_string(),
             path: new_workspace_dir.display().to_string(),
+            server_id: None,
+            remote_path: None,
             content_base64: Some(String::new()),
         }),
     )
@@ -16464,6 +16468,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         plan_auto_run_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
+        remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 

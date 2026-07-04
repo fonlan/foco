@@ -1,4 +1,8 @@
-use std::{fs, path::Path, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 const WORKSPACE_FILE_TREE_MAX_DEPTH: usize = 12;
 const WORKSPACE_FILE_TREE_MAX_NODES: usize = 8_000;
@@ -27,6 +31,10 @@ pub(crate) struct WorkspacePathRequest {
     pub(crate) name: String,
     pub(crate) path: String,
     #[serde(default)]
+    pub(crate) server_id: Option<String>,
+    #[serde(default)]
+    pub(crate) remote_path: Option<String>,
+    #[serde(default)]
     pub(crate) content_base64: Option<String>,
 }
 
@@ -36,6 +44,10 @@ pub(crate) struct ManualWorkspaceRequest {
     id: String,
     name: String,
     path: String,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    remote_path: Option<String>,
     pinned: bool,
     terminal_shell: String,
     #[serde(default)]
@@ -494,10 +506,23 @@ pub(crate) async fn search_workspace_chats(
         )?;
         let response = response.0;
 
+        let server = workspace.server_id().and_then(|server_id| {
+            config
+                .remote_servers
+                .iter()
+                .find(|server| server.id == server_id)
+        });
+        let remote = settings_runtime::remote_workspace_fields(workspace, server);
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
-            path: display_path(&workspace.path),
+            path: workspace.display_path(server),
+            display_path: workspace.display_path(server),
+            server_id: remote.server_id,
+            server_name: remote.server_name,
+            remote_path: remote.remote_path,
+            connection_status: remote.connection_status,
+            last_remote_error: remote.last_remote_error,
             logo_url: workspace_logo_url(workspace)?,
             pinned: workspace.pinned,
             terminal_shell: workspace.terminal_shell.clone(),
@@ -568,7 +593,6 @@ fn default_workspace_chats_limit() -> usize {
 fn default_workspace_chat_search_limit() -> usize {
     WORKSPACE_CHAT_PAGE_LIMIT
 }
-
 fn decode_workspace_chat_cursor(cursor: Option<&str>) -> Result<Option<ChatPageCursor>, ApiError> {
     let Some(cursor) = cursor else {
         return Ok(None);
@@ -588,6 +612,23 @@ pub(crate) async fn add_workspace(
     State(state): State<AppState>,
     Json(request): Json<WorkspacePathRequest>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
+    if request
+        .server_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .remote_path
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        if request.content_base64.is_some() {
+            return Err(ApiError::bad_request(
+                "remote workspace icon upload is not supported yet",
+            ));
+        }
+        return add_remote_workspace(state, request).await;
+    }
+
     let logo = if let Some(bytes) =
         optional_workspace_logo_request_bytes(request.content_base64.as_deref())?
     {
@@ -646,6 +687,107 @@ pub(crate) async fn add_workspace(
     workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
+async fn add_remote_workspace(
+    state: AppState,
+    request: WorkspacePathRequest,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+    let server_id = request
+        .server_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("remote workspace serverId must not be empty"))?;
+    let remote_path = request
+        .remote_path
+        .as_deref()
+        .or(Some(request.path.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("remote workspace remotePath must not be empty"))?;
+    validate_remote_workspace_path(remote_path)?;
+
+    let mut config = config_snapshot(&state)?;
+    if !config
+        .remote_servers
+        .iter()
+        .any(|server| server.id == server_id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "remote server was not found: {server_id}"
+        )));
+    }
+    reject_registered_remote_workspace(&config, server_id, remote_path, None)?;
+
+    let terminal_shell = config
+        .remote_servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .and_then(|server| server.terminal_shell.clone())
+        .unwrap_or_else(|| default_terminal_shell_for_current_platform().to_string());
+    let id = unique_workspace_id(&config, name);
+    config.workspaces.insert(
+        0,
+        WorkspaceConfig {
+            id,
+            name: name.to_string(),
+            path: PathBuf::new(),
+            location: WorkspaceLocation::Ssh {
+                server_id: server_id.to_string(),
+                remote_path: remote_path.to_string(),
+            },
+            pinned: false,
+            terminal_shell,
+            common_commands: Vec::new(),
+        },
+    );
+    save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+
+    workspace_response_from_config(&config, &state.active_chat_runs)
+}
+
+fn validate_remote_workspace_path(path: &str) -> Result<(), ApiError> {
+    if path.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "remote workspace remotePath must not be empty",
+        ));
+    }
+    // ponytail: POSIX absolute path check is enough for Phase 4; future Windows remotes need a target-aware parser.
+    if !path.starts_with('/') {
+        return Err(ApiError::bad_request(format!(
+            "remote workspace remotePath must be absolute: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_registered_remote_workspace(
+    config: &GlobalConfig,
+    server_id: &str,
+    remote_path: &str,
+    allowed_workspace_id: Option<&str>,
+) -> Result<(), ApiError> {
+    for workspace in &config.workspaces {
+        if allowed_workspace_id == Some(workspace.id.as_str()) {
+            continue;
+        }
+        if workspace.server_id() == Some(server_id) && workspace.remote_path() == Some(remote_path)
+        {
+            return Err(ApiError::bad_request(format!(
+                "remote workspace path is already registered as '{}': {server_id}:{remote_path}",
+                workspace.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn save_workspace_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualWorkspaceRequest>,
@@ -653,7 +795,6 @@ pub(crate) async fn save_workspace_settings(
     let mut config = config_snapshot(&state)?;
     let workspace_id = request.id.trim();
     let name = request.name.trim();
-    let requested_path = validate_workspace_path(&request.path)?;
     let terminal_shell = normalize_terminal_shell(&request.terminal_shell)?;
     let common_commands = normalize_workspace_common_commands(&request.common_commands)?;
 
@@ -665,6 +806,63 @@ pub(crate) async fn save_workspace_settings(
         return Err(ApiError::bad_request("workspace name must not be empty"));
     }
 
+    let use_remote = request
+        .server_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .remote_path
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if use_remote {
+        let server_id = request
+            .server_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request("remote workspace serverId must not be empty"))?;
+        let remote_path = request
+            .remote_path
+            .as_deref()
+            .or(Some(request.path.as_str()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request("remote workspace remotePath must not be empty")
+            })?;
+        validate_remote_workspace_path(remote_path)?;
+        if !config
+            .remote_servers
+            .iter()
+            .any(|server| server.id == server_id)
+        {
+            return Err(ApiError::bad_request(format!(
+                "remote server was not found: {server_id}"
+            )));
+        }
+        reject_registered_remote_workspace(&config, server_id, remote_path, Some(workspace_id))?;
+        let workspace = config
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("workspace was not found: {workspace_id}"))
+            })?;
+        workspace.name = name.to_string();
+        workspace.path = PathBuf::new();
+        workspace.location = WorkspaceLocation::Ssh {
+            server_id: server_id.to_string(),
+            remote_path: remote_path.to_string(),
+        };
+        workspace.pinned = request.pinned;
+        workspace.terminal_shell = terminal_shell;
+        workspace.common_commands = common_commands;
+        group_pinned_workspaces(&mut config.workspaces);
+        save_config(&state, config.clone())?;
+        return settings_response(&state, &config).await;
+    }
+
+    let requested_path = validate_workspace_path(&request.path)?;
     if requested_path.exists() && !requested_path.is_dir() {
         return Err(ApiError::bad_request(format!(
             "workspace path exists but is not a directory: {}",
@@ -693,6 +891,7 @@ pub(crate) async fn save_workspace_settings(
 
     workspace.name = name.to_string();
     workspace.path = path;
+    workspace.location = WorkspaceLocation::Local;
     workspace.pinned = request.pinned;
     workspace.terminal_shell = terminal_shell;
     workspace.common_commands = common_commands;

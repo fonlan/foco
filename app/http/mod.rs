@@ -6,6 +6,7 @@ pub mod git;
 pub mod hooks;
 pub mod memory;
 pub mod plans;
+pub mod remote_servers;
 pub mod router;
 pub mod scheduled_tasks;
 pub mod settings;
