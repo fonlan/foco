@@ -8633,6 +8633,7 @@ export function App() {
               workspaceId: request.workspaceId,
             });
           }
+          refreshRunContextUsage();
           void refreshWorkspaces();
           return;
         }

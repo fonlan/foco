@@ -227,7 +227,7 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCalls).toHaveLength(1);
+    expect(usageCalls).toHaveLength(2);
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -339,7 +339,7 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCalls).toHaveLength(2);
+    expect(usageCalls).toHaveLength(3);
     const [, usageInit] = usageCalls.at(-1)!;
     expect(typeof usageInit?.body).toBe("string");
     expect(JSON.parse(usageInit?.body as string)).toMatchObject({ chatId: "chat-1" });
@@ -1907,6 +1907,7 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("opens a new chat tab before the stream start event arrives", async () => {
     const fetchMock = vi.mocked(fetch);
+    const encoder = new TextEncoder();
     let delayedStreamController: ReadableStreamDefaultController<Uint8Array> | null =
       null;
     fetchMock.mockImplementation((input, init) => {
@@ -1964,6 +1965,46 @@ describe("app-chat-stream verification surfaces", () => {
       message: "memory-gated chat",
       queuedUserMessageId: "queued-user-1",
     });
+
+    const contextUsageCallsBeforeStart = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    ).length;
+    await act(async () => {
+      delayedStreamController?.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            type: "start",
+            chatId: "server-chat-new",
+            userMessageId: "server-user-new",
+            assistantMessageId: "server-assistant-new",
+            llmRequestId: "server-run-new",
+            memoriesUsed: [],
+          })}\n\n`,
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/context-usage",
+        ),
+      ).toHaveLength(contextUsageCallsBeforeStart + 1);
+    });
+    const contextUsageCalls = fetchMock.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.endsWith("/context-usage"),
+    );
+    const [, contextUsageInit] = contextUsageCalls.at(-1)!;
+    expect(JSON.parse(String(contextUsageInit?.body))).toMatchObject({
+      chatId: "server-chat-new",
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await act(async () => {
       delayedStreamController?.close();
