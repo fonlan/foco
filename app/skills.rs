@@ -13,10 +13,6 @@ use serde::Serialize;
 
 use crate::{ApiError, neutral_text_message, xml_cdata_section, xml_text_escape};
 
-// Prefix used to identify injected enabled skill front matter messages.
-pub(crate) const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
-    "Enabled skill front matter loaded from configured skills";
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillDiscoveryErrorSummary {
@@ -845,10 +841,9 @@ pub(crate) fn enabled_skill_frontmatter_messages(
     }
 
     Ok(vec![neutral_text_message(
-        NeutralChatRole::System,
+        NeutralChatRole::Developer,
         format!(
-            "<skills_instructions>\n<source>{}</source>\n<usage>\nEnabled skill frontmatter is already loaded below as a lightweight skill routing table. Use it to answer questions about available skills and to route tasks by comparing the user's task to each skill's name and description.\nWhen a skill clearly matches, use read_file on that skill's path to load the full SKILL.md before applying it.\nDo not pre-load every skill's SKILL.md or read all skill full instructions speculatively; only read matched skills. If no skill clearly matches, continue silently with the normal workflow.\n</usage>\n<skills>\n{}\n</skills>\n</skills_instructions>",
-            xml_text_escape(ENABLED_SKILLS_MESSAGE_PREFIX),
+            "<skills_instructions>\n## Skills\nA skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used in this session. Each entry includes a name, description, and source locator. Foco currently exposes filesystem-backed skills; `file` locators are paths on the host filesystem.\n\n### Available skills\n{}\n\n### How to use skills\n- Discovery: The list above is the skills available in this session (name + description + source locator). `file` entries live on the host filesystem and must be opened with `read_file` when the skill is selected.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or its `SKILL.md` file can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1. After deciding to use a skill, the main agent must read its `SKILL.md` completely with `read_file` before taking task actions. If a read is truncated or line-ranged, continue until the full file is loaded.\n  2. When `SKILL.md` references another resource, resolve relative paths against that skill's directory and read only the resources required for the current task.\n  3. If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the relevant files. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent.\n  4. Prefer running or patching provided scripts, templates, or assets from the skill directory instead of retyping large code blocks or recreating assets.\n  5. Reuse provided assets or templates from the skill source whenever they fit the task.\n- Coordination and sequencing: If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them. Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.\n- Context hygiene: Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets. Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked. When variants exist, pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly, state the issue, pick the next-best approach, and continue.\n</skills_instructions>",
             entries.join("\n")
         ),
     )])
@@ -856,7 +851,7 @@ pub(crate) fn enabled_skill_frontmatter_messages(
 
 fn skill_frontmatter_entry(skill: &SkillSettings) -> String {
     format!(
-        "<skill>\nname: {}\ndescription: {}\npath: {}\n</skill>",
+        "- {}: {} (file: {})",
         xml_text_escape(&skill.name),
         xml_text_escape(&skill.description),
         xml_text_escape(&skill.path.display().to_string())

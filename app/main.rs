@@ -185,7 +185,7 @@ pub(crate) use settings_runtime::{
     configured_model_summary_for_config, settings_response, workspace_response_from_config,
 };
 #[cfg(test)]
-pub(crate) use skills::{ENABLED_SKILLS_MESSAGE_PREFIX, parse_skill_markdown};
+pub(crate) use skills::parse_skill_markdown;
 pub(crate) use skills::{
     SkillDiscoveryErrorSummary, deletable_skill_directory_for_path, discover_skills,
     enabled_skill_frontmatter_messages, merge_disabled_skill_keys, message_with_selected_skills,

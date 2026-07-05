@@ -1856,40 +1856,36 @@ Search memory before repo work.
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::System);
+    assert_eq!(messages[0].role, NeutralChatRole::Developer);
     assert!(messages[0].content.contains("<skills_instructions>"));
-    assert!(messages[0].content.contains(ENABLED_SKILLS_MESSAGE_PREFIX));
+    assert!(messages[0].content.contains("## Skills"));
     assert!(
         messages[0]
             .content
-            .contains("lightweight skill routing table")
+            .contains("A skill is a set of instructions provided through a `SKILL.md` source")
+    );
+    assert!(messages[0].content.contains("### Available skills"));
+    assert!(messages[0].content.contains("### How to use skills"));
+    assert!(
+        messages[0]
+            .content
+            .contains("If the user names a skill (with `$SkillName` or plain text)")
     );
     assert!(
         messages[0]
             .content
-            .contains("answer questions about available skills")
+            .contains("must read its `SKILL.md` completely with `read_file`")
     );
     assert!(
         messages[0]
             .content
-            .contains("read_file on that skill's path")
+            .contains("Do not load unrelated references, scripts, or assets")
     );
+    assert!(messages[0].content.contains("- gitmemo: Project memory. (file: "));
     assert!(
         messages[0]
             .content
-            .contains("Do not pre-load every skill's SKILL.md")
-    );
-    assert!(
-        messages[0]
-            .content
-            .contains("If no skill clearly matches, continue silently")
-    );
-    assert!(messages[0].content.contains("name: gitmemo"));
-    assert!(messages[0].content.contains("description: Project memory."));
-    assert!(
-        messages[0]
-            .content
-            .contains(&format!("path: {}", skill_file.display()))
+            .contains(&format!("(file: {})", skill_file.display()))
     );
     assert!(!messages[0].content.contains("<frontmatter>"));
     assert!(!messages[0].content.contains("CDATA"));
@@ -1940,9 +1936,13 @@ fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
             .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::System);
+    assert_eq!(messages[0].role, NeutralChatRole::Developer);
     for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
-        assert!(messages[0].content.contains(&format!("name: {skill_id}")));
+        assert!(
+            messages[0]
+                .content
+                .contains(&format!("- {skill_id}:"))
+        );
         assert!(
             messages[0]
                 .content
@@ -2070,8 +2070,8 @@ description:
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].content.contains("name: gitmemo"));
-    assert!(!messages[0].content.contains("name: broken"));
+    assert!(messages[0].content.contains("- gitmemo: Project memory. (file: "));
+    assert!(!messages[0].content.contains("- broken:"));
 
     fs::remove_dir_all(profile_dir).expect("remove skill test profile");
 }
@@ -6531,11 +6531,11 @@ Only load this when matched.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
     assert!(
         skill_messages[0]
             .content
-            .contains("description: Queued skill routing.")
+            .contains("- queuedmemo: Queued skill routing. (file: ")
     );
     assert!(
         !skill_messages[0]
@@ -6550,7 +6550,7 @@ Only load this when matched.
     assert!(
         scheduler_context
             .request_body_json
-            .contains("name: queuedmemo")
+            .contains("- queuedmemo:")
     );
 
     drop(state);
@@ -6665,7 +6665,7 @@ Only load this when matched.
     assert!(
         scheduler_context
             .request_body_json
-            .contains("name: deferredmemo")
+            .contains("- deferredmemo:")
     );
 
     drop(state);
@@ -12362,13 +12362,10 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
-    assert!(skill_messages[0].content.contains("name: gitmemo"));
-    assert!(
-        skill_messages[0]
-            .content
-            .contains("description: Project memory.")
-    );
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert!(skill_messages[0]
+        .content
+        .contains("- gitmemo: Project memory. (file: "));
     assert!(!skill_messages[0].content.contains("Search memory"));
     let environment_messages = new_context
         .provider_request
@@ -12512,7 +12509,7 @@ Updated full instructions.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
-    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::System);
+    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
     assert!(
         existing_skill_messages[0]
             .content
@@ -13120,43 +13117,31 @@ Use this only after reading the skill file.
         .iter()
         .find(|message| message.content.contains("<skills_instructions>"))
         .expect("plan mode skill instructions message");
-    assert_eq!(skill_message.role, NeutralChatRole::System);
+    assert_eq!(skill_message.role, NeutralChatRole::Developer);
+    assert!(skill_message.content.contains("## Skills"));
+    assert!(skill_message.content.contains("### Available skills"));
+    assert!(skill_message.content.contains("### How to use skills"));
     assert!(
         skill_message
             .content
-            .contains("lightweight skill routing table")
+            .contains("If the user names a skill (with `$SkillName` or plain text)")
     );
     assert!(
         skill_message
             .content
-            .contains("answer questions about available skills")
+            .contains("must read its `SKILL.md` completely with `read_file`")
     );
     assert!(
         skill_message
             .content
-            .contains("read_file on that skill's path")
+            .contains("Do not load unrelated references, scripts, or assets")
     );
     assert!(
         skill_message
             .content
-            .contains("Do not pre-load every skill's SKILL.md")
+            .contains(&format!("(file: {})", skill_file.display()))
     );
-    assert!(
-        skill_message
-            .content
-            .contains("If no skill clearly matches, continue silently")
-    );
-    assert!(
-        skill_message
-            .content
-            .contains(&format!("path: {}", skill_file.display()))
-    );
-    assert!(skill_message.content.contains("name: plan-router"));
-    assert!(
-        skill_message
-            .content
-            .contains("description: Helps draft focused plans.")
-    );
+    assert!(skill_message.content.contains("- plan-router: Helps draft focused plans. (file: "));
     assert!(!skill_message.content.contains("CDATA"));
     assert!(
         !skill_message

@@ -299,11 +299,7 @@ pub(crate) async fn prepare_prompt_context(
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
-            .unwrap_or(0)
-        + skill_messages
-            .iter()
-            .map(|message| estimate_text_tokens(&message.content))
-            .sum::<u64>();
+            .unwrap_or(0);
     let context_budget = calculate_context_budget(
         limits.context_window,
         limits.max_output_tokens,
