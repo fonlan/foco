@@ -132,7 +132,8 @@ pub(crate) struct ContextUsageRequest {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Option<Vec<String>>,
-    pub(crate) latest_response_usage: NeutralUsage,
+    #[serde(default, rename = "latestResponseUsage")]
+    pub(crate) _latest_response_usage: Option<NeutralUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1283,7 +1284,6 @@ pub(crate) async fn context_usage(
     Json(request): Json<ContextUsageRequest>,
 ) -> Result<Json<ContextUsageResponse>, ApiError> {
     let config = config_snapshot(&state)?;
-    let latest_response_usage = request.latest_response_usage.clone();
     let prompt_context = prepare_prompt_context(
         &state,
         &config,
@@ -1294,10 +1294,7 @@ pub(crate) async fn context_usage(
     )
     .await?;
 
-    Ok(Json(context_usage_response(
-        &prompt_context,
-        &latest_response_usage,
-    )?))
+    Ok(Json(context_usage_response(&prompt_context)?))
 }
 
 pub(crate) async fn answer_question(

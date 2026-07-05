@@ -5149,6 +5149,7 @@ impl WorkspaceDatabase {
                    AND final_state IN ('succeeded', 'completed')
                    AND input_tokens IS NOT NULL
                    AND output_tokens IS NOT NULL
+                   AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') <> 'memory retrieval'
                  ORDER BY request_started_at DESC, id DESC
                  LIMIT 1",
                 params![chat_id],

@@ -15074,6 +15074,75 @@ fn model_memory_retrieval_keeps_all_small_candidate_sets() {
 }
 
 #[tokio::test]
+async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-budget-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-budget-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-context-usage-budget", "Large history")
+            .expect("chat insert");
+        let large_message = "assembled prompt token budget ".repeat(500);
+        for sequence in 0..6 {
+            database
+                .insert_message(NewMessage {
+                    id: &format!("message-{sequence}"),
+                    chat_id: "chat-context-usage-budget",
+                    role: if sequence % 2 == 0 {
+                        "user"
+                    } else {
+                        "assistant"
+                    },
+                    content: &large_message,
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("message insert");
+        }
+    }
+
+    let Json(usage) = crate::http::chat::context_usage(
+        State(state),
+        AxumPath(config.workspaces[0].id.clone()),
+        Json(crate::http::chat::ContextUsageRequest {
+            chat_id: Some("chat-context-usage-budget".to_string()),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            _latest_response_usage: Some(foco_providers::NeutralUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
+            }),
+        }),
+    )
+    .await
+    .expect("context usage response");
+
+    assert!(usage.used_message_tokens > 2);
+    assert!(usage.available_message_tokens < 20_000);
+    assert_eq!(
+        usage.compression_trigger_tokens,
+        context_compression_trigger_tokens(usage.available_message_tokens)
+    );
+    assert_eq!(usage.compression_trigger_percent, 80);
+    assert!(usage.usage_percent > usage.compression_trigger_percent);
+    assert!(usage.will_compress_on_next_send);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn context_usage_preview_does_not_persist_chat_messages() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-workspace-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-profile-test"));
@@ -15151,19 +15220,20 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     )
     .await
     .expect("prompt context");
-    let usage = context_usage_response(
-        &prompt_context,
-        &NeutralUsage {
-            input_tokens: Some(1_500),
-            output_tokens: Some(250),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            reasoning_tokens: None,
-        },
-    )
-    .expect("context usage from response usage");
+    let usage =
+        context_usage_response(&prompt_context).expect("context usage from assembled prompt");
 
-    assert_eq!(usage.used_message_tokens, 1_750);
+    assert_eq!(
+        usage.used_message_tokens,
+        usage
+            .token_breakdown
+            .required_tokens
+            .saturating_add(usage.token_breakdown.optional_tokens)
+    );
+    assert_eq!(
+        usage.available_message_tokens,
+        prompt_context.context_budget.available_message_tokens
+    );
     assert!(usage.memory_context_tokens > 0);
     assert_eq!(
         usage.memory_context_tokens,
@@ -15175,13 +15245,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     );
     assert_eq!(
         usage.compression_trigger_tokens,
-        prompt_context
-            .context_budget
-            .system_prompt_tokens
-            .saturating_add(prompt_context.context_budget.tool_schema_tokens)
-            .saturating_add(context_compression_trigger_tokens(
-                prompt_context.context_budget.available_message_tokens
-            ))
+        context_compression_trigger_tokens(prompt_context.context_budget.available_message_tokens)
     );
     assert_eq!(
         usage.compression_trigger_percent,
