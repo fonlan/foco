@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -15,7 +16,7 @@ use foco_agent::{
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
-use foco_store::config::{GlobalConfig, HookConfig, WebSearchSettings};
+use foco_store::config::{GlobalConfig, HookConfig, SKILL_SCOPE_GLOBAL, WebSearchSettings};
 use foco_store::workspace::{
     AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentInstance, NewAgentMessage,
     NewAgentTask, NewAgentTaskDependency, WorkspaceDatabase,
@@ -970,6 +971,7 @@ pub(crate) async fn execute_tool(
             .and_then(remaining_duration_until)
             .unwrap_or(Duration::ZERO);
         let allow_external_read_access = match ensure_read_file_external_access(
+            &global_config,
             question_registry.clone(),
             question_event_tx.clone(),
             workspace_id,
@@ -2929,6 +2931,7 @@ enum ReadFileExternalAccessDecision {
 }
 
 async fn ensure_read_file_external_access(
+    global_config: &GlobalConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
@@ -2950,6 +2953,10 @@ async fn ensure_read_file_external_access(
     let Some(target_path) = read_file_target_outside_workspace(workspace_path, path)? else {
         return Ok(false);
     };
+
+    if read_file_target_is_configured_global_skill(global_config, &target_path) {
+        return Ok(true);
+    }
 
     if chat_allows_external_read_file(chat_id) {
         return Ok(true);
@@ -2983,6 +2990,17 @@ async fn ensure_read_file_external_access(
             target_path.display()
         )),
     }
+}
+
+fn read_file_target_is_configured_global_skill(config: &GlobalConfig, target_path: &Path) -> bool {
+    config
+        .skills
+        .detected
+        .iter()
+        .filter(|skill| skill.scope == SKILL_SCOPE_GLOBAL)
+        .filter_map(|skill| skill.path.parent())
+        .filter_map(|skill_dir| fs::canonicalize(skill_dir).ok())
+        .any(|skill_dir| target_path.starts_with(skill_dir))
 }
 
 async fn ask_read_file_external_access(
@@ -3414,11 +3432,13 @@ mod tests {
     async fn read_file_external_access_skips_question_for_workspace_file() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("inside.txt"), "inside").expect("write inside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-inside-{}", unique_id("case"));
 
         let allowed = ensure_read_file_external_access(
+            &config,
             registry,
             event_tx,
             "workspace-1",
@@ -3437,16 +3457,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_external_access_skips_question_for_configured_global_skill_files() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let skill_dir = profile
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("gitmemo");
+        let reference_dir = skill_dir.join("references");
+        fs::create_dir_all(&reference_dir).expect("reference directory");
+        let skill_file = skill_dir.join("SKILL.md");
+        let reference_file = reference_dir.join("details.md");
+        fs::write(
+            &skill_file,
+            "---\nname: gitmemo\ndescription: memory\n---\n\nUse it.",
+        )
+        .expect("write skill file");
+        fs::write(&reference_file, "details").expect("write reference file");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .skills
+            .detected
+            .push(foco_store::config::SkillSettings {
+                key: "global:gitmemo".to_string(),
+                id: "gitmemo".to_string(),
+                name: "gitmemo".to_string(),
+                description: "memory".to_string(),
+                path: skill_file.clone(),
+                scope: SKILL_SCOPE_GLOBAL.to_string(),
+                workspace_id: None,
+                workspace_name: None,
+            });
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-global-skill-{}", unique_id("case"));
+
+        for (call_id, path) in [("call-1", &skill_file), ("call-2", &reference_file)] {
+            let allowed = ensure_read_file_external_access(
+                &config,
+                registry.clone(),
+                event_tx.clone(),
+                "workspace-1",
+                workspace.path(),
+                &chat_id,
+                call_id,
+                READ_FILE_TOOL,
+                &json!({ "path": path.to_string_lossy(), "startLine": null, "endLine": null }),
+                ToolCancellationToken::default(),
+            )
+            .await
+            .expect("global skill file access check");
+            assert!(allowed);
+            assert!(event_rx.try_recv().is_err());
+        }
+
+        let result = execute_builtin_tool_with_context_and_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            READ_FILE_TOOL,
+            json!({ "path": reference_file.to_string_lossy(), "startLine": null, "endLine": null }),
+            None,
+            None,
+            true,
+        );
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "1\tdetails");
+    }
+
+    #[tokio::test]
     async fn read_file_external_access_allows_once_and_reads_file() {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::NamedTempFile::new().expect("outside file");
         fs::write(outside.path(), "outside once").expect("write outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-allow-{}", unique_id("case"));
         let path = outside.path().to_string_lossy().to_string();
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx,
             "workspace-1",
@@ -3482,12 +3573,14 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::NamedTempFile::new().expect("outside file");
         fs::write(outside.path(), "outside denied").expect("write outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-deny-{}", unique_id("case"));
         let path = outside.path().to_string_lossy().to_string();
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx,
             "workspace-1",
@@ -3525,12 +3618,14 @@ mod tests {
         let second = tempfile::NamedTempFile::new().expect("second outside file");
         fs::write(first.path(), "first outside").expect("write first outside");
         fs::write(second.path(), "second outside").expect("write second outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-all-{}", unique_id("case"));
         let first_path = first.path().to_string_lossy().to_string();
         let first_arguments = json!({ "path": first_path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3556,6 +3651,7 @@ mod tests {
         let second_arguments =
             json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
         let second_allowed = ensure_read_file_external_access(
+            &config,
             registry,
             event_tx,
             "workspace-1",
@@ -3582,6 +3678,7 @@ mod tests {
         fs::write(first.path(), "first outside").expect("write first outside");
         fs::write(second.path(), "second outside").expect("write second outside");
         fs::write(third.path(), "third outside").expect("write third outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-concurrent-{}", unique_id("case"));
@@ -3593,6 +3690,7 @@ mod tests {
             json!({ "path": third.path().to_string_lossy(), "startLine": null, "endLine": null });
 
         let first_access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3604,6 +3702,7 @@ mod tests {
             ToolCancellationToken::default(),
         );
         let second_access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3615,6 +3714,7 @@ mod tests {
             ToolCancellationToken::default(),
         );
         let third_access = ensure_read_file_external_access(
+            &config,
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
