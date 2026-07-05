@@ -299,6 +299,7 @@ Extract only durable, user-reviewable memory facts from the provided completed c
 Use the submit_memory_extraction tool exactly once. Do not return prose. \
 Apply a high bar: save only facts that are important for future turns and unlikely to change often. \
 Do not save transient progress, timestamps, temporary plans, routine chat summaries, obvious tool actions, or facts that are likely to be invalid soon. \
+Do not save dynamic environment observations such as whether this workspace currently has skills installed, which skills/tools/dependencies are available, probe results, or temporary configuration state; these can change between turns and should stay out of memory. \
 Compare against Existing memory candidates JSON. Do not extract a fact that duplicates or near-duplicates an existing active or pending memory, even if the wording differs. \
 If the evidence materially changes an existing memory, extract only the updated fact and add an updates or extends relationCandidate pointing at the existing targetFactId or targetFact. \
 If the evidence merely repeats or adds another source for the same memory, submit {\"facts\":[]}. \

@@ -11234,6 +11234,8 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
     assert!(system_prompt.contains("Use the submit_memory_extraction tool exactly once"));
     assert!(system_prompt.contains("Do not return prose"));
     assert!(system_prompt.contains("unlikely to change often"));
+    assert!(system_prompt.contains("dynamic environment observations"));
+    assert!(system_prompt.contains("skills/tools/dependencies are available"));
     assert!(system_prompt.contains("duplicates or near-duplicates"));
     assert!(system_prompt.contains("provided evidenceIds"));
     assert_eq!(request.messages[1].role, NeutralChatRole::User);
