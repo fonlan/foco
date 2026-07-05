@@ -743,7 +743,7 @@ pub async fn stream_chat(
     request: NeutralChatRequest,
 ) -> Result<NeutralChatStream, ProviderConfigError> {
     let client = config.genai_client()?;
-    let chat_request = genai_chat_request(&request)?;
+    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())?;
     let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
     let error_context =
         config.provider_error_context("opening provider stream", upstream_model_id)?;
@@ -898,7 +898,15 @@ fn append_v1_path_segment(
     normalized_base_url(url.as_str())
 }
 
+#[cfg(test)]
 fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, ProviderConfigError> {
+    genai_chat_request_for_adapter(request, AdapterKind::OpenAI)
+}
+
+fn genai_chat_request_for_adapter(
+    request: &NeutralChatRequest,
+    adapter_kind: AdapterKind,
+) -> Result<ChatRequest, ProviderConfigError> {
     if request.model_id.trim().is_empty() {
         return Err(ProviderConfigError::InvalidRequest(
             "model id must not be empty".to_string(),
@@ -911,11 +919,21 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
         ));
     }
 
-    let leading_system_count = request
+    let mut leading_system_count = request
         .messages
         .iter()
         .take_while(|message| message.role == NeutralChatRole::System)
         .count();
+    let developer_after_leading_system = request
+        .messages
+        .get(leading_system_count)
+        .is_some_and(|message| message.role == NeutralChatRole::Developer);
+    if adapter_kind == AdapterKind::OpenAIResp && developer_after_leading_system {
+        // ponytail: Responses maps chat_req.system to top-level instructions; keep
+        // the whole pre-skill prompt inline. Broaden this if another adapter gains
+        // the same top-level instructions behavior.
+        leading_system_count = 0;
+    }
     let leading_system = leading_system_prompt(&request.messages[..leading_system_count])?;
 
     let mut messages = Vec::with_capacity(request.messages.len() - leading_system_count);
@@ -2059,6 +2077,45 @@ mod tests {
             chat_request.messages[1].content.first_text(),
             Some("Continue.")
         );
+    }
+
+    #[test]
+    fn openai_responses_keeps_pre_skill_system_messages_inline() {
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::System, "Project spec."),
+            neutral_text_message(
+                NeutralChatRole::Developer,
+                "<skills_instructions>name: html-ppt</skills_instructions>",
+            ),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+
+        let chat_request = genai_chat_request_for_adapter(&request, AdapterKind::OpenAIResp)
+            .expect("responses chat request");
+
+        assert_eq!(chat_request.system.as_deref(), None);
+        assert_eq!(chat_request.messages.len(), 4);
+        assert!(
+            chat_request
+                .messages
+                .iter()
+                .take(3)
+                .all(|message| message.role == genai::chat::ChatRole::System)
+        );
+        assert_eq!(
+            chat_request.messages[0].content.first_text(),
+            Some("Base system.")
+        );
+        assert_eq!(
+            chat_request.messages[1].content.first_text(),
+            Some("Project spec.")
+        );
+        assert_eq!(
+            chat_request.messages[2].content.first_text(),
+            Some("<skills_instructions>name: html-ppt</skills_instructions>")
+        );
+        assert_eq!(chat_request.messages[3].role, genai::chat::ChatRole::User);
     }
 
     #[test]

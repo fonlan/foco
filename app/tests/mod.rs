@@ -12429,7 +12429,7 @@ Search memory before repo work.
         new_context.provider_request.messages[..skill_index]
             .iter()
             .all(|message| message.role == NeutralChatRole::System),
-        "messages before skills should remain leading system instructions"
+        "messages before skills should remain reserved system prompts in neutral assembly"
     );
     let environment_messages = new_context
         .provider_request
