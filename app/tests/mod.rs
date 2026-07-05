@@ -1856,7 +1856,7 @@ Search memory before repo work.
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(messages[0].role, NeutralChatRole::System);
     assert!(messages[0].content.contains("<skills_instructions>"));
     assert!(messages[0].content.contains("## Skills"));
     assert!(
@@ -1879,17 +1879,22 @@ Search memory before repo work.
     assert!(
         messages[0]
             .content
+            .contains("Empty selected `skillIds` or empty Agent task skill ids")
+    );
+    assert!(
+        messages[0]
+            .content
             .contains("Do not load unrelated references, scripts, or assets")
     );
     assert!(
         messages[0]
             .content
-            .contains("- gitmemo: Project memory. (file: ")
+            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
     );
     assert!(
         messages[0]
             .content
-            .contains(&format!("(file: {})", skill_file.display()))
+            .contains(&format!("file: {})", skill_file.display()))
     );
     assert!(!messages[0].content.contains("<frontmatter>"));
     assert!(!messages[0].content.contains("CDATA"));
@@ -1940,7 +1945,7 @@ fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
             .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(messages[0].role, NeutralChatRole::System);
     for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
         assert!(messages[0].content.contains(&format!("- {skill_id}:")));
         assert!(
@@ -2073,7 +2078,7 @@ description:
     assert!(
         messages[0]
             .content
-            .contains("- gitmemo: Project memory. (file: ")
+            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
     );
     assert!(!messages[0].content.contains("- broken:"));
 
@@ -6535,12 +6540,10 @@ Only load this when matched.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
-    assert!(
-        skill_messages[0]
-            .content
-            .contains("- queuedmemo: Queued skill routing. (file: ")
-    );
+    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
+    assert!(skill_messages[0].content.contains(
+        "- queuedmemo: Queued skill routing. (key: global:queuedmemo, scope: global, file: "
+    ));
     assert!(
         !skill_messages[0]
             .content
@@ -12399,13 +12402,29 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
     assert!(
         skill_messages[0]
             .content
-            .contains("- gitmemo: Project memory. (file: ")
+            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
     );
     assert!(!skill_messages[0].content.contains("Search memory"));
+    let skill_index = new_context
+        .provider_request
+        .messages
+        .iter()
+        .position(|message| message.content.contains("<skills_instructions>"))
+        .expect("skill message index");
+    let first_non_system_index = new_context
+        .provider_request
+        .messages
+        .iter()
+        .position(|message| message.role != NeutralChatRole::System)
+        .expect("first non-system message index");
+    assert!(
+        skill_index < first_non_system_index,
+        "skills must remain in the leading system block so providers send them as instructions"
+    );
     let environment_messages = new_context
         .provider_request
         .messages
@@ -12548,12 +12567,10 @@ Updated full instructions.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
-    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
-    assert!(
-        existing_skill_messages[0]
-            .content
-            .contains("description: Updated project memory.")
-    );
+    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::System);
+    assert!(existing_skill_messages[0].content.contains(
+        "- gitmemo: Updated project memory. (key: global:gitmemo, scope: global, file: "
+    ));
     assert!(
         !existing_skill_messages[0]
             .content
@@ -13156,7 +13173,7 @@ Use this only after reading the skill file.
         .iter()
         .find(|message| message.content.contains("<skills_instructions>"))
         .expect("plan mode skill instructions message");
-    assert_eq!(skill_message.role, NeutralChatRole::Developer);
+    assert_eq!(skill_message.role, NeutralChatRole::System);
     assert!(skill_message.content.contains("## Skills"));
     assert!(skill_message.content.contains("### Available skills"));
     assert!(skill_message.content.contains("### How to use skills"));
@@ -13178,13 +13195,11 @@ Use this only after reading the skill file.
     assert!(
         skill_message
             .content
-            .contains(&format!("(file: {})", skill_file.display()))
+            .contains(&format!("file: {})", skill_file.display()))
     );
-    assert!(
-        skill_message
-            .content
-            .contains("- plan-router: Helps draft focused plans. (file: ")
-    );
+    assert!(skill_message.content.contains(
+        "- plan-router: Helps draft focused plans. (key: global:plan-router, scope: global, file: "
+    ));
     assert!(!skill_message.content.contains("CDATA"));
     assert!(
         !skill_message
@@ -16591,6 +16606,20 @@ async fn blocked_plan_worktree_fixture(suffix: &str) -> BlockedPlanWorktreeFixtu
     let mut config = prompt_test_config(workspace_path.clone());
     config.plan.merge_automation_mode =
         foco_store::config::PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE.to_string();
+    config.agent_definitions.push(AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-default").expect("definition id"),
+        revision: 1,
+        name: "Default agent".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Run the plan phase.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    });
     let workspace = config.workspaces[0].clone();
     let mut state = test_app_state(config, profile_tempdir.path().to_path_buf());
     let (agent_scheduler, agent_scheduler_rx) = AgentScheduler::new();

@@ -287,6 +287,10 @@ pub(crate) async fn prepare_prompt_context(
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
     let skill_messages =
         enabled_skill_frontmatter_messages(&state.user_profile_dir, config, &workspace.id)?;
+    let skill_prompt_tokens = skill_messages
+        .iter()
+        .map(|message| estimate_text_tokens(&message.content))
+        .sum::<u64>();
     let system_prompt_tokens = estimate_text_tokens(&system_prompt)
         + project_spec_prompt_section
             .as_ref()
@@ -299,7 +303,8 @@ pub(crate) async fn prepare_prompt_context(
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
-            .unwrap_or(0);
+            .unwrap_or(0)
+        + skill_prompt_tokens;
     let context_budget = calculate_context_budget(
         limits.context_window,
         limits.max_output_tokens,
