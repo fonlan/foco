@@ -1856,7 +1856,7 @@ Search memory before repo work.
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::System);
+    assert_eq!(messages[0].role, NeutralChatRole::Developer);
     assert!(messages[0].content.contains("<skills_instructions>"));
     assert!(messages[0].content.contains("## Skills"));
     assert!(
@@ -1945,7 +1945,7 @@ fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
             .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::System);
+    assert_eq!(messages[0].role, NeutralChatRole::Developer);
     for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
         assert!(messages[0].content.contains(&format!("- {skill_id}:")));
         assert!(
@@ -6540,7 +6540,7 @@ Only load this when matched.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
     assert!(skill_messages[0].content.contains(
         "- queuedmemo: Queued skill routing. (key: global:queuedmemo, scope: global, file: "
     ));
@@ -12402,7 +12402,7 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
-    assert_eq!(skill_messages[0].role, NeutralChatRole::System);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
     assert!(
         skill_messages[0]
             .content
@@ -12421,9 +12421,15 @@ Search memory before repo work.
         .iter()
         .position(|message| message.role != NeutralChatRole::System)
         .expect("first non-system message index");
+    assert_eq!(
+        skill_index, first_non_system_index,
+        "skills must break the leading system block so providers keep them inline"
+    );
     assert!(
-        skill_index < first_non_system_index,
-        "skills must remain in the leading system block so providers send them as instructions"
+        new_context.provider_request.messages[..skill_index]
+            .iter()
+            .all(|message| message.role == NeutralChatRole::System),
+        "messages before skills should remain leading system instructions"
     );
     let environment_messages = new_context
         .provider_request
@@ -12567,7 +12573,7 @@ Updated full instructions.
         .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
-    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::System);
+    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
     assert!(existing_skill_messages[0].content.contains(
         "- gitmemo: Updated project memory. (key: global:gitmemo, scope: global, file: "
     ));
@@ -13173,7 +13179,7 @@ Use this only after reading the skill file.
         .iter()
         .find(|message| message.content.contains("<skills_instructions>"))
         .expect("plan mode skill instructions message");
-    assert_eq!(skill_message.role, NeutralChatRole::System);
+    assert_eq!(skill_message.role, NeutralChatRole::Developer);
     assert!(skill_message.content.contains("## Skills"));
     assert!(skill_message.content.contains("### Available skills"));
     assert!(skill_message.content.contains("### How to use skills"));

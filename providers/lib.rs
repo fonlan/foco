@@ -2038,22 +2038,27 @@ mod tests {
     fn keeps_developer_messages_inline() {
         let request = neutral_request(vec![
             neutral_text_message(NeutralChatRole::System, "Base system."),
-            neutral_text_message(NeutralChatRole::User, "User turn."),
-            neutral_text_message(NeutralChatRole::Developer, "Skill instructions."),
+            neutral_text_message(
+                NeutralChatRole::Developer,
+                "<skills_instructions>name: html-ppt</skills_instructions>",
+            ),
             neutral_text_message(NeutralChatRole::User, "Continue."),
         ]);
 
         let chat_request = genai_chat_request(&request).expect("chat request");
 
         assert_eq!(chat_request.system.as_deref(), Some("Base system."));
-        assert_eq!(chat_request.messages.len(), 3);
-        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
-        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::System);
+        assert_eq!(chat_request.messages.len(), 2);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::System);
+        assert_eq!(
+            chat_request.messages[0].content.first_text(),
+            Some("<skills_instructions>name: html-ppt</skills_instructions>")
+        );
+        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::User);
         assert_eq!(
             chat_request.messages[1].content.first_text(),
-            Some("Skill instructions.")
+            Some("Continue.")
         );
-        assert_eq!(chat_request.messages[2].role, genai::chat::ChatRole::User);
     }
 
     #[test]
