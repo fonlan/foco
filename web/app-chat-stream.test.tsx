@@ -194,13 +194,13 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.queryByRole("button", { name: "Select skill Other skill" })).not.toBeInTheDocument();
   });
 
-  it("updates context usage from latest response usage during a stream", async () => {
+  it("refreshes assembled context usage after a stream completes", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -209,8 +209,8 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
 
     expect(
-      screen.getByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      screen.getByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
@@ -220,14 +220,14 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     const usageCalls = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCalls).toHaveLength(0);
+    expect(usageCalls).toHaveLength(1);
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -242,24 +242,14 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     const usageCallsAfterUsage = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    const [, usageInit] = usageCallsAfterUsage.at(-1)!;
-    expect(typeof usageInit?.body).toBe("string");
-    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
-      chatId: "chat-1",
-      latestResponseUsage: {
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        inputTokens: 70000,
-        outputTokens: 1000,
-      },
-    });
+    expect(usageCallsAfterUsage).toHaveLength(usageCalls.length);
 
     const usageCallCountBeforeComplete = usageCallsAfterUsage.length;
     await act(async () => {
@@ -292,23 +282,23 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete);
+    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete + 1);
     expect(
-      screen.getByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      screen.getByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
   });
 
-  it("updates context usage from complete usage when no usage event was sent", async () => {
+  it("refreshes context usage on complete when no usage event was sent", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -342,25 +332,20 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     const usageCalls = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCalls).toHaveLength(1);
-    const [, usageInit] = usageCalls[0];
+    expect(usageCalls).toHaveLength(2);
+    const [, usageInit] = usageCalls.at(-1)!;
     expect(typeof usageInit?.body).toBe("string");
-    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
-      chatId: "chat-1",
-      latestResponseUsage: {
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        inputTokens: 70000,
-        outputTokens: 1000,
-      },
-    });
+    expect(JSON.parse(usageInit?.body as string)).toMatchObject({ chatId: "chat-1" });
+    expect(JSON.parse(usageInit?.body as string)).not.toHaveProperty(
+      "latestResponseUsage",
+    );
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -372,8 +357,8 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -408,8 +393,8 @@ describe("app-chat-stream verification surfaces", () => {
       ),
     ).toHaveLength(usageCallCountBeforeDeltas);
     expect(
-      screen.getByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      screen.getByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -754,8 +739,8 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -777,14 +762,14 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
     expect(
-      await screen.findByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      await screen.findByRole("status", { name: "Context usage 23%" }),
+    ).toHaveTextContent("23%");
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {
@@ -799,13 +784,13 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      screen.getByRole("status", { name: "Context usage 0%" }),
-    ).toHaveTextContent("0%");
+      screen.getByRole("status", { name: "Context usage 23%" }),
+    ).toHaveTextContent("23%");
 
     await userEvent.click(screen.getByRole("tab", { name: /Tool run/ }));
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
@@ -3570,6 +3555,11 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.queryByText("Persisted fallback reasoning.")).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
 
+    const usageCallCountBeforeUsage = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    ).length;
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {
         type: "usage",
@@ -3583,24 +3573,14 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     const usageCalls = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    const [, usageInit] = usageCalls.at(-1)!;
-    expect(typeof usageInit?.body).toBe("string");
-    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
-      chatId: "chat-1",
-      latestResponseUsage: {
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        inputTokens: 70000,
-        outputTokens: 1000,
-      },
-    });
+    expect(usageCalls).toHaveLength(usageCallCountBeforeUsage);
 
     const usageCallCountBeforeComplete = usageCalls.length;
     await act(async () => {
@@ -3633,10 +3613,10 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete);
+    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete + 1);
     expect(
-      screen.getByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      screen.getByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

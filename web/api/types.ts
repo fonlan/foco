@@ -807,7 +807,6 @@ export type ContextUsageRefreshRequest = {
   thinkingLevel: string;
   skillIds: string[];
   sessionMode?: "plan";
-  latestResponseUsage: ChatUsage;
 };
 
 export type ContextMemoryScopeState = {

@@ -3450,17 +3450,8 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as {
             chatId?: string | null;
-            latestResponseUsage?: { inputTokens?: number | null };
           })
         : {};
-
-    if (body.latestResponseUsage?.inputTokens === 70000) {
-      return jsonResponse({
-        ...contextUsage,
-        usagePercent: 64,
-        usedMessageTokens: 71000,
-      });
-    }
 
     return jsonResponse({
       ...contextUsage,

@@ -1567,6 +1567,7 @@ export function App() {
       selectedModelId,
       selectedProviderId,
       selectedThinkingLevel,
+      ...selectedSkillIds,
     ].join("\u0000");
 
     if (!chatKey) {
@@ -1601,12 +1602,23 @@ export function App() {
       chatKey,
       (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1,
     );
+    if (selectedModelId && selectedProviderId) {
+      void refreshContextUsage({
+        chatId: activeChatId,
+        modelId: selectedModelId,
+        providerId: selectedProviderId,
+        skillIds: selectedSkillIds,
+        thinkingLevel: selectedThinkingLevel,
+        workspaceId: activeWorkspaceId,
+      });
+    }
   }, [
     activeChatId,
     activeWorkspaceId,
     isSendingMessage,
     selectedModelId,
     selectedProviderId,
+    selectedSkillIds,
     selectedThinkingLevel,
   ]);
 
@@ -4768,7 +4780,6 @@ export function App() {
         chatMessagesByKeyRef.current[chatKey] ?? [],
       );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
-      const latestResponseUsage = parseNullableChatUsage(data.latestResponseUsage);
       const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
       const pagination = normalizeChatMessagesPagination(data.pagination);
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
@@ -4808,17 +4819,6 @@ export function App() {
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
         clearWorkspaceChatActiveRun(workspaceId, chatId);
-        if (latestResponseUsage && selectedModelId && selectedProviderId) {
-          void refreshContextUsage({
-            chatId,
-            latestResponseUsage,
-            modelId: selectedModelId,
-            providerId: selectedProviderId,
-            skillIds: selectedSkillIds,
-            thinkingLevel: selectedThinkingLevel,
-            workspaceId,
-          });
-        }
       }
     } catch (requestError) {
       if (activeChatKeyRef.current === chatKey) {
@@ -7094,6 +7094,7 @@ export function App() {
         request.modelId,
         request.providerId,
         request.thinkingLevel,
+        ...request.skillIds,
       ].join("\u0000"),
     );
     const requestId =
@@ -7119,7 +7120,6 @@ export function App() {
             providerId: request.providerId,
             thinkingLevel: request.thinkingLevel || null,
             skillIds: request.skillIds.length ? request.skillIds : null,
-            latestResponseUsage: request.latestResponseUsage,
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -7348,13 +7348,12 @@ export function App() {
     const refreshRunContextUsage = () => {
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
-      if (!modelId || !providerId || !latestResponseUsage) {
+      if (!modelId || !providerId) {
         return;
       }
 
       void refreshContextUsage({
         chatId: activeRun.chatId,
-        latestResponseUsage,
         modelId,
         providerId,
         skillIds: [],
@@ -7752,7 +7751,6 @@ export function App() {
               usage: latestResponseUsage,
             });
           });
-          refreshRunContextUsage();
           return;
         }
 
@@ -7785,8 +7783,8 @@ export function App() {
               : latestResponseUsage;
           if (!latestResponseUsage && liveStatisticsUsage) {
             latestResponseUsage = liveStatisticsUsage;
-            refreshRunContextUsage();
           }
+          refreshRunContextUsage();
           updateLiveChatStatistics(chatKey, {
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,
@@ -8188,13 +8186,8 @@ export function App() {
       toolOutputDeltaBuffer.flush();
     };
     const refreshRunContextUsage = () => {
-      if (!latestResponseUsage) {
-        return;
-      }
-
       void refreshContextUsage({
         chatId: requestChatId,
-        latestResponseUsage,
         modelId: request.modelId,
         providerId: request.providerId,
         skillIds: request.skillIds,
@@ -8758,7 +8751,6 @@ export function App() {
               usage: latestResponseUsage,
             });
           });
-          refreshRunContextUsage();
           return;
         }
 
@@ -8794,8 +8786,8 @@ export function App() {
               : latestResponseUsage;
           if (!latestResponseUsage && liveStatisticsUsage) {
             latestResponseUsage = liveStatisticsUsage;
-            refreshRunContextUsage();
           }
+          refreshRunContextUsage();
           updateLiveChatStatistics(runMessagesKey, {
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,

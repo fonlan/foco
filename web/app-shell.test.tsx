@@ -1343,7 +1343,7 @@ describe("app-shell verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("restores context usage for completed historical chats from stored latest usage", async () => {
+  it("loads assembled context usage for completed historical chats", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation((input, init) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -1373,22 +1373,17 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 64%" }),
-    ).toHaveTextContent("64%");
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     const usageCall = fetchMock.mock.calls.find(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
     expect(usageCall).toBeDefined();
-    expect(JSON.parse(String(usageCall?.[1]?.body))).toMatchObject({
-      latestResponseUsage: {
-        cacheReadTokens: 1200,
-        cacheWriteTokens: 300,
-        inputTokens: 70000,
-        outputTokens: 900,
-      },
-    });
+    expect(JSON.parse(String(usageCall?.[1]?.body))).not.toHaveProperty(
+      "latestResponseUsage",
+    );
     expect(
       fetchMock.mock.calls.some(
         ([url]) => typeof url === "string" && url.includes("/chat/runs/"),
@@ -1396,22 +1391,22 @@ describe("app-shell verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("does not estimate context usage for opened chats or composer drafts", async () => {
+  it("loads context usage without stored response usage and ignores composer drafts", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
     const usage = await screen.findByRole("status", {
-      name: "Context usage 0%",
+      name: "Context usage 47%",
     });
-    expect(usage).toHaveTextContent("0%");
+    expect(usage).toHaveTextContent("47%");
 
     const usageCallsBeforeDraft = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsBeforeDraft).toHaveLength(0);
+    expect(usageCallsBeforeDraft).toHaveLength(1);
 
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
 

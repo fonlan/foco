@@ -2664,10 +2664,10 @@ describe("app-panels-stats verification surfaces", () => {
       within(screen.getByText("Runtime tool-state snapshots").parentElement!)
         .getByText("2"),
     ).toBeInTheDocument();
-    expect(screen.getByText("Context usage unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("52,340 / 110,960")).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/context-usage"),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("shows context usage only once in the stats context mix", async () => {
@@ -2694,7 +2694,7 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(await screen.findByRole("tab", { name: "Stats" }));
 
     const contextMix = screen.getByText("Context mix").parentElement!;
-    expect(await within(contextMix).findByText("71,000 / 110,960")).toBeInTheDocument();
+    expect(await within(contextMix).findByText("52,340 / 110,960")).toBeInTheDocument();
     expect(contextMix.querySelector(".context-mini-chart-bars")).not.toBeNull();
     expect(contextMix.querySelector(".context-stats-rows")).toBeNull();
     expect(within(contextMix).getAllByText("History")).toHaveLength(1);
