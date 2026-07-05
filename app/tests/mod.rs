@@ -235,7 +235,6 @@ fn insert_waiting_coordinator_task(
         "queuedUserMessageId": user_message_id,
         "message": "Wait for child task.",
         "attachments": [],
-        "skillIds": [],
         "collaborationToolsEnabled": true,
     }))
     .expect("task input json");
@@ -6255,6 +6254,8 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
     );
     assert_eq!(input.visible_assistant_sequence, Some(1));
     assert_eq!(input.message, "Normal send");
+    assert!(!task.input_json.contains("skillIds"));
+    assert!(!task.input_json.contains("skill_ids"));
     assert!(!input.collaboration_tools_enabled);
     let chat = database
         .chat(&queued.chat_id)

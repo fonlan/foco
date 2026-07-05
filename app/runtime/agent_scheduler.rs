@@ -71,7 +71,7 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) attachments: Vec<ChatAttachmentInput>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub(crate) skill_ids: Vec<String>,
     #[serde(default)]
     pub(crate) session_mode: Option<String>,
@@ -612,9 +612,8 @@ async fn run_coordinator_task_inner(
             ))
         })?,
     );
-    chat_context.agent_task_input = Some(serde_json::from_str::<Value>(&task.input_json).map_err(
-        |source| ApiError::internal(format!("failed to parse Agent task input: {source}")),
-    )?);
+    let input = agent_task_input_prompt_value(&task)?;
+    chat_context.agent_task_input = Some(input);
     chat_context.agent_allowed_tools = Some(allowed_tools);
     chat_context.agent_tool_context = Some(AgentToolContext {
         workspace_path: workspace.path.clone(),
@@ -1183,15 +1182,24 @@ fn agent_context_entry_prompt_value(entry: &AgentContextEntryRecord) -> Result<V
     }))
 }
 
+fn agent_task_input_prompt_value(task: &AgentTaskRecord) -> Result<Value, ApiError> {
+    let mut input = serde_json::from_str::<Value>(&task.input_json).map_err(|source| {
+        ApiError::internal(format!("failed to parse Agent task input: {source}"))
+    })?;
+    if let Some(object) = input.as_object_mut() {
+        object.remove("skillIds");
+        object.remove("skill_ids");
+    }
+    Ok(input)
+}
+
 fn agent_current_task_prompt(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
     wait_dependencies: &[AgentTaskDependencyRecord],
     wait_dependency_tasks: &[AgentTaskRecord],
 ) -> Result<String, ApiError> {
-    let input = serde_json::from_str::<Value>(&task.input_json).map_err(|source| {
-        ApiError::internal(format!("failed to parse Agent task input: {source}"))
-    })?;
+    let input = agent_task_input_prompt_value(task)?;
     let mut current_task = json!({
         "taskId": task.id.to_string(),
         "teamId": task.team_id.to_string(),
@@ -1926,6 +1934,34 @@ mod tests {
 
         let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
         assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
+    }
+
+    #[test]
+    fn agent_task_input_prompt_value_removes_skill_ids() {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let task = AgentTaskRecord {
+            id: AgentTaskId::new("agent-task-skill-ids").expect("task id"),
+            team_id: foco_agent::AgentTeamId::new("agent-team-skill-ids").expect("team id"),
+            owner_instance_id: foco_agent::AgentInstanceId::new("agent-instance-skill-ids")
+                .expect("instance id"),
+            origin_instance_id: None,
+            parent_task_id: None,
+            sequence: 0,
+            status: AgentTaskStatus::Running,
+            input_json: r#"{"message":"work","skillIds":[],"skill_ids":["legacy"]}"#.to_string(),
+            result_json: None,
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now),
+            completed_at: None,
+        };
+
+        let input = agent_task_input_prompt_value(&task).expect("prompt input");
+
+        assert_eq!(input["message"], json!("work"));
+        assert!(input.get("skillIds").is_none());
+        assert!(input.get("skill_ids").is_none());
     }
 
     fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {

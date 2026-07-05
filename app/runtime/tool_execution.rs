@@ -1387,7 +1387,6 @@ fn execute_agent_delegate_task(
         "queuedUserMessageId": format!("{}:{}", parent_task_id, child_task_id),
         "message": agent_delegate_task_message(&input.input, input.correlation_id.as_deref())?,
         "attachments": [],
-        "skillIds": [],
         "collaborationToolsEnabled": true,
         "delegatedInput": input.input,
         "correlationId": input.correlation_id,
