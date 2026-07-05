@@ -1881,7 +1881,11 @@ Search memory before repo work.
             .content
             .contains("Do not load unrelated references, scripts, or assets")
     );
-    assert!(messages[0].content.contains("- gitmemo: Project memory. (file: "));
+    assert!(
+        messages[0]
+            .content
+            .contains("- gitmemo: Project memory. (file: ")
+    );
     assert!(
         messages[0]
             .content
@@ -1938,11 +1942,7 @@ fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, NeutralChatRole::Developer);
     for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
-        assert!(
-            messages[0]
-                .content
-                .contains(&format!("- {skill_id}:"))
-        );
+        assert!(messages[0].content.contains(&format!("- {skill_id}:")));
         assert!(
             messages[0]
                 .content
@@ -2070,7 +2070,11 @@ description:
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].content.contains("- gitmemo: Project memory. (file: "));
+    assert!(
+        messages[0]
+            .content
+            .contains("- gitmemo: Project memory. (file: ")
+    );
     assert!(!messages[0].content.contains("- broken:"));
 
     fs::remove_dir_all(profile_dir).expect("remove skill test profile");
@@ -12060,6 +12064,39 @@ fn pack_neutral_messages_keeps_saved_tool_state_group_together() {
     );
 }
 
+#[test]
+fn pack_neutral_messages_rejects_oversized_required_current_user() {
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::User, "好".repeat(64)),
+    ];
+    let message_source_sequences = vec![None, Some(0)];
+    let message_context_sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::CurrentUser { sequence: 0 },
+    ];
+    let budget = foco_agent::ContextBudget {
+        context_window: 100,
+        max_output_tokens: 1,
+        system_prompt_tokens: 0,
+        tool_schema_tokens: 0,
+        safety_tokens: 0,
+        available_message_tokens: 16,
+    };
+
+    let error = pack_neutral_messages(
+        messages,
+        &message_source_sequences,
+        &message_context_sources,
+        &budget,
+        message_source_sequences.len(),
+    )
+    .expect_err("required context should exceed budget");
+
+    assert!(error.message.contains("required context messages need"));
+    assert!(error.message.contains("currentUser"));
+}
+
 #[tokio::test]
 async fn add_workspace_creates_missing_directory_and_registers_it() {
     let existing_workspace_dir = env::temp_dir().join(unique_id("foco-existing-workspace-test"));
@@ -12363,9 +12400,11 @@ Search memory before repo work.
 
     assert_eq!(skill_messages.len(), 1);
     assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
-    assert!(skill_messages[0]
-        .content
-        .contains("- gitmemo: Project memory. (file: "));
+    assert!(
+        skill_messages[0]
+            .content
+            .contains("- gitmemo: Project memory. (file: ")
+    );
     assert!(!skill_messages[0].content.contains("Search memory"));
     let environment_messages = new_context
         .provider_request
@@ -13141,7 +13180,11 @@ Use this only after reading the skill file.
             .content
             .contains(&format!("(file: {})", skill_file.display()))
     );
-    assert!(skill_message.content.contains("- plan-router: Helps draft focused plans. (file: "));
+    assert!(
+        skill_message
+            .content
+            .contains("- plan-router: Helps draft focused plans. (file: ")
+    );
     assert!(!skill_message.content.contains("CDATA"));
     assert!(
         !skill_message

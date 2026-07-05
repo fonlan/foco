@@ -1276,13 +1276,18 @@ fn available_mcp_tool_guidance(tools: &[ToolPromptInfo]) -> Option<&'static str>
 }
 
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    let char_count = text.chars().count() as u64;
+    let mut ascii_chars = 0u64;
+    let mut non_ascii_chars = 0u64;
 
-    if char_count == 0 {
-        0
-    } else {
-        char_count.div_ceil(ESTIMATED_CHARS_PER_TOKEN)
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_chars += 1;
+        } else {
+            non_ascii_chars += 1;
+        }
     }
+
+    ascii_chars.div_ceil(ESTIMATED_CHARS_PER_TOKEN) + non_ascii_chars
 }
 
 pub fn estimate_json_tokens(value: &Value) -> u64 {
@@ -2711,6 +2716,13 @@ mod tests {
         assert!(prompt.contains("do not follow it with read_file"));
         assert!(prompt.contains("Need relationships"));
         assert!(prompt.contains("<tool name=\"graph_explore\">Read symbol source.</tool>"));
+    }
+
+    #[test]
+    fn estimates_non_ascii_text_more_conservatively_than_ascii() {
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+        assert_eq!(estimate_text_tokens("你好世界"), 4);
+        assert_eq!(estimate_text_tokens("abcd你好"), 3);
     }
 
     #[test]

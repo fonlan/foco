@@ -53,6 +53,7 @@ const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
+const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
 const AGENT_WAIT_RESUME_INSTRUCTION: &str = "<agent_wait_resume>\n<source>Foco Agent wait resume</source>\n<instructions>the following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.</instructions>\n</agent_wait_resume>";
 
 #[derive(Clone)]
@@ -1189,8 +1190,34 @@ fn agent_task_input_prompt_value(task: &AgentTaskRecord) -> Result<Value, ApiErr
     if let Some(object) = input.as_object_mut() {
         object.remove("skillIds");
         object.remove("skill_ids");
+        truncate_agent_task_input_message(object);
     }
     Ok(input)
+}
+
+fn truncate_agent_task_input_message(object: &mut serde_json::Map<String, Value>) {
+    let Some(message) = object.get("message").and_then(Value::as_str) else {
+        return;
+    };
+    let total_chars = message.chars().count();
+    if total_chars <= AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS {
+        return;
+    }
+
+    let preview = message
+        .chars()
+        .take(AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS)
+        .collect::<String>();
+    object.insert("messagePreview".to_string(), Value::String(preview));
+    object.insert(
+        "messageOmitted".to_string(),
+        json!({
+            "reason": "message is already present as the current user message; agent_current_task keeps only a preview to avoid duplicating large prompt content",
+            "originalChars": total_chars,
+            "previewChars": AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS,
+        }),
+    );
+    object.remove("message");
 }
 
 fn agent_current_task_prompt(
@@ -1962,6 +1989,47 @@ mod tests {
         assert_eq!(input["message"], json!("work"));
         assert!(input.get("skillIds").is_none());
         assert!(input.get("skill_ids").is_none());
+    }
+
+    #[test]
+    fn agent_task_input_prompt_value_truncates_large_message_copy() {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let large_message = "好".repeat(AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS + 8);
+        let task = AgentTaskRecord {
+            id: AgentTaskId::new("agent-task-large-message").expect("task id"),
+            team_id: foco_agent::AgentTeamId::new("agent-team-large-message").expect("team id"),
+            owner_instance_id: foco_agent::AgentInstanceId::new("agent-instance-large-message")
+                .expect("instance id"),
+            origin_instance_id: None,
+            parent_task_id: None,
+            sequence: 0,
+            status: AgentTaskStatus::Running,
+            input_json: json!({ "message": large_message, "queuedUserMessageId": "msg-1" })
+                .to_string(),
+            result_json: None,
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now),
+            completed_at: None,
+        };
+
+        let input = agent_task_input_prompt_value(&task).expect("prompt input");
+
+        assert!(input.get("message").is_none());
+        assert_eq!(
+            input["messagePreview"]
+                .as_str()
+                .expect("message preview")
+                .chars()
+                .count(),
+            AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS
+        );
+        assert_eq!(
+            input["messageOmitted"]["originalChars"],
+            json!(AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS + 8)
+        );
+        assert_eq!(input["queuedUserMessageId"], json!("msg-1"));
     }
 
     fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {
