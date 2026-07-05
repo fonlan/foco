@@ -1676,7 +1676,6 @@ export function SettingsPanel({
   function updateProviderProtocol(kind: string) {
     setProviderForm((current) => ({
       ...current,
-      baseUrl: providerKindDefaultBaseUrl(providerKinds, kind),
       kind,
       serviceId: providerServiceIdForKind(kind) || current.serviceId,
     }));

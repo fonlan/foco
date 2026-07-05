@@ -646,6 +646,23 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
   });
 
+  it("keeps custom provider base URL when changing protocol", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
+
+    const baseUrlInput = screen.getByLabelText("Base URL");
+    await userEvent.clear(baseUrlInput);
+    await userEvent.type(baseUrlInput, "https://proxy.example.test/v1");
+    await userEvent.selectOptions(screen.getByLabelText("Protocol"), "openai-chat");
+
+    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-chat");
+    expect(baseUrlInput).toHaveValue("https://proxy.example.test/v1");
+  });
+
   it("toggles the app theme from the nav rail", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
