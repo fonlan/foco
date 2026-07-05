@@ -33,15 +33,17 @@ jobs:
       - run: npm run build -w web
       - name: Build sidecars
         run: |
-          cross build --release -p foco-app --target x86_64-unknown-linux-musl
+          CARGO_TARGET_DIR=target/cross-x86_64-unknown-linux-musl \
+            cross build --release -p foco-app --target x86_64-unknown-linux-musl
           node scripts/sidecars.mjs manifest \
             --target linux-x64 \
-            --binary target/x86_64-unknown-linux-musl/release/foco \
+            --binary target/cross-x86_64-unknown-linux-musl/x86_64-unknown-linux-musl/release/foco \
             --out sidecars
-          cross build --release -p foco-app --target aarch64-unknown-linux-musl
+          CARGO_TARGET_DIR=target/cross-aarch64-unknown-linux-musl \
+            cross build --release -p foco-app --target aarch64-unknown-linux-musl
           node scripts/sidecars.mjs manifest \
             --target linux-arm64 \
-            --binary target/aarch64-unknown-linux-musl/release/foco \
+            --binary target/cross-aarch64-unknown-linux-musl/aarch64-unknown-linux-musl/release/foco \
             --out sidecars
       - name: Upload sidecars
         uses: actions/upload-artifact@v4
