@@ -1400,16 +1400,41 @@ export function App() {
       ),
     [settings?.configuredModels],
   );
+  const enabledProviderIds = useMemo(
+    () =>
+      new Set(
+        (settings?.providers ?? [])
+          .filter((provider) => provider.enabled)
+          .map((provider) => provider.id),
+      ),
+    [settings?.providers],
+  );
   const availableModels = useMemo(
     () =>
-      configuredModelsByName.filter(
-        (model) =>
-          model.enabled &&
-          model.canEnable &&
-          model.activeProviderId !== null &&
-          model.providerIds.length > 0,
-      ),
-    [configuredModelsByName],
+      configuredModelsByName.flatMap((model) => {
+        const providerIds = model.providerIds.filter((providerId) =>
+          enabledProviderIds.has(providerId),
+        );
+        if (
+          !model.enabled ||
+          !model.canEnable ||
+          model.activeProviderId === null ||
+          providerIds.length === 0
+        ) {
+          return [];
+        }
+
+        return [
+          {
+            ...model,
+            activeProviderId: providerIds.includes(model.activeProviderId)
+              ? model.activeProviderId
+              : providerIds[0],
+            providerIds,
+          },
+        ];
+      }),
+    [configuredModelsByName, enabledProviderIds],
   );
   const selectedModel = useMemo(
     () => availableModels.find((model) => model.id === selectedModelId) ?? null,

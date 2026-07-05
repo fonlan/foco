@@ -194,6 +194,24 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.queryByRole("button", { name: "Select skill Other skill" })).not.toBeInTheDocument();
   });
 
+  it("hides disabled providers from the composer model picker", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      providers: settings.providers.map((provider) =>
+        provider.id === "anthropic" ? { ...provider, enabled: false } : provider,
+      ),
+    } as typeof settings;
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(screen.getByLabelText("Model"));
+
+    expect(screen.getByRole("button", { name: "OpenAI: GPT Test" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Anthropic: GPT Test" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("refreshes assembled context usage after a stream completes", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
