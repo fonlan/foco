@@ -2,9 +2,17 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to publish as a GitHub Release; leave empty to only build artifacts."
+        required: false
+        type: string
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: read
 
 jobs:
   linux-sidecars:
@@ -12,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -46,6 +56,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -75,6 +87,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -91,11 +105,81 @@ jobs:
         run: node scripts/sidecars.mjs verify --root sidecars
       - name: Build Windows release
         run: npm run build:release -- --bundle-sidecars
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\windows | Out-Null
+          Push-Location target\release
+          Compress-Archive -Path foco.exe,resources -DestinationPath ..\..\dist\windows\Foco-windows.zip -Force
+          Pop-Location
       - name: Upload Windows release
         uses: actions/upload-artifact@v4
         with:
-          name: Foco-windows
-          path: |
-            target/release/foco.exe
-            target/release/resources/sidecars/**
+          name: Foco-windows-zip
+          path: dist/windows/Foco-windows.zip
           if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    needs: [macos-release, windows-release]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" == v* ]]; then
+            echo "Release tag must start with v: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | node -e 'let input = ""; process.stdin.on("data", (chunk) => input += chunk); process.stdin.on("end", () => { const metadata = JSON.parse(input); const appPackage = metadata.packages.find((pkg) => pkg.name === "foco-app"); if (!appPackage?.version) process.exit(1); process.stdout.write(appPackage.version); });')"
+          tag_version="${RELEASE_TAG#v}"
+          if [[ "$tag_version" != "$cargo_version" ]]; then
+            echo "Release tag $RELEASE_TAG does not match foco-app version $cargo_version" >&2
+            exit 1
+          fi
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Foco-macos-dmg
+          path: artifacts/macos
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Foco-windows-zip
+          path: artifacts/windows
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp artifacts/macos/Foco.dmg "release-assets/Foco-${RELEASE_TAG}-macos.dmg"
+          cp artifacts/windows/Foco-windows.zip "release-assets/Foco-${RELEASE_TAG}-windows.zip"
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --generate-notes "${prerelease_flag[@]}"
+          fi
