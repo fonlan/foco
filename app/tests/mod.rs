@@ -29,6 +29,7 @@ use foco_store::{
         LlmRequestAuditFilters, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphSymbol,
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession,
         NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
+        WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -15743,6 +15744,207 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     assert_eq!(legacy.snapshot_id, "ctx-timeline-legacy");
     assert_eq!(legacy.context_window, 20_000);
     assert_eq!(legacy.max_output_tokens, 1_000);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
+    fn request<'a>(
+        id: &'a str,
+        workspace_id: &'a str,
+        request_kind: &'a str,
+        input_tokens: i64,
+        output_tokens: i64,
+        request_started_at: &'a str,
+        response_body_json: Option<&'a str>,
+    ) -> NewLlmRequest<'a> {
+        NewLlmRequest {
+            id,
+            workspace_id,
+            chat_id: Some("chat-internal-filter"),
+            request_kind,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "provider",
+            model_id: "model",
+            request_started_at,
+            first_token_at: None,
+            completed_at: Some(request_started_at),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            reasoning_tokens: None,
+            first_token_latency_ms: Some(10),
+            total_latency_ms: Some(100),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json,
+        }
+    }
+
+    let workspace_dir = env::temp_dir().join(unique_id("foco-chat-stats-internal-filter-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-chat-stats-internal-filter-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.providers.push(ProviderSettings {
+        id: "provider".to_string(),
+        name: "Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+    config.models.push(ModelSettings {
+        id: "model".to_string(),
+        display_name: "Model".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 20_000,
+            max_output_tokens: 1_000,
+        }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-internal-filter", "Internal filter")
+            .expect("chat insert");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-chat-internal-filter",
+                trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+                chat_id: Some("chat-internal-filter"),
+                run_id: Some("run-internal-filter"),
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: Some("{}"),
+            })
+            .expect("spec job insert");
+
+        for request in [
+            request(
+                "internal-spec-compaction",
+                &workspace_id,
+                "workspace spec compaction",
+                900,
+                90,
+                "2026-07-06T10:00:05Z",
+                None,
+            ),
+            request(
+                "internal-spec-update",
+                &workspace_id,
+                "workspace spec update",
+                800,
+                80,
+                "2026-07-06T10:00:04Z",
+                Some(r#"{"requestKind":"workspace spec update"}"#),
+            ),
+            request(
+                "internal-memory-retrieval",
+                &workspace_id,
+                "memory retrieval",
+                700,
+                70,
+                "2026-07-06T10:00:03Z",
+                None,
+            ),
+            request(
+                "internal-memory-extraction",
+                &workspace_id,
+                "memory extraction",
+                600,
+                60,
+                "2026-07-06T10:00:02Z",
+                None,
+            ),
+            request(
+                "main-chat-request",
+                &workspace_id,
+                "chat completion",
+                100,
+                25,
+                "2026-07-06T10:00:01Z",
+                None,
+            ),
+        ] {
+            database
+                .insert_llm_request(request)
+                .expect("llm request insert");
+        }
+    }
+
+    let Json(stats) = crate::http::chat::chat_statistics(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "chat-internal-filter".to_string())),
+    )
+    .await
+    .expect("chat statistics");
+    assert_eq!(stats.total_requests, 1);
+    assert_eq!(stats.total_input_tokens, 100);
+    assert_eq!(stats.total_output_tokens, 25);
+    assert_eq!(stats.total_tokens, 125);
+    assert_eq!(stats.model_breakdown.len(), 1);
+    assert_eq!(stats.provider_breakdown.len(), 1);
+
+    let Json(ai_stats) = crate::http::chat::ai_statistics(
+        State(state.clone()),
+        Query(AiStatisticsQuery {
+            workspace_id: Some(workspace_id.clone()),
+            request_id: None,
+            request_ids: Some("main-chat-request,internal-memory-retrieval".to_string()),
+            chat_id: Some("chat-internal-filter".to_string()),
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: None,
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("ai statistics");
+    assert_eq!(ai_stats.total_count, 1);
+    assert_eq!(ai_stats.summary.total_requests, 1);
+    assert_eq!(ai_stats.summary.total_tokens, 125);
+    assert_eq!(ai_stats.requests.len(), 1);
+    assert_eq!(ai_stats.requests[0].id, "main-chat-request");
+    assert_eq!(ai_stats.requests[0].request_kind, "chat completion");
+
+    let Json(detail) = crate::http::chat::ai_statistics_detail(
+        State(state),
+        AxumPath((workspace_id.clone(), "main-chat-request".to_string())),
+    )
+    .await
+    .expect("ai statistics detail");
+    assert_eq!(detail.request.id, "main-chat-request");
+    assert_eq!(detail.request.request_kind, "chat completion");
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

@@ -15,21 +15,22 @@ use foco_store::{
     },
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord,
-        LlmRequestUsageRollupFilters, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
-        NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
-        NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-        NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent,
-        NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
-        NewWorkspaceSpecJob, PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
+        LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewAgentContextEntry,
+        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
+        NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
+        NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+        PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch, ScheduledTaskDueRunClaim,
+        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -5170,6 +5171,155 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("filtered audit count"),
         1
     );
+}
+
+#[test]
+fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
+    fn request<'a>(
+        id: &'a str,
+        request_kind: &'a str,
+        input_tokens: i64,
+        output_tokens: i64,
+        request_started_at: &'a str,
+        response_body_json: Option<&'a str>,
+    ) -> NewLlmRequest<'a> {
+        NewLlmRequest {
+            id,
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            request_kind,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "provider",
+            model_id: "model",
+            request_started_at,
+            first_token_at: None,
+            completed_at: Some(request_started_at),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: Some(100),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json,
+        }
+    }
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Audit filter chat")
+        .expect("chat insert");
+    let spec_job = database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-1",
+            trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+            chat_id: Some("chat-1"),
+            run_id: Some("run-1"),
+            model_id: Some("model"),
+            base_revision: Some(1),
+            input_summary_json: Some("{}"),
+        })
+        .expect("spec job insert");
+    assert_eq!(spec_job.chat_id.as_deref(), Some("chat-1"));
+
+    for request in [
+        request(
+            "internal-spec-compaction",
+            "workspace spec compaction",
+            800,
+            80,
+            "2026-07-06T10:00:06Z",
+            None,
+        ),
+        request(
+            "internal-spec-update",
+            "workspace spec update",
+            700,
+            70,
+            "2026-07-06T10:00:05Z",
+            Some(r#"{"requestKind":"workspace spec update"}"#),
+        ),
+        request(
+            "legacy-memory-retrieval",
+            "unknown",
+            600,
+            60,
+            "2026-07-06T10:00:04Z",
+            Some(r#"{"requestKind":"memory retrieval"}"#),
+        ),
+        request(
+            "internal-memory-extraction",
+            "memory extraction",
+            500,
+            50,
+            "2026-07-06T10:00:03Z",
+            None,
+        ),
+        request(
+            "main-chat-request",
+            "chat completion",
+            10,
+            5,
+            "2026-07-06T10:00:02Z",
+            None,
+        ),
+    ] {
+        database
+            .insert_llm_request(request)
+            .expect("llm request insert");
+    }
+
+    let all_chat_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            chat_id: Some("chat-1"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("all chat audit rows");
+    assert_eq!(all_chat_rows.len(), 5);
+
+    let main_chat_filters = LlmRequestAuditFilters {
+        chat_id: Some("chat-1"),
+        exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        ..LlmRequestAuditFilters::default()
+    };
+    let filtered_rows = database
+        .llm_request_audit_rows(main_chat_filters)
+        .expect("main chat audit rows");
+    assert_eq!(filtered_rows.len(), 1);
+    assert_eq!(filtered_rows[0].id, "main-chat-request");
+    assert_eq!(
+        database
+            .llm_request_audit_count(main_chat_filters)
+            .expect("main chat audit count"),
+        1
+    );
+
+    let summary = database
+        .llm_request_audit_summary(main_chat_filters)
+        .expect("main chat audit summary");
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.total_input_tokens, 10);
+    assert_eq!(summary.total_output_tokens, 5);
+    assert_eq!(summary.total_tokens, 15);
+
+    let request_kind_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            chat_id: Some("chat-1"),
+            request_kind: Some("chat completion"),
+            exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request kind audit rows");
+    assert_eq!(request_kind_rows.len(), 1);
+    assert_eq!(request_kind_rows[0].id, "main-chat-request");
 }
 
 #[test]
