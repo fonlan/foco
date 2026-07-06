@@ -2175,6 +2175,7 @@ type EditFileDiff = {
 
 type ToolCallViewMode = "compact" | "raw";
 
+const EMPTY_SELECTED_SKILL_PREFIX: SelectedSkillPrefixResolver = () => null;
 const DIRECT_COMPACT_TEXT_FIELDS = ["content", "text", "message", "note", "error"];
 const ARRAY_COMPACT_SUMMARY_FIELDS = [
   "matches",
@@ -2321,6 +2322,18 @@ function commandOutputText(output: JsonValue | null) {
   return parts.length ? parts.join("\n") : null;
 }
 
+function successfulUpdateSpecMarkdown(toolCall: ChatToolCallSummary) {
+  if (toolCall.name !== "update_spec" || toolCall.isError || toolCall.status !== "completed") {
+    return null;
+  }
+  if (!isJsonRecord(toolCall.output)) {
+    return null;
+  }
+
+  const contentMarkdown = toolCall.output.contentMarkdown;
+  return typeof contentMarkdown === "string" ? contentMarkdown : null;
+}
+
 function compactToolCallText(
   toolCall: ChatToolCallSummary,
   input: JsonValue,
@@ -2458,6 +2471,19 @@ function CompactToolCallView({
 }) {
   if (diff) {
     return <EditFileDiffBlock diff={diff} />;
+  }
+
+  const updateSpecMarkdown = successfulUpdateSpecMarkdown(toolCall);
+  if (updateSpecMarkdown !== null) {
+    return (
+      <div className="panel-scroll max-h-64 overflow-auto border-l border-stone-200 pl-3">
+        <MarkdownContent
+          content={updateSpecMarkdown}
+          isUser={false}
+          selectedSkillPrefix={EMPTY_SELECTED_SKILL_PREFIX}
+        />
+      </div>
+    );
   }
 
   const text = compactToolCallText(toolCall, input, liveOutputText, compactJson);
