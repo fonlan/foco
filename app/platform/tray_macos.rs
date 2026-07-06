@@ -370,7 +370,9 @@ fn show_about_foco_alert() {
     alert.setAlertStyle(NSAlertStyle::Informational);
     alert.setMessageText(&NSString::from_str("Foco"));
     alert.setInformativeText(&NSString::from_str(concat!(
-        "Foco ", env!("CARGO_PKG_VERSION"), "\n\n",
+        "Foco ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\n",
         "A local AI coding workspace and automation runtime."
     )));
     alert.addButtonWithTitle(&NSString::from_str("OK"));

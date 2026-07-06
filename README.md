@@ -140,7 +140,14 @@ Users only need to install local Foco. On first connection to a remote workspace
 
 ### macOS Pre-Support
 
-macOS pre-support currently covers the runtime integration points: release startup as a menu bar background app, Open Foco in the default browser, Quit handling, user LaunchAgent auto-start, native file and directory pickers, zsh as the default macOS shell, and zsh defaults for newly created workspaces. The release workflow now builds a `.app`/`.dmg` with bundled sidecars; codesigning and notarization are still not provided yet.
+macOS pre-support currently covers the runtime integration points: release startup as a menu bar background app, Open Foco in the default browser, Quit handling, user LaunchAgent auto-start, native file and directory pickers, zsh as the default macOS shell, and zsh defaults for newly created workspaces. The release workflow builds an Apple Silicon `arm64` `.app`/`.dmg` with bundled sidecars and applies a valid ad-hoc signature for trusted local use. Developer ID signing and notarization are intentionally not provided.
+
+After dragging `Foco.app` to Applications, a GitHub-downloaded build may still be blocked by Gatekeeper because it is not notarized. Only for a build you trust, remove the download quarantine once before opening it:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Foco.app
+open /Applications/Foco.app
+```
 
 Validated-on-mac checklist for the next macOS pass:
 

@@ -66,6 +66,8 @@ try {
     throw new Error(`release executable was not created: ${releaseExecutable}`);
   }
 
+  await run("lipo", [releaseExecutable, "-verify_arch", "arm64"]);
+  await run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", releaseApp]);
   await run(process.execPath, ["scripts/sidecars.mjs", "verify", "--root", releaseSidecars]);
 
   appProcess = spawn(releaseExecutable, [], {

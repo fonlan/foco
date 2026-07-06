@@ -18,6 +18,8 @@ import process from "node:process";
 const APP_NAME = "Foco";
 const BUNDLE_ID = "app.foco.Foco";
 const EXECUTABLE_NAME = "foco";
+const MACOS_TARGET = "aarch64-apple-darwin";
+const MACOS_ARCH = "arm64";
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const distRoot = path.join(repoRoot, "dist", "macos");
 const appRoot = path.join(distRoot, `${APP_NAME}.app`);
@@ -32,9 +34,10 @@ try {
   assertMacosHost();
 
   runNpm(["run", "build", "-w", "web"]);
-  runCargo(["build", "--release", "-p", "foco-app"]);
+  runCargo(["build", "--release", "-p", "foco-app", "--target", MACOS_TARGET]);
 
   await buildAppBundle(options);
+  signAppBundleAdHoc();
   try {
     await buildDmg();
   } finally {
@@ -66,7 +69,7 @@ function assertMacosHost() {
 
 async function buildAppBundle(options) {
   const targetRoot = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
-  const releaseExecutable = path.join(targetRoot, "release", EXECUTABLE_NAME);
+  const releaseExecutable = path.join(targetRoot, MACOS_TARGET, "release", EXECUTABLE_NAME);
 
   if (!existsSync(releaseExecutable)) {
     throw new Error(`release executable was not created: ${releaseExecutable}`);
@@ -79,6 +82,7 @@ async function buildAppBundle(options) {
   const bundledExecutable = path.join(macosDir, EXECUTABLE_NAME);
   await copyFile(releaseExecutable, bundledExecutable);
   await chmod(bundledExecutable, 0o755);
+  run("lipo", [bundledExecutable, "-verify_arch", MACOS_ARCH]);
 
   await writeIcns();
   await writeInfoPlist(await cargoPackageVersion());
@@ -88,6 +92,11 @@ async function buildAppBundle(options) {
     // ponytail: local-only DMGs can skip SSH remote-workspace sidecars; release CI keeps the default bundled path.
     console.warn("[macos] skipped sidecars; remote SSH workspaces will require a custom focoCommand.");
   }
+}
+
+function signAppBundleAdHoc() {
+  run("codesign", ["--force", "--deep", "--sign", "-", "--timestamp=none", appRoot]);
+  run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appRoot]);
 }
 
 async function writeIcns() {

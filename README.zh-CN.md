@@ -140,7 +140,14 @@ SSH 远程工作区使用桌面发布包内置的 Linux sidecar。CI release wor
 
 ### macOS 预支持
 
-macOS 预支持目前覆盖运行时集成点：release 启动为菜单栏后台应用、Open Foco 使用默认浏览器打开、Quit 退出处理、用户级 LaunchAgent 自启动、原生文件/目录选择器、macOS 默认 zsh 终端，以及新建工作区时的 zsh 默认值。release workflow 现在会构建带 sidecar 的 `.app`/`.dmg`；codesign 和 notarization 仍未提供。
+macOS 预支持目前覆盖运行时集成点：release 启动为菜单栏后台应用、Open Foco 使用默认浏览器打开、Quit 退出处理、用户级 LaunchAgent 自启动、原生文件/目录选择器、macOS 默认 zsh 终端，以及新建工作区时的 zsh 默认值。release workflow 会构建带 sidecar 的 Apple Silicon `arm64` `.app`/`.dmg`，并为可信的本地自用场景添加有效的 ad-hoc 签名；有意不提供 Developer ID 签名和 Apple 公证。
+
+把 `Foco.app` 拖到“应用程序”后，从 GitHub 下载的构建仍可能因为没有公证而被 Gatekeeper 拦截。只对自己信任的构建执行一次下面的命令来移除下载隔离属性：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Foco.app
+open /Applications/Foco.app
+```
 
 后续迁移到 macOS 实机后的验收命令：
 
