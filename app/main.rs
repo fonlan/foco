@@ -23,7 +23,7 @@ use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
     calculate_context_budget, estimate_json_tokens, estimate_text_tokens, pack_context,
-    plan_context_compression_at_trigger, plan_tool_execution,
+    plan_tool_execution,
 };
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
@@ -213,8 +213,7 @@ const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES: usize = 2;
 // Maximum characters kept from each covered message inside a compression snapshot summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
-// Maximum compressed message entries shown in a single snapshot prompt summary.
-const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
+
 // Prefix used to identify injected context compression snapshot messages.
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 // Metadata kind for deterministic local context compression snapshots.

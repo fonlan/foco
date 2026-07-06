@@ -3728,6 +3728,104 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
+#[test]
+fn runtime_tool_state_compression_uses_total_context_threshold() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-total-threshold-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        900,
+    );
+    context.context_budget.system_prompt_tokens = 250;
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    for batch_index in 0..4 {
+        let call_id = format!("call-total-{batch_index}");
+        let tool_calls = vec![NeutralToolCall {
+            call_id: call_id.clone(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
+            thought_signatures: None,
+        }];
+        let tool_results = vec![ExecutedToolCall {
+            id: call_id,
+            name: "read_file".to_string(),
+            input: tool_calls[0].arguments.clone(),
+            output: json!({
+                "path": "app/main.rs",
+                "bytes": 12_000,
+                "content": "z".repeat(600),
+                "timeoutMs": 10000
+            }),
+            is_error: false,
+            started_at: "2026-06-13T09:00:00Z".to_string(),
+            completed_at: "2026-06-13T09:00:01Z".to_string(),
+        }];
+        append_tool_state_messages(
+            &mut context.provider_request.messages,
+            &mut context.message_source_sequences,
+            &mut context.message_context_sources,
+            &mut context.next_runtime_tool_batch_index,
+            tool_calls,
+            &tool_results,
+            String::new(),
+            None,
+        );
+    }
+
+    assert!(
+        compress_runtime_tool_state_if_needed(&mut context, false).expect("runtime compression")
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn ensure_context_compression_skips_rule_snapshots_below_llm_threshold() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-no-rule-compression-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut messages = vec![neutral_text_message(
+        NeutralChatRole::System,
+        "system".to_string(),
+    )];
+    let mut sequences = vec![None];
+    let mut sources = vec![PromptContextSource::ReservedPrompt];
+    for sequence in 0..6 {
+        messages.push(neutral_text_message(
+            NeutralChatRole::Assistant,
+            "h".repeat(560),
+        ));
+        sequences.push(Some(sequence));
+        sources.push(PromptContextSource::StoredMessage { sequence });
+    }
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    let result = ensure_context_compression(&mut context)
+        .await
+        .expect("context compression");
+
+    assert!(!result.runtime_tool_state_compressed);
+    assert!(result.events.is_empty());
+    assert!(context.compression_snapshots.is_empty());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn llm_context_compression_trigger_is_95_percent_of_context_window() {
+    assert_eq!(
+        crate::prompt::llm_context_compression_trigger_tokens(20_000),
+        19_000
+    );
+}
 
 #[test]
 fn compress_all_runtime_tool_state_removes_tool_protocol_messages() {
