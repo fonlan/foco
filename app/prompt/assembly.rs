@@ -706,7 +706,7 @@ fn project_spec_context_message(
     }
 
     Some(neutral_text_message(
-        NeutralChatRole::System,
+        NeutralChatRole::User,
         format!(
             "<project_spec_context>\n\
              <source>{}</source>\n\

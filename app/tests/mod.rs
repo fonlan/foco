@@ -13825,6 +13825,10 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
             .any(|message| message.content.contains("<project_spec>"))
     );
     assert_eq!(
+        first_context.provider_request.messages[first_spec_index].role,
+        NeutralChatRole::User
+    );
+    assert_eq!(
         first_context.message_context_sources[first_spec_index],
         PromptContextSource::ProjectSpec
     );
