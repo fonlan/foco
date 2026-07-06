@@ -664,6 +664,7 @@ fn test_prepared_chat_context(
         message_context_sources,
         active_tool_start_index: 1,
         next_runtime_tool_batch_index: 0,
+        runtime_tool_state_compression_count: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
         code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
@@ -3653,6 +3654,14 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
     assert!(
         compress_runtime_tool_state_if_needed(&mut context, true).expect("runtime compression")
     );
+    let first_snapshot_index = context
+        .message_context_sources
+        .iter()
+        .position(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+        .expect("first snapshot");
+    let first_snapshot_content = context.provider_request.messages[first_snapshot_index]
+        .content
+        .clone();
     let snapshot_count = context
         .message_context_sources
         .iter()
@@ -3679,11 +3688,7 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
         CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES
     );
     assert_eq!(remaining_batch_indices, BTreeSet::from([2, 3]));
-    assert!(context.provider_request.messages.iter().any(|message| {
-        message
-            .content
-            .contains("Runtime tool-state compression snapshot")
-    }));
+    assert!(first_snapshot_content.contains("Runtime tool-state compression snapshot"));
 
     for batch_index in 4..6 {
         let call_id = format!("call-{batch_index}");
@@ -3719,12 +3724,110 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
         );
     }
     assert!(compress_runtime_tool_state_if_needed(&mut context, true).expect("second compression"));
-    let snapshot_count = context
+    let snapshot_indices = context
         .message_context_sources
         .iter()
-        .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
-        .count();
-    assert_eq!(snapshot_count, 1);
+        .enumerate()
+        .filter_map(|(index, source)| {
+            matches!(source, PromptContextSource::RuntimeToolStateSnapshot).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let remaining_batch_indices = context
+        .message_context_sources
+        .iter()
+        .filter_map(|source| match source {
+            PromptContextSource::RuntimeToolState { batch_index } => Some(*batch_index),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(snapshot_indices.len(), 2);
+    assert_eq!(snapshot_indices[0], first_snapshot_index);
+    assert_eq!(
+        context.provider_request.messages[first_snapshot_index].content,
+        first_snapshot_content
+    );
+    assert!(
+        context.provider_request.messages[snapshot_indices[1]]
+            .content
+            .contains("call-2")
+    );
+    assert!(
+        !context.provider_request.messages[snapshot_indices[1]]
+            .content
+            .contains("call-0")
+    );
+    assert_eq!(remaining_batch_indices, BTreeSet::from([4, 5]));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn compress_runtime_tool_state_stops_after_three_successes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-compress-cap-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        80,
+    );
+    context.active_tool_start_index = context.provider_request.messages.len();
+    context.runtime_tool_state_compression_count =
+        CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS;
+
+    for batch_index in 0..4 {
+        let call_id = format!("call-cap-{batch_index}");
+        let tool_calls = vec![NeutralToolCall {
+            call_id: call_id.clone(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
+            thought_signatures: None,
+        }];
+        let tool_results = vec![ExecutedToolCall {
+            id: call_id,
+            name: "read_file".to_string(),
+            input: tool_calls[0].arguments.clone(),
+            output: json!({ "content": "x".repeat(2_000), "timeoutMs": 10000 }),
+            is_error: false,
+            started_at: "2026-06-13T09:00:00Z".to_string(),
+            completed_at: "2026-06-13T09:00:01Z".to_string(),
+        }];
+        append_tool_state_messages(
+            &mut context.provider_request.messages,
+            &mut context.message_source_sequences,
+            &mut context.message_context_sources,
+            &mut context.next_runtime_tool_batch_index,
+            tool_calls,
+            &tool_results,
+            String::new(),
+            None,
+        );
+    }
+
+    assert!(
+        !compress_runtime_tool_state_if_needed(&mut context, true).expect("capped compression")
+    );
+    assert_eq!(
+        context
+            .message_context_sources
+            .iter()
+            .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+            .count(),
+        0
+    );
+    assert_eq!(
+        context
+            .message_context_sources
+            .iter()
+            .filter(|source| matches!(source, PromptContextSource::RuntimeToolState { .. }))
+            .count(),
+        8
+    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -8094,6 +8197,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
         active_tool_start_index: 1,
         next_runtime_tool_batch_index: 0,
+        runtime_tool_state_compression_count: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
         code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
@@ -8893,6 +8997,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
         active_tool_start_index: 1,
         next_runtime_tool_batch_index: 0,
+        runtime_tool_state_compression_count: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
         code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
@@ -9241,6 +9346,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
         active_tool_start_index: 1,
         next_runtime_tool_batch_index: 0,
+        runtime_tool_state_compression_count: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
         code_change_baseline: SessionCodeChangeBaselineState::Unavailable {

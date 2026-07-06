@@ -211,6 +211,8 @@ const READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD: usize = 16;
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 // Number of newest in-progress tool batches kept verbatim inside a long agent run.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES: usize = 2;
+// Maximum runtime tool-state snapshots appended during one assistant run.
+const CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS: usize = 3;
 // Maximum characters kept from each covered message inside a compression snapshot summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 
@@ -2062,6 +2064,7 @@ struct PreparedChatContext {
     message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
     next_runtime_tool_batch_index: usize,
+    runtime_tool_state_compression_count: usize,
     hook_context_messages: Vec<String>,
     hook_notifications: Vec<HookNotification>,
     code_change_baseline: SessionCodeChangeBaselineState,
@@ -4588,6 +4591,7 @@ async fn prepare_chat_context(
         message_context_sources: prompt_context.message_context_sources,
         active_tool_start_index: prompt_context.active_tool_start_index,
         next_runtime_tool_batch_index: 0,
+        runtime_tool_state_compression_count: 0,
         hook_context_messages,
         hook_notifications,
         code_change_baseline,

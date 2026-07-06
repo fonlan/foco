@@ -621,6 +621,12 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
         &context.message_context_sources,
     )?;
 
+    if context.runtime_tool_state_compression_count
+        >= CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS
+    {
+        return Ok(false);
+    }
+
     let message_groups = context_message_groups(
         &context.provider_request.messages,
         &context.message_source_sequences,
@@ -654,25 +660,11 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
 
     let covered_tool_group_count =
         runtime_tool_groups.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES;
-    let mut covered_group_indices = message_groups
+    let covered_group_indices = runtime_tool_groups
         .iter()
-        .enumerate()
-        .filter_map(|(group_index, group)| {
-            if group.source_bucket == PromptContextSourceBucket::RuntimeToolStateSnapshot {
-                Some(group_index)
-            } else {
-                None
-            }
-        })
+        .take(covered_tool_group_count)
+        .map(|(group_index, _, _)| *group_index)
         .collect::<Vec<_>>();
-    covered_group_indices.extend(
-        runtime_tool_groups
-            .iter()
-            .take(covered_tool_group_count)
-            .map(|(group_index, _, _)| *group_index),
-    );
-    covered_group_indices.sort_unstable();
-    covered_group_indices.dedup();
     if covered_group_indices.is_empty() {
         return Ok(false);
     }
@@ -714,6 +706,7 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
         context.active_tool_start_index,
         &covered_message_indices,
     );
+    context.runtime_tool_state_compression_count += 1;
 
     Ok(true)
 }
