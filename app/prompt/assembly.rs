@@ -1,4 +1,6 @@
-use super::{compression_snapshot_message, snapshot_covered_sequences};
+use super::{
+    active_compression_snapshots, compression_snapshot_message, snapshot_covered_sequences,
+};
 use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
@@ -191,6 +193,7 @@ pub(crate) async fn prepare_prompt_context(
             None => Vec::new(),
         }
     };
+    let compression_snapshots = active_compression_snapshots(&compression_snapshots);
     let prompt_context_injections = if is_new_chat {
         Vec::new()
     } else {

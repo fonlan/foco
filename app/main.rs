@@ -23,7 +23,7 @@ use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
     calculate_context_budget, estimate_json_tokens, estimate_text_tokens, pack_context,
-    plan_context_compression, plan_tool_execution,
+    plan_context_compression_at_trigger, plan_tool_execution,
 };
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
@@ -98,7 +98,8 @@ use crate::hooks::{
 use crate::http::chat::{
     AiStatisticsQuery, ChatAttachmentInput, ChatAttachmentPart, ChatCompressionStatistics,
     ChatMessagesChatSummary, ChatStatisticsResponse, ChatStreamRequest, ChatSummary,
-    ChatToolBreakdown, ContextUsageRequest, QueuedRunSummary,
+    ChatToolBreakdown, ContextUsageRequest, ContextUsageSegments, ContextUsageTimelineEntry,
+    QueuedRunSummary,
 };
 use crate::http::memory::{EditMemorySourceRequest, refresh_memory_profile};
 use crate::http::settings::{
@@ -122,6 +123,7 @@ use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
     configured_extra_prompt_message, configured_prompt_messages, context_usage_response,
+    context_usage_segments_total, context_window_compression_trigger_tokens,
     ensure_context_compression, environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
     persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
@@ -221,10 +223,6 @@ const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
 const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
 // Event kind for lossy in-progress tool-state compression.
 const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToolState";
-// Numerator for the 95% model-generated fallback compression threshold.
-const LLM_CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 19;
-// Denominator for the 95% model-generated fallback compression threshold.
-const LLM_CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 20;
 // Timeout for model-generated fallback compression requests.
 const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
 // Maximum output tokens requested for model-generated fallback compression summaries.
@@ -1797,6 +1795,12 @@ enum ChatMessagePart {
     ToolCall {
         tool_call: ChatToolCallSummary,
     },
+    ContextCompression {
+        id: String,
+        status: String,
+        kind: String,
+        detail: ContextCompressionEventDetail,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1812,6 +1816,12 @@ enum StoredChatMessagePart {
     },
     ToolCall {
         tool_call_id: String,
+    },
+    ContextCompression {
+        id: String,
+        status: String,
+        kind: String,
+        detail: ContextCompressionEventDetail,
     },
 }
 
@@ -1914,6 +1924,9 @@ enum ChatSseEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot_id: Option<String>,
         kind: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<ContextCompressionEventDetail>,
     },
     ToolCall {
         assistant_message_id: String,
@@ -2268,10 +2281,30 @@ struct ContextMessageGroup {
     runtime_tool_batch_index: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextCompressionEventDetail {
+    status: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_token_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_token_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    provider_id: String,
+    model_id: String,
+}
+
+#[derive(Clone, Debug)]
 struct ContextCompressionResult {
     active_tool_start_index: usize,
     runtime_tool_state_compressed: bool,
+    events: Vec<ContextCompressionEventDetail>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2682,7 +2715,6 @@ impl PreparedChatContext {
                             yield event;
                         }
 
-                        let previous_compression_snapshot_count = self.compression_snapshots.len();
                         let compression_result = match ensure_context_compression(&mut self).await {
                             Ok(result) => result,
                             Err(error) => {
@@ -2721,25 +2753,42 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             yield event;
                         }
-                        if self.compression_snapshots.len() > previous_compression_snapshot_count {
-                            if let Some(snapshot) = self.compression_snapshots.last() {
+                        for detail in compression_result.events.clone() {
+                            let event = ChatSseEvent::ContextCompression {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                snapshot_id: detail.snapshot_id.clone(),
+                                kind: detail.kind.clone(),
+                                status: detail.status.clone(),
+                                detail: Some(detail),
+                            };
+                            events.push(captured_event(&event));
+                            yield event;
+                        }
+                        if compression_result.runtime_tool_state_compressed {
+                            let started_at = utc_timestamp();
+                            let completed_at = utc_timestamp();
+                            for status in ["start", "completed"] {
+                                let detail = ContextCompressionEventDetail {
+                                    status: status.to_string(),
+                                    kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                                    snapshot_id: None,
+                                    original_token_count: None,
+                                    summary_token_count: None,
+                                    started_at: Some(started_at.clone()),
+                                    completed_at: (status == "completed").then(|| completed_at.clone()),
+                                    provider_id: self.provider_id.clone(),
+                                    model_id: self.model_id.clone(),
+                                };
                                 let event = ChatSseEvent::ContextCompression {
                                     assistant_message_id: self.assistant_message_id.clone(),
-                                    snapshot_id: Some(snapshot.id.clone()),
-                                    kind: compression_snapshot_kind(snapshot).to_string(),
+                                    snapshot_id: None,
+                                    kind: detail.kind.clone(),
+                                    status: detail.status.clone(),
+                                    detail: Some(detail),
                                 };
                                 events.push(captured_event(&event));
                                 yield event;
                             }
-                        }
-                        if compression_result.runtime_tool_state_compressed {
-                            let event = ChatSseEvent::ContextCompression {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                snapshot_id: None,
-                                kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
-                            };
-                            events.push(captured_event(&event));
-                            yield event;
                         }
                         let packed_messages = match pack_neutral_messages(
                             self.provider_request.messages.clone(),
@@ -7812,6 +7861,8 @@ fn chat_statistics_response(
     llm_rows: Vec<LlmRequestAuditRow>,
     prompt_injections: Vec<PromptContextInjectionRecord>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
+    messages: Vec<MessageRecord>,
+    models: &[ModelSettings],
     runtime_tool_state_snapshot_count: i64,
     code_change_stats: CodeChangeStats,
     tool_breakdown: Vec<ChatToolBreakdown>,
@@ -7825,6 +7876,8 @@ fn chat_statistics_response(
     let memory_references = unique_prompt_context_memory_keys(&prompt_injections)? as i64;
     let compression =
         chat_compression_statistics(&compression_snapshots, runtime_tool_state_snapshot_count);
+    let context_usage_timeline =
+        context_usage_timeline(&compression_snapshots, &messages, &llm_rows, models)?;
 
     Ok(ChatStatisticsResponse {
         workspace_id: workspace_id.to_string(),
@@ -7849,6 +7902,7 @@ fn chat_statistics_response(
         provider_breakdown: ai_summary.provider_breakdown,
         tool_breakdown,
         compression,
+        context_usage_timeline,
     })
 }
 
@@ -7911,6 +7965,115 @@ fn chat_compression_statistics(
         summary_token_count,
         saved_token_count: (original_token_count - summary_token_count).max(0),
     }
+}
+
+fn context_usage_timeline(
+    snapshots: &[ContextCompressionSnapshotRecord],
+    messages: &[MessageRecord],
+    llm_rows: &[LlmRequestAuditRow],
+    models: &[ModelSettings],
+) -> Result<Vec<ContextUsageTimelineEntry>, ApiError> {
+    let fallback_limits = llm_rows
+        .first()
+        .and_then(|row| models.iter().find(|model| model.id == row.model_id))
+        .and_then(|model| model.limits.as_ref())
+        .or_else(|| models.iter().find_map(|model| model.limits.as_ref()));
+
+    snapshots
+        .iter()
+        .map(|snapshot| context_usage_timeline_entry(snapshot, messages, fallback_limits))
+        .collect()
+}
+
+fn context_usage_timeline_entry(
+    snapshot: &ContextCompressionSnapshotRecord,
+    messages: &[MessageRecord],
+    fallback_limits: Option<&ModelLimits>,
+) -> Result<ContextUsageTimelineEntry, ApiError> {
+    let metadata = parse_json_value(
+        &snapshot.metadata_json,
+        "context compression snapshot metadata",
+    )?;
+    if let Some(usage) = metadata.get("contextUsage") {
+        let segments = usage
+            .get("segments")
+            .cloned()
+            .map(serde_json::from_value::<ContextUsageSegments>)
+            .transpose()
+            .map_err(|source| ApiError::internal(source.to_string()))?
+            .unwrap_or_default();
+        return Ok(ContextUsageTimelineEntry {
+            snapshot_id: snapshot.id.clone(),
+            sequence: snapshot.sequence,
+            kind: compression_snapshot_kind(snapshot).to_string(),
+            context_window: usage
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    fallback_limits
+                        .map(|limits| limits.context_window)
+                        .unwrap_or(0)
+                }),
+            max_output_tokens: usage
+                .get("maxOutputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    fallback_limits
+                        .map(|limits| limits.max_output_tokens)
+                        .unwrap_or(0)
+                }),
+            trigger_tokens: usage
+                .get("triggerTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    fallback_limits
+                        .map(|limits| {
+                            context_window_compression_trigger_tokens(limits.context_window)
+                        })
+                        .unwrap_or(0)
+                }),
+            total_used_tokens: usage
+                .get("totalUsedTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| context_usage_segments_total(&segments)),
+            segments,
+        });
+    }
+
+    let context_window = fallback_limits
+        .map(|limits| limits.context_window)
+        .unwrap_or(0);
+    let max_output_tokens = fallback_limits
+        .map(|limits| limits.max_output_tokens)
+        .unwrap_or(0);
+    let history = messages
+        .iter()
+        .filter(|message| {
+            message.sequence > snapshot.source_message_end_sequence
+                || message.sequence < snapshot.source_message_start_sequence
+        })
+        .map(|message| estimate_text_tokens(&message.content))
+        .sum::<u64>();
+    // ponytail: old snapshots did not persist exact post-compression prompt segments,
+    // so this estimates from stored message text and the snapshot summary only. Upgrade
+    // path is the new contextUsage metadata written when snapshots are created.
+    let segments = ContextUsageSegments {
+        compression_snapshot: u64::try_from(snapshot.summary_token_count.max(0)).unwrap_or(0),
+        history,
+        reserved_output: max_output_tokens,
+        ..ContextUsageSegments::default()
+    };
+
+    Ok(ContextUsageTimelineEntry {
+        snapshot_id: snapshot.id.clone(),
+        sequence: snapshot.sequence,
+        kind: compression_snapshot_kind(snapshot).to_string(),
+        context_window,
+        max_output_tokens,
+        trigger_tokens: context_window_compression_trigger_tokens(context_window),
+        total_used_tokens: context_usage_segments_total(&segments),
+        segments,
+    })
 }
 
 fn compression_snapshot_kind(snapshot: &ContextCompressionSnapshotRecord) -> &'static str {
@@ -8695,6 +8858,17 @@ fn assistant_parts_from_metadata(
                         "assistant message metadata references missing tool call '{tool_call_id}'"
                     ))
                 }),
+            StoredChatMessagePart::ContextCompression {
+                id,
+                status,
+                kind,
+                detail,
+            } => Ok(ChatMessagePart::ContextCompression {
+                id,
+                status,
+                kind,
+                detail,
+            }),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -9459,6 +9633,12 @@ fn materialize_missing_assistant_parts(
                     }
                 }
             }
+            "context_compression" => {
+                push_context_compression_part(
+                    parts_by_message.entry(message_id.to_string()).or_default(),
+                    &value,
+                );
+            }
             _ => {}
         }
     }
@@ -9539,6 +9719,155 @@ fn push_materialized_tool_call_part(
                 tool_call: (*tool_call).clone(),
             });
     }
+}
+
+fn push_context_compression_part(parts: &mut Vec<ChatMessagePart>, value: &Value) {
+    let Some(next_part) = context_compression_part_from_value(value) else {
+        return;
+    };
+    let Some(existing) = parts
+        .iter_mut()
+        .find(|part| context_compression_parts_match(part, &next_part))
+    else {
+        parts.push(next_part);
+        return;
+    };
+
+    merge_context_compression_part(existing, next_part);
+}
+
+fn context_compression_part_from_value(value: &Value) -> Option<ChatMessagePart> {
+    let kind = string_json_field(value, "kind", "kind")
+        .map(normalize_context_compression_kind)
+        .unwrap_or_else(|| CONTEXT_COMPRESSION_KIND_RULE.to_string());
+    let status = string_json_field(value, "status", "status")
+        .unwrap_or("completed")
+        .to_string();
+    let top_snapshot_id = string_json_field(value, "snapshotId", "snapshot_id").map(str::to_string);
+    let mut detail = value
+        .get("detail")
+        .and_then(|detail| {
+            serde_json::from_value::<ContextCompressionEventDetail>(detail.clone()).ok()
+        })
+        .unwrap_or_else(|| ContextCompressionEventDetail {
+            status: status.clone(),
+            kind: kind.clone(),
+            snapshot_id: top_snapshot_id.clone(),
+            original_token_count: None,
+            summary_token_count: None,
+            started_at: None,
+            completed_at: None,
+            provider_id: String::new(),
+            model_id: String::new(),
+        });
+    detail.status = status.clone();
+    detail.kind = kind.clone();
+    if detail.snapshot_id.is_none() {
+        detail.snapshot_id = top_snapshot_id;
+    }
+    let id = context_compression_part_id(&kind, &detail);
+
+    Some(ChatMessagePart::ContextCompression {
+        id,
+        status,
+        kind,
+        detail,
+    })
+}
+
+fn normalize_context_compression_kind(kind: &str) -> String {
+    match kind {
+        CONTEXT_COMPRESSION_KIND_LLM => CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+        "runtime_tool_state" | CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE => {
+            CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string()
+        }
+        _ => CONTEXT_COMPRESSION_KIND_RULE.to_string(),
+    }
+}
+
+fn context_compression_part_id(kind: &str, detail: &ContextCompressionEventDetail) -> String {
+    detail.snapshot_id.clone().unwrap_or_else(|| {
+        format!(
+            "{kind}:{}",
+            detail.started_at.as_deref().unwrap_or("pending")
+        )
+    })
+}
+
+fn context_compression_parts_match(current: &ChatMessagePart, next: &ChatMessagePart) -> bool {
+    let ChatMessagePart::ContextCompression {
+        id: current_id,
+        status: current_status,
+        kind: current_kind,
+        detail: current_detail,
+    } = current
+    else {
+        return false;
+    };
+    let ChatMessagePart::ContextCompression {
+        id: next_id,
+        status: next_status,
+        kind: next_kind,
+        detail: next_detail,
+    } = next
+    else {
+        return false;
+    };
+
+    current_id == next_id
+        || (current_kind == next_kind
+            && current_detail.started_at.is_some()
+            && current_detail.started_at == next_detail.started_at)
+        || (current_kind == next_kind
+            && current_status == "start"
+            && next_status == "completed"
+            && current_detail.snapshot_id.is_none())
+}
+
+fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessagePart) {
+    let ChatMessagePart::ContextCompression {
+        id,
+        status,
+        kind,
+        detail,
+    } = current
+    else {
+        return;
+    };
+    let ChatMessagePart::ContextCompression {
+        id: next_id,
+        status: next_status,
+        kind: next_kind,
+        detail: next_detail,
+    } = next
+    else {
+        return;
+    };
+
+    detail.snapshot_id = next_detail
+        .snapshot_id
+        .or_else(|| detail.snapshot_id.clone());
+    detail.original_token_count = next_detail
+        .original_token_count
+        .or(detail.original_token_count);
+    detail.summary_token_count = next_detail
+        .summary_token_count
+        .or(detail.summary_token_count);
+    detail.started_at = next_detail.started_at.or_else(|| detail.started_at.clone());
+    detail.completed_at = next_detail
+        .completed_at
+        .or_else(|| detail.completed_at.clone());
+    if !next_detail.provider_id.is_empty() {
+        detail.provider_id = next_detail.provider_id;
+    }
+    if !next_detail.model_id.is_empty() {
+        detail.model_id = next_detail.model_id;
+    }
+    detail.status = next_status.clone();
+    detail.kind = next_kind.clone();
+    *id = detail.snapshot_id.clone().unwrap_or(next_id);
+    *status = next_status;
+    *kind = next_kind;
 }
 
 #[cfg(test)]
@@ -10196,6 +10525,7 @@ fn finalized_assistant_message_parts(
             "text_delta"
                 | "reasoning_delta"
                 | "tool_call"
+                | "context_compression"
                 | "stream_attempt_start"
                 | "stream_reset"
         ) {
@@ -10238,6 +10568,9 @@ fn finalized_assistant_message_parts(
                         tool_call_id,
                     );
                 }
+            }
+            "context_compression" => {
+                push_context_compression_part(&mut parts, &value);
             }
             "stream_attempt_start" => {
                 stream_attempt_snapshot = Some((
@@ -10360,6 +10693,17 @@ fn stored_chat_message_parts(
             }
             ChatMessagePart::ToolCall { tool_call } => Ok(StoredChatMessagePart::ToolCall {
                 tool_call_id: tool_call.id,
+            }),
+            ChatMessagePart::ContextCompression {
+                id,
+                status,
+                kind,
+                detail,
+            } => Ok(StoredChatMessagePart::ContextCompression {
+                id,
+                status,
+                kind,
+                detail,
             }),
             ChatMessagePart::Attachment { .. } => Err(ApiError::internal(
                 "assistant message history parts must not contain attachments",

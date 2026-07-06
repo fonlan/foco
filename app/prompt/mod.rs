@@ -10,7 +10,8 @@ pub(crate) use compression::{
     context_token_breakdown,
 };
 pub(crate) use compression::{
-    compression_snapshot_message, context_usage_response, ensure_context_compression,
+    active_compression_snapshots, compression_snapshot_message, context_usage_response, context_usage_segments_total,
+    context_window_compression_trigger_tokens, ensure_context_compression,
     interleaved_tool_state_messages, neutral_assistant_tool_call_message,
     neutral_message_estimated_tokens, neutral_tool_call_from_record, pack_neutral_messages,
     persist_chat_result, persist_running_llm_request, recover_after_tool_round_cap,

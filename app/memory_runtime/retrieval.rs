@@ -1471,6 +1471,7 @@ fn replay_stored_assistant_parts(
                     &mut replayed_tool_call_ids,
                 )?;
             }
+            StoredChatMessagePart::ContextCompression { .. } => {}
         }
     }
 

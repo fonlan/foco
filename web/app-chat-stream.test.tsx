@@ -623,7 +623,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("shows context compression badges from stream side events", async () => {
+  it("shows context compression parts from stream side events", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     await userEvent.type(
@@ -637,12 +637,52 @@ describe("app-chat-stream verification surfaces", () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
         kind: "rule",
-        snapshotId: "snapshot-rule-1",
+        status: "start",
         type: "contextCompression",
+        detail: {
+          kind: "rule",
+          originalTokenCount: 1200,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-06T06:00:00Z",
+          status: "start",
+        },
       });
     });
 
-    expect(await screen.findByText("Rule compressed")).toBeInTheDocument();
+    expect(await screen.findByText("Context compression")).toBeInTheDocument();
+    expect(screen.getByText("Compressing")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        kind: "rule",
+        snapshotId: "snapshot-rule-1",
+        status: "completed",
+        type: "contextCompression",
+        detail: {
+          kind: "rule",
+          snapshotId: "snapshot-rule-1",
+          originalTokenCount: 1200,
+          summaryTokenCount: 320,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-06T06:00:00Z",
+          completedAt: "2026-07-06T06:00:01Z",
+          status: "completed",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Compressed")).toBeInTheDocument();
+    expect(screen.getByText(/Saved 880 tokens/)).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    await userEvent.click(screen.getByText("Context compression"));
+    expect(screen.getByText("Original tokens")).toBeInTheDocument();
+    expect(screen.getByText("Compressed tokens")).toBeInTheDocument();
+    expect(screen.getByText("snapshot-rule-1")).toBeInTheDocument();
+    expect(screen.getAllByText("openai").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("gpt-test").length).toBeGreaterThan(0);
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

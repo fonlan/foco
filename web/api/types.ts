@@ -445,6 +445,28 @@ export type ChatAttachmentPartSummary = {
   previewDataUrl: string | null;
 };
 
+export type ChatContextCompressionKind = "rule" | "llm" | "runtimeToolState";
+
+export type ChatContextCompressionDetail = {
+  status?: string;
+  kind?: ChatContextCompressionKind;
+  snapshotId?: string | null;
+  originalTokenCount?: number | null;
+  summaryTokenCount?: number | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  providerId?: string | null;
+  modelId?: string | null;
+};
+
+export type ChatContextCompressionPart = {
+  type: "contextCompression";
+  id: string;
+  status: string;
+  kind: ChatContextCompressionKind;
+  detail: ChatContextCompressionDetail;
+};
+
 export type ChatMessagePart =
   | { type: "text"; text: string }
   | { type: "error"; text: string }
@@ -456,7 +478,8 @@ export type ChatMessagePart =
       startedAtMs?: number;
     }
   | { type: "attachment"; attachment: ChatAttachmentPartSummary }
-  | { type: "toolCall"; toolCall: ChatToolCallSummary };
+  | { type: "toolCall"; toolCall: ChatToolCallSummary }
+  | ChatContextCompressionPart;
 
 export type ChatAttachmentPayload = {
   id: string;
@@ -613,7 +636,9 @@ export type ChatStreamEvent =
     type: "contextCompression";
     assistantMessageId: string;
     snapshotId?: string;
-    kind: "rule" | "llm" | "runtimeToolState";
+    kind: ChatContextCompressionKind;
+    status: string;
+    detail?: ChatContextCompressionDetail | null;
   }
   | { type: "usage"; usage?: ChatUsage }
   | {
@@ -760,6 +785,26 @@ export type ChatStatisticsResponse = {
   providerBreakdown: AiStatisticsProviderBreakdown[];
   toolBreakdown: ChatToolBreakdown[];
   compression: ChatCompressionStatistics;
+  contextUsageTimeline: ContextUsageTimelineEntry[];
+};
+
+export type ContextUsageSegments = {
+  systemPrompt: number;
+  toolSchema: number;
+  compressionSnapshot: number;
+  history: number;
+  reservedOutput: number;
+};
+
+export type ContextUsageTimelineEntry = {
+  snapshotId: string;
+  sequence: number;
+  kind: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+  triggerTokens: number;
+  totalUsedTokens: number;
+  segments: ContextUsageSegments;
 };
 
 export type LiveChatStatistics = {
@@ -789,13 +834,24 @@ type ContextSourceTokenBreakdown = {
 
 export type ContextUsageResponse = {
   usedMessageTokens: number;
+  assembledMessageTokens: number;
+  postCompressionMessageTokens: number;
+  packedMessageTokens: number;
   availableMessageTokens: number;
+  contextWindow: number;
+  maxOutputTokens: number;
+  systemPromptTokens: number;
+  toolSchemaTokens: number;
+  historyTokens: number;
+  compressionSnapshotTokens: number;
+  totalUsedContextTokens: number;
   memoryContextTokens: number;
   memoryBudgetTokens: number;
   usagePercent: number;
   compressionTriggerTokens: number;
   compressionTriggerPercent: number;
   willCompressOnNextSend: boolean;
+  segments: ContextUsageSegments;
   tokenBreakdown: ContextTokenBreakdown;
 };
 

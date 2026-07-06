@@ -1390,6 +1390,22 @@ pub fn plan_context_compression(
     active_tool_start_index: usize,
     preserve_recent_messages: usize,
 ) -> Option<ContextCompressionPlan> {
+    plan_context_compression_at_trigger(
+        messages,
+        available_tokens,
+        context_compression_trigger_tokens(available_tokens),
+        active_tool_start_index,
+        preserve_recent_messages,
+    )
+}
+
+pub fn plan_context_compression_at_trigger(
+    messages: &[ContextPackItem],
+    available_tokens: u64,
+    trigger_tokens: u64,
+    active_tool_start_index: usize,
+    preserve_recent_messages: usize,
+) -> Option<ContextCompressionPlan> {
     if available_tokens == 0 {
         return None;
     }
@@ -1398,7 +1414,6 @@ pub fn plan_context_compression(
         .iter()
         .map(|message| message.estimated_tokens)
         .sum::<u64>();
-    let trigger_tokens = context_compression_trigger_tokens(available_tokens);
 
     if used_tokens <= trigger_tokens {
         return None;

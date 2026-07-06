@@ -767,8 +767,14 @@ fn serialized_provider_request_promotes_leading_system_messages_to_instructions(
         .and_then(Value::as_array)
         .expect("messages array");
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("developer"));
-    assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
+    assert_eq!(
+        messages[0].get("role").and_then(Value::as_str),
+        Some("developer")
+    );
+    assert_eq!(
+        messages[1].get("role").and_then(Value::as_str),
+        Some("user")
+    );
 }
 
 #[tokio::test]
@@ -5148,6 +5154,83 @@ fn finalized_assistant_parts_persist_reasoning_duration_from_stream_events() {
     assert!(
         matches!(&parts[0], ChatMessagePart::Reasoning { text, duration_ms: Some(1500) } if text == "Think.")
     );
+}
+
+#[test]
+fn finalized_assistant_parts_persist_context_compression_events() {
+    let events = [
+        (
+            "context_compression",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "rule",
+                "status": "start",
+                "detail": {
+                    "status": "start",
+                    "kind": "rule",
+                    "originalTokenCount": 1200,
+                    "startedAt": "2026-06-18T10:00:00Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            }),
+        ),
+        (
+            "context_compression",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "rule",
+                "snapshotId": "snapshot-1",
+                "status": "completed",
+                "detail": {
+                    "status": "completed",
+                    "kind": "rule",
+                    "snapshotId": "snapshot-1",
+                    "originalTokenCount": 1200,
+                    "summaryTokenCount": 320,
+                    "startedAt": "2026-06-18T10:00:00Z",
+                    "completedAt": "2026-06-18T10:00:01Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-06-18T10:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let stored_parts =
+        finalized_assistant_message_parts("assistant-1", &events, "Done.", None, &[])
+            .expect("stored parts");
+    let metadata_json = assistant_message_metadata_json(
+        None,
+        &[],
+        &CodeChangeStats::default(),
+        None,
+        Some(&stored_parts),
+    )
+    .expect("assistant metadata");
+    let parts = assistant_parts_from_metadata(&metadata_json, &[])
+        .expect("hydrate parts")
+        .expect("stored parts present");
+
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(
+        &parts[0],
+        ChatMessagePart::ContextCompression { id, status, detail, .. }
+            if id == "snapshot-1"
+                && status == "completed"
+                && detail.original_token_count == Some(1200)
+                && detail.summary_token_count == Some(320)
+    ));
+    assert!(matches!(&parts[1], ChatMessagePart::Text { text } if text == "Done."));
 }
 
 #[test]
@@ -15157,6 +15240,131 @@ fn model_memory_retrieval_keeps_all_small_candidate_sets() {
 }
 
 #[tokio::test]
+async fn context_usage_preview_uses_only_active_compression_snapshots() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-context-active-snapshot-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-context-active-snapshot-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-active-snapshot", "Compressed history")
+            .expect("chat insert");
+        for (sequence, role, content) in [
+            (1, "user", "first message covered by old snapshot"),
+            (2, "assistant", "second message covered by new snapshot"),
+            (3, "user", "visible tail message"),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id: &format!("message-{sequence}"),
+                    chat_id: "chat-active-snapshot",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("message insert");
+        }
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id: "ctx-old",
+                chat_id: "chat-active-snapshot",
+                run_id: "run-1",
+                sequence: 0,
+                summary: "old compressed summary",
+                source_message_start_sequence: 1,
+                source_message_end_sequence: 1,
+                original_token_count: 100,
+                summary_token_count: 10,
+                metadata_json: Some(&json!({ "kind": "rule", "coveredSequences": [1] }).to_string()),
+            })
+            .expect("old snapshot insert");
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id: "ctx-new",
+                chat_id: "chat-active-snapshot",
+                run_id: "run-2",
+                sequence: 1,
+                summary: "new compressed summary",
+                source_message_start_sequence: 1,
+                source_message_end_sequence: 2,
+                original_token_count: 120,
+                summary_token_count: 12,
+                metadata_json: Some(
+                    &json!({
+                        "kind": "llm",
+                        "coveredSequences": [1, 2],
+                        "coveredSnapshotIds": ["ctx-old"],
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("new snapshot insert");
+    }
+
+    let prompt_context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: Some("chat-active-snapshot".to_string()),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: None,
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("prompt context");
+    let assembled_text = prompt_context
+        .provider_request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(assembled_text.contains("new compressed summary"));
+    assert!(!assembled_text.contains("old compressed summary"));
+    assert!(!assembled_text.contains("first message covered by old snapshot"));
+    assert!(!assembled_text.contains("second message covered by new snapshot"));
+    assert!(assembled_text.contains("visible tail message"));
+    assert_eq!(prompt_context.compression_snapshots.len(), 1);
+
+    let usage =
+        context_usage_response(&prompt_context).expect("context usage from assembled prompt");
+    let compression_entry = usage
+        .token_breakdown
+        .by_source
+        .iter()
+        .find(|entry| entry.source == PromptContextSourceBucket::CompressionSnapshot)
+        .expect("compression snapshot usage");
+    assert!(compression_entry.tokens > 0);
+    assert_eq!(
+        compression_entry.tokens,
+        crate::prompt::neutral_message_estimated_tokens(&crate::prompt::compression_snapshot_message(
+            &prompt_context.compression_snapshots[0],
+        ))
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-budget-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-budget-profile-test"));
@@ -15215,11 +15423,125 @@ async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
     assert!(usage.available_message_tokens < 20_000);
     assert_eq!(
         usage.compression_trigger_tokens,
-        context_compression_trigger_tokens(usage.available_message_tokens)
+        context_compression_trigger_tokens(usage.context_window)
     );
     assert_eq!(usage.compression_trigger_percent, 80);
-    assert!(usage.usage_percent > usage.compression_trigger_percent);
+    assert!(usage.total_used_context_tokens >= usage.compression_trigger_tokens);
     assert!(usage.will_compress_on_next_send);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshots() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-context-timeline-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-context-timeline-profile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.providers.push(ProviderSettings {
+        id: "provider".to_string(),
+        name: "Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+    config.models.push(ModelSettings {
+        id: "model".to_string(),
+        display_name: "Model".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 20_000,
+            max_output_tokens: 1_000,
+        }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-context-timeline", "Timeline")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "message-after-snapshot",
+                chat_id: "chat-context-timeline",
+                role: "user",
+                content: "after snapshot",
+                sequence: 3,
+                metadata_json: Some("{}"),
+            })
+            .expect("message insert");
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id: "ctx-timeline-1",
+                chat_id: "chat-context-timeline",
+                run_id: "run-timeline",
+                sequence: 1,
+                summary: "compressed summary",
+                source_message_start_sequence: 0,
+                source_message_end_sequence: 2,
+                original_token_count: 120,
+                summary_token_count: 12,
+                metadata_json: Some(
+                    &json!({
+                        "kind": CONTEXT_COMPRESSION_KIND_RULE,
+                        "contextUsage": {
+                            "contextWindow": 20_000,
+                            "maxOutputTokens": 1_000,
+                            "triggerTokens": 16_000,
+                            "totalUsedTokens": 1_345,
+                            "segments": {
+                                "systemPrompt": 100,
+                                "toolSchema": 200,
+                                "compressionSnapshot": 40,
+                                "history": 5,
+                                "reservedOutput": 1_000
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("snapshot insert");
+    }
+
+    let Json(stats) = crate::http::chat::chat_statistics(
+        State(state),
+        AxumPath((
+            config.workspaces[0].id.clone(),
+            "chat-context-timeline".to_string(),
+        )),
+    )
+    .await
+    .expect("chat statistics");
+
+    assert_eq!(stats.context_usage_timeline.len(), 1);
+    let entry = &stats.context_usage_timeline[0];
+    assert_eq!(entry.snapshot_id, "ctx-timeline-1");
+    assert_eq!(entry.context_window, 20_000);
+    assert_eq!(entry.max_output_tokens, 1_000);
+    assert_eq!(entry.trigger_tokens, 16_000);
+    assert_eq!(entry.total_used_tokens, 1_345);
+    assert_eq!(entry.segments.reserved_output, 1_000);
+    assert_eq!(entry.segments.compression_snapshot, 40);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
@@ -15328,14 +15650,16 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     );
     assert_eq!(
         usage.compression_trigger_tokens,
-        context_compression_trigger_tokens(prompt_context.context_budget.available_message_tokens)
+        context_compression_trigger_tokens(prompt_context.context_budget.context_window)
+    );
+    assert_eq!(usage.compression_trigger_percent, 80);
+    assert_eq!(
+        usage.context_window,
+        prompt_context.context_budget.context_window
     );
     assert_eq!(
-        usage.compression_trigger_percent,
-        usage
-            .compression_trigger_tokens
-            .saturating_mul(100)
-            .div_ceil(usage.available_message_tokens)
+        usage.max_output_tokens,
+        prompt_context.context_budget.max_output_tokens
     );
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(database.chats().expect("chat list").is_empty());

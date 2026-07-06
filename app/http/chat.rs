@@ -162,14 +162,48 @@ pub(crate) struct ChatAttachmentPart {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContextUsageResponse {
     pub(crate) used_message_tokens: u64,
+    pub(crate) assembled_message_tokens: u64,
+    pub(crate) post_compression_message_tokens: u64,
+    pub(crate) packed_message_tokens: u64,
     pub(crate) available_message_tokens: u64,
+    pub(crate) context_window: u64,
+    pub(crate) max_output_tokens: u64,
+    pub(crate) system_prompt_tokens: u64,
+    pub(crate) tool_schema_tokens: u64,
+    pub(crate) history_tokens: u64,
+    pub(crate) compression_snapshot_tokens: u64,
+    pub(crate) total_used_context_tokens: u64,
     pub(crate) memory_context_tokens: u64,
     pub(crate) memory_budget_tokens: u64,
     pub(crate) usage_percent: u64,
     pub(crate) compression_trigger_tokens: u64,
     pub(crate) compression_trigger_percent: u64,
     pub(crate) will_compress_on_next_send: bool,
+    pub(crate) segments: ContextUsageSegments,
     pub(crate) token_breakdown: ContextTokenBreakdown,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextUsageSegments {
+    pub(crate) system_prompt: u64,
+    pub(crate) tool_schema: u64,
+    pub(crate) compression_snapshot: u64,
+    pub(crate) history: u64,
+    pub(crate) reserved_output: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextUsageTimelineEntry {
+    pub(crate) snapshot_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) kind: String,
+    pub(crate) context_window: u64,
+    pub(crate) max_output_tokens: u64,
+    pub(crate) trigger_tokens: u64,
+    pub(crate) total_used_tokens: u64,
+    pub(crate) segments: ContextUsageSegments,
 }
 
 #[derive(Deserialize)]
@@ -304,6 +338,7 @@ pub(crate) struct ChatStatisticsResponse {
     pub(crate) provider_breakdown: Vec<AiStatisticsProviderBreakdown>,
     pub(crate) tool_breakdown: Vec<ChatToolBreakdown>,
     pub(crate) compression: ChatCompressionStatistics,
+    pub(crate) context_usage_timeline: Vec<ContextUsageTimelineEntry>,
 }
 
 #[derive(Serialize)]
@@ -1914,6 +1949,9 @@ pub(crate) async fn chat_statistics(
     let compression_snapshots = database
         .context_compression_snapshots_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
+    let messages = database
+        .messages_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
     let runtime_tool_state_snapshot_count = database
         .runtime_tool_state_compression_count_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
@@ -1950,6 +1988,8 @@ pub(crate) async fn chat_statistics(
         llm_rows,
         prompt_injections,
         compression_snapshots,
+        messages,
+        &config.models,
         runtime_tool_state_snapshot_count,
         code_change_stats,
         tool_breakdown,

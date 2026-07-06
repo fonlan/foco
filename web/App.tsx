@@ -70,6 +70,9 @@ import type {
   BrowserRouteFileTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
+  ChatContextCompressionDetail,
+  ChatContextCompressionKind,
+  ChatContextCompressionPart,
   ChatExtractedMemorySummary,
   ChatMemoryUsedSummary,
   ChatMessagePart,
@@ -7753,7 +7756,7 @@ export function App() {
             setMessagesForChatKey(chatKey, (current) =>
               current.map((message) =>
                 isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                  ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
+                  ? assistantMessageWithContextCompression(message, streamEvent)
                   : message,
               ),
             );
@@ -8754,7 +8757,7 @@ export function App() {
             setMessagesForChatKey(runMessagesKey, (current) =>
               current.map((message) =>
                 isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                  ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
+                  ? assistantMessageWithContextCompression(message, streamEvent)
                   : message,
               ),
             );
@@ -12209,9 +12212,7 @@ function addChatRunBadge(
   return { ...message, runBadges: [...runBadges, badge] };
 }
 
-function contextCompressionBadge(
-  kind: "rule" | "llm" | "runtimeToolState",
-): ChatRunBadge {
+function contextCompressionBadge(kind: ChatContextCompressionKind): ChatRunBadge {
   if (kind === "llm") {
     return "contextCompressionLlm";
   }
@@ -12219,6 +12220,129 @@ function contextCompressionBadge(
     return "contextCompressionRuntime";
   }
   return "contextCompressionRule";
+}
+
+function assistantMessageWithContextCompression(
+  message: ShellMessage,
+  streamEvent: Extract<ChatStreamEvent, { type: "contextCompression" }>,
+): ShellMessage {
+  const messageWithBadge = addChatRunBadge(
+    message,
+    contextCompressionBadge(streamEvent.kind),
+  );
+  return {
+    ...messageWithBadge,
+    parts: upsertContextCompressionPart(messageWithBadge.parts, streamEvent),
+  };
+}
+
+function contextCompressionEventPart(
+  streamEvent: Extract<ChatStreamEvent, { type: "contextCompression" }>,
+): ChatContextCompressionPart {
+  const detail = normalizedContextCompressionDetail({
+    ...(streamEvent.detail ?? {}),
+    status: streamEvent.detail?.status ?? streamEvent.status,
+    kind: streamEvent.detail?.kind ?? streamEvent.kind,
+    snapshotId: streamEvent.detail?.snapshotId ?? streamEvent.snapshotId ?? null,
+  });
+  return {
+    type: "contextCompression",
+    id: contextCompressionPartId(streamEvent.kind, detail),
+    status: streamEvent.status,
+    kind: streamEvent.kind,
+    detail,
+  };
+}
+
+function contextCompressionPartId(
+  kind: ChatContextCompressionKind,
+  detail: ChatContextCompressionDetail,
+) {
+  return detail.snapshotId ?? `${kind}:${detail.startedAt ?? "pending"}`;
+}
+
+function upsertContextCompressionPart(
+  parts: ChatMessagePart[],
+  streamEvent: Extract<ChatStreamEvent, { type: "contextCompression" }>,
+): ChatMessagePart[] {
+  const nextPart = contextCompressionEventPart(streamEvent);
+  const existingIndex = parts.findIndex((part) => {
+    if (part.type !== "contextCompression") {
+      return false;
+    }
+    return part.id === nextPart.id || contextCompressionPartsMatch(part, nextPart);
+  });
+
+  if (existingIndex === -1) {
+    return [...parts, nextPart];
+  }
+
+  return parts.map((part, index) =>
+    index === existingIndex && part.type === "contextCompression"
+      ? mergeContextCompressionPart(part, nextPart)
+      : part,
+  );
+}
+
+function contextCompressionPartsMatch(
+  current: ChatContextCompressionPart,
+  next: ChatContextCompressionPart,
+) {
+  if (current.kind !== next.kind) {
+    return false;
+  }
+  if (
+    current.detail.startedAt &&
+    next.detail.startedAt &&
+    current.detail.startedAt === next.detail.startedAt
+  ) {
+    return true;
+  }
+  return (
+    current.status === "start" &&
+    next.status === "completed" &&
+    !current.detail.snapshotId
+  );
+}
+
+function mergeContextCompressionPart(
+  current: ChatContextCompressionPart,
+  next: ChatContextCompressionPart,
+): ChatContextCompressionPart {
+  const detail = normalizedContextCompressionDetail({
+    ...current.detail,
+    ...next.detail,
+    snapshotId: next.detail.snapshotId ?? current.detail.snapshotId ?? null,
+    originalTokenCount:
+      next.detail.originalTokenCount ?? current.detail.originalTokenCount ?? null,
+    summaryTokenCount:
+      next.detail.summaryTokenCount ?? current.detail.summaryTokenCount ?? null,
+    startedAt: next.detail.startedAt ?? current.detail.startedAt ?? null,
+    completedAt: next.detail.completedAt ?? current.detail.completedAt ?? null,
+    providerId: next.detail.providerId ?? current.detail.providerId ?? null,
+    modelId: next.detail.modelId ?? current.detail.modelId ?? null,
+  });
+  return {
+    ...next,
+    id: detail.snapshotId ?? current.id,
+    detail,
+  };
+}
+
+function normalizedContextCompressionDetail(
+  detail: ChatContextCompressionDetail,
+): ChatContextCompressionDetail {
+  return {
+    status: detail.status,
+    kind: detail.kind,
+    snapshotId: detail.snapshotId ?? null,
+    originalTokenCount: detail.originalTokenCount ?? null,
+    summaryTokenCount: detail.summaryTokenCount ?? null,
+    startedAt: detail.startedAt ?? null,
+    completedAt: detail.completedAt ?? null,
+    providerId: detail.providerId ?? null,
+    modelId: detail.modelId ?? null,
+  };
 }
 
 type StreamAttemptSnapshot = {
@@ -12703,6 +12827,9 @@ function messageCopyText(
       if (part.type === "attachment") {
         return part.attachment.path ?? part.attachment.name;
       }
+      if (part.type === "contextCompression") {
+        return `context compression ${part.kind} ${part.status}`.trim();
+      }
       return `${part.toolCall.name} ${part.toolCall.status}`.trim();
     })
     .map((partText) => partText.trim())
@@ -13036,6 +13163,7 @@ function emptyChatStatistics(
       summaryTokenCount: 0,
       savedTokenCount: 0,
     },
+    contextUsageTimeline: [],
   };
 }
 
@@ -13608,15 +13736,11 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "assistant_message_id",
     );
     const snapshotId = stringField(value, "snapshotId", "snapshot_id");
-    const kindValue = stringField(value, "kind") ?? "rule";
-    const kind =
-      kindValue === "llm"
-        ? "llm"
-        : kindValue === "runtimeToolState" || kindValue === "runtime_tool_state"
-          ? "runtimeToolState"
-          : "rule";
+    const kind = parseContextCompressionKind(fieldValue(value, "kind"));
+    const status = stringField(value, "status") ?? "completed";
+    const detail = parseContextCompressionDetail(fieldValue(value, "detail"));
 
-    if (!assistantMessageId || (kind !== "runtimeToolState" && !snapshotId)) {
+    if (!assistantMessageId || !kind || detail === false) {
       return null;
     }
 
@@ -13625,6 +13749,8 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       assistantMessageId,
       ...(snapshotId ? { snapshotId } : {}),
       kind,
+      status,
+      detail: detail ?? null,
     };
   }
   if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
@@ -14103,6 +14229,76 @@ function describeChatStreamEvent(value: unknown) {
   }
 }
 
+function parseContextCompressionKind(
+  value: unknown,
+): ChatContextCompressionKind | null {
+  if (value === "llm") {
+    return "llm";
+  }
+  if (value === "runtimeToolState" || value === "runtime_tool_state") {
+    return "runtimeToolState";
+  }
+  if (value === "rule" || typeof value === "undefined" || value === null) {
+    return "rule";
+  }
+  return null;
+}
+
+function parseContextCompressionDetail(
+  value: unknown,
+): ChatContextCompressionDetail | null | false {
+  if (typeof value === "undefined" || value === null) {
+    return null;
+  }
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+
+  const kind = parseContextCompressionKind(fieldValue(value, "kind"));
+  const status = optionalStringField(value, "status");
+  const snapshotId = optionalNullableStringField(value, "snapshotId", "snapshot_id");
+  const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
+  const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
+  const providerId = optionalNullableStringField(value, "providerId", "provider_id");
+  const modelId = optionalNullableStringField(value, "modelId", "model_id");
+  const originalTokenCount = optionalNumberField(
+    value,
+    "originalTokenCount",
+    "original_token_count",
+  );
+  const summaryTokenCount = optionalNumberField(
+    value,
+    "summaryTokenCount",
+    "summary_token_count",
+  );
+
+  if (
+    !kind ||
+    status === null ||
+    snapshotId === false ||
+    startedAt === false ||
+    completedAt === false ||
+    providerId === false ||
+    modelId === false ||
+    originalTokenCount === false ||
+    summaryTokenCount === false
+  ) {
+    return false;
+  }
+
+  return normalizedContextCompressionDetail({
+    ...(status ? { status } : {}),
+    kind,
+    snapshotId: snapshotId ?? null,
+    originalTokenCount: originalTokenCount ?? null,
+    summaryTokenCount: summaryTokenCount ?? null,
+    startedAt: startedAt ?? null,
+    completedAt: completedAt ?? null,
+    providerId: providerId ?? null,
+    modelId: modelId ?? null,
+  });
+}
+
 function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
   if (!isObjectRecord(value)) {
     return null;
@@ -14527,6 +14723,28 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       fieldValue(part, "toolCall", "tool_call"),
     );
     return toolCall ? { type: "toolCall", toolCall } : null;
+  }
+
+  if (part.type === "contextCompression" || part.type === "context_compression") {
+    const kind = parseContextCompressionKind(fieldValue(part, "kind"));
+    const status = stringField(part, "status") ?? "completed";
+    const detail = parseContextCompressionDetail(fieldValue(part, "detail"));
+    if (!kind || detail === false) {
+      return null;
+    }
+    const normalizedDetail = normalizedContextCompressionDetail({
+      ...(detail ?? {}),
+      status: detail?.status ?? status,
+      kind: detail?.kind ?? kind,
+    });
+    const id = stringField(part, "id") ?? contextCompressionPartId(kind, normalizedDetail);
+    return {
+      type: "contextCompression",
+      id,
+      status,
+      kind,
+      detail: normalizedDetail,
+    };
   }
 
   return null;

@@ -1867,6 +1867,10 @@ function MessagePartBlockComponent({
     );
   }
 
+  if (part.type === "contextCompression") {
+    return <ContextCompressionBlock compression={part} helpers={helpers} />;
+  }
+
   if (part.type === "attachment") {
     return <AttachmentPartBlock attachment={part.attachment} helpers={helpers} isUser={isUser} />;
   }
@@ -2458,6 +2462,105 @@ function CompactToolCallView({
         : "border-stone-200 text-stone-700"
         }`}
     >{text}</pre>
+  );
+}
+
+function contextCompressionKindLabel(kind: "rule" | "llm" | "runtimeToolState", t: Translate) {
+  if (kind === "llm") {
+    return t("LLM");
+  }
+  if (kind === "runtimeToolState") {
+    return t("Runtime tool state");
+  }
+  return t("Rule");
+}
+
+function contextCompressionStatusLabel(status: string, t: Translate) {
+  if (status === "start") {
+    return t("Compressing");
+  }
+  if (status === "completed") {
+    return t("Compressed");
+  }
+  return status || "-";
+}
+
+function formatContextCompressionTokenDelta(
+  originalTokenCount: number | null | undefined,
+  summaryTokenCount: number | null | undefined,
+  t: Translate,
+) {
+  if (typeof originalTokenCount !== "number" || typeof summaryTokenCount !== "number") {
+    return "-";
+  }
+  const savedTokens = Math.max(0, originalTokenCount - summaryTokenCount);
+  return t("Saved {count} tokens", { count: savedTokens.toLocaleString() });
+}
+
+function ContextCompressionBlock({
+  compression,
+  helpers,
+}: {
+  compression: Extract<ChatMessagePart, { type: "contextCompression" }>;
+  helpers: ChatPanelHelpers;
+}) {
+  const { formatChatCreatedAt } = helpers;
+  const { t } = useI18n();
+  const detail = compression.detail;
+  const kindLabel = contextCompressionKindLabel(compression.kind, t);
+  const statusLabel = contextCompressionStatusLabel(compression.status, t);
+  const originalTokenCount = detail.originalTokenCount ?? null;
+  const summaryTokenCount = detail.summaryTokenCount ?? null;
+  const savedLabel = formatContextCompressionTokenDelta(
+    originalTokenCount,
+    summaryTokenCount,
+    t,
+  );
+  const modelLabel = [detail.providerId, detail.modelId].filter(Boolean).join(" / ") || "-";
+  const fields = [
+    [t("Original tokens"), originalTokenCount?.toLocaleString() ?? "-"],
+    [t("Compressed tokens"), summaryTokenCount?.toLocaleString() ?? "-"],
+    [t("Started"), detail.startedAt ? formatChatCreatedAt(detail.startedAt) : "-"],
+    [t("Ended"), detail.completedAt ? formatChatCreatedAt(detail.completedAt) : "-"],
+    [t("Provider"), detail.providerId || "-"],
+    [t("Model"), detail.modelId || "-"],
+    ["snapshotId", detail.snapshotId ?? "-"],
+    ["kind", compression.kind],
+  ];
+
+  return (
+    <details className="tool-call-block group min-w-0">
+      <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
+        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span className="min-w-0 shrink-0 truncate">{t("Context compression")}</span>
+        <span className="shrink-0 text-stone-300">·</span>
+        <span className="shrink-0 text-stone-500">{kindLabel}</span>
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+          title={`${savedLabel} · ${modelLabel}`}
+        >
+          {savedLabel} · {modelLabel}
+        </span>
+        <span
+          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${compression.status === "completed"
+              ? "bg-emerald-50 text-emerald-700"
+              : "bg-stone-100 text-stone-600"
+            }`}
+        >
+          {statusLabel}
+        </span>
+      </summary>
+      <div className="mt-2 grid gap-1.5 border-l border-stone-200 pl-3 text-[11px] text-stone-600">
+        {fields.map(([label, value]) => (
+          <div className="flex min-w-0 gap-2" key={label}>
+            <span className="w-32 shrink-0 font-semibold text-stone-500">{label}</span>
+            <span className="min-w-0 flex-1 truncate font-mono" title={value}>
+              {value}
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 

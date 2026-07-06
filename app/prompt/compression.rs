@@ -5,7 +5,7 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::workspace::{ContextCompressionSnapshotRecord, ToolCallWithResultRecord};
 use serde_json::{Value, json};
 
-use crate::http::chat::ContextUsageResponse;
+use crate::http::chat::{ContextUsageResponse, ContextUsageSegments};
 use crate::*;
 
 pub(crate) fn neutral_tool_call_from_record(
@@ -106,6 +106,7 @@ pub(crate) async fn ensure_context_compression(
     )?;
 
     let mut runtime_tool_state_compressed = compress_runtime_tool_state_if_needed(context, false)?;
+    let mut events = Vec::new();
 
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -113,24 +114,32 @@ pub(crate) async fn ensure_context_compression(
         &context.message_context_sources,
         context.active_tool_start_index,
     )?;
-    let used_tokens = message_groups
-        .iter()
-        .map(|group| group.estimated_tokens)
-        .sum::<u64>();
-    if used_tokens
-        > llm_context_compression_trigger_tokens(context.context_budget.available_message_tokens)
-        && ensure_llm_context_compression(context, &message_groups).await?
+    let segments = context_usage_segments(&context.context_budget, &message_groups);
+    let total_used_context_tokens = context_usage_segments_total(&segments);
+    let compression_trigger_tokens =
+        context_window_compression_trigger_tokens(context.context_budget.context_window);
+    if total_used_context_tokens >= compression_trigger_tokens
+        && ensure_llm_context_compression(context, &message_groups, &mut events).await?
     {
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
             runtime_tool_state_compressed,
+            events,
         });
     }
     let pack_items = pack_items_from_message_groups(&message_groups);
 
-    let Some(plan) = plan_context_compression(
+    let message_trigger_tokens = compression_trigger_tokens.saturating_sub(
+        context
+            .context_budget
+            .system_prompt_tokens
+            .saturating_add(context.context_budget.tool_schema_tokens)
+            .saturating_add(context.context_budget.max_output_tokens),
+    );
+    let Some(plan) = plan_context_compression_at_trigger(
         &pack_items,
         context.context_budget.available_message_tokens,
+        message_trigger_tokens.saturating_sub(1),
         active_tool_start_group_index(&message_groups, context.active_tool_start_index),
         CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
     ) else {
@@ -144,6 +153,7 @@ pub(crate) async fn ensure_context_compression(
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
             runtime_tool_state_compressed,
+            events,
         });
     };
     let covered_indices = message_group_indices(&message_groups, &plan.covered_indices)?;
@@ -159,6 +169,7 @@ pub(crate) async fn ensure_context_compression(
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
             runtime_tool_state_compressed,
+            events,
         });
     }
 
@@ -200,24 +211,36 @@ pub(crate) async fn ensure_context_compression(
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
+        events.pop();
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
             runtime_tool_state_compressed,
+            events,
         });
     }
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
-    let metadata_json = json!({
+    let mut metadata = json!({
         "kind": CONTEXT_COMPRESSION_KIND_RULE,
         "coveredSequences": covered_sequences,
-        "triggerTokens": plan.trigger_tokens,
+        "triggerTokens": context_window_compression_trigger_tokens(context.context_budget.context_window),
         "availableMessageTokens": context.context_budget.available_message_tokens
-    })
-    .to_string();
+    });
     let original_token_count = i64::try_from(plan.original_tokens)
         .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
     let summary_token_count_i64 = i64::try_from(summary_token_count)
         .map_err(|_| ApiError::internal("context compression summary token count exceeds i64"))?;
+    let compression_started_at = utc_timestamp();
+    events.push(context_compression_event_detail(
+        "start",
+        CONTEXT_COMPRESSION_KIND_RULE,
+        None,
+        Some(original_token_count),
+        Some(summary_token_count_i64),
+        Some(compression_started_at.clone()),
+        None,
+        context,
+    ));
     let source_message_start_sequence = covered_sequences
         .first()
         .copied()
@@ -227,11 +250,51 @@ pub(crate) async fn ensure_context_compression(
         .copied()
         .ok_or_else(|| ApiError::internal("context compression has no source message sequence"))?;
 
+    let mut snapshot = ContextCompressionSnapshotRecord {
+        id: snapshot_id,
+        chat_id: context.chat_id.clone(),
+        run_id: context.llm_request_id.clone(),
+        sequence: snapshot_sequence,
+        summary: summary.clone(),
+        source_message_start_sequence,
+        source_message_end_sequence,
+        original_token_count,
+        summary_token_count: summary_token_count_i64,
+        created_at: utc_timestamp(),
+        metadata_json: String::new(),
+    };
+
+    let replaced_messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        &covered_indices,
+        compression_snapshot_message(&snapshot),
+    );
+    let replaced_sequences = replace_covered_sequences_with_snapshot(
+        &context.message_source_sequences,
+        &covered_indices,
+    );
+    let replaced_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        &covered_indices,
+        PromptContextSource::CompressionSnapshot,
+    );
+    let replaced_active_tool_start_index =
+        compressed_active_tool_start_index(context.active_tool_start_index, &covered_indices);
+    metadata["contextUsage"] = post_compression_context_usage_metadata(
+        context,
+        &replaced_messages,
+        &replaced_sequences,
+        &replaced_sources,
+        replaced_active_tool_start_index,
+    )?;
+    let metadata_json = metadata.to_string();
+    snapshot.metadata_json = metadata_json.clone();
+
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     database
         .insert_context_compression_snapshot(NewContextCompressionSnapshot {
-            id: &snapshot_id,
+            id: &snapshot.id,
             chat_id: &context.chat_id,
             run_id: &context.llm_request_id,
             sequence: snapshot_sequence,
@@ -244,38 +307,11 @@ pub(crate) async fn ensure_context_compression(
         })
         .map_err(ApiError::from_workspace_error)?;
 
-    let created_at = utc_timestamp();
-    let snapshot = ContextCompressionSnapshotRecord {
-        id: snapshot_id,
-        chat_id: context.chat_id.clone(),
-        run_id: context.llm_request_id.clone(),
-        sequence: snapshot_sequence,
-        summary: summary.clone(),
-        source_message_start_sequence,
-        source_message_end_sequence,
-        original_token_count,
-        summary_token_count: summary_token_count_i64,
-        created_at,
-        metadata_json,
-    };
-
-    context.provider_request.messages = replace_covered_messages_with_snapshot(
-        &context.provider_request.messages,
-        &covered_indices,
-        compression_snapshot_message(&snapshot),
-    );
-    context.message_source_sequences = replace_covered_sequences_with_snapshot(
-        &context.message_source_sequences,
-        &covered_indices,
-    );
-    context.message_context_sources = replace_covered_sources_with_snapshot(
-        &context.message_context_sources,
-        &covered_indices,
-        PromptContextSource::CompressionSnapshot,
-    );
-    context.active_tool_start_index =
-        compressed_active_tool_start_index(context.active_tool_start_index, &covered_indices);
-    context.compression_snapshots.push(snapshot);
+    context.provider_request.messages = replaced_messages;
+    context.message_source_sequences = replaced_sequences;
+    context.message_context_sources = replaced_sources;
+    context.active_tool_start_index = replaced_active_tool_start_index;
+    context.compression_snapshots.push(snapshot.clone());
 
     let post_summary = context
         .hook_runtime
@@ -309,6 +345,16 @@ pub(crate) async fn ensure_context_compression(
         &mut context.message_context_sources,
         &post_summary.additional_context,
     );
+    events.push(context_compression_event_detail(
+        "completed",
+        CONTEXT_COMPRESSION_KIND_RULE,
+        Some(snapshot.id.clone()),
+        Some(snapshot.original_token_count),
+        Some(snapshot.summary_token_count),
+        Some(compression_started_at),
+        Some(utc_timestamp()),
+        context,
+    ));
 
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -324,17 +370,37 @@ pub(crate) async fn ensure_context_compression(
     Ok(ContextCompressionResult {
         active_tool_start_index: context.active_tool_start_index,
         runtime_tool_state_compressed,
+        events,
     })
 }
 
-fn llm_context_compression_trigger_tokens(available_tokens: u64) -> u64 {
-    available_tokens.saturating_mul(LLM_CONTEXT_COMPRESSION_TRIGGER_NUMERATOR)
-        / LLM_CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR
+fn context_compression_event_detail(
+    status: &str,
+    kind: &str,
+    snapshot_id: Option<String>,
+    original_token_count: Option<i64>,
+    summary_token_count: Option<i64>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    context: &PreparedChatContext,
+) -> ContextCompressionEventDetail {
+    ContextCompressionEventDetail {
+        status: status.to_string(),
+        kind: kind.to_string(),
+        snapshot_id,
+        original_token_count,
+        summary_token_count,
+        started_at,
+        completed_at,
+        provider_id: context.provider_id.clone(),
+        model_id: context.model_id.clone(),
+    }
 }
 
 async fn ensure_llm_context_compression(
     context: &mut PreparedChatContext,
     message_groups: &[ContextMessageGroup],
+    events: &mut Vec<ContextCompressionEventDetail>,
 ) -> Result<bool, ApiError> {
     let covered_group_indices = llm_context_compression_group_indices(message_groups);
     if covered_group_indices.is_empty() {
@@ -348,6 +414,19 @@ async fn ensure_llm_context_compression(
     if original_tokens == 0 {
         return Ok(false);
     }
+    let compression_started_at = utc_timestamp();
+    events.push(context_compression_event_detail(
+        "start",
+        CONTEXT_COMPRESSION_KIND_LLM,
+        None,
+        Some(i64::try_from(original_tokens).map_err(|_| {
+            ApiError::internal("context compression original token count exceeds i64")
+        })?),
+        None,
+        Some(compression_started_at.clone()),
+        None,
+        context,
+    ));
 
     let source_summary = context_compression_summary_allowing_snapshots(
         &context.provider_request.messages,
@@ -357,11 +436,19 @@ async fn ensure_llm_context_compression(
     let summary = llm_context_compression_summary(context, &source_summary).await?;
     let summary_token_count = estimate_text_tokens(&summary);
     if summary_token_count >= original_tokens {
+        events.pop();
         return Ok(false);
     }
 
+    let covered_snapshot_ids = compression_covered_snapshot_ids(
+        &context.provider_request.messages,
+        &context.message_context_sources,
+        &covered_indices,
+    );
     let covered_sequences = compression_covered_sequences_allowing_snapshots(
+        &context.provider_request.messages,
         &context.message_source_sequences,
+        &context.compression_snapshots,
         &covered_indices,
     );
     let pre_summary = context
@@ -401,10 +488,11 @@ async fn ensure_llm_context_compression(
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
+        events.pop();
         return Ok(false);
     }
 
-    persist_context_compression_snapshot(
+    let snapshot = persist_context_compression_snapshot(
         context,
         &covered_indices,
         summary,
@@ -414,10 +502,22 @@ async fn ensure_llm_context_compression(
         json!({
             "kind": CONTEXT_COMPRESSION_KIND_LLM,
             "coveredSequences": covered_sequences,
-            "triggerTokens": llm_context_compression_trigger_tokens(context.context_budget.available_message_tokens),
+            "coveredSnapshotIds": covered_snapshot_ids,
+            "supersededSnapshotIds": covered_snapshot_ids,
+            "triggerTokens": context_window_compression_trigger_tokens(context.context_budget.context_window),
             "availableMessageTokens": context.context_budget.available_message_tokens
         }),
     )?;
+    events.push(context_compression_event_detail(
+        "completed",
+        CONTEXT_COMPRESSION_KIND_LLM,
+        Some(snapshot.id.clone()),
+        Some(snapshot.original_token_count),
+        Some(snapshot.summary_token_count),
+        Some(compression_started_at),
+        Some(utc_timestamp()),
+        context,
+    ));
 
     let post_summary = context
         .hook_runtime
@@ -658,11 +758,10 @@ fn persist_context_compression_snapshot(
     original_tokens: u64,
     summary_token_count: u64,
     kind: &str,
-    metadata: Value,
-) -> Result<(), ApiError> {
+    mut metadata: Value,
+) -> Result<ContextCompressionSnapshotRecord, ApiError> {
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
-    let metadata_json = metadata.to_string();
     let original_token_count = i64::try_from(original_tokens)
         .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
     let summary_token_count_i64 = i64::try_from(summary_token_count)
@@ -670,11 +769,48 @@ fn persist_context_compression_snapshot(
     let (source_message_start_sequence, source_message_end_sequence) =
         compression_source_sequence_range(&context.message_source_sequences, covered_indices);
 
+    let mut snapshot = ContextCompressionSnapshotRecord {
+        id: snapshot_id,
+        chat_id: context.chat_id.clone(),
+        run_id: context.llm_request_id.clone(),
+        sequence: snapshot_sequence,
+        summary: summary.clone(),
+        source_message_start_sequence,
+        source_message_end_sequence,
+        original_token_count,
+        summary_token_count: summary_token_count_i64,
+        created_at: utc_timestamp(),
+        metadata_json: String::new(),
+    };
+    let replaced_messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        covered_indices,
+        compression_snapshot_message(&snapshot),
+    );
+    let replaced_sequences =
+        replace_covered_sequences_with_snapshot(&context.message_source_sequences, covered_indices);
+    let replaced_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        covered_indices,
+        PromptContextSource::CompressionSnapshot,
+    );
+    let replaced_active_tool_start_index =
+        compressed_active_tool_start_index(context.active_tool_start_index, covered_indices);
+    metadata["contextUsage"] = post_compression_context_usage_metadata(
+        context,
+        &replaced_messages,
+        &replaced_sequences,
+        &replaced_sources,
+        replaced_active_tool_start_index,
+    )?;
+    let metadata_json = metadata.to_string();
+    snapshot.metadata_json = metadata_json.clone();
+
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     database
         .insert_context_compression_snapshot(NewContextCompressionSnapshot {
-            id: &snapshot_id,
+            id: &snapshot.id,
             chat_id: &context.chat_id,
             run_id: &context.llm_request_id,
             sequence: snapshot_sequence,
@@ -687,46 +823,21 @@ fn persist_context_compression_snapshot(
         })
         .map_err(ApiError::from_workspace_error)?;
 
-    let snapshot = ContextCompressionSnapshotRecord {
-        id: snapshot_id,
-        chat_id: context.chat_id.clone(),
-        run_id: context.llm_request_id.clone(),
-        sequence: snapshot_sequence,
-        summary: summary.clone(),
-        source_message_start_sequence,
-        source_message_end_sequence,
-        original_token_count,
-        summary_token_count: summary_token_count_i64,
-        created_at: utc_timestamp(),
-        metadata_json,
-    };
-
-    context.provider_request.messages = replace_covered_messages_with_snapshot(
-        &context.provider_request.messages,
-        covered_indices,
-        compression_snapshot_message(&snapshot),
-    );
-    context.message_source_sequences =
-        replace_covered_sequences_with_snapshot(&context.message_source_sequences, covered_indices);
-    context.message_context_sources = replace_covered_sources_with_snapshot(
-        &context.message_context_sources,
-        covered_indices,
-        PromptContextSource::CompressionSnapshot,
-    );
-    context.active_tool_start_index =
-        compressed_active_tool_start_index(context.active_tool_start_index, covered_indices);
-    context.compression_snapshots.push(snapshot);
+    context.provider_request.messages = replaced_messages;
+    context.message_source_sequences = replaced_sequences;
+    context.message_context_sources = replaced_sources;
+    context.active_tool_start_index = replaced_active_tool_start_index;
+    context.compression_snapshots.push(snapshot.clone());
 
     tracing::debug!(kind = kind, "created context compression snapshot");
-    Ok(())
+    Ok(snapshot)
 }
 
 fn compression_source_sequence_range(
     message_source_sequences: &[Option<i64>],
     covered_indices: &[usize],
 ) -> (i64, i64) {
-    let sequences =
-        compression_covered_sequences_allowing_snapshots(message_source_sequences, covered_indices);
+    let sequences = direct_covered_sequences(message_source_sequences, covered_indices);
     let start = sequences.first().copied().unwrap_or(0);
     let end = sequences.last().copied().unwrap_or(start);
     (start, end)
@@ -1068,31 +1179,58 @@ fn compact_tool_output_for_runtime_summary(tool_name: &str, content: &str) -> St
     }
 }
 
+pub(crate) fn active_compression_snapshots(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> Vec<ContextCompressionSnapshotRecord> {
+    let superseded_ids = snapshots
+        .iter()
+        .flat_map(snapshot_superseded_snapshot_ids)
+        .collect::<HashSet<_>>();
+
+    snapshots
+        .iter()
+        .filter(|snapshot| !superseded_ids.contains(&snapshot.id))
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn snapshot_covered_sequences(
     snapshots: &[ContextCompressionSnapshotRecord],
 ) -> HashSet<i64> {
     let mut sequences = HashSet::new();
 
     for snapshot in snapshots {
-        if let Ok(metadata) = serde_json::from_str::<Value>(&snapshot.metadata_json) {
-            if let Some(covered_sequences) =
-                metadata.get("coveredSequences").and_then(Value::as_array)
-            {
-                for sequence in covered_sequences.iter().filter_map(Value::as_i64) {
-                    sequences.insert(sequence);
-                }
-                continue;
-            }
-        }
-
-        for sequence in
-            snapshot.source_message_start_sequence..=snapshot.source_message_end_sequence
-        {
-            sequences.insert(sequence);
-        }
+        sequences.extend(snapshot_covered_sequence_vec(snapshot));
     }
 
     sequences
+}
+
+fn snapshot_covered_sequence_vec(snapshot: &ContextCompressionSnapshotRecord) -> Vec<i64> {
+    if let Ok(metadata) = serde_json::from_str::<Value>(&snapshot.metadata_json) {
+        if let Some(covered_sequences) = metadata.get("coveredSequences").and_then(Value::as_array)
+        {
+            return covered_sequences.iter().filter_map(Value::as_i64).collect();
+        }
+    }
+
+    (snapshot.source_message_start_sequence..=snapshot.source_message_end_sequence).collect()
+}
+
+fn snapshot_superseded_snapshot_ids(snapshot: &ContextCompressionSnapshotRecord) -> Vec<String> {
+    serde_json::from_str::<Value>(&snapshot.metadata_json)
+        .ok()
+        .into_iter()
+        .flat_map(|metadata| {
+            ["supersededSnapshotIds", "coveredSnapshotIds"]
+                .into_iter()
+                .filter_map(move |key| metadata.get(key).and_then(Value::as_array).cloned())
+        })
+        .flat_map(|ids| {
+            ids.into_iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+        })
+        .collect()
 }
 
 pub(crate) fn compression_snapshot_message(
@@ -1305,6 +1443,80 @@ fn context_compression_summary_allowing_snapshots(
 }
 
 fn compression_covered_sequences_allowing_snapshots(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    snapshots: &[ContextCompressionSnapshotRecord],
+    covered_indices: &[usize],
+) -> Vec<i64> {
+    let mut sequences = Vec::new();
+
+    for index in covered_indices {
+        if let Some(sequence) = message_source_sequences
+            .get(*index)
+            .and_then(|sequence| *sequence)
+        {
+            sequences.push(sequence);
+            continue;
+        }
+
+        let Some(message) = messages.get(*index) else {
+            continue;
+        };
+        let Some(snapshot_id) = compression_snapshot_id_from_message(message) else {
+            continue;
+        };
+        let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.id == snapshot_id) else {
+            continue;
+        };
+        sequences.extend(snapshot_covered_sequence_vec(snapshot));
+    }
+
+    sequences.sort_unstable();
+    sequences.dedup();
+    sequences
+}
+
+fn compression_covered_snapshot_ids(
+    messages: &[NeutralChatMessage],
+    message_context_sources: &[PromptContextSource],
+    covered_indices: &[usize],
+) -> Vec<String> {
+    let mut ids = covered_indices
+        .iter()
+        .filter(|index| {
+            message_context_sources
+                .get(**index)
+                .is_some_and(|source| matches!(source, PromptContextSource::CompressionSnapshot))
+        })
+        .filter_map(|index| {
+            messages
+                .get(*index)
+                .and_then(compression_snapshot_id_from_message)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn compression_snapshot_id_from_message(message: &NeutralChatMessage) -> Option<String> {
+    if let Some(start) = message.content.find("<snapshot_id>") {
+        let start = start + "<snapshot_id>".len();
+        let end = message.content[start..].find("</snapshot_id>")? + start;
+        return Some(message.content[start..end].trim().to_string());
+    }
+
+    message
+        .content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Snapshot ID: `"))
+        .and_then(|rest| rest.split('`').next())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn direct_covered_sequences(
     message_source_sequences: &[Option<i64>],
     covered_indices: &[usize],
 ) -> Vec<i64> {
@@ -2069,6 +2281,66 @@ pub(crate) fn prompt_context_source_bucket_label(
     }
 }
 
+fn post_compression_context_usage_metadata(
+    context: &PreparedChatContext,
+    messages: &[NeutralChatMessage],
+    source_sequences: &[Option<i64>],
+    sources: &[PromptContextSource],
+    active_tool_start_index: usize,
+) -> Result<Value, ApiError> {
+    let message_groups =
+        context_message_groups(messages, source_sequences, sources, active_tool_start_index)?;
+    let segments = context_usage_segments(&context.context_budget, &message_groups);
+    Ok(json!({
+        "contextWindow": context.context_budget.context_window,
+        "maxOutputTokens": context.context_budget.max_output_tokens,
+        "triggerTokens": context_window_compression_trigger_tokens(context.context_budget.context_window),
+        "totalUsedTokens": context_usage_segments_total(&segments),
+        "segments": segments,
+    }))
+}
+
+pub(crate) fn context_usage_segments(
+    budget: &foco_agent::ContextBudget,
+    groups: &[ContextMessageGroup],
+) -> ContextUsageSegments {
+    let mut segments = ContextUsageSegments {
+        system_prompt: budget.system_prompt_tokens,
+        tool_schema: budget.tool_schema_tokens,
+        reserved_output: budget.max_output_tokens,
+        ..ContextUsageSegments::default()
+    };
+
+    for group in groups {
+        match group.source_bucket {
+            PromptContextSourceBucket::CompressionSnapshot => {
+                segments.compression_snapshot = segments
+                    .compression_snapshot
+                    .saturating_add(group.estimated_tokens);
+            }
+            PromptContextSourceBucket::ReservedPrompt => {}
+            _ => {
+                segments.history = segments.history.saturating_add(group.estimated_tokens);
+            }
+        }
+    }
+
+    segments
+}
+
+pub(crate) fn context_usage_segments_total(segments: &ContextUsageSegments) -> u64 {
+    segments
+        .system_prompt
+        .saturating_add(segments.tool_schema)
+        .saturating_add(segments.compression_snapshot)
+        .saturating_add(segments.history)
+        .saturating_add(segments.reserved_output)
+}
+
+pub(crate) fn context_window_compression_trigger_tokens(context_window: u64) -> u64 {
+    context_compression_trigger_tokens(context_window)
+}
+
 pub(crate) fn context_usage_response(
     context: &PreparedPromptContext,
 ) -> Result<ContextUsageResponse, ApiError> {
@@ -2078,34 +2350,56 @@ pub(crate) fn context_usage_response(
         &context.message_context_sources,
         context.active_tool_start_index,
     )?;
-    let pack_items = pack_items_from_message_groups(&message_groups);
-    let used_message_tokens = message_groups
+    let assembled_message_tokens = message_groups
         .iter()
         .map(|group| group.estimated_tokens)
         .sum::<u64>();
     let available_message_tokens = context.context_budget.available_message_tokens;
-    let compression_trigger_tokens = context_compression_trigger_tokens(available_message_tokens);
-    let usage_percent = percentage_ceil(used_message_tokens, available_message_tokens);
-    let compression_trigger_percent =
-        percentage_ceil(compression_trigger_tokens, available_message_tokens);
+    let context_window = context.context_budget.context_window;
+    let max_output_tokens = context.context_budget.max_output_tokens;
+    let segments = context_usage_segments(&context.context_budget, &message_groups);
+    let total_used_context_tokens = context_usage_segments_total(&segments);
     let token_breakdown = context_token_breakdown(&message_groups);
-    let will_compress_on_next_send = plan_context_compression(
-        &pack_items,
-        available_message_tokens,
-        active_tool_start_group_index(&message_groups, context.active_tool_start_index),
-        CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
-    )
-    .is_some();
+    let packed_message_tokens = if token_breakdown.required_tokens > available_message_tokens {
+        assembled_message_tokens
+    } else {
+        pack_neutral_messages(
+            context.provider_request.messages.clone(),
+            &context.message_source_sequences,
+            &context.message_context_sources,
+            &context.context_budget,
+            context.active_tool_start_index,
+        )?
+        .iter()
+        .map(neutral_message_estimated_tokens)
+        .sum::<u64>()
+    };
+    let used_message_tokens = packed_message_tokens;
+    let compression_trigger_tokens = context_window_compression_trigger_tokens(context_window);
+    let usage_percent = percentage_ceil(total_used_context_tokens, context_window);
+    let compression_trigger_percent = 80;
+    let will_compress_on_next_send = total_used_context_tokens >= compression_trigger_tokens;
 
     Ok(ContextUsageResponse {
         used_message_tokens,
+        assembled_message_tokens,
+        post_compression_message_tokens: assembled_message_tokens,
+        packed_message_tokens,
         available_message_tokens,
+        context_window,
+        max_output_tokens,
+        system_prompt_tokens: segments.system_prompt,
+        tool_schema_tokens: segments.tool_schema,
+        history_tokens: segments.history,
+        compression_snapshot_tokens: segments.compression_snapshot,
+        total_used_context_tokens,
         memory_context_tokens: context.memory_context_tokens,
         memory_budget_tokens: context.memory_budget_tokens,
         usage_percent,
         compression_trigger_tokens,
         compression_trigger_percent,
         will_compress_on_next_send,
+        segments,
         token_breakdown,
     })
 }
