@@ -2670,6 +2670,8 @@ describe("app-panels-stats verification surfaces", () => {
     expect(within(contextTimeline).getByText("Snapshot 1")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Snapshot 2")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Past 80%")).toBeInTheDocument();
+    expect(within(contextTimeline).getAllByText("80%")).not.toHaveLength(0);
+    expect(within(contextTimeline).getAllByText("95%")).not.toHaveLength(0);
     const contextLegend = within(contextTimeline).getByLabelText("Context usage legend");
     expect(within(contextLegend).getByText("Prompt/tools")).toBeInTheDocument();
     expect(within(contextLegend).getByText("History")).toBeInTheDocument();

@@ -2505,8 +2505,11 @@ function ContextUsageBar({
             style={{ backgroundColor: segment.color, width: `${segment.widthPercent}%` }}
           />
         ))}
-        <span className="context-usage-trigger-marker" aria-hidden="true">
+        <span className="context-usage-trigger-marker is-tool-state" aria-hidden="true">
           <span>80%</span>
+        </span>
+        <span className="context-usage-trigger-marker is-llm" aria-hidden="true">
+          <span>95%</span>
         </span>
       </div>
       <div className="context-usage-bar-footer">
