@@ -2566,6 +2566,30 @@ body,
   padding: 0.625rem;
 }
 
+.context-usage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.625rem;
+  margin-top: 0.625rem;
+  color: var(--foco-text-muted);
+  font-size: var(--foco-font-micro);
+}
+
+.context-usage-legend-item {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+
+.context-usage-legend-swatch {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+}
+
 .context-usage-history-stack {
   display: grid;
   gap: 0.5rem;
@@ -2577,7 +2601,7 @@ body,
 .context-usage-bar-row {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 7.25rem) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 4.75rem) minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.5rem;
 }
@@ -2626,13 +2650,16 @@ body,
   min-width: 0;
   height: 100%;
 }
-
 .context-usage-bar-segment.is-first {
   border-radius: 999px 0 0 999px;
 }
 
 .context-usage-bar-segment.is-last {
   border-radius: 0 999px 999px 0;
+}
+
+.context-usage-bar-segment.is-first.is-last {
+  border-radius: 999px;
 }
 
 .context-usage-trigger-marker {

@@ -2321,20 +2321,11 @@ function ContextStatsTab({
 
       <ContextStatsSection title={t("Context mix")}>
         {contextUsage ? (
-          <>
-            <div className="context-stats-inline">
-              <span>{t("Context usage")}</span>
-              <strong>
-                {formatNumber(contextUsage.usedMessageTokens, language)} /{" "}
-                {formatNumber(contextUsage.availableMessageTokens, language)}
-              </strong>
-            </div>
-            <ContextMiniBarChart
-              data={contextChart}
-              emptyLabel={t("No context usage yet.")}
-              valueFormatter={(value) => formatNumber(value, language)}
-            />
-          </>
+          <ContextMiniBarChart
+            data={contextChart}
+            emptyLabel={t("No context usage yet.")}
+            valueFormatter={(value) => formatNumber(value, language)}
+          />
         ) : (
           <div className="context-empty-inline">{t("Context usage unavailable.")}</div>
         )}
@@ -2398,10 +2389,7 @@ function ContextUsageTimelinePanel({
   const currentEntry: ContextUsageBarEntry = {
     id: "current",
     label: t("Current"),
-    meta: `${formatNumber(contextUsage.totalUsedContextTokens, language)} / ${formatNumber(
-      contextUsage.contextWindow,
-      language,
-    )}`,
+    usagePercent: contextUsage.usagePercent,
     contextWindow: contextUsage.contextWindow,
     totalUsedTokens: contextUsage.totalUsedContextTokens,
     segments: contextUsage.segments,
@@ -2418,6 +2406,18 @@ function ContextUsageTimelinePanel({
   return (
     <section className="context-usage-timeline-panel" aria-label={t("Context usage timeline")}>
       <ContextUsageBar entry={currentEntry} isCurrent />
+      <div className="context-usage-legend" aria-label={t("Context usage legend")}>
+        {CONTEXT_USAGE_SEGMENT_STYLES.map((segment) => (
+          <span className="context-usage-legend-item" key={segment.key}>
+            <span
+              aria-hidden="true"
+              className="context-usage-legend-swatch"
+              style={{ backgroundColor: segment.color }}
+            />
+            {t(segment.label)}
+          </span>
+        ))}
+      </div>
       {historyEntries.length ? (
         <div className="context-usage-history-stack">
           {historyEntries.map((entry) => (
@@ -2432,7 +2432,8 @@ function ContextUsageTimelinePanel({
 type ContextUsageBarEntry = {
   id: string;
   label: string;
-  meta: string;
+  meta?: string;
+  usagePercent?: number;
   contextWindow: number;
   totalUsedTokens: number;
   segments: ContextUsageSegments;
@@ -2456,6 +2457,8 @@ function ContextUsageBar({
   const contextWindow = Math.max(entry.contextWindow, 1);
   const usedPercent = (entry.totalUsedTokens / contextWindow) * 100;
   const isPastTrigger = usedPercent >= 80;
+  const displayMeta =
+    typeof entry.usagePercent === "number" ? `${entry.usagePercent}%` : entry.meta;
   let usedPercentCursor = 0;
   const rawSegments = {
     promptTools: entry.segments.systemPrompt + entry.segments.toolSchema,
@@ -2479,9 +2482,11 @@ function ContextUsageBar({
         <span className="context-usage-bar-label" title={entry.label}>
           {entry.label}
         </span>
-        <span className="context-usage-bar-meta" title={entry.meta}>
-          {entry.meta}
-        </span>
+        {displayMeta ? (
+          <span className="context-usage-bar-meta" title={displayMeta}>
+            {displayMeta}
+          </span>
+        ) : null}
       </div>
       <div
         className="context-usage-bar-track"
@@ -3432,6 +3437,7 @@ function contextSourceLabel(source: string, t: Translate) {
     guidance: t("Guidance"),
     hookContext: t("Hook context"),
     persistedHistory: t("History"),
+    projectSpec: t("Project Spec"),
     reservedPrompt: t("Prompt"),
     runtimeAssistant: t("Runtime assistant"),
     runtimeToolState: t("Runtime tools"),

@@ -2664,12 +2664,17 @@ describe("app-panels-stats verification surfaces", () => {
       within(screen.getByText("Runtime tool-state snapshots").parentElement!)
         .getByText("2"),
     ).toBeInTheDocument();
-    expect(screen.getByText("52,340 / 110,960")).toBeInTheDocument();
+    expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     const contextTimeline = screen.getByLabelText("Context usage timeline");
-    expect(within(contextTimeline).getByText("68,340 / 128,000")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("53%")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Snapshot 1")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Snapshot 2")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Past 80%")).toBeInTheDocument();
+    const contextLegend = within(contextTimeline).getByLabelText("Context usage legend");
+    expect(within(contextLegend).getByText("Prompt/tools")).toBeInTheDocument();
+    expect(within(contextLegend).getByText("History")).toBeInTheDocument();
+    expect(within(contextLegend).getByText("Compression snapshot")).toBeInTheDocument();
+    expect(within(contextLegend).getByText("Reserved output")).toBeInTheDocument();
     expect(within(contextTimeline).getAllByLabelText(/Prompt\/tools:/)).not.toHaveLength(0);
     expect(within(contextTimeline).getAllByLabelText(/History:/)).not.toHaveLength(0);
     expect(within(contextTimeline).getAllByLabelText(/Compression snapshot:/)).not.toHaveLength(0);
@@ -2706,7 +2711,7 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(await screen.findByRole("tab", { name: "Stats" }));
 
     const contextMix = screen.getByText("Context mix").parentElement!;
-    expect(await within(contextMix).findByText("52,340 / 110,960")).toBeInTheDocument();
+    expect(within(contextMix).queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     expect(contextMix.querySelector(".context-mini-chart-bars")).not.toBeNull();
     expect(contextMix.querySelector(".context-stats-rows")).toBeNull();
     expect(within(contextMix).getAllByText("History")).toHaveLength(1);
