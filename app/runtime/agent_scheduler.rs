@@ -1819,6 +1819,9 @@ fn fail_claimed_task(
             interruption_reason: None,
         })
         .map_err(ApiError::from_workspace_error)?;
+    database
+        .fail_plan_phase_run(&task.id, message)
+        .map_err(ApiError::from_workspace_error)?;
     crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
         workspace_path,
         &task.id,
@@ -1964,6 +1967,126 @@ mod tests {
 
         let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
         assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
+    }
+
+    #[test]
+    fn fail_claimed_task_fails_linked_plan_phase() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-fail-claimed-task",
+                title: "Fail claimed task",
+                overview: "A scheduler persistence error must not leave a Plan phase running.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "plan-fail-claimed-task-phase",
+                    title: "Phase one",
+                    summary: "Attached task fails outside the normal outcome path.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "plan-fail-claimed-task-step",
+                        title: "Do work",
+                        detail: "Fail cleanly.",
+                        acceptance: vec!["phase is failed".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-fail-claimed-task", "start")
+            .expect("start plan");
+        database
+            .insert_chat("chat-fail-claimed-task", "Fail claimed task")
+            .expect("insert chat");
+        let team_id =
+            foco_agent::AgentTeamId::new("agent-team-fail-claimed-task").expect("team id");
+        let instance_id = foco_agent::AgentInstanceId::new("agent-instance-fail-claimed-task")
+            .expect("instance id");
+        let definition = foco_store::config::AgentDefinitionSettings {
+            id: foco_agent::AgentDefinitionId::new("agent-definition-fail-claimed-task")
+                .expect("definition id"),
+            revision: 1,
+            name: "Fail claimed task".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Be precise.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-fail-claimed-task",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            })
+            .expect("create team");
+        let task_id = AgentTaskId::new("agent-task-fail-claimed-task").expect("task id");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                "plan-fail-claimed-task",
+                "plan-fail-claimed-task-phase",
+                foco_store::workspace::PlanPhaseAttemptTrigger::Initial,
+                Some("provider-test"),
+                Some("model-test"),
+                None,
+            )
+            .expect("begin plan attempt");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                "chat-fail-claimed-task",
+                &team_id,
+                &task_id,
+            )
+            .expect("attach task");
+        database
+            .claim_runnable_agent_task(
+                &team_id,
+                &task_id,
+                &AgentAttemptId::new("agent-attempt-fail-claimed-task").expect("attempt id"),
+            )
+            .expect("claim task")
+            .expect("claimed");
+        drop(database);
+
+        fail_claimed_task(
+            workspace.path(),
+            &task_id,
+            "Agent task result_json exceeds 65536 bytes",
+        )
+        .expect("fail claimed task");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let plan = database
+            .plan("plan-fail-claimed-task")
+            .expect("plan")
+            .expect("plan");
+        assert_eq!(plan.status, "failed");
+        assert_eq!(plan.phases[0].status, "failed");
+        assert_eq!(plan.phases[0].steps[0].status, "failed");
+        assert_eq!(plan.phases[0].attempts[0].status, "failed");
     }
 
     #[test]
