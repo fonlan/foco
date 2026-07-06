@@ -720,10 +720,7 @@ fn retrieved_memory_context_message(
         };
     }
 
-    let prefix = format!(
-        "<memory_context>\n<source>{}</source>",
-        xml_text_escape(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
-    );
+    let prefix = format!("## Memory Context\n\nSource: {MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX}");
     let prefix_tokens = estimate_text_tokens(&prefix);
     if prefix_tokens > *remaining_tokens {
         return RetrievedMemoryContext {
@@ -738,16 +735,20 @@ fn retrieved_memory_context_message(
     let mut memory_keys = Vec::new();
     for retrieved_fact in facts {
         let fact = &retrieved_fact.fact;
+        let metadata = serde_json::to_string_pretty(&json!({
+            "id": fact.id,
+            "scope": fact.scope.to_string(),
+            "chatId": fact.chat_id.as_deref().unwrap_or("n/a"),
+            "kind": fact.kind.to_string(),
+            "pinned": fact.pinned,
+            "source": retrieved_fact.source.as_str(),
+            "updatedAt": fact.updated_at,
+        }))
+        .expect("memory fact metadata is always JSON serializable");
         let entry = format!(
-            "\n<memory_fact id=\"{}\" scope=\"{}\" chat_id=\"{}\" kind=\"{}\" pinned=\"{}\" source=\"{}\" updated_at=\"{}\">\n{}\n</memory_fact>",
-            xml_text_escape(&fact.id),
-            xml_text_escape(&fact.scope.to_string()),
-            xml_text_escape(fact.chat_id.as_deref().unwrap_or("n/a")),
-            xml_text_escape(&fact.kind.to_string()),
-            fact.pinned,
-            xml_text_escape(retrieved_fact.source.as_str()),
-            xml_text_escape(&fact.updated_at),
-            xml_cdata_section("fact", &fact.fact)
+            "\n\n### Memory Fact\n\n{}\n\n#### Fact\n\n{}",
+            markdown_code_block("json", &metadata),
+            markdown_code_block("text", &fact.fact),
         );
         let entry_tokens = estimate_text_tokens(&entry);
         if entry_tokens > *remaining_tokens {
@@ -766,8 +767,6 @@ fn retrieved_memory_context_message(
             memory_keys: Vec::new(),
         };
     }
-    content.push_str("\n</memory_context>");
-
     RetrievedMemoryContext {
         message: Some(neutral_text_message(role, content)),
         memories_used,

@@ -54,7 +54,7 @@ const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
 const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
-const AGENT_WAIT_RESUME_INSTRUCTION: &str = "<agent_wait_resume>\n<source>Foco Agent wait resume</source>\n<instructions>the following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.</instructions>\n</agent_wait_resume>";
+const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -828,7 +828,7 @@ fn apply_agent_prompt_layers(
                 "failed to serialize Agent message prompt: {source}"
             ))
         })?;
-        let prompt = xml_json_section("agent_unread_message", &payload_json);
+        let prompt = markdown_json_section("Agent Unread Message", &payload_json);
         let index = chat_context.active_tool_start_index;
         insert_agent_prompt_message(
             chat_context,
@@ -1025,7 +1025,7 @@ fn agent_team_protocol_prompt(
     Ok(format!(
         "{}\n{}",
         build_subagents_prompt_section(),
-        xml_json_section("agent_team_protocol", &protocol_json)
+        markdown_json_section("Agent Team Protocol", &protocol_json)
     ))
 }
 
@@ -1162,8 +1162,8 @@ fn agent_private_context_prompt(
             "failed to serialize Agent private context: {source}"
         ))
     })?;
-    Ok(Some(xml_json_section(
-        "agent_private_context",
+    Ok(Some(markdown_json_section(
+        "Agent Private Context",
         &context_json,
     )))
 }
@@ -1248,7 +1248,10 @@ fn agent_current_task_prompt(
     let current_task_json = serde_json::to_string_pretty(&current_task).map_err(|source| {
         ApiError::internal(format!("failed to serialize Agent current task: {source}"))
     })?;
-    Ok(xml_json_section("agent_current_task", &current_task_json))
+    Ok(markdown_json_section(
+        "Agent Current Task",
+        &current_task_json,
+    ))
 }
 
 fn agent_previous_attempt_payload(task: &AgentTaskRecord) -> Result<Value, ApiError> {
@@ -2033,17 +2036,17 @@ mod tests {
     }
 
     fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {
-        assert!(prompt.contains("<subagents>"));
+        assert!(prompt.contains("## Subagents"));
         let protocol_prompt = prompt
-            .split_once("<agent_team_protocol>")
-            .map(|(_, rest)| format!("<agent_team_protocol>{rest}"))
+            .split_once("## Agent Team Protocol")
+            .map(|(_, rest)| format!("## Agent Team Protocol{rest}"))
             .expect("protocol section");
-        assert!(protocol_prompt.starts_with("<agent_team_protocol>\n<json><![CDATA[\n"));
-        assert!(protocol_prompt.ends_with("\n]]></json>\n</agent_team_protocol>"));
+        assert!(protocol_prompt.starts_with("## Agent Team Protocol\n\n```json\n"));
+        assert!(protocol_prompt.ends_with("\n```"));
         let json_text = protocol_prompt
-            .strip_prefix("<agent_team_protocol>\n<json><![CDATA[\n")
+            .strip_prefix("## Agent Team Protocol\n\n```json\n")
             .expect("protocol prefix")
-            .strip_suffix("\n]]></json>\n</agent_team_protocol>")
+            .strip_suffix("\n```")
             .expect("protocol suffix");
         serde_json::from_str(json_text).expect("protocol json")
     }

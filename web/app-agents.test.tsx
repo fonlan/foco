@@ -107,7 +107,7 @@ function stubImageAgentSettings() {
     providerId: textModel.activeProviderId!,
     revision: 1,
     systemPrompt:
-      "<agent_definition_prompt>\n<identity>You are Foco's image generation agent.</identity>\n<instructions>Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.</instructions>\n<tool_defaults>Use image_gen with model &quot;gpt-image-2&quot; unless the user explicitly asks for another configured image model.</tool_defaults>\n</agent_definition_prompt>",
+      "# Image Generation Agent\n\n## Identity\n\nYou are Foco's image generation agent.\n\n## Instructions\n\nTurn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.\n\n## Tool Defaults\n\nUse image_gen with model \"gpt-image-2\" unless the user explicitly asks for another configured image model.",
   };
   const settingsWithImageModels = {
     ...settings,
@@ -276,7 +276,7 @@ describe("app agents verification surfaces", () => {
 
     const promptContent = within(dialog).getByLabelText("Agent role prompt");
     expect((promptContent as HTMLTextAreaElement).value).toContain(
-      "<tool_defaults>",
+      "## Tool Defaults",
     );
     expect((promptContent as HTMLTextAreaElement).value).toContain("gpt-image-2");
     await userEvent.clear(promptContent);
@@ -287,7 +287,7 @@ describe("app agents verification surfaces", () => {
       }),
     );
     expect((promptContent as HTMLTextAreaElement).value).toContain(
-      "<tool_defaults>",
+      "## Tool Defaults",
     );
     expect((promptContent as HTMLTextAreaElement).value).toContain("gpt-image-2");
 
@@ -306,7 +306,7 @@ describe("app agents verification surfaces", () => {
       expect(body.id).toBe("agent-definition-image-gen");
       expect(body.definition.modelId).toBe("gpt-test");
       expect(body.definition.providerId).toBe("openai");
-      expect(body.definition.systemPrompt).toContain("<tool_defaults>");
+      expect(body.definition.systemPrompt).toContain("## Tool Defaults");
       expect(body.definition.systemPrompt).toContain("gpt-image-2");
     });
     await waitFor(() => {

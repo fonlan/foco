@@ -15,7 +15,7 @@ use crate::{
         SystemPromptSummary, default_image_generation_system_prompt,
         default_plan_mode_system_prompt, default_review_system_prompt,
     },
-    neutral_text_message, xml_cdata_section, xml_text_escape,
+    markdown_code_block, neutral_text_message,
 };
 
 pub(crate) fn active_system_prompt(
@@ -189,10 +189,9 @@ fn prompt_file_message(
     Ok(Some(neutral_text_message(
         NeutralChatRole::User,
         format!(
-            "<prompt_file_context>\n<source>{}</source>\n<path>{}</path>\n{}\n</prompt_file_context>",
-            xml_text_escape(prefix),
-            xml_text_escape(&path.display().to_string()),
-            xml_cdata_section("content", content.trim())
+            "## Prompt File Context\n\nSource: {prefix}\n\nPath: `{}`\n\n{}",
+            path.display(),
+            markdown_code_block("markdown", content.trim())
         ),
     )))
 }
@@ -206,9 +205,8 @@ fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
     Some(neutral_text_message(
         NeutralChatRole::User,
         format!(
-            "<extra_prompt_context>\n<source>{}</source>\n{}\n</extra_prompt_context>",
-            xml_text_escape(EXTRA_PROMPT_MESSAGE_PREFIX),
-            xml_cdata_section("content", content)
+            "## Extra Prompt Context\n\nSource: {EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{}",
+            markdown_code_block("markdown", content)
         ),
     ))
 }

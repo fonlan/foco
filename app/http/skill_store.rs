@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 
 use crate::{
     ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
-    discover_skills, merge_disabled_skill_keys, neutral_text_message, provider_connection_config,
-    refresh_derived_enabled_skills, save_config, settings_response, skills::parse_skill_markdown,
-    unique_id, workspace_by_id, xml_cdata_section,
+    discover_skills, markdown_code_block, merge_disabled_skill_keys, neutral_text_message,
+    provider_connection_config, refresh_derived_enabled_skills, save_config, settings_response,
+    skills::parse_skill_markdown, unique_id, workspace_by_id,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -949,8 +949,8 @@ pub(crate) fn skill_translation_provider_request(
             neutral_text_message(
                 NeutralChatRole::User,
                 format!(
-                    "Target language: {target_language}\n\nTranslate this SKILL.md content for display only. Do not add commentary.\n{}",
-                    xml_cdata_section("skill_markdown", content)
+                    "Target language: {target_language}\n\nTranslate this SKILL.md content for display only. Do not add commentary.\n\n{}",
+                    markdown_code_block("markdown", content)
                 ),
             ),
         ],

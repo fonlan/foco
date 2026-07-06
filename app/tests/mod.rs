@@ -1890,15 +1890,15 @@ Search memory before repo work.
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, NeutralChatRole::Developer);
-    assert!(messages[0].content.contains("<skills_instructions>"));
+    assert!(messages[0].content.starts_with("## Skills"));
     assert!(messages[0].content.contains("## Skills"));
     assert!(
         messages[0]
             .content
             .contains("A skill is a set of instructions provided through a `SKILL.md` source")
     );
-    assert!(messages[0].content.contains("### Available skills"));
-    assert!(messages[0].content.contains("### How to use skills"));
+    assert!(messages[0].content.contains("### Available Skills"));
+    assert!(messages[0].content.contains("### How to Use Skills"));
     assert!(
         messages[0]
             .content
@@ -1922,16 +1922,16 @@ Search memory before repo work.
     assert!(
         messages[0]
             .content
-            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
+            .contains("- Name: \"gitmemo\"; description: \"Project memory.\"; key: \"global:gitmemo\"; scope: \"global\"; file: ")
     );
     assert!(
         messages[0]
             .content
-            .contains(&format!("file: {})", skill_file.display()))
+            .contains(&format!("file: \"{}\"", skill_file.display()))
     );
     assert!(!messages[0].content.contains("<frontmatter>"));
     assert!(!messages[0].content.contains("CDATA"));
-    assert!(messages[0].content.contains("</skills_instructions>"));
+    assert!(!messages[0].content.contains("<skills_instructions>"));
 }
 
 #[test]
@@ -1980,7 +1980,11 @@ fn enabled_skill_frontmatter_messages_include_global_and_workspace_skills() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, NeutralChatRole::Developer);
     for skill_id in ["global-one", "global-two", "workspace-one", "workspace-two"] {
-        assert!(messages[0].content.contains(&format!("- {skill_id}:")));
+        assert!(
+            messages[0]
+                .content
+                .contains(&format!("- Name: \"{skill_id}\";"))
+        );
         assert!(
             messages[0]
                 .content
@@ -2111,9 +2115,9 @@ description:
     assert!(
         messages[0]
             .content
-            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
+            .contains("- Name: \"gitmemo\"; description: \"Project memory.\"; key: \"global:gitmemo\"; scope: \"global\"; file: ")
     );
-    assert!(!messages[0].content.contains("- broken:"));
+    assert!(!messages[0].content.contains("Name: \"broken\""));
 
     fs::remove_dir_all(profile_dir).expect("remove skill test profile");
 }
@@ -2987,8 +2991,8 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             .default_role_prompts
             .get(&image_definition_id)
             .is_some_and(|prompt| {
-                prompt.contains("<agent_definition_prompt>")
-                    && prompt.contains("<tool_defaults>")
+                prompt.contains("# Image Generation Agent")
+                    && prompt.contains("## Tool Defaults")
                     && prompt.contains("gpt-image-2")
             })
     );
@@ -3008,14 +3012,14 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
     assert!(
         image_definition
             .system_prompt
-            .contains("<agent_definition_prompt>")
+            .contains("# Image Generation Agent")
     );
     assert!(
         image_definition
             .system_prompt
             .contains("image generation agent")
     );
-    assert!(image_definition.system_prompt.contains("<tool_defaults>"));
+    assert!(image_definition.system_prompt.contains("## Tool Defaults"));
     assert!(image_definition.system_prompt.contains("gpt-image-2"));
 
     let delete_image_error = match crate::http::settings::delete_agent_definition(
@@ -3368,16 +3372,24 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
 
     assert_eq!(agents_messages.len(), 1);
     assert_eq!(agents_messages[0].role, NeutralChatRole::User);
-    assert!(agents_messages[0].content.contains("<prompt_file_context>"));
+    assert!(
+        agents_messages[0]
+            .content
+            .contains("## Prompt File Context")
+    );
     assert!(agents_messages[0].content.contains(AGENTS_MESSAGE_PREFIX));
     assert!(
         agents_messages[0]
             .content
-            .contains("<content><![CDATA[\nWorkspace instructions.")
+            .contains("```markdown\nWorkspace instructions.")
     );
     assert_eq!(prompt_messages.len(), 1);
     assert_eq!(prompt_messages[0].role, NeutralChatRole::User);
-    assert!(prompt_messages[0].content.contains("<prompt_file_context>"));
+    assert!(
+        prompt_messages[0]
+            .content
+            .contains("## Prompt File Context")
+    );
     assert!(
         prompt_messages[0]
             .content
@@ -3386,13 +3398,13 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
     assert!(
         prompt_messages[0]
             .content
-            .contains("<content><![CDATA[\nConfigured prompt instructions.")
+            .contains("```markdown\nConfigured prompt instructions.")
     );
     assert_eq!(extra_prompt_message.role, NeutralChatRole::User);
     assert!(
         extra_prompt_message
             .content
-            .contains("<extra_prompt_context>")
+            .contains("## Extra Prompt Context")
     );
     assert!(
         extra_prompt_message
@@ -3402,7 +3414,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
     assert!(
         extra_prompt_message
             .content
-            .contains("<content><![CDATA[\nExtra prompt instructions.")
+            .contains("```markdown\nExtra prompt instructions.")
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -6534,13 +6546,9 @@ Only load this when matched.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<environment_context>")
+                .contains("## Environment Context")
         );
-        assert!(
-            !context_injections[0]
-                .messages_json
-                .contains("<skills_instructions>")
-        );
+        assert!(!context_injections[0].messages_json.contains("## Skills"));
         assert_eq!(context_injections[0].memory_keys_json, "[]");
     }
 
@@ -6570,27 +6578,23 @@ Only load this when matched.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains("<skills_instructions>"))
+        .filter(|message| message.content.starts_with("## Skills"))
         .collect::<Vec<_>>();
     assert_eq!(skill_messages.len(), 1);
     assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
     assert!(skill_messages[0].content.contains(
-        "- queuedmemo: Queued skill routing. (key: global:queuedmemo, scope: global, file: "
+        "- Name: \"queuedmemo\"; description: \"Queued skill routing.\"; key: \"global:queuedmemo\"; scope: \"global\"; file: "
     ));
     assert!(
         !skill_messages[0]
             .content
             .contains("Only load this when matched")
     );
+    assert!(scheduler_context.request_body_json.contains("## Skills"));
     assert!(
         scheduler_context
             .request_body_json
-            .contains("<skills_instructions>")
-    );
-    assert!(
-        scheduler_context
-            .request_body_json
-            .contains("- queuedmemo:")
+            .contains("- Name: \\\"queuedmemo\\\";")
     );
 
     drop(state);
@@ -6664,13 +6668,9 @@ Only load this when matched.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<environment_context>")
+                .contains("## Environment Context")
         );
-        assert!(
-            !context_injections[0]
-                .messages_json
-                .contains("<skills_instructions>")
-        );
+        assert!(!context_injections[0].messages_json.contains("## Skills"));
         assert_eq!(context_injections[0].memory_keys_json, "[]");
     }
 
@@ -6697,15 +6697,11 @@ Only load this when matched.
     .expect("scheduler chat context");
 
     assert!(scheduler_context.pending_memory_retrieval.is_some());
+    assert!(scheduler_context.request_body_json.contains("## Skills"));
     assert!(
         scheduler_context
             .request_body_json
-            .contains("<skills_instructions>")
-    );
-    assert!(
-        scheduler_context
-            .request_body_json
-            .contains("- deferredmemo:")
+            .contains("- Name: \\\"deferredmemo\\\";")
     );
 
     drop(state);
@@ -12431,7 +12427,7 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains("<skills_instructions>"))
+        .filter(|message| message.content.starts_with("## Skills"))
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
@@ -12439,14 +12435,14 @@ Search memory before repo work.
     assert!(
         skill_messages[0]
             .content
-            .contains("- gitmemo: Project memory. (key: global:gitmemo, scope: global, file: ")
+            .contains("- Name: \"gitmemo\"; description: \"Project memory.\"; key: \"global:gitmemo\"; scope: \"global\"; file: ")
     );
     assert!(!skill_messages[0].content.contains("Search memory"));
     let skill_index = new_context
         .provider_request
         .messages
         .iter()
-        .position(|message| message.content.contains("<skills_instructions>"))
+        .position(|message| message.content.starts_with("## Skills"))
         .expect("skill message index");
     let first_non_system_index = new_context
         .provider_request
@@ -12468,20 +12464,24 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains("<environment_context>"))
+        .filter(|message| message.content.contains("## Environment Context"))
         .collect::<Vec<_>>();
 
     assert_eq!(environment_messages.len(), 1);
     assert_eq!(environment_messages[0].role, NeutralChatRole::User);
     assert!(environment_messages[0].content.contains(&format!(
-        "<workspace_directory>{}</workspace_directory>",
+        "\"workspaceDirectory\": \"{}\"",
         workspace_dir.display()
     )));
-    assert!(environment_messages[0].content.contains("<git_repository>"));
-    assert!(environment_messages[0].content.contains("<shell type="));
-    assert!(environment_messages[0].content.contains("<current_date>"));
-    assert!(environment_messages[0].content.contains("<time_zone>"));
-    assert!(environment_messages[0].content.contains("<wsl>"));
+    assert!(
+        environment_messages[0]
+            .content
+            .contains("\"gitRepository\":")
+    );
+    assert!(environment_messages[0].content.contains("\"shell\":"));
+    assert!(environment_messages[0].content.contains("\"currentDate\":"));
+    assert!(environment_messages[0].content.contains("\"timeZone\":"));
+    assert!(environment_messages[0].content.contains("\"wsl\":"));
 
     {
         let database =
@@ -12499,18 +12499,14 @@ Search memory before repo work.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<prompt_file_context>")
+                .contains("## Prompt File Context")
         );
         assert!(
             context_injections[0]
                 .messages_json
-                .contains("<environment_context>")
+                .contains("## Environment Context")
         );
-        assert!(
-            !context_injections[0]
-                .messages_json
-                .contains("<skills_instructions>")
-        );
+        assert!(!context_injections[0].messages_json.contains("## Skills"));
         assert!(
             !context_injections[0]
                 .messages_json
@@ -12603,12 +12599,12 @@ Updated full instructions.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains("<skills_instructions>"))
+        .filter(|message| message.content.starts_with("## Skills"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
     assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
     assert!(existing_skill_messages[0].content.contains(
-        "- gitmemo: Updated project memory. (key: global:gitmemo, scope: global, file: "
+        "- Name: \"gitmemo\"; description: \"Updated project memory.\"; key: \"global:gitmemo\"; scope: \"global\"; file: "
     ));
     assert!(
         !existing_skill_messages[0]
@@ -12619,7 +12615,7 @@ Updated full instructions.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains("<environment_context>"))
+        .filter(|message| message.content.contains("## Environment Context"))
         .collect::<Vec<_>>();
     assert_eq!(existing_environment_messages.len(), 1);
     assert_eq!(
@@ -12755,7 +12751,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         assert!(
             injections[0]
                 .messages_json
-                .contains("<environment_context>")
+                .contains("## Environment Context")
         );
     }
 
@@ -12902,7 +12898,8 @@ Use the existing product UI conventions.
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let expected_message = format!(
-        "<selected_skills>\n<skill name=\"web-design-guidelines\" path=\"{}\">\n<content_markdown><![CDATA[\n{}\n]]></content_markdown>\n</skill>\n</selected_skills>\n\nSettings single-column layout.",
+        "# Selected Skills\n\n```json\n[\n  {{\n    \"name\": \"web-design-guidelines\",\n    \"path\": \"{}\"\n  }}\n]\n```\n\n## Skill 1: web-design-guidelines\n\nPath: `{}`\n\n### Instructions\n\n{}\n\n## End Selected Skills\n\nSettings single-column layout.",
+        skill_file.display(),
         skill_file.display(),
         skill_markdown.trim()
     );
@@ -13028,13 +13025,13 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("<available_tools>"))
+        .find(|message| message.content.contains("## Available Tools"))
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
     assert!(
         available_tools_message
             .content
-            .contains("<available_tools>")
+            .contains("## Available Tools")
     );
     assert!(
         !available_tools_message
@@ -13051,7 +13048,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             .provider_request
             .messages
             .iter()
-            .all(|message| !message.content.contains("<memory>"))
+            .all(|message| !message.content.starts_with("## Memory"))
     );
 
     drop(context);
@@ -13182,8 +13179,8 @@ Use this only after reading the skill file.
         context.provider_request.messages[0].content,
         plan_mode_prompt
     );
-    assert!(plan_mode_prompt.starts_with("<agent_definition_prompt>"));
-    assert!(plan_mode_prompt.ends_with("</agent_definition_prompt>"));
+    assert!(plan_mode_prompt.starts_with("# Plan Mode"));
+    assert!(!plan_mode_prompt.contains("<agent_definition_prompt>"));
     assert!(plan_mode_prompt.contains("Plan Mode is for planning only, not implementation"));
     assert!(plan_mode_prompt.contains("call create_plan"));
     assert!(plan_mode_prompt.contains("use delete_plan to remove it"));
@@ -13210,12 +13207,12 @@ Use this only after reading the skill file.
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("<skills_instructions>"))
+        .find(|message| message.content.starts_with("## Skills"))
         .expect("plan mode skill instructions message");
     assert_eq!(skill_message.role, NeutralChatRole::Developer);
     assert!(skill_message.content.contains("## Skills"));
-    assert!(skill_message.content.contains("### Available skills"));
-    assert!(skill_message.content.contains("### How to use skills"));
+    assert!(skill_message.content.contains("### Available Skills"));
+    assert!(skill_message.content.contains("### How to Use Skills"));
     assert!(
         skill_message
             .content
@@ -13234,10 +13231,10 @@ Use this only after reading the skill file.
     assert!(
         skill_message
             .content
-            .contains(&format!("file: {})", skill_file.display()))
+            .contains(&format!("file: \"{}\"", skill_file.display()))
     );
     assert!(skill_message.content.contains(
-        "- plan-router: Helps draft focused plans. (key: global:plan-router, scope: global, file: "
+        "- Name: \"plan-router\"; description: \"Helps draft focused plans.\"; key: \"global:plan-router\"; scope: \"global\"; file: "
     ));
     assert!(!skill_message.content.contains("CDATA"));
     assert!(
@@ -13250,32 +13247,32 @@ Use this only after reading the skill file.
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("<available_tools>"))
+        .find(|message| message.content.contains("## Available Tools"))
         .expect("available tools message");
     assert!(
         available_tools_message
             .content
-            .contains(&format!(r#"<tool name="{CREATE_PLAN_TOOL}">"#))
+            .contains(&format!("- `{CREATE_PLAN_TOOL}`:"))
     );
     assert!(
         available_tools_message
             .content
-            .contains(&format!(r#"<tool name="{DELETE_PLAN_TOOL}">"#))
+            .contains(&format!("- `{DELETE_PLAN_TOOL}`:"))
     );
     assert!(
         available_tools_message
             .content
-            .contains(&format!(r#"<tool name="{mcp_tool_name}">"#))
+            .contains(&format!("- `{mcp_tool_name}`:"))
     );
     assert!(
         !available_tools_message
             .content
-            .contains(&format!(r#"<tool name="{WRITE_FILE_TOOL}">"#))
+            .contains(&format!("- `{WRITE_FILE_TOOL}`:"))
     );
     assert!(
         !available_tools_message
             .content
-            .contains(&format!(r#"<tool name="{MEMORY_WRITE_TOOL_NAME}">"#))
+            .contains(&format!("- `{MEMORY_WRITE_TOOL_NAME}`:"))
     );
 
     drop(context);
@@ -13435,7 +13432,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
     assert!(
         available_tools_message
             .content
-            .contains("<available_tools>")
+            .contains("## Available Tools")
     );
     assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
 
@@ -13645,7 +13642,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
     assert!(
         !context.provider_request.messages[0]
             .content
-            .contains("<available_tools>")
+            .contains("## Available Tools")
     );
     let available_tools_message = context
         .provider_request
@@ -13656,7 +13653,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
     assert!(
         available_tools_message
             .content
-            .contains("<available_tools>")
+            .contains("## Available Tools")
     );
     assert!(available_tools_message.content.contains("read_file"));
 
@@ -13848,14 +13845,14 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .provider_request
         .messages
         .iter()
-        .position(|message| message.content.contains("<project_spec_context>"))
+        .position(|message| message.content.contains("## Project Spec Context"))
         .expect("project spec message");
     assert!(
         first_context
             .provider_request
             .messages
             .iter()
-            .any(|message| message.content.contains("<project_spec>"))
+            .any(|message| message.content.starts_with("## Project Spec"))
     );
     assert_eq!(
         first_context.provider_request.messages[first_spec_index].role,
@@ -13909,7 +13906,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("<project_spec_context>"))
+        .find(|message| message.content.contains("## Project Spec Context"))
         .expect("project spec message");
     assert!(second_spec.content.contains("Version one"));
     assert!(!second_spec.content.contains("Version two"));
@@ -13965,14 +13962,14 @@ async fn prepare_chat_context_skips_project_spec_when_injection_disabled() {
             .provider_request
             .messages
             .iter()
-            .all(|message| { !message.content.contains("<project_spec_context>") })
+            .all(|message| { !message.content.contains("## Project Spec Context") })
     );
     assert!(
         context
             .provider_request
             .messages
             .iter()
-            .all(|message| !message.content.contains("<project_spec>"))
+            .all(|message| !message.content.starts_with("## Project Spec"))
     );
     {
         let database =
@@ -14041,7 +14038,7 @@ async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("<project_spec_context>"))
+        .find(|message| message.content.contains("## Project Spec Context"))
         .expect("project spec message");
 
     assert!(spec_message.content.contains("Saved spec"));
@@ -14050,7 +14047,7 @@ async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
             .provider_request
             .messages
             .iter()
-            .any(|message| message.content.contains("<project_spec>"))
+            .any(|message| message.content.starts_with("## Project Spec"))
     );
     assert!(!spec_message.content.contains("Latest spec"));
     assert!(context.pending_spec_snapshot.is_none());
@@ -14300,7 +14297,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
     assert!(
         messages
             .iter()
-            .any(|message| message.content.contains("<memory>"))
+            .any(|message| message.content.starts_with("## Memory"))
     );
     let current_user_index = messages
         .iter()
@@ -14334,9 +14331,9 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             .content
             .contains("Graph-linked memory is pulled through adjacent edges.")
     );
-    assert!(memory_message.content.contains("<memory_context>"));
-    assert!(memory_message.content.contains("source=\"direct\""));
-    assert!(memory_message.content.contains("source=\"related\""));
+    assert!(memory_message.content.contains("## Memory Context"));
+    assert!(memory_message.content.contains("\"source\": \"direct\""));
+    assert!(memory_message.content.contains("\"source\": \"related\""));
     assert!(
         memory_message
             .content
@@ -14478,7 +14475,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
     let messages = &context.provider_request.messages;
     let todo_graph_index = messages
         .iter()
-        .position(|message| message.content.contains("<todo_graph_context>"))
+        .position(|message| message.content.contains("## Todo Graph Context"))
         .expect("todo graph context message");
     assert_eq!(messages[todo_graph_index].role, NeutralChatRole::System);
     assert!(

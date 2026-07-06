@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 
 use crate::{
     ApiError, AppState, PreparedChatContext, api_audit_save_details, audited_provider_tool_request,
-    config_snapshot, neutral_text_message, provider_connection_config, unique_id, workspace_by_id,
-    xml_cdata_section,
+    config_snapshot, markdown_code_block, neutral_text_message, provider_connection_config,
+    unique_id, workspace_by_id,
 };
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
@@ -932,9 +932,9 @@ Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSP
             neutral_text_message(
                 NeutralChatRole::User,
                 format!(
-                    "Current Project Spec Markdown is {} bytes. Compact it below the target.\n{}",
+                    "Current Project Spec Markdown is {} bytes. Compact it below the target.\n\n{}",
                     content_markdown.len(),
-                    xml_cdata_section("content_markdown", content_markdown)
+                    markdown_code_block("markdown", content_markdown)
                 ),
             ),
         ],

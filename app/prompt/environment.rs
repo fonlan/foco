@@ -2,10 +2,11 @@ use std::{env, fs, path::Path};
 
 use chrono::{Local, SecondsFormat};
 use foco_providers::{NeutralChatMessage, NeutralChatRole};
+use serde_json::json;
 
 use crate::{
     ApiError, ENVIRONMENT_CONTEXT_MESSAGE_PREFIX, git_backend::is_git_workspace,
-    neutral_text_message, non_empty_string, xml_text_escape,
+    markdown_code_block, neutral_text_message, non_empty_string,
 };
 
 pub(crate) fn environment_context_message(
@@ -19,25 +20,24 @@ pub(crate) fn environment_context_message(
     Ok(neutral_text_message(
         NeutralChatRole::User,
         format!(
-            "<environment_context>\n\
-             <source>{}</source>\n\
-             <workspace_directory>{}</workspace_directory>\n\
-             <git_repository>{}</git_repository>\n\
-             <shell type=\"{}\">{}</shell>\n\
-             <current_date>{}</current_date>\n\
-             <local_timestamp>{}</local_timestamp>\n\
-             <time_zone>{}</time_zone>\n\
-             <wsl>{}</wsl>\n\
-             </environment_context>",
-            xml_text_escape(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX),
-            xml_text_escape(&workspace_path.display().to_string()),
-            git_repository,
-            xml_text_escape(&shell.kind),
-            xml_text_escape(&shell.executable),
-            now.format("%Y-%m-%d"),
-            now.to_rfc3339_opts(SecondsFormat::Secs, false),
-            now.offset(),
-            wsl
+            "## Environment Context\n\n{}",
+            markdown_code_block(
+                "json",
+                &serde_json::to_string_pretty(&json!({
+                    "source": ENVIRONMENT_CONTEXT_MESSAGE_PREFIX,
+                    "workspaceDirectory": workspace_path.display().to_string(),
+                    "gitRepository": git_repository,
+                    "shell": {
+                        "type": shell.kind,
+                        "executable": shell.executable,
+                    },
+                    "currentDate": now.format("%Y-%m-%d").to_string(),
+                    "localTimestamp": now.to_rfc3339_opts(SecondsFormat::Secs, false),
+                    "timeZone": now.offset().to_string(),
+                    "wsl": wsl,
+                }))
+                .expect("environment context is always JSON serializable")
+            )
         ),
     ))
 }

@@ -78,10 +78,21 @@ describe("app-chat-stream verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
   it("collapses selected skill content blocks in user messages", async () => {
+    const skillPath =
+      "C:\\Users\\fonla\\.agents\\skills\\web-design-guidelines\\SKILL.md";
     const selectedSkillContent = [
-      "<selected_skills>",
-      '<skill name="web-design-guidelines" path="C:\\Users\\fonla\\.agents\\skills\\web-design-guidelines\\SKILL.md">',
-      "<content_markdown><![CDATA[",
+      "# Selected Skills",
+      "",
+      "```json",
+      JSON.stringify([{ name: "web-design-guidelines", path: skillPath }], null, 2),
+      "```",
+      "",
+      "## Skill 1: web-design-guidelines",
+      "",
+      `Path: \`${skillPath}\``,
+      "",
+      "### Instructions",
+      "",
       "---",
       "name: web-design-guidelines",
       "description: UI design guidance.",
@@ -90,9 +101,8 @@ describe("app-chat-stream verification surfaces", () => {
       "# Web Design Guidelines",
       "",
       "Use the existing product UI conventions.",
-      "]]></content_markdown>",
-      "</skill>",
-      "</selected_skills>",
+      "",
+      "## End Selected Skills",
       "",
       "Settings single-column layout.",
     ].join("\n");

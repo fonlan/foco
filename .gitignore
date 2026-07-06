@@ -10,6 +10,7 @@ macos-support-implementation-plan.md
 .agents/
 .foco/
 .codex/
+.reasonix/
 openspec/
 target/
 dist/

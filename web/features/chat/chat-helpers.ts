@@ -208,6 +208,64 @@ export function unsupportedFileAttachmentMessage(
 
 function selectedSkillBlockPrefix(content: string): SelectedSkillPrefix | null {
   const remaining = content.trimStart();
+  const markdownPrefix = selectedSkillMarkdownPrefix(remaining);
+  if (markdownPrefix) {
+    return markdownPrefix;
+  }
+
+  return selectedSkillXmlPrefix(remaining);
+}
+
+function selectedSkillMarkdownPrefix(remaining: string): SelectedSkillPrefix | null {
+  if (!remaining.startsWith("# Selected Skills")) {
+    return null;
+  }
+
+  const closingMarker = "\n## End Selected Skills\n";
+  const endIndex = remaining.lastIndexOf(closingMarker);
+  if (endIndex < 0) {
+    return null;
+  }
+
+  const block = remaining.slice(0, endIndex);
+  const metadata = /```json\s*\n([\s\S]*?)\n```/.exec(block)?.[1];
+  if (!metadata) {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(metadata);
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    const skills = parsed.filter(
+      (skill): skill is { name: string; path: string } =>
+        Boolean(
+          skill &&
+            typeof skill === "object" &&
+            "name" in skill &&
+            typeof skill.name === "string" &&
+            skill.name &&
+            "path" in skill &&
+            typeof skill.path === "string" &&
+            skill.path,
+        ),
+    );
+    if (!skills.length) {
+      return null;
+    }
+
+    return {
+      remaining: remaining.slice(endIndex + closingMarker.length).trimStart(),
+      skills,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Keep parsing the old prefix so existing chat history still renders cleanly.
+function selectedSkillXmlPrefix(remaining: string): SelectedSkillPrefix | null {
   if (!remaining.startsWith("<selected_skills>")) {
     return null;
   }

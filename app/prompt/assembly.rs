@@ -708,13 +708,11 @@ fn project_spec_context_message(
     Some(neutral_text_message(
         NeutralChatRole::User,
         format!(
-            "<project_spec_context>\n\
-             <source>{}</source>\n\
-             <revision>{revision}</revision>\n\
-             {}\n\
-             </project_spec_context>",
-            xml_text_escape(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX),
-            xml_cdata_section("content_markdown", content_markdown)
+            "## Project Spec Context\n\n\
+             Source: {PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX}\n\n\
+             Revision: {revision}\n\n\
+             {}",
+            markdown_code_block("markdown", content_markdown)
         ),
     ))
 }
