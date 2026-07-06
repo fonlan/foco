@@ -55,6 +55,7 @@ pub(crate) struct PreparedWorkspaceSpecJob {
     pub(crate) workspace_id: String,
     pub(crate) workspace_path: PathBuf,
     pub(crate) job_id: String,
+    pub(crate) chat_id: Option<String>,
     pub(crate) base_revision: u64,
     pub(crate) provider_id: String,
     pub(crate) provider_config: ProviderConnectionConfig,
@@ -510,7 +511,7 @@ async fn run_workspace_spec_job_inner(
     let tool_arguments = audited_provider_tool_request(
         &prepared.workspace_path,
         &prepared.workspace_id,
-        None,
+        prepared.chat_id.as_deref(),
         &prepared.provider_id,
         &prepared.provider_config,
         prepared.request.clone(),
@@ -532,6 +533,7 @@ async fn run_workspace_spec_job_inner(
         &prepared.request.model_id,
         prepared.request.max_output_tokens,
         &content_markdown,
+        prepared.chat_id.as_deref(),
     )
     .await?;
     let result = apply_workspace_spec_job_output(
@@ -599,7 +601,7 @@ async fn run_workspace_spec_update_job_inner(
     let tool_arguments = audited_provider_tool_request(
         workspace_path,
         workspace_id,
-        None,
+        job.chat_id.as_deref(),
         &model.provider_id,
         &model.provider_config,
         request,
@@ -622,6 +624,7 @@ async fn run_workspace_spec_update_job_inner(
         &model.model_id,
         model.max_output_tokens,
         update_output,
+        job.chat_id.as_deref(),
     )
     .await?;
     let result = apply_workspace_spec_update_job_parsed_output(
@@ -756,6 +759,7 @@ fn prepare_workspace_spec_generation_job(
         workspace_id: workspace_id.to_string(),
         workspace_path: workspace_path.to_path_buf(),
         job_id: job.id,
+        chat_id: job.chat_id,
         base_revision,
         provider_id: model.provider_id,
         provider_config: model.provider_config,
@@ -843,6 +847,7 @@ async fn ensure_workspace_spec_update_fits_limit(
     model_id: &str,
     max_output_tokens: u32,
     output: WorkspaceSpecUpdateOutput,
+    chat_id: Option<&str>,
 ) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
     match output {
         WorkspaceSpecUpdateOutput::NoUpdateNeeded => Ok(WorkspaceSpecUpdateOutput::NoUpdateNeeded),
@@ -856,6 +861,7 @@ async fn ensure_workspace_spec_update_fits_limit(
                 model_id,
                 Some(max_output_tokens),
                 &content_markdown,
+                chat_id,
             )
             .await
             .map(WorkspaceSpecUpdateOutput::FullReplacementMarkdown)
@@ -872,6 +878,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
     model_id: &str,
     max_output_tokens: Option<u32>,
     content_markdown: &str,
+    chat_id: Option<&str>,
 ) -> Result<String, ApiError> {
     if content_markdown.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
         return Ok(content_markdown.to_string());
@@ -891,7 +898,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
     let tool_arguments = audited_provider_tool_request(
         workspace_path,
         workspace_id,
-        None,
+        chat_id,
         provider_id,
         provider_config,
         request,

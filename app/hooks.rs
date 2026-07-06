@@ -910,6 +910,7 @@ async fn audited_prompt_hook_stream(
             id: &request_id,
             workspace_id,
             chat_id: request.chat_id,
+            request_kind: "prompt hook",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,

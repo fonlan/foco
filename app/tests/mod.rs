@@ -1272,6 +1272,7 @@ fn captured_test_llm_request(
 ) -> CapturedLlmRequest {
     CapturedLlmRequest {
         id: request_id.to_string(),
+        request_kind: "chat completion",
         request_started_at: "2026-06-06T09:00:00Z".to_string(),
         request_body_json: "{}".to_string(),
         events: vec![CapturedAuditEvent {
@@ -5330,6 +5331,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -8977,6 +8979,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
     }];
     context.captured_llm_requests.push(CapturedLlmRequest {
         id: "llm-succeeded".to_string(),
+        request_kind: "chat completion",
         request_started_at: "2026-06-06T08:59:00Z".to_string(),
         request_body_json: "{}".to_string(),
         events: Vec::new(),
@@ -11926,6 +11929,7 @@ fn chat_message_summary_includes_assistant_reply_metrics() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -12084,6 +12088,7 @@ fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
                 id: request_id,
                 workspace_id: "workspace-1",
                 chat_id: Some("chat-1"),
+                request_kind: "chat completion",
                 agent_team_id: None,
                 agent_instance_id: None,
                 agent_task_id: None,

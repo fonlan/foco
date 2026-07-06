@@ -1592,6 +1592,7 @@ struct AiRequestAuditSummary {
     workspace_name: String,
     chat_id: Option<String>,
     chat_title: Option<String>,
+    request_kind: String,
     provider_id: String,
     model_id: String,
     request_started_at: String,
@@ -1617,6 +1618,7 @@ struct AiRequestAuditDetail {
     workspace_name: String,
     chat_id: Option<String>,
     chat_title: Option<String>,
+    request_kind: String,
     provider_id: String,
     model_id: String,
     request_started_at: String,
@@ -2403,6 +2405,7 @@ struct ChatAuditOutcome {
 #[derive(Clone)]
 struct CapturedLlmRequest {
     id: String,
+    request_kind: &'static str,
     request_started_at: String,
     request_body_json: String,
     events: Vec<CapturedAuditEvent>,
@@ -2418,6 +2421,7 @@ impl CapturedLlmRequest {
     ) -> Self {
         Self {
             id: context.llm_request_id.clone(),
+            request_kind: "chat completion",
             request_started_at: request_started_at.to_string(),
             request_body_json: context.request_body_json.clone(),
             events: events.to_vec(),
@@ -2435,6 +2439,7 @@ impl CapturedLlmRequest {
     ) -> Self {
         Self {
             id: request_id.to_string(),
+            request_kind: "chat completion",
             request_started_at: request_started_at.to_string(),
             request_body_json: request_body_json.to_string(),
             events: events.to_vec(),
@@ -2533,6 +2538,7 @@ impl PreparedChatContext {
     ) {
         self.captured_llm_requests.push(CapturedLlmRequest {
             id: request_id,
+            request_kind: "chat completion",
             request_started_at,
             request_body_json,
             events,
@@ -3022,6 +3028,7 @@ impl PreparedChatContext {
                                 .await;
                                 self.captured_llm_requests.push(CapturedLlmRequest {
                                     id: turn_llm_request_id,
+                                    request_kind: "chat completion",
                                     request_started_at: turn_request_started_at,
                                     request_body_json: turn_request_body_json,
                                     events: turn_events,
@@ -3167,6 +3174,7 @@ impl PreparedChatContext {
                                     .await;
                                     self.captured_llm_requests.push(CapturedLlmRequest {
                                         id: turn_llm_request_id,
+                                        request_kind: "chat completion",
                                         request_started_at: turn_request_started_at,
                                         request_body_json: turn_request_body_json,
                                         events: turn_events,
@@ -3313,6 +3321,7 @@ impl PreparedChatContext {
                                 .await;
                                         self.captured_llm_requests.push(CapturedLlmRequest {
                                             id: turn_llm_request_id,
+                                            request_kind: "chat completion",
                                             request_started_at: turn_request_started_at,
                                             request_body_json: turn_request_body_json,
                                             events: turn_events,
@@ -3381,6 +3390,7 @@ impl PreparedChatContext {
                                 .await;
                                         self.captured_llm_requests.push(CapturedLlmRequest {
                                             id: turn_llm_request_id,
+                                            request_kind: "chat completion",
                                             request_started_at: turn_request_started_at,
                                             request_body_json: turn_request_body_json,
                                             events: turn_events,
@@ -3422,6 +3432,7 @@ impl PreparedChatContext {
                                     let turn_total_latency_ms = elapsed_millis(turn_started_at);
                                     let completed_turn_request = CapturedLlmRequest {
                                         id: turn_llm_request_id.clone(),
+                                        request_kind: "chat completion",
                                         request_started_at: turn_request_started_at.clone(),
                                         request_body_json: turn_request_body_json.clone(),
                                         events: turn_events.clone(),
@@ -4178,6 +4189,7 @@ impl PreparedChatContext {
                                 .await;
                                     self.captured_llm_requests.push(CapturedLlmRequest {
                                         id: turn_llm_request_id,
+                                        request_kind: "chat completion",
                                         request_started_at: turn_request_started_at,
                                         request_body_json: turn_request_body_json,
                                         events: turn_events,
@@ -4253,6 +4265,7 @@ impl PreparedChatContext {
                                 .await;
                         self.captured_llm_requests.push(CapturedLlmRequest {
                             id: turn_llm_request_id,
+                            request_kind: "chat completion",
                             request_started_at: turn_request_started_at,
                             request_body_json: turn_request_body_json,
                             events: turn_events,
@@ -4932,6 +4945,7 @@ pub(crate) async fn audited_provider_tool_request(
                 id: &request_id,
                 workspace_id,
                 chat_id,
+                request_kind,
                 agent_team_id: None,
                 agent_instance_id: None,
                 agent_task_id: None,
@@ -7756,6 +7770,7 @@ fn ai_request_audit_summary(
             .as_ref()
             .and_then(|chat_id| chat_titles.get(chat_id).cloned()),
         chat_id: row.chat_id,
+        request_kind: row.request_kind,
         provider_id: row.provider_id,
         model_id: row.model_id,
         request_started_at: row.request_started_at,
@@ -7788,6 +7803,7 @@ fn ai_request_audit_detail(
             .as_ref()
             .and_then(|chat_id| chat_titles.get(chat_id).cloned()),
         chat_id: request.chat_id,
+        request_kind: request.request_kind,
         provider_id: request.provider_id,
         model_id: request.model_id,
         request_started_at: request.request_started_at,

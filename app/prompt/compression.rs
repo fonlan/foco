@@ -723,6 +723,7 @@ async fn llm_context_compression_summary(
     }
     context.captured_llm_requests.push(CapturedLlmRequest {
         id: request_id,
+        request_kind: "contextCompression",
         request_started_at,
         request_body_json,
         events,
@@ -1847,6 +1848,7 @@ pub(crate) fn persist_running_llm_request(
             id: request_id,
             workspace_id: &context.workspace_id,
             chat_id: Some(&context.chat_id),
+            request_kind: "chat completion",
             agent_team_id: context.agent_associations.team_id.as_ref(),
             agent_instance_id: context.agent_associations.instance_id.as_ref(),
             agent_task_id: context.agent_associations.task_id.as_ref(),
@@ -1922,6 +1924,7 @@ fn persist_llm_request(
                 id: &request.id,
                 workspace_id: &context.workspace_id,
                 chat_id: Some(&context.chat_id),
+                request_kind: request.request_kind,
                 agent_team_id: context.agent_associations.team_id.as_ref(),
                 agent_instance_id: context.agent_associations.instance_id.as_ref(),
                 agent_task_id: context.agent_associations.task_id.as_ref(),

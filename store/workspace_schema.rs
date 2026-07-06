@@ -885,7 +885,6 @@ CREATE TABLE workspace_spec_jobs (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
     trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual_initial', 'manual_refresh', 'chat_completed')),
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'skipped', 'failed')),
-    chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
     run_id TEXT CHECK (run_id IS NULL OR length(run_id) > 0),
     model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
     base_revision INTEGER CHECK (base_revision IS NULL OR base_revision >= 0),
@@ -1234,6 +1233,18 @@ ON chats (title COLLATE NOCASE);
 pub(crate) const MIGRATION_027: &str = r#"
 ALTER TABLE llm_requests
     ADD COLUMN reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0);
+"#;
+
+pub(crate) const MIGRATION_028: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'unknown' CHECK (length(request_kind) > 0);
+
+CREATE INDEX llm_requests_request_kind_idx ON llm_requests (request_kind);
+"#;
+
+pub(crate) const MIGRATION_029: &str = r#"
+ALTER TABLE workspace_spec_jobs
+    ADD COLUMN chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL;
 "#;
 
 #[cfg(test)]

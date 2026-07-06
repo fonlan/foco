@@ -1434,6 +1434,7 @@ fn load_ai_statistics_response(
             request_ids: &filters.request_ids,
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
+            request_kind: None,
             provider_id: filters.provider_id.as_deref(),
             model_id: filters.model_id.as_deref(),
             final_state: filters.status.as_deref(),

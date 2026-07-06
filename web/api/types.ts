@@ -2019,6 +2019,7 @@ export type AiRequestAuditSummary = {
   workspaceName: string;
   chatId: string | null;
   chatTitle: string | null;
+  requestKind: string;
   providerId: string;
   modelId: string;
   requestStartedAt: string;

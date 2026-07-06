@@ -1048,6 +1048,7 @@ export const aiStatistics = {
       outputTokens: 40,
       providerId: "openai",
       reasoningTokens: 4,
+      requestKind: "chat completion",
       requestStartedAt: "2026-06-05T10:00:00Z",
       statusCode: 200,
       totalLatencyMs: 2000,

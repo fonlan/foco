@@ -2590,6 +2590,7 @@ fn infers_runtime_tool_state_compression_from_saved_request_bodies() {
                 id,
                 workspace_id: "workspace-1",
                 chat_id: Some("chat-1"),
+                request_kind: "chat completion",
                 agent_team_id: Some(&team_id),
                 agent_instance_id: None,
                 agent_task_id: Some(task_id),
@@ -3360,6 +3361,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             id: "request-scheduled-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-scheduled-run"),
+            request_kind: "chat completion",
             agent_team_id: Some(&team_id),
             agent_instance_id: Some(&instance_id),
             agent_task_id: Some(&agent_task_id),
@@ -3387,6 +3389,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             id: "request-scheduled-2",
             workspace_id: "workspace-1",
             chat_id: Some("chat-scheduled-run"),
+            request_kind: "chat completion",
             agent_team_id: Some(&team_id),
             agent_instance_id: Some(&instance_id),
             agent_task_id: Some(&agent_task_id),
@@ -3414,6 +3417,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             id: "request-unrelated",
             workspace_id: "workspace-1",
             chat_id: Some("chat-scheduled-run"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -3971,6 +3975,7 @@ fn repository_helpers_round_trip_core_records() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -4110,6 +4115,7 @@ fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -4840,6 +4846,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -4920,6 +4927,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         .expect("llm request");
     assert_eq!(request.workspace_id, Some("workspace-1".to_string()));
     assert_eq!(request.chat_id, Some("chat-1".to_string()));
+    assert_eq!(request.request_kind, "chat completion");
     assert_eq!(request.provider_id, "openai-responses");
     assert_eq!(request.model_id, "gpt-audit");
     assert_eq!(request.request_started_at, "2026-06-03T10:00:00.000Z");
@@ -4965,6 +4973,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             id: "request-2",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5127,6 +5136,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             request_ids: &request_ids,
             workspace_id: Some("workspace-1"),
             chat_id: Some("chat-1"),
+            request_kind: Some("chat completion"),
             provider_id: Some("openai-responses"),
             model_id: Some("gpt-audit"),
             final_state: Some("completed"),
@@ -5146,6 +5156,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
                 request_ids: &request_ids,
                 workspace_id: Some("workspace-1"),
                 chat_id: Some("chat-1"),
+                request_kind: Some("chat completion"),
                 provider_id: Some("openai-responses"),
                 model_id: Some("gpt-audit"),
                 final_state: Some("completed"),
@@ -5158,6 +5169,114 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         1
     );
 }
+
+#[test]
+fn migrates_v27_llm_request_kind_and_spec_job_chat_id_defaults() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v27 database");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO chats (id, title, created_at, updated_at, metadata_json)
+            VALUES ('chat-1', 'Old audit chat', '2026-06-03T09:00:00Z', '2026-06-03T09:00:00Z', '{}');
+
+            CREATE TABLE llm_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                request_started_at TEXT NOT NULL,
+                first_token_at TEXT,
+                completed_at TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                first_token_latency_ms INTEGER,
+                total_latency_ms INTEGER,
+                status_code INTEGER,
+                final_state TEXT NOT NULL,
+                request_body_json TEXT,
+                response_body_json TEXT,
+                workspace_id TEXT,
+                cache_ratio REAL,
+                agent_team_id TEXT,
+                agent_instance_id TEXT,
+                agent_task_id TEXT,
+                agent_attempt_id TEXT
+            );
+            INSERT INTO llm_requests (
+                id, workspace_id, chat_id, provider_id, model_id, request_started_at,
+                completed_at, input_tokens, output_tokens, final_state
+            ) VALUES (
+                'old-request', 'workspace-1', 'chat-1', 'openai-responses', 'gpt-old',
+                '2026-06-03T10:00:00Z', '2026-06-03T10:00:01Z', 10, 5, 'completed'
+            );
+
+            CREATE TABLE workspace_spec_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                trigger_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                run_id TEXT,
+                model_id TEXT,
+                base_revision INTEGER,
+                input_summary_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                retry_of_job_id TEXT REFERENCES workspace_spec_jobs(id) ON DELETE SET NULL
+            );
+            INSERT INTO workspace_spec_jobs (
+                id, trigger_type, status, run_id, model_id, base_revision, input_summary_json, created_at
+            ) VALUES (
+                'old-spec-job', 'manual_refresh', 'queued', NULL, 'gpt-old', 1, '{}',
+                '2026-06-03T10:00:00Z'
+            );
+            PRAGMA user_version = 27;
+            "#,
+        )
+        .expect("v27 audit/spec schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let request = database
+        .llm_request("old-request")
+        .expect("old request lookup")
+        .expect("old request");
+    assert_eq!(request.request_kind, "unknown");
+    let rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_kind: Some("unknown"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("audit rows by request kind");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "old-request");
+    assert_eq!(rows[0].request_kind, "unknown");
+    let job = database
+        .workspace_spec_job("old-spec-job")
+        .expect("old spec job lookup")
+        .expect("old spec job");
+    assert_eq!(job.chat_id, None);
+}
+
 #[test]
 fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebuild() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -5169,6 +5288,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             id: "rollup-request-1",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5247,6 +5367,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             id: "rollup-request-2",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5275,6 +5396,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
             id: "rollup-request-running",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5456,6 +5578,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             id: "old-request",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5505,6 +5628,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             id: "new-request",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -5570,6 +5694,7 @@ fn vacuum_reclaims_workspace_database_freelist_pages() {
             id: "large-old-request",
             workspace_id: "workspace-1",
             chat_id: None,
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -8585,6 +8710,7 @@ fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
             id: "request-agent-runtime",
             workspace_id: "workspace-1",
             chat_id: Some("chat-agent-runtime"),
+            request_kind: "chat completion",
             agent_team_id: Some(&team_id),
             agent_instance_id: Some(&instance_id),
             agent_task_id: Some(&task_id),
@@ -8979,6 +9105,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-memory-retrieval-latest",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "memory retrieval",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9004,6 +9131,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-running-latest",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9029,6 +9157,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-empty-tokens",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9054,6 +9183,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-failed",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9079,6 +9209,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-selected-b",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9104,6 +9235,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-selected-a",
             workspace_id: "workspace-1",
             chat_id: Some("chat-usage"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -9129,6 +9261,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             id: "request-other-chat",
             workspace_id: "workspace-1",
             chat_id: Some("other-chat"),
+            request_kind: "chat completion",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
