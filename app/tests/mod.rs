@@ -88,7 +88,7 @@ use crate::memory_runtime::{
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
-    context_token_breakdown, context_usage_segments_total,
+    context_token_breakdown, context_usage_segments, context_usage_segments_total,
 };
 use crate::runtime::{
     QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
@@ -673,6 +673,50 @@ fn test_prepared_chat_context(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     }
+}
+
+fn append_test_runtime_tool_batch(
+    context: &mut PreparedChatContext,
+    batch_index: usize,
+    content_chars: usize,
+) {
+    let call_id = format!("call-test-{batch_index}");
+    let tool_calls = vec![NeutralToolCall {
+        call_id: call_id.clone(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
+        thought_signatures: None,
+    }];
+    let tool_results = vec![ExecutedToolCall {
+        id: call_id,
+        name: "read_file".to_string(),
+        input: tool_calls[0].arguments.clone(),
+        output: json!({ "content": "x".repeat(content_chars), "timeoutMs": 10000 }),
+        is_error: false,
+        started_at: "2026-06-13T09:00:00Z".to_string(),
+        completed_at: "2026-06-13T09:00:01Z".to_string(),
+    }];
+    append_tool_state_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &mut context.next_runtime_tool_batch_index,
+        tool_calls,
+        &tool_results,
+        String::new(),
+        None,
+    );
+}
+
+fn prepared_context_total_used_tokens(context: &PreparedChatContext) -> u64 {
+    let groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )
+    .expect("context message groups");
+    context_usage_segments_total(&context_usage_segments(&context.context_budget, &groups))
 }
 
 #[test]
@@ -3845,43 +3889,23 @@ fn runtime_tool_state_compression_uses_total_context_threshold() {
         vec![PromptContextSource::ReservedPrompt],
         900,
     );
-    context.context_budget.system_prompt_tokens = 250;
+    context.context_budget.system_prompt_tokens = 620;
     context.active_tool_start_index = context.provider_request.messages.len();
 
     for batch_index in 0..4 {
-        let call_id = format!("call-total-{batch_index}");
-        let tool_calls = vec![NeutralToolCall {
-            call_id: call_id.clone(),
-            name: "read_file".to_string(),
-            arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
-            thought_signatures: None,
-        }];
-        let tool_results = vec![ExecutedToolCall {
-            id: call_id,
-            name: "read_file".to_string(),
-            input: tool_calls[0].arguments.clone(),
-            output: json!({
-                "path": "app/main.rs",
-                "bytes": 12_000,
-                "content": "z".repeat(600),
-                "timeoutMs": 10000
-            }),
-            is_error: false,
-            started_at: "2026-06-13T09:00:00Z".to_string(),
-            completed_at: "2026-06-13T09:00:01Z".to_string(),
-        }];
-        append_tool_state_messages(
-            &mut context.provider_request.messages,
-            &mut context.message_source_sequences,
-            &mut context.message_context_sources,
-            &mut context.next_runtime_tool_batch_index,
-            tool_calls,
-            &tool_results,
-            String::new(),
-            None,
-        );
+        append_test_runtime_tool_batch(&mut context, batch_index, 600);
     }
 
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )
+    .expect("context groups");
+    assert!(total_used_context_tokens >= 800);
+    assert!(context_token_breakdown(&message_groups).required_tokens <= 900);
     assert!(
         compress_runtime_tool_state_if_needed(&mut context, false).expect("runtime compression")
     );
@@ -3910,6 +3934,8 @@ async fn ensure_context_compression_skips_rule_snapshots_below_llm_threshold() {
     let mut context =
         test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
     context.active_tool_start_index = context.provider_request.messages.len();
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!((800..950).contains(&total_used_context_tokens));
 
     let result = ensure_context_compression(&mut context)
         .await
@@ -3917,6 +3943,41 @@ async fn ensure_context_compression_skips_rule_snapshots_below_llm_threshold() {
 
     assert!(!result.runtime_tool_state_compressed);
     assert!(result.events.is_empty());
+    assert!(context.compression_snapshots.is_empty());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-llm-compression-threshold-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut messages = vec![neutral_text_message(
+        NeutralChatRole::System,
+        "system".to_string(),
+    )];
+    let mut sequences = vec![None];
+    let mut sources = vec![PromptContextSource::ReservedPrompt];
+    for sequence in 0..7 {
+        messages.push(neutral_text_message(
+            NeutralChatRole::Assistant,
+            "h".repeat(560),
+        ));
+        sequences.push(Some(sequence));
+        sources.push(PromptContextSource::StoredMessage { sequence });
+    }
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
+    context.provider_config.api_key = None;
+    context.active_tool_start_index = context.provider_request.messages.len();
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!(total_used_context_tokens >= 950);
+
+    let error = ensure_context_compression(&mut context)
+        .await
+        .expect_err("llm compression branch should try the provider");
+
+    assert!(error.message().contains("API key"));
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -5367,11 +5428,11 @@ fn finalized_assistant_parts_persist_context_compression_events() {
             json!({
                 "assistantMessageId": "assistant-1",
                 "type": "contextCompression",
-                "kind": "rule",
+                "kind": "llm",
                 "status": "start",
                 "detail": {
                     "status": "start",
-                    "kind": "rule",
+                    "kind": "llm",
                     "originalTokenCount": 1200,
                     "startedAt": "2026-06-18T10:00:00Z",
                     "providerId": "openai",
@@ -5384,12 +5445,12 @@ fn finalized_assistant_parts_persist_context_compression_events() {
             json!({
                 "assistantMessageId": "assistant-1",
                 "type": "contextCompression",
-                "kind": "rule",
+                "kind": "llm",
                 "snapshotId": "snapshot-1",
                 "status": "completed",
                 "detail": {
                     "status": "completed",
-                    "kind": "rule",
+                    "kind": "llm",
                     "snapshotId": "snapshot-1",
                     "originalTokenCount": 1200,
                     "summaryTokenCount": 320,
@@ -5594,28 +5655,6 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             json!({ "assistant_message_id": "assistant-1", "delta": "After." }),
         ),
         (
-            5,
-            "context_compression",
-            json!({
-                "assistant_message_id": "assistant-1",
-                "type": "contextCompression",
-                "kind": "rule",
-                "snapshotId": "rule-snapshot-1",
-                "status": "completed",
-                "detail": {
-                    "status": "completed",
-                    "kind": "rule",
-                    "snapshotId": "rule-snapshot-1",
-                    "originalTokenCount": 3000,
-                    "summaryTokenCount": 1000,
-                    "startedAt": "2026-06-18T10:00:02Z",
-                    "completedAt": "2026-06-18T10:00:03Z",
-                    "providerId": "",
-                    "modelId": ""
-                }
-            }),
-        ),
-        (
             6,
             "context_compression",
             json!({
@@ -5713,16 +5752,12 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
     assert!(
         matches!(&summary.parts[5], ChatMessagePart::ContextCompression { kind, detail, .. }
-            if kind == "rule" && detail.snapshot_id.as_deref() == Some("rule-snapshot-1"))
-    );
-    assert!(
-        matches!(&summary.parts[6], ChatMessagePart::ContextCompression { kind, detail, .. }
             if kind == "llm"
                 && detail.snapshot_id.as_deref() == Some("llm-snapshot-1")
                 && detail.summary_token_count == Some(1200))
     );
     assert!(
-        matches!(&summary.parts[7], ChatMessagePart::ContextCompression { kind, detail, .. }
+        matches!(&summary.parts[6], ChatMessagePart::ContextCompression { kind, detail, .. }
             if kind == "runtimeToolState"
                 && detail.snapshot_id.as_deref() == Some("runtime-snapshot-1")
                 && detail.summary_token_count == Some(800))
@@ -16080,12 +16115,21 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                 None,
             ),
             request(
+                "internal-context-compression",
+                &workspace_id,
+                "contextCompression",
+                500,
+                50,
+                "2026-07-06T10:00:02Z",
+                Some(r#"{"requestKind":"contextCompression"}"#),
+            ),
+            request(
                 "internal-memory-extraction",
                 &workspace_id,
                 "memory extraction",
                 600,
                 60,
-                "2026-07-06T10:00:02Z",
+                "2026-07-06T10:00:01Z",
                 None,
             ),
             request(
@@ -16094,7 +16138,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                 "chat completion",
                 100,
                 25,
-                "2026-07-06T10:00:01Z",
+                "2026-07-06T10:00:00Z",
                 None,
             ),
         ] {
@@ -16122,7 +16166,10 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
         Query(AiStatisticsQuery {
             workspace_id: Some(workspace_id.clone()),
             request_id: None,
-            request_ids: Some("main-chat-request,internal-memory-retrieval".to_string()),
+            request_ids: Some(
+                "main-chat-request,internal-memory-retrieval,internal-context-compression"
+                    .to_string(),
+            ),
             chat_id: Some("chat-internal-filter".to_string()),
             provider_id: None,
             model_id: None,
@@ -16144,13 +16191,24 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     assert_eq!(ai_stats.requests[0].request_kind, "chat completion");
 
     let Json(detail) = crate::http::chat::ai_statistics_detail(
-        State(state),
+        State(state.clone()),
         AxumPath((workspace_id.clone(), "main-chat-request".to_string())),
     )
     .await
     .expect("ai statistics detail");
     assert_eq!(detail.request.id, "main-chat-request");
     assert_eq!(detail.request.request_kind, "chat completion");
+
+    let Json(internal_detail) = crate::http::chat::ai_statistics_detail(
+        State(state),
+        AxumPath((
+            workspace_id.clone(),
+            "internal-context-compression".to_string(),
+        )),
+    )
+    .await
+    .expect("internal ai statistics detail");
+    assert_eq!(internal_detail.request.request_kind, "contextCompression");
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

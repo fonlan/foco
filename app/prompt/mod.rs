@@ -16,7 +16,7 @@ pub(crate) use compression::{
 #[cfg(test)]
 pub(crate) use compression::{
     compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
-    context_token_breakdown, llm_context_compression_trigger_tokens,
+    context_token_breakdown, context_usage_segments, llm_context_compression_trigger_tokens,
 };
 pub(crate) use environment::environment_context_message;
 #[cfg(all(not(windows), not(target_os = "macos")))]
