@@ -87,7 +87,7 @@ use crate::memory_runtime::{
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
-    context_token_breakdown,
+    context_token_breakdown, context_usage_segments_total,
 };
 use crate::runtime::{
     QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
@@ -15489,38 +15489,42 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
                 metadata_json: Some("{}"),
             })
             .expect("message insert");
-        database
-            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
-                id: "ctx-timeline-1",
-                chat_id: "chat-context-timeline",
-                run_id: "run-timeline",
-                sequence: 1,
-                summary: "compressed summary",
-                source_message_start_sequence: 0,
-                source_message_end_sequence: 2,
-                original_token_count: 120,
-                summary_token_count: 12,
-                metadata_json: Some(
-                    &json!({
-                        "kind": CONTEXT_COMPRESSION_KIND_RULE,
-                        "contextUsage": {
-                            "contextWindow": 20_000,
-                            "maxOutputTokens": 1_000,
-                            "triggerTokens": 16_000,
-                            "totalUsedTokens": 1_345,
-                            "segments": {
-                                "systemPrompt": 100,
-                                "toolSchema": 200,
-                                "compressionSnapshot": 40,
-                                "history": 5,
-                                "reservedOutput": 1_000
-                            }
-                        }
-                    })
-                    .to_string(),
-                ),
+        for (id, sequence, segments, total_used_tokens) in [
+            ("ctx-timeline-1", 1, (100, 200, 40, 5, 1_000), 1_345),
+            ("ctx-timeline-2", 2, (150, 250, 60, 15, 1_000), 1_475),
+        ] {
+            let metadata = json!({
+                "kind": CONTEXT_COMPRESSION_KIND_RULE,
+                "contextUsage": {
+                    "contextWindow": 20_000,
+                    "maxOutputTokens": 1_000,
+                    "triggerTokens": 16_000,
+                    "totalUsedTokens": total_used_tokens,
+                    "segments": {
+                        "systemPrompt": segments.0,
+                        "toolSchema": segments.1,
+                        "compressionSnapshot": segments.2,
+                        "history": segments.3,
+                        "reservedOutput": segments.4
+                    }
+                }
             })
-            .expect("snapshot insert");
+            .to_string();
+            database
+                .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                    id,
+                    chat_id: "chat-context-timeline",
+                    run_id: "run-timeline",
+                    sequence,
+                    summary: "compressed summary",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 2,
+                    original_token_count: 120,
+                    summary_token_count: 12,
+                    metadata_json: Some(&metadata),
+                })
+                .expect("snapshot insert");
+        }
     }
 
     let Json(stats) = crate::http::chat::chat_statistics(
@@ -15533,7 +15537,13 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     .await
     .expect("chat statistics");
 
-    assert_eq!(stats.context_usage_timeline.len(), 1);
+    assert_eq!(stats.context_usage_timeline.len(), 2);
+    for entry in &stats.context_usage_timeline {
+        let segment_total = context_usage_segments_total(&entry.segments);
+        assert_eq!(segment_total, entry.total_used_tokens);
+        assert!(entry.trigger_tokens <= entry.context_window);
+    }
+
     let entry = &stats.context_usage_timeline[0];
     assert_eq!(entry.snapshot_id, "ctx-timeline-1");
     assert_eq!(entry.context_window, 20_000);
@@ -15542,6 +15552,10 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     assert_eq!(entry.total_used_tokens, 1_345);
     assert_eq!(entry.segments.reserved_output, 1_000);
     assert_eq!(entry.segments.compression_snapshot, 40);
+
+    let second = &stats.context_usage_timeline[1];
+    assert_eq!(second.snapshot_id, "ctx-timeline-2");
+    assert_eq!(second.total_used_tokens, 1_475);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

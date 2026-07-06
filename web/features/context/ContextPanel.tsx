@@ -51,6 +51,8 @@ import type {
   ConfiguredProviderSummary,
   ContextMemoryState,
   ContextUsageResponse,
+  ContextUsageSegments,
+  ContextUsageTimelineEntry,
   GitDiffResponse,
   GitStatusFileSummary,
   MemoryFactRecord,
@@ -2269,6 +2271,11 @@ function ContextStatsTab({
         ) : null}
       </div>
 
+      <ContextUsageTimelinePanel
+        contextUsage={contextUsage}
+        timeline={statistics.contextUsageTimeline}
+      />
+
       <div className="context-stats-metrics">
         <ContextStatMetric
           label={t("Total tokens")}
@@ -2367,6 +2374,140 @@ function ContextStatsTab({
           ]}
         />
       </ContextStatsSection>
+    </div>
+  );
+}
+
+function ContextUsageTimelinePanel({
+  contextUsage,
+  timeline,
+}: {
+  contextUsage: ContextUsageResponse | null;
+  timeline: ContextUsageTimelineEntry[];
+}) {
+  const { language, t } = useI18n();
+
+  if (!contextUsage?.contextWindow) {
+    return (
+      <section className="context-usage-timeline-panel">
+        <div className="context-empty-inline">{t("Context usage unavailable.")}</div>
+      </section>
+    );
+  }
+
+  const currentEntry: ContextUsageBarEntry = {
+    id: "current",
+    label: t("Current"),
+    meta: `${formatNumber(contextUsage.totalUsedContextTokens, language)} / ${formatNumber(
+      contextUsage.contextWindow,
+      language,
+    )}`,
+    contextWindow: contextUsage.contextWindow,
+    totalUsedTokens: contextUsage.totalUsedContextTokens,
+    segments: contextUsage.segments,
+  };
+  const historyEntries = timeline.map((entry) => ({
+    id: entry.snapshotId,
+    label: `${t("Snapshot")} ${formatNumber(entry.sequence, language)}`,
+    meta: `${entry.kind} / ${entry.snapshotId}`,
+    contextWindow: entry.contextWindow,
+    totalUsedTokens: entry.totalUsedTokens,
+    segments: entry.segments,
+  }));
+
+  return (
+    <section className="context-usage-timeline-panel" aria-label={t("Context usage timeline")}>
+      <ContextUsageBar entry={currentEntry} isCurrent />
+      {historyEntries.length ? (
+        <div className="context-usage-history-stack">
+          {historyEntries.map((entry) => (
+            <ContextUsageBar entry={entry} key={entry.id} />
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+type ContextUsageBarEntry = {
+  id: string;
+  label: string;
+  meta: string;
+  contextWindow: number;
+  totalUsedTokens: number;
+  segments: ContextUsageSegments;
+};
+
+const CONTEXT_USAGE_SEGMENT_STYLES = [
+  { key: "promptTools", label: "Prompt/tools", color: "#2563eb" },
+  { key: "history", label: "History", color: "#16a34a" },
+  { key: "compressionSnapshot", label: "Compression snapshot", color: "#7c3aed" },
+  { key: "reservedOutput", label: "Reserved output", color: "#f97316" },
+] as const;
+
+function ContextUsageBar({
+  entry,
+  isCurrent = false,
+}: {
+  entry: ContextUsageBarEntry;
+  isCurrent?: boolean;
+}) {
+  const { language, t } = useI18n();
+  const contextWindow = Math.max(entry.contextWindow, 1);
+  const usedPercent = (entry.totalUsedTokens / contextWindow) * 100;
+  const isPastTrigger = usedPercent >= 80;
+  let usedPercentCursor = 0;
+  const rawSegments = {
+    promptTools: entry.segments.systemPrompt + entry.segments.toolSchema,
+    history: entry.segments.history,
+    compressionSnapshot: entry.segments.compressionSnapshot,
+    reservedOutput: entry.segments.reservedOutput,
+  };
+  const segmentParts = CONTEXT_USAGE_SEGMENT_STYLES.flatMap((segment) => {
+    const tokens = rawSegments[segment.key];
+    if (tokens <= 0 || usedPercentCursor >= 100) {
+      return [];
+    }
+    const widthPercent = Math.min((tokens / contextWindow) * 100, 100 - usedPercentCursor);
+    usedPercentCursor += widthPercent;
+    return [{ ...segment, tokens, widthPercent }];
+  });
+
+  return (
+    <div className={`context-usage-bar-row${isCurrent ? " is-current" : ""}`}>
+      <div className="context-usage-bar-copy">
+        <span className="context-usage-bar-label" title={entry.label}>
+          {entry.label}
+        </span>
+        <span className="context-usage-bar-meta" title={entry.meta}>
+          {entry.meta}
+        </span>
+      </div>
+      <div
+        className="context-usage-bar-track"
+        title={`${formatNumber(entry.totalUsedTokens, language)} / ${formatNumber(
+          entry.contextWindow,
+          language,
+        )}`}
+      >
+        {segmentParts.map((segment, index) => (
+          <span
+            aria-label={`${t(segment.label)}: ${formatNumber(segment.tokens, language)}`}
+            className={`context-usage-bar-segment${index === 0 ? " is-first" : ""}${
+              index === segmentParts.length - 1 ? " is-last" : ""
+            }`}
+            key={segment.key}
+            style={{ backgroundColor: segment.color, width: `${segment.widthPercent}%` }}
+          />
+        ))}
+        <span className="context-usage-trigger-marker" aria-hidden="true">
+          <span>80%</span>
+        </span>
+      </div>
+      <div className="context-usage-bar-footer">
+        <span>{formatNumber(entry.totalUsedTokens, language)}</span>
+        {isPastTrigger ? <strong>{t("Past 80%")}</strong> : null}
+      </div>
     </div>
   );
 }

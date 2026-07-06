@@ -1610,10 +1610,22 @@ export const planFixture: Plan = {
 
 export const contextUsage = {
   availableMessageTokens: 110960,
+  compressionSnapshotTokens: 2340,
   compressionTriggerPercent: 80,
-  compressionTriggerTokens: 88768,
-  memoryBudgetTokens: 13315,
+  compressionTriggerTokens: 102400,
+  contextWindow: 128000,
+  historyTokens: 32000,
+  maxOutputTokens: 20000,
+  memoryBudgetTokens: 15360,
   memoryContextTokens: 120,
+  segments: {
+    compressionSnapshot: 2340,
+    history: 32000,
+    reservedOutput: 20000,
+    systemPrompt: 4200,
+    toolSchema: 9800,
+  },
+  systemPromptTokens: 4200,
   tokenBreakdown: {
     bySource: [
       {
@@ -1642,7 +1654,9 @@ export const contextUsage = {
     optionalTokens: 32120,
     requiredTokens: 20220,
   },
-  usagePercent: 47,
+  toolSchemaTokens: 9800,
+  totalUsedContextTokens: 68340,
+  usagePercent: 53,
   usedMessageTokens: 52340,
   willCompressOnNextSend: false,
 };
@@ -1661,6 +1675,40 @@ export const chatStatistics = {
     snapshotCount: 1,
     summaryTokenCount: 2200,
   },
+  contextUsageTimeline: [
+    {
+      contextWindow: 128000,
+      kind: "rule",
+      maxOutputTokens: 20000,
+      segments: {
+        compressionSnapshot: 18000,
+        history: 58000,
+        reservedOutput: 20000,
+        systemPrompt: 4200,
+        toolSchema: 9800,
+      },
+      sequence: 1,
+      snapshotId: "snapshot-with-a-long-id-that-should-not-break-layout",
+      totalUsedTokens: 110000,
+      triggerTokens: 102400,
+    },
+    {
+      contextWindow: 128000,
+      kind: "llm",
+      maxOutputTokens: 20000,
+      segments: {
+        compressionSnapshot: 12000,
+        history: 54000,
+        reservedOutput: 20000,
+        systemPrompt: 4200,
+        toolSchema: 9800,
+      },
+      sequence: 2,
+      snapshotId: "snapshot-2",
+      totalUsedTokens: 100000,
+      triggerTokens: 102400,
+    },
+  ],
   createdMemories: 2,
   failedRequests: 0,
   memoryReferences: 3,

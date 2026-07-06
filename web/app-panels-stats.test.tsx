@@ -2665,6 +2665,18 @@ describe("app-panels-stats verification surfaces", () => {
         .getByText("2"),
     ).toBeInTheDocument();
     expect(screen.getByText("52,340 / 110,960")).toBeInTheDocument();
+    const contextTimeline = screen.getByLabelText("Context usage timeline");
+    expect(within(contextTimeline).getByText("68,340 / 128,000")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("Snapshot 1")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("Snapshot 2")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("Past 80%")).toBeInTheDocument();
+    expect(within(contextTimeline).getAllByLabelText(/Prompt\/tools:/)).not.toHaveLength(0);
+    expect(within(contextTimeline).getAllByLabelText(/History:/)).not.toHaveLength(0);
+    expect(within(contextTimeline).getAllByLabelText(/Compression snapshot:/)).not.toHaveLength(0);
+    expect(within(contextTimeline).getAllByLabelText(/Reserved output:/)).not.toHaveLength(0);
+    expect(
+      contextTimeline.querySelectorAll(".context-usage-history-stack .context-usage-bar-row"),
+    ).toHaveLength(2);
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/context-usage"),
     ).toBe(true);
