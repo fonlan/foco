@@ -451,7 +451,7 @@ describe("app agents verification surfaces", () => {
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
     expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
   });
 
   it("refreshes empty Agent transcripts without replaying snapshot events", async () => {
@@ -632,7 +632,7 @@ describe("app agents verification surfaces", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
 
     expect(await screen.findByText("Checking workspace state.")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
 
     transcriptResponse = secondTranscriptResponse;

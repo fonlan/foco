@@ -583,7 +583,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Before.")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -646,7 +646,7 @@ describe("app-chat-stream verification surfaces", () => {
       expect(screen.queryByText("dropped_tool")).not.toBeInTheDocument();
     });
     expect(screen.getByText("Before.")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -1172,13 +1172,13 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
     expect(
-      within(guidedAnswerRow as HTMLElement).getByText(/noop/),
+      within(guidedAnswerRow as HTMLElement).getByText(/Noop/),
     ).toBeInTheDocument();
     expect(
       within(guidedAnswerRow as HTMLElement).queryByText(/running/i),
     ).not.toBeInTheDocument();
     expect(
-      within(initialAnswerRow as HTMLElement).queryByText(/noop/),
+      within(initialAnswerRow as HTMLElement).queryByText(/Noop/),
     ).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1212,7 +1212,7 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const toolName = await screen.findByText("pre_guidance_tool");
+    const toolName = await screen.findByText("Pre Guidance Tool");
     const interruptedAssistantRow = toolName.closest(".message-row") as HTMLElement | null;
     expect(interruptedAssistantRow).not.toBeNull();
     expect(
@@ -1268,7 +1268,7 @@ describe("app-chat-stream verification surfaces", () => {
       within(interruptedAssistantRow as HTMLElement).getByText(/finished output/),
     ).toBeInTheDocument();
     expect(
-      within(guidedAssistantRow as HTMLElement).queryByText("pre_guidance_tool"),
+      within(guidedAssistantRow as HTMLElement).queryByText("Pre Guidance Tool"),
     ).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1314,12 +1314,12 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const toolName = await screen.findByText("run_command");
+    const toolName = await screen.findByText("Run");
     const assistantRow = toolName.closest(".message-row") as HTMLElement | null;
     expect(assistantRow).not.toBeNull();
     const row = assistantRow as HTMLElement;
     const beforeText = within(row).getByText("Before command.");
-    expect(within(row).getAllByText("run_command")).toHaveLength(1);
+    expect(within(row).getAllByText("Run")).toHaveLength(1);
     expect(within(row).getByText("running")).toBeInTheDocument();
     expect(
       beforeText.compareDocumentPosition(toolName) &
@@ -1352,8 +1352,8 @@ describe("app-chat-stream verification surfaces", () => {
 
     const fullCommand = "npm run test -- --watch=false | cwd: web";
     expect(await within(row).findByText(fullCommand)).toBeInTheDocument();
-    const updatedToolName = within(row).getByText("run_command");
-    expect(within(row).getAllByText("run_command")).toHaveLength(1);
+    const updatedToolName = within(row).getByText("Run");
+    expect(within(row).getAllByText("Run")).toHaveLength(1);
     expect(
       beforeText.compareDocumentPosition(updatedToolName) &
         Node.DOCUMENT_POSITION_FOLLOWING,

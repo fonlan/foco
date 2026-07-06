@@ -66,6 +66,7 @@ import type {
 } from "../../api/types";
 import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
+import { toolDisplayName } from "./chat-helpers";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
 
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
@@ -2027,6 +2028,10 @@ function ChatReplyMetricsLine({
   );
 }
 
+function memoryMetaLabel(value: string, t: Translate) {
+  return t(`memory.${value}`);
+}
+
 function MemoriesUsedBlock({ memories }: { memories: ChatMemoryUsedSummary[] }) {
   const { t } = useI18n();
   if (!memories.length) {
@@ -2050,9 +2055,9 @@ function MemoriesUsedBlock({ memories }: { memories: ChatMemoryUsedSummary[] }) 
             key={`${memory.scope}-${memory.id}`}
           >
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
-              <span>{memory.scope}</span>
-              <span>{memory.kind}</span>
-              <span>{memory.source}</span>
+              <span>{memoryMetaLabel(memory.scope, t)}</span>
+              <span>{memoryMetaLabel(memory.kind, t)}</span>
+              <span>{memoryMetaLabel(memory.source, t)}</span>
               {memory.pinned ? <span>{t("Pinned")}</span> : null}
             </div>
             <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
@@ -2092,9 +2097,9 @@ function ExtractedMemoriesBlock({
             key={`${memory.scope}-${memory.id}`}
           >
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
-              <span>{memory.scope}</span>
-              <span>{memory.kind}</span>
-              <span>{memory.status}</span>
+              <span>{memoryMetaLabel(memory.scope, t)}</span>
+              <span>{memoryMetaLabel(memory.kind, t)}</span>
+              <span>{memoryMetaLabel(memory.status, t)}</span>
             </div>
             <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
               {memory.fact}
@@ -2584,7 +2589,7 @@ function ToolCallBlock({
     toolLiveOutputText,
     toolStatusText,
   } = helpers;
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
   const input = normalizedToolInput(toolCall.input);
   const editFileDiff = successfulEditFileDiff(toolCall, input);
@@ -2595,6 +2600,7 @@ function ToolCallBlock({
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
   const toggleLabel = viewMode === "compact" ? t("Raw") : t("Compact");
+  const displayName = toolDisplayName(toolCall.name, language);
   const ToolIcon = TOOL_CALL_ICONS[toolCall.name] ?? Wrench;
 
   return (
@@ -2605,9 +2611,13 @@ function ToolCallBlock({
         workspaceId={workspaceId}
       />
       <details className="tool-call-block group min-w-0">
-        <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
+        <summary
+          aria-label={`${displayName} (${toolCall.name})`}
+          className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden"
+          title={toolCall.name}
+        >
           <ToolIcon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-          <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
+          <span className="min-w-0 shrink-0 truncate">{displayName}</span>
           {changeStats ? (
             <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
               <span className="text-emerald-700">+{changeStats.linesAdded}</span>{" "}

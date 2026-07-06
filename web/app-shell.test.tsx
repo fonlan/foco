@@ -148,7 +148,7 @@ describe("app-shell verification surfaces", () => {
     const userBubble = screen
       .getByText("Please inspect README.")
       .closest(".message-bubble") as HTMLElement | null;
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     expect(userBubble).toHaveClass("message-bubble-user");
     expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
@@ -221,7 +221,7 @@ describe("app-shell verification surfaces", () => {
     expect(within(reasoningToggle).getByText("2 s")).toBeInTheDocument();
     expect(screen.getByText("Need file context.")).toBeInTheDocument();
     expect(screen.getByText("Then answer.")).toBeInTheDocument();
-    expect(screen.getByText("edit_file")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Edit")).toBeInTheDocument();
     expect(screen.getByText("+1")).toHaveClass("text-emerald-700");
     expect(screen.getByText("-1")).toHaveClass("text-rose-700");
     expect(screen.getByText("README.md")).toBeInTheDocument();
@@ -307,7 +307,7 @@ describe("app-shell verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("编辑 (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -329,7 +329,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -380,7 +380,7 @@ describe("app-shell verification surfaces", () => {
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -613,7 +613,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
 
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -666,7 +666,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
 
-    const assistantBubble = (await screen.findByText("read_file"))
+    const assistantBubble = (await screen.findByLabelText("Read (read_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -717,7 +717,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
 
-    const assistantBubble = (await screen.findByText("write_file"))
+    const assistantBubble = (await screen.findByLabelText("Write (write_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");
@@ -786,8 +786,8 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
 
-    const runCommandSummary = (await screen.findByText("run_command")).closest("summary");
-    const unknownSummary = (await screen.findByText("mystery_tool")).closest("summary");
+    const runCommandSummary = (await screen.findByLabelText("Run (run_command)")).closest("summary");
+    const unknownSummary = (await screen.findByLabelText("Mystery Tool (mystery_tool)")).closest("summary");
 
     expect(runCommandSummary?.querySelector("svg.lucide-terminal")).toBeInTheDocument();
     expect(unknownSummary?.querySelector("svg.lucide-wrench")).toBeInTheDocument();
@@ -818,7 +818,7 @@ describe("app-shell verification surfaces", () => {
     renderApp();
 
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
-    const assistantBubble = (await screen.findByText("edit_file"))
+    const assistantBubble = (await screen.findByLabelText("编辑 (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");

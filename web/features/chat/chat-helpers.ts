@@ -1,4 +1,5 @@
 import type {
+  AppLanguageId,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
   ChatMessagePart,
@@ -8,6 +9,78 @@ import type {
   Translate,
 } from "../../api/types";
 import type { SelectedSkillPrefix } from "./MarkdownContent";
+
+type ToolDisplayLabels = {
+  en: string;
+  "zh-CN": string;
+};
+
+const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
+  agent_cancel_task: { en: "Cancel Task", "zh-CN": "取消任务" },
+  agent_create_instances: { en: "Create Agents", "zh-CN": "创建智能体" },
+  agent_delegate_task: { en: "Delegate Task", "zh-CN": "委派任务" },
+  agent_get_task: { en: "Get Task", "zh-CN": "获取任务" },
+  agent_list: { en: "List Agents", "zh-CN": "列出智能体" },
+  agent_send_message: { en: "Send Message", "zh-CN": "发送消息" },
+  agent_transfer_task: { en: "Transfer Task", "zh-CN": "转交任务" },
+  agent_wait_tasks: { en: "Wait Tasks", "zh-CN": "等待任务" },
+  ask_question: { en: "Ask", "zh-CN": "询问" },
+  create_plan: { en: "Create Plan", "zh-CN": "创建计划" },
+  create_todo_graph: { en: "Create Todos", "zh-CN": "创建待办" },
+  delete_plan: { en: "Delete Plan", "zh-CN": "删除计划" },
+  edit_file: { en: "Edit", "zh-CN": "编辑" },
+  finance: { en: "Finance", "zh-CN": "金融" },
+  find: { en: "Find", "zh-CN": "查找" },
+  find_files: { en: "Glob", "zh-CN": "查找" },
+  get_plans: { en: "Plans", "zh-CN": "计划" },
+  get_todo_graph: { en: "Todos", "zh-CN": "待办" },
+  git_branch: { en: "Branch", "zh-CN": "分支" },
+  git_status: { en: "Git", "zh-CN": "Git" },
+  graph_explore: { en: "Explore", "zh-CN": "探索" },
+  graph_find_callees: { en: "Callees", "zh-CN": "被调" },
+  graph_find_callers: { en: "Callers", "zh-CN": "调用" },
+  graph_find_references: { en: "References", "zh-CN": "引用" },
+  graph_find_symbols: { en: "Symbols", "zh-CN": "符号" },
+  graph_related_files: { en: "Related", "zh-CN": "相关" },
+  image_gen: { en: "ImageGen", "zh-CN": "生图" },
+  image_query: { en: "Image Search", "zh-CN": "搜图" },
+  memory_search: { en: "Memory Search", "zh-CN": "搜记忆" },
+  memory_write: { en: "Memory Write", "zh-CN": "写记忆" },
+  open: { en: "Open", "zh-CN": "打开" },
+  read_file: { en: "Read", "zh-CN": "读取" },
+  read_spec: { en: "Read Spec", "zh-CN": "读 Spec" },
+  run_command: { en: "Run", "zh-CN": "运行" },
+  screenshot: { en: "Screenshot", "zh-CN": "截图" },
+  search_query: { en: "Search", "zh-CN": "Web搜索" },
+  search_text: { en: "Grep", "zh-CN": "搜索" },
+  sleep: { en: "Sleep", "zh-CN": "等待" },
+  sports: { en: "Sports", "zh-CN": "体育" },
+  time: { en: "Time", "zh-CN": "时间" },
+  update_plan: { en: "Update Plan", "zh-CN": "更新计划" },
+  update_plan_step: { en: "Update Step", "zh-CN": "更新步骤" },
+  update_spec: { en: "Update Spec", "zh-CN": "更新 Spec" },
+  weather: { en: "Weather", "zh-CN": "天气" },
+  web_fetch: { en: "Fetch", "zh-CN": "Web获取" },
+  write_file: { en: "Write", "zh-CN": "写入" },
+};
+
+export function toolDisplayName(toolName: string, language: AppLanguageId) {
+  if (toolName.startsWith("mcp__")) {
+    return language === "zh-CN" ? "MCP工具" : "MCP Tool";
+  }
+  const known = TOOL_DISPLAY_NAMES[toolName];
+  if (known) {
+    return known[language];
+  }
+  if (language === "zh-CN") {
+    return "工具";
+  }
+  return toolName
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || "Tool";
+}
 
 export function isSkillAvailableForWorkspace(
   skill: ConfiguredSkillSummary,
