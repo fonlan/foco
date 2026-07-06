@@ -17,17 +17,17 @@ use foco_store::{
 };
 
 use crate::http::settings::{
-    ApiAuditSettingsSummary, ApiProxySettingsSummary, ApiProxyTypeSummary, AppLanguageSummary,
-    AppThemeSummary, ConfiguredMcpServerSummary, ConfiguredModelSummary, ConfiguredProviderSummary,
-    ConfiguredSkillStoreSummary, ConfiguredSkillSummary, ConfiguredWorkspaceSummary,
-    GeneralSettingsSummary, IMAGE_AGENT_SYSTEM_PROMPT_NAME, McpTransportSummary,
-    MemoryDreamSettingsSummary, MemoryExtractionModeSummary, MemorySettingsSummary,
-    NativeToolsSummary, PlanMergeAutomationModeSummary, PlanSettingsSummary, PromptSettingsSummary,
-    ProviderKindSummary, SettingsResponse, SkillsSettingsSummary, SpecSettingsSummary,
-    SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary, WebSearchProviderSummary,
-    WebSearchSettingsSummary, WebServerSettingsSummary, WorkspaceCommonCommandSummary,
-    default_image_agent_system_prompt_for_config, default_plan_mode_system_prompt,
-    default_review_system_prompt, known_agent_tool_names,
+    AboutSettingsSummary, ApiAuditSettingsSummary, ApiProxySettingsSummary, ApiProxyTypeSummary,
+    AppLanguageSummary, AppThemeSummary, ConfiguredMcpServerSummary, ConfiguredModelSummary,
+    ConfiguredProviderSummary, ConfiguredSkillStoreSummary, ConfiguredSkillSummary,
+    ConfiguredWorkspaceSummary, GeneralSettingsSummary, IMAGE_AGENT_SYSTEM_PROMPT_NAME,
+    McpTransportSummary, MemoryDreamSettingsSummary, MemoryExtractionModeSummary,
+    MemorySettingsSummary, NativeToolsSummary, PlanMergeAutomationModeSummary, PlanSettingsSummary,
+    PromptSettingsSummary, ProviderKindSummary, SettingsResponse, SkillsSettingsSummary,
+    SpecSettingsSummary, SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary,
+    WebSearchProviderSummary, WebSearchSettingsSummary, WebServerSettingsSummary,
+    WorkspaceCommonCommandSummary, default_image_agent_system_prompt_for_config,
+    default_plan_mode_system_prompt, default_review_system_prompt, known_agent_tool_names,
 };
 use crate::platform::autostart_windows::auto_start_enabled_for_response;
 use crate::*;
@@ -263,6 +263,9 @@ pub(crate) async fn settings_response(
             .map(|server| configured_mcp_server_summary(server, &mcp_statuses))
             .collect(),
         skills: skills_settings_summary(config, &state.user_profile_dir),
+        about: AboutSettingsSummary {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
     }))
 }
 

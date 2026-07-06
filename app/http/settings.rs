@@ -307,6 +307,13 @@ pub(crate) struct SettingsResponse {
     pub(crate) mcp_transports: Vec<McpTransportSummary>,
     pub(crate) mcp_servers: Vec<ConfiguredMcpServerSummary>,
     pub(crate) skills: SkillsSettingsSummary,
+    pub(crate) about: AboutSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AboutSettingsSummary {
+    pub(crate) version: String,
 }
 
 #[derive(Serialize)]

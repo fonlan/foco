@@ -38,6 +38,7 @@ export const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "models",
   "mcp",
   "skills",
+  "about",
 ];
 export const MEMORY_KIND_OPTIONS = [
   "user_note",

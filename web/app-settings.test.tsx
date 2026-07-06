@@ -42,6 +42,8 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     expect(screen.getByRole("navigation", { name: "Foco" })).toBeInTheDocument();
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    const settingsNavButtons = within(settingsNav).getAllByRole("button");
+    expect(settingsNavButtons.at(-1)).toHaveAccessibleName("About");
     const settingsSidebar = settingsNav.closest("aside");
     expect(settingsSidebar).not.toBeNull();
     expect(within(settingsSidebar as HTMLElement).getByText("Settings")).toBeInTheDocument();
@@ -95,6 +97,16 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Update all store skills" })).toBeNull();
+
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "About" }));
+    expect(screen.getByText("About Foco")).toBeInTheDocument();
+    expect(screen.getByText("0.1.3")).toBeInTheDocument();
+    const githubLink = screen.getByRole("link", {
+      name: "Open GitHub repository",
+    });
+    expect(githubLink).toHaveAttribute("href", "https://github.com/fonlan/foco");
+    expect(githubLink).toHaveAttribute("target", "_blank");
+    expect(githubLink).toHaveAttribute("rel", "noreferrer");
   });
 
   it("saves the skill translation model without changing enabled skills", async () => {
@@ -580,6 +592,9 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("Spec 生成系统提示词")).toBeInTheDocument();
     expect(screen.getByLabelText("Spec 更新系统提示词")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "保存 Spec 设置" })).toBeInTheDocument();
+
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "关于" }));
+    expect(await screen.findByRole("heading", { name: "关于 Foco" })).toBeInTheDocument();
   });
 
   it("localizes provider model redirect controls", async () => {

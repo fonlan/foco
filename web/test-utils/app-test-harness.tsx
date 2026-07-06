@@ -138,6 +138,9 @@ export const secondaryWorkspace = {
 };
 
 export const settings = {
+  about: {
+    version: "0.1.3",
+  },
   agentTools: [
     "ask_question",
     "edit_file",

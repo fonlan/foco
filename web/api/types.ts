@@ -16,7 +16,8 @@ export type SettingsSection =
   | "models"
   | "providers"
   | "skills"
-  | "workspaces";
+  | "workspaces"
+  | "about";
 
 export type BrowserRouteChatTab = {
   workspaceId: string;
@@ -2372,4 +2373,9 @@ export type SettingsResponse = {
   mcpTransports: McpTransportSummary[];
   mcpServers: ConfiguredMcpServerSummary[];
   skills: SkillsSettingsSummary;
+  about: AboutSettingsSummary;
+};
+
+export type AboutSettingsSummary = {
+  version: string;
 };

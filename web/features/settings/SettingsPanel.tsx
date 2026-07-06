@@ -17,6 +17,7 @@ import {
   FolderSearch,
   Globe,
   GripVertical,
+  Info,
   KeyRound,
   ListChecks,
   LoaderCircle,
@@ -4397,6 +4398,12 @@ export function SettingsPanel({
               icon={Wrench}
               label={t("Skills")}
               onClick={() => onActiveSectionChange("skills")}
+            />
+            <SettingsNavButton
+              active={activeSection === "about"}
+              icon={Info}
+              label={t("About")}
+              onClick={() => onActiveSectionChange("about")}
             />
           </nav>
         </aside>
@@ -11040,6 +11047,51 @@ export function SettingsPanel({
 
             </section>
           ) : null}
+          {activeSection === "about" ? (
+            <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-center">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-3">
+                    <div className="inline-flex size-12 shrink-0 items-center justify-center rounded-xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
+                      <Code2 aria-hidden="true" className="size-6" />
+                    </div>
+                    <div className="min-w-0">
+                      <h3 className="text-xl font-semibold text-stone-950">Foco</h3>
+                      <p className="mt-1 text-sm font-medium text-stone-500">
+                        {t("Local-first AI coding workspace")}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <dl className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-xs font-semibold uppercase text-stone-400">
+                      {t("Version")}
+                    </dt>
+                    <dd className="text-sm font-semibold text-stone-800">
+                      {settings?.about.version ?? ""}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-xs font-semibold uppercase text-stone-400">
+                      {t("GitHub repository")}
+                    </dt>
+                    <dd className="min-w-0 text-right text-sm font-semibold">
+                      <a
+                        aria-label={t("Open GitHub repository")}
+                        className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
+                        href="https://github.com/fonlan/foco"
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        https://github.com/fonlan/foco
+                      </a>
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            </section>
+          ) : null}
         </div>
       </div>
     </div>
@@ -11569,7 +11621,11 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("MCP settings");
   }
 
-  return t("Skill settings");
+  if (section === "skills") {
+    return t("Skill settings");
+  }
+
+  return t("About Foco");
 }
 
 function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
@@ -11623,6 +11679,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "skills") {
     return t("Skill discovery and enablement");
+  }
+
+  if (section === "about") {
+    return t("Local-first AI coding workspace");
   }
 
   return t("Model metadata and runtime limits");
