@@ -1426,11 +1426,47 @@ fn next_context_snapshot_sequence(
 }
 
 pub(crate) fn serialize_provider_request(request: &NeutralChatRequest) -> Result<String, ApiError> {
-    serde_json::to_string(request).map_err(|source| {
+    let mut value = serde_json::to_value(request).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize provider-neutral chat request: {source}"
+        ))
+    })?;
+    // ponytail: audit JSON mirrors genai's leading-system-to-instructions step;
+    // use genai/WebRequestData if this ever needs to be an exact provider payload.
+    promote_leading_system_messages_to_instructions(&mut value);
+    serde_json::to_string(&value).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize provider-neutral chat request: {source}"
         ))
     })
+}
+
+fn promote_leading_system_messages_to_instructions(value: &mut Value) {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let leading_system_count = messages
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    if leading_system_count == 0 {
+        return;
+    }
+
+    let instructions = messages
+        .iter()
+        .take(leading_system_count)
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if instructions.is_empty() {
+        return;
+    }
+
+    messages.drain(0..leading_system_count);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("instructions".to_string(), Value::String(instructions));
+    }
 }
 
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {

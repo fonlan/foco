@@ -738,6 +738,39 @@ fn prompt_cache_key_includes_agent_layers_and_resolved_memory() {
     assert_ne!(base_key, memory_key);
 }
 
+#[test]
+fn serialized_provider_request_promotes_leading_system_messages_to_instructions() {
+    let request = NeutralChatRequest {
+        model_id: "gpt-5.4".to_string(),
+        messages: vec![
+            neutral_text_message(NeutralChatRole::System, "base".to_string()),
+            neutral_text_message(NeutralChatRole::System, "workspace prompt".to_string()),
+            neutral_text_message(NeutralChatRole::Developer, "skills".to_string()),
+            neutral_text_message(NeutralChatRole::User, "go".to_string()),
+        ],
+        tools: Vec::new(),
+        thinking_level: None,
+        max_output_tokens: Some(16),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    };
+
+    let request_json: Value =
+        serde_json::from_str(&serialize_provider_request(&request).expect("request json"))
+            .expect("serialized request is json");
+    assert_eq!(
+        request_json.get("instructions").and_then(Value::as_str),
+        Some("base\n\nworkspace prompt")
+    );
+    let messages = request_json
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages array");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("developer"));
+    assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
+}
+
 #[tokio::test]
 async fn tool_resource_registry_blocks_same_file_read_write() {
     let registry = ToolResourceLockRegistry::default();
