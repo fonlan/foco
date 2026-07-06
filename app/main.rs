@@ -1373,8 +1373,8 @@ impl ContextUsageRequest {
             skill_ids: self.skill_ids,
             session_mode: None,
             message: None,
-            assistant_draft: None,
-            assistant_draft_reasoning: None,
+            assistant_draft: self.assistant_draft,
+            assistant_draft_reasoning: self.assistant_draft_reasoning,
             attachments: Vec::new(),
         }
     }

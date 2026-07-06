@@ -380,13 +380,19 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("does not estimate context usage from streaming deltas", async () => {
+  it("refreshes context usage from streaming assistant drafts on a 5 second throttle", async () => {
     const fetchMock = vi.mocked(fetch);
+    const contextUsageCalls = () =>
+      fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      );
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-    expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+    await waitFor(() => expect(contextUsageCalls().length).toBeGreaterThan(0));
+    let now = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -394,18 +400,21 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
 
-    const usageCallCountBeforeDeltas = fetchMock.mock.calls.filter(
-      ([url]) =>
-        typeof url === "string" &&
-        url === "/api/workspaces/workspace-1/context-usage",
-    ).length;
+    const usageCallCountBeforeDeltas = contextUsageCalls().length;
 
+    now += 4_999;
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
         delta: "Part one. ",
         type: "textDelta",
       });
+    });
+
+    expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas);
+
+    now += 1;
+    await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
         delta: "Part two.",
@@ -413,16 +422,37 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    expect(
-      fetchMock.mock.calls.filter(
-        ([url]) =>
-          typeof url === "string" &&
-          url === "/api/workspaces/workspace-1/context-usage",
-      ),
-    ).toHaveLength(usageCallCountBeforeDeltas);
-    expect(
-      screen.getByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+    await waitFor(() => expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 1));
+    const liveUsageBody = JSON.parse(contextUsageCalls().at(-1)?.[1]?.body as string);
+    expect(liveUsageBody).toMatchObject({
+      assistantDraft: "Part one. Part two.",
+      chatId: "chat-1",
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 1000,
+          providerId: "provider-1",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Part one. Part two.",
+        type: "complete",
+      });
+    });
+
+    await waitFor(() => expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 2));
+    const finalUsageBody = JSON.parse(contextUsageCalls().at(-1)?.[1]?.body as string);
+    expect(finalUsageBody).toMatchObject({ chatId: "chat-1" });
+    expect(finalUsageBody).not.toHaveProperty("assistantDraft");
+    expect(finalUsageBody).not.toHaveProperty("assistantDraftReasoning");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

@@ -526,6 +526,7 @@ type WorkspaceFileContextMenuState = {
 };
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 1000;
+const LIVE_CONTEXT_USAGE_REFRESH_MS = 5000;
 const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
 const CHAT_MESSAGES_PAGE_LIMIT = 100;
 const INACTIVE_CHAT_FULL_CACHE_LIMIT = 8;
@@ -7148,6 +7149,10 @@ export function App() {
             providerId: request.providerId,
             thinkingLevel: request.thinkingLevel || null,
             skillIds: request.skillIds.length ? request.skillIds : null,
+            ...(request.assistantDraft ? { assistantDraft: request.assistantDraft } : {}),
+            ...(request.assistantDraftReasoning
+              ? { assistantDraftReasoning: request.assistantDraftReasoning }
+              : {}),
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -7363,6 +7368,9 @@ export function App() {
     let interruptedAssistantMessageId: string | null = null;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
+    let liveAssistantDraft = "";
+    let liveAssistantDraftReasoning = "";
+    let lastLiveContextUsageRefreshAtMs = Date.now();
     let hasGuidanceTurns = false;
     let streamHadError = false;
     const textDeltaBuffer = createTextDeltaBuffer();
@@ -7381,6 +7389,32 @@ export function App() {
       }
 
       void refreshContextUsage({
+        chatId: activeRun.chatId,
+        modelId,
+        providerId,
+        skillIds: [],
+        thinkingLevel: selectedThinkingLevelRef.current,
+        workspaceId: activeRun.workspaceId,
+      });
+    };
+    const scheduleLiveContextUsageRefresh = () => {
+      if (!liveAssistantDraft && !liveAssistantDraftReasoning) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastLiveContextUsageRefreshAtMs < LIVE_CONTEXT_USAGE_REFRESH_MS) {
+        return;
+      }
+      const modelId = selectedModelIdRef.current;
+      const providerId = selectedProviderIdRef.current;
+      if (!modelId || !providerId) {
+        return;
+      }
+
+      lastLiveContextUsageRefreshAtMs = now;
+      void refreshContextUsage({
+        assistantDraft: liveAssistantDraft,
+        assistantDraftReasoning: liveAssistantDraftReasoning,
         chatId: activeRun.chatId,
         modelId,
         providerId,
@@ -7654,6 +7688,9 @@ export function App() {
             workspaceId: activeRun.workspaceId,
           });
           liveStartedAtMs = Date.now();
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           updateLiveChatStatistics(chatKey, {
             modelId: selectedModelIdRef.current,
             providerId: selectedProviderIdRef.current,
@@ -7677,6 +7714,8 @@ export function App() {
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
             streamEvent.delta,
           );
+          liveAssistantDraft += streamEvent.delta;
+          scheduleLiveContextUsageRefresh();
           return;
         }
 
@@ -7692,6 +7731,8 @@ export function App() {
             streamEvent.delta,
             reasoningStartedAtMs,
           );
+          liveAssistantDraftReasoning += streamEvent.delta;
+          scheduleLiveContextUsageRefresh();
           return;
         }
 
@@ -7729,6 +7770,9 @@ export function App() {
         if (streamEvent.type === "streamReset") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
           latestResponseUsage = null;
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           updateLiveChatStatistics(chatKey, {
             modelId: selectedModelIdRef.current,
             providerId: selectedProviderIdRef.current,
@@ -7788,6 +7832,9 @@ export function App() {
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
           interruptedAssistantMessageId = previousAssistantId;
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           hasGuidanceTurns = true;
           appendGuidanceMessage(
             chatKey,
@@ -8200,6 +8247,9 @@ export function App() {
     let currentRunningChatKey = runMessagesKey;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
+    let liveAssistantDraft = "";
+    let liveAssistantDraftReasoning = "";
+    let lastLiveContextUsageRefreshAtMs = Date.now();
     let runSucceeded = false;
     let streamHadError = false;
     let hasGuidanceTurns = false;
@@ -8215,6 +8265,27 @@ export function App() {
     };
     const refreshRunContextUsage = () => {
       void refreshContextUsage({
+        chatId: requestChatId,
+        modelId: request.modelId,
+        providerId: request.providerId,
+        skillIds: request.skillIds,
+        thinkingLevel: request.thinkingLevel,
+        workspaceId: request.workspaceId,
+      });
+    };
+    const scheduleLiveContextUsageRefresh = () => {
+      if (!liveAssistantDraft && !liveAssistantDraftReasoning) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastLiveContextUsageRefreshAtMs < LIVE_CONTEXT_USAGE_REFRESH_MS) {
+        return;
+      }
+
+      lastLiveContextUsageRefreshAtMs = now;
+      void refreshContextUsage({
+        assistantDraft: liveAssistantDraft,
+        assistantDraftReasoning: liveAssistantDraftReasoning,
         chatId: requestChatId,
         modelId: request.modelId,
         providerId: request.providerId,
@@ -8637,6 +8708,9 @@ export function App() {
             workspaceId: request.workspaceId,
           });
           liveStartedAtMs = Date.now();
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           updateLiveChatStatistics(currentRunningChatKey, {
             modelId: request.modelId,
             providerId: request.providerId,
@@ -8679,6 +8753,8 @@ export function App() {
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
             streamEvent.delta,
           );
+          liveAssistantDraft += streamEvent.delta;
+          scheduleLiveContextUsageRefresh();
           return;
         }
 
@@ -8694,6 +8770,8 @@ export function App() {
             streamEvent.delta,
             reasoningStartedAtMs,
           );
+          liveAssistantDraftReasoning += streamEvent.delta;
+          scheduleLiveContextUsageRefresh();
           return;
         }
 
@@ -8730,6 +8808,9 @@ export function App() {
         if (streamEvent.type === "streamReset") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
           latestResponseUsage = null;
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           updateLiveChatStatistics(runMessagesKey, {
             modelId: request.modelId,
             providerId: request.providerId,
@@ -8789,6 +8870,9 @@ export function App() {
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
           interruptedAssistantMessageId = previousAssistantId;
+          liveAssistantDraft = "";
+          liveAssistantDraftReasoning = "";
+          lastLiveContextUsageRefreshAtMs = Date.now();
           hasGuidanceTurns = true;
           appendGuidanceMessage(
             runMessagesKey,

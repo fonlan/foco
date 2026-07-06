@@ -862,6 +862,8 @@ export type ContextUsageRefreshRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  assistantDraft?: string;
+  assistantDraftReasoning?: string;
   sessionMode?: "plan";
 };
 

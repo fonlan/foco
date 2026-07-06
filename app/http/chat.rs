@@ -133,6 +133,8 @@ pub(crate) struct ContextUsageRequest {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) assistant_draft: Option<String>,
+    pub(crate) assistant_draft_reasoning: Option<String>,
     #[serde(default, rename = "latestResponseUsage")]
     pub(crate) _latest_response_usage: Option<NeutralUsage>,
 }

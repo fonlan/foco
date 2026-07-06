@@ -15497,6 +15497,8 @@ async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
             _latest_response_usage: Some(foco_providers::NeutralUsage {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
