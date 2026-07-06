@@ -16,7 +16,8 @@ use foco_store::{
     workspace::{
         LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
         LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestUsageRecord,
-        LlmRequestUsageRollupFilters, TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
+        LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, TodoGraphFilter,
+        WorkspaceDatabase, workspace_database_path,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1435,6 +1436,11 @@ fn load_ai_statistics_response(
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
             request_kind: None,
+            exclude_request_kinds: if filters.chat_id.is_some() {
+                MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS
+            } else {
+                &[]
+            },
             provider_id: filters.provider_id.as_deref(),
             model_id: filters.model_id.as_deref(),
             final_state: filters.status.as_deref(),
@@ -1933,11 +1939,13 @@ pub(crate) async fn chat_statistics(
     let llm_rows = database
         .llm_request_audit_count(LlmRequestAuditFilters {
             chat_id: Some(chat_id),
+            exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
             ..LlmRequestAuditFilters::default()
         })
         .and_then(|request_count| {
             database.llm_request_audit_rows(LlmRequestAuditFilters {
                 chat_id: Some(chat_id),
+                exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
                 limit: Some(request_count),
                 offset: Some(0),
                 ..LlmRequestAuditFilters::default()

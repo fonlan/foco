@@ -863,6 +863,7 @@ pub struct LlmRequestAuditFilters<'a> {
     pub workspace_id: Option<&'a str>,
     pub chat_id: Option<&'a str>,
     pub request_kind: Option<&'a str>,
+    pub exclude_request_kinds: &'a [&'a str],
     pub provider_id: Option<&'a str>,
     pub model_id: Option<&'a str>,
     pub final_state: Option<&'a str>,

@@ -15560,6 +15560,24 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         input_modalities: vec!["text".to_string()],
         output_modalities: vec!["text".to_string()],
     });
+    config.models.push(ModelSettings {
+        id: "internal-model".to_string(),
+        display_name: "Internal Model".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 100,
+            max_output_tokens: 10,
+        }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
     let state = test_app_state(config.clone(), profile_dir.clone());
 
     {
@@ -15578,6 +15596,64 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
                 metadata_json: Some("{}"),
             })
             .expect("message insert");
+        for request in [
+            NewLlmRequest {
+                id: "ctx-internal-request",
+                workspace_id: &config.workspaces[0].id,
+                chat_id: Some("chat-context-timeline"),
+                request_kind: "memory retrieval",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider",
+                model_id: "internal-model",
+                request_started_at: "2026-07-06T10:00:01Z",
+                first_token_at: None,
+                completed_at: Some("2026-07-06T10:00:02Z"),
+                input_tokens: Some(50),
+                output_tokens: Some(10),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: Some(r#"{"requestKind":"memory retrieval"}"#),
+            },
+            NewLlmRequest {
+                id: "ctx-chat-request",
+                workspace_id: &config.workspaces[0].id,
+                chat_id: Some("chat-context-timeline"),
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider",
+                model_id: "model",
+                request_started_at: "2026-07-06T10:00:00Z",
+                first_token_at: None,
+                completed_at: Some("2026-07-06T10:00:01Z"),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(200),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            },
+        ] {
+            database
+                .insert_llm_request(request)
+                .expect("llm request insert");
+        }
         for (id, sequence, segments, total_used_tokens) in [
             ("ctx-timeline-1", 1, (100, 200, 40, 5, 1_000), 1_345),
             ("ctx-timeline-2", 2, (150, 250, 60, 15, 1_000), 1_475),
@@ -15614,6 +15690,21 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
                 })
                 .expect("snapshot insert");
         }
+        let legacy_metadata = json!({ "kind": CONTEXT_COMPRESSION_KIND_RULE }).to_string();
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id: "ctx-timeline-legacy",
+                chat_id: "chat-context-timeline",
+                run_id: "run-timeline",
+                sequence: 3,
+                summary: "legacy compressed summary",
+                source_message_start_sequence: 0,
+                source_message_end_sequence: 2,
+                original_token_count: 120,
+                summary_token_count: 12,
+                metadata_json: Some(&legacy_metadata),
+            })
+            .expect("legacy snapshot insert");
     }
 
     let Json(stats) = crate::http::chat::chat_statistics(
@@ -15626,7 +15717,9 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     .await
     .expect("chat statistics");
 
-    assert_eq!(stats.context_usage_timeline.len(), 2);
+    assert_eq!(stats.total_requests, 1);
+    assert_eq!(stats.total_tokens, 120);
+    assert_eq!(stats.context_usage_timeline.len(), 3);
     for entry in &stats.context_usage_timeline {
         let segment_total = context_usage_segments_total(&entry.segments);
         assert_eq!(segment_total, entry.total_used_tokens);
@@ -15645,6 +15738,11 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     let second = &stats.context_usage_timeline[1];
     assert_eq!(second.snapshot_id, "ctx-timeline-2");
     assert_eq!(second.total_used_tokens, 1_475);
+
+    let legacy = &stats.context_usage_timeline[2];
+    assert_eq!(legacy.snapshot_id, "ctx-timeline-legacy");
+    assert_eq!(legacy.context_window, 20_000);
+    assert_eq!(legacy.max_output_tokens, 1_000);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

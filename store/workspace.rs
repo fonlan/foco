@@ -70,6 +70,14 @@ pub const WORKSPACE_SCHEMA_VERSION: u32 = 29;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
+pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
+    "contextCompression",
+    "memory extraction",
+    "memory retrieval",
+    "workspace spec compaction",
+    "workspace spec generation",
+    "workspace spec update",
+];
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -5151,27 +5159,31 @@ impl WorkspaceDatabase {
         &self,
         chat_id: &str,
     ) -> Result<Option<LlmRequestUsageRecord>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+             FROM llm_requests
+             WHERE chat_id = ?
+               AND final_state IN ('succeeded', 'completed')
+               AND input_tokens IS NOT NULL
+               AND output_tokens IS NOT NULL",
+        );
+        let mut query_params = vec![SqlValue::Text(chat_id.to_string())];
+        append_llm_request_kind_exclusion_condition(
+            &mut query,
+            &mut query_params,
+            MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        );
+        query.push_str(" ORDER BY request_started_at DESC, id DESC LIMIT 1");
+
         self.connection
-            .query_row(
-                "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
-                 FROM llm_requests
-                 WHERE chat_id = ?1
-                   AND final_state IN ('succeeded', 'completed')
-                   AND input_tokens IS NOT NULL
-                   AND output_tokens IS NOT NULL
-                   AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') <> 'memory retrieval'
-                 ORDER BY request_started_at DESC, id DESC
-                 LIMIT 1",
-                params![chat_id],
-                |row| {
-                    Ok(LlmRequestUsageRecord {
-                        input_tokens: row.get(0)?,
-                        output_tokens: row.get(1)?,
-                        cache_read_tokens: row.get(2)?,
-                        cache_write_tokens: row.get(3)?,
-                    })
-                },
-            )
+            .query_row(&query, params_from_iter(query_params), |row| {
+                Ok(LlmRequestUsageRecord {
+                    input_tokens: row.get(0)?,
+                    output_tokens: row.get(1)?,
+                    cache_read_tokens: row.get(2)?,
+                    cache_write_tokens: row.get(3)?,
+                })
+            })
             .optional()
             .map_err(|source| self.sqlite_error(source))
     }
@@ -12127,6 +12139,27 @@ const TODO_GRAPH_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
+fn append_llm_request_kind_exclusion_condition(
+    query: &mut String,
+    query_params: &mut Vec<SqlValue>,
+    request_kinds: &[&str],
+) {
+    if request_kinds.is_empty() {
+        return;
+    }
+    let placeholders = vec!["?"; request_kinds.len()].join(", ");
+    query.push_str(&format!(
+        " AND request_kind NOT IN ({placeholders}) \
+          AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') NOT IN ({placeholders})"
+    ));
+    query_params.extend(
+        request_kinds
+            .iter()
+            .chain(request_kinds.iter())
+            .map(|value| SqlValue::Text((*value).to_string())),
+    );
+}
+
 fn append_llm_request_audit_where_clause(
     query: &mut String,
     query_params: &mut Vec<SqlValue>,
@@ -12136,6 +12169,32 @@ fn append_llm_request_audit_where_clause(
         query.push_str(if *has_where { " AND " } else { " WHERE " });
         query.push_str(condition);
         *has_where = true;
+    }
+
+    fn append_request_kind_exclusion(
+        query: &mut String,
+        query_params: &mut Vec<SqlValue>,
+        has_where: &mut bool,
+        request_kinds: &[&str],
+    ) {
+        if request_kinds.is_empty() {
+            return;
+        }
+        let placeholders = vec!["?"; request_kinds.len()].join(", ");
+        append_condition(
+            query,
+            has_where,
+            &format!(
+                "request_kind NOT IN ({placeholders}) \
+                 AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') NOT IN ({placeholders})"
+            ),
+        );
+        query_params.extend(
+            request_kinds
+                .iter()
+                .chain(request_kinds.iter())
+                .map(|value| SqlValue::Text((*value).to_string())),
+        );
     }
 
     let mut has_where = false;
@@ -12178,6 +12237,12 @@ fn append_llm_request_audit_where_clause(
     if let Some(value) = filters.started_before {
         push_condition("request_started_at <= ?", value);
     }
+    append_request_kind_exclusion(
+        query,
+        query_params,
+        &mut has_where,
+        filters.exclude_request_kinds,
+    );
 }
 
 fn append_llm_request_usage_rollup_where_clause(
