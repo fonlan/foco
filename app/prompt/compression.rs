@@ -2307,7 +2307,7 @@ pub(crate) fn context_usage_segments(
     let mut segments = ContextUsageSegments {
         system_prompt: budget.system_prompt_tokens,
         tool_schema: budget.tool_schema_tokens,
-        reserved_output: budget.max_output_tokens,
+        reserved_output: 0,
         ..ContextUsageSegments::default()
     };
 

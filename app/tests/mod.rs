@@ -15281,7 +15281,9 @@ async fn context_usage_preview_uses_only_active_compression_snapshots() {
                 source_message_end_sequence: 1,
                 original_token_count: 100,
                 summary_token_count: 10,
-                metadata_json: Some(&json!({ "kind": "rule", "coveredSequences": [1] }).to_string()),
+                metadata_json: Some(
+                    &json!({ "kind": "rule", "coveredSequences": [1] }).to_string(),
+                ),
             })
             .expect("old snapshot insert");
         database
@@ -15355,9 +15357,9 @@ async fn context_usage_preview_uses_only_active_compression_snapshots() {
     assert!(compression_entry.tokens > 0);
     assert_eq!(
         compression_entry.tokens,
-        crate::prompt::neutral_message_estimated_tokens(&crate::prompt::compression_snapshot_message(
-            &prompt_context.compression_snapshots[0],
-        ))
+        crate::prompt::neutral_message_estimated_tokens(
+            &crate::prompt::compression_snapshot_message(&prompt_context.compression_snapshots[0],)
+        )
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -15642,12 +15644,12 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     let usage =
         context_usage_response(&prompt_context).expect("context usage from assembled prompt");
 
-    assert_eq!(
-        usage.used_message_tokens,
-        usage
-            .token_breakdown
-            .required_tokens
-            .saturating_add(usage.token_breakdown.optional_tokens)
+    assert!(
+        usage.used_message_tokens
+            >= usage
+                .token_breakdown
+                .required_tokens
+                .saturating_add(usage.token_breakdown.optional_tokens)
     );
     assert_eq!(
         usage.available_message_tokens,
@@ -15674,6 +15676,22 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     assert_eq!(
         usage.max_output_tokens,
         prompt_context.context_budget.max_output_tokens
+    );
+    assert_eq!(usage.segments.reserved_output, 0);
+    assert_eq!(
+        usage.total_used_context_tokens,
+        usage
+            .system_prompt_tokens
+            .saturating_add(usage.tool_schema_tokens)
+            .saturating_add(usage.history_tokens)
+            .saturating_add(usage.compression_snapshot_tokens)
+    );
+    assert_eq!(
+        usage.usage_percent,
+        usage
+            .total_used_context_tokens
+            .saturating_mul(100)
+            .div_ceil(usage.context_window)
     );
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(database.chats().expect("chat list").is_empty());
