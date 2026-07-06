@@ -905,7 +905,7 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
 
 fn genai_chat_request_for_adapter(
     request: &NeutralChatRequest,
-    adapter_kind: AdapterKind,
+    _adapter_kind: AdapterKind,
 ) -> Result<ChatRequest, ProviderConfigError> {
     if request.model_id.trim().is_empty() {
         return Err(ProviderConfigError::InvalidRequest(
@@ -919,21 +919,11 @@ fn genai_chat_request_for_adapter(
         ));
     }
 
-    let mut leading_system_count = request
+    let leading_system_count = request
         .messages
         .iter()
         .take_while(|message| message.role == NeutralChatRole::System)
         .count();
-    let developer_after_leading_system = request
-        .messages
-        .get(leading_system_count)
-        .is_some_and(|message| message.role == NeutralChatRole::Developer);
-    if adapter_kind == AdapterKind::OpenAIResp && developer_after_leading_system {
-        // ponytail: Responses maps chat_req.system to top-level instructions; keep
-        // the whole pre-skill prompt inline. Broaden this if another adapter gains
-        // the same top-level instructions behavior.
-        leading_system_count = 0;
-    }
     let leading_system = leading_system_prompt(&request.messages[..leading_system_count])?;
 
     let mut messages = Vec::with_capacity(request.messages.len() - leading_system_count);
@@ -2080,42 +2070,32 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_keeps_pre_skill_system_messages_inline() {
+    fn openai_responses_moves_leading_system_messages_to_genai_system() {
         let request = neutral_request(vec![
             neutral_text_message(NeutralChatRole::System, "Base system."),
             neutral_text_message(NeutralChatRole::System, "Project spec."),
-            neutral_text_message(
-                NeutralChatRole::Developer,
-                "<skills_instructions>name: html-ppt</skills_instructions>",
-            ),
+            neutral_text_message(NeutralChatRole::Developer, "## Skills\n\n- Name: html-ppt"),
             neutral_text_message(NeutralChatRole::User, "Continue."),
         ]);
 
         let chat_request = genai_chat_request_for_adapter(&request, AdapterKind::OpenAIResp)
             .expect("responses chat request");
 
-        assert_eq!(chat_request.system.as_deref(), None);
-        assert_eq!(chat_request.messages.len(), 4);
-        assert!(
-            chat_request
-                .messages
-                .iter()
-                .take(3)
-                .all(|message| message.role == genai::chat::ChatRole::System)
+        assert_eq!(
+            chat_request.system.as_deref(),
+            Some("Base system.\n\nProject spec.")
         );
+        assert_eq!(chat_request.messages.len(), 2);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::System);
         assert_eq!(
             chat_request.messages[0].content.first_text(),
-            Some("Base system.")
+            Some("## Skills\n\n- Name: html-ppt")
         );
+        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::User);
         assert_eq!(
             chat_request.messages[1].content.first_text(),
-            Some("Project spec.")
+            Some("Continue.")
         );
-        assert_eq!(
-            chat_request.messages[2].content.first_text(),
-            Some("<skills_instructions>name: html-ppt</skills_instructions>")
-        );
-        assert_eq!(chat_request.messages[3].role, genai::chat::ChatRole::User);
     }
 
     #[test]
