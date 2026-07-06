@@ -43,6 +43,7 @@ pub(crate) struct WorkspaceSpecJobsQuery {
     limit: Option<i64>,
     page: Option<i64>,
     page_size: Option<i64>,
+    retryable_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +287,7 @@ pub(crate) async fn settings_workspace_spec_jobs(
     let mut jobs = Vec::new();
     let mut errors = Vec::new();
     let mut total_count = 0;
+    let retryable_only = query.retryable_only.unwrap_or(false);
 
     for workspace in &config.workspaces {
         if !workspace_database_path(&workspace.path).exists() {
@@ -294,7 +296,7 @@ pub(crate) async fn settings_workspace_spec_jobs(
         // ponytail: cross-workspace pagination reads each workspace through the requested
         // page window, then globally sorts and slices. Huge histories can upgrade to a
         // per-workspace cursor/merge without changing the HTTP contract.
-        match workspace_spec_jobs_for_workspace(workspace, fetch_limit) {
+        match workspace_spec_jobs_for_workspace(workspace, fetch_limit, retryable_only) {
             Ok((mut workspace_jobs, workspace_total_count)) => {
                 jobs.append(&mut workspace_jobs);
                 total_count += workspace_total_count;
@@ -411,11 +413,12 @@ fn spec_job_total_pages(total_count: i64, page_size: i64) -> i64 {
 fn workspace_spec_jobs_for_workspace(
     workspace: &WorkspaceConfig,
     limit: i64,
+    retryable_only: bool,
 ) -> Result<(Vec<WorkspaceSpecJobWithWorkspaceSummary>, i64), WorkspaceDatabaseError> {
     let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
-    let total_count = database.workspace_spec_job_count()?;
+    let total_count = database.workspace_spec_job_count_filtered(retryable_only)?;
     let jobs = database
-        .workspace_spec_jobs(limit)?
+        .workspace_spec_jobs_filtered(limit, retryable_only)?
         .into_iter()
         .map(|job| {
             let job = workspace_spec_job_summary(job).map_err(|error| {

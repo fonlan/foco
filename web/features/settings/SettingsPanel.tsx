@@ -522,6 +522,7 @@ export function SettingsPanel({
   const [specJobsPageSize, setSpecJobsPageSize] = useState(20);
   const [specJobsTotalCount, setSpecJobsTotalCount] = useState(0);
   const [specJobsTotalPages, setSpecJobsTotalPages] = useState(0);
+  const [showRetryableSpecJobsOnly, setShowRetryableSpecJobsOnly] = useState(true);
   const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
   const [specJobOperationKey, setSpecJobOperationKey] = useState<string | null>(null);
   const specJobOperationKeysRef = useRef<Set<string>>(new Set());
@@ -1195,6 +1196,7 @@ export function SettingsPanel({
       const params = new URLSearchParams({
         page: String(specJobsPage),
         pageSize: String(specJobsPageSize),
+        retryableOnly: String(showRetryableSpecJobsOnly),
       });
       const data = await requestJson<SettingsWorkspaceSpecJobsResponse>(
         `/api/settings/spec/jobs?${params.toString()}`,
@@ -1223,7 +1225,7 @@ export function SettingsPanel({
     } finally {
       setIsLoadingSpecJobs(false);
     }
-  }, [specJobsPage, specJobsPageSize]);
+  }, [showRetryableSpecJobsOnly, specJobsPage, specJobsPageSize]);
 
   const loadPlanHistory = useCallback(async () => {
     if (!effectivePlanHistoryWorkspaceId) {
@@ -2515,6 +2517,11 @@ export function SettingsPanel({
     setSpecJobsPageSize((current) =>
       Math.min(100, positiveIntegerText(value, current)),
     );
+  }
+
+  function updateShowRetryableSpecJobsOnly(value: boolean) {
+    setSpecJobsPage(1);
+    setShowRetryableSpecJobsOnly(value);
   }
 
   function goToPlanHistoryPage(page: number) {
@@ -5536,20 +5543,33 @@ export function SettingsPanel({
                       {t("All workspace Spec jobs")}
                     </p>
                   </div>
-                  <button
-                    aria-label={t("Refresh Spec job history")}
-                    className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                    disabled={isLoadingSpecJobs}
-                    onClick={() => void loadSpecJobs()}
-                    title={t("Refresh Spec job history")}
-                    type="button"
-                  >
-                    {isLoadingSpecJobs ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <RefreshCw aria-hidden="true" className="size-4" />
-                    )}
-                  </button>
+                  <div className="flex flex-wrap items-center justify-end gap-3">
+                    <label className="inline-flex items-center gap-2 text-sm font-medium text-stone-700">
+                      <input
+                        checked={showRetryableSpecJobsOnly}
+                        className="size-4 accent-teal-700"
+                        onChange={(event) =>
+                          updateShowRetryableSpecJobsOnly(event.target.checked)
+                        }
+                        type="checkbox"
+                      />
+                      <span>{t("Only retryable Spec jobs")}</span>
+                    </label>
+                    <button
+                      aria-label={t("Refresh Spec job history")}
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                      disabled={isLoadingSpecJobs}
+                      onClick={() => void loadSpecJobs()}
+                      title={t("Refresh Spec job history")}
+                      type="button"
+                    >
+                      {isLoadingSpecJobs ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : (
+                        <RefreshCw aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="panel-scroll overflow-x-auto" onWheel={handleSettingsTableWheel}>

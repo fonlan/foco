@@ -47,6 +47,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Prompt/tools": "Prompt/tools",
     "Compression snapshot": "Compression snapshot",
     "Reserved output": "Reserved output",
+    "Only retryable Spec jobs": "Only retryable Spec jobs",
   },
   "zh-CN": {
     "Local workspace": "本地工作区",
@@ -898,6 +899,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Spec job history pagination": "Spec 任务历史分页",
     "All workspace Spec jobs": "全部工作区 Spec 任务",
     "Refresh Spec job history": "刷新 Spec 任务历史",
+    "Only retryable Spec jobs": "仅显示可重试记录",
     "Loading Spec job history...": "正在加载 Spec 任务历史...",
     "No Spec jobs": "暂无 Spec 任务",
     "Request type": "请求类型",

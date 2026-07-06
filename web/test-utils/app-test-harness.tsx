@@ -1005,9 +1005,40 @@ export const settingsSpecFailedJob: SettingsWorkspaceSpecJobSummary = {
   workspacePath: "/Users/fonla/Repos/SideProject",
 };
 
+export const settingsSpecRunningJob: SettingsWorkspaceSpecJobSummary = {
+  job: {
+    ...workspaceSpecQueuedJob,
+    createdAt: "2026-06-11T03:07:00Z",
+    id: "workspace-spec-job-running",
+    startedAt: "2026-06-11T03:07:10Z",
+    status: "running",
+  },
+  workspaceId: "workspace-1",
+  workspaceName: "Default",
+  workspacePath: "/Users/fonla/Repos/Foco",
+};
+
+export const settingsSpecFailedRetriedJob: SettingsWorkspaceSpecJobSummary = {
+  job: {
+    ...settingsSpecFailedJob.job,
+    createdAt: "2026-06-11T03:06:00Z",
+    errorMessage: "already retried timeout",
+    hasRetry: true,
+    id: "workspace-spec-job-failed-retried",
+  },
+  workspaceId: "workspace-1",
+  workspaceName: "Default",
+  workspacePath: "/Users/fonla/Repos/Foco",
+};
+
 function clonedSettingsSpecJobs(): SettingsWorkspaceSpecJobSummary[] {
   return JSON.parse(
-    JSON.stringify([settingsSpecFailedJob, settingsSpecCompletedJob]),
+    JSON.stringify([
+      settingsSpecFailedJob,
+      settingsSpecRunningJob,
+      settingsSpecFailedRetriedJob,
+      settingsSpecCompletedJob,
+    ]),
   ) as SettingsWorkspaceSpecJobSummary[];
 }
 
@@ -2938,12 +2969,21 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       100,
       Math.max(1, Number(requestUrl.searchParams.get("pageSize") ?? requestUrl.searchParams.get("limit") ?? "20") || 20),
     );
-    const totalCount = appTestState.settingsSpecJobsResponse.length;
+    const retryableOnly = requestUrl.searchParams.get("retryableOnly") === "true";
+    const source = retryableOnly
+      ? appTestState.settingsSpecJobsResponse.filter(
+        (item) =>
+          item.job.status === "queued" ||
+          item.job.status === "running" ||
+          (item.job.status === "failed" && !item.job.hasRetry),
+      )
+      : appTestState.settingsSpecJobsResponse;
+    const totalCount = source.length;
     const totalPages = totalCount ? Math.ceil(totalCount / pageSize) : 0;
     const offset = (page - 1) * pageSize;
     return jsonResponse({
       errors: [],
-      jobs: appTestState.settingsSpecJobsResponse.slice(offset, offset + pageSize),
+      jobs: source.slice(offset, offset + pageSize),
       page,
       pageSize,
       totalCount,

@@ -10153,6 +10153,120 @@ async fn settings_workspace_spec_jobs_aggregates_workspace_history() {
 }
 
 #[tokio::test]
+async fn settings_workspace_spec_jobs_filters_retryable_before_pagination() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "completed-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("completed job");
+        database
+            .mark_workspace_spec_job_completed("completed-spec-job", None)
+            .expect("mark completed");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "queued-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("queued job");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "running-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("running job");
+        database
+            .mark_workspace_spec_job_running("running-spec-job")
+            .expect("mark running");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "failed-retryable-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("failed retryable job");
+        database
+            .mark_workspace_spec_job_failed("failed-retryable-spec-job", "failed")
+            .expect("mark failed retryable");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "failed-retried-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("failed retried job");
+        database
+            .mark_workspace_spec_job_failed("failed-retried-spec-job", "failed")
+            .expect("mark failed retried");
+        database
+            .retry_failed_workspace_spec_job(
+                "failed-retried-spec-job",
+                "retry-for-failed-retried-spec-job",
+                Some("model"),
+            )
+            .expect("retry failed job")
+            .expect("retry job");
+    }
+
+    let query = serde_json::from_value(json!({
+        "page": 1,
+        "pageSize": 10,
+        "retryableOnly": true,
+    }))
+    .expect("jobs query");
+    let Json(response) = settings_workspace_spec_jobs(State(state), Query(query))
+        .await
+        .expect("settings spec jobs");
+    let response = serde_json::to_value(response).expect("settings jobs json");
+    let ids: Vec<&str> = response["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .filter_map(|item| item["job"]["id"].as_str())
+        .collect();
+
+    assert_eq!(response["totalCount"], 4);
+    assert_eq!(response["totalPages"], 1);
+    assert!(ids.contains(&"queued-spec-job"));
+    assert!(ids.contains(&"running-spec-job"));
+    assert!(ids.contains(&"failed-retryable-spec-job"));
+    assert!(ids.contains(&"retry-for-failed-retried-spec-job"));
+    assert!(!ids.contains(&"completed-spec-job"));
+    assert!(!ids.contains(&"failed-retried-spec-job"));
+}
+
+#[tokio::test]
 async fn workspace_spec_failed_job_retry_inserts_queued_copy() {
     let profile = tempfile::tempdir().expect("profile");
     let workspace = tempfile::tempdir().expect("workspace");

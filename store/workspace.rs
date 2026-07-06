@@ -1078,6 +1078,14 @@ impl WorkspaceDatabase {
         &self,
         limit: i64,
     ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.workspace_spec_jobs_filtered(limit, false)
+    }
+
+    pub fn workspace_spec_jobs_filtered(
+        &self,
+        limit: i64,
+        retryable_only: bool,
+    ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
         if limit <= 0 {
             return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
                 message: "workspace spec job limit must be positive".to_string(),
@@ -1091,20 +1099,56 @@ impl WorkspaceDatabase {
                         started_at, completed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
+                 WHERE (?2 = 0
+                        OR status IN (?3, ?4)
+                        OR (status = ?5 AND NOT EXISTS(
+                            SELECT 1 FROM workspace_spec_jobs retry
+                            WHERE retry.retry_of_job_id = workspace_spec_jobs.id
+                        )))
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?1",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(params![limit], workspace_spec_job_from_row)
+            .query_map(
+                params![
+                    limit,
+                    retryable_only,
+                    WorkspaceSpecJobStatus::Queued.as_str(),
+                    WorkspaceSpecJobStatus::Running.as_str(),
+                    WorkspaceSpecJobStatus::Failed.as_str(),
+                ],
+                workspace_spec_job_from_row,
+            )
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
     pub fn workspace_spec_job_count(&self) -> Result<i64, WorkspaceDatabaseError> {
+        self.workspace_spec_job_count_filtered(false)
+    }
+
+    pub fn workspace_spec_job_count_filtered(
+        &self,
+        retryable_only: bool,
+    ) -> Result<i64, WorkspaceDatabaseError> {
         self.connection
-            .query_row("SELECT COUNT(*) FROM workspace_spec_jobs", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM workspace_spec_jobs
+                 WHERE (?1 = 0
+                        OR status IN (?2, ?3)
+                        OR (status = ?4 AND NOT EXISTS(
+                            SELECT 1 FROM workspace_spec_jobs retry
+                            WHERE retry.retry_of_job_id = workspace_spec_jobs.id
+                        )))",
+                params![
+                    retryable_only,
+                    WorkspaceSpecJobStatus::Queued.as_str(),
+                    WorkspaceSpecJobStatus::Running.as_str(),
+                    WorkspaceSpecJobStatus::Failed.as_str(),
+                ],
+                |row| row.get(0),
+            )
             .map_err(|source| self.sqlite_error(source))
     }
 

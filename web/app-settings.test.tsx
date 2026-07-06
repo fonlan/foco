@@ -297,10 +297,26 @@ describe("app-settings verification surfaces", () => {
     expect(await within(specHistorySection as HTMLElement).findByText("Side project")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("Default")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("Failed")).toBeInTheDocument();
-    expect(within(specHistorySection as HTMLElement).getByText("Completed")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Running")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).queryByText("Completed")).not.toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).queryByText("already retried timeout")).not.toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("model timed out")).toBeInTheDocument();
-    expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("Showing 1-2 of 2")).toBeInTheDocument();
+    const retryableOnlyControl = within(specHistorySection as HTMLElement).getByLabelText(
+      "Only retryable Spec jobs",
+    );
+    expect(retryableOnlyControl).toBeChecked();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          const value = String(input);
+          return (
+            value.startsWith("/api/settings/spec/jobs?") &&
+            value.includes("retryableOnly=true")
+          );
+        }),
+      ).toBe(true),
+    );
     const pageSizeControl = within(specHistorySection as HTMLElement).getByLabelText("Page size");
     const pagination = within(specHistorySection as HTMLElement).getByRole("navigation", {
       name: "Spec job history pagination",
@@ -326,6 +342,25 @@ describe("app-settings verification surfaces", () => {
     settingsScroller.scrollTop = 0;
     fireEvent.wheel(specTableScroller, { deltaX: 0, deltaY: 120 });
     expect(settingsScroller.scrollTop).toBe(120);
+
+    await userEvent.click(retryableOnlyControl);
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          const value = String(input);
+          return (
+            value.startsWith("/api/settings/spec/jobs?") &&
+            value.includes("page=1") &&
+            value.includes("retryableOnly=false")
+          );
+        }),
+      ).toBe(true),
+    );
+    await waitFor(() =>
+      expect(within(specHistorySection as HTMLElement).getByText("Completed")).toBeInTheDocument(),
+    );
+    expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("Showing 1-4 of 4")).toBeInTheDocument();
 
     await userEvent.click(
       within(specHistorySection as HTMLElement).getByRole("button", {
@@ -537,6 +572,7 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByText("每页数量")).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Spec 任务历史分页" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新 Spec 任务历史" })).toBeInTheDocument();
+    expect(screen.getByLabelText("仅显示可重试记录")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试 Spec 任务" })).toBeInTheDocument();
     expect(screen.getByText("自动化")).toBeInTheDocument();
     expect(screen.getByText("成功聊天轮次结束后更新已启用的工作区 Spec。")).toBeInTheDocument();
