@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Send,
   Server,
+  Shrink,
   SlidersHorizontal,
   Search,
   Terminal,
@@ -2531,7 +2532,7 @@ function ContextCompressionBlock({
   return (
     <details className="tool-call-block group min-w-0">
       <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
-        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <Shrink aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
         <span className="min-w-0 shrink-0 truncate">{t("Context compression")}</span>
         <span className="shrink-0 text-stone-300">·</span>
         <span className="shrink-0 text-stone-500">{kindLabel}</span>

@@ -1825,7 +1825,8 @@ enum StoredChatMessagePart {
     },
 }
 
-const STORED_CHAT_PARTS_VERSION: i64 = 3;
+// ponytail: invalidate all stored assistant parts instead of a one-off SQL repair; add a targeted migration if parts ever get too large.
+const STORED_CHAT_PARTS_VERSION: i64 = 4;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -5094,7 +5094,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
-    assert!(metadata_json.contains(r#""partsVersion":3"#));
+    assert!(metadata_json.contains(r#""partsVersion":4"#));
     assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
@@ -5321,7 +5321,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             content: "Before.After.",
             sequence: 0,
             metadata_json: Some(
-                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":3,"partsSource":"live_sse"}"#,
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":3,"partsSource":"run_events"}"#,
             ),
         })
         .expect("assistant insert");
@@ -5389,6 +5389,72 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             "text_delta",
             json!({ "assistant_message_id": "assistant-1", "delta": "After." }),
         ),
+        (
+            5,
+            "context_compression",
+            json!({
+                "assistant_message_id": "assistant-1",
+                "type": "contextCompression",
+                "kind": "rule",
+                "snapshotId": "rule-snapshot-1",
+                "status": "completed",
+                "detail": {
+                    "status": "completed",
+                    "kind": "rule",
+                    "snapshotId": "rule-snapshot-1",
+                    "originalTokenCount": 3000,
+                    "summaryTokenCount": 1000,
+                    "startedAt": "2026-06-18T10:00:02Z",
+                    "completedAt": "2026-06-18T10:00:03Z",
+                    "providerId": "",
+                    "modelId": ""
+                }
+            }),
+        ),
+        (
+            6,
+            "context_compression",
+            json!({
+                "assistant_message_id": "assistant-1",
+                "type": "contextCompression",
+                "kind": "llm",
+                "snapshotId": "llm-snapshot-1",
+                "status": "completed",
+                "detail": {
+                    "status": "completed",
+                    "kind": "llm",
+                    "snapshotId": "llm-snapshot-1",
+                    "originalTokenCount": 5000,
+                    "summaryTokenCount": 1200,
+                    "startedAt": "2026-06-18T10:00:04Z",
+                    "completedAt": "2026-06-18T10:00:05Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            }),
+        ),
+        (
+            7,
+            "context_compression",
+            json!({
+                "assistant_message_id": "assistant-1",
+                "type": "contextCompression",
+                "kind": "runtimeToolState",
+                "snapshotId": "runtime-snapshot-1",
+                "status": "completed",
+                "detail": {
+                    "status": "completed",
+                    "kind": "runtimeToolState",
+                    "snapshotId": "runtime-snapshot-1",
+                    "originalTokenCount": 7000,
+                    "summaryTokenCount": 800,
+                    "startedAt": "2026-06-18T10:00:06Z",
+                    "completedAt": "2026-06-18T10:00:07Z",
+                    "providerId": "",
+                    "modelId": ""
+                }
+            }),
+        ),
     ] {
         database
             .insert_run_event(NewRunEvent {
@@ -5441,13 +5507,29 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think two.")
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
+    assert!(
+        matches!(&summary.parts[5], ChatMessagePart::ContextCompression { kind, detail, .. }
+            if kind == "rule" && detail.snapshot_id.as_deref() == Some("rule-snapshot-1"))
+    );
+    assert!(
+        matches!(&summary.parts[6], ChatMessagePart::ContextCompression { kind, detail, .. }
+            if kind == "llm"
+                && detail.snapshot_id.as_deref() == Some("llm-snapshot-1")
+                && detail.summary_token_count == Some(1200))
+    );
+    assert!(
+        matches!(&summary.parts[7], ChatMessagePart::ContextCompression { kind, detail, .. }
+            if kind == "runtimeToolState"
+                && detail.snapshot_id.as_deref() == Some("runtime-snapshot-1")
+                && detail.summary_token_count == Some(800))
+    );
 
     let saved = database
         .message("assistant-1")
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
-    assert!(saved.metadata_json.contains(r#""partsVersion":3"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":4"#));
     assert!(
         saved
             .metadata_json
@@ -5564,7 +5646,7 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             .metadata_json
             .contains(r#""partsSource":"run_events""#)
     );
-    assert!(saved.metadata_json.contains(r#""partsVersion":3"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":4"#));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
