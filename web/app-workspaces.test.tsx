@@ -486,6 +486,71 @@ describe("app-workspaces verification surfaces", () => {
     );
   });
 
+  it("clears workspace active run dot immediately after manual cancel", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...workspace.chats[0],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          },
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            activeRun: {
+              acceptingGuidance: false,
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          }),
+        );
+      }
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyButton = (await within(workspaceList).findByText("Tool run")).closest(
+      "button",
+    );
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+
+    expect(statusDot()).toHaveClass("session-status-dot-running");
+
+    await userEvent.click(historyButton);
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
+
+    await waitFor(() => expect(statusDot()).not.toHaveClass("session-status-dot-running"));
+    expect(statusDot()).toHaveClass("session-status-dot-open");
+  });
+
   it("clears stale workspace active run summary when loaded chat has no active run", async () => {
     appTestState.workspaceResponseWorkspaces = [
       {

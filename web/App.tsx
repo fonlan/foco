@@ -511,6 +511,83 @@ type MainTabSummary =
 
 type MainTabCloseScope = "current" | "others" | "all" | "right" | "left";
 
+type ChatSessionStatusKind = "idle" | "open" | "scheduled" | "running" | "failed";
+
+type ChatSessionStatus = {
+  activeRun: ActiveRunInfo | ActiveChatRunSummary | null;
+  kind: ChatSessionStatusKind;
+};
+
+type ChatSessionStatusInput = {
+  activeChatKey: string | null;
+  activeRunInfoByChatKey: Record<string, ActiveRunInfo>;
+  chatKey: string;
+  failedChatKeySet: Set<string>;
+  openChatKeySet: Set<string>;
+  runningChatKeys: Set<string>;
+  scheduledChatKey?: string | null;
+  scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
+  workspaceActiveRun?: ActiveChatRunSummary | null;
+};
+
+export function deriveChatSessionStatus({
+  activeChatKey,
+  activeRunInfoByChatKey,
+  chatKey,
+  failedChatKeySet,
+  openChatKeySet,
+  runningChatKeys,
+  scheduledChatKey = null,
+  scheduledStatus = null,
+  workspaceActiveRun = null,
+}: ChatSessionStatusInput): ChatSessionStatus {
+  const statusChatKeys = scheduledChatKey && scheduledChatKey !== chatKey
+    ? [chatKey, scheduledChatKey]
+    : [chatKey];
+  const activeRun =
+    statusChatKeys
+      .map((statusChatKey) => activeRunInfoByChatKey[statusChatKey] ?? null)
+      .find((runInfo): runInfo is ActiveRunInfo => runInfo !== null) ??
+    workspaceActiveRun;
+  const isRunning =
+    statusChatKeys.some((statusChatKey) => runningChatKeys.has(statusChatKey)) ||
+    workspaceActiveRun !== null;
+  const isScheduled = scheduledStatus === "queued" || scheduledStatus === "starting";
+  const isOpen = statusChatKeys.some(
+    (statusChatKey) => openChatKeySet.has(statusChatKey) || activeChatKey === statusChatKey,
+  );
+  const isFailed = isOpen && failedChatKeySet.has(chatKey);
+
+  if (isRunning) {
+    return { activeRun, kind: "running" };
+  }
+  if (isScheduled) {
+    return { activeRun, kind: "scheduled" };
+  }
+  if (isFailed) {
+    return { activeRun, kind: "failed" };
+  }
+  if (isOpen) {
+    return { activeRun, kind: "open" };
+  }
+  return { activeRun, kind: "idle" };
+}
+
+export function chatSessionStatusDotClass(kind: ChatSessionStatusKind) {
+  switch (kind) {
+    case "running":
+      return "session-status-dot-running";
+    case "scheduled":
+      return "session-status-dot-scheduled";
+    case "failed":
+      return "session-status-dot-error";
+    case "open":
+      return "session-status-dot-open";
+    case "idle":
+      return "session-status-dot-idle";
+  }
+}
+
 type MainTabContextMenuState = {
   left: number;
   positioned: boolean;
@@ -1328,6 +1405,44 @@ export function App() {
   const isLoadingContextUsage = activeContextUsageKey
     ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
     : false;
+  const openChatKeySet = useMemo(
+    () =>
+      new Set(
+        openChatTabs.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
+      ),
+    [openChatTabs],
+  );
+  const chatSessionStatusFor = useCallback(
+    (
+      chatKey: string,
+      options: {
+        scheduledChatKey?: string | null;
+        scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
+        workspaceActiveRun?: ActiveChatRunSummary | null;
+      } = {},
+    ) =>
+      deriveChatSessionStatus({
+        activeChatKey,
+        activeRunInfoByChatKey,
+        chatKey,
+        failedChatKeySet,
+        openChatKeySet,
+        runningChatKeys,
+        scheduledChatKey: options.scheduledChatKey,
+        scheduledStatus: options.scheduledStatus,
+        workspaceActiveRun: options.workspaceActiveRun ?? null,
+      }),
+    [
+      activeChatKey,
+      activeRunInfoByChatKey,
+      failedChatKeySet,
+      openChatKeySet,
+      runningChatKeys,
+    ],
+  );
+  const activeChatSessionStatus = activeChatKey
+    ? chatSessionStatusFor(activeChatKey)
+    : { activeRun: null, kind: "idle" as const };
   const activeRunInfo = activeChatKey
     ? activeRunInfoByChatKey[activeChatKey] ?? null
     : null;
@@ -1335,8 +1450,7 @@ export function App() {
     ? readOnlyChatKeys[activeChatKey] === true
     : false;
   const canUseTeamMode = agentDefinitions.length > 1;
-  const isSendingMessage =
-    activeChatKey !== null && runningChatKeys.has(activeChatKey);
+  const isSendingMessage = activeChatSessionStatus.kind === "running";
   const queuedRunRequests = activeChatKey
     ? queuedRunRequestsByChatKey[activeChatKey] ?? []
     : [];
@@ -1390,13 +1504,7 @@ export function App() {
   const activeFileEditor = activeFileEditorKey
     ? workspaceFileEditors[activeFileEditorKey] ?? null
     : null;
-  const openChatKeySet = useMemo(
-    () =>
-      new Set(
-        openChatTabs.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
-      ),
-    [openChatTabs],
-  );
+
   const configuredModelsByName = useMemo(
     () =>
       [...(settings?.configuredModels ?? [])].sort((left, right) =>
@@ -4707,7 +4815,12 @@ export function App() {
       workspaces.some(
         (workspace) =>
           workspace.id === workspaceId &&
-          workspace.chats.some((chat) => Boolean(chat.activeRun)),
+          workspace.chats.some(
+            (chat) =>
+              chatSessionStatusFor(chatRunKey(workspace.id, chat.id), {
+                workspaceActiveRun: chat.activeRun,
+              }).kind === "running",
+          ),
       ) ||
       scheduledWorkspaceRunsRef.current.some(
         (run) => run.workspaceId === workspaceId && run.status === "starting",
@@ -5886,7 +5999,11 @@ export function App() {
   }
 
   function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
-    if (runningChatKeys.has(chatRunKey(workspace.id, chat.id))) {
+    const chatKey = chatRunKey(workspace.id, chat.id);
+    if (
+      chatSessionStatusFor(chatKey, { workspaceActiveRun: chat.activeRun }).kind ===
+      "running"
+    ) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
     }
@@ -5910,7 +6027,14 @@ export function App() {
   }
 
   async function deleteWorkspaceChat(workspaceId: string, chatId: string) {
-    if (runningChatKeys.has(chatRunKey(workspaceId, chatId))) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const workspaceChat = workspaces
+      .find((workspace) => workspace.id === workspaceId)
+      ?.chats.find((chat) => chat.id === chatId);
+    if (
+      chatSessionStatusFor(chatKey, { workspaceActiveRun: workspaceChat?.activeRun ?? null })
+        .kind === "running"
+    ) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
     }
@@ -7090,7 +7214,7 @@ export function App() {
       return;
     }
 
-    const runInfo = activeRunInfoByChatKey[currentChatKey] ?? null;
+    const runInfo = activeRunInfoByChatKeyRef.current[currentChatKey] ?? null;
     if (runInfo?.runId) {
       try {
         await requestJson<{ ok: boolean; runId: string }>(
@@ -7104,6 +7228,16 @@ export function App() {
     }
 
     activeRunAbortByChatKeyRef.current.get(currentChatKey)?.abort();
+    setChatRunning(currentChatKey, false);
+    setActiveRunInfoForChatKey(currentChatKey, null);
+    clearLiveChatStatistics(currentChatKey);
+    setChatRunFailed(currentChatKey, false);
+    const cancelledChat = runInfo?.chatId
+      ? { chatId: runInfo.chatId, workspaceId: runInfo.workspaceId }
+      : parseChatRunKey(currentChatKey);
+    if (cancelledChat) {
+      clearWorkspaceChatActiveRun(cancelledChat.workspaceId, cancelledChat.chatId);
+    }
     setPendingQuestion(null);
     setQuestionError(null);
     setIsAnsweringQuestion(false);
@@ -8169,6 +8303,7 @@ export function App() {
           setChatRunning(chatKey, false);
           setActiveRunInfoForChatKey(chatKey, null);
           clearLiveChatStatistics(chatKey);
+          clearWorkspaceChatActiveRun(activeRun.workspaceId, activeRun.chatId);
         }
       }
       if (!streamHadError) {
@@ -10155,34 +10290,12 @@ export function App() {
                                     const chatKey = chatRunKey(workspace.id, chat.id);
                                     const scheduledChatKey =
                                       chat.scheduledChatKey ?? null;
-                                    const isChatRunning =
-                                      runningChatKeys.has(chatKey) ||
-                                      Boolean(chat.activeRun) ||
-                                      Boolean(
-                                        scheduledChatKey &&
-                                        runningChatKeys.has(scheduledChatKey),
-                                      );
-                                    const isChatScheduled =
-                                      chat.scheduledStatus === "queued" ||
-                                      chat.scheduledStatus === "starting";
-                                    const isChatOpen =
-                                      openChatKeySet.has(chatKey) ||
-                                      Boolean(
-                                        scheduledChatKey &&
-                                        activeChatKey === scheduledChatKey,
-                                      );
-                                    const isChatFailed =
-                                      isChatOpen && failedChatKeySet.has(chatKey);
-                                    let statusDotClass = "session-status-dot-idle";
-                                    if (isChatRunning) {
-                                      statusDotClass = "session-status-dot-running";
-                                    } else if (isChatScheduled) {
-                                      statusDotClass = "session-status-dot-scheduled";
-                                    } else if (isChatFailed) {
-                                      statusDotClass = "session-status-dot-error";
-                                    } else if (isChatOpen) {
-                                      statusDotClass = "session-status-dot-open";
-                                    }
+                                    const sessionStatus = chatSessionStatusFor(chatKey, {
+                                      scheduledChatKey,
+                                      scheduledStatus: chat.scheduledStatus ?? null,
+                                      workspaceActiveRun: chat.activeRun,
+                                    });
+                                    const statusDotClass = chatSessionStatusDotClass(sessionStatus.kind);
                                     const isChatActive =
                                       activeWorkspace?.id === workspace.id &&
                                       activeChatId === chat.id;
@@ -10476,10 +10589,10 @@ export function App() {
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <MainTabBar
                     activeTab={activeMainTab}
+                    chatSessionStatusFor={chatSessionStatusFor}
                     onCloseTab={closeMainTab}
                     onCloseTabs={closeMainTabs}
                     onSelectTab={selectMainTab}
-                    runningChatKeys={runningChatKeys}
                     tabs={mainTabs}
                   />
                 </div>
@@ -11190,17 +11303,17 @@ function QuestionDialog({
 
 function MainTabBar({
   activeTab,
+  chatSessionStatusFor,
   onCloseTab,
   onCloseTabs,
   onSelectTab,
-  runningChatKeys,
   tabs,
 }: {
   activeTab: ActiveMainTab;
+  chatSessionStatusFor: (chatKey: string) => ChatSessionStatus;
   onCloseTab: (tab: MainTabSummary) => void;
   onCloseTabs: (scope: MainTabCloseScope, anchorTab: MainTabSummary) => void;
   onSelectTab: (tab: MainTabSummary) => void;
-  runningChatKeys: Set<string>;
   tabs: MainTabSummary[];
 }) {
   const { t } = useI18n();
@@ -11534,7 +11647,7 @@ function MainTabBar({
             const isActive = mainTabMatches(activeTab, tab);
             const isRunning =
               tab.type === "chat" &&
-              runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId));
+              chatSessionStatusFor(chatRunKey(tab.workspaceId, tab.chatId)).kind === "running";
             const title = tab.title || t(tab.type === "chat" ? "Chat" : tab.type === "agent" ? "Agent" : "Files");
             const key = mainTabKey(tab);
 

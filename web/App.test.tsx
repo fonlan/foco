@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ShellMessage } from "./api/types";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import type { ActiveRunInfo, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
   return {
@@ -18,6 +18,64 @@ function message(id: string): ShellMessage {
     toolCalls: [],
   };
 }
+
+describe("deriveChatSessionStatus", () => {
+  const activeRun: ActiveRunInfo = {
+    acceptingGuidance: false,
+    chatId: "chat-1",
+    chatKey: "workspace-1:chat-1",
+    runId: "run-1",
+    workspaceId: "workspace-1",
+  };
+
+  function status(options: Partial<Parameters<typeof deriveChatSessionStatus>[0]> = {}) {
+    return deriveChatSessionStatus({
+      activeChatKey: null,
+      activeRunInfoByChatKey: {},
+      chatKey: "workspace-1:chat-1",
+      failedChatKeySet: new Set(),
+      openChatKeySet: new Set(),
+      runningChatKeys: new Set(),
+      ...options,
+    });
+  }
+
+  it("uses one explicit priority order for chat session UI state", () => {
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        runningChatKeys: new Set(["workspace-1:chat-1"]),
+        scheduledStatus: "queued",
+      }).kind,
+    ).toBe("running");
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        scheduledStatus: "queued",
+      }).kind,
+    ).toBe("scheduled");
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+      }).kind,
+    ).toBe("failed");
+    expect(status({ openChatKeySet: new Set(["workspace-1:chat-1"]) }).kind).toBe(
+      "open",
+    );
+    expect(status().kind).toBe("idle");
+  });
+
+  it("keeps tab spinner and workspace dot classes on the same status kind", () => {
+    expect(
+      status({ activeRunInfoByChatKey: { "workspace-1:chat-1": activeRun } }).activeRun,
+    ).toEqual(activeRun);
+    expect(chatSessionStatusDotClass("running")).toBe("session-status-dot-running");
+    expect(chatSessionStatusDotClass("failed")).toBe("session-status-dot-error");
+  });
+});
 
 describe("trimInactiveChatMessageCaches", () => {
   it("keeps active and running chat caches intact while trimming old inactive caches", () => {
