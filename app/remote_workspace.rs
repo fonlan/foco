@@ -1452,8 +1452,14 @@ async fn ensure_sidecar_command(
 
     let asset = select_sidecar_asset(target)
         .map_err(|message| remote_error(server_id, workspace_id, message))?;
-    let remote_dir = format!("~/.foco/sidecars/{}/{}", asset.version, asset.target);
-    let remote_bin = format!("{remote_dir}/{SIDECAR_BINARY_NAME}");
+    let remote_dir = remote_home_shell_path(&format!(
+        ".foco/sidecars/{}/{}",
+        asset.version, asset.target
+    ));
+    let remote_bin = remote_home_shell_path(&format!(
+        ".foco/sidecars/{}/{}/{}",
+        asset.version, asset.target, SIDECAR_BINARY_NAME
+    ));
     if remote_sidecar_matches(
         server,
         &remote_bin,
@@ -1478,12 +1484,15 @@ async fn ensure_sidecar_command(
             ),
         )
     })?;
-    let remote_tmp = format!("{remote_dir}/{SIDECAR_BINARY_NAME}.tmp");
+    let remote_tmp = remote_home_shell_path(&format!(
+        ".foco/sidecars/{}/{}/{}.tmp",
+        asset.version, asset.target, SIDECAR_BINARY_NAME
+    ));
     let install_script = format!(
         "set -e; mkdir -p {dir}; cat > {tmp}; chmod +x {tmp}; mv -f {tmp} {bin}; {bin} --version; {bin} --sidecar-target",
-        dir = shell_quote(&remote_dir),
-        tmp = shell_quote(&remote_tmp),
-        bin = shell_quote(&remote_bin),
+        dir = remote_dir,
+        tmp = remote_tmp,
+        bin = remote_bin,
     );
     let output = run_ssh_with_stdin(
         server,
@@ -1515,7 +1524,7 @@ async fn remote_sidecar_matches(
 ) -> Result<bool, ApiError> {
     let command = format!(
         "test -x {bin} && {bin} --version && {bin} --sidecar-target",
-        bin = shell_quote(remote_bin)
+        bin = remote_bin
     );
     let output = run_ssh_output(server, &[command.as_str()], true, server_id, workspace_id).await?;
     if !output.status.success() {
@@ -1590,7 +1599,7 @@ async fn ensure_remote_session_file(
     })
     .to_string();
     let script = format!(
-        "set -e; dir=\"$HOME/.foco/remote-sessions\"; mkdir -p \"$dir\"; chmod 700 \"$dir\"; path=\"$dir/{session_name}\"; tmp=\"$path.tmp.$$\"; cat > \"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" \"$path\"; printf '%s\\n' \"$path\"",
+        "set -e; dir=\"$HOME/.foco/remote-sessions\"; mkdir -p \"$dir\"; chmod 700 \"$dir\"; session_path=\"$dir/{session_name}\"; tmp=\"$session_path.tmp.$$\"; cat > \"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" \"$session_path\"; printf '%s\\n' \"$session_path\"",
     );
     let output = run_ssh_with_stdin(
         server,
@@ -3085,6 +3094,10 @@ fn random_token() -> Result<String, ApiError> {
         ApiError::internal(format!("failed to generate sidecar token: {source}"))
     })?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn remote_home_shell_path(suffix: &str) -> String {
+    format!("\"$HOME\"/{}", shell_quote(suffix))
 }
 
 fn shell_quote(value: &str) -> String {

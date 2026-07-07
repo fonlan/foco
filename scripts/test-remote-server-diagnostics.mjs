@@ -8,6 +8,10 @@ const remoteServersRs = await readFile(
   path.join(repoRoot, "app/http/remote_servers.rs"),
   "utf8",
 );
+const remoteWorkspaceRs = await readFile(
+  path.join(repoRoot, "app/remote_workspace.rs"),
+  "utf8",
+);
 const settingsPanelTsx = await readFile(
   path.join(repoRoot, "web/features/settings/SettingsPanel.tsx"),
   "utf8",
@@ -49,6 +53,11 @@ assert.match(remoteServersRs, /BatchMode=yes/, "SSH diagnostics use BatchMode");
 assert.match(remoteServersRs, /mkdir -p ~\/\.foco\/sidecars && test -w ~\/\.foco\/sidecars/, "install dir writability is checked");
 assert.match(remoteServersRs, /remote_server_summary_sidecar_install_state/, "summary derives sidecar install state");
 assert.match(remoteServersRs, /server_summary_treats_ready_version_as_available_sidecar/, "stale notInstalled with version is covered");
+assert.match(remoteWorkspaceRs, /"\.foco\/sidecars\/\{\}\/\{\}"/, "sidecar install directory is built under $HOME/.foco");
+assert.match(remoteWorkspaceRs, /format!\("\\\"\$HOME\\\"\/\{\}"/, "remote home path keeps $HOME expandable");
+assert.doesNotMatch(remoteWorkspaceRs, /format!\(\s*"~\/\.foco\/sidecars/, "sidecar install path does not use literal tilde");
+assert.match(remoteWorkspaceRs, /session_path=\\"\$dir\//, "session script uses session_path variable");
+assert.doesNotMatch(remoteWorkspaceRs, /; path=\\"\$dir\//, "session script does not assign zsh path variable");
 
 for (const source of [settingsPanelTsx, workspaceDialogTsx, appTsx]) {
   assert.match(source, /Checking Sidecar version/, "focoCommandVersion label checks sidecar version");
