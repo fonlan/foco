@@ -2989,8 +2989,8 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   if (path === "/api/update/check") {
     const update = {
       ...appTestState.settingsResponse.update,
-      assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos.dmg",
-      assetName: "Foco-v0.2.0-macos.dmg",
+      assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos-arm64.dmg",
+      assetName: "Foco-v0.2.0-macos-arm64.dmg",
       error: null,
       releaseName: "Foco v0.2.0",
       releaseUrl: "https://github.com/fonlan/foco/releases/tag/v0.2.0",

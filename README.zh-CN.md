@@ -130,11 +130,11 @@ npm run typecheck -w web
 npm run build:release
 ```
 
-该命令会构建 Web 资源，然后运行 `cargo build --release -p foco-app`。Windows release 构建会启用 Windows subsystem 设置并嵌入应用图标资源。正式远程工作区发布包还会打包 CI 产出的 Linux sidecar；本地开发构建不强制需要 sidecar。
+该命令会构建 Web 资源，然后运行 `cargo build --release -p foco-app`。Windows release 构建会启用 Windows subsystem 设置并嵌入应用图标资源。正式远程工作区发布包还会打包 CI 产出的 Linux sidecar；本地开发构建不强制需要 sidecar。Windows 安装包使用 `npm run build:windows` 生成 NSIS 用户级安装器，安装到 `%LOCALAPPDATA%\Foco`，自动更新会下载同名 setup exe 并以 `/S` 静默运行。
 
 ### 远程 Sidecar 发布产物
 
-SSH 远程工作区使用桌面发布包内置的 Linux sidecar。CI release workflow 会用 `cross` 构建 `linux-x64` 和 `linux-arm64` sidecar，写入 `sidecars/manifest.json`，并记录每个二进制的 `sha256`。macOS 打包会把校验后的 sidecar 复制到 `Foco.app/Contents/Resources/sidecars/`；Windows release bundling 会复制到可执行文件旁的 `resources/sidecars/`。
+SSH 远程工作区使用桌面发布包内置的 Linux sidecar。CI release workflow 会用 `cross` 构建 `linux-x64` 和 `linux-arm64` sidecar，写入 `sidecars/manifest.json`，并记录每个二进制的 `sha256`。macOS 打包会把校验后的 sidecar 复制到 `Foco.app/Contents/Resources/sidecars/`；Windows NSIS 安装器会复制到安装目录下的 `resources\sidecars\`。
 
 用户只需要安装本机 Foco。首次连接远程工作区时，Foco 会按服务器 target 选择包内 sidecar，校验 manifest hash，然后通过 SSH stdin 上传到 `~/.foco/sidecars/<version>/<target>/foco`。高级服务器配置可以设置 `focoCommand`，跳过上传并使用远端已有的 Foco 命令。远端清理策略保留最近 2 个 sidecar 版本，并在新版本成功启动后删除更旧版本。
 

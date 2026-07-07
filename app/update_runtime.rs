@@ -360,9 +360,20 @@ fn select_platform_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubRelease
 }
 
 fn platform_asset_name(name: &str) -> bool {
+    platform_asset_name_for(name, env::consts::OS, env::consts::ARCH)
+}
+
+fn platform_asset_name_for(name: &str, target_os: &str, target_arch: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    cfg!(target_os = "macos") && name.starts_with("foco-v") && name.ends_with("-macos.dmg")
-        || cfg!(windows) && name.starts_with("foco-v") && name.ends_with("-windows.zip")
+    if !name.starts_with("foco-v") {
+        return false;
+    }
+
+    match (target_os, target_arch) {
+        ("macos", "aarch64" | "arm64") => name.ends_with("-macos-arm64.dmg"),
+        ("windows", "x86_64" | "x64") => name.ends_with("-windows-x64-setup.exe"),
+        _ => false,
+    }
 }
 
 fn platform_supports_installation() -> bool {
@@ -483,8 +494,33 @@ fn validate_downloaded_update_asset(asset_name: &str, path: &Path) -> Result<(),
             path.display()
         )));
     }
+    if asset_name.to_ascii_lowercase().ends_with(".exe") && !pe_file_has_header(path)? {
+        return Err(ApiError::internal(format!(
+            "downloaded Foco update is not a Windows executable: {}",
+            path.display()
+        )));
+    }
 
     Ok(())
+}
+
+fn pe_file_has_header(path: &Path) -> Result<bool, ApiError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to open downloaded Foco update {}: {source}",
+            path.display()
+        ))
+    })?;
+    let mut header = [0_u8; 2];
+    file.read_exact(&mut header).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to read downloaded Foco update {}: {source}",
+            path.display()
+        ))
+    })?;
+    Ok(matches!(header, [b'M', b'Z']))
 }
 
 fn zip_file_has_header(path: &Path) -> Result<bool, ApiError> {
@@ -655,7 +691,7 @@ fn start_windows_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), A
             "-File",
             script_path.to_string_lossy().as_ref(),
         ])
-        .env("FOCO_UPDATE_ZIP", &prepared.archive_path)
+        .env("FOCO_UPDATE_INSTALLER", &prepared.archive_path)
         .env("FOCO_UPDATE_INSTALL_DIR", &install_dir)
         .env("FOCO_UPDATE_EXE", &current_exe)
         .env("FOCO_UPDATE_PID", std::process::id().to_string())
@@ -680,29 +716,17 @@ fn start_windows_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), A
 
 fn windows_update_script() -> &'static str {
     r#"$ErrorActionPreference = "Stop"
-$zip = $env:FOCO_UPDATE_ZIP
+$installer = $env:FOCO_UPDATE_INSTALLER
 $installDir = $env:FOCO_UPDATE_INSTALL_DIR
 $currentExe = $env:FOCO_UPDATE_EXE
 $pidToWait = [int]$env:FOCO_UPDATE_PID
 $logPath = $env:FOCO_UPDATE_LOG
-if (-not $zip -or -not $installDir -or -not $currentExe -or -not $pidToWait -or -not $logPath) { throw "missing Foco update environment" }
+if (-not $installer -or -not $installDir -or -not $currentExe -or -not $pidToWait -or -not $logPath) { throw "missing Foco update environment" }
 Start-Transcript -Path $logPath -Append | Out-Null
 try {
   Wait-Process -Id $pidToWait
-  $extractDir = Join-Path (Split-Path -Parent $zip) "extract"
-  Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Path $extractDir | Out-Null
-  Expand-Archive -Path $zip -DestinationPath $extractDir -Force
-  $focoExe = Get-ChildItem -Path $extractDir -Recurse -Filter "foco.exe" | Select-Object -First 1
-  if (-not $focoExe) { throw "foco.exe was not found in update zip" }
-  $sourceDir = $focoExe.Directory.FullName
-  Copy-Item -Path $focoExe.FullName -Destination $currentExe -Force
-  $sourceResources = Join-Path $sourceDir "resources"
-  if (Test-Path $sourceResources) {
-    $targetResources = Join-Path $installDir "resources"
-    Remove-Item -Recurse -Force $targetResources -ErrorAction SilentlyContinue
-    Copy-Item -Path $sourceResources -Destination $targetResources -Recurse -Force
-  }
+  $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+  if ($process.ExitCode -ne 0) { throw "Foco installer exited with code $($process.ExitCode)" }
   Start-Process -FilePath $currentExe -WorkingDirectory $installDir
 } finally {
   Stop-Transcript | Out-Null
@@ -811,8 +835,8 @@ mod tests {
               "html_url": "https://github.com/fonlan/foco/releases/tag/v1.2.3",
               "assets": [
                 {
-                  "name": "Foco-v1.2.3-macos.dmg",
-                  "browser_download_url": "https://example.test/Foco-v1.2.3-macos.dmg"
+                  "name": "Foco-v1.2.3-macos-arm64.dmg",
+                  "browser_download_url": "https://example.test/Foco-v1.2.3-macos-arm64.dmg"
                 }
               ]
             }"#,
@@ -821,18 +845,18 @@ mod tests {
 
         assert_eq!(release.tag_name, "v1.2.3");
         assert_eq!(release.name.as_deref(), Some("Foco v1.2.3"));
-        assert_eq!(release.assets[0].name, "Foco-v1.2.3-macos.dmg");
+        assert_eq!(release.assets[0].name, "Foco-v1.2.3-macos-arm64.dmg");
     }
 
     #[test]
     fn platform_asset_selection_matches_current_platform() {
         let assets = vec![
             GithubReleaseAsset {
-                name: "Foco-v1.2.3-macos.dmg".to_string(),
+                name: "Foco-v1.2.3-macos-arm64.dmg".to_string(),
                 browser_download_url: "https://example.test/macos".to_string(),
             },
             GithubReleaseAsset {
-                name: "Foco-v1.2.3-windows.zip".to_string(),
+                name: "Foco-v1.2.3-windows-x64-setup.exe".to_string(),
                 browser_download_url: "https://example.test/windows".to_string(),
             },
         ];
@@ -846,10 +870,51 @@ mod tests {
     }
 
     #[test]
+    fn platform_asset_name_uses_platform_arch_suffix() {
+        assert!(platform_asset_name_for(
+            "Foco-v1.2.3-macos-arm64.dmg",
+            "macos",
+            "aarch64"
+        ));
+        assert!(platform_asset_name_for(
+            "Foco-v1.2.3-windows-x64-setup.exe",
+            "windows",
+            "x86_64"
+        ));
+        assert!(!platform_asset_name_for(
+            "Foco-v1.2.3-windows-installer.exe",
+            "windows",
+            "x86_64"
+        ));
+        assert!(!platform_asset_name_for(
+            "Foco-v1.2.3-windows.zip",
+            "windows",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn downloaded_windows_update_requires_mz_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid = dir.path().join("Foco-v1.2.3-windows-x64-setup.exe");
+        let invalid = dir.path().join("not-an-installer.exe");
+        std::fs::write(&valid, b"MZpayload").expect("write valid exe");
+        std::fs::write(&invalid, b"PK\x03\x04payload").expect("write invalid exe");
+
+        assert!(
+            validate_downloaded_update_asset("Foco-v1.2.3-windows-x64-setup.exe", &valid).is_ok()
+        );
+        assert!(
+            validate_downloaded_update_asset("Foco-v1.2.3-windows-x64-setup.exe", &invalid)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn update_path_components_reject_traversal() {
         assert!(safe_update_path_component("v1.2.3", "version").is_ok());
         assert!(safe_update_path_component("../v1.2.3", "version").is_err());
-        assert!(safe_update_path_component("Foco-v1.2.3-macos.dmg", "asset name").is_ok());
+        assert!(safe_update_path_component("Foco-v1.2.3-macos-arm64.dmg", "asset name").is_ok());
         assert!(safe_update_path_component("nested/Foco.zip", "asset name").is_err());
     }
 

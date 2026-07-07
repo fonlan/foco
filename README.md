@@ -130,11 +130,11 @@ Use `cargo test --workspace` when you want the default Rust harness concurrency,
 npm run build:release
 ```
 
-This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource. Official remote-workspace releases also bundle Linux sidecars produced by CI; local development builds do not require them.
+This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource. Official remote-workspace releases also bundle Linux sidecars produced by CI; local development builds do not require them. Windows installers are built with `npm run build:windows` as a per-user NSIS setup installed under `%LOCALAPPDATA%\Foco`; automatic updates download the setup exe and run it silently with `/S`.
 
 ### Remote Sidecar Release Artifacts
 
-Remote SSH workspaces use Linux sidecars bundled with the desktop release. The CI release workflow builds `linux-x64` and `linux-arm64` sidecars with `cross`, writes `sidecars/manifest.json`, and records the `sha256` for each binary. macOS packaging copies verified sidecars into `Foco.app/Contents/Resources/sidecars/`; Windows release bundling copies them into `resources/sidecars/` beside the executable.
+Remote SSH workspaces use Linux sidecars bundled with the desktop release. The CI release workflow builds `linux-x64` and `linux-arm64` sidecars with `cross`, writes `sidecars/manifest.json`, and records the `sha256` for each binary. macOS packaging copies verified sidecars into `Foco.app/Contents/Resources/sidecars/`; the Windows NSIS installer copies them into `resources\sidecars\` under the install directory.
 
 Users only need to install local Foco. On first connection to a remote workspace, Foco selects the packaged sidecar for the server target, verifies the manifest hash, and uploads it over SSH stdin to `~/.foco/sidecars/<version>/<target>/foco`. Advanced server profiles can set `focoCommand` to skip upload and use an existing Foco command on the remote server. Remote cleanup keeps the latest two sidecar versions and removes older versions after a newer sidecar starts successfully.
 

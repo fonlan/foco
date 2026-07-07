@@ -105,20 +105,18 @@ jobs:
           path: sidecars
       - name: Verify sidecars
         run: node scripts/sidecars.mjs verify --root sidecars
-      - name: Build Windows release
-        run: npm run build:release -- --bundle-sidecars
-      - name: Package Windows zip
+      - name: Install NSIS
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist\windows | Out-Null
-          Push-Location target\release
-          Compress-Archive -Path foco.exe,resources -DestinationPath ..\..\dist\windows\Foco-windows.zip -Force
-          Pop-Location
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build Windows installer
+        run: npm run build:windows
       - name: Upload Windows release
         uses: actions/upload-artifact@v4
         with:
-          name: Foco-windows-zip
-          path: dist/windows/Foco-windows.zip
+          name: Foco-windows-setup
+          path: dist/windows/Foco-windows-x64-setup.exe
           if-no-files-found: error
 
   github-release:
@@ -162,15 +160,15 @@ jobs:
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
-          name: Foco-windows-zip
+          name: Foco-windows-setup
           path: artifacts/windows
       - name: Prepare release assets
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          cp artifacts/macos/Foco.dmg "release-assets/Foco-${RELEASE_TAG}-macos.dmg"
-          cp artifacts/windows/Foco-windows.zip "release-assets/Foco-${RELEASE_TAG}-windows.zip"
+          cp artifacts/macos/Foco.dmg "release-assets/Foco-${RELEASE_TAG}-macos-arm64.dmg"
+          cp artifacts/windows/Foco-windows-x64-setup.exe "release-assets/Foco-${RELEASE_TAG}-windows-x64-setup.exe"
       - name: Create or update GitHub release
         shell: bash
         run: |

@@ -913,8 +913,8 @@ describe("app-shell verification surfaces", () => {
       ...appTestState.settingsResponse,
       update: {
         ...appTestState.settingsResponse.update,
-        assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos.dmg",
-        assetName: "Foco-v0.2.0-macos.dmg",
+        assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos-arm64.dmg",
+        assetName: "Foco-v0.2.0-macos-arm64.dmg",
         error: null,
         releaseUrl: "https://github.com/fonlan/foco/releases/tag/v0.2.0",
         targetVersion: "0.2.0",
