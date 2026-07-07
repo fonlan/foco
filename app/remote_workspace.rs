@@ -182,6 +182,8 @@ pub(crate) struct RemoteActiveRunSummary {
 pub(crate) struct RemoteWorkspaceManager {
     sessions: Arc<Mutex<HashMap<String, Arc<RemoteWorkspaceSession>>>>,
     statuses: Arc<Mutex<HashMap<String, RemoteSessionStatus>>>,
+    // ponytail: process-local keyed mutex; remote lockfile later if multiple Foco processes must coordinate.
+    sidecar_install_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl RemoteWorkspaceManager {
@@ -277,6 +279,35 @@ impl RemoteWorkspaceManager {
             .lock()
             .map_err(|_| ApiError::internal("remote workspace status lock is poisoned"))?;
         Ok(statuses.get(&status_key(server_id, workspace_id)).cloned())
+    }
+
+    fn sidecar_install_lock(&self, key: &str) -> Result<Arc<AsyncMutex<()>>, ApiError> {
+        let mut locks = self
+            .sidecar_install_locks
+            .lock()
+            .map_err(|_| ApiError::internal("remote sidecar install lock map is poisoned"))?;
+        Ok(locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone())
+    }
+
+    fn remove_sidecar_install_lock(
+        &self,
+        key: &str,
+        lock: &Arc<AsyncMutex<()>>,
+    ) -> Result<(), ApiError> {
+        let mut locks = self
+            .sidecar_install_locks
+            .lock()
+            .map_err(|_| ApiError::internal("remote sidecar install lock map is poisoned"))?;
+        let should_remove = locks.get(key).is_some_and(|existing| {
+            Arc::ptr_eq(existing, lock) && Arc::strong_count(existing) == 2
+        });
+        if should_remove {
+            locks.remove(key);
+        }
+        Ok(())
     }
 
     async fn connect_workspace_inner(
@@ -1474,39 +1505,67 @@ async fn ensure_sidecar_command(
         return Ok(remote_bin);
     }
 
-    let bytes = std::fs::read(&asset.path).map_err(|source| {
-        remote_error(
-            server_id,
-            workspace_id,
-            format!(
-                "failed to read sidecar asset {}: {source}",
-                asset.path.display()
-            ),
-        )
-    })?;
-    let install_script = format!(
-        "set -e; dir={dir}; bin={bin}; tmp=\"$bin.tmp.$$\"; mkdir -p \"$dir\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; chmod +x \"$tmp\"; mv -f \"$tmp\" \"$bin\"; trap - EXIT; \"$bin\" --version; \"$bin\" --sidecar-target",
-        dir = remote_dir,
-        bin = remote_bin,
-    );
-    let output = run_ssh_with_stdin(
-        server,
-        &[install_script.as_str()],
-        &bytes,
-        server_id,
-        workspace_id,
-    )
-    .await?;
-    if !output.status.success() {
-        return Err(remote_error(
-            server_id,
-            workspace_id,
-            format!("sidecar upload/install failed: {}", output_text(&output)),
-        ));
-    }
-    verify_remote_command(server, &remote_bin, target, server_id, workspace_id).await?;
-    update_sidecar_cache(state, server_id, target, &asset.version, None)?;
-    Ok(remote_bin)
+    let install_key = sidecar_install_key(server_id, target, &asset.version);
+    let install_lock = state
+        .remote_workspace_manager
+        .sidecar_install_lock(&install_key)?;
+    let result: Result<String, ApiError> = {
+        let _install_guard = install_lock.lock().await;
+        async {
+            if remote_sidecar_matches(
+                server,
+                &remote_bin,
+                &asset.version,
+                target,
+                server_id,
+                workspace_id,
+            )
+            .await?
+            {
+                update_sidecar_cache(state, server_id, target, &asset.version, None)?;
+                return Ok(remote_bin.clone());
+            }
+
+            let bytes = std::fs::read(&asset.path).map_err(|source| {
+                remote_error(
+                    server_id,
+                    workspace_id,
+                    format!(
+                        "failed to read sidecar asset {}: {source}",
+                        asset.path.display()
+                    ),
+                )
+            })?;
+            let install_script = format!(
+                "set -e; dir={dir}; bin={bin}; tmp=\"$bin.tmp.$$\"; mkdir -p \"$dir\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; chmod +x \"$tmp\"; mv -f \"$tmp\" \"$bin\"; trap - EXIT; \"$bin\" --version; \"$bin\" --sidecar-target",
+                dir = remote_dir,
+                bin = remote_bin,
+            );
+            let output = run_ssh_with_stdin(
+                server,
+                &[install_script.as_str()],
+                &bytes,
+                server_id,
+                workspace_id,
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(remote_error(
+                    server_id,
+                    workspace_id,
+                    format!("sidecar upload/install failed: {}", output_text(&output)),
+                ));
+            }
+            verify_remote_command(server, &remote_bin, target, server_id, workspace_id).await?;
+            update_sidecar_cache(state, server_id, target, &asset.version, None)?;
+            Ok(remote_bin.clone())
+        }
+        .await
+    };
+    let _ = state
+        .remote_workspace_manager
+        .remove_sidecar_install_lock(&install_key, &install_lock);
+    result
 }
 
 async fn remote_sidecar_matches(
@@ -2977,6 +3036,10 @@ async fn run_ssh_with_stdin(
 
 fn session_key(server_id: &str, workspace_id: &str) -> String {
     format!("{server_id}:{workspace_id}")
+}
+
+fn sidecar_install_key(server_id: &str, target: &str, version: &str) -> String {
+    format!("{server_id}\0{target}\0{version}")
 }
 
 fn status_key(server_id: &str, workspace_id: Option<&str>) -> String {
