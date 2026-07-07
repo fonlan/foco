@@ -3328,13 +3328,8 @@ export function SettingsPanel({
     setIsSavingWorkspaceOrder(true);
     setError(null);
 
-    const nextWorkspaces = orderedWorkspaces.map((item) =>
-      item.id === workspace.id ? { ...item, pinned } : item,
-    );
-    const workspaceIds = groupedWorkspaceIds(nextWorkspaces);
-
     try {
-      await requestJson<SettingsResponse>("/api/workspaces/manual", {
+      const data = await requestJson<SettingsResponse>("/api/workspaces/manual", {
         body: JSON.stringify({
           id: workspace.id,
           name: workspace.name,
@@ -3348,13 +3343,8 @@ export function SettingsPanel({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      const orderData = await requestJson<SettingsResponse>("/api/workspaces/order", {
-        body: JSON.stringify({ workspaceIds }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
-      setSettings(orderData);
-      onSettingsChange(orderData);
+      setSettings(data);
+      onSettingsChange(data);
       setWorkspaceForm((current) =>
         current.id === workspace.id ? { ...current, pinned } : current,
       );

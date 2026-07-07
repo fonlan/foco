@@ -2194,6 +2194,7 @@ export const appTestState: {
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
+  lastManualWorkspaceRequest: Partial<ConfiguredWorkspaceSummary> | null;
 } = {
   activeChatStreamController: null,
   chatStreamControllers: new Map<string, ReadableStreamDefaultController<Uint8Array>>(),
@@ -2217,6 +2218,7 @@ export const appTestState: {
   workspaceChatSearchResponseWorkspaces: null,
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
+  lastManualWorkspaceRequest: null,
 };
 function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspaceSummary {
   const workspaceSummary = item as ConfiguredWorkspaceSummary & { chats?: unknown[] };
@@ -2315,6 +2317,13 @@ function reorderUnknownWorkspacesByIds<T>(items: T[], itemIds: string[]) {
   return next.length === items.length ? next : items;
 }
 
+function groupPinnedUnknownWorkspaces<T>(items: T[]) {
+  return [
+    ...items.filter((item) => Boolean((item as { pinned?: boolean }).pinned)),
+    ...items.filter((item) => !Boolean((item as { pinned?: boolean }).pinned)),
+  ];
+}
+
 function workspaceOrderSettings(workspaceIds: string[]) {
   appTestState.lastWorkspaceOrderRequest = workspaceIds;
   appTestState.workspaceResponseWorkspaces = reorderUnknownWorkspacesByIds(
@@ -2331,10 +2340,13 @@ function workspaceOrderSettings(workspaceIds: string[]) {
 
 function saveManualWorkspaceSettings(init?: RequestInit) {
   const body = JSON.parse(String(init?.body ?? "{}")) as Partial<ConfiguredWorkspaceSummary>;
-  appTestState.workspaceResponseWorkspaces = appTestState.workspaceResponseWorkspaces.map((item) => {
-    const current = item as Record<string, unknown>;
-    return current.id === body.id ? { ...current, ...body } : current;
-  });
+  appTestState.lastManualWorkspaceRequest = body;
+  appTestState.workspaceResponseWorkspaces = groupPinnedUnknownWorkspaces(
+    appTestState.workspaceResponseWorkspaces.map((item) => {
+      const current = item as Record<string, unknown>;
+      return current.id === body.id ? { ...current, ...body } : current;
+    }),
+  );
   appTestState.settingsResponse = {
     ...appTestState.settingsResponse,
     workspaces: settingsWorkspacesFromWorkspaceResponse(),
@@ -2498,6 +2510,7 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
+  appTestState.lastManualWorkspaceRequest = null;
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-foco-theme");
@@ -2979,9 +2992,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           },
           chats: [],
           id: "new-workspace",
+          connectionStatus: "local",
+          displayPath: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+          lastRemoteError: null,
           logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",
           name: "New Workspace",
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+          remotePath: null,
+          serverId: null,
+          serverName: null,
           pinned: false,
           terminalShell: "powershell",
           commonCommands: [],

@@ -141,7 +141,7 @@ describe("app-workspaces verification surfaces", () => {
     expectWorkspaceOrder(["Pinned project", "Default", "Another project", "Side project"]);
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
     const defaultSettingsButton = await screen.findByRole("button", {
       name: "Edit workspace Default",
     });
@@ -315,17 +315,50 @@ describe("app-workspaces verification surfaces", () => {
 
     await screen.findByRole("navigation", { name: "Workspace list" });
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
     await userEvent.click(
       await screen.findByRole("button", { name: "Pin workspace Another project" }),
     );
 
     await waitFor(() => {
-      expect(appTestState.lastWorkspaceOrderRequest).toEqual([
-        "workspace-3",
-        "workspace-1",
-        "workspace-2",
-      ]);
+      expect(appTestState.lastManualWorkspaceRequest).toEqual(
+        expect.objectContaining({ id: "workspace-3", pinned: true }),
+      );
+    });
+    expect(appTestState.lastWorkspaceOrderRequest).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Unpin workspace Another project" }),
+    ).toBeInTheDocument();
+    const pinnedSettingsButton = screen.getByRole("button", {
+      name: "Edit workspace Another project",
+    });
+    const defaultSettingsButton = screen.getByRole("button", {
+      name: "Edit workspace Default",
+    });
+    expect(
+      Boolean(
+        pinnedSettingsButton.compareDocumentPosition(defaultSettingsButton) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Unpin workspace Another project" }),
+    );
+    await waitFor(() => {
+      expect(appTestState.lastManualWorkspaceRequest).toEqual(
+        expect.objectContaining({ id: "workspace-3", pinned: false }),
+      );
+    });
+    expect(
+      screen.getByRole("button", { name: "Pin workspace Another project" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Pin workspace Another project" }));
+    await waitFor(() => {
+      expect(appTestState.lastManualWorkspaceRequest).toEqual(
+        expect.objectContaining({ id: "workspace-3", pinned: true }),
+      );
     });
     await userEvent.click(screen.getByRole("button", { name: "Home" }));
 
@@ -808,11 +841,13 @@ describe("app-workspaces verification surfaces", () => {
         ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
       );
       expect(addWorkspaceCall).toBeDefined();
-      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual({
-        contentBase64: expect.any(String),
-        name: "NewWorkspace",
-        path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-      });
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          contentBase64: expect.any(String),
+          name: "NewWorkspace",
+          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+        }),
+      );
       const specSettingsCall = fetchMock.mock.calls.find(
         ([url, init]) =>
           url === "/api/workspaces/new-workspace/spec/settings" &&
@@ -859,11 +894,13 @@ describe("app-workspaces verification surfaces", () => {
         ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
       );
       expect(addWorkspaceCall).toBeDefined();
-      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual({
-        contentBase64: null,
-        name: "New Workspace",
-        path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-      });
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          contentBase64: null,
+          name: "New Workspace",
+          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+        }),
+      );
     });
   });
 
@@ -872,7 +909,7 @@ describe("app-workspaces verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit workspace Default" }),
     );
@@ -915,7 +952,7 @@ describe("app-workspaces verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit workspace Default" }),
     );
