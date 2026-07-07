@@ -10344,6 +10344,8 @@ export function App() {
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
                         hiddenChatCount,
                       );
+                      const isRemoteWorkspace = workspace.serverId !== null;
+                      const isRemoteReady = workspaceConnectionLooksReady(workspace.connectionStatus);
 
                       return (
                         <div
@@ -10386,16 +10388,16 @@ export function App() {
                                 <WorkspaceIcon
                                   className="size-4 shrink-0 rounded object-cover"
                                   fallbackClassName="size-4 shrink-0"
-                                  isRemote={Boolean(workspace.serverId)}
+                                  isRemote={isRemoteWorkspace}
                                   logoUrl={workspace.logoUrl}
                                 />
-                                {workspace.serverId ? (
+                                {isRemoteWorkspace ? (
                                   <span className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`} />
                                 ) : null}
                               </span>
                               <span className="min-w-0 flex-1 text-left">
                                 <span className="block truncate">{workspace.name}</span>
-                                {workspace.serverId ? (
+                                {isRemoteWorkspace ? (
                                   <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
                                     {workspace.displayPath}
                                   </span>
@@ -10407,41 +10409,40 @@ export function App() {
                                 name: workspace.name,
                               })}
                               className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
-                              disabled={workspace.serverId !== null && !workspaceConnectionLooksReady(workspace.connectionStatus)}
+                              disabled={isRemoteWorkspace && !isRemoteReady}
                               onClick={() => {
-                                if (workspace.serverId && !workspaceConnectionLooksReady(workspace.connectionStatus)) {
+                                if (isRemoteWorkspace && !isRemoteReady) {
                                   setError(t("Remote workspace is offline. Retry the connection before opening remote operations."));
                                   return;
                                 }
                                 startNewWorkspaceChat(workspace.id);
                               }}
-                              title={workspace.serverId && !workspaceConnectionLooksReady(workspace.connectionStatus) ? t("Remote workspace is offline") : t("New chat")}
+                              title={isRemoteWorkspace && !isRemoteReady ? t("Remote workspace is offline") : t("New chat")}
                               type="button"
                             >
                               <Plus aria-hidden="true" className="size-4" />
                             </button>
                           </div>
-                          {workspace.serverId ? (
+                          {isRemoteWorkspace && !isRemoteReady ? (
                             <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-stone-500">
-                              <span className="min-w-0 flex-1 truncate">
-                                {workspaceConnectionLabel(workspace.connectionStatus, t)}
-                                {workspace.lastRemoteError ? `: ${workspace.lastRemoteError}` : ""}
-                              </span>
-                              {!workspaceConnectionLooksReady(workspace.connectionStatus) ? (
-                                <button
-                                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-stone-200 bg-white px-2 font-semibold text-teal-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400"
-                                  disabled={retryingRemoteWorkspaceId === workspace.id}
-                                  onClick={() => void retryRemoteWorkspace(workspace)}
-                                  type="button"
-                                >
-                                  {retryingRemoteWorkspaceId === workspace.id ? (
-                                    <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
-                                  ) : (
-                                    <RefreshCw aria-hidden="true" className="size-3" />
-                                  )}
-                                  {t("Retry")}
-                                </button>
+                              {workspace.lastRemoteError ? (
+                                <span className="min-w-0 flex-1 truncate">
+                                  {workspace.lastRemoteError}
+                                </span>
                               ) : null}
+                              <button
+                                className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-stone-200 bg-white px-2 font-semibold text-teal-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                disabled={retryingRemoteWorkspaceId === workspace.id}
+                                onClick={() => void retryRemoteWorkspace(workspace)}
+                                type="button"
+                              >
+                                {retryingRemoteWorkspaceId === workspace.id ? (
+                                  <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                                ) : (
+                                  <RefreshCw aria-hidden="true" className="size-3" />
+                                )}
+                                {t("Retry")}
+                              </button>
                             </div>
                           ) : null}
                           {isExpanded ? (
@@ -12082,23 +12083,6 @@ function ApiOverviewPanel({
 function workspaceConnectionLooksReady(status: string) {
   const normalized = status.toLowerCase();
   return normalized === "connected" || normalized === "ready" || normalized === "degraded";
-}
-
-function workspaceConnectionLabel(status: string, t: Translate) {
-  const normalized = status.toLowerCase();
-  if (normalized === "connected" || normalized === "ready") {
-    return t("Connected");
-  }
-  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
-    return t("Checking");
-  }
-  if (normalized === "failed" || normalized === "failedauth") {
-    return t("Failed");
-  }
-  if (normalized === "offline" || normalized === "disconnected") {
-    return t("Offline");
-  }
-  return status;
 }
 
 function workspaceConnectionDotClass(status: string) {
