@@ -87,8 +87,9 @@ use crate::memory_runtime::{
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
-    compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
-    context_token_breakdown, context_usage_segments, context_usage_segments_total,
+    LlmContextCompressionMode, compress_all_runtime_tool_state,
+    compress_runtime_tool_state_if_needed, context_message_groups, context_token_breakdown,
+    context_usage_segments, context_usage_segments_total, llm_context_compression_group_indices,
 };
 use crate::runtime::{
     QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
@@ -4007,6 +4008,61 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
     assert!(error.message().contains("API key"));
     assert!(context.compression_snapshots.is_empty());
 
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-required-overflow-llm-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::System, "stable ".repeat(80)),
+        neutral_text_message(NeutralChatRole::User, "snapshot a ".repeat(120)),
+        neutral_text_message(NeutralChatRole::User, "snapshot b ".repeat(120)),
+        neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+    ];
+    let sequences = vec![None, None, None, None, Some(9)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StableInjection,
+        PromptContextSource::RuntimeToolStateSnapshot,
+        PromptContextSource::RuntimeToolStateSnapshot,
+        PromptContextSource::CurrentUser { sequence: 9 },
+    ];
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 8);
+    context.provider_config.api_key = None;
+    context.context_budget.context_window = 10_000;
+    context.active_tool_start_index = context.provider_request.messages.len() - 1;
+    context.runtime_tool_state_compression_count =
+        CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS;
+
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )
+    .expect("context groups");
+    assert!(context_token_breakdown(&message_groups).required_tokens > 8);
+    assert!(
+        llm_context_compression_group_indices(&message_groups, LlmContextCompressionMode::Normal)
+            .is_empty()
+    );
+    assert_eq!(
+        llm_context_compression_group_indices(
+            &message_groups,
+            LlmContextCompressionMode::RequiredOverflow
+        ),
+        vec![2, 3]
+    );
+
+    let error = ensure_context_compression(&mut context)
+        .await
+        .expect_err("required overflow should try the LLM fallback");
+
+    assert!(error.message().contains("API key"));
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 

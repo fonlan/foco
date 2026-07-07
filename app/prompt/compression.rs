@@ -108,7 +108,7 @@ pub(crate) async fn ensure_context_compression(
     let mut runtime_tool_state_compressed = compress_runtime_tool_state_if_needed(context, false)?;
     let mut events = Vec::new();
 
-    let message_groups = context_message_groups(
+    let mut message_groups = context_message_groups(
         &context.provider_request.messages,
         &context.message_source_sequences,
         &context.message_context_sources,
@@ -118,7 +118,13 @@ pub(crate) async fn ensure_context_compression(
     let total_used_context_tokens = context_usage_segments_total(&segments);
     if total_used_context_tokens
         >= llm_context_compression_trigger_tokens(context.context_budget.context_window)
-        && ensure_llm_context_compression(context, &message_groups, &mut events).await?
+        && ensure_llm_context_compression(
+            context,
+            &message_groups,
+            &mut events,
+            LlmContextCompressionMode::Normal,
+        )
+        .await?
     {
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
@@ -127,10 +133,32 @@ pub(crate) async fn ensure_context_compression(
         });
     }
 
-    if !runtime_tool_state_compressed {
-        let breakdown = context_token_breakdown(&message_groups);
-        if breakdown.required_tokens > context.context_budget.available_message_tokens {
+    let mut breakdown = context_token_breakdown(&message_groups);
+    if breakdown.required_tokens > context.context_budget.available_message_tokens {
+        if !runtime_tool_state_compressed {
             runtime_tool_state_compressed |= compress_runtime_tool_state_if_needed(context, true)?;
+        }
+        message_groups = context_message_groups(
+            &context.provider_request.messages,
+            &context.message_source_sequences,
+            &context.message_context_sources,
+            context.active_tool_start_index,
+        )?;
+        breakdown = context_token_breakdown(&message_groups);
+        if breakdown.required_tokens > context.context_budget.available_message_tokens
+            && ensure_llm_context_compression(
+                context,
+                &message_groups,
+                &mut events,
+                LlmContextCompressionMode::RequiredOverflow,
+            )
+            .await?
+        {
+            return Ok(ContextCompressionResult {
+                active_tool_start_index: context.active_tool_start_index,
+                runtime_tool_state_compressed,
+                events,
+            });
         }
     }
 
@@ -164,12 +192,19 @@ fn context_compression_event_detail(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LlmContextCompressionMode {
+    Normal,
+    RequiredOverflow,
+}
+
 async fn ensure_llm_context_compression(
     context: &mut PreparedChatContext,
     message_groups: &[ContextMessageGroup],
     events: &mut Vec<ContextCompressionEventDetail>,
+    mode: LlmContextCompressionMode,
 ) -> Result<bool, ApiError> {
-    let covered_group_indices = llm_context_compression_group_indices(message_groups);
+    let covered_group_indices = llm_context_compression_group_indices(message_groups, mode);
     if covered_group_indices.is_empty() {
         return Ok(false);
     }
@@ -323,13 +358,15 @@ async fn ensure_llm_context_compression(
     Ok(true)
 }
 
-fn llm_context_compression_group_indices(groups: &[ContextMessageGroup]) -> Vec<usize> {
+pub(crate) fn llm_context_compression_group_indices(
+    groups: &[ContextMessageGroup],
+    mode: LlmContextCompressionMode,
+) -> Vec<usize> {
     let compressible_indices = groups
         .iter()
         .enumerate()
         .filter(|(_, group)| {
-            !group.must_keep
-                && group.estimated_tokens > 0
+            group.estimated_tokens > 0
                 && matches!(
                     group.source_bucket,
                     PromptContextSourceBucket::CompressionSnapshot
@@ -337,14 +374,25 @@ fn llm_context_compression_group_indices(groups: &[ContextMessageGroup]) -> Vec<
                         | PromptContextSourceBucket::TurnMemory
                         | PromptContextSourceBucket::RuntimeToolStateSnapshot
                 )
+                && (!group.must_keep
+                    || (matches!(mode, LlmContextCompressionMode::RequiredOverflow)
+                        && group.source_bucket
+                            == PromptContextSourceBucket::RuntimeToolStateSnapshot))
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if compressible_indices.len() <= CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES {
+    if matches!(mode, LlmContextCompressionMode::Normal)
+        && compressible_indices.len() <= CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES
+    {
         return Vec::new();
     }
 
-    let covered_count = compressible_indices.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES;
+    let covered_count = match mode {
+        LlmContextCompressionMode::Normal => {
+            compressible_indices.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES
+        }
+        LlmContextCompressionMode::RequiredOverflow => compressible_indices.len(),
+    };
     compressible_indices
         .into_iter()
         .take(covered_count)
@@ -1810,6 +1858,7 @@ pub(crate) fn prompt_context_source_is_required(source: &PromptContextSource) ->
             | PromptContextSource::AgentPrivateContext
             | PromptContextSource::TurnMemory { .. }
             | PromptContextSource::RuntimeToolState { .. }
+            | PromptContextSource::RuntimeToolStateSnapshot
     )
 }
 
