@@ -2901,6 +2901,105 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps a memory-updated streaming placeholder through message reloads", async () => {
+    let exposeReloadQuestion = false;
+    let refreshedMessages = 0;
+    const pendingQuestion = {
+      chatId: "chat-1",
+      id: "reload-running-chat-question",
+      questions: [
+        {
+          allowFreeText: true,
+          id: "reload-running-chat-question-item",
+          options: [],
+          question: "Keep going?",
+        },
+      ],
+      toolCallId: "ask-question-call",
+      workspaceId: "workspace-1",
+    };
+    const resolvedMemory = {
+      chatId: null,
+      fact: "Matched memory survives reload.",
+      id: "stream-memory-resolved-1",
+      kind: "project_fact",
+      pinned: false,
+      scope: "workspace",
+      source: "direct",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/chat/questions/pending") {
+        return jsonResponse({ questions: exposeReloadQuestion ? [pendingQuestion] : [] });
+      }
+
+      if (
+        exposeReloadQuestion &&
+        path === "/api/workspaces/workspace-1/chats/chat-1/messages"
+      ) {
+        refreshedMessages += 1;
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: {
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+          messages: [
+            {
+              ...chatMessages.messages[0],
+              content: "use memory",
+              id: "message-user-stream",
+              parts: [{ text: "use memory", type: "text" }],
+            },
+          ],
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "use memory",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(document.querySelector(".message-waiting-spinner")).not.toBeNull(),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        memoriesUsed: [resolvedMemory],
+        type: "memoryResolved",
+      });
+    });
+
+    exposeReloadQuestion = true;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(refreshedMessages).toBeGreaterThan(0));
+    expect(document.querySelector(".message-waiting-spinner")).not.toBeNull();
+    expect(screen.getAllByText("Memories used").length).toBeGreaterThan(0);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("shows saved memories from the current chat stream", async () => {
     renderApp();
 

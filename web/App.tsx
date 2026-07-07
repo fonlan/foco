@@ -381,6 +381,51 @@ export function trimInactiveChatMessageCaches(
   return { messagesByKey: changed ? next : current, trimmedChatKeys };
 }
 
+export function mergeLoadedMessagesWithStreamingPlaceholders(
+  loadedMessages: ShellMessage[],
+  cachedMessages: ShellMessage[],
+  activeRun: ActiveChatRunSummary | null,
+): ShellMessage[] {
+  if (!activeRun || !cachedMessages.length) {
+    return loadedMessages;
+  }
+
+  const loadedIds = new Set(loadedMessages.map((message) => message.id));
+  const placeholders = cachedMessages
+    .map((message, index) => ({ index, message }))
+    .filter(
+      ({ message }) =>
+        message.role === "assistant" &&
+        message.status === "streaming" &&
+        !loadedIds.has(message.id),
+    );
+  if (!placeholders.length) {
+    return loadedMessages;
+  }
+
+  const nextMessages = [...loadedMessages];
+  for (const { index, message } of placeholders) {
+    let anchor: ShellMessage | undefined;
+    for (let anchorIndex = index - 1; anchorIndex >= 0; anchorIndex -= 1) {
+      const candidate = cachedMessages[anchorIndex];
+      if (candidate && nextMessages.some((message) => message.id === candidate.id)) {
+        anchor = candidate;
+        break;
+      }
+    }
+    const anchorIndex = anchor
+      ? nextMessages.findIndex((candidate) => candidate.id === anchor.id)
+      : -1;
+    const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : nextMessages.length;
+    // ponytail: only preserves the live assistant bubble; if we later need
+    // multi-placeholder replay ordering, use backend sequence numbers here.
+    nextMessages.splice(insertIndex, 0, message);
+    loadedIds.add(message.id);
+  }
+
+  return nextMessages;
+}
+
 export function preserveCachedReasoningDurations(
   messages: ShellMessage[],
   cachedMessages: ShellMessage[],
@@ -4971,11 +5016,17 @@ export function App() {
         { signal: controller.signal },
       );
       const normalizedMessages = data.messages.map(normalizeChatMessageSummary);
-      const nextMessages = preserveCachedReasoningDurations(
-        normalizedMessages,
-        chatMessagesByKeyRef.current[chatKey] ?? [],
-      );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
+      const mergedMessages = mergeLoadedMessagesWithStreamingPlaceholders(
+        normalizedMessages,
+        cachedMessages,
+        activeRun,
+      );
+      const nextMessages = preserveCachedReasoningDurations(
+        mergedMessages,
+        cachedMessages,
+      );
       const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
       const pagination = normalizeChatMessagesPagination(data.pagination);
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);

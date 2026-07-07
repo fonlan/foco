@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ActiveRunInfo, ShellMessage } from "./api/types";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, mergeLoadedMessagesWithStreamingPlaceholders, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import type { ActiveChatRunSummary, ActiveRunInfo, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
   return {
@@ -105,6 +105,58 @@ describe("trimInactiveChatMessageCaches", () => {
     expect(result.messagesByKey["chat-3"]).toBe(messagesByKey["chat-3"]);
     expect(result.messagesByKey["chat-5"]).toBe(messagesByKey["chat-5"]);
     expect(result.messagesByKey["chat-6"]).toBe(messagesByKey["chat-6"]);
+  });
+});
+
+describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
+  const activeRun: ActiveChatRunSummary = {
+    acceptingGuidance: false,
+    chatId: "chat-1",
+    lastSequence: 0,
+    runId: "run-1",
+    workspaceId: "workspace-1",
+  };
+
+  it("keeps a cached streaming assistant placeholder after its loaded user message", () => {
+    const loadedUser = { ...message("user-1"), role: "user" as const };
+    const placeholder = { ...message("assistant-stream"), status: "streaming" as const };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedUser],
+      [loadedUser, placeholder],
+      activeRun,
+    );
+
+    expect(result.map((item) => item.id)).toEqual(["user-1", "assistant-stream"]);
+    expect(result[1]).toBe(placeholder);
+  });
+
+  it("lets a loaded assistant with the same id replace the cached placeholder", () => {
+    const loadedUser = { ...message("user-1"), role: "user" as const };
+    const loadedAssistant = { ...message("assistant-stream"), content: "Done" };
+    const placeholder = { ...message("assistant-stream"), status: "streaming" as const };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedUser, loadedAssistant],
+      [loadedUser, placeholder],
+      activeRun,
+    );
+
+    expect(result).toEqual([loadedUser, loadedAssistant]);
+    expect(result[1].status).toBeUndefined();
+  });
+
+  it("drops cached streaming placeholders when there is no active run", () => {
+    const loadedUser = { ...message("user-1"), role: "user" as const };
+    const placeholder = { ...message("assistant-stream"), status: "streaming" as const };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedUser],
+      [loadedUser, placeholder],
+      null,
+    );
+
+    expect(result).toEqual([loadedUser]);
   });
 });
 
