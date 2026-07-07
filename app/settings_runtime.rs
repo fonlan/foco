@@ -223,6 +223,10 @@ pub(crate) async fn settings_response(
             .collect(),
         thinking_levels: vec![
             ThinkingLevelSummary {
+                value: "none",
+                label: "None",
+            },
+            ThinkingLevelSummary {
                 value: "minimal",
                 label: "Minimal",
             },

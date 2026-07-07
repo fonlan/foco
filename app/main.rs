@@ -790,7 +790,7 @@ async fn run_server_until_shutdown(
     let provider_model_sync_task = spawn_provider_model_sync_scheduler(state.clone());
     let update_check_scheduler_task =
         crate::update_runtime::spawn_update_check_scheduler(state.clone());
-    let model_metadata_cache_task = spawn_model_metadata_cache_warmup(state.clone());
+    let model_metadata_cache_task = spawn_model_metadata_cache_refresh(state.clone());
     agent_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -883,12 +883,12 @@ fn initialize_workspace_databases_for_startup(
     Ok(count)
 }
 
-fn spawn_model_metadata_cache_warmup(state: AppState) -> tokio::task::JoinHandle<()> {
+fn spawn_model_metadata_cache_refresh(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match crate::http::settings::warm_model_metadata_cache_once(&state).await {
-            Ok(()) => tracing::info!("model metadata cache warmup completed"),
+            Ok(()) => tracing::info!("model metadata cache startup refresh completed"),
             Err(error) => {
-                tracing::warn!(error = %error.message, "model metadata cache warmup failed")
+                tracing::warn!(error = %error.message, "model metadata cache startup refresh failed")
             }
         }
     })

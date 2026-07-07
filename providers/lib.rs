@@ -2367,6 +2367,30 @@ mod tests {
     }
 
     #[test]
+    fn accepts_none_thinking_level() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: Some("none".to_string()),
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+
+        genai_chat_options(&config, &request).expect("none thinking level should parse");
+    }
+
+    #[test]
     fn uses_temperature_one_and_omits_top_p_for_claude_models() {
         let request = NeutralChatRequest {
             model_id: "anthropic/claude-sonnet-4".to_string(),

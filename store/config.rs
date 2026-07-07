@@ -57,7 +57,8 @@ pub const SUPPORTED_PLAN_MERGE_AUTOMATION_MODES: &[&str] = &[
     PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
     PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
 ];
-pub const SUPPORTED_AGENT_THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+pub const SUPPORTED_AGENT_THINKING_LEVELS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh"];
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[

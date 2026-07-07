@@ -18210,7 +18210,56 @@ fn init_plan_merge_git_workspace(workspace_path: &Path) {
 }
 
 #[tokio::test]
-async fn warm_model_metadata_cache_skips_existing_readable_cache() {
+async fn warm_model_metadata_cache_refreshes_existing_readable_cache() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    fs::create_dir_all(state.model_metadata_file.parent().expect("cache parent"))
+        .expect("cache dir");
+    let existing = foco_store::model_metadata::ModelMetadataCache {
+        source_url: "cached".to_string(),
+        fetched_at: "2026-07-02T00:00:00Z".to_string(),
+        models: Vec::new(),
+    };
+    foco_store::model_metadata::write_model_metadata_cache(&state.model_metadata_file, &existing)
+        .expect("write cache");
+    let (source_url, server_task) = serve_models_dev_fixture(
+        r#"{
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "models": {
+      "gpt-refresh": {
+        "id": "gpt-refresh",
+        "name": "GPT Refresh",
+        "reasoning_options": [
+          { "type": "effort", "values": ["none", "low"] }
+        ]
+      }
+    }
+  }
+}"#,
+    )
+    .await;
+
+    crate::http::settings::warm_model_metadata_cache_once_from_url(&state, &source_url)
+        .await
+        .expect("warmup should refresh cache");
+    server_task.abort();
+
+    let cache = foco_store::model_metadata::read_model_metadata_cache(&state.model_metadata_file)
+        .expect("read cache")
+        .expect("cache exists");
+    assert_eq!(cache.source_url, source_url);
+    assert_eq!(cache.models[0].key, "openai/gpt-refresh");
+    assert_eq!(cache.models[0].supported_thinking_levels, ["none", "low"]);
+}
+
+#[tokio::test]
+async fn warm_model_metadata_cache_failure_keeps_existing_cache() {
     let profile = tempfile::tempdir().expect("profile");
     let workspace = tempfile::tempdir().expect("workspace");
     let state = test_app_state(
@@ -18227,10 +18276,13 @@ async fn warm_model_metadata_cache_skips_existing_readable_cache() {
     foco_store::model_metadata::write_model_metadata_cache(&state.model_metadata_file, &existing)
         .expect("write cache");
 
-    crate::http::settings::warm_model_metadata_cache_once_from_url(&state, "http://127.0.0.1:9/")
-        .await
-        .expect("warmup should skip fetch");
+    let result = crate::http::settings::warm_model_metadata_cache_once_from_url(
+        &state,
+        "http://127.0.0.1:9/",
+    )
+    .await;
 
+    assert!(result.is_err());
     let cache = foco_store::model_metadata::read_model_metadata_cache(&state.model_metadata_file)
         .expect("read cache")
         .expect("cache exists");

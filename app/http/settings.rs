@@ -2198,14 +2198,6 @@ pub(crate) async fn warm_model_metadata_cache_once_from_url(
     state: &AppState,
     source_url: &str,
 ) -> Result<(), ApiError> {
-    match read_model_metadata_cache(&state.model_metadata_file) {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(error = %error, "model metadata cache is unreadable; refreshing");
-        }
-    }
-
     fetch_and_write_model_metadata_cache_from_url(state, source_url)
         .await
         .map(|_| ())

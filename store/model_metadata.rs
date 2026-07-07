@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::SUPPORTED_AGENT_THINKING_LEVELS;
 
@@ -265,12 +265,13 @@ fn required_source_id(
 fn supported_thinking_levels(reasoning_options: &[RawReasoningOption]) -> Vec<String> {
     reasoning_options
         .iter()
-        .filter(|option| option.option_type == "effort")
-        .flat_map(|option| option.values.iter())
-        .filter(|level| SUPPORTED_AGENT_THINKING_LEVELS.contains(&level.as_str()))
+        .filter(|option| option.option_type.as_deref() == Some("effort"))
+        .flat_map(|option| option.values.iter().filter_map(Option::as_ref))
+        .map(|level| level.trim())
+        .filter(|level| SUPPORTED_AGENT_THINKING_LEVELS.contains(&level))
         .fold(Vec::new(), |mut levels, level| {
-            if !levels.contains(level) {
-                levels.push(level.clone());
+            if !levels.iter().any(|existing| existing == level) {
+                levels.push(level.to_string());
             }
             levels
         })
@@ -299,10 +300,31 @@ struct RawModel {
 
 #[derive(Deserialize)]
 struct RawReasoningOption {
-    #[serde(default, rename = "type")]
-    option_type: String,
-    #[serde(default)]
-    values: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_trimmed_string",
+        rename = "type"
+    )]
+    option_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
+    values: Vec<Option<String>>,
+}
+
+fn deserialize_optional_trimmed_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn deserialize_optional_string_vec<'de, D>(deserializer: D) -> Result<Vec<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Option::<Vec<Option<String>>>::deserialize(deserializer)?;
+    Ok(values.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -345,7 +367,7 @@ mod tests {
         "name": "GPT Test",
         "reasoning": true,
         "reasoning_options": [
-          { "type": "effort", "values": ["minimal", "low", "default", "max", "medium", "minimal"] },
+          { "type": "effort", "values": ["none", "minimal", "low", "default", "max", "medium", "minimal"] },
           { "type": "budget_tokens" },
           { "type": "toggle", "values": ["high"] }
         ],
@@ -375,12 +397,44 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(
             model.supported_thinking_levels,
-            ["minimal", "low", "medium"]
+            ["none", "minimal", "low", "medium"]
         );
         assert_eq!(model.input_modalities, ["text", "image"]);
         assert_eq!(model.output_modalities, ["text"]);
         assert_eq!(model.source_url, MODELS_DEV_API_URL);
         assert_eq!(model.refreshed_at, "2026-06-03T10:00:00Z");
+    }
+
+    #[test]
+    fn derives_gpt55_thinking_levels_and_ignores_nulls() {
+        let cache = parse_models_dev_metadata(
+            r#"{
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "models": {
+      "gpt-5.5": {
+        "id": "gpt-5.5",
+        "name": "GPT 5.5",
+        "reasoning_options": [
+          { "type": null, "values": ["high"] },
+          { "type": "effort", "values": null },
+          { "type": "effort", "values": [null, "", "none", "low", "medium", "high", "xhigh", "max"] },
+          { "type": "toggle", "values": ["minimal"] }
+        ]
+      }
+    }
+  }
+}"#,
+            MODELS_DEV_API_URL,
+            "2026-07-07T10:00:00Z",
+        )
+        .expect("metadata should parse");
+
+        assert_eq!(
+            cache.models[0].supported_thinking_levels,
+            ["none", "low", "medium", "high", "xhigh"]
+        );
     }
 
     #[test]
