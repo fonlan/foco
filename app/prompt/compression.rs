@@ -2087,7 +2087,6 @@ pub(crate) fn context_usage_segments_total(segments: &ContextUsageSegments) -> u
         .saturating_add(segments.tool_schema)
         .saturating_add(segments.compression_snapshot)
         .saturating_add(segments.history)
-        .saturating_add(segments.reserved_output)
 }
 
 pub(crate) fn context_window_compression_trigger_tokens(context_window: u64) -> u64 {

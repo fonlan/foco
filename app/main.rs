@@ -8139,6 +8139,7 @@ fn context_usage_timeline_entry(
             .transpose()
             .map_err(|source| ApiError::internal(source.to_string()))?
             .unwrap_or_default();
+        let total_used_tokens = context_usage_segments_total(&segments);
         return Ok(ContextUsageTimelineEntry {
             snapshot_id: snapshot.id.clone(),
             sequence: snapshot.sequence,
@@ -8169,10 +8170,7 @@ fn context_usage_timeline_entry(
                         })
                         .unwrap_or(0)
                 }),
-            total_used_tokens: usage
-                .get("totalUsedTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| context_usage_segments_total(&segments)),
+            total_used_tokens,
             segments,
         });
     }
@@ -8197,7 +8195,7 @@ fn context_usage_timeline_entry(
     let segments = ContextUsageSegments {
         compression_snapshot: u64::try_from(snapshot.summary_token_count.max(0)).unwrap_or(0),
         history,
-        reserved_output: max_output_tokens,
+        reserved_output: 0,
         ..ContextUsageSegments::default()
     };
 

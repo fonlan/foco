@@ -2666,7 +2666,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     const contextTimeline = screen.getByLabelText("Context usage timeline");
-    expect(within(contextTimeline).getByText("53%")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("38%")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Snapshot 1")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Snapshot 2")).toBeInTheDocument();
     expect(within(contextTimeline).getByText("Past 80%")).toBeInTheDocument();
@@ -2676,11 +2676,11 @@ describe("app-panels-stats verification surfaces", () => {
     expect(within(contextLegend).getByText("Prompt/tools")).toBeInTheDocument();
     expect(within(contextLegend).getByText("History")).toBeInTheDocument();
     expect(within(contextLegend).getByText("Compression snapshot")).toBeInTheDocument();
-    expect(within(contextLegend).getByText("Reserved output")).toBeInTheDocument();
+    expect(within(contextLegend).queryByText("Reserved output")).not.toBeInTheDocument();
     expect(within(contextTimeline).getAllByLabelText(/Prompt\/tools:/)).not.toHaveLength(0);
     expect(within(contextTimeline).getAllByLabelText(/History:/)).not.toHaveLength(0);
     expect(within(contextTimeline).getAllByLabelText(/Compression snapshot:/)).not.toHaveLength(0);
-    expect(within(contextTimeline).getAllByLabelText(/Reserved output:/)).not.toHaveLength(0);
+    expect(within(contextTimeline).queryByLabelText(/Reserved output:/)).not.toBeInTheDocument();
     expect(
       contextTimeline.querySelectorAll(".context-usage-history-stack .context-usage-bar-row"),
     ).toHaveLength(2);

@@ -2447,7 +2447,6 @@ const CONTEXT_USAGE_SEGMENT_STYLES = [
   { key: "promptTools", label: "Prompt/tools", color: "#2563eb" },
   { key: "history", label: "History", color: "#16a34a" },
   { key: "compressionSnapshot", label: "Compression snapshot", color: "#7c3aed" },
-  { key: "reservedOutput", label: "Reserved output", color: "#f97316" },
 ] as const;
 
 function ContextUsageBar({
@@ -2468,7 +2467,6 @@ function ContextUsageBar({
     promptTools: entry.segments.systemPrompt + entry.segments.toolSchema,
     history: entry.segments.history,
     compressionSnapshot: entry.segments.compressionSnapshot,
-    reservedOutput: entry.segments.reservedOutput,
   };
   const segmentParts = CONTEXT_USAGE_SEGMENT_STYLES.flatMap((segment) => {
     const tokens = rawSegments[segment.key];

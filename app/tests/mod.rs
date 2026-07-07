@@ -16349,13 +16349,13 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
     assert_eq!(entry.context_window, 20_000);
     assert_eq!(entry.max_output_tokens, 1_000);
     assert_eq!(entry.trigger_tokens, 16_000);
-    assert_eq!(entry.total_used_tokens, 1_345);
+    assert_eq!(entry.total_used_tokens, 345);
     assert_eq!(entry.segments.reserved_output, 1_000);
     assert_eq!(entry.segments.compression_snapshot, 40);
 
     let second = &stats.context_usage_timeline[1];
     assert_eq!(second.snapshot_id, "ctx-timeline-2");
-    assert_eq!(second.total_used_tokens, 1_475);
+    assert_eq!(second.total_used_tokens, 475);
 
     let legacy = &stats.context_usage_timeline[2];
     assert_eq!(legacy.snapshot_id, "ctx-timeline-legacy");
