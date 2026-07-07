@@ -18082,7 +18082,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
 
 fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let (terminal_shutdown_tx, _) = broadcast::channel(1);
-    let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+    let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
     let foco_root_dir = user_profile_dir.join(".foco");
     let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
@@ -18098,11 +18098,14 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         model_metadata_file: foco_root_dir.join("models.dev.json"),
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 3210)),
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
+        update_install_lock: Arc::new(AsyncMutex::new(())),
+        update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(detect_ripgrep(&foco_root_dir))),
         native_browser_authorizations: NativeBrowserAuthorizations::default(),
         user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx,
+        app_shutdown_tx,
         app_shutdown_rx,
         hook_runtime: HookRuntime::new(mcp_registry.clone()),
         mcp_registry,

@@ -13,4 +13,5 @@ pub mod settings;
 pub mod skill_store;
 pub mod spec;
 pub mod terminal;
+pub mod update;
 pub mod workspaces;

@@ -171,6 +171,7 @@ mod settings_runtime;
 mod skills;
 mod spec_runtime;
 mod terminal;
+mod update_runtime;
 #[cfg(test)]
 use foco_store::config::{SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE};
 pub(crate) use hooks_support::{
@@ -362,11 +363,14 @@ pub(crate) struct AppState {
     model_metadata_file: PathBuf,
     listen_addr: SocketAddr,
     ripgrep_install_lock: Arc<AsyncMutex<()>>,
+    update_install_lock: Arc<AsyncMutex<()>>,
+    update_state: Arc<Mutex<crate::update_runtime::UpdateState>>,
     ripgrep_status: Arc<Mutex<RipgrepStatus>>,
     native_browser_authorizations: NativeBrowserAuthorizations,
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
+    app_shutdown_tx: watch::Sender<bool>,
     app_shutdown_rx: watch::Receiver<bool>,
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
@@ -627,7 +631,7 @@ fn memory_dream_latest_usage() -> String {
 }
 
 async fn run_server_until_shutdown(
-    shutdown_rx: Option<watch::Receiver<bool>>,
+    shutdown_channel: Option<(watch::Sender<bool>, watch::Receiver<bool>)>,
     open_browser_on_startup: bool,
     #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
     active_chat_runs: ActiveChatRunRegistry,
@@ -727,11 +731,11 @@ async fn run_server_until_shutdown(
     let code_graph_indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let (owned_shutdown_tx, owned_shutdown_rx);
-    let (shutdown_tx, app_shutdown_rx) = match shutdown_rx {
-        Some(shutdown_rx) => (None, shutdown_rx),
+    let (shutdown_tx, app_shutdown_rx) = match shutdown_channel {
+        Some((shutdown_tx, shutdown_rx)) => (shutdown_tx, shutdown_rx),
         None => {
             (owned_shutdown_tx, owned_shutdown_rx) = watch::channel(false);
-            (Some(owned_shutdown_tx), owned_shutdown_rx)
+            (owned_shutdown_tx, owned_shutdown_rx)
         }
     };
     let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
@@ -746,11 +750,14 @@ async fn run_server_until_shutdown(
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
         listen_addr: addr,
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
+        update_install_lock: Arc::new(AsyncMutex::new(())),
+        update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
         native_browser_authorizations: NativeBrowserAuthorizations::default(),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
+        app_shutdown_tx: shutdown_tx.clone(),
         app_shutdown_rx: app_shutdown_rx.clone(),
         mcp_registry: mcp_registry.clone(),
         hook_runtime,
@@ -778,6 +785,8 @@ async fn run_server_until_shutdown(
         Duration::from_secs(API_AUDIT_CLEANUP_STARTUP_DELAY_SECS),
     );
     let provider_model_sync_task = spawn_provider_model_sync_scheduler(state.clone());
+    let update_check_scheduler_task =
+        crate::update_runtime::spawn_update_check_scheduler(state.clone());
     let model_metadata_cache_task = spawn_model_metadata_cache_warmup(state.clone());
     agent_scheduler
         .wake()
@@ -816,7 +825,7 @@ async fn run_server_until_shutdown(
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal(
-        shutdown_tx,
+        Some(shutdown_tx),
         app_shutdown_rx,
         terminal_shutdown_tx,
         mcp_registry,
@@ -829,6 +838,7 @@ async fn run_server_until_shutdown(
         memory_dream_scheduler_task.abort();
         api_audit_cleanup_task.abort();
         provider_model_sync_task.abort();
+        update_check_scheduler_task.abort();
     }
     model_metadata_cache_task.abort();
     let _ = agent_scheduler_task.await;
@@ -837,6 +847,7 @@ async fn run_server_until_shutdown(
     let _ = memory_dream_scheduler_task.await;
     let _ = api_audit_cleanup_task.await;
     let _ = provider_model_sync_task.await;
+    let _ = update_check_scheduler_task.await;
     let _ = model_metadata_cache_task.await;
     server_result?;
 

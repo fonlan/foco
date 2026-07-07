@@ -81,6 +81,7 @@ pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
         thread_id: tray_menu_thread_id.clone(),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime_shutdown_tx = shutdown_tx.clone();
     let active_chat_runs = ActiveChatRunRegistry::default();
     let runtime_active_chat_runs = active_chat_runs.clone();
     let runtime_thread = std::thread::Builder::new()
@@ -91,7 +92,7 @@ pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
                 .build()
                 .expect("failed to build Foco HTTP runtime");
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
-                Some(shutdown_rx),
+                Some((runtime_shutdown_tx, shutdown_rx)),
                 !started_from_auto_start,
                 tray_menu_update_notifier,
                 runtime_active_chat_runs,

@@ -339,6 +339,7 @@ impl GlobalConfig {
                 theme: DEFAULT_APP_THEME.to_string(),
                 llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
                 auto_start_enabled: false,
+                auto_update_check_enabled: false,
                 default_team_mode_enabled: true,
                 api_audit: ApiAuditSettings::default(),
                 web_server: WebServerSettings::default(),
@@ -722,6 +723,8 @@ pub struct AppSettings {
     pub llm_request_retry_count: u32,
     #[serde(default)]
     pub auto_start_enabled: bool,
+    #[serde(default)]
+    pub auto_update_check_enabled: bool,
     #[serde(default = "default_true")]
     pub default_team_mode_enabled: bool,
     #[serde(default)]
@@ -3038,6 +3041,7 @@ mod tests {
         );
         assert_eq!(loaded.config.app.language, DEFAULT_APP_LANGUAGE);
         assert_eq!(loaded.config.app.theme, DEFAULT_APP_THEME);
+        assert!(!loaded.config.app.auto_update_check_enabled);
         assert_eq!(loaded.config.app.web_server, WebServerSettings::default());
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
@@ -4112,6 +4116,30 @@ mod tests {
         let loaded = load_global_config(&paths.config_file).expect("old config should load");
 
         assert_eq!(loaded.plan, PlanSettings::default());
+    }
+
+    #[test]
+    fn auto_update_check_defaults_are_loaded_for_old_configs() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        let config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        let mut json = serde_json::to_value(&config).expect("config json");
+        json.get_mut("app")
+            .and_then(Value::as_object_mut)
+            .expect("app object")
+            .remove("auto_update_check_enabled");
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&json).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("old config should load");
+
+        assert!(!loaded.app.auto_update_check_enabled);
     }
 
     #[test]

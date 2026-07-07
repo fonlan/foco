@@ -10,6 +10,7 @@ import {
   CircleAlert,
   Code2,
   Database,
+  Download,
   Eye,
   EyeOff,
   FileText,
@@ -132,6 +133,7 @@ import type {
   SystemPromptSummary,
   TerminalShellSummary,
   Translate,
+  UpdateStatusSummary,
   WebSearchFormState,
   WorkspaceCommonCommandSummary,
   WorkspaceFormState,
@@ -166,6 +168,11 @@ type ProviderModelListState = {
   message: string | null;
   models: string[];
   status: "error" | "loading" | "ok";
+};
+
+type UpdateConfirmState = {
+  status: UpdateStatusSummary;
+  source: "check" | "install";
 };
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
@@ -514,6 +521,10 @@ export function SettingsPanel({
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isSavingUpdateSettings, setIsSavingUpdateSettings] = useState(false);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateConfirm, setUpdateConfirm] = useState<UpdateConfirmState | null>(null);
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
@@ -1793,6 +1804,66 @@ export function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsRefreshing(false);
+    }
+  }
+
+  function applyUpdateStatus(update: UpdateStatusSummary) {
+    if (!settings) {
+      return;
+    }
+    const next = { ...settings, update };
+    setSettings(next);
+    onSettingsChange(next);
+  }
+
+  async function checkForUpdate() {
+    setIsCheckingUpdate(true);
+    setError(null);
+    try {
+      const update = await requestJson<UpdateStatusSummary>("/api/update/check", {
+        method: "POST",
+      });
+      applyUpdateStatus(update);
+      if (update.updateAvailable) {
+        setUpdateConfirm({ status: update, source: "check" });
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  }
+
+  async function saveAutoUpdateCheck(autoCheckEnabled: boolean) {
+    setIsSavingUpdateSettings(true);
+    setError(null);
+    try {
+      const update = await requestJson<UpdateStatusSummary>("/api/update/settings", {
+        body: JSON.stringify({ autoCheckEnabled }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      applyUpdateStatus(update);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingUpdateSettings(false);
+    }
+  }
+
+  async function installUpdate() {
+    setIsInstallingUpdate(true);
+    setError(null);
+    try {
+      const update = await requestJson<UpdateStatusSummary>("/api/update/install", {
+        method: "POST",
+      });
+      applyUpdateStatus(update);
+      setUpdateConfirm({ status: update, source: "install" });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsInstallingUpdate(false);
     }
   }
 
@@ -11048,49 +11119,204 @@ export function SettingsPanel({
             </section>
           ) : null}
           {activeSection === "about" ? (
-            <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-              <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-center">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-3">
-                    <div className="inline-flex size-12 shrink-0 items-center justify-center rounded-xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
-                      <Code2 aria-hidden="true" className="size-6" />
+            <>
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-start">
+                  <div className="min-w-0 space-y-4">
+                    <div className="flex items-center gap-3">
+                      <div className="inline-flex size-12 shrink-0 items-center justify-center rounded-xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
+                        <Code2 aria-hidden="true" className="size-6" />
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-xl font-semibold text-stone-950">Foco</h3>
+                        <p className="mt-1 text-sm font-medium text-stone-500">
+                          {t("Local-first AI coding workspace")}
+                        </p>
+                      </div>
                     </div>
-                    <div className="min-w-0">
-                      <h3 className="text-xl font-semibold text-stone-950">Foco</h3>
-                      <p className="mt-1 text-sm font-medium text-stone-500">
-                        {t("Local-first AI coding workspace")}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-                <dl className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <dt className="text-xs font-semibold uppercase text-stone-400">
-                      {t("Version")}
-                    </dt>
-                    <dd className="text-sm font-semibold text-stone-800">
-                      {settings?.about.version ?? ""}
-                    </dd>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <dt className="text-xs font-semibold uppercase text-stone-400">
-                      {t("GitHub repository")}
-                    </dt>
-                    <dd className="min-w-0 text-right text-sm font-semibold">
-                      <a
-                        aria-label={t("Open GitHub repository")}
-                        className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
-                        href="https://github.com/fonlan/foco"
-                        rel="noreferrer"
-                        target="_blank"
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        disabled={isCheckingUpdate}
+                        onClick={() => void checkForUpdate()}
+                        type="button"
                       >
-                        https://github.com/fonlan/foco
-                      </a>
-                    </dd>
+                        {isCheckingUpdate ? (
+                          <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                        ) : (
+                          <RefreshCw aria-hidden="true" className="size-4" />
+                        )}
+                        <span>{t("Check for updates")}</span>
+                      </button>
+                      {settings?.update.updateAvailable ? (
+                        <button
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-800 hover:border-teal-300 hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          disabled={isInstallingUpdate}
+                          onClick={() => void installUpdate()}
+                          type="button"
+                        >
+                          {isInstallingUpdate ? (
+                            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                          ) : (
+                            <Download aria-hidden="true" className="size-4" />
+                          )}
+                          <span>{isInstallingUpdate ? t("Installing update...") : t("Install update")}</span>
+                        </button>
+                      ) : null}
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-sm font-medium text-stone-700">
+                      <input
+                        checked={Boolean(settings?.update.autoCheckEnabled)}
+                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-600"
+                        disabled={isSavingUpdateSettings}
+                        onChange={(event) => void saveAutoUpdateCheck(event.target.checked)}
+                        type="checkbox"
+                      />
+                      <span>{t("Automatically check for updates")}</span>
+                    </label>
+                    {settings?.update.error ? (
+                      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                        {settings.update.error}
+                      </div>
+                    ) : null}
                   </div>
-                </dl>
-              </div>
-            </section>
+                  <dl className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                        {t("Version")}
+                      </dt>
+                      <dd className="text-sm font-semibold text-stone-800">
+                        {settings?.about.version ?? ""}
+                      </dd>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                        {t("Current version")}
+                      </dt>
+                      <dd className="text-sm font-semibold text-stone-800">
+                        {settings?.update.currentVersion ?? settings?.appVersion ?? ""}
+                      </dd>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                        {t("Latest version")}
+                      </dt>
+                      <dd className="text-sm font-semibold text-stone-800">
+                        {settings?.update.targetVersion ?? t("Up to date")}
+                      </dd>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                        {t("Last checked")}
+                      </dt>
+                      <dd className="text-right text-sm font-semibold text-stone-800">
+                        {settings?.update.lastCheckedAt
+                          ? formatAuditDate(settings.update.lastCheckedAt, language)
+                          : t("Never")}
+                      </dd>
+                    </div>
+                    {settings?.update.releaseUrl ? (
+                      <div className="flex items-center justify-between gap-3">
+                        <dt className="text-xs font-semibold uppercase text-stone-400">
+                          {t("Release")}
+                        </dt>
+                        <dd className="min-w-0 text-right text-sm font-semibold">
+                          <a
+                            className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
+                            href={settings.update.releaseUrl}
+                            rel="noreferrer"
+                            target="_blank"
+                          >
+                            {settings.update.releaseName ?? settings.update.releaseUrl}
+                          </a>
+                        </dd>
+                      </div>
+                    ) : null}
+                    <div className="flex items-center justify-between gap-3">
+                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                        {t("GitHub repository")}
+                      </dt>
+                      <dd className="min-w-0 text-right text-sm font-semibold">
+                        <a
+                          aria-label={t("Open GitHub repository")}
+                          className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
+                          href="https://github.com/fonlan/foco"
+                          rel="noreferrer"
+                          target="_blank"
+                        >
+                          https://github.com/fonlan/foco
+                        </a>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              </section>
+              {updateConfirm ? (
+                <>
+                  <button
+                    aria-label={t("Close update dialog backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setUpdateConfirm(null)}
+                    type="button"
+                  />
+                  <section
+                    aria-modal="true"
+                    className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    role="dialog"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <h3 className="text-base font-semibold text-stone-950">
+                          {updateConfirm.source === "install"
+                            ? t("Update is installing")
+                            : t("Update available")}
+                        </h3>
+                        <p className="mt-1 text-sm text-stone-600">
+                          {updateConfirm.source === "install"
+                            ? t("Foco will restart shortly.")
+                            : t("Version {version} is available", {
+                                version: updateConfirm.status.targetVersion ?? "",
+                              })}
+                        </p>
+                      </div>
+                      <button
+                        aria-label={t("Close")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        onClick={() => setUpdateConfirm(null)}
+                        title={t("Close")}
+                        type="button"
+                      >
+                        <X aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                    {updateConfirm.source === "check" ? (
+                      <div className="flex justify-end gap-2">
+                        <button
+                          className="inline-flex min-h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 hover:border-stone-300 hover:bg-stone-50"
+                          onClick={() => setUpdateConfirm(null)}
+                          type="button"
+                        >
+                          {t("Not now")}
+                        </button>
+                        <button
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                          disabled={isInstallingUpdate}
+                          onClick={() => void installUpdate()}
+                          type="button"
+                        >
+                          {isInstallingUpdate ? (
+                            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                          ) : (
+                            <Download aria-hidden="true" className="size-4" />
+                          )}
+                          <span>{t("Install update")}</span>
+                        </button>
+                      </div>
+                    ) : null}
+                  </section>
+                </>
+              ) : null}
+            </>
           ) : null}
         </div>
       </div>

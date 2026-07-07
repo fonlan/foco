@@ -132,6 +132,7 @@ import type {
   SettingsSection,
   ShellMessage,
   TaskStatus,
+  UpdateStatusSummary,
   TodoGraphResponse,
   TodoGraphTask,
   Translate,
@@ -999,6 +1000,9 @@ export function App() {
     chatMessagePaginationByKeyRef.current = next;
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusSummary | null>(null);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateInstallNotice, setUpdateInstallNotice] = useState<string | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
   const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<Record<string, string>>({});
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
@@ -1922,6 +1926,7 @@ export function App() {
     try {
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
+      setUpdateStatus(data.update);
       setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -1929,6 +1934,32 @@ export function App() {
       setIsLoadingSettings(false);
     }
   }, []);
+
+  const loadUpdateStatus = useCallback(async () => {
+    try {
+      const data = await requestJson<UpdateStatusSummary>("/api/update/status");
+      setUpdateStatus(data);
+    } catch {
+      // ponytail: nav stays quiet on status failures; About exposes explicit check errors.
+      setUpdateStatus(null);
+    }
+  }, []);
+
+  async function installUpdateFromNav() {
+    setIsInstallingUpdate(true);
+    setUpdateInstallNotice(null);
+    try {
+      const data = await requestJson<UpdateStatusSummary>("/api/update/install", {
+        method: "POST",
+      });
+      setUpdateStatus(data);
+      setUpdateInstallNotice(t("Foco is installing the update and will restart shortly."));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsInstallingUpdate(false);
+    }
+  }
 
   const loadAgentDefinitions = useCallback(async () => {
     setIsLoadingAgentDefinitions(true);
@@ -2986,7 +3017,20 @@ export function App() {
 
     void refreshWorkspaces();
     void loadSettings();
-  }, [canUseApp, loadSettings, refreshWorkspaces]);
+    void loadUpdateStatus();
+  }, [canUseApp, loadSettings, loadUpdateStatus, refreshWorkspaces]);
+
+  useEffect(() => {
+    if (!canUseApp || !updateStatus?.autoCheckEnabled) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadUpdateStatus();
+    }, 10 * 60 * 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [canUseApp, loadUpdateStatus, updateStatus?.autoCheckEnabled]);
 
   useEffect(() => {
     const probePort = settings?.nativeTools.browserProbePort;
@@ -9592,6 +9636,7 @@ export function App() {
 
   const handleSettingsPanelSettingsChange = useCallback((data: SettingsResponse) => {
     setSettings(data);
+    setUpdateStatus(data.update);
     setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
     void loadAgentDefinitions();
   }, [loadAgentDefinitions]);
@@ -9878,6 +9923,16 @@ export function App() {
   const sidebarWorkspaces = isWorkspaceSearchActive
     ? workspaceChatSearchResults
     : displayedWorkspaces;
+  const updateNavButton =
+    updateStatus?.updateAvailable && !updateStatus.error
+      ? {
+          active: false,
+          disabled: isInstallingUpdate,
+          icon: isInstallingUpdate ? LoaderCircle : Download,
+          label: isInstallingUpdate ? t("Installing update...") : t("Install update"),
+          onClick: () => void installUpdateFromNav(),
+        }
+      : null;
 
   if (isCheckingAuth) {
     return (
@@ -9925,6 +9980,25 @@ export function App() {
             </button>
           </section>
         ) : null}
+        {updateInstallNotice ? (
+          <section
+            aria-live="polite"
+            className="app-status-toast"
+            role="status"
+          >
+            <CheckCircle2 aria-hidden="true" className="app-status-toast-icon" />
+            <div className="app-error-toast-message">{updateInstallNotice}</div>
+            <button
+              aria-label={t("Dismiss update message")}
+              className="app-status-toast-close"
+              onClick={() => setUpdateInstallNotice(null)}
+              title={t("Close")}
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+          </section>
+        ) : null}
         {isGlobalView ? (
           <div className="global-shell">
             <FocoNavRail
@@ -9945,6 +10019,7 @@ export function App() {
               }
               terminalButton={null}
               theme={theme}
+              updateButton={updateNavButton}
             />
             <section className="global-main-panel min-w-0">
               <Suspense fallback={<PanelLoadingFallback />}>
@@ -10049,6 +10124,7 @@ export function App() {
                 void saveAppTheme(theme === "dark" ? "light" : "dark")
               }
               theme={theme}
+              updateButton={updateNavButton}
             />
             <aside
               className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
@@ -11765,6 +11841,7 @@ function FocoNavRail({
   onToggleTheme,
   terminalButton,
   theme,
+  updateButton,
 }: {
   activeMode: ViewMode;
   canLogout: boolean;
@@ -11781,6 +11858,7 @@ function FocoNavRail({
   onToggleTheme: () => void;
   terminalButton: NavRailAction | null;
   theme: AppThemeId;
+  updateButton: NavRailAction | null;
 }) {
   const { t } = useI18n();
   const themeLabel =
@@ -11830,6 +11908,7 @@ function FocoNavRail({
         />
       </div>
       <div className="foco-nav-rail-bottom">
+        {updateButton ? <NavRailButton {...updateButton} /> : null}
         {terminalButton ? <NavRailButton {...terminalButton} /> : null}
         {contextPanelButton ? <NavRailButton {...contextPanelButton} /> : null}
         <NavRailButton

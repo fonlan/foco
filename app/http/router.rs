@@ -137,6 +137,19 @@ pub(crate) fn app_router(state: AppState) -> Router {
         )
         .route("/api/settings", get(crate::http::settings::settings))
         .route(
+            "/api/update/status",
+            get(crate::http::update::update_status),
+        )
+        .route("/api/update/check", post(crate::http::update::check_update))
+        .route(
+            "/api/update/settings",
+            post(crate::http::update::save_update_settings),
+        )
+        .route(
+            "/api/update/install",
+            post(crate::http::update::install_update),
+        )
+        .route(
             "/api/skill-store/hot",
             get(crate::http::skill_store::skill_store_hot),
         )

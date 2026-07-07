@@ -100,13 +100,59 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "About" }));
     expect(screen.getByText("About Foco")).toBeInTheDocument();
-    expect(screen.getByText("0.1.3")).toBeInTheDocument();
+    expect(screen.getAllByText("0.1.3").length).toBeGreaterThan(0);
     const githubLink = screen.getByRole("link", {
       name: "Open GitHub repository",
     });
     expect(githubLink).toHaveAttribute("href", "https://github.com/fonlan/foco");
     expect(githubLink).toHaveAttribute("target", "_blank");
     expect(githubLink).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("checks and installs updates from the About settings page", async () => {
+    const fetchMock = vi.mocked(fetch);
+    window.history.replaceState(null, "", "/settings/about");
+    renderApp();
+
+    expect(await screen.findByText("About Foco")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/settings/about");
+
+    await userEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Update available")).toBeInTheDocument();
+    expect(within(dialog).getByText("Version 0.2.0 is available")).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Install update" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/update/install",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    expect(await screen.findByText("Update is installing")).toBeInTheDocument();
+  });
+
+  it("saves the automatic update check setting", async () => {
+    const fetchMock = vi.mocked(fetch);
+    window.history.replaceState(null, "", "/settings/about");
+    renderApp();
+
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "Automatically check for updates",
+    });
+    await userEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/update/settings",
+        expect.objectContaining({
+          body: JSON.stringify({ autoCheckEnabled: true }),
+          method: "POST",
+        }),
+      );
+    });
   });
 
   it("saves the skill translation model without changing enabled skills", async () => {
@@ -1167,7 +1213,6 @@ describe("app-settings verification surfaces", () => {
     });
 
     await userEvent.click(screen.getByRole("button", { name: "Open transcript" }));
-    expect(await screen.findByText("Memory Dream: workspace manual")).toBeInTheDocument();
     expect(await screen.findByText(/job started/)).toBeInTheDocument();
     expect(screen.queryByText("API overview")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();

@@ -2355,6 +2355,7 @@ export type ActiveRunInfo = {
 // Settings response (aggregate type)
 
 export type SettingsResponse = {
+  appVersion: string;
   general: GeneralSettingsSummary;
   agentTools: string[];
   nativeTools: NativeToolsSummary;
@@ -2374,7 +2375,25 @@ export type SettingsResponse = {
   mcpServers: ConfiguredMcpServerSummary[];
   skills: SkillsSettingsSummary;
   about: AboutSettingsSummary;
+  update: UpdateStatusSummary;
 };
+
+export type UpdateStatusSummary = {
+  currentVersion: string;
+  autoCheckEnabled: boolean;
+  checking: boolean;
+  lastCheckedAt: string | null;
+  updateAvailable: boolean;
+  targetVersion: string | null;
+  releaseName: string | null;
+  publishedAt: string | null;
+  releaseUrl: string | null;
+  assetName: string | null;
+  assetDownloadUrl: string | null;
+  error: string | null;
+};
+
+export type UpdateStatusResponse = UpdateStatusSummary;
 
 export type AboutSettingsSummary = {
   version: string;

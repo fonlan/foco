@@ -289,6 +289,7 @@ pub(crate) struct DeleteSettingsItemRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsResponse {
+    pub(crate) app_version: String,
     pub(crate) general: GeneralSettingsSummary,
     pub(crate) agent_tools: Vec<String>,
     pub(crate) native_tools: NativeToolsSummary,
@@ -308,6 +309,7 @@ pub(crate) struct SettingsResponse {
     pub(crate) mcp_servers: Vec<ConfiguredMcpServerSummary>,
     pub(crate) skills: SkillsSettingsSummary,
     pub(crate) about: AboutSettingsSummary,
+    pub(crate) update: crate::update_runtime::UpdateStatusSummary,
 }
 
 #[derive(Serialize)]

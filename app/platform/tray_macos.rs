@@ -66,6 +66,7 @@ fn run_macos_menu_bar_entrypoint_blocking(
     let logs_dir = loaded_config.paths.logs_dir.clone();
     let config_dir = loaded_config.paths.root_dir.clone();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime_shutdown_tx = shutdown_tx.clone();
     let active_chat_runs = ActiveChatRunRegistry::default();
     let runtime_active_chat_runs = active_chat_runs.clone();
     let runtime_thread = std::thread::Builder::new()
@@ -76,7 +77,7 @@ fn run_macos_menu_bar_entrypoint_blocking(
                 .build()
                 .expect("failed to build Foco HTTP runtime");
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
-                Some(shutdown_rx),
+                Some((runtime_shutdown_tx, shutdown_rx)),
                 false,
                 runtime_active_chat_runs,
             )) {

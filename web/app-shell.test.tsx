@@ -907,6 +907,35 @@ describe("app-shell verification surfaces", () => {
     expect(window.location.pathname).toBe("/settings/general");
   });
 
+  it("shows the nav update button when an update is available", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      update: {
+        ...appTestState.settingsResponse.update,
+        assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos.dmg",
+        assetName: "Foco-v0.2.0-macos.dmg",
+        error: null,
+        releaseUrl: "https://github.com/fonlan/foco/releases/tag/v0.2.0",
+        targetVersion: "0.2.0",
+        updateAvailable: true,
+      },
+    };
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Install update" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/update/install",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    expect(
+      await screen.findByText("Foco is installing the update and will restart shortly."),
+    ).toBeInTheDocument();
+  });
+
   it("opens scheduled tasks from the nav and URL", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

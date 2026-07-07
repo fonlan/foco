@@ -9,6 +9,7 @@ import type {
   Plan,
   QuestionRequestSummary,
   SettingsWorkspaceSpecJobSummary,
+  UpdateStatusSummary,
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../api/types";
@@ -141,6 +142,7 @@ export const settings = {
   about: {
     version: "0.1.3",
   },
+  appVersion: "0.1.3",
   agentTools: [
     "ask_question",
     "edit_file",
@@ -411,6 +413,20 @@ export const settings = {
     { label: "Low", value: "low" },
     { label: "High", value: "high" },
   ],
+  update: {
+    assetDownloadUrl: null as string | null,
+    assetName: null as string | null,
+    autoCheckEnabled: false,
+    checking: false,
+    currentVersion: "0.1.3",
+    error: null as string | null,
+    lastCheckedAt: null as string | null,
+    publishedAt: null as string | null,
+    releaseName: null as string | null,
+    releaseUrl: null as string | null,
+    targetVersion: null as string | null,
+    updateAvailable: false,
+  } as UpdateStatusSummary,
   workspaces: [
     {
       id: workspace.id,
@@ -2964,6 +2980,47 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings") {
     return jsonResponse(appTestState.settingsResponse);
+  }
+
+  if (path === "/api/update/status") {
+    return jsonResponse(appTestState.settingsResponse.update);
+  }
+
+  if (path === "/api/update/check") {
+    const update = {
+      ...appTestState.settingsResponse.update,
+      assetDownloadUrl: "https://github.com/fonlan/foco/releases/download/v0.2.0/Foco-v0.2.0-macos.dmg",
+      assetName: "Foco-v0.2.0-macos.dmg",
+      error: null,
+      releaseName: "Foco v0.2.0",
+      releaseUrl: "https://github.com/fonlan/foco/releases/tag/v0.2.0",
+      targetVersion: "0.2.0",
+      updateAvailable: true,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      update,
+    };
+    return jsonResponse(update);
+  }
+
+  if (path === "/api/update/settings") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      autoCheckEnabled?: boolean;
+    };
+    const update = {
+      ...appTestState.settingsResponse.update,
+      autoCheckEnabled: Boolean(body.autoCheckEnabled),
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      update,
+    };
+    return jsonResponse(update);
+  }
+
+  if (path === "/api/update/install") {
+    return jsonResponse(appTestState.settingsResponse.update);
   }
 
   if (path === "/api/settings/spec/jobs") {

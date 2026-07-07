@@ -41,6 +41,7 @@ pub(crate) async fn settings_response(
     let default_system_prompt = build_default_system_prompt();
 
     Ok(Json(SettingsResponse {
+        app_version: crate::update_runtime::current_version().to_string(),
         general: GeneralSettingsSummary {
             auto_start_enabled: auto_start_enabled_for_response(config.app.auto_start_enabled),
             default_team_mode_enabled: config.app.default_team_mode_enabled,
@@ -264,8 +265,9 @@ pub(crate) async fn settings_response(
             .collect(),
         skills: skills_settings_summary(config, &state.user_profile_dir),
         about: AboutSettingsSummary {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::update_runtime::current_version().to_string(),
         },
+        update: crate::update_runtime::update_status_summary(state, config)?,
     }))
 }
 
