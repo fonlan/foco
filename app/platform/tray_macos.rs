@@ -12,8 +12,6 @@ use foco_store::config::load_or_create_global_config;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use tokio::sync::watch;
 
-#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
-use crate::AUTO_START_COMMAND;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use crate::platform::tray::{
     TrayMenuLabels, browser_addr_for_listen_addr, foco_ui_url_for_listen_addr, open_foco_ui,
@@ -21,6 +19,8 @@ use crate::platform::tray::{
 };
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use crate::runtime::ActiveChatRunRegistry;
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+use crate::{AUTO_START_COMMAND, UPDATED_RESTART_COMMAND};
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use crate::{AppResult, local_addr, logging, run_server_until_shutdown};
 
@@ -37,16 +37,17 @@ const MENU_QUIT_ITEM_ID: &str = "foco-quit";
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 pub(crate) async fn run_macos_menu_bar_entrypoint() -> AppResult<()> {
-    let started_from_auto_start = args_started_from_auto_start(std::env::args().skip(1));
+    let start_silently = args_start_silently(std::env::args().skip(1));
     let loaded_config = load_or_create_global_config()?;
     logging::init(&loaded_config.paths.logs_dir)?;
     crate::platform::macos_environment::apply_macos_gui_environment();
-    run_macos_menu_bar_entrypoint_blocking(loaded_config, started_from_auto_start)
+    run_macos_menu_bar_entrypoint_blocking(loaded_config, start_silently)
 }
 
 #[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
-fn args_started_from_auto_start(args: impl IntoIterator<Item = String>) -> bool {
-    args.into_iter().any(|arg| arg == AUTO_START_COMMAND)
+fn args_start_silently(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter()
+        .any(|arg| arg == AUTO_START_COMMAND || arg == UPDATED_RESTART_COMMAND)
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -389,14 +390,15 @@ fn foco_macos_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
 
 #[cfg(test)]
 mod tests {
-    use super::{args_started_from_auto_start, should_open_existing_foco_ui};
+    use super::{args_start_silently, should_open_existing_foco_ui};
 
     #[test]
-    fn args_started_from_auto_start_detects_internal_flag() {
-        assert!(args_started_from_auto_start([
+    fn args_start_silently_detects_internal_flags() {
+        assert!(args_start_silently([
             "--ignored".to_string(),
             "--auto-start".to_string(),
         ]));
+        assert!(args_start_silently(["--updated-restart".to_string()]));
     }
 
     #[test]

@@ -662,7 +662,7 @@ mv "$new_app" "$FOCO_UPDATE_APP"
 rm -rf "$old_app"
 hdiutil detach "$volume"
 trap - EXIT
-open -n "$FOCO_UPDATE_APP"
+open -n "$FOCO_UPDATE_APP" --args --updated-restart
 "#
 }
 
@@ -727,7 +727,7 @@ try {
   Wait-Process -Id $pidToWait
   $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "Foco installer exited with code $($process.ExitCode)" }
-  Start-Process -FilePath $currentExe -WorkingDirectory $installDir
+  Start-Process -FilePath $currentExe -ArgumentList '--updated-restart' -WorkingDirectory $installDir
 } finally {
   Stop-Transcript | Out-Null
 }
@@ -926,6 +926,21 @@ mod tests {
             Some(PathBuf::from("/Applications/Foco.app"))
         );
         assert!(current_macos_app_bundle_from_exe(Path::new("/usr/local/bin/foco")).is_none());
+    }
+
+    #[test]
+    fn macos_update_helper_restarts_silently() {
+        assert!(
+            macos_update_script()
+                .contains(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#)
+        );
+    }
+
+    #[test]
+    fn windows_update_helper_restarts_silently() {
+        assert!(windows_update_script().contains(
+            "Start-Process -FilePath $currentExe -ArgumentList '--updated-restart' -WorkingDirectory $installDir"
+        ));
     }
 
     #[test]

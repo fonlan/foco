@@ -350,6 +350,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 // Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
+pub(crate) const UPDATED_RESTART_COMMAND: &str = "--updated-restart";
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.

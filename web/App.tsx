@@ -262,6 +262,7 @@ const SettingsPanel = lazy(() =>
   })),
 );
 import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
+import { installUpdateAndWaitForRestart } from "./shared/update-install";
 const ScheduledTasksPage = lazy(() =>
   import("./features/scheduled-tasks/ScheduledTasksPage").then((m) => ({
     default: m.ScheduledTasksPage,
@@ -2013,14 +2014,11 @@ export function App() {
     setIsInstallingUpdate(true);
     setUpdateInstallNotice(null);
     try {
-      const data = await requestJson<UpdateStatusSummary>("/api/update/install", {
-        method: "POST",
-      });
+      const data = await installUpdateAndWaitForRestart();
       setUpdateStatus(data);
       setUpdateInstallNotice(t("Foco is installing the update and will restart shortly."));
     } catch (requestError) {
       setError(errorMessage(requestError));
-    } finally {
       setIsInstallingUpdate(false);
     }
   }

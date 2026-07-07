@@ -149,6 +149,7 @@ import {
   SAVED_PASSWORD_MASK,
 } from "../../app/constants";
 import { errorMessage, requestJson } from "../../shared/api-client";
+import { installUpdateAndWaitForRestart } from "../../shared/update-install";
 import { useI18n } from "../../shared/i18n";
 import {
   defaultThinkingLevelForModel,
@@ -1863,14 +1864,11 @@ export function SettingsPanel({
     setIsInstallingUpdate(true);
     setError(null);
     try {
-      const update = await requestJson<UpdateStatusSummary>("/api/update/install", {
-        method: "POST",
-      });
+      const update = await installUpdateAndWaitForRestart();
       applyUpdateStatus(update);
       setUpdateConfirm({ status: update, source: "install" });
     } catch (requestError) {
       setError(errorMessage(requestError));
-    } finally {
       setIsInstallingUpdate(false);
     }
   }

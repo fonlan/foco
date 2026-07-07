@@ -32,6 +32,7 @@ import {
   workspace,
   workspaceMemory,
 } from "./test-utils/app-test-harness";
+import { installUpdateAndWaitForRestart } from "./shared/update-install";
 
 describe("app-settings verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
@@ -132,6 +133,19 @@ describe("app-settings verification surfaces", () => {
       );
     });
     expect(await screen.findByText("Update is installing")).toBeInTheDocument();
+  });
+
+  it("waits for update restart health recovery before reloading", async () => {
+    appTestState.updateHealthStatuses = [200, 503, 200];
+    const reload = vi.fn();
+    const waitForReload = installUpdateAndWaitForRestart({ pollMs: 1, reload });
+
+    await expect(waitForReload).resolves.toEqual(appTestState.settingsResponse.update);
+
+    await waitFor(() => expect(reload).toHaveBeenCalledOnce());
+    expect(
+      vi.mocked(fetch).mock.calls.filter(([url]) => url === "/api/health"),
+    ).toHaveLength(3);
   });
 
   it("saves the automatic update check setting", async () => {

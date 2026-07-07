@@ -2192,6 +2192,7 @@ export const appTestState: {
   answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
+  updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
 } = {
   activeChatStreamController: null,
@@ -2214,6 +2215,7 @@ export const appTestState: {
   answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
+  updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
 };
 function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspaceSummary {
@@ -2494,6 +2496,7 @@ export function resetAppTestEnvironment() {
   appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
+  appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
@@ -2987,6 +2990,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         secondaryWorkspace,
       ],
     });
+  }
+
+  if (path === "/api/health") {
+    const status = appTestState.updateHealthStatuses.shift() ?? 200;
+    return jsonResponse({ service: "foco" }, { status });
   }
 
   if (path === "/api/settings") {
