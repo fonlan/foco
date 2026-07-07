@@ -914,6 +914,8 @@ export function SettingsPanel({
       apiSaveRequestResponseDetails:
         data.general.apiAudit.saveRequestResponseDetails,
       autoStartEnabled: data.general.autoStartEnabled,
+      chatTitleGenerationModelId:
+        data.general.chatTitleGenerationModelId ?? "current_chat_model",
       hookAuditEnabled: data.general.hookAuditEnabled,
       language: data.general.language,
       listenHost: data.general.webServer.listenHost,
@@ -1898,6 +1900,7 @@ export function SettingsPanel({
           ...(shouldSaveAutoStart
             ? { autoStartEnabled: generalForm.autoStartEnabled }
             : {}),
+          chatTitleGenerationModelId: generalForm.chatTitleGenerationModelId,
           clearPassword: false,
           listenHost: generalForm.listenHost,
           listenPort: optionalPositiveInteger(
@@ -4620,6 +4623,31 @@ export function SettingsPanel({
                       type="number"
                       value={generalForm.llmRequestRetryCount}
                     />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Chat title generation model")}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setGeneralForm((current) => ({
+                          ...current,
+                          chatTitleGenerationModelId: event.target.value,
+                        }))
+                      }
+                      value={generalForm.chatTitleGenerationModelId}
+                    >
+                      <option value="disabled">{t("Disabled")}</option>
+                      <option value="current_chat_model">{t("Current chat model")}</option>
+                      {configuredModelsByName
+                        .filter((model) => model.enabled)
+                        .map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.displayName || model.id}
+                          </option>
+                        ))}
+                    </select>
                   </label>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-stone-600">
@@ -12446,6 +12474,7 @@ function emptyGeneralForm(): GeneralFormState {
     apiRequestDetailRetentionDays: "3",
     apiSaveRequestResponseDetails: true,
     autoStartEnabled: false,
+    chatTitleGenerationModelId: "current_chat_model",
     hookAuditEnabled: false,
     language: "en",
     listenHost: "127.0.0.1",

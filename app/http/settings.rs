@@ -17,6 +17,7 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
+        CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL, CHAT_TITLE_GENERATION_DISABLED,
         IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PlanSettings, PromptSettings,
         REVIEW_SYSTEM_PROMPT_NAME, SpecSettings,
     },
@@ -79,6 +80,7 @@ pub(crate) struct ManualGeneralSettingsRequest {
     pub(crate) auto_start_enabled: Option<bool>,
     pub(crate) default_team_mode_enabled: Option<bool>,
     pub(crate) api_audit: Option<ManualApiAuditSettingsRequest>,
+    pub(crate) chat_title_generation_model_id: Option<String>,
     pub(crate) listen_host: String,
     pub(crate) listen_port: u32,
     pub(crate) llm_request_retry_count: Option<u32>,
@@ -337,6 +339,7 @@ pub(crate) struct NativeToolsSummary {
 pub(crate) struct GeneralSettingsSummary {
     pub(crate) auto_start_enabled: bool,
     pub(crate) default_team_mode_enabled: bool,
+    pub(crate) chat_title_generation_model_id: Option<String>,
     pub(crate) api_audit: ApiAuditSettingsSummary,
     pub(crate) web_server: WebServerSettingsSummary,
     pub(crate) llm_request_retry_count: u32,
@@ -1339,6 +1342,49 @@ fn default_agent_role_prompts(config: &GlobalConfig) -> BTreeMap<AgentDefinition
     prompts
 }
 
+pub(crate) fn normalize_chat_title_generation_model_id(
+    config: &GlobalConfig,
+    requested: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let Some(model_id) = requested.map(str::trim) else {
+        return Ok(config.app.chat_title_generation_model_id.clone());
+    };
+
+    if model_id == CHAT_TITLE_GENERATION_DISABLED
+        || model_id == CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL
+    {
+        return Ok(Some(model_id.to_string()));
+    }
+
+    if config
+        .models
+        .iter()
+        .any(|model| model.id == model_id && chat_title_generation_model_available(config, model))
+    {
+        return Ok(Some(model_id.to_string()));
+    }
+
+    Err(ApiError::bad_request(
+        "chat title generation model must be disabled, current_chat_model, or an enabled available model id",
+    ))
+}
+
+fn chat_title_generation_model_available(config: &GlobalConfig, model: &ModelSettings) -> bool {
+    model.enabled
+        && model.limits.is_some()
+        && model_outputs_text(model)
+        && model
+            .active_provider_id
+            .as_ref()
+            .is_some_and(|provider_id| {
+                model.provider_ids.iter().any(|id| id == provider_id)
+                    && config
+                        .providers
+                        .iter()
+                        .any(|provider| provider.enabled && provider.id == *provider_id)
+            })
+}
+
 pub(crate) async fn save_general_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualGeneralSettingsRequest>,
@@ -1358,6 +1404,10 @@ pub(crate) async fn save_general_settings(
     if let Some(retry_count) = request.llm_request_retry_count {
         config.app.llm_request_retry_count = retry_count;
     }
+    config.app.chat_title_generation_model_id = normalize_chat_title_generation_model_id(
+        &config,
+        request.chat_title_generation_model_id.as_deref(),
+    )?;
     config.app.language = normalize_app_language(&request.language)?;
     config.app.theme = normalize_app_theme(&request.theme)?;
     if let Some(hook_audit_enabled) = request.hook_audit_enabled {

@@ -1454,6 +1454,7 @@ type ApiAuditSettingsSummary = {
 export type GeneralSettingsSummary = {
   apiAudit: ApiAuditSettingsSummary;
   autoStartEnabled: boolean;
+  chatTitleGenerationModelId: string | null;
   defaultTeamModeEnabled: boolean;
   hookAuditEnabled: boolean;
   language: AppLanguageId;
@@ -1469,6 +1470,7 @@ export type GeneralFormState = {
   apiRequestDetailRetentionDays: string;
   apiSaveRequestResponseDetails: boolean;
   autoStartEnabled: boolean;
+  chatTitleGenerationModelId: string;
   hookAuditEnabled: boolean;
   language: string;
   listenHost: string;

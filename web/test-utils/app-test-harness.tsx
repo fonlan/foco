@@ -181,6 +181,7 @@ export const settings = {
       saveRequestResponseDetails: true,
     },
     autoStartEnabled: false,
+    chatTitleGenerationModelId: "current_chat_model",
     defaultTeamModeEnabled: true,
     hookAuditEnabled: false,
     language: "en",
@@ -2448,6 +2449,10 @@ export function savedGeneralSettings(init?: RequestInit) {
         typeof body.hookAuditEnabled === "boolean"
           ? body.hookAuditEnabled
           : settings.general.hookAuditEnabled,
+      chatTitleGenerationModelId:
+        typeof body.chatTitleGenerationModelId === "string"
+          ? body.chatTitleGenerationModelId
+          : settings.general.chatTitleGenerationModelId,
       defaultTeamModeEnabled:
         typeof body.defaultTeamModeEnabled === "boolean"
           ? body.defaultTeamModeEnabled

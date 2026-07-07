@@ -30,6 +30,8 @@ pub const DEFAULT_APP_THEME: &str = "light";
 pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_LLM_REQUEST_RETRY_COUNT: u32 = 3;
 pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
+pub const CHAT_TITLE_GENERATION_DISABLED: &str = "disabled";
+pub const CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL: &str = "current_chat_model";
 pub const DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS: u32 = 3;
 pub const DEFAULT_TERMINAL_SHELL: &str = default_terminal_shell_for_current_platform();
 pub const DEFAULT_REMOTE_CONNECT_TIMEOUT_MS: u64 = 15_000;
@@ -339,6 +341,7 @@ impl GlobalConfig {
                 language: DEFAULT_APP_LANGUAGE.to_string(),
                 theme: DEFAULT_APP_THEME.to_string(),
                 llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
+                chat_title_generation_model_id: default_chat_title_generation_model_id(),
                 auto_start_enabled: false,
                 auto_update_check_enabled: false,
                 default_team_mode_enabled: true,
@@ -728,6 +731,8 @@ pub struct AppSettings {
     pub theme: String,
     #[serde(default = "default_llm_request_retry_count")]
     pub llm_request_retry_count: u32,
+    #[serde(default = "default_chat_title_generation_model_id")]
+    pub chat_title_generation_model_id: Option<String>,
     #[serde(default)]
     pub auto_start_enabled: bool,
     #[serde(default)]
@@ -772,6 +777,10 @@ fn default_app_theme() -> String {
 
 fn default_llm_request_retry_count() -> u32 {
     DEFAULT_LLM_REQUEST_RETRY_COUNT
+}
+
+fn default_chat_title_generation_model_id() -> Option<String> {
+    Some(CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL.to_string())
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -4158,7 +4167,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_update_check_defaults_are_loaded_for_old_configs() {
+    fn app_defaults_are_loaded_for_old_configs() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
         fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
@@ -4166,10 +4175,12 @@ mod tests {
 
         let config = GlobalConfig::first_run(paths.workspace_dir.clone());
         let mut json = serde_json::to_value(&config).expect("config json");
-        json.get_mut("app")
+        let app = json
+            .get_mut("app")
             .and_then(Value::as_object_mut)
-            .expect("app object")
-            .remove("auto_update_check_enabled");
+            .expect("app object");
+        app.remove("auto_update_check_enabled");
+        app.remove("chat_title_generation_model_id");
         fs::write(
             &paths.config_file,
             serde_json::to_string_pretty(&json).expect("serialize config"),
@@ -4179,6 +4190,10 @@ mod tests {
         let loaded = load_global_config(&paths.config_file).expect("old config should load");
 
         assert!(!loaded.app.auto_update_check_enabled);
+        assert_eq!(
+            loaded.app.chat_title_generation_model_id.as_deref(),
+            Some(CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL)
+        );
     }
 
     #[test]

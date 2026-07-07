@@ -80,6 +80,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Confirm delete workspace": "Confirm delete workspace",
     "Close workspace delete confirmation backdrop": "Close workspace delete confirmation backdrop",
     "Checking Sidecar version": "Checking Sidecar version",
+    "Chat title generation model": "Chat title generation model",
+    "Current chat model": "Current chat model",
   },
   "zh-CN": {
     "Local workspace": "本地工作区",
@@ -1075,6 +1077,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "设置密码后，浏览器访问需要先登录。",
     "Clear browser password": "清除浏览器密码",
     "LLM request retries": "大模型请求重试次数",
+    "Chat title generation model": "会话标题生成模型",
     "API request detail retention days": "API 请求详情保留天数",
     "API request details": "API 请求详情",
     "Save request and response bodies": "保存请求和响应正文",

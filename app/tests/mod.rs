@@ -52,6 +52,7 @@ use crate::http::{
         ManualPromptSettingsRequest, UpdateAgentDefinitionRequest,
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
         default_plan_mode_system_prompt, filter_provider_model_ids,
+        normalize_chat_title_generation_model_id,
     },
     skill_store::{
         SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
@@ -1737,6 +1738,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             api_audit: None,
             auto_start_enabled: None,
+            chat_title_generation_model_id: None,
             clear_password: None,
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -1756,6 +1758,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             api_audit: None,
             auto_start_enabled: None,
+            chat_title_generation_model_id: None,
             clear_password: None,
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -1781,6 +1784,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             api_audit: None,
             auto_start_enabled: None,
+            chat_title_generation_model_id: None,
             clear_password: Some(true),
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -1794,6 +1798,57 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
     )
     .expect("clear password hash");
     assert!(cleared.password_hash.is_none());
+}
+
+#[test]
+fn normalize_chat_title_generation_model_id_accepts_only_available_choices() {
+    let mut config = GlobalConfig::first_run(env::temp_dir());
+    config.providers.push(ProviderSettings {
+        id: "provider".to_string(),
+        name: "Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+
+    let mut model = test_model_settings("title-model");
+    model.enabled = true;
+    model.provider_ids = vec!["provider".to_string()];
+    model.active_provider_id = Some("provider".to_string());
+    model.limits = Some(ModelLimits {
+        context_window: 100_000,
+        max_output_tokens: 1_024,
+    });
+    config.models.push(model);
+
+    assert_eq!(
+        normalize_chat_title_generation_model_id(&config, Some("disabled"))
+            .expect("disabled allowed")
+            .as_deref(),
+        Some("disabled")
+    );
+    assert_eq!(
+        normalize_chat_title_generation_model_id(&config, Some("current_chat_model"))
+            .expect("current chat model allowed")
+            .as_deref(),
+        Some("current_chat_model")
+    );
+    assert_eq!(
+        normalize_chat_title_generation_model_id(&config, Some("title-model"))
+            .expect("enabled model allowed")
+            .as_deref(),
+        Some("title-model")
+    );
+    assert!(normalize_chat_title_generation_model_id(&config, Some("missing")).is_err());
+
+    config.providers[0].enabled = false;
+    assert!(normalize_chat_title_generation_model_id(&config, Some("title-model")).is_err());
 }
 
 #[test]
