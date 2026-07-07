@@ -3092,10 +3092,21 @@ export function SettingsPanel({
           method: "POST",
         },
       );
+      setRemoteServerForm(remoteServerFormFromSummary(data.server));
+      try {
+        await requestJson<RemoteServerDiagnosticResponse>(
+          `/api/remote-servers/${encodeURIComponent(data.server.id)}/connect`,
+          { method: "POST" },
+        );
+      } catch (connectError) {
+        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        setSettings(nextSettings);
+        onSettingsChange(nextSettings);
+        throw connectError;
+      }
       const nextSettings = await requestJson<SettingsResponse>("/api/settings");
       setSettings(nextSettings);
       onSettingsChange(nextSettings);
-      setRemoteServerForm(remoteServerFormFromSummary(data.server));
       setIsRemoteServerDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));

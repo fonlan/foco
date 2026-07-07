@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, time::timeout};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::*;
 
 const REMOTE_SERVER_STATUS_CONNECTED: &str = "connected";
@@ -21,6 +24,8 @@ const SIDECAR_INSTALL_STATE_NOT_INSTALLED: &str = "notInstalled";
 const SIDECAR_INSTALL_STATE_CUSTOM_COMMAND: &str = "customCommand";
 const SIDECAR_INSTALL_STATE_AVAILABLE: &str = "available";
 const SIDECAR_INSTALL_STATE_MISSING_ASSET: &str = "missingAsset";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -375,13 +380,22 @@ async fn run_remote_server_diagnostic_api(
 ) -> Result<Json<RemoteServerDiagnosticResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let server = remote_server_by_id(&config, &server_id)?.clone();
-    let result = test_remote_server_connection(&server).await;
+    let mut result = test_remote_server_connection(&server).await;
 
     let mut config = config_snapshot(&state)?;
-    let updated = update_remote_server_diagnostic_cache(&mut config, &server_id, &result)?;
+    let mut updated = update_remote_server_diagnostic_cache(&mut config, &server_id, &result)?;
     save_config(&state, config.clone())?;
 
     if mark_connected && result.ok {
+        state
+            .remote_workspace_manager
+            .ensure_server_sidecar(state.clone(), &server_id)
+            .await?;
+        config = config_snapshot(&state)?;
+        updated = remote_server_by_id(&config, &server_id)?.clone();
+        result = test_remote_server_connection(&updated).await;
+        updated = update_remote_server_diagnostic_cache(&mut config, &server_id, &result)?;
+        save_config(&state, config.clone())?;
         let mut connections = state
             .remote_server_connections
             .lock()
@@ -786,11 +800,23 @@ fn remote_server_status_value(
         .is_some_and(|value| !value.trim().is_empty())
     {
         REMOTE_SERVER_STATUS_ERROR.to_string()
-    } else if server.last_checked_at.is_some() {
+    } else if server.last_checked_at.is_some() && remote_server_sidecar_is_available(server) {
         REMOTE_SERVER_STATUS_READY.to_string()
     } else {
         REMOTE_SERVER_STATUS_UNKNOWN.to_string()
     }
+}
+
+fn remote_server_sidecar_is_available(server: &RemoteServerProfile) -> bool {
+    server
+        .sidecar_install_state
+        .as_deref()
+        .is_some_and(|state| {
+            matches!(
+                state,
+                SIDECAR_INSTALL_STATE_AVAILABLE | SIDECAR_INSTALL_STATE_CUSTOM_COMMAND
+            )
+        })
 }
 
 fn disconnect_remote_server_id(state: &AppState, server_id: &str) -> Result<(), ApiError> {
@@ -810,11 +836,24 @@ async fn run_ssh(
     let timeout_ms = server.connect_timeout_ms.max(1);
     let args = remote_server_ssh_args(server, extra_args, batch_mode);
 
-    let child = Command::new("ssh").args(&args).output();
+    let child = ssh_command().args(&args).output();
     timeout(Duration::from_millis(timeout_ms + 1_000), child)
         .await
         .map_err(|_| format!("ssh command timed out after {timeout_ms}ms"))?
         .map_err(|source| format!("failed to run ssh: {source}"))
+}
+
+fn ssh_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("ssh");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("ssh")
+    }
 }
 
 pub(crate) fn remote_server_ssh_args(

@@ -90,6 +90,7 @@ export function WorkspaceDialog({
   const { t } = useI18n();
   const title = t("Add workspace");
   const selectedServer = remoteServers.find((server) => server.id === selectedServerId) ?? null;
+  const selectedServerAvailable = selectedServer?.sidecarInstallState === "available" || selectedServer?.sidecarInstallState === "customCommand";
   const isRemote = mode === "ssh";
 
   return (
@@ -166,11 +167,14 @@ export function WorkspaceDialog({
                   value={selectedServerId}
                 >
                   <option value="">{t("Select remote server")}</option>
-                  {remoteServers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.hostAlias})
-                    </option>
-                  ))}
+                  {remoteServers.map((server) => {
+                    const isServerAvailable = server.sidecarInstallState === "available" || server.sidecarInstallState === "customCommand";
+                    return (
+                      <option disabled={!isServerAvailable} key={server.id} value={server.id}>
+                        {server.name} ({server.hostAlias})
+                      </option>
+                    );
+                  })}
                 </select>
               </label>
               {selectedServer ? (
@@ -398,7 +402,7 @@ export function WorkspaceDialog({
             <button
               aria-label={title}
               className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-              disabled={isSaving || (isRemote && !selectedServerId)}
+              disabled={isSaving || (isRemote && (!selectedServerId || !selectedServerAvailable))}
               title={title}
               type="submit"
             >

@@ -720,13 +720,16 @@ async fn add_remote_workspace(
     validate_remote_workspace_path(remote_path)?;
 
     let mut config = config_snapshot(&state)?;
-    if !config
+    let server = config
         .remote_servers
         .iter()
-        .any(|server| server.id == server_id)
-    {
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("remote server was not found: {server_id}"))
+        })?;
+    if !remote_server_is_available(server) {
         return Err(ApiError::bad_request(format!(
-            "remote server was not found: {server_id}"
+            "remote server is not ready yet: {server_id}"
         )));
     }
     reject_registered_remote_workspace(&config, server_id, remote_path, None)?;
@@ -791,6 +794,13 @@ async fn add_remote_workspace(
         &state.active_chat_runs,
         Some(&state.remote_workspace_manager),
     )
+}
+
+fn remote_server_is_available(server: &foco_store::config::RemoteServerProfile) -> bool {
+    server
+        .sidecar_install_state
+        .as_deref()
+        .is_some_and(|state| matches!(state, "available" | "customCommand"))
 }
 
 fn validate_remote_workspace_path(path: &str) -> Result<(), ApiError> {
@@ -872,13 +882,16 @@ pub(crate) async fn save_workspace_settings(
                 ApiError::bad_request("remote workspace remotePath must not be empty")
             })?;
         validate_remote_workspace_path(remote_path)?;
-        if !config
+        let server = config
             .remote_servers
             .iter()
-            .any(|server| server.id == server_id)
-        {
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("remote server was not found: {server_id}"))
+            })?;
+        if !remote_server_is_available(server) {
             return Err(ApiError::bad_request(format!(
-                "remote server was not found: {server_id}"
+                "remote server is not ready yet: {server_id}"
             )));
         }
         reject_registered_remote_workspace(&config, server_id, remote_path, Some(workspace_id))?;
@@ -1278,7 +1291,8 @@ pub(crate) fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str,
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_image_content_type;
+    use super::{remote_server_is_available, workspace_image_content_type};
+    use foco_store::config::RemoteServerProfile;
 
     #[test]
     fn workspace_image_content_type_accepts_svg_only_as_image_text() {
@@ -1288,6 +1302,18 @@ mod tests {
             "image/svg+xml"
         );
         assert!(workspace_image_content_type(b"plain text").is_err());
+    }
+
+    #[test]
+    fn remote_server_requires_installed_or_custom_sidecar_before_workspace_use() {
+        let mut server = RemoteServerProfile::default();
+        assert!(!remote_server_is_available(&server));
+        server.sidecar_install_state = Some("notInstalled".to_string());
+        assert!(!remote_server_is_available(&server));
+        server.sidecar_install_state = Some("available".to_string());
+        assert!(remote_server_is_available(&server));
+        server.sidecar_install_state = Some("customCommand".to_string());
+        assert!(remote_server_is_available(&server));
     }
 }
 

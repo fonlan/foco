@@ -3834,6 +3834,16 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
+      try {
+        await requestJson<RemoteServerDiagnosticResponse>(
+          `/api/remote-servers/${encodeURIComponent(response.server.id)}/connect`,
+          { method: "POST" },
+        );
+      } catch (connectError) {
+        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        setSettings(nextSettings);
+        throw connectError;
+      }
       const nextSettings = await requestJson<SettingsResponse>("/api/settings");
       setSettings(nextSettings);
       setWorkspaceServerId(response.server.id);

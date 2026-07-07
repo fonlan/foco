@@ -53,6 +53,9 @@ use tokio::{
 use tokio_tungstenite::connect_async;
 use tungstenite::client::IntoClientRequest;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::{
     ApiError, AppResult, AppState, config_snapshot,
     http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
@@ -72,6 +75,8 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +111,19 @@ impl RemoteConnectionState {
             Self::Offline => "offline",
             Self::FailedAuth => "failedAuth",
         }
+    }
+}
+
+fn ssh_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("ssh");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("ssh")
     }
 }
 
@@ -185,10 +203,52 @@ impl RemoteWorkspaceManager {
                 } else {
                     RemoteConnectionState::Offline
                 };
-                let _ = self.set_status(server_id, Some(workspace_id), state, Some(message));
+                let _ =
+                    self.set_status(server_id, Some(workspace_id), state, Some(message.clone()));
+                let _ = self.set_status(server_id, None, state, Some(message));
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn ensure_server_sidecar(
+        &self,
+        state: AppState,
+        server_id: &str,
+    ) -> Result<(), ApiError> {
+        match self.ensure_server_sidecar_inner(&state, server_id).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.message().to_string();
+                let state = if is_auth_error_message(&message) {
+                    RemoteConnectionState::FailedAuth
+                } else {
+                    RemoteConnectionState::Offline
+                };
+                let _ = self.set_status(server_id, None, state, Some(message));
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_server_sidecar_inner(
+        &self,
+        state: &AppState,
+        server_id: &str,
+    ) -> Result<(), ApiError> {
+        let config = config_snapshot(state)?;
+        let server = config
+            .remote_servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .cloned()
+            .ok_or_else(|| remote_error(server_id, None, "remote server was not found"))?;
+        self.set_status(server_id, None, RemoteConnectionState::Checking, None)?;
+        let target = detect_or_cached_target(&server, server_id, None).await?;
+        self.set_status(server_id, None, RemoteConnectionState::Installing, None)?;
+        ensure_sidecar_command(state, &server, server_id, None, &target).await?;
+        self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
+        Ok(())
     }
 
     fn set_status(
@@ -248,7 +308,7 @@ impl RemoteWorkspaceManager {
             return Ok(existing.summary());
         }
 
-        let target = detect_or_cached_target(&server, server_id, workspace_id).await?;
+        let target = detect_or_cached_target(&server, server_id, Some(workspace_id)).await?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -257,7 +317,7 @@ impl RemoteWorkspaceManager {
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Installing, None)?;
         let command =
-            ensure_sidecar_command(&state, &server, server_id, workspace_id, &target).await?;
+            ensure_sidecar_command(&state, &server, server_id, Some(workspace_id), &target).await?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1344,7 +1404,7 @@ fn workspace_remote_path(workspace: &WorkspaceConfig, server_id: &str) -> Result
 async fn detect_or_cached_target(
     server: &RemoteServerProfile,
     server_id: &str,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
 ) -> Result<String, ApiError> {
     if let Some(target) = server
         .last_known_target
@@ -1359,25 +1419,25 @@ async fn detect_or_cached_target(
         &["uname -s && uname -m"],
         true,
         server_id,
-        Some(workspace_id),
+        workspace_id,
     )
     .await?;
     if !output.status.success() {
         return Err(remote_error(
             server_id,
-            Some(workspace_id),
+            workspace_id,
             format!("target probe failed: {}", output_text(&output)),
         ));
     }
     normalize_target(&String::from_utf8_lossy(&output.stdout))
-        .map_err(|message| remote_error(server_id, Some(workspace_id), message))
+        .map_err(|message| remote_error(server_id, workspace_id, message))
 }
 
 async fn ensure_sidecar_command(
     state: &AppState,
     server: &RemoteServerProfile,
     server_id: &str,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
     target: &str,
 ) -> Result<String, ApiError> {
     if let Some(command) = server
@@ -1391,7 +1451,7 @@ async fn ensure_sidecar_command(
     }
 
     let asset = select_sidecar_asset(target)
-        .map_err(|message| remote_error(server_id, Some(workspace_id), message))?;
+        .map_err(|message| remote_error(server_id, workspace_id, message))?;
     let remote_dir = format!("~/.foco/sidecars/{}/{}", asset.version, asset.target);
     let remote_bin = format!("{remote_dir}/{SIDECAR_BINARY_NAME}");
     if remote_sidecar_matches(
@@ -1411,7 +1471,7 @@ async fn ensure_sidecar_command(
     let bytes = std::fs::read(&asset.path).map_err(|source| {
         remote_error(
             server_id,
-            Some(workspace_id),
+            workspace_id,
             format!(
                 "failed to read sidecar asset {}: {source}",
                 asset.path.display()
@@ -1430,13 +1490,13 @@ async fn ensure_sidecar_command(
         &[install_script.as_str()],
         &bytes,
         server_id,
-        Some(workspace_id),
+        workspace_id,
     )
     .await?;
     if !output.status.success() {
         return Err(remote_error(
             server_id,
-            Some(workspace_id),
+            workspace_id,
             format!("sidecar upload/install failed: {}", output_text(&output)),
         ));
     }
@@ -1451,20 +1511,13 @@ async fn remote_sidecar_matches(
     version: &str,
     target: &str,
     server_id: &str,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
 ) -> Result<bool, ApiError> {
     let command = format!(
         "test -x {bin} && {bin} --version && {bin} --sidecar-target",
         bin = shell_quote(remote_bin)
     );
-    let output = run_ssh_output(
-        server,
-        &[command.as_str()],
-        true,
-        server_id,
-        Some(workspace_id),
-    )
-    .await?;
+    let output = run_ssh_output(server, &[command.as_str()], true, server_id, workspace_id).await?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -1481,24 +1534,17 @@ async fn verify_remote_command(
     command: &str,
     target: &str,
     server_id: &str,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let check = format!(
         "{command} --version && {command} --sidecar-target",
         command = command
     );
-    let output = run_ssh_output(
-        server,
-        &[check.as_str()],
-        true,
-        server_id,
-        Some(workspace_id),
-    )
-    .await?;
+    let output = run_ssh_output(server, &[check.as_str()], true, server_id, workspace_id).await?;
     if !output.status.success() {
         return Err(remote_error(
             server_id,
-            Some(workspace_id),
+            workspace_id,
             format!(
                 "remote sidecar command verification failed: {}",
                 output_text(&output)
@@ -1509,7 +1555,7 @@ async fn verify_remote_command(
     if !stdout.lines().map(str::trim).any(|line| line == target) {
         return Err(remote_error(
             server_id,
-            Some(workspace_id),
+            workspace_id,
             format!("remote sidecar command did not report target {target}"),
         ));
     }
@@ -1622,7 +1668,7 @@ async fn launch_remote_sidecar(
         session_file = shell_quote(session_file),
     );
     let args = remote_server_ssh_args(server, &[remote_command.as_str()], true);
-    let child = Command::new("ssh")
+    let child = ssh_command()
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1751,7 +1797,7 @@ async fn start_local_forward(
         ],
         true,
     );
-    let child = Command::new("ssh")
+    let child = ssh_command()
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2850,7 +2896,7 @@ async fn run_ssh_output(
     let args = remote_server_ssh_args(server, extra_args, batch_mode);
     timeout(
         Duration::from_millis(timeout_ms + 1_000),
-        Command::new("ssh").args(&args).output(),
+        ssh_command().args(&args).output(),
     )
     .await
     .map_err(|_| {
@@ -2877,8 +2923,9 @@ async fn run_ssh_with_stdin(
     workspace_id: Option<&str>,
 ) -> Result<std::process::Output, ApiError> {
     let timeout_ms = server.connect_timeout_ms.max(1);
+    let upload_timeout = Duration::from_millis(timeout_ms + 30_000);
     let args = remote_server_ssh_args(server, extra_args, true);
-    let mut child = Command::new("ssh")
+    let mut child = ssh_command()
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2892,27 +2939,36 @@ async fn run_ssh_with_stdin(
             )
         })?;
     if let Some(mut child_stdin) = child.stdin.take() {
-        child_stdin.write_all(stdin).await.map_err(|source| {
+        match timeout(upload_timeout, child_stdin.write_all(stdin)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(source)) => {
+                let _ = child.kill().await;
+                return Err(remote_error(
+                    server_id,
+                    workspace_id,
+                    format!("failed to upload sidecar over ssh stdin: {source}"),
+                ));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(remote_error(
+                    server_id,
+                    workspace_id,
+                    "ssh upload timed out",
+                ));
+            }
+        }
+    }
+    timeout(upload_timeout, child.wait_with_output())
+        .await
+        .map_err(|_| remote_error(server_id, workspace_id, "ssh upload timed out"))?
+        .map_err(|source| {
             remote_error(
                 server_id,
                 workspace_id,
-                format!("failed to upload sidecar over ssh stdin: {source}"),
+                format!("failed to finish ssh upload: {source}"),
             )
-        })?;
-    }
-    timeout(
-        Duration::from_millis(timeout_ms + 30_000),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| remote_error(server_id, workspace_id, "ssh upload timed out"))?
-    .map_err(|source| {
-        remote_error(
-            server_id,
-            workspace_id,
-            format!("failed to finish ssh upload: {source}"),
-        )
-    })
+        })
 }
 
 fn session_key(server_id: &str, workspace_id: &str) -> String {
