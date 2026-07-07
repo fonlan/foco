@@ -554,6 +554,9 @@ export function SettingsPanel({
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
+  const [pendingDeleteWorkspace, setPendingDeleteWorkspace] =
+    useState<ConfiguredWorkspaceSummary | null>(null);
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [isSavingWorkspaceOrder, setIsSavingWorkspaceOrder] = useState(false);
   const [isSavingWorkspaceLogo, setIsSavingWorkspaceLogo] = useState(false);
   const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
@@ -3254,6 +3257,31 @@ export function SettingsPanel({
         (_command, commandIndex) => commandIndex !== index,
       ),
     }));
+  }
+
+  async function deleteConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
+    setPendingDeleteWorkspace(null);
+    setDeletingWorkspaceId(workspace.id);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        `/api/workspaces/${encodeURIComponent(workspace.id)}`,
+        { method: "DELETE" },
+      );
+      setSettings(data);
+      onSettingsChange(data);
+      await onWorkspacesChange();
+      setWorkspaceOrderPreview(null);
+      if (workspaceForm.id === workspace.id) {
+        setWorkspaceForm(emptyWorkspaceForm());
+        setIsWorkspaceDialogOpen(false);
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setDeletingWorkspaceId(null);
+    }
   }
 
   async function saveWorkspaceOrder(workspaceIds: string[]) {
@@ -8278,7 +8306,7 @@ export function SettingsPanel({
                                 ? "border-teal-300 bg-teal-700 text-white shadow-[0_10px_22px_rgba(15,118,110,0.22)] hover:bg-teal-800"
                                 : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                               }`}
-                            disabled={isSavingWorkspaceOrder}
+                            disabled={isSavingWorkspaceOrder || deletingWorkspaceId === workspace.id}
                             onClick={() =>
                               void toggleWorkspacePinned(workspace, !workspace.pinned)
                             }
@@ -8288,10 +8316,27 @@ export function SettingsPanel({
                             <Lock aria-hidden="true" className="size-4" />
                           </button>
                           <button
+                            aria-label={t("Delete workspace {name}", {
+                              name: workspace.name,
+                            })}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={orderedWorkspaces.length <= 1 || deletingWorkspaceId === workspace.id}
+                            onClick={() => setPendingDeleteWorkspace(workspace)}
+                            title={t("Delete workspace")}
+                            type="button"
+                          >
+                            {deletingWorkspaceId === workspace.id ? (
+                              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                            ) : (
+                              <Trash2 aria-hidden="true" className="size-4" />
+                            )}
+                          </button>
+                          <button
                             aria-label={t("Edit workspace {name}", {
                               name: workspace.name,
                             })}
                             className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            disabled={deletingWorkspaceId === workspace.id}
                             onClick={() => void editConfiguredWorkspace(workspace)}
                             title={t("Edit workspace")}
                             type="button"
@@ -8309,6 +8354,74 @@ export function SettingsPanel({
                 </div>
               </section>
             </section>
+          ) : null}
+
+          {activeSection === "workspaces" && pendingDeleteWorkspace ? (
+            <>
+              <button
+                aria-label={t("Close workspace delete confirmation backdrop")}
+                className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                onClick={() => setPendingDeleteWorkspace(null)}
+                type="button"
+              />
+              <section
+                aria-labelledby="delete-workspace-dialog-title"
+                aria-modal="true"
+                className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                role="dialog"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3
+                      className="text-base font-semibold text-stone-950"
+                      id="delete-workspace-dialog-title"
+                    >
+                      {t("Delete workspace?")}
+                    </h3>
+                    <p className="mt-1 text-sm font-medium text-stone-950">
+                      {pendingDeleteWorkspace.name}
+                    </p>
+                    <p className="mt-2 text-sm leading-6 text-stone-600">
+                      {t("Delete workspace confirmation", {
+                        name: pendingDeleteWorkspace.name,
+                      })}
+                    </p>
+                  </div>
+                  <button
+                    aria-label={t("Cancel workspace deletion")}
+                    className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={() => setPendingDeleteWorkspace(null)}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button
+                    className="inline-flex min-h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 hover:border-stone-300 hover:bg-stone-50"
+                    onClick={() => setPendingDeleteWorkspace(null)}
+                    type="button"
+                  >
+                    {t("Cancel")}
+                  </button>
+                  <button
+                    aria-label={t("Confirm delete workspace")}
+                    className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-rose-700 px-3 py-2 text-sm font-semibold text-white shadow-[0_12px_28px_rgba(190,18,60,0.22)] hover:bg-rose-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    disabled={deletingWorkspaceId === pendingDeleteWorkspace.id}
+                    onClick={() => void deleteConfiguredWorkspace(pendingDeleteWorkspace)}
+                    type="button"
+                  >
+                    {deletingWorkspaceId === pendingDeleteWorkspace.id ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Trash2 aria-hidden="true" className="size-4" />
+                    )}
+                    <span>{t("Delete workspace")}</span>
+                  </button>
+                </div>
+              </section>
+            </>
           ) : null}
 
           {activeSection === "hooks" ? (

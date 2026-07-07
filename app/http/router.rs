@@ -7,7 +7,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 
 use crate::{
@@ -36,6 +36,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/manual",
             post(crate::http::workspaces::save_workspace_settings),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}",
+            delete(crate::http::workspaces::delete_workspace),
         )
         .route(
             "/api/workspaces/order",

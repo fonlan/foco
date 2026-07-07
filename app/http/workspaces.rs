@@ -958,6 +958,28 @@ pub(crate) async fn save_workspace_settings(
     settings_response(&state, &config).await
 }
 
+pub(crate) async fn delete_workspace(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let removed = delete_configured_workspace(&mut config, &workspace_id)?;
+    let remote_server_id = removed.server_id().map(str::to_string);
+
+    save_config(&state, config.clone())?;
+    if let Some(server_id) = remote_server_id {
+        let _ = state
+            .remote_workspace_manager
+            .disconnect_workspace(&server_id, &removed.id)
+            .await;
+    }
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+
+    settings_response(&state, &config).await
+}
+
 pub(crate) async fn save_workspace_order(
     State(state): State<AppState>,
     Json(request): Json<WorkspaceOrderRequest>,

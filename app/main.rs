@@ -7239,6 +7239,39 @@ fn reorder_workspaces(
     Ok(())
 }
 
+fn delete_configured_workspace(
+    config: &mut GlobalConfig,
+    workspace_id: &str,
+) -> Result<WorkspaceConfig, ApiError> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err(ApiError::bad_request("workspace id must not be empty"));
+    }
+    if config.workspaces.len() <= 1 {
+        return Err(ApiError::bad_request(
+            "at least one workspace must remain configured",
+        ));
+    }
+
+    let index = config
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+    let removed = config.workspaces.remove(index);
+
+    if config.app.active_workspace_id == removed.id {
+        config.app.active_workspace_id = config
+            .workspaces
+            .first()
+            .expect("last workspace deletion is rejected")
+            .id
+            .clone();
+    }
+
+    Ok(removed)
+}
+
 fn group_pinned_workspaces(workspaces: &mut Vec<WorkspaceConfig>) {
     let mut pinned = Vec::new();
     let mut unpinned = Vec::new();

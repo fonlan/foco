@@ -3321,6 +3321,33 @@ fn reorder_workspaces_requires_complete_unique_existing_ids() {
 }
 
 #[test]
+fn delete_configured_workspace_updates_active_workspace_and_keeps_one_workspace() {
+    let mut config =
+        GlobalConfig::first_run(env::temp_dir().join(unique_id("foco-delete-workspace-default")));
+    config.workspaces = vec![
+        test_workspace_config("default"),
+        test_workspace_config("side"),
+        test_workspace_config("archive"),
+    ];
+    config.app.active_workspace_id = "side".to_string();
+
+    let removed =
+        delete_configured_workspace(&mut config, "side").expect("workspace should be deleted");
+    assert_eq!(removed.id, "side");
+    assert_eq!(
+        workspace_ids(&config.workspaces),
+        vec!["default", "archive"]
+    );
+    assert_eq!(config.app.active_workspace_id, "default");
+
+    delete_configured_workspace(&mut config, "archive").expect("second workspace can be deleted");
+    let error = delete_configured_workspace(&mut config, "default")
+        .expect_err("last workspace cannot be deleted");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("one workspace"));
+}
+
+#[test]
 fn group_pinned_workspaces_keeps_group_order() {
     let mut workspaces = vec![
         test_workspace_config("first"),
