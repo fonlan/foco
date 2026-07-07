@@ -3799,6 +3799,7 @@ export function App() {
 
       setWorkspaces(data.workspaces);
       setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
+      void loadSettings();
       setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       setExpandedWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       updateBrowserRoute({

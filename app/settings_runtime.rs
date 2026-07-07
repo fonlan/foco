@@ -758,7 +758,7 @@ pub(crate) fn workspace_response_from_config(
                 remote_path: remote.remote_path,
                 connection_status: remote.connection_status,
                 last_remote_error: remote.last_remote_error,
-                logo_url: None,
+                logo_url: workspace_logo_url(workspace)?,
                 pinned: workspace.pinned,
                 terminal_shell: workspace.terminal_shell.clone(),
                 common_commands: workspace_common_command_summaries(&workspace.common_commands),

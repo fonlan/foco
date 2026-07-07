@@ -13028,6 +13028,65 @@ async fn add_workspace_allows_empty_logo_content() {
 }
 
 #[tokio::test]
+async fn add_remote_workspace_with_logo_returns_logo_url() {
+    let existing_workspace_dir =
+        env::temp_dir().join(unique_id("foco-existing-remote-logo-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-add-remote-logo-profile-test"));
+
+    fs::create_dir_all(&existing_workspace_dir).expect("existing workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+
+    let mut config = GlobalConfig::first_run(existing_workspace_dir.clone());
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "remote-server".to_string(),
+            name: "Remote Server".to_string(),
+            host_alias: "remote.example".to_string(),
+            sidecar_install_state: Some("available".to_string()),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    let state = test_app_state(config, profile_dir.clone());
+
+    let response = add_workspace(
+        State(state),
+        Json(WorkspacePathRequest {
+            name: "Remote Workspace".to_string(),
+            path: "/srv/remote-workspace".to_string(),
+            server_id: Some("remote-server".to_string()),
+            remote_path: Some("/srv/remote-workspace".to_string()),
+            terminal_shell: None,
+            content_base64: Some(
+                general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            ),
+        }),
+    )
+    .await
+    .expect("add remote workspace");
+
+    let response = response.0;
+    let response_workspace = response
+        .workspaces
+        .first()
+        .expect("response workspace first");
+    assert_eq!(response_workspace.name, "Remote Workspace");
+    assert!(
+        response_workspace
+            .logo_url
+            .as_deref()
+            .is_some_and(|logo_url| {
+                logo_url.starts_with(&format!(
+                    "/api/workspaces/{}/logo/thumbnail?v=",
+                    response_workspace.id
+                ))
+            })
+    );
+
+    remove_dir_if_exists(&existing_workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn create_terminal_session_defaults_to_workspace_directory() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-terminal-workspace-test"));
     let nested_dir = workspace_dir.join("nested");
