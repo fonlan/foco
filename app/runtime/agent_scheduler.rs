@@ -1831,12 +1831,170 @@ fn fail_claimed_task(
 
 fn agent_task_outcome_json(value: &Value, field: &'static str) -> Result<String, ApiError> {
     let json = value.to_string();
-    if json.len() > AGENT_MAX_TASK_OUTCOME_BYTES {
-        return Err(ApiError::internal(format!(
-            "Agent task {field} exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
-        )));
+    if json.len() <= AGENT_MAX_TASK_OUTCOME_BYTES {
+        return Ok(json);
     }
-    Ok(json)
+    if field == "result_json" {
+        return compact_agent_task_result_json(value, json.len());
+    }
+    Err(ApiError::internal(format!(
+        "Agent task {field} exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
+    )))
+}
+
+fn compact_agent_task_result_json(
+    value: &Value,
+    original_bytes: usize,
+) -> Result<String, ApiError> {
+    let mut compacted = value.clone();
+    let Some(object) = compacted.as_object_mut() else {
+        return Err(ApiError::internal(format!(
+            "Agent task result_json exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
+        )));
+    };
+    let mut truncated_fields = Vec::new();
+
+    if object
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .is_some_and(|reasoning| !reasoning.is_empty())
+    {
+        object.insert("reasoning".to_string(), Value::String(String::new()));
+        truncated_fields.push(Value::String("reasoning".to_string()));
+    }
+    mark_agent_task_result_truncated(object, original_bytes, &truncated_fields);
+    if let Some(json) = agent_task_json_if_within_limit(&compacted) {
+        return Ok(json);
+    }
+
+    if truncate_agent_task_string_field_to_fit(&mut compacted, "text", &mut truncated_fields) {
+        if let Some(object) = compacted.as_object_mut() {
+            mark_agent_task_result_truncated(object, original_bytes, &truncated_fields);
+        }
+        if let Some(json) = agent_task_json_if_within_limit(&compacted) {
+            return Ok(json);
+        }
+    }
+
+    compact_agent_task_worktree(&mut compacted, &mut truncated_fields);
+    if let Some(object) = compacted.as_object_mut() {
+        mark_agent_task_result_truncated(object, original_bytes, &truncated_fields);
+    }
+    if let Some(json) = agent_task_json_if_within_limit(&compacted) {
+        return Ok(json);
+    }
+
+    let fallback = json!({
+        "text": "",
+        "reasoning": "",
+        "usage": value.get("usage").cloned().unwrap_or(Value::Null),
+        "worktree": compacted.get("worktree").cloned().unwrap_or(Value::Null),
+        "truncated": true,
+        "truncatedFields": ["reasoning", "text", "worktree"],
+        "originalBytes": original_bytes,
+    });
+    agent_task_json_if_within_limit(&fallback).ok_or_else(|| {
+        ApiError::internal(format!(
+            "Agent task result_json exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes after compaction"
+        ))
+    })
+}
+
+fn mark_agent_task_result_truncated(
+    object: &mut serde_json::Map<String, Value>,
+    original_bytes: usize,
+    truncated_fields: &[Value],
+) {
+    object.insert("truncated".to_string(), Value::Bool(true));
+    object.insert("originalBytes".to_string(), json!(original_bytes));
+    object.insert(
+        "truncatedFields".to_string(),
+        Value::Array(truncated_fields.to_vec()),
+    );
+}
+
+fn agent_task_json_if_within_limit(value: &Value) -> Option<String> {
+    let json = value.to_string();
+    (json.len() <= AGENT_MAX_TASK_OUTCOME_BYTES).then_some(json)
+}
+
+fn truncate_agent_task_string_field_to_fit(
+    value: &mut Value,
+    field: &'static str,
+    truncated_fields: &mut Vec<Value>,
+) -> bool {
+    let Some(original) = value.get(field).and_then(Value::as_str).map(str::to_string) else {
+        return false;
+    };
+    if original.is_empty() {
+        return false;
+    }
+
+    truncated_fields.push(Value::String(field.to_string()));
+    if let Some(fields) = value
+        .get_mut("truncatedFields")
+        .and_then(Value::as_array_mut)
+    {
+        fields.push(Value::String(field.to_string()));
+    }
+
+    let mut low = 0usize;
+    let mut high = original.len();
+    let mut best = String::new();
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = truncated_agent_task_text(&original, mid);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(field.to_string(), Value::String(candidate.clone()));
+        }
+        if agent_task_json_if_within_limit(value).is_some() {
+            best = candidate;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(field.to_string(), Value::String(best));
+    }
+    true
+}
+
+fn truncated_agent_task_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[truncated to fit agent task result_json]",
+        &value[..end]
+    )
+}
+
+fn compact_agent_task_worktree(value: &mut Value, truncated_fields: &mut Vec<Value>) {
+    let Some(worktree) = value.get_mut("worktree").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(changed_paths) = worktree.get("changedPaths").and_then(Value::as_array) else {
+        return;
+    };
+    let original_count = changed_paths.len();
+    if original_count <= 32 {
+        return;
+    }
+    let kept = changed_paths.iter().take(32).cloned().collect::<Vec<_>>();
+    worktree.insert("changedPaths".to_string(), Value::Array(kept));
+    worktree.insert("changedPathsTruncated".to_string(), Value::Bool(true));
+    worktree.insert(
+        "originalChangedPathCount".to_string(),
+        json!(original_count),
+    );
+    truncated_fields.push(Value::String("worktree.changedPaths".to_string()));
 }
 
 pub(crate) fn validate_agent_snapshot_for_workspace(
@@ -1962,11 +2120,51 @@ mod tests {
     }
 
     #[test]
-    fn agent_task_outcome_json_rejects_oversized_payload() {
-        assert!(agent_task_outcome_json(&json!({ "text": "ok" }), "result_json").is_ok());
+    fn agent_task_outcome_json_compacts_large_result_reasoning_first() {
+        let text = "phase completed";
+        let oversized = json!({
+            "text": text,
+            "reasoning": "r".repeat(AGENT_MAX_TASK_OUTCOME_BYTES),
+            "usage": { "totalTokens": 1 },
+        });
 
-        let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
-        assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
+        let compacted =
+            agent_task_outcome_json(&oversized, "result_json").expect("compacted result");
+        assert!(compacted.len() <= AGENT_MAX_TASK_OUTCOME_BYTES);
+        let value = serde_json::from_str::<Value>(&compacted).expect("valid json");
+        assert_eq!(value["text"], json!(text));
+        assert_eq!(value["reasoning"], json!(""));
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value["truncatedFields"], json!(["reasoning"]));
+    }
+
+    #[test]
+    fn agent_task_outcome_json_truncates_text_if_reasoning_is_not_enough() {
+        let oversized = json!({
+            "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES),
+            "reasoning": "r".repeat(AGENT_MAX_TASK_OUTCOME_BYTES),
+            "usage": { "totalTokens": 1 },
+        });
+
+        let compacted =
+            agent_task_outcome_json(&oversized, "result_json").expect("compacted result");
+        assert!(compacted.len() <= AGENT_MAX_TASK_OUTCOME_BYTES);
+        let value = serde_json::from_str::<Value>(&compacted).expect("valid json");
+        assert_eq!(value["reasoning"], json!(""));
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value["truncatedFields"], json!(["reasoning", "text"]));
+        assert!(
+            value["text"]
+                .as_str()
+                .expect("text")
+                .contains("[truncated to fit agent task result_json]")
+        );
+    }
+
+    #[test]
+    fn agent_task_outcome_json_still_rejects_oversized_error_payload() {
+        let oversized = json!({ "message": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
+        assert!(agent_task_outcome_json(&oversized, "error_json").is_err());
     }
 
     #[test]
