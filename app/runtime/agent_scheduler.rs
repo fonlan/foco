@@ -580,6 +580,7 @@ async fn run_coordinator_task_inner(
         &task,
         attempt_id,
         &allowed_tools,
+        task_input.collaboration_tools_enabled,
         &collaboration_permissions,
         &config.agent_definitions,
     )?;
@@ -695,6 +696,7 @@ fn apply_agent_prompt_layers(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
+    collaboration_tools_enabled: bool,
     collaboration_permissions: &AgentPermissions,
     agent_definitions: &[AgentDefinitionSettings],
 ) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
@@ -743,12 +745,13 @@ fn apply_agent_prompt_layers(
         .collect::<Result<Vec<_>, _>>()?;
     drop(database);
 
+    let agent_prompt_role = agent_prompt_role(collaboration_tools_enabled);
     let definition_index = agent_definition_insert_index(chat_context);
     insert_agent_prompt_message(
         chat_context,
         definition_index,
         neutral_agent_message(
-            NeutralChatRole::System,
+            agent_prompt_role.clone(),
             instance
                 .definition_snapshot
                 .system_prompt
@@ -764,13 +767,14 @@ fn apply_agent_prompt_layers(
         chat_context,
         protocol_index,
         neutral_agent_message(
-            NeutralChatRole::System,
+            agent_prompt_role,
             agent_team_protocol_prompt(
                 team,
                 instance,
                 task,
                 attempt_id,
                 allowed_tools,
+                collaboration_tools_enabled,
                 collaboration_permissions,
                 agent_definitions,
                 &team_instances,
@@ -795,7 +799,7 @@ fn apply_agent_prompt_layers(
 
     let current_task =
         agent_current_task_prompt(task, attempt_id, &wait_dependencies, &wait_dependency_tasks)?;
-    let index = chat_context.active_tool_start_index;
+    let index = agent_current_task_insert_index(chat_context);
     insert_agent_prompt_message(
         chat_context,
         index,
@@ -807,7 +811,7 @@ fn apply_agent_prompt_layers(
     );
 
     for message in agent_wait_resume_messages(&wait_dependencies, &wait_dependency_tasks)? {
-        let index = chat_context.active_tool_start_index;
+        let index = agent_current_task_insert_index(chat_context);
         insert_agent_prompt_message(
             chat_context,
             index,
@@ -861,6 +865,14 @@ fn validate_agent_definition_system_prompt(instance: &AgentInstanceRecord) -> Re
     Ok(())
 }
 
+fn agent_prompt_role(collaboration_tools_enabled: bool) -> NeutralChatRole {
+    if collaboration_tools_enabled {
+        NeutralChatRole::Developer
+    } else {
+        NeutralChatRole::System
+    }
+}
+
 fn agent_definition_insert_index(chat_context: &PreparedChatContext) -> usize {
     chat_context
         .message_context_sources
@@ -888,6 +900,23 @@ fn agent_team_protocol_insert_index_for_sources(
                 PromptContextSource::ReservedPrompt | PromptContextSource::AgentDefinition
             )
         })
+        .unwrap_or(fallback_index)
+}
+
+fn agent_current_task_insert_index(chat_context: &PreparedChatContext) -> usize {
+    agent_current_task_insert_index_for_sources(
+        &chat_context.message_context_sources,
+        chat_context.active_tool_start_index,
+    )
+}
+
+fn agent_current_task_insert_index_for_sources(
+    message_context_sources: &[PromptContextSource],
+    fallback_index: usize,
+) -> usize {
+    message_context_sources
+        .iter()
+        .position(|source| matches!(source, PromptContextSource::CurrentUser { .. }))
         .unwrap_or(fallback_index)
 }
 
@@ -972,6 +1001,7 @@ fn agent_team_protocol_prompt(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
+    collaboration_tools_enabled: bool,
     collaboration_permissions: &AgentPermissions,
     agent_definitions: &[AgentDefinitionSettings],
     team_instances: &[AgentInstanceRecord],
@@ -1022,11 +1052,16 @@ fn agent_team_protocol_prompt(
     let protocol_json = serde_json::to_string_pretty(&protocol).map_err(|source| {
         ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
     })?;
-    Ok(format!(
-        "{}\n{}",
-        build_subagents_prompt_section(),
-        markdown_json_section("Agent Team Protocol", &protocol_json)
-    ))
+    let protocol_section = markdown_json_section("Agent Team Protocol", &protocol_json);
+    if collaboration_tools_enabled {
+        Ok(format!(
+            "{}\n{}",
+            build_subagents_prompt_section(),
+            protocol_section
+        ))
+    } else {
+        Ok(protocol_section)
+    }
 }
 
 fn creatable_agent_definitions_prompt(
@@ -2356,6 +2391,109 @@ mod tests {
         assert_eq!(input["queuedUserMessageId"], json!("msg-1"));
     }
 
+    #[test]
+    fn agent_prompt_role_uses_developer_only_for_collaboration_tools() {
+        assert_eq!(agent_prompt_role(true), NeutralChatRole::Developer);
+        assert_eq!(agent_prompt_role(false), NeutralChatRole::System);
+    }
+
+    #[test]
+    fn agent_current_task_inserts_before_current_user_and_preserves_order() {
+        let mut sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::AgentDefinition,
+            PromptContextSource::CurrentUser { sequence: 7 },
+        ];
+        let first_index = agent_current_task_insert_index_for_sources(&sources, sources.len());
+        sources.insert(
+            first_index,
+            PromptContextSource::AgentCurrentTask { sequence: 0 },
+        );
+        let second_index = agent_current_task_insert_index_for_sources(&sources, sources.len());
+        sources.insert(
+            second_index,
+            PromptContextSource::AgentCurrentTask { sequence: 0 },
+        );
+
+        assert_eq!(first_index, 2);
+        assert_eq!(second_index, 3);
+        assert!(matches!(
+            sources.last(),
+            Some(PromptContextSource::CurrentUser { sequence: 7 })
+        ));
+    }
+
+    #[test]
+    fn agent_current_task_insert_index_falls_back_without_current_user() {
+        let sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::AgentDefinition,
+            PromptContextSource::StableInjection,
+        ];
+
+        assert_eq!(agent_current_task_insert_index_for_sources(&sources, 9), 9);
+    }
+
+    #[test]
+    fn team_protocol_omits_subagents_when_collaboration_tools_are_disabled() {
+        let definition = test_agent_definition("solo", 1);
+        let team_id = foco_agent::AgentTeamId::new("agent-team-solo").expect("team id");
+        let instance_id =
+            foco_agent::AgentInstanceId::new("agent-instance-solo").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-solo").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-solo").expect("attempt id");
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let team = AgentTeamRecord {
+            id: team_id.clone(),
+            chat_id: "chat-solo".to_string(),
+            coordinator_instance_id: instance_id.clone(),
+            status: foco_agent::AgentTeamStatus::Active,
+            max_concurrent_runs: 1,
+            next_event_sequence: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let instance = test_agent_instance(
+            &team_id,
+            &instance_id,
+            definition.clone(),
+            AgentRole::Coordinator,
+            &now,
+        );
+        let task = AgentTaskRecord {
+            id: task_id,
+            team_id: team_id.clone(),
+            owner_instance_id: instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            sequence: 0,
+            status: AgentTaskStatus::Running,
+            input_json: "{}".to_string(),
+            result_json: None,
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now),
+            completed_at: None,
+        };
+
+        let prompt = agent_team_protocol_prompt(
+            &team,
+            &instance,
+            &task,
+            &attempt_id,
+            &HashSet::new(),
+            false,
+            &AgentPermissions::default(),
+            &[definition],
+            &[instance.clone()],
+        )
+        .expect("protocol prompt");
+
+        assert!(!prompt.contains("## Subagents"));
+        assert!(prompt.starts_with("## Agent Team Protocol"));
+    }
+
     fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {
         assert!(prompt.contains("## Subagents"));
         let protocol_prompt = prompt
@@ -2451,6 +2589,7 @@ mod tests {
             &task,
             &attempt_id,
             &HashSet::new(),
+            true,
             &permissions,
             &[coordinator_definition, worker_definition],
             &[coordinator.clone(), worker],
@@ -2555,6 +2694,7 @@ mod tests {
             &task,
             &attempt_id,
             &HashSet::new(),
+            true,
             &permissions,
             &[coordinator_definition],
             &[coordinator.clone(), worker],
