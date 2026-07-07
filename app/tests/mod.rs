@@ -3691,22 +3691,91 @@ fn context_message_groups_do_not_double_count_reserved_prompt_tokens() {
 fn context_token_breakdown_handles_every_source_bucket() {
     // Guards against a repeat of the panic where a source bucket existed on the
     // enum but was missing from the SOURCES list inside context_token_breakdown.
-    for bucket in [
-        PromptContextSourceBucket::ReservedPrompt,
-        PromptContextSourceBucket::StableInjection,
-        PromptContextSourceBucket::ProjectSpec,
-        PromptContextSourceBucket::TodoGraph,
-        PromptContextSourceBucket::CompressionSnapshot,
-        PromptContextSourceBucket::PersistedHistory,
-        PromptContextSourceBucket::TurnMemory,
-        PromptContextSourceBucket::CurrentUser,
-        PromptContextSourceBucket::AssistantDraft,
-        PromptContextSourceBucket::HookContext,
-        PromptContextSourceBucket::Guidance,
-        PromptContextSourceBucket::RuntimeGuard,
-        PromptContextSourceBucket::RuntimeAssistant,
-        PromptContextSourceBucket::RuntimeToolState,
-        PromptContextSourceBucket::RuntimeToolStateSnapshot,
+    for (bucket, expected_source) in [
+        (
+            PromptContextSourceBucket::ReservedPrompt,
+            PromptContextSourceBucket::ReservedPrompt,
+        ),
+        (
+            PromptContextSourceBucket::AgentDefinition,
+            PromptContextSourceBucket::AgentDefinition,
+        ),
+        (
+            PromptContextSourceBucket::AgentTeamProtocol,
+            PromptContextSourceBucket::AgentTeamProtocol,
+        ),
+        (
+            PromptContextSourceBucket::StableInjection,
+            PromptContextSourceBucket::StableInjection,
+        ),
+        (
+            PromptContextSourceBucket::ProjectSpec,
+            PromptContextSourceBucket::ProjectSpec,
+        ),
+        (
+            PromptContextSourceBucket::TodoGraph,
+            PromptContextSourceBucket::ToolCalls,
+        ),
+        (
+            PromptContextSourceBucket::ToolCalls,
+            PromptContextSourceBucket::ToolCalls,
+        ),
+        (
+            PromptContextSourceBucket::CompressionSnapshot,
+            PromptContextSourceBucket::CompressionSnapshot,
+        ),
+        (
+            PromptContextSourceBucket::AgentPrivateContext,
+            PromptContextSourceBucket::AgentPrivateContext,
+        ),
+        (
+            PromptContextSourceBucket::PersistedHistory,
+            PromptContextSourceBucket::PersistedHistory,
+        ),
+        (
+            PromptContextSourceBucket::TurnMemory,
+            PromptContextSourceBucket::TurnMemory,
+        ),
+        (
+            PromptContextSourceBucket::CurrentUser,
+            PromptContextSourceBucket::CurrentUser,
+        ),
+        (
+            PromptContextSourceBucket::AgentCurrentTask,
+            PromptContextSourceBucket::AgentCurrentTask,
+        ),
+        (
+            PromptContextSourceBucket::AgentUnreadMessage,
+            PromptContextSourceBucket::AgentUnreadMessage,
+        ),
+        (
+            PromptContextSourceBucket::AssistantDraft,
+            PromptContextSourceBucket::AssistantDraft,
+        ),
+        (
+            PromptContextSourceBucket::HookContext,
+            PromptContextSourceBucket::HookContext,
+        ),
+        (
+            PromptContextSourceBucket::Guidance,
+            PromptContextSourceBucket::Guidance,
+        ),
+        (
+            PromptContextSourceBucket::RuntimeGuard,
+            PromptContextSourceBucket::RuntimeGuard,
+        ),
+        (
+            PromptContextSourceBucket::RuntimeAssistant,
+            PromptContextSourceBucket::RuntimeAssistant,
+        ),
+        (
+            PromptContextSourceBucket::RuntimeToolState,
+            PromptContextSourceBucket::ToolCalls,
+        ),
+        (
+            PromptContextSourceBucket::RuntimeToolStateSnapshot,
+            PromptContextSourceBucket::ToolCalls,
+        ),
     ] {
         let groups = vec![ContextMessageGroup {
             message_indices: vec![0],
@@ -3719,11 +3788,63 @@ fn context_token_breakdown_handles_every_source_bucket() {
         let entry = breakdown
             .by_source
             .iter()
-            .find(|entry| entry.source == bucket)
+            .find(|entry| entry.source == expected_source)
             .unwrap_or_else(|| panic!("source bucket {:?} missing from breakdown", bucket));
         assert_eq!(entry.tokens, 10);
         assert_eq!(entry.required_tokens, 10);
     }
+}
+
+#[test]
+fn context_token_breakdown_groups_tool_related_sources_as_tool_calls() {
+    let groups = vec![
+        ContextMessageGroup {
+            message_indices: vec![0],
+            estimated_tokens: 10,
+            must_keep: true,
+            source_bucket: PromptContextSourceBucket::TodoGraph,
+            runtime_tool_batch_index: None,
+        },
+        ContextMessageGroup {
+            message_indices: vec![1],
+            estimated_tokens: 20,
+            must_keep: false,
+            source_bucket: PromptContextSourceBucket::RuntimeToolState,
+            runtime_tool_batch_index: Some(0),
+        },
+        ContextMessageGroup {
+            message_indices: vec![2],
+            estimated_tokens: 30,
+            must_keep: false,
+            source_bucket: PromptContextSourceBucket::RuntimeToolStateSnapshot,
+            runtime_tool_batch_index: None,
+        },
+    ];
+
+    let breakdown = context_token_breakdown(&groups);
+    assert_eq!(
+        breakdown
+            .by_source
+            .iter()
+            .filter(|entry| entry.source == PromptContextSourceBucket::ToolCalls)
+            .count(),
+        1
+    );
+    let tool_calls = breakdown
+        .by_source
+        .iter()
+        .find(|entry| entry.source == PromptContextSourceBucket::ToolCalls)
+        .expect("tool calls breakdown");
+    assert_eq!(tool_calls.tokens, 60);
+    assert_eq!(tool_calls.required_tokens, 10);
+    assert_eq!(tool_calls.optional_tokens, 50);
+    assert_eq!(tool_calls.compressible_tokens, 20);
+    assert!(!breakdown.by_source.iter().any(|entry| matches!(
+        entry.source,
+        PromptContextSourceBucket::TodoGraph
+            | PromptContextSourceBucket::RuntimeToolState
+            | PromptContextSourceBucket::RuntimeToolStateSnapshot
+    )));
 }
 
 #[test]

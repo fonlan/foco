@@ -2718,6 +2718,8 @@ describe("app-panels-stats verification surfaces", () => {
     expect(contextMix.querySelector(".context-stats-rows")).toBeNull();
     expect(within(contextMix).getAllByText("History")).toHaveLength(1);
     expect(within(contextMix).getAllByText("Current user")).toHaveLength(1);
+    expect(within(contextMix).getAllByText("Tools")).toHaveLength(1);
+    expect(within(contextMix).queryByText("ToDo")).not.toBeInTheDocument();
     expect(within(contextMix).getAllByText("32,000")).toHaveLength(1);
 
     await act(async () => {

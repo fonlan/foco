@@ -2287,6 +2287,7 @@ enum PromptContextSourceBucket {
     Guidance,
     RuntimeGuard,
     RuntimeAssistant,
+    ToolCalls,
     RuntimeToolState,
     RuntimeToolStateSnapshot,
 }

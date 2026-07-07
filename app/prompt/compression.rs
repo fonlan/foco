@@ -1881,7 +1881,7 @@ pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> Context
         PromptContextSourceBucket::AgentTeamProtocol,
         PromptContextSourceBucket::StableInjection,
         PromptContextSourceBucket::ProjectSpec,
-        PromptContextSourceBucket::TodoGraph,
+        PromptContextSourceBucket::ToolCalls,
         PromptContextSourceBucket::CompressionSnapshot,
         PromptContextSourceBucket::AgentPrivateContext,
         PromptContextSourceBucket::PersistedHistory,
@@ -1894,8 +1894,6 @@ pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> Context
         PromptContextSourceBucket::Guidance,
         PromptContextSourceBucket::RuntimeGuard,
         PromptContextSourceBucket::RuntimeAssistant,
-        PromptContextSourceBucket::RuntimeToolState,
-        PromptContextSourceBucket::RuntimeToolStateSnapshot,
     ];
 
     let mut by_source = SOURCES
@@ -1911,9 +1909,10 @@ pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> Context
         .collect::<Vec<_>>();
 
     for group in groups {
+        let source = context_token_breakdown_source_bucket(group.source_bucket);
         let entry = by_source
             .iter_mut()
-            .find(|entry| entry.source == group.source_bucket)
+            .find(|entry| entry.source == source)
             .expect("all prompt context source buckets must be listed");
         entry.tokens = entry.tokens.saturating_add(group.estimated_tokens);
         if group.must_keep {
@@ -1949,6 +1948,19 @@ pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> Context
         optional_tokens,
         compressible_tokens,
         by_source,
+    }
+}
+
+fn context_token_breakdown_source_bucket(
+    source: PromptContextSourceBucket,
+) -> PromptContextSourceBucket {
+    match source {
+        PromptContextSourceBucket::TodoGraph
+        | PromptContextSourceBucket::RuntimeToolState
+        | PromptContextSourceBucket::RuntimeToolStateSnapshot => {
+            PromptContextSourceBucket::ToolCalls
+        }
+        source => source,
     }
 }
 
@@ -2016,6 +2028,7 @@ pub(crate) fn prompt_context_source_bucket_label(
         PromptContextSourceBucket::Guidance => "guidance",
         PromptContextSourceBucket::RuntimeGuard => "runtimeGuard",
         PromptContextSourceBucket::RuntimeAssistant => "runtimeAssistant",
+        PromptContextSourceBucket::ToolCalls => "toolCalls",
         PromptContextSourceBucket::RuntimeToolState => "runtimeToolState",
         PromptContextSourceBucket::RuntimeToolStateSnapshot => "runtimeToolStateSnapshot",
     }

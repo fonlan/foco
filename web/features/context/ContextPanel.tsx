@@ -3447,10 +3447,11 @@ function contextSourceLabel(source: string, t: Translate) {
     projectSpec: t("Project Spec"),
     reservedPrompt: t("Prompt"),
     runtimeAssistant: t("Runtime assistant"),
-    runtimeToolState: t("Runtime tools"),
-    runtimeToolStateSnapshot: t("Tool snapshot"),
+    runtimeToolState: t("Tools"),
+    runtimeToolStateSnapshot: t("Tools"),
     stableInjection: t("Stable context"),
-    todoGraph: t("ToDo"),
+    todoGraph: t("Tools"),
+    toolCalls: t("Tools"),
     turnMemory: t("Memory"),
   };
 
