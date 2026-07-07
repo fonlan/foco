@@ -100,7 +100,7 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "About" }));
     expect(screen.getByText("About Foco")).toBeInTheDocument();
-    expect(screen.getAllByText("0.1.6").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("0.1.7").length).toBeGreaterThan(0);
     const githubLink = screen.getByRole("link", {
       name: "Open GitHub repository",
     });
@@ -1816,7 +1816,7 @@ describe("app-settings verification surfaces", () => {
               reasoning: true,
               refreshedAt: "2026-06-05T10:00:00Z",
               sourceUrl: "https://models.dev/api.json",
-              supportedThinkingLevels: [],
+              supportedThinkingLevels: ["low", "high"],
               supportsCache: true,
               supportsTools: true,
             },

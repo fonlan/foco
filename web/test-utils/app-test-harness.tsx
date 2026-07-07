@@ -140,9 +140,9 @@ export const secondaryWorkspace = {
 
 export const settings = {
   about: {
-    version: "0.1.6",
+    version: "0.1.7",
   },
-  appVersion: "0.1.6",
+  appVersion: "0.1.7",
   agentTools: [
     "ask_question",
     "edit_file",
@@ -419,7 +419,7 @@ export const settings = {
     assetName: null as string | null,
     autoCheckEnabled: false,
     checking: false,
-    currentVersion: "0.1.6",
+    currentVersion: "0.1.7",
     error: null as string | null,
     lastCheckedAt: null as string | null,
     publishedAt: null as string | null,
