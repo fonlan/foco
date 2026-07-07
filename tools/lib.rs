@@ -1393,23 +1393,25 @@ mod tests {
     #[test]
     fn strict_tool_schemas_require_every_property() {
         for tool in builtin_tool_definitions() {
-            if !tool.strict {
-                continue;
+            if tool.strict {
+                assert_strict_required_matches_properties(tool.name, &tool.input_schema);
             }
+        }
+    }
 
-            let schema = tool.input_schema.as_object().expect("schema object");
+    fn assert_strict_required_matches_properties(path: &str, schema: &Value) {
+        let Some(schema_object) = schema.as_object() else {
+            return;
+        };
+
+        if let Some(properties_value) = schema_object.get("properties") {
             assert_eq!(
-                schema.get("additionalProperties"),
+                schema_object.get("additionalProperties"),
                 Some(&Value::Bool(false)),
-                "{} schema must reject unknown properties",
-                tool.name
+                "{path} object schema must reject unknown properties"
             );
-
-            let properties = schema
-                .get("properties")
-                .and_then(Value::as_object)
-                .expect("properties object");
-            let required = schema
+            let properties = properties_value.as_object().expect("properties object");
+            let required = schema_object
                 .get("required")
                 .and_then(Value::as_array)
                 .expect("required array");
@@ -1424,9 +1426,19 @@ mod tests {
 
             assert_eq!(
                 required_names, property_names,
-                "{} schema required keys must match properties",
-                tool.name
+                "{path} required keys must match object properties"
             );
+
+            for (name, value) in properties {
+                assert_strict_required_matches_properties(
+                    &format!("{path}.properties.{name}"),
+                    value,
+                );
+            }
+        }
+
+        if let Some(items) = schema_object.get("items") {
+            assert_strict_required_matches_properties(&format!("{path}.items"), items);
         }
     }
 

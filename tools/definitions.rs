@@ -720,7 +720,7 @@ fn create_plan_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["id", "title", "overview", "phases"]
+            "required": ["id", "title", "overview", "status", "sourceChatId", "phases", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1161,7 +1161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_plan_schema_requires_minimum_properties() {
+    fn create_plan_schema_requires_every_property_for_strict_providers() {
         let definition = create_plan_definition();
         let required = definition.input_schema["required"]
             .as_array()
@@ -1170,10 +1170,33 @@ mod tests {
             .map(|value| value.as_str().expect("required string"))
             .collect::<Vec<_>>();
 
-        assert_eq!(required, vec!["id", "title", "overview", "phases"]);
+        assert_eq!(
+            required,
+            vec![
+                "id",
+                "title",
+                "overview",
+                "status",
+                "sourceChatId",
+                "phases",
+                "timeoutMs"
+            ]
+        );
         assert_eq!(
             definition.input_schema["additionalProperties"],
             serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["status"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["sourceChatId"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["timeoutMs"]["type"],
+            json!(["integer", "null"])
         );
     }
 }
