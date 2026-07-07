@@ -54,6 +54,8 @@ assert.match(remoteServersRs, /mkdir -p ~\/\.foco\/sidecars && test -w ~\/\.foco
 assert.match(remoteServersRs, /remote_server_summary_sidecar_install_state/, "summary derives sidecar install state");
 assert.match(remoteServersRs, /server_summary_treats_ready_version_as_available_sidecar/, "stale notInstalled with version is covered");
 assert.match(remoteWorkspaceRs, /"\.foco\/sidecars\/\{\}\/\{\}"/, "sidecar install directory is built under $HOME/.foco");
+assert.match(remoteWorkspaceRs, /tmp=\\"\$bin\.tmp\.\$\$\\"/, "sidecar upload uses per-process temp path");
+assert.doesNotMatch(remoteWorkspaceRs, /cat > \{tmp\}; chmod \+x \{tmp\}/, "sidecar upload does not reuse one shared temp path");
 assert.match(remoteWorkspaceRs, /format!\("\\\"\$HOME\\\"\/\{\}"/, "remote home path keeps $HOME expandable");
 assert.doesNotMatch(remoteWorkspaceRs, /format!\(\s*"~\/\.foco\/sidecars/, "sidecar install path does not use literal tilde");
 assert.match(remoteWorkspaceRs, /session_path=\\"\$dir\//, "session script uses session_path variable");

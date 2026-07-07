@@ -1484,14 +1484,9 @@ async fn ensure_sidecar_command(
             ),
         )
     })?;
-    let remote_tmp = remote_home_shell_path(&format!(
-        ".foco/sidecars/{}/{}/{}.tmp",
-        asset.version, asset.target, SIDECAR_BINARY_NAME
-    ));
     let install_script = format!(
-        "set -e; mkdir -p {dir}; cat > {tmp}; chmod +x {tmp}; mv -f {tmp} {bin}; {bin} --version; {bin} --sidecar-target",
+        "set -e; dir={dir}; bin={bin}; tmp=\"$bin.tmp.$$\"; mkdir -p \"$dir\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; chmod +x \"$tmp\"; mv -f \"$tmp\" \"$bin\"; trap - EXIT; \"$bin\" --version; \"$bin\" --sidecar-target",
         dir = remote_dir,
-        tmp = remote_tmp,
         bin = remote_bin,
     );
     let output = run_ssh_with_stdin(
