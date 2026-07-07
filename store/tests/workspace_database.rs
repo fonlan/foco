@@ -3885,10 +3885,28 @@ fn repository_helpers_round_trip_core_records() {
             .title,
         "First chat"
     );
+    assert!(
+        database
+            .update_chat_title_if_current("chat-1", "First chat", "Generated title")
+            .expect("chat title update")
+    );
+    assert!(
+        !database
+            .update_chat_title_if_current("chat-1", "First chat", "Stale title")
+            .expect("stale chat title update")
+    );
+    assert_eq!(
+        database
+            .chat("chat-1")
+            .expect("updated chat read")
+            .expect("updated chat")
+            .title,
+        "Generated title"
+    );
     let chats = database.chats().expect("chat list");
     assert_eq!(chats.len(), 2);
     assert_eq!(chats[0].title, "Second chat");
-    assert_eq!(chats[1].title, "First chat");
+    assert_eq!(chats[1].title, "Generated title");
     let dream_chats = database
         .dream_transcript_chats()
         .expect("dream transcript chat list");

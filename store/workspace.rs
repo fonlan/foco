@@ -71,6 +71,7 @@ pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
 pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
+    "chat title generation",
     "contextCompression",
     "memory extraction",
     "memory retrieval",
@@ -3507,6 +3508,23 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         Ok(())
+    }
+
+    pub fn update_chat_title_if_current(
+        &mut self,
+        id: &str,
+        current_title: &str,
+        title: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE chats SET title = ?1 WHERE id = ?2 AND title = ?3",
+                params![title, id, current_title],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(updated > 0)
     }
 
     pub fn chat(&self, id: &str) -> Result<Option<ChatRecord>, WorkspaceDatabaseError> {

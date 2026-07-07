@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -12,6 +12,7 @@ use axum::{
     response::sse::{Event, KeepAlive, KeepAliveStream, Sse},
 };
 use foco_store::{
+    config::{CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL, CHAT_TITLE_GENERATION_DISABLED},
     memory::MemoryDatabase,
     workspace::{
         LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
@@ -21,6 +22,7 @@ use foco_store::{
     },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::git_backend::{
@@ -36,6 +38,11 @@ const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "# Default Coding Agent\n\n## Identity\n\nYou are Foco's default coding agent.\n\n## Instructions\n\nComplete simple tasks directly. When agent team tools are available, create and coordinate worker agents only when they materially help with parallel investigation, implementation, review, or verification. After completing non-trivial implementation work, when agent team tools are available, create a review-focused worker agent when practical to independently inspect the diff, run or recommend validation, and surface issues before finalizing.";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
+const CHAT_TITLE_GENERATION_REQUEST_KIND: &str = "chat title generation";
+const CHAT_TITLE_GENERATION_TOOL_NAME: &str = "submit_chat_title";
+const CHAT_TITLE_GENERATION_TIMEOUT_MS: u64 = 15_000;
+const CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 64;
+const CHAT_TITLE_GENERATION_MAX_INPUT_CHARS: usize = 4_000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -390,6 +397,10 @@ pub(crate) enum QueuedChatMessageOrigin {
 }
 
 impl QueuedChatMessageOrigin {
+    fn is_user_direct_chat(&self) -> bool {
+        matches!(self, Self::User)
+    }
+
     fn metadata_value(&self) -> Option<serde_json::Value> {
         match self {
             Self::User => None,
@@ -581,6 +592,12 @@ pub(crate) async fn queue_chat_message_internal(
         .message
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let should_generate_chat_title = should_queue_chat_title_generation(
+        prompt_context.is_new_chat,
+        &origin,
+        chat_title_override.is_some(),
+        &config,
+    );
     let task_attachments = prompt_context
         .attachments
         .iter()
@@ -809,6 +826,23 @@ pub(crate) async fn queue_chat_message_internal(
     if agent_task_id.is_some() && !defer_start {
         state.agent_scheduler.wake()?;
     }
+    if should_generate_chat_title {
+        spawn_chat_title_generation(ChatTitleGenerationInput {
+            config: config.clone(),
+            workspace_id: prompt_context.workspace_id.clone(),
+            workspace_path: prompt_context.workspace_path.clone(),
+            chat_id: chat_id.clone(),
+            placeholder_title: chat_title.clone(),
+            user_message: raw_message.to_string(),
+            attachment_names: prompt_context
+                .attachments
+                .iter()
+                .map(|attachment| attachment.name.clone())
+                .collect(),
+            request_model_id: prompt_context.model_id.clone(),
+            request_provider_id: prompt_context.provider_id.clone(),
+        });
+    }
     let chat = database
         .chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?
@@ -827,6 +861,265 @@ pub(crate) async fn queue_chat_message_internal(
         agent_team_id,
         agent_task_id,
     })
+}
+
+#[derive(Clone)]
+struct ChatTitleGenerationInput {
+    config: GlobalConfig,
+    workspace_id: String,
+    workspace_path: PathBuf,
+    chat_id: String,
+    placeholder_title: String,
+    user_message: String,
+    attachment_names: Vec<String>,
+    request_model_id: String,
+    request_provider_id: String,
+}
+
+pub(crate) fn should_queue_chat_title_generation(
+    is_new_chat: bool,
+    origin: &QueuedChatMessageOrigin,
+    has_chat_title_override: bool,
+    config: &GlobalConfig,
+) -> bool {
+    is_new_chat
+        && origin.is_user_direct_chat()
+        && !has_chat_title_override
+        && config.app.chat_title_generation_model_id.as_deref()
+            != Some(CHAT_TITLE_GENERATION_DISABLED)
+}
+
+fn spawn_chat_title_generation(input: ChatTitleGenerationInput) {
+    tokio::spawn(async move {
+        let workspace_id = input.workspace_id.clone();
+        let chat_id = input.chat_id.clone();
+        if let Err(error) = run_chat_title_generation(input).await {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                chat_id = %chat_id,
+                error = %error.message,
+                "chat title generation failed"
+            );
+        }
+    });
+}
+
+async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<(), ApiError> {
+    let Some((model_id, provider_id, provider_config)) = chat_title_generation_model_selection(
+        &input.config,
+        &input.request_model_id,
+        &input.request_provider_id,
+    )?
+    else {
+        return Ok(());
+    };
+    let request = chat_title_generation_provider_request(
+        &model_id,
+        &input.user_message,
+        &input.attachment_names,
+    );
+    let tool_arguments = audited_provider_tool_request(
+        &input.workspace_path,
+        &input.workspace_id,
+        Some(&input.chat_id),
+        &provider_id,
+        &provider_config,
+        request,
+        CHAT_TITLE_GENERATION_REQUEST_KIND,
+        CHAT_TITLE_GENERATION_TOOL_NAME,
+        "chat title submission tool",
+        CHAT_TITLE_GENERATION_TIMEOUT_MS,
+        0,
+        api_audit_save_details(&input.config),
+    )
+    .await?;
+    let Some(title) = parse_generated_chat_title(&tool_arguments) else {
+        return Ok(());
+    };
+    if title == input.placeholder_title {
+        return Ok(());
+    }
+
+    let mut database = open_workspace_database(&input.workspace_path)?;
+    database
+        .update_chat_title_if_current(&input.chat_id, &input.placeholder_title, &title)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+pub(crate) fn chat_title_generation_model_selection(
+    config: &GlobalConfig,
+    request_model_id: &str,
+    request_provider_id: &str,
+) -> Result<Option<(String, String, foco_providers::ProviderConnectionConfig)>, ApiError> {
+    let configured = config
+        .app
+        .chat_title_generation_model_id
+        .as_deref()
+        .unwrap_or(CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL);
+    if configured == CHAT_TITLE_GENERATION_DISABLED {
+        return Ok(None);
+    }
+
+    let (model_id, provider_id) = if configured == CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL {
+        (request_model_id, request_provider_id)
+    } else {
+        let model = config
+            .models
+            .iter()
+            .find(|model| model.id == configured)
+            .ok_or_else(|| ApiError::bad_request("chat title generation model was not found"))?;
+        if !chat_title_generation_model_available(config, model) {
+            return Err(ApiError::bad_request(
+                "chat title generation model is disabled or unavailable",
+            ));
+        }
+        let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+            ApiError::bad_request("chat title generation model has no active provider")
+        })?;
+        (model.id.as_str(), provider_id)
+    };
+
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request("chat title generation request model was not found")
+        })?;
+    if !model.enabled || !model_outputs_text_for_chat_title(model) {
+        return Err(ApiError::bad_request(
+            "chat title generation request model is disabled or does not output text",
+        ));
+    }
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(
+            "chat title generation provider is not available for the model",
+        ));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::bad_request("chat title generation provider was not found"))?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(
+            "chat title generation provider is disabled",
+        ));
+    }
+
+    Ok(Some((
+        model_id.to_string(),
+        provider_id.to_string(),
+        provider_connection_config(provider)?,
+    )))
+}
+
+fn chat_title_generation_model_available(config: &GlobalConfig, model: &ModelSettings) -> bool {
+    model.enabled
+        && model_outputs_text_for_chat_title(model)
+        && model
+            .active_provider_id
+            .as_ref()
+            .is_some_and(|provider_id| {
+                model.provider_ids.iter().any(|id| id == provider_id)
+                    && config
+                        .providers
+                        .iter()
+                        .any(|provider| provider.enabled && provider.id == *provider_id)
+            })
+}
+
+fn model_outputs_text_for_chat_title(model: &ModelSettings) -> bool {
+    model.output_modalities.is_empty()
+        || model
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "text")
+}
+
+pub(crate) fn chat_title_generation_provider_request(
+    model_id: &str,
+    user_message: &str,
+    attachment_names: &[String],
+) -> foco_providers::NeutralChatRequest {
+    foco_providers::NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(
+                foco_providers::NeutralChatRole::System,
+                "Generate a short title for the user's new chat. Return only by calling the tool. Title language should match the user's message. Keep it under 8 words or 24 CJK characters. Do not include quotes, punctuation padding, or file extensions unless essential."
+                    .to_string(),
+            ),
+            neutral_text_message(
+                foco_providers::NeutralChatRole::User,
+                chat_title_generation_user_input(user_message, attachment_names),
+            ),
+        ],
+        tools: vec![chat_title_generation_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    }
+}
+
+fn chat_title_generation_user_input(user_message: &str, attachment_names: &[String]) -> String {
+    let mut input = format!(
+        "User message:\n{}",
+        truncate_utf8(user_message.trim(), CHAT_TITLE_GENERATION_MAX_INPUT_CHARS)
+    );
+    if !attachment_names.is_empty() {
+        input.push_str("\n\nAttachment names:\n");
+        input.push_str(
+            &attachment_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    input
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let boundary = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &value[..boundary]
+}
+
+fn chat_title_generation_tool_definition() -> foco_providers::NeutralToolDefinition {
+    foco_providers::NeutralToolDefinition {
+        name: CHAT_TITLE_GENERATION_TOOL_NAME.to_string(),
+        description: "Submit exactly one concise generated chat title.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "A concise title for the chat."
+                }
+            },
+            "required": ["title"]
+        }),
+        strict: true,
+    }
+}
+
+fn parse_generated_chat_title(arguments: &Value) -> Option<String> {
+    let title = arguments.get("title")?.as_str()?.trim();
+    let title = title
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
+        .trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 fn configured_agent_definition(

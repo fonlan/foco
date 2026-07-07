@@ -1852,6 +1852,117 @@ fn normalize_chat_title_generation_model_id_accepts_only_available_choices() {
 }
 
 #[test]
+fn chat_title_generation_trigger_is_only_user_new_chat_without_override() {
+    let mut config = GlobalConfig::first_run(env::temp_dir());
+    assert!(crate::http::chat::should_queue_chat_title_generation(
+        true,
+        &crate::http::chat::QueuedChatMessageOrigin::User,
+        false,
+        &config,
+    ));
+    assert!(!crate::http::chat::should_queue_chat_title_generation(
+        false,
+        &crate::http::chat::QueuedChatMessageOrigin::User,
+        false,
+        &config,
+    ));
+    assert!(!crate::http::chat::should_queue_chat_title_generation(
+        true,
+        &crate::http::chat::QueuedChatMessageOrigin::User,
+        true,
+        &config,
+    ));
+    assert!(!crate::http::chat::should_queue_chat_title_generation(
+        true,
+        &crate::http::chat::QueuedChatMessageOrigin::PlanPhase {
+            plan_id: "plan".to_string(),
+            phase_id: "phase".to_string(),
+        },
+        false,
+        &config,
+    ));
+    assert!(!crate::http::chat::should_queue_chat_title_generation(
+        true,
+        &crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
+            task_id: "task".to_string(),
+            run_id: "run".to_string(),
+            trigger_reason: "manual".to_string(),
+        },
+        false,
+        &config,
+    ));
+
+    config.app.chat_title_generation_model_id = Some("disabled".to_string());
+    assert!(!crate::http::chat::should_queue_chat_title_generation(
+        true,
+        &crate::http::chat::QueuedChatMessageOrigin::User,
+        false,
+        &config,
+    ));
+}
+
+#[test]
+fn chat_title_generation_model_selection_uses_configured_model_or_current_chat_model() {
+    let mut config = prompt_test_config(env::temp_dir());
+    config.providers.push(ProviderSettings {
+        id: "title-provider".to_string(),
+        name: "Title Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+    let mut title_model = test_model_settings("title-model");
+    title_model.enabled = true;
+    title_model.provider_ids = vec!["title-provider".to_string()];
+    title_model.active_provider_id = Some("title-provider".to_string());
+    config.models.push(title_model);
+
+    let selected =
+        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
+            .expect("current chat selection")
+            .expect("not disabled");
+    assert_eq!(selected.0, "model");
+    assert_eq!(selected.1, "provider");
+
+    config.app.chat_title_generation_model_id = Some("title-model".to_string());
+    let selected =
+        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
+            .expect("configured model selection")
+            .expect("not disabled");
+    assert_eq!(selected.0, "title-model");
+    assert_eq!(selected.1, "title-provider");
+
+    config.app.chat_title_generation_model_id = Some("disabled".to_string());
+    assert!(
+        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
+            .expect("disabled selection")
+            .is_none()
+    );
+}
+
+#[test]
+fn chat_title_generation_provider_request_uses_tool_only_small_output() {
+    let request = crate::http::chat::chat_title_generation_provider_request(
+        "model",
+        "请帮我修一下远程 sidecar 安装并发的问题",
+        &["debug.log".to_string()],
+    );
+
+    assert_eq!(request.model_id, "model");
+    assert_eq!(request.max_output_tokens, Some(64));
+    assert_eq!(request.thinking_level, None);
+    assert_eq!(request.tools.len(), 1);
+    assert_eq!(request.tools[0].name, "submit_chat_title");
+    assert!(request.messages[1].content.contains("debug.log"));
+}
+
+#[test]
 fn normalize_api_proxy_settings_preserves_updates_and_disables_proxy() {
     let current = ApiProxySettings {
         enabled: true,

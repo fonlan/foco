@@ -8120,6 +8120,7 @@ export function App() {
             usage: liveStatisticsUsage,
           });
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
+          void refreshWorkspaces();
           setChatRunFailed(chatKey, false);
           setChatRunning(chatKey, false);
           setActiveRunInfoForChatKey(chatKey, null);
@@ -9176,6 +9177,7 @@ export function App() {
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
+          void refreshWorkspaces();
           setChatRunFailed(runMessagesKey, false);
           setChatRunning(runMessagesKey, false);
           setRetryRunRequest(null);
