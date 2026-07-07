@@ -11,7 +11,9 @@ import {
 const thinkingLevels: ThinkingLevelSummary[] = [
   { label: "Minimal", value: "minimal" },
   { label: "Low", value: "low" },
+  { label: "Medium", value: "medium" },
   { label: "High", value: "high" },
+  { label: "XHigh", value: "xhigh" },
 ];
 
 function model(overrides: Partial<ConfiguredModelSummary>): ConfiguredModelSummary {
@@ -38,6 +40,22 @@ describe("thinking level helpers", () => {
     expect(thinkingLevelOptionsForModel(model({}), thinkingLevels)).toEqual([
       { label: "Low", value: "low" },
       { label: "High", value: "high" },
+    ]);
+  });
+  it("does not show Minimal when the model only supports low through xhigh", () => {
+    expect(
+      thinkingLevelOptionsForModel(
+        model({
+          id: "gpt-5.5",
+          supportedThinkingLevels: ["low", "medium", "high", "xhigh"],
+        }),
+        thinkingLevels,
+      ),
+    ).toEqual([
+      { label: "Low", value: "low" },
+      { label: "Medium", value: "medium" },
+      { label: "High", value: "high" },
+      { label: "XHigh", value: "xhigh" },
     ]);
   });
 

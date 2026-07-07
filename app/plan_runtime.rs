@@ -95,7 +95,7 @@ pub(crate) async fn transition_plan_action(
     }
 
     let config = config_snapshot(state)?;
-    let _selection = plan_runner_model_selection(&config)?;
+    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
     let plan = {
         let mut database = open_workspace_database(&workspace.path)?;
@@ -181,7 +181,8 @@ pub(crate) async fn retry_plan_phase(
                 phase.id
             )));
         }
-        let selection = plan_retry_model_selection(&config, phase, &request)?;
+        let selection =
+            plan_retry_model_selection(&config, &state.model_metadata_file, phase, &request)?;
         let has_override = request.has_override();
         let attempt = database
             .begin_plan_phase_attempt(
@@ -429,7 +430,7 @@ async fn dispatch_plan_merge(
             return Ok(false);
         }
     }
-    let selection = plan_runner_model_selection(&config)?;
+    let selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let queued = queue_chat_message_internal(
         state,
         &workspace.id,
@@ -574,9 +575,9 @@ async fn dispatch_plan_phase(
             });
             let request = PlanPhaseRetryRequest::default();
             let selection = if is_retry {
-                plan_retry_model_selection(&config, phase, &request)?
+                plan_retry_model_selection(&config, &state.model_metadata_file, phase, &request)?
             } else {
-                plan_runner_model_selection(&config)?
+                plan_runner_model_selection(&config, &state.model_metadata_file)?
             };
             let workspace = workspace_by_id(&config, workspace_id)?;
             let mut database = open_workspace_database(&workspace.path)?;
@@ -986,6 +987,7 @@ fn delete_instance_worktree(
 
 fn plan_runner_model_selection(
     config: &GlobalConfig,
+    model_metadata_file: &Path,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
     let default_id = AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID)
         .expect("default agent definition id is valid");
@@ -1005,11 +1007,13 @@ fn plan_runner_model_selection(
                 ))
             })?;
     selection.thinking_level = definition.model_options.thinking_level.clone();
+    validate_plan_selection_thinking_level(config, model_metadata_file, &selection)?;
     Ok(selection)
 }
 
 fn plan_retry_model_selection(
     config: &GlobalConfig,
+    model_metadata_file: &Path,
     phase: &PlanPhaseRecord,
     request: &PlanPhaseRetryRequest,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
@@ -1039,7 +1043,7 @@ fn plan_retry_model_selection(
                 validate_plan_model_selection(config, provider_id, model_id)
             })
             .transpose()?
-            .unwrap_or(plan_runner_model_selection(config)?),
+            .unwrap_or(plan_runner_model_selection(config, model_metadata_file)?),
     };
 
     let thinking_level = match trimmed_non_empty(request.thinking_level.as_deref()) {
@@ -1056,10 +1060,12 @@ fn plan_retry_model_selection(
             .or(base.thinking_level),
     };
 
-    Ok(PlanRunnerModelSelection {
+    let selection = PlanRunnerModelSelection {
         thinking_level,
         ..base
-    })
+    };
+    validate_plan_selection_thinking_level(config, model_metadata_file, &selection)?;
+    Ok(selection)
 }
 
 fn validate_plan_model_selection(
@@ -1115,6 +1121,24 @@ fn validate_plan_thinking_level(thinking_level: &str) -> Result<(), ApiError> {
             SUPPORTED_AGENT_THINKING_LEVELS.join(", ")
         )))
     }
+}
+
+fn validate_plan_selection_thinking_level(
+    config: &GlobalConfig,
+    model_metadata_file: &Path,
+    selection: &PlanRunnerModelSelection,
+) -> Result<(), ApiError> {
+    let Some(thinking_level) = selection.thinking_level.as_deref() else {
+        return Ok(());
+    };
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == selection.model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("model was not found: {}", selection.model_id))
+        })?;
+    validate_model_thinking_level(model_metadata_file, model, thinking_level)
 }
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
@@ -1425,6 +1449,10 @@ mod tests {
             AgentDefinitionSettings, AgentModelOptions, ApiProxySettings,
             DEFAULT_SYSTEM_PROMPT_NAME, ModelLimits, ProviderSettings,
         },
+        model_metadata::{
+            ModelMetadataCache, ModelMetadataRecord, ModelPricing, model_metadata_key,
+            write_model_metadata_cache,
+        },
         workspace::PlanPhaseAttemptRecord,
     };
 
@@ -1456,7 +1484,12 @@ mod tests {
 
     #[test]
     fn retry_model_selection_reuses_last_attempt_by_default() {
-        let config = retry_selection_config();
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
         let mut phase = phase_record_for_prompt();
         phase.status = "failed".to_string();
         phase.attempts.push(attempt_record_for_selection(
@@ -1466,9 +1499,13 @@ mod tests {
             Some("high"),
         ));
 
-        let selection =
-            plan_retry_model_selection(&config, &phase, &PlanPhaseRetryRequest::default())
-                .expect("selection");
+        let selection = plan_retry_model_selection(
+            &config,
+            &metadata_file,
+            &phase,
+            &PlanPhaseRetryRequest::default(),
+        )
+        .expect("selection");
 
         assert_eq!(selection.provider_id, "provider-b");
         assert_eq!(selection.model_id, "model-b");
@@ -1477,7 +1514,12 @@ mod tests {
 
     #[test]
     fn retry_model_selection_applies_per_attempt_override() {
-        let config = retry_selection_config();
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
         let mut phase = phase_record_for_prompt();
         phase.status = "failed".to_string();
         phase.attempts.push(attempt_record_for_selection(
@@ -1489,6 +1531,7 @@ mod tests {
 
         let selection = plan_retry_model_selection(
             &config,
+            &metadata_file,
             &phase,
             &PlanPhaseRetryRequest {
                 provider_id: Some("provider-b".to_string()),
@@ -1505,9 +1548,14 @@ mod tests {
 
     #[test]
     fn plan_runner_model_selection_uses_default_agent_definition_not_model_order() {
-        let config = retry_selection_config();
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
 
-        let selection = plan_runner_model_selection(&config).expect("selection");
+        let selection = plan_runner_model_selection(&config, &metadata_file).expect("selection");
 
         assert_eq!(selection.provider_id, "provider-b");
         assert_eq!(selection.model_id, "model-b");
@@ -1515,6 +1563,7 @@ mod tests {
 
         let fallback = plan_retry_model_selection(
             &config,
+            &metadata_file,
             &phase_record_for_prompt(),
             &PlanPhaseRetryRequest::default(),
         )
@@ -1528,7 +1577,8 @@ mod tests {
         config.providers[1].enabled = false;
 
         let error =
-            plan_runner_model_selection(&config).expect_err("disabled provider should fail");
+            plan_runner_model_selection(&config, Path::new("/tmp/missing-model-metadata.json"))
+                .expect_err("disabled provider should fail");
 
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(error.message().contains("plan runner default agent"));
@@ -1536,6 +1586,39 @@ mod tests {
             error
                 .message()
                 .contains("provider 'provider-b' is disabled")
+        );
+    }
+
+    #[test]
+    fn plan_retry_rejects_unsupported_thinking_level_for_model() {
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-b",
+            "model-b",
+            Some("minimal"),
+        ));
+
+        let error = plan_retry_model_selection(
+            &config,
+            &metadata_file,
+            &phase,
+            &PlanPhaseRetryRequest::default(),
+        )
+        .expect_err("unsupported thinking level should fail");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error
+                .message()
+                .contains("unsupported thinking level 'minimal' for model 'model-b'")
         );
     }
 
@@ -1692,6 +1775,59 @@ mod tests {
             permissions: foco_agent::AgentPermissions::default(),
         });
         config
+    }
+
+    fn write_retry_selection_metadata(
+        config: &mut GlobalConfig,
+        model_a_levels: &[&str],
+        model_b_levels: &[&str],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("model metadata dir");
+        let path = dir.path().join("model-metadata.json");
+        config.models[0].metadata_key = Some(model_metadata_key("provider-a", "model-a"));
+        config.models[1].metadata_key = Some(model_metadata_key("provider-b", "model-b"));
+        write_model_metadata_cache(
+            &path,
+            &ModelMetadataCache {
+                source_url: "https://models.dev/api.json".to_string(),
+                fetched_at: "2026-01-01T00:00:00Z".to_string(),
+                models: vec![
+                    model_metadata_record("provider-a", "Provider A", "model-a", model_a_levels),
+                    model_metadata_record("provider-b", "Provider B", "model-b", model_b_levels),
+                ],
+            },
+        )
+        .expect("write model metadata");
+        (dir, path)
+    }
+
+    fn model_metadata_record(
+        provider_id: &str,
+        provider_name: &str,
+        model_id: &str,
+        supported_thinking_levels: &[&str],
+    ) -> ModelMetadataRecord {
+        ModelMetadataRecord {
+            key: model_metadata_key(provider_id, model_id),
+            provider_id: provider_id.to_string(),
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
+            name: model_id.to_string(),
+            context_window: Some(20_000),
+            max_output_tokens: Some(1_000),
+            pricing: ModelPricing::default(),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+            supported_thinking_levels: supported_thinking_levels
+                .iter()
+                .map(|level| (*level).to_string())
+                .collect(),
+            supports_tools: false,
+            supports_cache: false,
+            reasoning: true,
+            source_url: "https://models.dev/api.json".to_string(),
+            refreshed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
     }
 
     #[test]

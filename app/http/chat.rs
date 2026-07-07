@@ -570,6 +570,12 @@ pub(crate) async fn queue_chat_message_internal(
         PromptAssemblyPurpose::ChatRun,
     )
     .await?;
+    validate_provider_request_thinking_level(
+        &config,
+        &state.model_metadata_file,
+        &prompt_context.model_id,
+        prompt_context.provider_request.thinking_level.as_deref(),
+    )?;
     let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
     let message = prompt_context
         .message

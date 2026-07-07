@@ -2581,7 +2581,7 @@ fn test_agent_definition_input() -> AgentDefinitionInput {
         provider_id: "provider".to_string(),
         model_id: "model".to_string(),
         model_options: AgentModelOptions {
-            thinking_level: Some("high".to_string()),
+            thinking_level: None,
             max_output_tokens: Some(800),
         },
         system_prompt: "Coordinate the team.".to_string(),
@@ -2728,6 +2728,64 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
             .agent_definitions
             .iter()
             .any(|definition| definition.id == default_definition_id)
+    );
+}
+#[tokio::test]
+async fn agent_definition_save_rejects_unsupported_thinking_level_for_model() {
+    let metadata_key = foco_store::model_metadata::model_metadata_key("provider", "model");
+    let fixture = prompt_state_fixture(|config| {
+        config.models[0].metadata_key = Some(metadata_key.clone());
+        config.models[0].metadata_source_url = Some("test".to_string());
+        config.models[0].metadata_refreshed_at = Some("2026-07-07T00:00:00Z".to_string());
+    });
+    let state = fixture.state.clone();
+    fs::write(
+        &state.model_metadata_file,
+        serde_json::to_string(&json!({
+            "sourceUrl": "test",
+            "fetchedAt": "2026-07-07T00:00:00Z",
+            "models": [{
+                "key": metadata_key,
+                "providerId": "provider",
+                "providerName": "Provider",
+                "modelId": "model",
+                "name": "Model",
+                "contextWindow": 20000,
+                "maxOutputTokens": 1000,
+                "pricing": {},
+                "inputModalities": ["text"],
+                "outputModalities": ["text"],
+                "supportedThinkingLevels": ["low", "medium", "high", "xhigh"],
+                "supportsTools": false,
+                "supportsCache": false,
+                "reasoning": true,
+                "sourceUrl": "test",
+                "refreshedAt": "2026-07-07T00:00:00Z"
+            }]
+        }))
+        .expect("metadata json"),
+    )
+    .expect("write model metadata");
+
+    let mut input = test_agent_definition_input();
+    input.model_options.thinking_level = Some("minimal".to_string());
+    let error = match crate::http::settings::create_agent_definition(
+        State(state),
+        Json(CreateAgentDefinitionRequest { definition: input }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("unsupported thinking level should fail"),
+    };
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        error
+            .message
+            .contains("unsupported thinking level 'minimal' for model 'model'"),
+        "{}",
+        error.message
     );
 }
 
@@ -3098,7 +3156,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
     custom_input.model_id = "gpt-alt".to_string();
     custom_input.provider_id = "provider".to_string();
     custom_input.model_options = AgentModelOptions {
-        thinking_level: Some("low".to_string()),
+        thinking_level: None,
         max_output_tokens: Some(800),
     };
     custom_input.system_prompt = "Custom image agent prompt.".to_string();

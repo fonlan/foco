@@ -1238,6 +1238,7 @@ async fn validate_agent_definition_update(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    validate_agent_definition_thinking_levels(&state.model_metadata_file, config)?;
     let known_tools = known_agent_tool_names(state, config).await;
     validate_agent_definition_tool_references(
         Some(&state.config_file),
@@ -1245,6 +1246,34 @@ async fn validate_agent_definition_update(
         &known_tools,
     )
     .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+fn validate_agent_definition_thinking_levels(
+    model_metadata_file: &std::path::Path,
+    config: &GlobalConfig,
+) -> Result<(), ApiError> {
+    for definition in &config.agent_definitions {
+        let Some(thinking_level) = definition.model_options.thinking_level.as_deref() else {
+            continue;
+        };
+        let model = config
+            .models
+            .iter()
+            .find(|model| model.id == definition.model_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("model was not found: {}", definition.model_id))
+            })?;
+        validate_model_thinking_level(model_metadata_file, model, thinking_level).map_err(
+            |error| {
+                ApiError::bad_request(format!(
+                    "agent definition '{}' uses {}; {}",
+                    definition.id,
+                    thinking_level,
+                    error.message()
+                ))
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn known_agent_tool_names(
@@ -2367,6 +2396,10 @@ pub(crate) async fn save_manual_model(
         input_modalities,
         output_modalities,
     };
+
+    if let Some(thinking_level) = model.thinking_level.as_deref() {
+        validate_model_thinking_level(&state.model_metadata_file, &model, thinking_level)?;
+    }
 
     if let Some(stored_model) = config.models.iter_mut().find(|model| model.id == model_id) {
         *stored_model = model;

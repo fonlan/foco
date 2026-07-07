@@ -39,10 +39,11 @@ use foco_store::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
         HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
-        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
-        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, WorkspaceLocation, default_agent_execution_workspace_modes,
+        ModelSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
+        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
+        SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        WorkspaceLocation, default_agent_execution_workspace_modes,
         default_terminal_shell_for_current_platform, load_global_config,
         load_or_create_global_config, save_global_config,
         validate_agent_definition_tool_references,
@@ -4346,6 +4347,12 @@ async fn prepare_chat_context(
         PromptAssemblyPurpose::ChatRun,
     )
     .await?;
+    validate_provider_request_thinking_level(
+        config,
+        &state.model_metadata_file,
+        &prompt_context.model_id,
+        prompt_context.provider_request.thinking_level.as_deref(),
+    )?;
     let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
     let message = prompt_context
         .message
@@ -7450,6 +7457,62 @@ fn model_warnings(
     }
 
     warnings
+}
+fn validate_provider_request_thinking_level(
+    config: &GlobalConfig,
+    model_metadata_file: &Path,
+    model_id: &str,
+    thinking_level: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(thinking_level) = thinking_level
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    validate_model_thinking_level(model_metadata_file, model, thinking_level)
+}
+
+fn validate_model_thinking_level(
+    model_metadata_file: &Path,
+    model: &ModelSettings,
+    thinking_level: &str,
+) -> Result<(), ApiError> {
+    if !SUPPORTED_AGENT_THINKING_LEVELS.contains(&thinking_level) {
+        return Err(ApiError::bad_request(format!(
+            "unsupported thinking level '{thinking_level}' for model '{}'; expected one of {}",
+            model.id,
+            SUPPORTED_AGENT_THINKING_LEVELS.join(", ")
+        )));
+    }
+    let supported = model_supported_thinking_levels(model_metadata_file, model)?;
+    if supported.iter().any(|level| level == thinking_level) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "unsupported thinking level '{thinking_level}' for model '{}'",
+            model.id
+        )))
+    }
+}
+
+fn model_supported_thinking_levels(
+    model_metadata_file: &Path,
+    model: &ModelSettings,
+) -> Result<Vec<String>, ApiError> {
+    let Some(key) = model.metadata_key.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let record = cached_model_record(model_metadata_file, key)
+        .map_err(ApiError::from_model_metadata_error)?;
+    Ok(record
+        .map(|record| record.supported_thinking_levels)
+        .unwrap_or_default())
 }
 
 fn provider_kind_label(kind: &str) -> &'static str {
