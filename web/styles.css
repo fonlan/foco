@@ -397,6 +397,10 @@ summary:focus-visible {
   text-underline-offset: 0.18em;
 }
 
+.markdown-content-user p {
+  white-space: pre-wrap;
+}
+
 .markdown-content-user a {
   color: var(--foco-accent-strong);
 }

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -140,6 +142,53 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       screen.queryByText("Use the existing product UI conventions."),
     ).not.toBeInTheDocument();
+  });
+
+  it("preserves single newlines in user message paragraphs", async () => {
+    const content = "第一行\n第二行";
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            activeRun: null,
+            messages: [
+              {
+                ...chatMessages.messages[0],
+                content,
+                parts: [{ text: content, type: "text" }],
+              },
+            ],
+          }),
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+
+    const stylesCss = readFileSync("styles.css", "utf8");
+    const userParagraphRule = stylesCss.match(
+      /\.markdown-content-user p\s*\{[^}]*\}/,
+    )?.[0];
+    expect(userParagraphRule).toContain("white-space: pre-wrap;");
+    const style = document.createElement("style");
+    style.textContent = userParagraphRule ?? "";
+    document.head.append(style);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const paragraph = await screen.findByText((_, element) => {
+      return element?.tagName.toLowerCase() === "p" && element.textContent === content;
+    });
+    expect(getComputedStyle(paragraph).whiteSpace).toBe("pre-wrap");
+    style.remove();
   });
 
   it("shows only enabled skills available to the active workspace in the composer picker", async () => {
