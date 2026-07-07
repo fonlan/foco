@@ -707,6 +707,12 @@ impl GlobalConfig {
             redacted.app.web_server.password_hash = Some(REDACTED_SECRET.to_string());
         }
         redacted.web_search.redact_secrets();
+        for server in &mut redacted.mcp.servers {
+            server.args.fill(REDACTED_SECRET.to_string());
+            if server.url.is_some() {
+                server.url = Some(REDACTED_SECRET.to_string());
+            }
+        }
 
         serde_json::to_string(&redacted)
     }
@@ -3929,6 +3935,38 @@ mod tests {
         let log_json = config.to_redacted_log_json().expect("redacted json");
 
         assert!(!log_json.contains("00112233445566778899aabbccddeeff"));
+        assert!(log_json.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn mcp_credentials_are_redacted_for_logs() {
+        let mut config = GlobalConfig::first_run(PathBuf::from(r"C:\Users\foco\.foco\workspace"));
+        config.mcp.servers.push(McpServerConfig {
+            id: "docs".to_string(),
+            name: "Docs".to_string(),
+            enabled: true,
+            transport: "stdio".to_string(),
+            command: Some("docs-mcp".to_string()),
+            args: vec!["--api-key".to_string(), "mcp-secret".to_string()],
+            url: None,
+            execution_host: McpExecutionHost::Local,
+        });
+        config.mcp.servers.push(McpServerConfig {
+            id: "remote-docs".to_string(),
+            name: "Remote Docs".to_string(),
+            enabled: true,
+            transport: "streamable-http".to_string(),
+            command: None,
+            args: Vec::new(),
+            url: Some("https://example.test/mcp?token=mcp-secret".to_string()),
+            execution_host: McpExecutionHost::Local,
+        });
+
+        let log_json = config.to_redacted_log_json().expect("redacted json");
+
+        assert!(!log_json.contains("mcp-secret"));
+        assert!(!log_json.contains("token="));
+        assert!(log_json.contains("docs-mcp"));
         assert!(log_json.contains(REDACTED_SECRET));
     }
 

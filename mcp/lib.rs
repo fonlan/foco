@@ -151,11 +151,16 @@ impl McpRegistry {
         &self,
         workspace_id: &str,
         workspace_path: &Path,
+        include_workspace_hosted: bool,
         definitions: &[McpServerDefinition],
     ) -> Result<(), McpError> {
         let definitions = definitions
             .iter()
-            .filter(|definition| definition.effective_execution_host() == McpExecutionHost::Local)
+            .filter(|definition| {
+                definition.effective_execution_host() == McpExecutionHost::Local
+                    || include_workspace_hosted
+                        && definition.effective_execution_host() == McpExecutionHost::Workspace
+            })
             .cloned()
             .collect::<Vec<_>>();
         validate_server_definitions(&definitions)?;
@@ -1242,11 +1247,11 @@ mod tests {
         let definitions = vec![disabled_stdio_server("context7")];
 
         registry
-            .sync_workspace_servers("workspace-a", Path::new("."), &definitions)
+            .sync_workspace_servers("workspace-a", Path::new("."), true, &definitions)
             .await
             .expect("first workspace sync should succeed");
         registry
-            .sync_workspace_servers("workspace-b", Path::new("."), &definitions)
+            .sync_workspace_servers("workspace-b", Path::new("."), true, &definitions)
             .await
             .expect("second workspace sync should succeed");
 
@@ -1254,5 +1259,33 @@ mod tests {
 
         assert_eq!(servers.len(), 1);
         assert!(servers.contains_key("context7"));
+    }
+
+    #[tokio::test]
+    async fn workspace_hosted_servers_run_for_local_workspaces() {
+        let registry = McpRegistry::default();
+        let mut definition = disabled_stdio_server("context7");
+        definition.execution_host = McpExecutionHost::Auto;
+
+        registry
+            .sync_workspace_servers("local", Path::new("."), true, &[definition])
+            .await
+            .expect("local workspace sync should succeed");
+
+        assert!(registry.servers.lock().await.contains_key("context7"));
+    }
+
+    #[tokio::test]
+    async fn workspace_hosted_servers_do_not_run_on_the_local_host_for_remote_workspaces() {
+        let registry = McpRegistry::default();
+        let mut definition = disabled_stdio_server("context7");
+        definition.execution_host = McpExecutionHost::Auto;
+
+        registry
+            .sync_workspace_servers("remote", Path::new("."), false, &[definition])
+            .await
+            .expect("remote workspace sync should succeed");
+
+        assert!(!registry.servers.lock().await.contains_key("context7"));
     }
 }

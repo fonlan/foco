@@ -942,7 +942,12 @@ async fn sync_all_mcp_workspaces(
     registry: &Arc<McpRegistry>,
     config: &GlobalConfig,
 ) -> Result<(), foco_mcp::McpError> {
-    for workspace in &config.workspaces {
+    if let Some(workspace) = config
+        .workspaces
+        .iter()
+        .find(|workspace| !workspace.is_remote())
+        .or_else(|| config.workspaces.first())
+    {
         let started_at = Instant::now();
         tracing::info!(
             workspace_id = %workspace.id,
@@ -966,10 +971,24 @@ async fn sync_mcp_workspace(
     workspace: &WorkspaceConfig,
     config: &GlobalConfig,
 ) -> Result<(), foco_mcp::McpError> {
+    let workspace = if workspace.is_remote() {
+        config
+            .workspaces
+            .iter()
+            .find(|candidate| !candidate.is_remote())
+            .unwrap_or(workspace)
+    } else {
+        workspace
+    };
     let definitions = mcp_server_definitions(config)?;
 
     registry
-        .sync_workspace_servers(&workspace.id, &workspace.path, &definitions)
+        .sync_workspace_servers(
+            &workspace.id,
+            &workspace.path,
+            !workspace.is_remote(),
+            &definitions,
+        )
         .await
 }
 
