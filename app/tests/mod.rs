@@ -18661,6 +18661,10 @@ async fn fake_sidecar_http_and_websocket_proxy_forward_bearer_token() {
         sidecar_port,
         "sidecar-token",
     );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/remote/logo/thumbnail"),
+        None
+    );
 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -18680,6 +18684,22 @@ async fn fake_sidecar_http_and_websocket_proxy_forward_bearer_token() {
     let body = http_response.json::<Value>().await.expect("proxy json");
     assert_eq!(body["proxied"], true);
     assert_eq!(body["query"], "depth=1");
+
+    let chat_response = reqwest::Client::new()
+        .post(format!(
+            "http://{app_addr}/api/workspaces/remote/chat/queue"
+        ))
+        .json(&json!({ "message": "hello" }))
+        .send()
+        .await
+        .expect("proxied chat queue request");
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    let body = chat_response
+        .json::<Value>()
+        .await
+        .expect("chat queue json");
+    assert_eq!(body["queued"], true);
+    assert_eq!(body["payload"]["message"], "hello");
 
     let mut ws_request = format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws")
         .into_client_request()
@@ -18720,9 +18740,11 @@ async fn serve_fake_sidecar_proxy_fixture(
     token: &str,
 ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let expected_http = format!("Bearer {token}");
+    let expected_chat = expected_http.clone();
     let expected_ws = expected_http.clone();
     let seen_auth = Arc::new(Mutex::new(Vec::new()));
     let http_seen = seen_auth.clone();
+    let chat_seen = seen_auth.clone();
     let ws_seen = seen_auth.clone();
     let app = axum::Router::new()
         .route(
@@ -18743,6 +18765,29 @@ async fn serve_fake_sidecar_proxy_fixture(
                     Json(json!({
                         "proxied": true,
                         "query": uri.query().unwrap_or_default(),
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chat/queue",
+            axum::routing::post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let expected = expected_chat.clone();
+                let seen = chat_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({
+                        "queued": true,
+                        "payload": payload,
                     }))
                     .into_response()
                 }

@@ -664,6 +664,7 @@ async fn remote_workspace_proxy_middleware(
 
     // Read the request body
     let method = request.method().clone();
+    let forwarded_headers = request.headers().clone();
     let bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -680,6 +681,16 @@ async fn remote_workspace_proxy_middleware(
         .request(method, &proxy_url)
         .bearer_auth(&token)
         .body(bytes.to_vec());
+    for name in [
+        header::CONTENT_TYPE.as_str(),
+        header::ACCEPT.as_str(),
+        header::ACCEPT_LANGUAGE.as_str(),
+        header::CACHE_CONTROL.as_str(),
+    ] {
+        if let Some(value) = forwarded_headers.get(name) {
+            req = req.header(name, value.clone());
+        }
+    }
     if is_code_graph_request {
         req = req.header("x-foco-ensure-code-graph", "1");
     }
@@ -741,7 +752,7 @@ async fn proxy_websocket_upgrade(request: Request, proxy_url: String, token: Str
 
 /// If the request path matches a proxied workspace route, return the path suffix
 /// after the workspace_id segment.  Returns None for routes that should stay local.
-fn proxy_workspace_route_path(path: &str) -> Option<&str> {
+pub(crate) fn proxy_workspace_route_path(path: &str) -> Option<&str> {
     // Match /api/workspaces/{id}/files, /api/workspaces/{id}/git, /api/workspaces/{id}/terminal,
     // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, chat/runtime, scheduled tasks.
     let rest = path.strip_prefix("/api/workspaces/")?;
@@ -753,7 +764,6 @@ fn proxy_workspace_route_path(path: &str) -> Option<&str> {
         | "terminal"
         | "spec"
         | "plans"
-        | "logo"
         | "code-graph"
         | "graph"
         | "chats"
