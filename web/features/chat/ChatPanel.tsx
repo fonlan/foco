@@ -87,6 +87,7 @@ const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
   agent_wait_tasks: Server,
   create_plan: ListChecks,
   create_todo_graph: ListChecks,
+  update_todo_graph: ListChecks,
   delete_plan: ListChecks,
   edit_file: FileText,
   finance: Globe,

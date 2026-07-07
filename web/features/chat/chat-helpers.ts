@@ -27,6 +27,7 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   ask_question: { en: "Ask", "zh-CN": "询问" },
   create_plan: { en: "Create Plan", "zh-CN": "创建计划" },
   create_todo_graph: { en: "Create Todos", "zh-CN": "创建待办" },
+  update_todo_graph: { en: "Update Todos", "zh-CN": "更新待办" },
   delete_plan: { en: "Delete Plan", "zh-CN": "删除计划" },
   edit_file: { en: "Edit", "zh-CN": "编辑" },
   finance: { en: "Finance", "zh-CN": "金融" },
