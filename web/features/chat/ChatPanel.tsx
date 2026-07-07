@@ -66,6 +66,7 @@ import type {
 } from "../../api/types";
 import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
+import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { toolDisplayName } from "./chat-helpers";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
 
@@ -348,15 +349,19 @@ function ChatPanelComponent({
         })),
     }));
   }, [availableModels, providers]);
+  const selectedModel = useMemo(
+    () => availableModels.find((model) => model.id === selectedModelId) ?? null,
+    [availableModels, selectedModelId],
+  );
   const thinkingOptions = useMemo(
     () => [
       { label: t("Model default"), value: "" },
-      ...thinkingLevels.map((level) => ({
+      ...thinkingLevelOptionsForModel(selectedModel, thinkingLevels).map((level) => ({
         label: t(level.label),
         value: level.value,
       })),
     ],
-    [thinkingLevels, t],
+    [selectedModel, thinkingLevels, t],
   );
   const visibleSkills = useMemo(
     () =>

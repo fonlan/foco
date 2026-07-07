@@ -189,6 +189,10 @@ import {
   currentBrowserRoute,
 } from "./shared/browser-route";
 import { I18nContext, translate, useI18n } from "./shared/i18n";
+import {
+  defaultThinkingLevelForModel,
+  isModelThinkingLevelSupported,
+} from "./shared/thinking-levels";
 const TerminalPanel = lazy(() =>
   import("./features/terminal/TerminalPanel").then((m) => ({
     default: m.TerminalPanel,
@@ -1626,8 +1630,12 @@ export function App() {
         return {
           modelId: agentModel.id,
           providerId: defaultAgentDefinition.providerId,
-          thinkingLevel:
-            defaultAgentDefinition.modelOptions.thinkingLevel ?? "",
+          thinkingLevel: isModelThinkingLevelSupported(
+            agentModel,
+            defaultAgentDefinition.modelOptions.thinkingLevel,
+          )
+            ? defaultAgentDefinition.modelOptions.thinkingLevel!
+            : "",
         };
       }
     }
@@ -1645,7 +1653,7 @@ export function App() {
     return {
       modelId: model.id,
       providerId,
-      thinkingLevel: model.thinkingLevel ?? "",
+      thinkingLevel: defaultThinkingLevelForModel(model),
     };
   }, [availableModels, defaultAgentDefinition]);
   const detectedSkills = useMemo(
@@ -1657,6 +1665,12 @@ export function App() {
     [activeWorkspace?.id, detectedSkills],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
+  const selectedRequestThinkingLevel = isModelThinkingLevelSupported(
+    selectedModel,
+    selectedThinkingLevel,
+  )
+    ? selectedThinkingLevel
+    : "";
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
@@ -1752,7 +1766,7 @@ export function App() {
       activeChatId ?? "",
       selectedModelId,
       selectedProviderId,
-      selectedThinkingLevel,
+      selectedRequestThinkingLevel,
       ...selectedSkillIds,
     ].join("\u0000");
 
@@ -1794,7 +1808,7 @@ export function App() {
         modelId: selectedModelId,
         providerId: selectedProviderId,
         skillIds: selectedSkillIds,
-        thinkingLevel: selectedThinkingLevel,
+        thinkingLevel: selectedRequestThinkingLevel,
         workspaceId: activeWorkspaceId,
       });
     }
@@ -1805,7 +1819,7 @@ export function App() {
     selectedModelId,
     selectedProviderId,
     selectedSkillIds,
-    selectedThinkingLevel,
+    selectedRequestThinkingLevel,
   ]);
 
   useLayoutEffect(() => {
@@ -1817,8 +1831,13 @@ export function App() {
   }, [selectedProviderId]);
 
   useLayoutEffect(() => {
-    selectedThinkingLevelRef.current = selectedThinkingLevel;
-  }, [selectedThinkingLevel]);
+    selectedThinkingLevelRef.current = isModelThinkingLevelSupported(
+      selectedModel,
+      selectedRequestThinkingLevel,
+    )
+      ? selectedThinkingLevel
+      : "";
+  }, [selectedModel, selectedThinkingLevel]);
 
   useEffect(
     () => () => {
@@ -3676,11 +3695,6 @@ export function App() {
     const selectedModel = availableModels.find(
       (model) => model.id === selectedModelId,
     );
-    const supportedThinkingValues = new Set([
-      "",
-      ...thinkingLevels.map((level) => level.value),
-    ]);
-
     setSelectedThinkingLevel((current) => {
       if (!selectedModel) {
         hasManuallySelectedThinkingLevelRef.current = false;
@@ -3691,13 +3705,13 @@ export function App() {
         !hasManuallySelectedModelRef.current &&
           selectedModel.id === defaultComposerSelection.modelId
           ? defaultComposerSelection.thinkingLevel
-          : selectedModel.thinkingLevel ?? "";
+          : defaultThinkingLevelForModel(selectedModel);
 
       if (!hasManuallySelectedThinkingLevelRef.current) {
         return defaultThinkingLevel;
       }
 
-      if (supportedThinkingValues.has(current)) {
+      if (!current || isModelThinkingLevelSupported(selectedModel, current)) {
         return current;
       }
 
@@ -3709,7 +3723,6 @@ export function App() {
     defaultComposerSelection.modelId,
     defaultComposerSelection.thinkingLevel,
     selectedModelId,
-    thinkingLevels,
   ]);
 
   useEffect(() => {
@@ -6765,7 +6778,9 @@ export function App() {
       skillIds,
       sessionMode: isPlanModeEnabled ? "plan" : undefined,
       teamModeEnabled: !isPlanModeEnabled && canUseTeamMode && isTeamModeEnabled,
-      thinkingLevel: selectedThinkingLevel,
+      thinkingLevel: isModelThinkingLevelSupported(selectedModel, selectedThinkingLevel)
+        ? selectedThinkingLevel
+        : "",
       workspaceId: currentWorkspace.id,
     };
   }
@@ -8420,7 +8435,18 @@ export function App() {
   }
 
   async function runChatMessage(initialRequest: RetryRunRequest): Promise<string | null> {
-    let request = initialRequest;
+    const requestModel = availableModels.find(
+      (model) => model.id === initialRequest.modelId,
+    );
+    let request = {
+      ...initialRequest,
+      thinkingLevel: isModelThinkingLevelSupported(
+        requestModel,
+        initialRequest.thinkingLevel,
+      )
+        ? initialRequest.thinkingLevel
+        : "",
+    };
     if (!request.queuedUserMessageId) {
       setIsPreparingChatRun(true);
       try {

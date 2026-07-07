@@ -169,7 +169,7 @@ export const settings = {
       providerIds: ["openai", "anthropic"],
       outputModalities: ["text"],
       supportsThinking: true,
-      supportedThinkingLevels: [],
+      supportedThinkingLevels: ["low", "high"],
       systemPromptName: "Default",
       thinkingLevel: null,
       warnings: [],

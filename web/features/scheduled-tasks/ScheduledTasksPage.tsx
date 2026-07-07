@@ -44,6 +44,11 @@ import type {
 } from "../../api/types";
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import {
+  defaultThinkingLevelForModel,
+  isModelThinkingLevelSupported,
+  thinkingLevelOptionsForModel,
+} from "../../shared/thinking-levels";
 
 type ScheduledTasksQuery = {
   page?: number;
@@ -965,6 +970,10 @@ function ScheduledTaskDrawer({
   }, [agentDefinitions, enabledModels, mode, workspaces]);
 
   const selectedModel = enabledModels.find((model) => model.id === form.modelId) ?? null;
+  const thinkingOptions = useMemo(
+    () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
+    [selectedModel, thinkingLevels],
+  );
   const selectableProviders = selectedModel
     ? providers.filter((provider) => selectedModel.providerIds.includes(provider.id))
     : [];
@@ -975,7 +984,7 @@ function ScheduledTaskDrawer({
       ...current,
       modelId,
       providerId: nextModel?.activeProviderId ?? nextModel?.providerIds[0] ?? "",
-      thinkingLevel: nextModel?.thinkingLevel ?? "",
+      thinkingLevel: defaultThinkingLevelForModel(nextModel),
     }));
   }
 
@@ -983,13 +992,21 @@ function ScheduledTaskDrawer({
     const definition =
       agentDefinitions.find((agentDefinition) => agentDefinition.id === agentDefinitionId) ??
       null;
+    const model =
+      enabledModels.find((candidate) => candidate.id === definition?.modelId) ?? null;
     setForm((current) => ({
       ...current,
       agentDefinitionId,
       modelId: definition?.modelId ?? current.modelId,
       providerId: definition?.providerId ?? current.providerId,
-      thinkingLevel:
-        definition?.modelOptions.thinkingLevel ?? (definition ? "" : current.thinkingLevel),
+      thinkingLevel: isModelThinkingLevelSupported(
+        model,
+        definition?.modelOptions.thinkingLevel,
+      )
+        ? definition!.modelOptions.thinkingLevel!
+        : definition
+          ? ""
+          : current.thinkingLevel,
     }));
   }
 
@@ -1052,7 +1069,7 @@ function ScheduledTaskDrawer({
 
     let payload: ReturnType<typeof taskFormPayload>;
     try {
-      payload = taskFormPayload(form, mode, t);
+      payload = taskFormPayload(form, mode, t, enabledModels);
     } catch (validationError) {
       setError(errorMessage(validationError));
       return;
@@ -1346,7 +1363,7 @@ function ScheduledTaskDrawer({
               value={form.thinkingLevel}
             >
               <option value="">{t("None")}</option>
-              {thinkingLevels.map((level) => (
+              {thinkingOptions.map((level) => (
                 <option key={level.value} value={level.value}>
                   {t(level.label)}
                 </option>
@@ -1692,11 +1709,22 @@ function taskFormDefaults(
     scheduleType: "interval",
     sessionMode: "create_new_chat",
     status: "enabled",
-    thinkingLevel:
-      agentDefinition?.modelOptions.thinkingLevel ?? model?.thinkingLevel ?? "",
+    thinkingLevel: normalizeScheduledThinkingLevel(
+      agentDefinition
+        ? enabledModels.find((candidate) => candidate.id === agentDefinition.modelId)
+        : model,
+      agentDefinition?.modelOptions.thinkingLevel ?? model?.thinkingLevel,
+    ),
     title: "",
     workspaceId: workspaces[0]?.id ?? "",
   };
+}
+
+function normalizeScheduledThinkingLevel(
+  model: ConfiguredModelSummary | null | undefined,
+  thinkingLevel: string | null | undefined,
+) {
+  return isModelThinkingLevelSupported(model, thinkingLevel) ? thinkingLevel : "";
 }
 
 function taskFormFromTask(task: ScheduledTaskView): ScheduledTaskFormState {
@@ -1748,6 +1776,7 @@ function taskFormPayload(
   form: ScheduledTaskFormState,
   mode: TaskFormMode,
   t: Translate,
+  enabledModels: ConfiguredModelSummary[] = [],
 ) {
   const title = form.title.trim();
   const prompt = form.prompt.trim();
@@ -1777,7 +1806,12 @@ function taskFormPayload(
     ...(form.agentDefinitionId ? { agent_definition_id: form.agentDefinitionId } : {}),
     ...(form.modelId ? { model_id: form.modelId } : {}),
     ...(form.modelId && form.providerId ? { provider_id: form.providerId } : {}),
-    ...(form.thinkingLevel ? { thinking_level: form.thinkingLevel } : {}),
+    ...(isModelThinkingLevelSupported(
+      form.modelId ? enabledModels.find((model) => model.id === form.modelId) : null,
+      form.thinkingLevel,
+    )
+      ? { thinking_level: form.thinkingLevel }
+      : {}),
   };
 
   return {

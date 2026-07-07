@@ -83,6 +83,11 @@ import { toolDisplayName } from "../chat/chat-helpers";
 import { diffLineClass, parseGitDiffSections, type GitDiffSection } from "../git/diff-parser";
 import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
+import {
+  defaultThinkingLevelForModel,
+  isModelThinkingLevelSupported,
+  thinkingLevelOptionsForModel,
+} from "../../shared/thinking-levels";
 import { moveItemId, sameStringList } from "../workspaces/workspace-helpers";
 
 export type ContextPanelTab = "todo" | "plan" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
@@ -1351,6 +1356,10 @@ function PlanPhaseRetryDialog({
   );
   const selectedModel =
     selectableModels.find((model) => model.id === modelId) ?? null;
+  const thinkingOptions = useMemo(
+    () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
+    [selectedModel, thinkingLevels],
+  );
   const providerOptions = selectedModel
     ? selectedModel.providerIds.filter((providerId) =>
         providers.some((provider) => provider.id === providerId && provider.enabled),
@@ -1359,9 +1368,9 @@ function PlanPhaseRetryDialog({
   const [providerId, setProviderId] = useState(() =>
     defaultPlanPhaseRetryProviderId(phase, selectedModel, providers),
   );
-  const supportsThinking = Boolean(selectedModel?.supportsThinking && thinkingLevels.length > 0);
+  const supportsThinking = thinkingOptions.length > 0;
   const [thinkingLevel, setThinkingLevel] = useState(() =>
-    supportsThinking ? selectedModel?.thinkingLevel ?? "" : "",
+    defaultThinkingLevelForModel(selectedModel),
   );
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -1381,10 +1390,10 @@ function PlanPhaseRetryDialog({
         ? nextModel.activeProviderId
         : enabledProviderIds[0] ?? "");
     }
-    if (!nextModel.supportsThinking) {
-      setThinkingLevel("");
+    if (thinkingLevel && !isModelThinkingLevelSupported(nextModel, thinkingLevel)) {
+      setThinkingLevel(defaultThinkingLevelForModel(nextModel));
     }
-  }, [modelId, phase, providerId, providers, selectableModels]);
+  }, [modelId, phase, providerId, providers, selectableModels, thinkingLevel]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1406,7 +1415,9 @@ function PlanPhaseRetryDialog({
     onSubmit({
       modelId,
       providerId,
-      thinkingLevel: supportsThinking && thinkingLevel ? thinkingLevel : null,
+      thinkingLevel: isModelThinkingLevelSupported(selectedModel, thinkingLevel)
+        ? thinkingLevel
+        : null,
     });
   };
 
@@ -1456,7 +1467,7 @@ function PlanPhaseRetryDialog({
               setModelId(value);
               setFormError(null);
               setProviderId(defaultPlanPhaseRetryProviderId(phase, nextModel, providers));
-              setThinkingLevel(nextModel?.supportsThinking ? nextModel.thinkingLevel ?? "" : "");
+              setThinkingLevel(defaultThinkingLevelForModel(nextModel));
             }}
             value={modelId}
           >
@@ -1491,7 +1502,7 @@ function PlanPhaseRetryDialog({
               value={thinkingLevel}
             >
               <option value="">{t("Model default")}</option>
-              {thinkingLevels.map((level) => (
+              {thinkingOptions.map((level) => (
                 <option key={level.value} value={level.value}>
                   {t(level.label)}
                 </option>

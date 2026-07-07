@@ -18,6 +18,11 @@ import type {
   ThinkingLevelSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import {
+  defaultThinkingLevelForModel,
+  isModelThinkingLevelSupported,
+  thinkingLevelOptionsForModel,
+} from "../../shared/thinking-levels";
 
 const AGENT_EXECUTION_WORKSPACE_MODES: AgentExecutionWorkspaceMode[] = [
   "shared",
@@ -108,6 +113,10 @@ export function AgentsSettingsPanel({
   const editingDefinition =
     definitions.find((definition) => definition.id === editingDefinitionId) ?? null;
   const selectedModel = enabledModels.find((model) => model.id === draft.modelId) ?? null;
+  const thinkingOptions = useMemo(
+    () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
+    [selectedModel, thinkingLevels],
+  );
   const selectableProviders = selectedModel
     ? selectedModel.providerIds
     : providers.filter((provider) => provider.enabled).map((provider) => provider.id);
@@ -154,8 +163,12 @@ export function AgentsSettingsPanel({
   }
 
   function openEditDialog(definition: AgentDefinitionSettings) {
+    const model = enabledModels.find((item) => item.id === definition.modelId) ?? null;
     setEditingDefinitionId(definition.id);
-    setDraft(agentDefinitionToDraft(definition));
+    setDraft({
+      ...agentDefinitionToDraft(definition),
+      thinkingLevel: normalizeAgentThinkingLevel(model, definition.modelOptions.thinkingLevel),
+    });
     setDialogMode("edit");
   }
 
@@ -170,6 +183,7 @@ export function AgentsSettingsPanel({
     updateDraft({
       modelId,
       providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
+      thinkingLevel: defaultThinkingLevelForModel(model),
     });
   }
 
@@ -214,7 +228,10 @@ export function AgentsSettingsPanel({
 
   async function submitDefinition(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const payload = draftToAgentDefinitionInput(draft);
+    const payload = draftToAgentDefinitionInput({
+      ...draft,
+      thinkingLevel: normalizeAgentThinkingLevel(selectedModel, draft.thinkingLevel),
+    });
     const saved = editingDefinition
       ? await onUpdateDefinition(editingDefinition.id, payload)
       : await onCreateDefinition(payload);
@@ -433,7 +450,7 @@ export function AgentsSettingsPanel({
                 value={draft.thinkingLevel}
               >
                 <option value="">{t("Model default")}</option>
-                {thinkingLevels.map((level) => (
+                {thinkingOptions.map((level) => (
                   <option key={level.value} value={level.value}>
                     {t(level.label)}
                   </option>
@@ -689,7 +706,7 @@ function emptyAgentDefinitionDraft(
     name: "",
     providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
     systemPrompt: "",
-    thinkingLevel: "",
+    thinkingLevel: defaultThinkingLevelForModel(model),
   };
 }
 
@@ -752,6 +769,13 @@ function draftToAgentDefinitionInput(
     providerId: draft.providerId,
     systemPrompt: draft.systemPrompt.trim(),
   };
+}
+
+function normalizeAgentThinkingLevel(
+  model: ConfiguredModelSummary | null,
+  thinkingLevel: string | null | undefined,
+) {
+  return isModelThinkingLevelSupported(model, thinkingLevel) ? thinkingLevel : "";
 }
 
 function uniqueString<T extends string>(value: T, index: number, values: T[]) {

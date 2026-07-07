@@ -151,6 +151,11 @@ import {
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 import {
+  defaultThinkingLevelForModel,
+  isModelThinkingLevelSupported,
+  thinkingLevelOptionsForModel,
+} from "../../shared/thinking-levels";
+import {
   findVerticalScrollAncestor,
   forwardVerticalTouchDrag,
   startVerticalTouchDragForward,
@@ -820,9 +825,11 @@ export function SettingsPanel({
   }, [workspaceOrderPreview, workspaces]);
   const editingModel =
     configuredModels.find((model) => model.id === form.modelId) ?? null;
-  const modelThinkingEnabled = selectedMetadata
-    ? selectedMetadata.reasoning || Boolean(editingModel?.supportsThinking)
-    : Boolean(editingModel?.supportsThinking);
+  const modelThinkingOptions = useMemo(
+    () => thinkingLevelOptionsForModel(selectedMetadata ?? editingModel, thinkingLevels),
+    [editingModel, selectedMetadata, thinkingLevels],
+  );
+  const modelThinkingEnabled = modelThinkingOptions.length > 0;
   const editingWorkspace =
     workspaces.find((workspace) => workspace.id === workspaceForm.id) ?? null;
   const selectedProviderKind = providerKinds.find(
@@ -1518,7 +1525,7 @@ export function SettingsPanel({
       activeProviderId,
       inputModalities,
       outputModalities,
-      thinkingLevel: model.reasoning ? current.thinkingLevel || thinkingLevels[0]?.value || "" : "",
+      thinkingLevel: model.supportedThinkingLevels[0] ?? "",
       systemPromptName: current.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     };
   }
@@ -1594,9 +1601,7 @@ export function SettingsPanel({
       activeProviderId: model.activeProviderId ?? "",
       inputModalities: defaultModalities(model.inputModalities),
       outputModalities: defaultModalities(model.outputModalities),
-      thinkingLevel: model.supportsThinking
-        ? model.thinkingLevel ?? thinkingLevels[0]?.value ?? ""
-        : "",
+      thinkingLevel: defaultThinkingLevelForModel(model),
       systemPromptName: model.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     });
     setIsModelDialogOpen(true);
@@ -3025,8 +3030,16 @@ export function SettingsPanel({
             activeProviderId: activeModelProviderId,
             inputModalities: normalizeModalities(form.inputModalities),
             outputModalities: normalizeModalities(form.outputModalities),
-            thinkingLevel: form.thinkingLevel || null,
-            clearThinkingLevel: !form.thinkingLevel,
+            thinkingLevel: isModelThinkingLevelSupported(
+              selectedMetadata ?? editingModel,
+              form.thinkingLevel,
+            )
+              ? form.thinkingLevel
+              : null,
+            clearThinkingLevel: !isModelThinkingLevelSupported(
+              selectedMetadata ?? editingModel,
+              form.thinkingLevel,
+            ),
             systemPromptName: form.systemPromptName,
           }),
           headers: { "Content-Type": "application/json" },
@@ -3063,8 +3076,10 @@ export function SettingsPanel({
           activeProviderId: model.activeProviderId ?? "",
           inputModalities: model.inputModalities,
           outputModalities: model.outputModalities,
-          thinkingLevel: model.thinkingLevel,
-          clearThinkingLevel: !model.thinkingLevel,
+          thinkingLevel: isModelThinkingLevelSupported(model, model.thinkingLevel)
+            ? model.thinkingLevel
+            : null,
+          clearThinkingLevel: !isModelThinkingLevelSupported(model, model.thinkingLevel),
           systemPromptName: model.systemPromptName,
         }),
         headers: { "Content-Type": "application/json" },
@@ -11167,12 +11182,22 @@ export function SettingsPanel({
                                 thinkingLevel: event.target.value,
                               }))
                             }
-                            value={modelThinkingEnabled ? form.thinkingLevel : ""}
+                            value={
+                              modelThinkingEnabled &&
+                                isModelThinkingLevelSupported(
+                                  selectedMetadata ?? editingModel,
+                                  form.thinkingLevel,
+                                )
+                                ? form.thinkingLevel
+                                : ""
+                            }
                           >
-                            {modelThinkingEnabled ? null : (
+                            {modelThinkingEnabled ? (
+                              <option value="">{t("Model default")}</option>
+                            ) : (
                               <option value="">{t("None")}</option>
                             )}
-                            {thinkingLevels.map((level) => (
+                            {modelThinkingOptions.map((level) => (
                               <option key={level.value} value={level.value}>
                                 {t(level.label)}
                               </option>
