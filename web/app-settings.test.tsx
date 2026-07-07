@@ -169,6 +169,23 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("orders chat title generation model choices before enabled models", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const select = await screen.findByLabelText("Chat title generation model");
+    const options = Array.from((select as HTMLSelectElement).options).map((option) => ({
+      label: option.textContent,
+      value: option.value,
+    }));
+
+    expect(options).toEqual([
+      { label: "Disabled", value: "disabled" },
+      { label: "Current chat model", value: "current_chat_model" },
+      { label: "GPT Test", value: "gpt-test" },
+    ]);
+  });
+
   it("saves the skill translation model without changing enabled skills", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

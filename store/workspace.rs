@@ -3519,8 +3519,8 @@ impl WorkspaceDatabase {
         let updated = self
             .connection
             .execute(
-                "UPDATE chats SET title = ?1 WHERE id = ?2 AND title = ?3",
-                params![title, id, current_title],
+                "UPDATE chats SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title = ?4",
+                params![title, now_timestamp(), id, current_title],
             )
             .map_err(|source| self.sqlite_error(source))?;
 

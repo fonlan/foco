@@ -1963,6 +1963,19 @@ fn chat_title_generation_provider_request_uses_tool_only_small_output() {
 }
 
 #[test]
+fn generated_chat_title_is_clean_single_line_and_bounded() {
+    let raw_title = format!(" \"{}\nnext line\" ", "很长".repeat(40));
+    let title =
+        crate::http::chat::clean_generated_chat_title(&raw_title).expect("clean generated title");
+
+    assert!(!title.contains('\n'));
+    assert!(!title.starts_with('"'));
+    assert!(!title.ends_with('"'));
+    assert!(!title.trim().is_empty());
+    assert!(title.chars().count() <= 60);
+}
+
+#[test]
 fn normalize_api_proxy_settings_preserves_updates_and_disables_proxy() {
     let current = ApiProxySettings {
         enabled: true,

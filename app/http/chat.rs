@@ -43,6 +43,7 @@ const CHAT_TITLE_GENERATION_TOOL_NAME: &str = "submit_chat_title";
 const CHAT_TITLE_GENERATION_TIMEOUT_MS: u64 = 15_000;
 const CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 64;
 const CHAT_TITLE_GENERATION_MAX_INPUT_CHARS: usize = 4_000;
+const CHAT_TITLE_MAX_CHARS: usize = 60;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1114,12 +1115,24 @@ fn chat_title_generation_tool_definition() -> foco_providers::NeutralToolDefinit
     }
 }
 
-fn parse_generated_chat_title(arguments: &Value) -> Option<String> {
-    let title = arguments.get("title")?.as_str()?.trim();
+pub(crate) fn parse_generated_chat_title(arguments: &Value) -> Option<String> {
+    clean_generated_chat_title(arguments.get("title")?.as_str()?)
+}
+
+pub(crate) fn clean_generated_chat_title(raw_title: &str) -> Option<String> {
+    let title = raw_title
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let title = title
         .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
         .trim();
-    (!title.is_empty()).then(|| title.to_string())
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.chars().take(CHAT_TITLE_MAX_CHARS).collect())
 }
 
 fn configured_agent_definition(
