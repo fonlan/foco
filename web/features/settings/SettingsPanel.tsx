@@ -11655,6 +11655,8 @@ function RemoteServersSettingsSection({
                 {servers.map((server) => {
                   const diagnostic = diagnostics[server.id];
                   const isBusy = Boolean(activeOperationKey?.endsWith(`:${server.id}`));
+                  const isConnected = server.status === "connected" || server.status === "ready";
+                  const toggleOperation = isConnected ? "disconnect" : "connect";
                   return (
                     <tr key={server.id} className="align-top">
                       <td className="px-4 py-3">
@@ -11717,17 +11719,10 @@ function RemoteServersSettingsSection({
                           />
                           <IconActionButton
                             disabled={isBusy}
-                            icon={Play}
-                            label={t("Connect remote server")}
-                            loading={activeOperationKey === operationKey("connect", server.id)}
-                            onClick={() => void onRunOperation(server, "connect")}
-                          />
-                          <IconActionButton
-                            disabled={isBusy}
-                            icon={CircleAlert}
-                            label={t("Disconnect remote server")}
-                            loading={activeOperationKey === operationKey("disconnect", server.id)}
-                            onClick={() => void onRunOperation(server, "disconnect")}
+                            icon={isConnected ? CircleAlert : Play}
+                            label={t(isConnected ? "Disconnect remote server" : "Connect remote server")}
+                            loading={activeOperationKey === operationKey(toggleOperation, server.id)}
+                            onClick={() => void onRunOperation(server, toggleOperation)}
                           />
                           <IconActionButton
                             disabled={isBusy}
@@ -11912,12 +11907,11 @@ function remoteDiagnosticStageLabel(stage: string, t: Translate) {
     case "remoteInstallDirWritable":
       return t("Starting sidecar");
     case "focoCommandVersion":
-      return t("Syncing config");
+      return t("Checking Sidecar version");
     default:
       return stage;
   }
 }
-
 function settingsSectionTitle(section: SettingsSection, t: Translate) {
   if (section === "general") {
     return t("General settings");

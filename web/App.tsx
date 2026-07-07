@@ -649,7 +649,7 @@ function remoteWorkspacePendingStages(t: Translate): RemoteServerDiagnosticStage
     {
       details: null,
       errorKind: null,
-      message: t("Syncing config"),
+      message: t("Checking Sidecar version"),
       stage: "focoCommandVersion",
       status: "pending",
     },

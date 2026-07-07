@@ -306,6 +306,16 @@ pub(crate) fn remote_server_summary(
     connected_ids: &HashSet<String>,
     state: Option<&AppState>,
 ) -> RemoteServerSummary {
+    let status = state
+        .and_then(|state| {
+            state
+                .remote_workspace_manager
+                .server_state(&server.id)
+                .ok()
+                .flatten()
+        })
+        .map(|state| state.as_str().to_string())
+        .unwrap_or_else(|| remote_server_status_value(server, connected_ids));
     RemoteServerSummary {
         id: server.id.clone(),
         name: server.name.clone(),
@@ -320,26 +330,34 @@ pub(crate) fn remote_server_summary(
         foco_command: server.foco_command.clone(),
         terminal_shell: server.terminal_shell.clone(),
         connect_timeout_ms: server.connect_timeout_ms,
-        status: state
-            .and_then(|state| {
-                state
-                    .remote_workspace_manager
-                    .server_state(&server.id)
-                    .ok()
-                    .flatten()
-            })
-            .map(|state| state.as_str().to_string())
-            .unwrap_or_else(|| remote_server_status_value(server, connected_ids)),
+        status: status.clone(),
         last_error: server.last_error.clone(),
         last_known_target: server.last_known_target.clone(),
         sidecar_version: server.last_sidecar_version.clone(),
-        sidecar_install_state: server
-            .sidecar_install_state
-            .clone()
-            .unwrap_or_else(|| SIDECAR_INSTALL_STATE_UNKNOWN.to_string()),
+        sidecar_install_state: remote_server_summary_sidecar_install_state(server, &status),
         workspace_count: workspace_count_for_server(config, &server.id),
         last_checked_at: server.last_checked_at.clone(),
     }
+}
+
+fn remote_server_summary_sidecar_install_state(
+    server: &RemoteServerProfile,
+    status: &str,
+) -> String {
+    let state = server
+        .sidecar_install_state
+        .clone()
+        .unwrap_or_else(|| SIDECAR_INSTALL_STATE_UNKNOWN.to_string());
+    if state == SIDECAR_INSTALL_STATE_NOT_INSTALLED
+        && server.last_sidecar_version.is_some()
+        && matches!(
+            status,
+            REMOTE_SERVER_STATUS_CONNECTED | REMOTE_SERVER_STATUS_READY
+        )
+    {
+        return SIDECAR_INSTALL_STATE_AVAILABLE.to_string();
+    }
+    state
 }
 
 pub(crate) fn connected_remote_server_ids(state: &AppState) -> Result<HashSet<String>, ApiError> {
@@ -1139,5 +1157,36 @@ mod tests {
             remote_server_summary(&config, &config.remote_servers[0], &HashSet::new(), None);
         assert_eq!(summary.workspace_count, 1);
         assert_eq!(summary.status, REMOTE_SERVER_STATUS_UNKNOWN);
+    }
+
+    #[test]
+    fn server_summary_treats_ready_version_as_available_sidecar() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Srv".to_string(),
+            host_alias: "srv".to_string(),
+            last_checked_at: Some("2026-07-07T00:00:00Z".to_string()),
+            last_sidecar_version: Some("0.1.0".to_string()),
+            sidecar_install_state: Some(SIDECAR_INSTALL_STATE_AVAILABLE.to_string()),
+            ..RemoteServerProfile::default()
+        });
+        assert_eq!(
+            remote_server_summary(&config, &config.remote_servers[0], &HashSet::new(), None)
+                .sidecar_install_state,
+            SIDECAR_INSTALL_STATE_AVAILABLE
+        );
+
+        config.remote_servers[0].sidecar_install_state =
+            Some(SIDECAR_INSTALL_STATE_NOT_INSTALLED.to_string());
+        let connected_ids = HashSet::from(["srv".to_string()]);
+        let connected_summary =
+            remote_server_summary(&config, &config.remote_servers[0], &connected_ids, None);
+        assert_eq!(connected_summary.status, REMOTE_SERVER_STATUS_CONNECTED);
+        assert_eq!(
+            connected_summary.sidecar_install_state,
+            SIDECAR_INSTALL_STATE_AVAILABLE
+        );
     }
 }

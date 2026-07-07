@@ -457,7 +457,7 @@ function remoteDialogStageLabel(stage: string, t: (key: string) => string) {
     case "remoteInstallDirWritable":
       return t("Starting sidecar");
     case "focoCommandVersion":
-      return t("Syncing config");
+      return t("Checking Sidecar version");
     case "ready":
       return t("Ready");
     default:

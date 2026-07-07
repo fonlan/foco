@@ -8,6 +8,16 @@ const remoteServersRs = await readFile(
   path.join(repoRoot, "app/http/remote_servers.rs"),
   "utf8",
 );
+const settingsPanelTsx = await readFile(
+  path.join(repoRoot, "web/features/settings/SettingsPanel.tsx"),
+  "utf8",
+);
+const workspaceDialogTsx = await readFile(
+  path.join(repoRoot, "web/features/workspaces/WorkspaceDialog.tsx"),
+  "utf8",
+);
+const appTsx = await readFile(path.join(repoRoot, "web/App.tsx"), "utf8");
+const i18nTs = await readFile(path.join(repoRoot, "web/shared/i18n.ts"), "utf8");
 
 const requiredDiagnosticStages = [
   "ssh",
@@ -37,5 +47,17 @@ assert.match(remoteServersRs, /Sha256::digest\(&bytes\)/, "sidecar selection ver
 assert.match(remoteServersRs, /sidecar asset sha256 mismatch/, "sha256 mismatch is reported");
 assert.match(remoteServersRs, /BatchMode=yes/, "SSH diagnostics use BatchMode");
 assert.match(remoteServersRs, /mkdir -p ~\/\.foco\/sidecars && test -w ~\/\.foco\/sidecars/, "install dir writability is checked");
+assert.match(remoteServersRs, /remote_server_summary_sidecar_install_state/, "summary derives sidecar install state");
+assert.match(remoteServersRs, /server_summary_treats_ready_version_as_available_sidecar/, "stale notInstalled with version is covered");
+
+for (const source of [settingsPanelTsx, workspaceDialogTsx, appTsx]) {
+  assert.match(source, /Checking Sidecar version/, "focoCommandVersion label checks sidecar version");
+}
+assert.match(i18nTs, /"Checking Sidecar version": "检查 Sidecar 版本"/, "Chinese diagnostic label is translated");
+assert.doesNotMatch(settingsPanelTsx, /case "focoCommandVersion":[\s\S]{0,80}Syncing config/, "settings diagnostic label is not config sync");
+assert.doesNotMatch(workspaceDialogTsx, /case "focoCommandVersion":[\s\S]{0,80}Syncing config/, "workspace diagnostic label is not config sync");
+assert.match(settingsPanelTsx, /const isConnected = server\.status === "connected" \|\| server\.status === "ready";/, "connected and ready servers use disconnect state");
+assert.match(settingsPanelTsx, /icon=\{isConnected \? CircleAlert : Play\}/, "one toggle button switches icon");
+assert.match(settingsPanelTsx, /onClick=\{\(\) => void onRunOperation\(server, toggleOperation\)\}/, "one toggle button switches operation");
 
 console.log("remote server diagnostics self-check passed");
