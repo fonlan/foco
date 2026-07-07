@@ -2655,13 +2655,13 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(screen.getByText("Model calls").parentElement!).getByText("gpt-test"),
     ).toBeInTheDocument();
+    const toolsSection = screen.getByText("Tools and compression").parentElement!;
+    expect(within(toolsSection).getByText("Read")).toBeInTheDocument();
+    expect(within(toolsSection).queryByText("Rule compression snapshots")).not.toBeInTheDocument();
+    expect(within(toolsSection).queryByText("Compression snapshots")).not.toBeInTheDocument();
+    expect(screen.getByText("Tool history compression")).toBeInTheDocument();
     expect(
-      within(screen.getByText("Tools and compression").parentElement!)
-        .getByText("read_file"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Runtime tool-state snapshots")).toBeInTheDocument();
-    expect(
-      within(screen.getByText("Runtime tool-state snapshots").parentElement!)
+      within(screen.getByText("Tool history compression").parentElement!)
         .getByText("2"),
     ).toBeInTheDocument();
     expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();

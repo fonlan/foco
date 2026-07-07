@@ -2645,7 +2645,7 @@ body,
 .context-usage-bar-row {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 3.75rem) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1.875rem) minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.375rem;
 }

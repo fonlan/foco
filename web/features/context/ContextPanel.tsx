@@ -79,6 +79,7 @@ import {
   MOBILE_BREAKPOINT_PX,
 } from "../../app/constants";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "../chat/MarkdownContent";
+import { toolDisplayName } from "../chat/chat-helpers";
 import { diffLineClass, parseGitDiffSections, type GitDiffSection } from "../git/diff-parser";
 import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
@@ -2336,13 +2337,9 @@ function ContextStatsTab({
           emptyLabel={t("No tools used yet.")}
           rows={[
             ...statistics.toolBreakdown.map((item) => ({
-              label: item.toolName,
+              label: toolDisplayName(item.toolName, language),
               value: formatNumber(item.callCount, language),
             })),
-            {
-              label: t("Rule compression snapshots"),
-              value: formatNumber(statistics.compression.ruleSnapshotCount, language),
-            },
             {
               label: t("LLM compression snapshots"),
               value: formatNumber(statistics.compression.llmSnapshotCount, language),
@@ -2353,10 +2350,6 @@ function ContextStatsTab({
                 statistics.compression.runtimeToolStateSnapshotCount,
                 language,
               ),
-            },
-            {
-              label: t("Compression snapshots"),
-              value: formatNumber(statistics.compression.snapshotCount, language),
             },
             {
               label: t("Tokens saved"),
@@ -2593,8 +2586,8 @@ function ContextStatsRows({
 
   return (
     <div className="context-stats-rows">
-      {rows.map((row) => (
-        <div className="context-stats-row" key={row.label}>
+      {rows.map((row, index) => (
+        <div className="context-stats-row" key={`${row.label}-${index}`}>
           <span>{row.label}</span>
           <strong>{row.value}</strong>
         </div>
