@@ -36,7 +36,9 @@ use foco_store::{
         MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
         NewMemorySource,
     },
-    workspace::{NewMessage, NewRunEvent, WorkspaceDatabase, workspace_database_path},
+    workspace::{
+        NewMessage, NewRunEvent, TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -932,14 +934,30 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/statistics",
-            get(remote_sidecar_passthrough_unavailable),
+            get(remote_sidecar_chat_statistics),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/todo-graph",
-            get(remote_sidecar_passthrough_unavailable),
+            get(remote_sidecar_chat_todo_graph),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/delete",
+            post(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/agent-team",
+            get(remote_sidecar_agent_no_team),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/agent-team/enable",
+            post(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/agent-team/action",
+            post(remote_sidecar_passthrough_unavailable),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/agent-team/instances/create",
             post(remote_sidecar_passthrough_unavailable),
         )
         .route(
@@ -3591,6 +3609,139 @@ async fn remote_sidecar_chat_messages(
         "pendingQuestion": null,
         "latestResponseUsage": null,
     })))
+}
+
+async fn remote_sidecar_chat_statistics(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database = sidecar_workspace_database(&state)?;
+    if database
+        .chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .is_none()
+    {
+        return Err(
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
+        );
+    }
+
+    let counts = database
+        .message_role_counts_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let mut message_count = 0_i64;
+    let mut user_message_count = 0_i64;
+    let mut assistant_message_count = 0_i64;
+    let mut tool_message_count = 0_i64;
+    for count in counts {
+        message_count += count.count;
+        match count.role.as_str() {
+            "user" => user_message_count = count.count,
+            "assistant" => assistant_message_count = count.count,
+            "tool" => tool_message_count = count.count,
+            _ => {}
+        }
+    }
+    let code_change_stats = database
+        .code_change_stats_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({
+        "workspaceId": state.workspace_id,
+        "chatId": chat_id,
+        "messageCount": message_count,
+        "userMessageCount": user_message_count,
+        "assistantMessageCount": assistant_message_count,
+        "toolMessageCount": tool_message_count,
+        "totalRequests": 0,
+        "failedRequests": 0,
+        "totalInputTokens": 0,
+        "totalOutputTokens": 0,
+        "totalCacheReadTokens": 0,
+        "totalCacheWriteTokens": 0,
+        "totalTokens": 0,
+        "totalLatencyMs": 0,
+        "averageLatencyMs": null,
+        "memoryReferences": 0,
+        "createdMemories": 0,
+        "codeChangeStats": code_change_stats,
+        "modelBreakdown": [],
+        "providerBreakdown": [],
+        "toolBreakdown": [],
+        "compression": {
+            "snapshotCount": 0,
+            "ruleSnapshotCount": 0,
+            "llmSnapshotCount": 0,
+            "runtimeToolStateSnapshotCount": 0,
+            "originalTokenCount": 0,
+            "summaryTokenCount": 0,
+            "savedTokenCount": 0
+        },
+        "contextUsageTimeline": []
+    })))
+}
+
+async fn remote_sidecar_chat_todo_graph(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database = sidecar_workspace_database(&state)?;
+    if database
+        .chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .is_none()
+    {
+        return Err(
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
+        );
+    }
+    let status = query
+        .get("status")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let task_id = query
+        .get("taskId")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let include_subtasks = query
+        .get("includeSubtasks")
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(true);
+    let graph = database
+        .filtered_todo_graph(
+            &chat_id,
+            TodoGraphFilter {
+                status,
+                task_id,
+                include_subtasks,
+            },
+        )
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let response = match graph {
+        Some(graph) => json!({
+            "chatId": graph.chat_id,
+            "exists": true,
+            "tasks": graph.tasks,
+            "createdAt": graph.created_at,
+            "updatedAt": graph.updated_at,
+        }),
+        None => json!({
+            "chatId": chat_id,
+            "exists": false,
+            "tasks": [],
+            "createdAt": null,
+            "updatedAt": null,
+        }),
+    };
+    Ok(Json(response))
+}
+
+async fn remote_sidecar_agent_no_team(
+    AxumPath(chat_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    Err(ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")).into_response())
 }
 
 fn remote_required_text(

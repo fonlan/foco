@@ -18667,7 +18667,7 @@ fn restore_env_var(key: &str, value: Option<&str>) {
 }
 
 #[tokio::test]
-async fn fake_sidecar_http_and_websocket_proxy_forward_bearer_token() {
+async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests() {
     use futures_util::SinkExt;
     use tungstenite::client::IntoClientRequest;
 
@@ -18760,6 +18760,37 @@ async fn fake_sidecar_http_and_websocket_proxy_forward_bearer_token() {
     assert_eq!(body["queued"], true);
     assert_eq!(body["payload"]["message"], "hello");
 
+    let stats_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/chats/chat-1/statistics"
+    ))
+    .await
+    .expect("proxied chat statistics request");
+    assert_eq!(stats_response.status(), StatusCode::OK);
+    let body = stats_response
+        .json::<Value>()
+        .await
+        .expect("statistics json");
+    assert_eq!(body["statistics"], true);
+
+    let todo_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/chats/chat-1/todo-graph"
+    ))
+    .await
+    .expect("proxied todo graph request");
+    assert_eq!(todo_response.status(), StatusCode::OK);
+    let body = todo_response
+        .json::<Value>()
+        .await
+        .expect("todo graph json");
+    assert_eq!(body["todoGraph"], true);
+
+    let agent_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/chats/chat-1/agent-team"
+    ))
+    .await
+    .expect("proxied agent team request");
+    assert_eq!(agent_response.status(), StatusCode::BAD_REQUEST);
+
     let mut ws_request = format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws")
         .into_client_request()
         .expect("websocket request");
@@ -18800,10 +18831,16 @@ async fn serve_fake_sidecar_proxy_fixture(
 ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let expected_http = format!("Bearer {token}");
     let expected_chat = expected_http.clone();
+    let expected_chat_stats = expected_http.clone();
+    let expected_todo_graph = expected_http.clone();
+    let expected_agent_team = expected_http.clone();
     let expected_ws = expected_http.clone();
     let seen_auth = Arc::new(Mutex::new(Vec::new()));
     let http_seen = seen_auth.clone();
     let chat_seen = seen_auth.clone();
+    let chat_stats_seen = seen_auth.clone();
+    let todo_graph_seen = seen_auth.clone();
+    let agent_team_seen = seen_auth.clone();
     let ws_seen = seen_auth.clone();
     let app = axum::Router::new()
         .route(
@@ -18849,6 +18886,63 @@ async fn serve_fake_sidecar_proxy_fixture(
                         "payload": payload,
                     }))
                     .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/statistics",
+            axum::routing::get(move |headers: HeaderMap| {
+                let expected = expected_chat_stats.clone();
+                let seen = chat_stats_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({ "statistics": true })).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/todo-graph",
+            axum::routing::get(move |headers: HeaderMap| {
+                let expected = expected_todo_graph.clone();
+                let seen = todo_graph_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({ "todoGraph": true })).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/agent-team",
+            axum::routing::get(move |headers: HeaderMap| {
+                let expected = expected_agent_team.clone();
+                let seen = agent_team_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    StatusCode::BAD_REQUEST.into_response()
                 }
             }),
         )
