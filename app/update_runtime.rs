@@ -660,6 +660,8 @@ if [ -d "$FOCO_UPDATE_APP" ]; then
 fi
 mv "$new_app" "$FOCO_UPDATE_APP"
 rm -rf "$old_app"
+# ponytail: trusted self-updates are unsigned; public releases should use Developer ID notarization instead.
+xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP" || true
 hdiutil detach "$volume"
 trap - EXIT
 open -n "$FOCO_UPDATE_APP" --args --updated-restart
@@ -930,10 +932,9 @@ mod tests {
 
     #[test]
     fn macos_update_helper_restarts_silently() {
-        assert!(
-            macos_update_script()
-                .contains(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#)
-        );
+        let script = macos_update_script();
+        assert!(script.contains(r#"xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP" || true"#));
+        assert!(script.contains(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#));
     }
 
     #[test]

@@ -1187,7 +1187,7 @@ mod tests {
             command: Some("foco-test-mcp".to_string()),
             args: Vec::new(),
             url: None,
-            execution_host: McpExecutionHost::Auto,
+            execution_host: McpExecutionHost::Local,
         }
     }
     #[cfg(unix)]

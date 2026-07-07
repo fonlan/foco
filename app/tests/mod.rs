@@ -6647,15 +6647,17 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
 }
 
 #[tokio::test]
-async fn agent_scheduler_exits_when_app_shutdown_channel_closes() {
+async fn agent_scheduler_exits_when_app_shutdown_signal_is_sent() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-shutdown-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let state = test_app_state(
         prompt_test_config(workspace_dir.clone()),
         workspace_dir.clone(),
     );
+    let app_shutdown_tx = state.app_shutdown_tx.clone();
     let (scheduler, wake_rx) = AgentScheduler::new();
     let task = scheduler.spawn(state, wake_rx);
+    app_shutdown_tx.send(true).expect("signal app shutdown");
     timeout(Duration::from_secs(1), task)
         .await
         .expect("scheduler shutdown timeout")
