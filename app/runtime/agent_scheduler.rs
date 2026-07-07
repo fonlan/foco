@@ -2392,8 +2392,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_prompt_role_uses_developer_only_for_collaboration_tools() {
-        assert_eq!(agent_prompt_role(true), NeutralChatRole::Developer);
+    fn agent_definition_and_protocol_role_uses_developer_only_for_collaboration_tools() {
+        let collaboration_role = agent_prompt_role(true);
+        let definition_message =
+            neutral_agent_message(collaboration_role.clone(), "definition".to_string());
+        let protocol_message = neutral_agent_message(collaboration_role, "protocol".to_string());
+
+        assert_eq!(definition_message.role, NeutralChatRole::Developer);
+        assert_eq!(protocol_message.role, NeutralChatRole::Developer);
         assert_eq!(agent_prompt_role(false), NeutralChatRole::System);
     }
 
@@ -2421,6 +2427,38 @@ mod tests {
             sources.last(),
             Some(PromptContextSource::CurrentUser { sequence: 7 })
         ));
+    }
+
+    #[test]
+    fn first_turn_agent_sources_keep_current_user_last() {
+        let mut sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::CurrentUser { sequence: 7 },
+        ];
+        let definition_index = sources
+            .iter()
+            .position(|source| !matches!(source, PromptContextSource::ReservedPrompt))
+            .unwrap_or(sources.len());
+        sources.insert(definition_index, PromptContextSource::AgentDefinition);
+        let protocol_index = agent_team_protocol_insert_index_for_sources(&sources, sources.len());
+        sources.insert(protocol_index, PromptContextSource::AgentTeamProtocol);
+        let current_task_index =
+            agent_current_task_insert_index_for_sources(&sources, sources.len());
+        sources.insert(
+            current_task_index,
+            PromptContextSource::AgentCurrentTask { sequence: 0 },
+        );
+
+        assert_eq!(
+            sources,
+            vec![
+                PromptContextSource::ReservedPrompt,
+                PromptContextSource::AgentDefinition,
+                PromptContextSource::AgentTeamProtocol,
+                PromptContextSource::AgentCurrentTask { sequence: 0 },
+                PromptContextSource::CurrentUser { sequence: 7 },
+            ]
+        );
     }
 
     #[test]
@@ -2595,6 +2633,7 @@ mod tests {
             &[coordinator.clone(), worker],
         )
         .expect("protocol prompt");
+        assert!(prompt.contains("## Subagents"));
         let protocol = agent_team_protocol_json_from_prompt(&prompt);
         let creatable = protocol["creatableAgentDefinitions"]
             .as_array()
