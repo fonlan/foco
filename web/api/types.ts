@@ -1042,6 +1042,7 @@ export type ModelMetadataRecord = {
   pricing: ModelPricing;
   inputModalities: string[];
   outputModalities: string[];
+  supportedThinkingLevels: string[];
   supportsTools: boolean;
   supportsCache: boolean;
   reasoning: boolean;
@@ -1066,6 +1067,7 @@ export type ConfiguredModelSummary = {
   thinkingLevel: string | null;
   systemPromptName: string;
   supportsThinking: boolean;
+  supportedThinkingLevels: string[];
   warnings: string[];
 };
 

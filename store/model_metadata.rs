@@ -6,6 +6,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::SUPPORTED_AGENT_THINKING_LEVELS;
+
 pub const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -29,6 +31,8 @@ pub struct ModelMetadataRecord {
     pub pricing: ModelPricing,
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
+    #[serde(default)]
+    pub supported_thinking_levels: Vec<String>,
     pub supports_tools: bool,
     pub supports_cache: bool,
     #[serde(default)]
@@ -135,6 +139,7 @@ pub fn parse_models_dev_metadata(
                 .as_ref()
                 .map(|modalities| modalities.output.clone())
                 .unwrap_or_default();
+            let supported_thinking_levels = supported_thinking_levels(&model.reasoning_options);
 
             models.push(ModelMetadataRecord {
                 key: model_metadata_key(&provider_id, &model_id),
@@ -147,6 +152,7 @@ pub fn parse_models_dev_metadata(
                 pricing,
                 input_modalities,
                 output_modalities,
+                supported_thinking_levels,
                 supports_tools: model.tool_call.unwrap_or(false),
                 supports_cache,
                 reasoning: model.reasoning.unwrap_or(false),
@@ -256,6 +262,20 @@ fn required_source_id(
     Ok(id.to_string())
 }
 
+fn supported_thinking_levels(reasoning_options: &[RawReasoningOption]) -> Vec<String> {
+    reasoning_options
+        .iter()
+        .filter(|option| option.option_type == "effort")
+        .flat_map(|option| option.values.iter())
+        .filter(|level| SUPPORTED_AGENT_THINKING_LEVELS.contains(&level.as_str()))
+        .fold(Vec::new(), |mut levels, level| {
+            if !levels.contains(level) {
+                levels.push(level.clone());
+            }
+            levels
+        })
+}
+
 #[derive(Deserialize)]
 struct RawProvider {
     id: Option<String>,
@@ -273,6 +293,16 @@ struct RawModel {
     limit: Option<RawLimit>,
     cost: Option<RawCost>,
     modalities: Option<RawModalities>,
+    #[serde(default)]
+    reasoning_options: Vec<RawReasoningOption>,
+}
+
+#[derive(Deserialize)]
+struct RawReasoningOption {
+    #[serde(default, rename = "type")]
+    option_type: String,
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +344,11 @@ mod tests {
         "id": "gpt-test",
         "name": "GPT Test",
         "reasoning": true,
+        "reasoning_options": [
+          { "type": "effort", "values": ["minimal", "low", "default", "max", "medium", "minimal"] },
+          { "type": "budget_tokens" },
+          { "type": "toggle", "values": ["high"] }
+        ],
         "tool_call": true,
         "limit": { "context": 128000, "output": 16384 },
         "cost": { "input": 1.25, "output": 10.0, "cache_read": 0.125 },
@@ -338,6 +373,10 @@ mod tests {
         assert!(model.supports_tools);
         assert!(model.supports_cache);
         assert!(model.reasoning);
+        assert_eq!(
+            model.supported_thinking_levels,
+            ["minimal", "low", "medium"]
+        );
         assert_eq!(model.input_modalities, ["text", "image"]);
         assert_eq!(model.output_modalities, ["text"]);
         assert_eq!(model.source_url, MODELS_DEV_API_URL);
@@ -369,5 +408,38 @@ mod tests {
         assert_eq!(model.max_output_tokens, None);
         assert!(!model.supports_tools);
         assert!(!model.supports_cache);
+        assert!(model.supported_thinking_levels.is_empty());
+    }
+
+    #[test]
+    fn reads_legacy_cache_without_supported_thinking_levels() {
+        let cache: ModelMetadataCache = serde_json::from_str(
+            r#"{
+  "sourceUrl": "https://models.dev/api.json",
+  "fetchedAt": "2026-06-03T10:00:00Z",
+  "models": [
+    {
+      "key": "local/legacy",
+      "providerId": "local",
+      "providerName": "Local",
+      "modelId": "legacy",
+      "name": "Legacy",
+      "contextWindow": null,
+      "maxOutputTokens": null,
+      "pricing": {},
+      "inputModalities": ["text"],
+      "outputModalities": ["text"],
+      "supportsTools": false,
+      "supportsCache": false,
+      "reasoning": false,
+      "sourceUrl": "https://models.dev/api.json",
+      "refreshedAt": "2026-06-03T10:00:00Z"
+    }
+  ]
+}"#,
+        )
+        .expect("legacy cache should parse");
+
+        assert!(cache.models[0].supported_thinking_levels.is_empty());
     }
 }

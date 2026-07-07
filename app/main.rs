@@ -185,7 +185,8 @@ pub(crate) use platform::tray::{
 #[cfg(test)]
 pub(crate) use settings_runtime::skills_settings_summary;
 pub(crate) use settings_runtime::{
-    configured_model_summary_for_config, settings_response, workspace_response_from_config,
+    configured_model_summary_for_config_and_metadata, settings_response,
+    workspace_response_from_config,
 };
 #[cfg(test)]
 pub(crate) use skills::parse_skill_markdown;
@@ -7079,6 +7080,12 @@ fn model_metadata_response(
         None => (None, None, Vec::new()),
     };
 
+    let metadata_by_key = models
+        .iter()
+        .cloned()
+        .map(|model| (model.key.clone(), model))
+        .collect();
+
     ModelMetadataResponse {
         source_url,
         fetched_at,
@@ -7087,7 +7094,9 @@ fn model_metadata_response(
         configured_models: config
             .models
             .iter()
-            .map(|model| configured_model_summary_for_config(model, config))
+            .map(|model| {
+                configured_model_summary_for_config_and_metadata(model, config, &metadata_by_key)
+            })
             .collect(),
     }
 }

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Instant,
+};
 
 use axum::Json;
 use base64::{Engine as _, engine::general_purpose};
@@ -13,6 +17,7 @@ use foco_store::{
         SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
         WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
     },
+    model_metadata::{ModelMetadataRecord, read_model_metadata_cache},
     workspace::{ChatPageCursor, WorkspaceDatabase},
 };
 
@@ -39,6 +44,7 @@ pub(crate) async fn settings_response(
     let active_workspace_id = config.app.active_workspace_id.clone();
     let mcp_statuses = state.mcp_registry.statuses(&active_workspace_id).await;
     let default_system_prompt = build_default_system_prompt();
+    let model_metadata_by_key = model_metadata_by_key(&state.model_metadata_file);
 
     Ok(Json(SettingsResponse {
         app_version: crate::update_runtime::current_version().to_string(),
@@ -255,7 +261,13 @@ pub(crate) async fn settings_response(
         configured_models: config
             .models
             .iter()
-            .map(|model| configured_model_summary_for_config(model, config))
+            .map(|model| {
+                configured_model_summary_for_config_and_metadata(
+                    model,
+                    config,
+                    &model_metadata_by_key,
+                )
+            })
             .collect(),
         mcp_servers: config
             .mcp
@@ -678,6 +690,36 @@ pub(crate) fn configured_model_summary_for_config(
     summary
 }
 
+pub(crate) fn configured_model_summary_for_config_and_metadata(
+    model: &ModelSettings,
+    config: &GlobalConfig,
+    metadata_by_key: &HashMap<String, ModelMetadataRecord>,
+) -> ConfiguredModelSummary {
+    let mut summary = configured_model_summary_for_config(model, config);
+    summary.supported_thinking_levels = model
+        .metadata_key
+        .as_ref()
+        .and_then(|key| metadata_by_key.get(key))
+        .map(|record| record.supported_thinking_levels.clone())
+        .unwrap_or_default();
+    summary
+}
+
+pub(crate) fn model_metadata_by_key(cache_path: &Path) -> HashMap<String, ModelMetadataRecord> {
+    match read_model_metadata_cache(cache_path) {
+        Ok(Some(cache)) => cache
+            .models
+            .into_iter()
+            .map(|model| (model.key.clone(), model))
+            .collect(),
+        Ok(None) => HashMap::new(),
+        Err(error) => {
+            tracing::warn!(error = %error, "model metadata cache is unreadable; model capabilities unavailable");
+            HashMap::new()
+        }
+    }
+}
+
 pub(crate) const WORKSPACE_CHAT_PAGE_LIMIT: usize = 5;
 
 pub(crate) fn workspace_response_from_config(
@@ -883,6 +925,7 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         thinking_level: model.thinking_level.clone(),
         system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
+        supported_thinking_levels: Vec::new(),
         warnings: Vec::new(),
     }
 }
