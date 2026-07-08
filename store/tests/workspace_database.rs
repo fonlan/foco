@@ -1047,12 +1047,22 @@ fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
     assert!(running.phases[0].agent_team_id.is_none());
     assert!(running.phases[0].agent_task_id.is_none());
 
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run before dispatch repair");
+
     let repaired = database
         .fail_running_plan_phases_without_agent_runs(
             "Plan phase start did not create an implementation chat or Agent task",
         )
         .expect("repair running phase without Agent run");
     assert_eq!(repaired, 1);
+    assert!(
+        !database
+            .plan_auto_run_state()
+            .expect("auto-run state")
+            .enabled
+    );
 
     let failed = database
         .plan("plan-running-without-agent-run")
@@ -1125,10 +1135,20 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
         .attach_plan_phase_attempt_run(&first_attempt.id, "chat-plan-restart", &team_id, &task_id)
         .expect("attach phase attempt");
 
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run before phase failure");
+
     let failed = database
         .fail_plan_phase_run(&task_id, "provider failed")
         .expect("fail phase")
         .expect("failed plan");
+    assert!(
+        !database
+            .plan_auto_run_state()
+            .expect("auto-run state")
+            .enabled
+    );
     assert_eq!(failed.status, "failed");
     assert_eq!(failed.phases[0].status, "failed");
     assert_eq!(
@@ -1413,11 +1433,21 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
         })
         .expect("cancel task");
 
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run before cancellation");
+
     let cancelled = database
         .cancel_plan_phase_run(&task_id, "user cancelled the run")
         .expect("cancel phase run")
         .expect("cancelled plan");
 
+    assert!(
+        database
+            .plan_auto_run_state()
+            .expect("auto-run state")
+            .enabled
+    );
     assert_eq!(cancelled.status, "failed");
     assert!(cancelled.active_phase_id.is_none());
     assert_eq!(

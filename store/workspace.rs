@@ -3004,6 +3004,7 @@ impl WorkspaceDatabase {
                 params![phase.plan_id.as_str(), error_message, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        self.set_workspace_metadata("plan_auto_run_enabled", "false")?;
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after phase failure: {}", phase.plan_id),
