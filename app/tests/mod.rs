@@ -3631,6 +3631,23 @@ fn group_pinned_workspaces_keeps_group_order() {
 }
 
 #[test]
+fn promote_pinned_workspace_moves_only_pinned_target_to_front() {
+    let mut workspaces = vec![
+        test_workspace_config("first"),
+        test_workspace_config("second"),
+        test_workspace_config("third"),
+    ];
+    workspaces[0].pinned = true;
+    workspaces[2].pinned = true;
+
+    promote_pinned_workspace(&mut workspaces, "third");
+    assert_eq!(workspace_ids(&workspaces), vec!["third", "first", "second"]);
+
+    promote_pinned_workspace(&mut workspaces, "second");
+    assert_eq!(workspace_ids(&workspaces), vec!["third", "first", "second"]);
+}
+
+#[test]
 fn normalize_windows_verbatim_path_removes_prefixes() {
     assert_eq!(
         normalize_windows_verbatim_path(PathBuf::from(r"\\?\C:\Users\fonla\Repo")),

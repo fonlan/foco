@@ -3248,17 +3248,6 @@ export function SettingsPanel({
     setIsSavingWorkspace(true);
     setError(null);
 
-    const shouldSaveOrder = editingWorkspace?.pinned !== workspaceForm.pinned;
-    const workspaceIds = shouldSaveOrder
-      ? groupedWorkspaceIds(
-        orderedWorkspaces.map((workspace) =>
-          workspace.id === workspaceForm.id
-            ? { ...workspace, pinned: workspaceForm.pinned }
-            : workspace,
-        ),
-      )
-      : null;
-
     try {
       const data = await requestJson<SettingsResponse>("/api/workspaces/manual", {
         body: JSON.stringify({
@@ -3274,15 +3263,8 @@ export function SettingsPanel({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      const finalData = workspaceIds
-        ? await requestJson<SettingsResponse>("/api/workspaces/order", {
-          body: JSON.stringify({ workspaceIds }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        })
-        : data;
-      setSettings(finalData);
-      onSettingsChange(finalData);
+      setSettings(data);
+      onSettingsChange(data);
       await onWorkspacesChange();
       if (editingWorkspace && isWorkspaceSpecSettingsLoaded) {
         try {
@@ -13334,17 +13316,6 @@ function nextMcpServerId(
   }
 
   return `${base}-${index}`;
-}
-
-function groupedWorkspaceIds(workspaces: ConfiguredWorkspaceSummary[]) {
-  return [
-    ...workspaces
-      .filter((workspace) => workspace.pinned)
-      .map((workspace) => workspace.id),
-    ...workspaces
-      .filter((workspace) => !workspace.pinned)
-      .map((workspace) => workspace.id),
-  ];
 }
 
 function terminalShellLabel(

@@ -7256,6 +7256,20 @@ fn group_pinned_workspaces(workspaces: &mut Vec<WorkspaceConfig>) {
     *workspaces = pinned;
 }
 
+fn promote_pinned_workspace(workspaces: &mut Vec<WorkspaceConfig>, workspace_id: &str) {
+    let Some(index) = workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id && workspace.pinned)
+    else {
+        return;
+    };
+
+    if index > 0 {
+        let workspace = workspaces.remove(index);
+        workspaces.insert(0, workspace);
+    }
+}
+
 fn normalize_terminal_shell(shell: &str) -> Result<String, ApiError> {
     let shell = shell.trim();
 

@@ -341,6 +341,10 @@ describe("app-workspaces verification surfaces", () => {
           Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Home" }));
+    expectWorkspaceOrder(["Another project", "Default", "Side project"]);
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
 
     await userEvent.click(
       screen.getByRole("button", { name: "Unpin workspace Another project" }),

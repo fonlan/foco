@@ -914,6 +914,7 @@ pub(crate) async fn save_workspace_settings(
         workspace.terminal_shell = terminal_shell;
         workspace.common_commands = common_commands;
         group_pinned_workspaces(&mut config.workspaces);
+        promote_pinned_workspace(&mut config.workspaces, workspace_id);
         save_config(&state, config.clone())?;
         return settings_response(&state, &config).await;
     }
@@ -952,6 +953,7 @@ pub(crate) async fn save_workspace_settings(
     workspace.terminal_shell = terminal_shell;
     workspace.common_commands = common_commands;
     group_pinned_workspaces(&mut config.workspaces);
+    promote_pinned_workspace(&mut config.workspaces, workspace_id);
 
     save_config(&state, config.clone())?;
 

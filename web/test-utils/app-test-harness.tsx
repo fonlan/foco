@@ -2325,6 +2325,21 @@ function groupPinnedUnknownWorkspaces<T>(items: T[]) {
   ];
 }
 
+function promotePinnedUnknownWorkspace<T>(items: T[], itemId: string | undefined) {
+  const index = items.findIndex(
+    (item) => (item as { id?: string; pinned?: boolean }).id === itemId &&
+      Boolean((item as { pinned?: boolean }).pinned),
+  );
+  if (index <= 0) {
+    return items;
+  }
+
+  const next = [...items];
+  const [item] = next.splice(index, 1);
+  next.unshift(item);
+  return next;
+}
+
 function workspaceOrderSettings(workspaceIds: string[]) {
   appTestState.lastWorkspaceOrderRequest = workspaceIds;
   appTestState.workspaceResponseWorkspaces = reorderUnknownWorkspacesByIds(
@@ -2342,11 +2357,14 @@ function workspaceOrderSettings(workspaceIds: string[]) {
 function saveManualWorkspaceSettings(init?: RequestInit) {
   const body = JSON.parse(String(init?.body ?? "{}")) as Partial<ConfiguredWorkspaceSummary>;
   appTestState.lastManualWorkspaceRequest = body;
-  appTestState.workspaceResponseWorkspaces = groupPinnedUnknownWorkspaces(
-    appTestState.workspaceResponseWorkspaces.map((item) => {
-      const current = item as Record<string, unknown>;
-      return current.id === body.id ? { ...current, ...body } : current;
-    }),
+  appTestState.workspaceResponseWorkspaces = promotePinnedUnknownWorkspace(
+    groupPinnedUnknownWorkspaces(
+      appTestState.workspaceResponseWorkspaces.map((item) => {
+        const current = item as Record<string, unknown>;
+        return current.id === body.id ? { ...current, ...body } : current;
+      }),
+    ),
+    body.id,
   );
   appTestState.settingsResponse = {
     ...appTestState.settingsResponse,
