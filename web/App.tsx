@@ -11619,13 +11619,11 @@ function MainTabBar({
     window.addEventListener("pointerdown", closeContextMenuForPointer);
     window.addEventListener("keydown", closeContextMenuForKey);
     window.addEventListener("resize", closeContextMenu);
-    window.addEventListener("scroll", closeContextMenu, true);
 
     return () => {
       window.removeEventListener("pointerdown", closeContextMenuForPointer);
       window.removeEventListener("keydown", closeContextMenuForKey);
       window.removeEventListener("resize", closeContextMenu);
-      window.removeEventListener("scroll", closeContextMenu, true);
     };
   }, [contextMenu]);
 
@@ -11678,6 +11676,13 @@ function MainTabBar({
       behavior: "smooth",
       left: direction * Math.max(180, Math.floor(element.clientWidth * 0.7)),
     });
+  }
+
+  function handleTabListScroll() {
+    updateScrollState();
+    if (contextMenu) {
+      setContextMenu(null);
+    }
   }
 
   function handleWheel(event: ReactWheelEvent<HTMLDivElement>) {
@@ -11814,7 +11819,7 @@ function MainTabBar({
       <div
         aria-label={t("Chat")}
         className="chat-tab-list panel-scroll flex min-w-0 flex-1 gap-1 overflow-x-auto"
-        onScroll={updateScrollState}
+        onScroll={handleTabListScroll}
         onWheel={handleWheel}
         ref={tabListRef}
         role="tablist"

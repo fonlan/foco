@@ -3370,6 +3370,45 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps the tab context menu open when the active stream scrolls messages", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    const toolRunTabItem = within(tabList).getByRole("tab", { name: /Tool run/ }).closest(".chat-tab-item");
+    expect(toolRunTabItem).not.toBeNull();
+    fireEvent.contextMenu(toolRunTabItem as HTMLElement);
+    expect(await screen.findByRole("menu", { name: "Tool run" })).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Partial answer.",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("Partial answer.")).toBeInTheDocument();
+
+    const messageList = document.querySelector(".message-list");
+    if (!(messageList instanceof HTMLElement)) {
+      throw new Error("Expected message list");
+    }
+    fireEvent.scroll(messageList);
+
+    expect(screen.getByRole("menu", { name: "Tool run" })).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("reattaches from refreshed workspace active run when reopening cached chat", async () => {
     const fetchMock = vi.mocked(fetch);
     let reattachActiveRun = false;
