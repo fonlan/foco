@@ -52,7 +52,6 @@ import type {
   ContextMemoryState,
   ContextUsageResponse,
   ContextUsageSegments,
-  ContextUsageTimelineEntry,
   GitDiffResponse,
   GitStatusFileSummary,
   MemoryFactRecord,
@@ -2283,10 +2282,7 @@ function ContextStatsTab({
         ) : null}
       </div>
 
-      <ContextUsageTimelinePanel
-        contextUsage={contextUsage}
-        timeline={statistics.contextUsageTimeline}
-      />
+      <ContextUsageTimelinePanel contextUsage={contextUsage} />
 
       <div className="context-stats-metrics">
         <ContextStatMetric
@@ -2375,12 +2371,10 @@ function ContextStatsTab({
 
 function ContextUsageTimelinePanel({
   contextUsage,
-  timeline,
 }: {
   contextUsage: ContextUsageResponse | null;
-  timeline: ContextUsageTimelineEntry[];
 }) {
-  const { language, t } = useI18n();
+  const { t } = useI18n();
 
   if (!contextUsage?.contextWindow) {
     return (
@@ -2398,15 +2392,6 @@ function ContextUsageTimelinePanel({
     totalUsedTokens: contextUsage.totalUsedContextTokens,
     segments: contextUsage.segments,
   };
-  const historyEntries = timeline.map((entry) => ({
-    id: entry.snapshotId,
-    label: `${t("Snapshot")} ${formatNumber(entry.sequence, language)}`,
-    meta: `${entry.kind} / ${entry.snapshotId}`,
-    contextWindow: entry.contextWindow,
-    totalUsedTokens: entry.totalUsedTokens,
-    segments: entry.segments,
-  }));
-
   return (
     <section className="context-usage-timeline-panel" aria-label={t("Context usage timeline")}>
       <ContextUsageBar entry={currentEntry} isCurrent />
@@ -2422,13 +2407,6 @@ function ContextUsageTimelinePanel({
           </span>
         ))}
       </div>
-      {historyEntries.length ? (
-        <div className="context-usage-history-stack">
-          {historyEntries.map((entry) => (
-            <ContextUsageBar entry={entry} key={entry.id} />
-          ))}
-        </div>
-      ) : null}
     </section>
   );
 }
@@ -2480,6 +2458,11 @@ function ContextUsageBar({
 
   return (
     <div className={`context-usage-bar-row${isCurrent ? " is-current" : ""}`}>
+      <div className="context-usage-bar-topline">
+        {isPastTrigger ? <strong>{t("Past 80%")}</strong> : null}
+        <span className="context-usage-bar-threshold is-tool-state">80%</span>
+        <span className="context-usage-bar-threshold is-llm">95%</span>
+      </div>
       <div className="context-usage-bar-copy">
         <span className="context-usage-bar-label" title={entry.label}>
           {entry.label}
@@ -2507,16 +2490,11 @@ function ContextUsageBar({
             style={{ backgroundColor: segment.color, width: `${segment.widthPercent}%` }}
           />
         ))}
-        <span className="context-usage-trigger-marker is-tool-state" aria-hidden="true">
-          <span>80%</span>
-        </span>
-        <span className="context-usage-trigger-marker is-llm" aria-hidden="true">
-          <span>95%</span>
-        </span>
+        <span className="context-usage-trigger-marker is-tool-state" aria-hidden="true" />
+        <span className="context-usage-trigger-marker is-llm" aria-hidden="true" />
       </div>
       <div className="context-usage-bar-footer">
         <span>{formatNumber(entry.totalUsedTokens, language)}</span>
-        {isPastTrigger ? <strong>{t("Past 80%")}</strong> : null}
       </div>
     </div>
   );

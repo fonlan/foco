@@ -703,6 +703,12 @@ describe("app-chat-stream verification surfaces", () => {
   });
 
   it("shows context compression parts from stream side events", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const contextUsageCallCount = () =>
+      fetchMock.mock.calls.filter(
+        ([url]) => typeof url === "string" && url === "/api/workspaces/workspace-1/context-usage",
+      ).length;
+
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     await userEvent.type(
@@ -711,7 +717,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
-
+    const contextUsageCallCountBeforeStart = contextUsageCallCount();
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
@@ -732,6 +738,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(await screen.findByText("Context compression")).toBeInTheDocument();
     expect(screen.getByText("Compressing")).toBeInTheDocument();
 
+    expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart);
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
@@ -755,6 +762,7 @@ describe("app-chat-stream verification surfaces", () => {
 
     expect(await screen.findByText("Compressed")).toBeInTheDocument();
     expect(screen.getByText(/Saved 880 tokens/)).toBeInTheDocument();
+    await waitFor(() => expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart + 1));
     expect(screen.getAllByText("Context compression")).toHaveLength(1);
     await userEvent.click(screen.getByText("Context compression"));
     expect(screen.getByText("Original tokens")).toBeInTheDocument();

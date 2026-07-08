@@ -8088,6 +8088,9 @@ export function App() {
                   : message,
               ),
             );
+            if (streamEvent.status === "completed") {
+              refreshRunContextUsage();
+            }
           });
           return;
         }
@@ -9133,6 +9136,9 @@ export function App() {
                   : message,
               ),
             );
+            if (streamEvent.status === "completed") {
+              refreshRunContextUsage();
+            }
           });
           return;
         }
