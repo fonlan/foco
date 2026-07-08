@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Request, State, WebSocketUpgrade},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -629,9 +629,9 @@ pub(crate) fn app_router(state: AppState) -> Router {
 /// terminal, spec, plans, code graph, chat/runtime state, agents, schedules, and
 /// workspace statistics. Settings and provider secrets stay local.
 ///
-/// ponytail: v1 reads the entire request body, proxies, and returns the full
-/// response body in memory.  This is fine for the localhost SSH tunnel but
-/// should stream for large file blobs.
+/// ponytail: v1 still buffers request bodies and non-SSE responses in memory.
+/// Chat streams are proxied as streams because reverse proxies otherwise wait for
+/// the sidecar SSE body to finish and can 504 long-running chats.
 async fn remote_workspace_proxy_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -646,6 +646,7 @@ async fn remote_workspace_proxy_middleware(
     let Some(workspace_id) = extract_workspace_id_from_path(path) else {
         return next.run(request).await;
     };
+    let suffix = suffix.to_string();
 
     // Check if this workspace is remote and has an active sidecar session.
     if let Err(error) =
@@ -711,6 +712,19 @@ async fn remote_workspace_proxy_middleware(
         Ok(resp) => {
             let status = resp.status();
             let headers = resp.headers().clone();
+            let is_sse_response = response_is_event_stream(&headers);
+            let mut builder = Response::builder().status(status);
+            for (name, value) in headers.iter() {
+                if should_skip_proxy_response_header(name) {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
+            if is_proxy_sse_path(&suffix) || is_sse_response {
+                return builder
+                    .body(Body::from_stream(resp.bytes_stream()))
+                    .expect("valid streaming proxy response");
+            }
             let body_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(_) => {
@@ -720,13 +734,6 @@ async fn remote_workspace_proxy_middleware(
                         .expect("valid response");
                 }
             };
-            let mut builder = Response::builder().status(status);
-            for (name, value) in headers.iter() {
-                if name == header::TRANSFER_ENCODING || name == header::CONNECTION {
-                    continue;
-                }
-                builder = builder.header(name, value);
-            }
             builder
                 .body(Body::from(body_bytes.to_vec()))
                 .expect("valid proxy response")
@@ -736,6 +743,30 @@ async fn remote_workspace_proxy_middleware(
             .body(Body::from(format!("sidecar proxy failed: {source}")))
             .expect("valid error response"),
     }
+}
+
+fn is_proxy_sse_path(suffix: &str) -> bool {
+    suffix == "chat/stream"
+        || (suffix.starts_with("chat/runs/") && suffix.ends_with("/stream"))
+        || (suffix.starts_with("chat/runs/") && suffix.ends_with("/stream-events"))
+}
+
+fn response_is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+fn should_skip_proxy_response_header(name: &header::HeaderName) -> bool {
+    name == header::CONTENT_LENGTH
+        || name == header::TRANSFER_ENCODING
+        || name == header::CONNECTION
 }
 
 fn is_websocket_request(request: &Request) -> bool {

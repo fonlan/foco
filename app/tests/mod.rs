@@ -1,6 +1,6 @@
 use super::*;
-use std::collections::BTreeSet;
 use std::sync::OnceLock;
+use std::{collections::BTreeSet, convert::Infallible};
 
 use crate::runtime::agent_run_event_kind;
 use axum::{
@@ -19137,6 +19137,33 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
     assert_eq!(body["queued"], true);
     assert_eq!(body["payload"]["message"], "hello");
 
+    let stream_response = tokio::time::timeout(
+        Duration::from_millis(500),
+        reqwest::Client::new()
+            .post(format!(
+                "http://{app_addr}/api/workspaces/remote/chat/stream"
+            ))
+            .json(&json!({ "chatId": "chat-1" }))
+            .send(),
+    )
+    .await
+    .expect("proxied chat stream should return headers before sidecar stream ends")
+    .expect("proxied chat stream request");
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    let first_chunk = tokio::time::timeout(
+        Duration::from_millis(500),
+        stream_response.bytes_stream().next(),
+    )
+    .await
+    .expect("first SSE chunk should arrive before sidecar stream ends")
+    .expect("first SSE chunk")
+    .expect("first SSE bytes");
+    assert!(
+        std::str::from_utf8(&first_chunk)
+            .expect("utf8 SSE chunk")
+            .contains("stream-start")
+    );
+
     let stats_response = reqwest::get(format!(
         "http://{app_addr}/api/workspaces/remote/chats/chat-1/statistics"
     ))
@@ -19166,8 +19193,12 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
     ))
     .await
     .expect("proxied agent team request");
-    assert_eq!(agent_response.status(), StatusCode::BAD_REQUEST);
-
+    assert_eq!(agent_response.status(), StatusCode::OK);
+    let body = agent_response
+        .json::<Value>()
+        .await
+        .expect("agent team json");
+    assert_eq!(body["team"]["id"], "remote-agent-team-chat-1");
     let mut ws_request = format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws")
         .into_client_request()
         .expect("websocket request");
@@ -19208,6 +19239,7 @@ async fn serve_fake_sidecar_proxy_fixture(
 ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let expected_http = format!("Bearer {token}");
     let expected_chat = expected_http.clone();
+    let expected_chat_stream = expected_http.clone();
     let expected_chat_stats = expected_http.clone();
     let expected_todo_graph = expected_http.clone();
     let expected_agent_team = expected_http.clone();
@@ -19215,6 +19247,7 @@ async fn serve_fake_sidecar_proxy_fixture(
     let seen_auth = Arc::new(Mutex::new(Vec::new()));
     let http_seen = seen_auth.clone();
     let chat_seen = seen_auth.clone();
+    let chat_stream_seen = seen_auth.clone();
     let chat_stats_seen = seen_auth.clone();
     let todo_graph_seen = seen_auth.clone();
     let agent_team_seen = seen_auth.clone();
@@ -19263,6 +19296,30 @@ async fn serve_fake_sidecar_proxy_fixture(
                         "payload": payload,
                     }))
                     .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chat/stream",
+            axum::routing::post(move |headers: HeaderMap| {
+                let expected = expected_chat_stream.clone();
+                let seen = chat_stream_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, Infallible>(axum::response::sse::Event::default().data("stream-start"));
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        yield Ok::<_, Infallible>(axum::response::sse::Event::default().data("stream-end"));
+                    };
+                    axum::response::sse::Sse::new(stream).into_response()
                 }
             }),
         )
@@ -19319,7 +19376,12 @@ async fn serve_fake_sidecar_proxy_fixture(
                     if auth != expected {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    StatusCode::BAD_REQUEST.into_response()
+                    Json(json!({
+                        "team": { "id": "remote-agent-team-chat-1" },
+                        "instances": [],
+                        "tasks": [],
+                    }))
+                    .into_response()
                 }
             }),
         )

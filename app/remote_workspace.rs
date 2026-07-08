@@ -77,6 +77,7 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const BROKER_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -3788,11 +3789,123 @@ async fn remote_sidecar_chat_todo_graph(
     };
     Ok(Json(response))
 }
-
 async fn remote_sidecar_agent_no_team(
+    State(state): State<RemoteSidecarState>,
     AxumPath(chat_id): AxumPath<String>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    Err(ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")).into_response())
+    let active_run = state
+        .active_runs
+        .lock()
+        .ok()
+        .and_then(|runs| runs.iter().find(|run| run.chat_id == chat_id).cloned());
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let team_id = format!("remote-agent-team-{chat_id}");
+    let instance_id = format!("remote-agent-instance-{chat_id}");
+    let task_status = if active_run.is_some() {
+        "running"
+    } else {
+        "completed"
+    };
+    let instance_status = if active_run.is_some() {
+        "running"
+    } else {
+        "idle"
+    };
+    let task = active_run.as_ref().map(|run| {
+        json!({
+            "id": format!("remote-agent-task-{}", run.run_id),
+            "teamId": team_id,
+            "ownerInstanceId": instance_id,
+            "originInstanceId": null,
+            "parentTaskId": null,
+            "sequence": 0,
+            "status": task_status,
+            "input": {
+                "message": "Remote workspace chat run",
+                "remote": true,
+                "runId": run.run_id,
+            },
+            "result": null,
+            "error": null,
+            "attempts": [],
+            "createdAt": run.updated_at,
+            "updatedAt": run.updated_at,
+            "startedAt": run.updated_at,
+            "completedAt": null,
+        })
+    });
+    Ok(Json(json!({
+        "team": {
+            "id": team_id,
+            "chatId": chat_id,
+            "coordinatorInstanceId": instance_id,
+            "status": "active",
+            "maxConcurrentRuns": 1,
+            "createdAt": now,
+            "updatedAt": active_run.as_ref().map(|run| run.updated_at.clone()).unwrap_or_else(|| now.clone()),
+        },
+        "workload": {
+            "queuedTasks": 0,
+            "runningTasks": if active_run.is_some() { 1 } else { 0 },
+            "waitingTasks": 0,
+        },
+        "observability": {
+            "queueLength": 0,
+            "queueWaitMs": { "count": 0, "max": null, "average": null },
+            "runDurationMs": { "count": 0, "max": null, "average": null },
+            "schedulerLatencyMs": { "count": 0, "max": null, "average": null },
+            "mutationLeaseWaitMs": { "count": 0, "max": null, "average": null },
+            "failedTasks": 0,
+            "cancelledTasks": 0,
+            "interruptedTasks": 0,
+            "failuresByType": [],
+        },
+        "instances": [{
+            "id": instance_id,
+            "teamId": team_id,
+            "definitionId": "agent-definition-default",
+            "definitionRevision": 1,
+            "definitionSnapshot": {
+                "id": "agent-definition-default",
+                "revision": 1,
+                "name": "Remote coordinator",
+                "description": "Read-only snapshot for remote workspace chat runs.",
+                "providerId": "remote",
+                "modelId": "remote",
+                "modelOptions": {},
+                "allowedTools": [],
+                "maxInstances": 1,
+                "allowedExecutionWorkspaceModes": ["shared"],
+                "permissions": {
+                    "canCreateInstances": false,
+                    "canDelegate": false,
+                    "allowedAgentDefinitionIds": [],
+                },
+            },
+            "role": "coordinator",
+            "status": instance_status,
+            "nextTaskSequence": 1,
+            "contextGeneration": 0,
+            "lastScheduledAt": active_run.as_ref().map(|run| run.updated_at.clone()),
+            "executionWorkspaceMode": "shared",
+            "executionRootPath": null,
+            "worktreeBaseRevision": null,
+            "worktreeBranch": null,
+            "worktreeStatus": null,
+            "createdAt": now,
+            "updatedAt": active_run.as_ref().map(|run| run.updated_at.clone()).unwrap_or_else(|| now.clone()),
+        }],
+        "tasks": task.into_iter().collect::<Vec<_>>(),
+        "dependencies": [],
+        "messages": [],
+        "events": [],
+        "runEvents": [],
+        "mutationLeaseOwners": [],
+        "worktreeAction": {
+            "kind": "unavailable",
+            "message": "Remote sidecar exposes a read-only Agent snapshot; Agent team actions are unavailable.",
+        },
+    })))
 }
 
 fn remote_required_text(
@@ -4089,24 +4202,18 @@ async fn remote_sidecar_chat_stream(
         chat_id: chat_id.clone(),
         last_sequence: Some(0),
         accepting_guidance: true,
-        broker_status: "connected".to_string(),
+        broker_status: "connecting".to_string(),
         updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     };
     remote_sidecar_set_active_run(&state, run);
-    let broker_rx = remote_sidecar_broker_request(
-        &state,
-        "llm.stream",
-        json!({
-            "providerId": provider_id,
-            "modelId": model_id,
-            "messages": messages,
-            "thinkingLevel": payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
-        }),
-    )
-    .await?;
+    let broker_payload = json!({
+        "providerId": provider_id,
+        "modelId": model_id,
+        "messages": messages,
+        "thinkingLevel": payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+    });
     let stream_state = state.clone();
     let stream = async_stream::stream! {
-        let mut broker_rx = broker_rx;
         let mut sequence = 0_i64;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -4118,6 +4225,38 @@ async fn remote_sidecar_chat_stream(
             "llmRequestId": run_id,
             "memoriesUsed": [],
         })));
+        sequence += 1;
+        yield Ok(remote_sse_json_event(sequence, json!({
+            "type": "connecting",
+            "message": "connecting to remote broker",
+        })));
+        let mut broker_rx = match timeout(
+            BROKER_STREAM_CONNECT_TIMEOUT,
+            remote_sidecar_broker_request(&stream_state, "llm.stream", broker_payload),
+        )
+        .await
+        {
+            Ok(Ok(rx)) => rx,
+            Ok(Err(_)) | Err(_) => {
+                sequence += 1;
+                yield Ok(remote_sse_json_event(sequence, json!({
+                    "type": "error",
+                    "message": "remote broker is unavailable; wait for reconnect and retry",
+                })));
+                sequence += 1;
+                yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                remote_sidecar_remove_active_run(&stream_state, &run_id);
+                return;
+            }
+        };
+        remote_sidecar_set_active_run(&stream_state, RemoteActiveRunSummary {
+            run_id: run_id.clone(),
+            chat_id: chat_id.clone(),
+            last_sequence: Some(sequence),
+            accepting_guidance: true,
+            broker_status: "connected".to_string(),
+            updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        });
         loop {
             let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
                 Ok(Some(envelope)) => envelope,
@@ -5741,6 +5880,58 @@ mod tests {
         assert_eq!(event["metrics"]["modelId"], "model-1");
         assert_eq!(event["metrics"]["providerId"], "provider-1");
         assert_eq!(event["metrics"]["outputTokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_returns_before_broker_connects() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
+        let state = RemoteSidecarState {
+            token: "token".to_string(),
+            last_config_hash: Arc::new(Mutex::new(None)),
+            code_graph_watcher: Arc::new(Mutex::new(None)),
+            ws_count: Arc::new(AtomicUsize::new(0)),
+            active_run_count: Arc::new(AtomicUsize::new(0)),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+            broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            broker_tx,
+            shutdown_tx: default_shutdown_tx(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: workspace.path().to_string_lossy().to_string(),
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            remote_sidecar_chat_stream(
+                State(state),
+                Json(json!({
+                    "chatId": "chat-1",
+                    "queuedUserMessageId": "msg-user-1",
+                    "visibleAssistantMessageId": "msg-assistant-1",
+                    "modelId": "model-1",
+                    "providerId": "provider-1",
+                })),
+            ),
+        )
+        .await
+        .expect("handler should return SSE before broker reconnects")
+        .expect("SSE response");
+        drop(response);
     }
 
     #[tokio::test]
