@@ -830,6 +830,7 @@ pub(crate) async fn queue_chat_message_internal(
     if should_generate_chat_title {
         spawn_chat_title_generation(ChatTitleGenerationInput {
             config: config.clone(),
+            app_language: config.app.language.clone(),
             workspace_id: prompt_context.workspace_id.clone(),
             workspace_path: prompt_context.workspace_path.clone(),
             chat_id: chat_id.clone(),
@@ -867,6 +868,7 @@ pub(crate) async fn queue_chat_message_internal(
 #[derive(Clone)]
 struct ChatTitleGenerationInput {
     config: GlobalConfig,
+    app_language: String,
     workspace_id: String,
     workspace_path: PathBuf,
     chat_id: String,
@@ -918,6 +920,7 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         &model_id,
         &input.user_message,
         &input.attachment_names,
+        &input.app_language,
     );
     let tool_arguments = audited_provider_tool_request(
         &input.workspace_path,
@@ -1043,14 +1046,17 @@ pub(crate) fn chat_title_generation_provider_request(
     model_id: &str,
     user_message: &str,
     attachment_names: &[String],
+    language: &str,
 ) -> foco_providers::NeutralChatRequest {
+    let title_language = chat_title_generation_language_name(language);
     foco_providers::NeutralChatRequest {
         model_id: model_id.to_string(),
         messages: vec![
             neutral_text_message(
                 foco_providers::NeutralChatRole::System,
-                "Generate a short title for the user's new chat. Return only by calling the tool. Title language should match the user's message. Keep it under 8 words or 24 CJK characters. Do not include quotes, punctuation padding, or file extensions unless essential."
-                    .to_string(),
+                format!(
+                    "Generate a short title for the user's new chat. Return only by calling the tool. Title language must match the current Foco app language setting: {title_language}. Keep it under 8 words or 24 CJK characters. Do not include quotes, punctuation padding, or file extensions unless essential."
+                ),
             ),
             neutral_text_message(
                 foco_providers::NeutralChatRole::User,
@@ -1062,6 +1068,15 @@ pub(crate) fn chat_title_generation_provider_request(
         max_output_tokens: Some(CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+    }
+}
+
+// ponytail: local mapping is enough for the two supported app languages; unknown values fall back safely.
+fn chat_title_generation_language_name(language: &str) -> &'static str {
+    match language {
+        "zh-CN" => "Simplified Chinese",
+        "en" => "English",
+        _ => "English",
     }
 }
 

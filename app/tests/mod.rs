@@ -1963,6 +1963,7 @@ fn chat_title_generation_provider_request_uses_tool_only_small_output() {
         "model",
         "请帮我修一下远程 sidecar 安装并发的问题",
         &["debug.log".to_string()],
+        "en",
     );
 
     assert_eq!(request.model_id, "model");
@@ -1970,7 +1971,21 @@ fn chat_title_generation_provider_request_uses_tool_only_small_output() {
     assert_eq!(request.thinking_level, None);
     assert_eq!(request.tools.len(), 1);
     assert_eq!(request.tools[0].name, "submit_chat_title");
+    assert!(request.messages[0].content.contains("English"));
+    assert!(!request.messages[0].content.contains("user's message"));
     assert!(request.messages[1].content.contains("debug.log"));
+
+    let chinese_request = crate::http::chat::chat_title_generation_provider_request(
+        "model",
+        "Fix the remote sidecar installer concurrency bug",
+        &[],
+        "zh-CN",
+    );
+    assert!(
+        chinese_request.messages[0]
+            .content
+            .contains("Simplified Chinese")
+    );
 }
 
 #[test]
