@@ -394,6 +394,8 @@ fn list_local(
     let path = request
         .path
         .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(default_local_path);
     let path = canonical_path_within(&path, root)?;
@@ -615,6 +617,25 @@ mod tests {
             .map(|index| PathBuf::from(format!("/tmp/file-{index}")))
             .collect();
         assert!(selected_files_from_paths(paths).is_err());
+    }
+
+    #[test]
+    fn empty_local_path_uses_default_directory() {
+        let default_path = fs::canonicalize(default_local_path()).unwrap();
+        let response = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Local,
+                path: Some("".to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.path, default_path.display().to_string());
     }
 
     #[test]
