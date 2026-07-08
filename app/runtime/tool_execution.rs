@@ -16,7 +16,9 @@ use foco_agent::{
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
-use foco_store::config::{GlobalConfig, HookConfig, SKILL_SCOPE_GLOBAL, WebSearchSettings};
+use foco_store::config::{
+    GlobalConfig, HookConfig, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, WebSearchSettings,
+};
 use foco_store::workspace::{
     AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentInstance, NewAgentMessage,
     NewAgentTask, NewAgentTaskDependency, WorkspaceDatabase,
@@ -2954,7 +2956,7 @@ async fn ensure_read_file_external_access(
         return Ok(false);
     };
 
-    if read_file_target_is_configured_global_skill(global_config, &target_path) {
+    if read_file_target_is_configured_skill(global_config, workspace_id, &target_path) {
         return Ok(true);
     }
 
@@ -2992,12 +2994,20 @@ async fn ensure_read_file_external_access(
     }
 }
 
-fn read_file_target_is_configured_global_skill(config: &GlobalConfig, target_path: &Path) -> bool {
+fn read_file_target_is_configured_skill(
+    config: &GlobalConfig,
+    workspace_id: &str,
+    target_path: &Path,
+) -> bool {
     config
         .skills
         .detected
         .iter()
-        .filter(|skill| skill.scope == SKILL_SCOPE_GLOBAL)
+        .filter(|skill| {
+            skill.scope == SKILL_SCOPE_GLOBAL
+                || (skill.scope == SKILL_SCOPE_WORKSPACE
+                    && skill.workspace_id.as_deref() == Some(workspace_id))
+        })
         .filter_map(|skill| skill.path.parent())
         .filter_map(|skill_dir| fs::canonicalize(skill_dir).ok())
         .any(|skill_dir| target_path.starts_with(skill_dir))
@@ -3523,6 +3533,116 @@ mod tests {
         );
         assert!(!result.is_error);
         assert_eq!(result.output["content"], "1\tdetails");
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_skips_question_for_current_workspace_skill() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let isolated_worktree = tempfile::tempdir().expect("isolated worktree");
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+        let current_skill_dir = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("build");
+        let other_skill_dir = other_workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("deploy");
+        fs::create_dir_all(&current_skill_dir).expect("current skill directory");
+        fs::create_dir_all(&other_skill_dir).expect("other skill directory");
+        let current_skill_file = current_skill_dir.join("SKILL.md");
+        let other_skill_file = other_skill_dir.join("SKILL.md");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(&current_skill_file, "current skill").expect("write current skill");
+        fs::write(&other_skill_file, "other skill").expect("write other skill");
+        fs::write(outside.path(), "plain outside").expect("write outside");
+
+        let workspace_id = "workspace-current";
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .skills
+            .detected
+            .push(foco_store::config::SkillSettings {
+                key: "workspace:workspace-current:build".to_string(),
+                id: "build".to_string(),
+                name: "build".to_string(),
+                description: "build".to_string(),
+                path: current_skill_file.clone(),
+                scope: SKILL_SCOPE_WORKSPACE.to_string(),
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_name: Some("Current".to_string()),
+            });
+        config
+            .skills
+            .detected
+            .push(foco_store::config::SkillSettings {
+                key: "workspace:workspace-other:deploy".to_string(),
+                id: "deploy".to_string(),
+                name: "deploy".to_string(),
+                description: "deploy".to_string(),
+                path: other_skill_file.clone(),
+                scope: SKILL_SCOPE_WORKSPACE.to_string(),
+                workspace_id: Some("workspace-other".to_string()),
+                workspace_name: Some("Other".to_string()),
+            });
+
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-workspace-skill-{}", unique_id("case"));
+        let allowed = ensure_read_file_external_access(
+            &config,
+            registry.clone(),
+            event_tx.clone(),
+            workspace_id,
+            isolated_worktree.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &json!({ "path": current_skill_file.to_string_lossy(), "startLine": null, "endLine": null }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("current workspace skill access check");
+        assert!(allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        for (call_id, path) in [
+            ("call-2", other_skill_file.as_path()),
+            ("call-3", outside.path()),
+        ] {
+            let prompted_chat_id = format!("{chat_id}-{call_id}");
+            let arguments =
+                json!({ "path": path.to_string_lossy(), "startLine": null, "endLine": null });
+            let access = ensure_read_file_external_access(
+                &config,
+                registry.clone(),
+                event_tx.clone(),
+                workspace_id,
+                isolated_worktree.path(),
+                &prompted_chat_id,
+                call_id,
+                READ_FILE_TOOL,
+                &arguments,
+                ToolCancellationToken::default(),
+            );
+
+            let (request, denied) = tokio::join!(
+                answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+                access
+            );
+            assert!(
+                request.questions[0]
+                    .question
+                    .contains(&path.display().to_string())
+            );
+            assert!(
+                denied
+                    .expect_err("external path should prompt and deny")
+                    .contains("user denied read_file access")
+            );
+        }
     }
 
     #[tokio::test]
