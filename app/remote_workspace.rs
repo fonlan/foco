@@ -4482,9 +4482,7 @@ async fn remote_sidecar_file_tree(
     let root =
         crate::http::workspaces::workspace_file_tree_response(sidecar_workspace_path(&state))
             .map_err(|e| e.into_response())?;
-    Ok(Json(serde_json::to_value(root).map_err(|e| {
-        ApiError::internal(e.to_string()).into_response()
-    })?))
+    Ok(Json(serde_json::json!({ "root": root })))
 }
 
 async fn remote_sidecar_file_children(

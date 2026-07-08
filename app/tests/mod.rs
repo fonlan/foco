@@ -19128,7 +19128,9 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
     .expect("proxied files request");
     assert_eq!(http_response.status(), StatusCode::OK);
     let body = http_response.json::<Value>().await.expect("proxy json");
-    assert_eq!(body["proxied"], true);
+    assert_eq!(body["root"]["kind"], "directory");
+    assert_eq!(body["root"]["name"], "project");
+    assert!(body.get("kind").is_none());
     assert_eq!(body["query"], "depth=1");
 
     let chat_response = reqwest::Client::new()
@@ -19279,7 +19281,15 @@ async fn serve_fake_sidecar_proxy_fixture(
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
                     Json(json!({
-                        "proxied": true,
+                        "root": {
+                            "name": "project",
+                            "path": "/srv/project",
+                            "kind": "directory",
+                            "sizeBytes": null,
+                            "hasChildren": false,
+                            "childrenLoaded": true,
+                            "children": [],
+                        },
                         "query": uri.query().unwrap_or_default(),
                     }))
                     .into_response()
