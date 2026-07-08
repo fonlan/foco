@@ -6234,6 +6234,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
                 && detail.snapshot_id.as_deref() == Some("runtime-snapshot-1")
                 && detail.summary_token_count == Some(800))
     );
+    assert_eq!(summary.status.as_deref(), None);
 
     let saved = database
         .message("assistant-1")
@@ -6273,6 +6274,45 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             ),
         })
         .expect("assistant insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai-responses",
+            model_id: "gpt-test",
+            request_started_at: "2026-06-18T10:00:00Z",
+            first_token_at: Some("2026-06-18T10:00:00Z"),
+            completed_at: Some("2026-06-18T10:00:01Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(40),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            reasoning_tokens: None,
+            first_token_latency_ms: Some(10),
+            total_latency_ms: Some(2_000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some("{}"),
+            response_body_json: Some("{}"),
+        })
+        .expect("request insert");
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: "request-event-0",
+            llm_request_id: "request-1",
+            sequence: 0,
+            event_at: "2026-06-18T10:00:00Z",
+            event_type: "start",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"assistantMessageId":"assistant-1"}"#,
+        })
+        .expect("request start event insert");
     for (sequence, event_type, value) in [
         (
             0,
@@ -6343,6 +6383,10 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
     assert_eq!(summary.status.as_deref(), Some("streaming"));
+    let metrics = summary.metrics.expect("streaming summary metrics");
+    assert_eq!(metrics.total_latency_ms, Some(2_000));
+    assert_eq!(metrics.output_tokens, Some(40));
+    assert_eq!(metrics.llm_request_ids, vec!["request-1".to_string()]);
 
     let saved = database
         .message("assistant-1")

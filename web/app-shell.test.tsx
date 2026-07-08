@@ -355,7 +355,14 @@ describe("app-shell verification surfaces", () => {
     });
   });
 
-  it("hides assistant reply metrics while the message is streaming", async () => {
+  it("hides assistant reply metrics while an active run message is streaming", async () => {
+    const activeRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 4,
+      runId: "active-run-1",
+      workspaceId: "workspace-1",
+    };
     const streamingMessages = {
       ...chatMessages,
       messages: chatMessages.messages.map((message) =>
@@ -371,7 +378,13 @@ describe("app-shell verification surfaces", () => {
         : url.split("?")[0];
 
       if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({ ...streamingMessages, activeRun: null });
+        return jsonResponse({ ...streamingMessages, activeRun });
+      }
+      if (path === "/api/workspaces/workspace-1/chat/runs/active-run-1/stream") {
+        return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          headers: { "Content-Type": "text/event-stream" },
+          status: 200,
+        });
       }
 
       return mockFetch(input, init);
@@ -386,6 +399,13 @@ describe("app-shell verification surfaces", () => {
       throw new Error("Expected assistant message bubble");
     }
 
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).includes("/api/workspaces/workspace-1/chat/runs/active-run-1/stream"),
+        ),
+      ).toBe(true);
+    });
     expect(assistantBubble.querySelector(".message-model-id")).toHaveTextContent(
       "gpt-test",
     );
