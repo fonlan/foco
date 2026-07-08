@@ -1,3 +1,4 @@
+import focoLogoSvg from "../../../foco.svg?raw";
 import {
   ArrowDown,
   ArrowUp,
@@ -11263,9 +11264,11 @@ export function SettingsPanel({
                 <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-start">
                   <div className="min-w-0 space-y-4">
                     <div className="flex items-center gap-3">
-                      <div className="inline-flex size-12 shrink-0 items-center justify-center rounded-xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
-                        <Code2 aria-hidden="true" className="size-6" />
-                      </div>
+                      <div
+                        aria-hidden="true"
+                        className="size-12 shrink-0 overflow-hidden rounded-xl shadow-[0_12px_28px_rgba(15,118,110,0.22)] [&>svg]:block [&>svg]:size-full"
+                        dangerouslySetInnerHTML={{ __html: focoLogoSvg }}
+                      />
                       <div className="min-w-0">
                         <h3 className="text-xl font-semibold text-stone-950">Foco</h3>
                         <p className="mt-1 text-sm font-medium text-stone-500">
@@ -11320,14 +11323,6 @@ export function SettingsPanel({
                     ) : null}
                   </div>
                   <dl className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <dt className="text-xs font-semibold uppercase text-stone-400">
-                        {t("Version")}
-                      </dt>
-                      <dd className="text-sm font-semibold text-stone-800">
-                        {settings?.about.version ?? ""}
-                      </dd>
-                    </div>
                     <div className="flex items-center justify-between gap-3">
                       <dt className="text-xs font-semibold uppercase text-stone-400">
                         {t("Current version")}
