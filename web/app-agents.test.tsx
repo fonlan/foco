@@ -11,6 +11,7 @@ import {
   appTestState,
   defaultComposerPlaceholder,
   defaultReviewSystemPrompt,
+  deferred,
   enqueueChatStreamEvent,
   jsonResponse,
   mockFetch,
@@ -431,6 +432,78 @@ describe("app agents verification surfaces", () => {
       "true",
     );
   });
+  it("shows active remote Agent team errors without white-screening", async () => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1") ? new URL(url).pathname : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+        return jsonResponse({ error: "Remote agent actions are unsupported" }, { status: 400 });
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+
+    expect(await screen.findByText("Remote agent actions are unsupported")).toBeInTheDocument();
+  });
+
+  it("ignores stale remote Agent team errors after switching chats", async () => {
+    const delayedChatOneResponse = deferred<Response>();
+    const emptyChatTwoSnapshot = {
+      ...agentTeamSnapshot,
+      team: {
+        ...agentTeamSnapshot.team,
+        chatId: "chat-2",
+        coordinatorInstanceId: "agent-instance-remote-coordinator",
+        id: "agent-team-chat-2",
+      },
+      instances: [],
+      runEvents: [],
+      tasks: [],
+    };
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1") ? new URL(url).pathname : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+        return delayedChatOneResponse.promise;
+      }
+      if (path === "/api/workspaces/workspace-1/chats/chat-2/agent-team") {
+        return jsonResponse(emptyChatTwoSnapshot);
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/chats/chat-1/agent-team"))
+        .toBe(true);
+    });
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/chats/chat-2/agent-team"))
+        .toBe(true);
+    });
+    expect(await screen.findByText("No agent instances in this chat yet.")).toBeInTheDocument();
+
+    await act(async () => {
+      delayedChatOneResponse.resolve(
+        jsonResponse({ error: "Remote agent actions are unsupported" }, { status: 400 }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Remote agent actions are unsupported")).not.toBeInTheDocument();
+      expect(screen.queryByText("agent-instance-coordinator")).not.toBeInTheDocument();
+    });
+  });
+
+
   it("loads Agent transcript items from the instance transcript API", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

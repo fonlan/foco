@@ -2688,6 +2688,39 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBe(true);
   });
 
+  it("renders partial active chat statistics and context usage payloads without crashing", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const path = url.startsWith("http") ? new URL(url).pathname : url;
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/statistics") {
+        return jsonResponse({ workspaceId: workspace.id, chatId: "chat-1" });
+      }
+      if (path === "/api/workspaces/workspace-1/context-usage") {
+        return jsonResponse({ contextWindow: 0 });
+      }
+      return mockFetch(input, init);
+    });
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
+
+    expect(await screen.findByText("Session statistics")).toBeInTheDocument();
+    expect(within(screen.getByText("Total tokens").closest(".context-stat-metric")!).getByText("0"))
+      .toBeInTheDocument();
+    expect(screen.getByText("+0 / -0")).toBeInTheDocument();
+    expect(within(screen.getByText("Model calls").parentElement!).getByText("No model calls yet."))
+      .toBeInTheDocument();
+    const toolsSection = screen.getByText("Tools and compression").parentElement!;
+    expect(within(toolsSection).getByText("LLM compression snapshots")).toBeInTheDocument();
+    expect(within(toolsSection).getByText("Tool history compression")).toBeInTheDocument();
+    expect(within(toolsSection).getAllByText("0").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("No context usage yet."))
+      .toBeInTheDocument();
+  });
+
+
   it("shows context usage only once in the stats context mix", async () => {
     const user = userEvent.setup();
     renderApp();

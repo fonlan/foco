@@ -2258,8 +2258,11 @@ function ContextStatsTab({
     label: item.modelId,
     value: item.requestCount,
   }));
-  const contextChart = contextUsage
+  const contextBreakdownBySource = Array.isArray(contextUsage?.tokenBreakdown?.bySource)
     ? contextUsage.tokenBreakdown.bySource
+    : [];
+  const contextChart = contextUsage
+    ? contextBreakdownBySource
       .filter((item) => item.tokens > 0)
       .map((item) => ({
         id: item.source,

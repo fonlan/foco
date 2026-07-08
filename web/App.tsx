@@ -69,6 +69,7 @@ import type {
   BrowserRouteFileTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
+  ChatCompressionStatistics,
   ChatContextCompressionDetail,
   ChatContextCompressionKind,
   ChatContextCompressionPart,
@@ -2083,6 +2084,10 @@ export function App() {
 
   const loadAgentTeamSnapshot = useCallback(
     async (workspaceId: string, chatId: string) => {
+      const requestedChatKey = chatRunKey(workspaceId, chatId);
+      const isCurrentAgentTeamRequest = () =>
+        activeChatKeyRef.current === requestedChatKey;
+
       setIsLoadingAgentTeam(true);
       setAgentTeamError(null);
 
@@ -2090,19 +2095,23 @@ export function App() {
         const data = await requestJson<AgentTeamSnapshotResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/agent-team`,
         );
-        setAgentTeamSnapshot(data);
+        if (isCurrentAgentTeamRequest()) {
+          setAgentTeamSnapshot(data);
+        }
         return data;
       } catch (requestError) {
         const message = errorMessage(requestError);
-        if (message.includes("has no Agent team")) {
+        if (isCurrentAgentTeamRequest()) {
           setAgentTeamSnapshot(null);
-          return null;
+          if (!message.includes("has no Agent team")) {
+            setAgentTeamError(message);
+          }
         }
-        setAgentTeamSnapshot(null);
-        setAgentTeamError(message);
         return null;
       } finally {
-        setIsLoadingAgentTeam(false);
+        if (isCurrentAgentTeamRequest()) {
+          setIsLoadingAgentTeam(false);
+        }
       }
     },
     [],
@@ -3026,7 +3035,7 @@ export function App() {
             `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
           );
           if (isCurrentStatisticsRequest()) {
-            setChatStatistics(data);
+            setChatStatistics(normalizeChatStatistics(data, workspaceId, chatId));
             if (!runningChatKeysRef.current.has(requestedChatKey)) {
               clearLiveChatStatistics(requestedChatKey);
             }
@@ -13561,6 +13570,49 @@ function emptyChatStatistics(
       savedTokenCount: 0,
     },
     contextUsageTimeline: [],
+  };
+}
+
+function normalizeChatStatistics(
+  payload: Partial<ChatStatisticsResponse> | null | undefined,
+  workspaceId: string,
+  chatId: string,
+): ChatStatisticsResponse {
+  const base = emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
+  const codeChangeStats = isObjectRecord(payload?.codeChangeStats)
+    ? (payload.codeChangeStats as Partial<GitDiffLineStats>)
+    : {};
+  const compression = isObjectRecord(payload?.compression)
+    ? (payload.compression as Partial<ChatCompressionStatistics>)
+    : {};
+
+  // ponytail: compatibility shim for remote/old sidecar partial stats payloads;
+  // ceiling is shape-only defaults, upgrade path is sidecar protocol versioning.
+  return {
+    ...base,
+    ...(payload ?? {}),
+    workspaceId: payload?.workspaceId ?? workspaceId,
+    chatId: payload?.chatId ?? chatId,
+    codeChangeStats: {
+      ...base.codeChangeStats,
+      ...codeChangeStats,
+    },
+    compression: {
+      ...base.compression,
+      ...compression,
+    },
+    modelBreakdown: Array.isArray(payload?.modelBreakdown)
+      ? payload.modelBreakdown
+      : base.modelBreakdown,
+    providerBreakdown: Array.isArray(payload?.providerBreakdown)
+      ? payload.providerBreakdown
+      : base.providerBreakdown,
+    toolBreakdown: Array.isArray(payload?.toolBreakdown)
+      ? payload.toolBreakdown
+      : base.toolBreakdown,
+    contextUsageTimeline: Array.isArray(payload?.contextUsageTimeline)
+      ? payload.contextUsageTimeline
+      : base.contextUsageTimeline,
   };
 }
 
