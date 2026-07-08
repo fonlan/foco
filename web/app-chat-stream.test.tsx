@@ -3749,6 +3749,114 @@ describe("app-chat-stream verification surfaces", () => {
     }
   });
 
+  it("keeps a pending ask_question dialog and draft through idle active run reconnect", async () => {
+    (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
+      .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;
+    let runStreamRequests = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          messages: [
+            chatMessages.messages[0],
+            {
+              ...chatMessages.messages[1],
+              id: "message-assistant-stream",
+              status: "streaming",
+            },
+          ],
+          activeRun: {
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
+        runStreamRequests += 1;
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            appTestState.chatStreamControllers.set("request-stream", controller);
+            if (runStreamRequests === 1) {
+              controller.enqueue(
+                encoder.encode(
+                  `id: 1\ndata: ${JSON.stringify({
+                    assistantMessageId: "message-assistant-stream",
+                    request: {
+                      chatId: "chat-1",
+                      id: "idle-reconnect-question",
+                      questions: [
+                        {
+                          allowFreeText: true,
+                          id: "idle-reconnect-question-item",
+                          options: [],
+                          question: "What should Foco do next?",
+                        },
+                      ],
+                      toolCallId: "ask-question-call",
+                      workspaceId: "workspace-1",
+                    },
+                    type: "questionRequest",
+                  })}\n\n`,
+                ),
+              );
+            }
+          },
+        });
+        return new Response(stream, {
+          headers: { "Content-Type": "text/event-stream" },
+          status: 200,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    try {
+      renderApp();
+      const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+      const answerDraft = within(dialog).getByLabelText("Custom answer");
+      fireEvent.change(answerDraft, { target: { value: "Keep this draft" } });
+
+      await waitFor(() => {
+        const streamRequests = fetchMock.mock.calls.filter(
+          ([url]) =>
+            typeof url === "string" &&
+            url.includes("/chat/runs/request-stream/stream"),
+        );
+        expect(streamRequests.length).toBeGreaterThan(1);
+      });
+
+      await act(async () => {
+        appTestState.chatStreamControllers.get("request-stream")?.close();
+      });
+
+      const reconnectedDialog = screen.getByRole("dialog", {
+        name: "Foco needs your answer",
+      });
+      expect(reconnectedDialog).toBeInTheDocument();
+      expect(within(reconnectedDialog).getByLabelText("Custom answer"))
+        .toHaveValue("Keep this draft");
+    } finally {
+      try {
+        appTestState.chatStreamControllers.get("request-stream")?.close();
+      } catch {
+        // Stream may already be cancelled by the idle watchdog.
+      }
+      delete (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
+        .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
+    }
+  });
+
   it("does not duplicate active run subscriptions on recovery events while the stream is alive", async () => {
     let runStreamRequests = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

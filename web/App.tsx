@@ -7626,7 +7626,6 @@ export function App() {
     let liveAssistantDraftReasoning = "";
     let lastLiveContextUsageRefreshAtMs = Date.now();
     let hasGuidanceTurns = false;
-    let streamHadError = false;
     const textDeltaBuffer = createTextDeltaBuffer();
     const reasoningDeltaBuffer = createReasoningDeltaBuffer();
     const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
@@ -8355,7 +8354,6 @@ export function App() {
           });
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
-          streamHadError = true;
           setChatRunFailed(chatKey, true);
           setChatRunning(chatKey, false);
           setError(streamEvent.message);
@@ -8426,11 +8424,6 @@ export function App() {
           clearLiveChatStatistics(chatKey);
           clearWorkspaceChatActiveRun(activeRun.workspaceId, activeRun.chatId);
         }
-      }
-      if (!streamHadError) {
-        setPendingQuestion(null);
-        setQuestionError(null);
-        setIsAnsweringQuestion(false);
       }
     }
   }
