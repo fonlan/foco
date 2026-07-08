@@ -1766,6 +1766,7 @@ enum ChatMessagePart {
         attachment: ChatAttachmentPart,
     },
     ToolCall {
+        #[serde(rename = "toolCall", alias = "tool_call")]
         tool_call: ChatToolCallSummary,
     },
     ContextCompression {

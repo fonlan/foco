@@ -505,6 +505,33 @@ describe("app agents verification surfaces", () => {
 
 
   it("loads Agent transcript items from the instance transcript API", async () => {
+    const snakeCaseTranscriptResponse = {
+      ...agentTranscriptResponse,
+      items: agentTranscriptResponse.items.map((item) =>
+        item.id === "task:agent-task-1:run"
+          ? {
+              ...item,
+              parts: item.parts.map((part) =>
+                part.type === "toolCall"
+                  ? { type: "toolCall", tool_call: part.toolCall }
+                  : part,
+              ),
+            }
+          : item,
+      ),
+    } as unknown as AgentTranscriptResponse;
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(snakeCaseTranscriptResponse);
+        }
+        return mockFetch(input, init);
+      },
+    );
     const fetchMock = vi.mocked(fetch);
     renderApp();
 

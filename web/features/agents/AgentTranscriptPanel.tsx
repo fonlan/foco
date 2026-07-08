@@ -5,6 +5,7 @@ import type {
   AgentTranscriptItemView,
   AgentTranscriptResponse,
   AgentTeamSnapshotResponse,
+  ChatMessagePart,
 } from "../../api/types";
 import {
   MessagePartBlock,
@@ -15,9 +16,37 @@ import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 
 type AgentTranscriptItem = AgentTranscriptItemView;
+type AgentTranscriptWirePart = ChatMessagePart | {
+  type?: string;
+  tool_call?: Extract<ChatMessagePart, { type: "toolCall" }>["toolCall"];
+  toolCall?: Extract<ChatMessagePart, { type: "toolCall" }>["toolCall"];
+};
 
 const AGENT_TRANSCRIPT_PAGE_SIZE = 25;
 const noSelectedSkillPrefix = () => null;
+
+function normalizeAgentTranscriptPart(
+  part: AgentTranscriptWirePart,
+  itemId: string,
+  partIndex: number,
+): ChatMessagePart {
+  if (part.type !== "toolCall") {
+    return part as ChatMessagePart;
+  }
+  if (part.toolCall) {
+    return part as ChatMessagePart;
+  }
+  const legacyToolCall = (part as {
+    tool_call?: Extract<ChatMessagePart, { type: "toolCall" }>["toolCall"];
+  }).tool_call;
+  if (legacyToolCall) {
+    return { ...part, toolCall: legacyToolCall, type: "toolCall" } as ChatMessagePart;
+  }
+
+  // ponytail: transcript-only guard; extract a shared schema normalizer if more APIs need runtime validation.
+  console.warn("Malformed agent transcript toolCall part", { itemId, partIndex });
+  return { type: "error", text: "Malformed tool call omitted." };
+}
 
 export function AgentTranscriptPanel({
   error,
@@ -222,7 +251,10 @@ function AgentTranscriptBubble({
   const { t } = useI18n();
   const isUser = item.role === "user";
   const isStreaming = item.status === "streaming";
-  const reasoningPartCount = item.parts.filter(
+  const parts = item.parts.map((part, partIndex) =>
+    normalizeAgentTranscriptPart(part as AgentTranscriptWirePart, item.id, partIndex),
+  );
+  const reasoningPartCount = parts.filter(
     (part) => part.type === "reasoning",
   ).length;
 
@@ -278,13 +310,13 @@ function AgentTranscriptBubble({
                 </time>
               </span>
             </div>
-            {item.parts.length ? (
-              item.parts.map((part, partIndex) => (
+            {parts.length ? (
+              parts.map((part, partIndex) => (
                 <MessagePartBlock
                   helpers={helpers}
                   isError={item.status === "error"}
                   isStreaming={isStreaming}
-                  isStreamingTail={partIndex === item.parts.length - 1}
+                  isStreamingTail={partIndex === parts.length - 1}
                   isUser={isUser}
                   key={`${item.id}-part-${partIndex}`}
                   part={part}

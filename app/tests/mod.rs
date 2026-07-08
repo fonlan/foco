@@ -445,6 +445,16 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
     };
     assert_eq!(tool_call.name, "read_file");
     assert_eq!(tool_call.status, "completed");
+    let serialized_tool_part =
+        serde_json::to_value(&run_item.parts[2]).expect("serialize tool part");
+    assert_eq!(serialized_tool_part["toolCall"]["name"], json!("read_file"));
+    assert!(serialized_tool_part.get("tool_call").is_none());
+    let legacy_tool_part: ChatMessagePart = serde_json::from_value(json!({
+        "type": "toolCall",
+        "tool_call": serialized_tool_part["toolCall"].clone(),
+    }))
+    .expect("deserialize legacy snake_case tool part");
+    assert!(matches!(legacy_tool_part, ChatMessagePart::ToolCall { .. }));
     assert_eq!(
         tool_call.output.as_ref().expect("output")["content"],
         json!("done")
