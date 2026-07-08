@@ -3044,34 +3044,41 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/add") {
+    const newWorkspace = {
+      chatPagination: {
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 0,
+      },
+      chats: [],
+      id: "new-workspace",
+      connectionStatus: "local",
+      displayPath: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      lastRemoteError: null,
+      logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",
+      name: "New Workspace",
+      path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      remotePath: null,
+      serverId: null,
+      serverName: null,
+      pinned: false,
+      terminalShell: "powershell",
+      commonCommands: [],
+    };
+    appTestState.workspaceResponseWorkspaces = [
+      newWorkspace,
+      workspace,
+      secondaryWorkspace,
+    ];
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: settingsWorkspacesFromWorkspaceResponse(),
+    };
+
     return jsonResponse({
       activeWorkspaceId: "new-workspace",
-      workspaces: [
-        {
-          chatPagination: {
-            hasMore: false,
-            limit: 5,
-            nextCursor: null,
-            total: 0,
-          },
-          chats: [],
-          id: "new-workspace",
-          connectionStatus: "local",
-          displayPath: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-          lastRemoteError: null,
-          logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",
-          name: "New Workspace",
-          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-          remotePath: null,
-          serverId: null,
-          serverName: null,
-          pinned: false,
-          terminalShell: "powershell",
-          commonCommands: [],
-        },
-        workspace,
-        secondaryWorkspace,
-      ],
+      workspaces: appTestState.workspaceResponseWorkspaces,
     });
   }
 

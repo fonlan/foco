@@ -9734,6 +9734,7 @@ export function App() {
   function closeWorkspaceDialog() {
     setWorkspaceIconDraft(null);
     setWorkspaceTestStages([]);
+    setWorkspaceDialogRevision((current) => current + 1);
     setIsWorkspaceDialogOpen(false);
   }
 

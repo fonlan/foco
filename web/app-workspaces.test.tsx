@@ -865,11 +865,20 @@ describe("app-workspaces verification surfaces", () => {
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
   });
 
-  it("adds a workspace without an icon as the folder icon", async () => {
-    const fetchMock = vi.mocked(fetch);
+  it("shows a newly added workspace in settings without leaving the page", async () => {
     renderApp();
 
-    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+
+    const workspaceListHeading = await screen.findByText("Workspace list");
+    const workspaceListSection = workspaceListHeading.closest("section");
+    expect(workspaceListSection).not.toBeNull();
+    await userEvent.click(
+      within(workspaceListSection as HTMLElement).getByRole("button", {
+        name: "Add workspace",
+      }),
+    );
 
     const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
     await userEvent.type(
@@ -880,24 +889,12 @@ describe("app-workspaces verification surfaces", () => {
       within(dialog).getByPlaceholderText("C:/Users/name/workspace"),
       "C:/Users/fonla/Documents/Repos/NewWorkspace",
     );
-
-    expect(within(dialog).getByText("Folder icon")).toBeInTheDocument();
-
     await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
 
     await waitFor(() => {
-      const addWorkspaceCall = fetchMock.mock.calls.find(
-        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
-      );
-      expect(addWorkspaceCall).toBeDefined();
-      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
-        expect.objectContaining({
-          contentBase64: null,
-          name: "New Workspace",
-          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-        }),
-      );
+      expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
     });
+    expect(await screen.findByRole("button", { name: "Edit workspace New Workspace" })).toBeInTheDocument();
   });
 
   it("uploads and clears a workspace icon in workspace settings", async () => {

@@ -603,6 +603,7 @@ export function SettingsPanel({
     Record<string, ProviderModelListState>
   >({});
   const loadingProviderModelIdsRef = useRef<Set<string>>(new Set());
+  const settingsLoadRequestIdRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [isGeneralPasswordVisible, setIsGeneralPasswordVisible] = useState(false);
   const [isProviderApiKeyVisible, setIsProviderApiKeyVisible] = useState(false);
@@ -1041,11 +1042,16 @@ export function SettingsPanel({
   }, []);
 
   const loadSettings = useCallback(async () => {
+    const requestId = settingsLoadRequestIdRef.current + 1;
+    settingsLoadRequestIdRef.current = requestId;
     setIsLoadingSettings(true);
     setError(null);
 
     try {
       const data = await requestJson<SettingsResponse>("/api/settings");
+      if (requestId !== settingsLoadRequestIdRef.current) {
+        return;
+      }
       setSettings(data);
       onSettingsChange(data);
       setHookWorkspaceId((current) => current || data.workspaces[0]?.id || "");
@@ -1073,9 +1079,13 @@ export function SettingsPanel({
         transport: current.transport || data.mcpTransports[0]?.transport || "stdio",
       }));
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (requestId === settingsLoadRequestIdRef.current) {
+        setError(errorMessage(requestError));
+      }
     } finally {
-      setIsLoadingSettings(false);
+      if (requestId === settingsLoadRequestIdRef.current) {
+        setIsLoadingSettings(false);
+      }
     }
   }, [onSettingsChange]);
 
