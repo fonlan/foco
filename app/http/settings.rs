@@ -6,7 +6,7 @@ use crate::runtime::spawn_api_audit_cleanup_once;
 use axum::{
     Json,
     extract::State,
-    http::header,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use fancy_regex::Regex;
@@ -280,6 +280,18 @@ pub(crate) struct ManualSkillsRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TestProviderRequest {
     pub(crate) provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RevealProviderApiKeyRequest {
+    pub(crate) id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RevealProviderApiKeyResponse {
+    pub(crate) api_key: String,
 }
 
 #[derive(Deserialize)]
@@ -1665,6 +1677,42 @@ fn notify_tray_menu_language_change(
     _next_language: &str,
 ) -> Result<(), ApiError> {
     Ok(())
+}
+
+pub(crate) async fn reveal_provider_api_key(
+    State(state): State<AppState>,
+    Json(request): Json<RevealProviderApiKeyRequest>,
+) -> Result<Json<RevealProviderApiKeyResponse>, ApiError> {
+    let provider_id = request.id.trim();
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+
+    let config = config_snapshot(&state)?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id);
+    let Some(provider) = provider else {
+        return Err(ApiError::from_status_message(
+            StatusCode::NOT_FOUND,
+            "provider was not found",
+        ));
+    };
+    let Some(api_key) = provider
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(ApiError::bad_request(
+            "provider does not have a saved API key",
+        ));
+    };
+
+    Ok(Json(RevealProviderApiKeyResponse {
+        api_key: api_key.to_string(),
+    }))
 }
 
 pub(crate) async fn save_manual_provider(

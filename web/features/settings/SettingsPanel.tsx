@@ -114,6 +114,7 @@ import type {
   PromptSettingsFormState,
   PromptSettingsSummary,
   ProviderFormState,
+  ProviderApiKeyResponse,
   ProviderModelsRefreshResponse,
   ProviderModelsResponse,
   ProviderModelRedirect,
@@ -578,6 +579,7 @@ export function SettingsPanel({
   const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
     useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
+  const [isRevealingProviderApiKey, setIsRevealingProviderApiKey] = useState(false);
   const [isRefreshingProviderModels, setIsRefreshingProviderModels] =
     useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
@@ -1666,6 +1668,7 @@ export function SettingsPanel({
       serviceId: providerServiceIdForKind(provider.kind) || "",
     });
     setIsProviderApiKeyVisible(false);
+    setIsRevealingProviderApiKey(false);
     setIsProviderDialogOpen(true);
   }
 
@@ -1678,7 +1681,55 @@ export function SettingsPanel({
       serviceId: providerServiceIdForKind(kind) || "",
     });
     setIsProviderApiKeyVisible(false);
+    setIsRevealingProviderApiKey(false);
     setIsProviderDialogOpen(true);
+  }
+
+  function closeProviderDialog() {
+    setIsProviderApiKeyVisible(false);
+    setIsRevealingProviderApiKey(false);
+    setIsProviderDialogOpen(false);
+  }
+
+  async function handleToggleProviderApiKeyVisibility() {
+    if (isRevealingProviderApiKey) {
+      return;
+    }
+
+    if (isProviderApiKeyVisible) {
+      setIsProviderApiKeyVisible(false);
+      return;
+    }
+
+    if (providerForm.apiKey || providerForm.clearApiKey || !hasSavedProviderKey || !editingProvider) {
+      setIsProviderApiKeyVisible(true);
+      return;
+    }
+
+    setIsRevealingProviderApiKey(true);
+    setError(null);
+    const providerId = editingProvider.id;
+
+    try {
+      const data = await requestJson<ProviderApiKeyResponse>(
+        "/api/providers/reveal-api-key",
+        {
+          body: JSON.stringify({ id: providerId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setProviderForm((current) =>
+        current.id === providerId
+          ? { ...current, apiKey: data.apiKey, clearApiKey: false }
+          : current,
+      );
+      setIsProviderApiKeyVisible(true);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsRevealingProviderApiKey(false);
+    }
   }
 
   function applyProviderService(serviceId: string) {
@@ -3589,6 +3640,8 @@ export function SettingsPanel({
     event.preventDefault();
     setIsSavingProvider(true);
     setError(null);
+    setIsProviderApiKeyVisible(false);
+    setIsRevealingProviderApiKey(false);
 
     try {
       const providerId =
@@ -3645,8 +3698,7 @@ export function SettingsPanel({
         apiKey: "",
         clearApiKey: false,
       }));
-      setIsProviderApiKeyVisible(false);
-      setIsProviderDialogOpen(false);
+      closeProviderDialog();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -3695,6 +3747,8 @@ export function SettingsPanel({
   async function deleteProvider(providerId: string) {
     setIsSavingProvider(true);
     setError(null);
+    setIsProviderApiKeyVisible(false);
+    setIsRevealingProviderApiKey(false);
 
     try {
       const data = await requestJson<SettingsResponse>("/api/providers/delete", {
@@ -3718,8 +3772,7 @@ export function SettingsPanel({
         ...emptyProviderForm(),
         kind: defaultProviderKind(data.providerKinds),
       });
-      setIsProviderApiKeyVisible(false);
-      setIsProviderDialogOpen(false);
+      closeProviderDialog();
       setForm((current) => ({
         ...current,
         activeProviderId:
@@ -9401,7 +9454,7 @@ export function SettingsPanel({
                   <button
                     aria-label={t("Close provider configuration backdrop")}
                     className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
-                    onClick={() => setIsProviderDialogOpen(false)}
+                    onClick={closeProviderDialog}
                     type="button"
                   />
                   <form
@@ -9455,7 +9508,7 @@ export function SettingsPanel({
                         <button
                           aria-label={t("Close provider configuration")}
                           className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-                          onClick={() => setIsProviderDialogOpen(false)}
+                          onClick={closeProviderDialog}
                           title={t("Close")}
                           type="button"
                         >
@@ -9564,10 +9617,9 @@ export function SettingsPanel({
                                 ? t("Hide API key")
                                 : t("Show API key")
                             }
-                            className={`absolute ${hasProviderKeyClearButton ? "right-10" : "right-1"} top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900`}
-                            onClick={() =>
-                              setIsProviderApiKeyVisible((current) => !current)
-                            }
+                            className={`absolute ${hasProviderKeyClearButton ? "right-10" : "right-1"} top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900 disabled:cursor-not-allowed disabled:text-stone-400`}
+                            disabled={isRevealingProviderApiKey}
+                            onClick={() => void handleToggleProviderApiKeyVisibility()}
                             title={
                               isProviderApiKeyVisible
                                 ? t("Hide API key")
@@ -9575,7 +9627,9 @@ export function SettingsPanel({
                             }
                             type="button"
                           >
-                            {isProviderApiKeyVisible ? (
+                            {isRevealingProviderApiKey ? (
+                              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                            ) : isProviderApiKeyVisible ? (
                               <EyeOff aria-hidden="true" className="size-4" />
                             ) : (
                               <Eye aria-hidden="true" className="size-4" />

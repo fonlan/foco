@@ -3570,6 +3570,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(savedSettings.provider);
   }
 
+  if (path === "/api/providers/reveal-api-key") {
+    return jsonResponse({ apiKey: "sk-saved" });
+  }
+
   if (path === "/api/providers/models/refresh") {
     return jsonResponse({
       providers: [

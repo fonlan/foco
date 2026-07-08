@@ -2252,6 +2252,48 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("reveals a saved provider API key on demand", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/providers/reveal-api-key") {
+        expect(JSON.parse(String(init?.body ?? "{}"))).toEqual({ id: "openai" });
+        return jsonResponse({ apiKey: "sk-saved" });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+
+    const providerApiKeyInput = screen.getByLabelText("API key");
+    expect(providerApiKeyInput).toHaveAttribute("type", "password");
+    expect(providerApiKeyInput).toHaveValue("");
+
+    await userEvent.click(screen.getByRole("button", { name: "Show API key" }));
+
+    await waitFor(() => {
+      expect(providerApiKeyInput).toHaveAttribute("type", "text");
+      expect(providerApiKeyInput).toHaveValue("sk-saved");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/providers/manual",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toMatchObject({
+        apiKey: "sk-saved",
+        clearApiKey: false,
+      });
+    });
+  });
+
   it("saves provider, model, MCP server, and skill settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

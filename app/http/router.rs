@@ -425,6 +425,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::settings::save_manual_provider),
         )
         .route(
+            "/api/providers/reveal-api-key",
+            post(crate::http::settings::reveal_provider_api_key),
+        )
+        .route(
             "/api/providers/delete",
             post(crate::http::settings::delete_provider),
         )

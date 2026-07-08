@@ -1416,6 +1416,10 @@ export type ProviderFormState = {
   serviceId: string;
 };
 
+export type ProviderApiKeyResponse = {
+  apiKey: string;
+};
+
 export type ProviderTestResponse = {
   ok: boolean;
   message: string;
