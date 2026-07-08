@@ -1719,7 +1719,7 @@ export const contextUsage = {
   },
   toolSchemaTokens: 9800,
   totalUsedContextTokens: 48340,
-  usagePercent: 38,
+  usagePercent: 47,
   usedMessageTokens: 52340,
   willCompressOnNextSend: false,
 };

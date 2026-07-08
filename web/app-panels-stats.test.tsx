@@ -2666,7 +2666,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     const contextTimeline = screen.getByLabelText("Context usage timeline");
-    expect(within(contextTimeline).getByText("38%")).toBeInTheDocument();
+    expect(within(contextTimeline).getByText("47%")).toBeInTheDocument();
     expect(within(contextTimeline).queryByText("Snapshot 1")).not.toBeInTheDocument();
     expect(within(contextTimeline).queryByText("Snapshot 2")).not.toBeInTheDocument();
     expect(within(contextTimeline).queryByText(/llm \/ ctx-/)).not.toBeInTheDocument();
