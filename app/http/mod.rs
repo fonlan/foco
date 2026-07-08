@@ -2,6 +2,7 @@ pub mod agents;
 pub mod assets;
 pub mod auth;
 pub mod chat;
+pub mod file_picker;
 pub mod git;
 pub mod hooks;
 pub mod memory;

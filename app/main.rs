@@ -87,7 +87,6 @@ use tokio::time::timeout;
 
 use crate::http::assets::verify_frontend_assets;
 use crate::platform::autostart_windows::apply_auto_start_setting;
-use crate::platform::native_browser::prune_native_browser_authorizations;
 #[cfg(all(windows, not(debug_assertions)))]
 use crate::platform::tray_windows::TrayMenuUpdateNotifier;
 
@@ -369,7 +368,6 @@ pub(crate) struct AppState {
     update_install_lock: Arc<AsyncMutex<()>>,
     update_state: Arc<Mutex<crate::update_runtime::UpdateState>>,
     ripgrep_status: Arc<Mutex<RipgrepStatus>>,
-    native_browser_authorizations: NativeBrowserAuthorizations,
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
@@ -468,37 +466,6 @@ fn acquire_workspace_database_permit(
     }
 }
 
-#[derive(Clone, Default)]
-struct NativeBrowserAuthorizations {
-    tokens: Arc<Mutex<HashMap<String, Instant>>>,
-}
-
-impl NativeBrowserAuthorizations {
-    fn authorize(&self, token: &str) -> Result<(), ApiError> {
-        let mut tokens = self
-            .tokens
-            .lock()
-            .map_err(|_| ApiError::internal("native browser authorization lock was poisoned"))?;
-        prune_native_browser_authorizations(&mut tokens);
-        tokens.insert(token.to_string(), Instant::now());
-        Ok(())
-    }
-
-    fn is_authorized(&self, token: &str) -> Result<bool, ApiError> {
-        let mut tokens = self
-            .tokens
-            .lock()
-            .map_err(|_| ApiError::internal("native browser authorization lock was poisoned"))?;
-        prune_native_browser_authorizations(&mut tokens);
-        if let Some(authorized_at) = tokens.get_mut(token) {
-            *authorized_at = Instant::now();
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-}
-
 #[tokio::main]
 async fn main() {
     if let Err(error) = run_entrypoint().await {
@@ -512,6 +479,11 @@ async fn run_entrypoint() -> AppResult<()> {
     if print_latest_memory_dream_job_if_requested()? {
         return Ok(());
     }
+    if let Some(command) = env::args().nth(1) {
+        if crate::http::file_picker::run_file_picker_cli_if_requested(&command)? {
+            return Ok(());
+        }
+    }
     if crate::remote_workspace::run_remote_sidecar_command_if_requested().await? {
         return Ok(());
     }
@@ -523,9 +495,6 @@ async fn run_entrypoint() -> AppResult<()> {
 
     #[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
     {
-        #[cfg(target_os = "macos")]
-        crate::platform::native_browser::install_macos_native_picker_dispatcher();
-
         run_server_until_shutdown(None, false, ActiveChatRunRegistry::default()).await
     }
 }
@@ -756,7 +725,6 @@ async fn run_server_until_shutdown(
         update_install_lock: Arc::new(AsyncMutex::new(())),
         update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
-        native_browser_authorizations: NativeBrowserAuthorizations::default(),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
@@ -1275,39 +1243,6 @@ fn app_theme_name(theme: &str) -> &'static str {
         "dark" => "Dark",
         _ => "Unknown",
     }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SelectDirectoryResponse {
-    path: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NativePickerRequest {
-    native_browser_token: String,
-}
-
-#[derive(Deserialize)]
-struct NativeBrowserProbeQuery {
-    token: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SelectFilesResponse {
-    files: Vec<NativeSelectedFile>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NativeSelectedFile {
-    path: String,
-    name: String,
-    content_type: String,
-    size_bytes: u64,
-    content_base64: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6283,7 +6218,7 @@ impl ApiError {
         }
     }
 
-    fn forbidden(message: impl Into<String>) -> Self {
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),

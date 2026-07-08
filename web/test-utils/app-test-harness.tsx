@@ -2904,21 +2904,80 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse({ task });
   }
 
-  if (path === "/api/native/select-directory") {
-    return jsonResponse({ path: "C:/Users/fonla/Documents/Repos/NewWorkspace" });
-  }
-
-  if (path === "/api/native/select-files") {
+  if (path === "/api/file-picker/list") {
     return jsonResponse({
-      files: [
+      entries: [
         {
-          contentBase64: null,
-          contentType: "text/plain",
+          disabled: false,
+          isDirectory: true,
+          modifiedMs: null,
+          name: "NewWorkspace",
+          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+          sizeBytes: null,
+        },
+        {
+          disabled: false,
+          isDirectory: false,
+          modifiedMs: null,
           name: "note.txt",
           path: "C:/Users/fonla/Desktop/note.txt",
           sizeBytes: 5,
         },
+        {
+          disabled: false,
+          isDirectory: false,
+          modifiedMs: null,
+          name: "screen.png",
+          path: "C:/Users/fonla/Desktop/screen.png",
+          sizeBytes: 3,
+        },
+        {
+          disabled: false,
+          isDirectory: false,
+          modifiedMs: null,
+          name: "workspace-logo.png",
+          path: "C:/Users/fonla/Desktop/workspace-logo.png",
+          sizeBytes: 8,
+        },
       ],
+      parentPath: "C:/Users/fonla/Documents",
+      path: "C:/Users/fonla/Documents/Repos",
+      truncated: false,
+      warnings: [],
+    });
+  }
+
+  if (path === "/api/file-picker/read-files") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { paths?: string[] };
+    return jsonResponse({
+      files: (body.paths ?? ["C:/Users/fonla/Desktop/note.txt"]).map((filePath) => {
+        const name = filePath.split(/[\\/]/).pop() ?? "note.txt";
+        if (name === "screen.png") {
+          return {
+            contentBase64: "cG5n",
+            contentType: "image/png",
+            name,
+            path: filePath,
+            sizeBytes: 3,
+          };
+        }
+        if (name === "workspace-logo.png") {
+          return {
+            contentBase64: "iVBORw0KGgo=",
+            contentType: "image/png",
+            name,
+            path: filePath,
+            sizeBytes: 8,
+          };
+        }
+        return {
+          contentBase64: "SGVsbG8=",
+          contentType: "text/plain",
+          name,
+          path: filePath,
+          sizeBytes: 5,
+        };
+      }),
     });
   }
 

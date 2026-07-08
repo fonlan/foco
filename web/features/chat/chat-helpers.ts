@@ -6,6 +6,7 @@ import type {
   ComposerAttachment,
   ConfiguredModelSummary,
   ConfiguredSkillSummary,
+  NativeSelectedFile,
   Translate,
 } from "../../api/types";
 import type { SelectedSkillPrefix } from "./MarkdownContent";
@@ -185,6 +186,31 @@ export async function fileToComposerAttachment(file: File): Promise<ComposerAtta
     path: undefined,
     previewDataUrl,
     sizeBytes: file.size,
+  };
+}
+
+export function composerAttachmentFromSelectedFile(
+  file: NativeSelectedFile,
+): ComposerAttachment {
+  const name = file.name.trim();
+  const contentType = file.contentType.trim();
+  if (!name) {
+    throw new Error("attachment name must not be empty");
+  }
+  if (!contentType) {
+    throw new Error(`attachment ${name} content type is missing`);
+  }
+  const contentBase64 = file.contentBase64 ?? undefined;
+  return {
+    id: localChatAttachmentId(),
+    name,
+    contentType,
+    contentBase64,
+    path: file.path,
+    previewDataUrl: contentType.startsWith("image/") && contentBase64
+      ? `data:${contentType};base64,${contentBase64}`
+      : null,
+    sizeBytes: file.sizeBytes,
   };
 }
 

@@ -503,6 +503,30 @@ export type NativeSelectedFile = {
   contentBase64?: string | null;
 };
 
+export type FilePickerTarget =
+  | { kind: "local" }
+  | { kind: "remoteServer"; serverId: string }
+  | { kind: "workspace"; workspaceId: string };
+
+export type FilePickerMode = "file" | "directory";
+
+export type FilePickerEntry = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  sizeBytes?: number | null;
+  modifiedAt?: string | null;
+  disabled?: boolean;
+};
+
+export type FilePickerListResponse = {
+  path: string;
+  parentPath?: string | null;
+  entries: FilePickerEntry[];
+  truncated: boolean;
+  warnings: string[];
+};
+
 export type QueuedMessageRunSummary = {
   status: "queued" | "running" | string;
   modelId: string;

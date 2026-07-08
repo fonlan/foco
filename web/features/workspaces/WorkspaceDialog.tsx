@@ -10,7 +10,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { ChangeEvent as ReactChangeEvent, FormEvent } from "react";
+import { FormEvent } from "react";
 
 import type {
   RemoteServerDiagnosticStage,
@@ -21,13 +21,10 @@ import { useI18n } from "../../shared/i18n";
 import { WorkspaceIcon } from "./WorkspaceIcon";
 
 export function WorkspaceDialog({
-  canUseNativePicker,
   iconDraft,
-  iconInputRef,
   inlineServerHost,
   inlineServerName,
   isCreatingInlineServer,
-  isSelectingPath,
   isSaving,
   isTestingConnection,
   mode,
@@ -35,13 +32,13 @@ export function WorkspaceDialog({
   onClearIcon,
   onClose,
   onCreateInlineServer,
-  onIconFileChange,
   onInlineServerHostChange,
   onInlineServerNameChange,
   onModeChange,
   onNameChange,
   onPathChange,
   onSelectPath,
+  onSelectIcon,
   onServerChange,
   onSpecEnabledChange,
   onSubmit,
@@ -54,13 +51,10 @@ export function WorkspaceDialog({
   terminalShell,
   testStages,
 }: {
-  canUseNativePicker: boolean;
   iconDraft: WorkspaceIconDraft | null;
-  iconInputRef: { current: HTMLInputElement | null };
   inlineServerHost: string;
   inlineServerName: string;
   isCreatingInlineServer: boolean;
-  isSelectingPath: boolean;
   isSaving: boolean;
   isTestingConnection: boolean;
   mode: "local" | "ssh";
@@ -68,13 +62,13 @@ export function WorkspaceDialog({
   onClearIcon: () => void;
   onClose: () => void;
   onCreateInlineServer: () => void;
-  onIconFileChange: (event: ReactChangeEvent<HTMLInputElement>) => void;
   onInlineServerHostChange: (value: string) => void;
   onInlineServerNameChange: (value: string) => void;
   onModeChange: (mode: "local" | "ssh") => void;
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
   onSelectPath: () => void;
+  onSelectIcon: () => void;
   onServerChange: (serverId: string) => void;
   onSpecEnabledChange: (enabled: boolean) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -246,26 +240,16 @@ export function WorkspaceDialog({
                 placeholder={isRemote ? "/home/name/workspace" : "C:/Users/name/workspace"}
                 value={path}
               />
-              {!isRemote ? (
-                <button
-                  aria-label={t("Choose workspace path")}
-                  className="inline-flex size-11 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                  disabled={isSelectingPath || !canUseNativePicker}
-                  onClick={onSelectPath}
-                  title={
-                    canUseNativePicker
-                      ? t("Choose workspace path")
-                      : t("Local Foco browser required")
-                  }
-                  type="button"
-                >
-                  {isSelectingPath ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <FolderSearch aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              ) : null}
+              <button
+                aria-label={t("Choose workspace path")}
+                className="inline-flex size-11 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                disabled={isRemote && (!selectedServerId || !selectedServerAvailable)}
+                onClick={onSelectPath}
+                title={t("Choose workspace path")}
+                type="button"
+              >
+                <FolderSearch aria-hidden="true" className="size-4" />
+              </button>
             </div>
           </label>
 
@@ -368,20 +352,11 @@ export function WorkspaceDialog({
                 <Trash2 aria-hidden="true" className="size-4" />
               </button>
             </div>
-            <input
-              aria-label={t("Workspace icon file")}
-              accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
-              className="sr-only"
-              disabled={isSaving}
-              onChange={onIconFileChange}
-              ref={iconInputRef}
-              type="file"
-            />
             <button
               aria-label={t("Upload icon")}
               className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-              disabled={isSaving}
-              onClick={() => iconInputRef.current?.click()}
+              disabled={isSaving || (isRemote && (!selectedServerId || !selectedServerAvailable))}
+              onClick={onSelectIcon}
               title={t("Upload icon")}
               type="button"
             >

@@ -18655,7 +18655,6 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         update_install_lock: Arc::new(AsyncMutex::new(())),
         update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(detect_ripgrep(&foco_root_dir))),
-        native_browser_authorizations: NativeBrowserAuthorizations::default(),
         user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx,

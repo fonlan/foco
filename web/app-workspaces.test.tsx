@@ -815,17 +815,19 @@ describe("app-workspaces verification surfaces", () => {
     await waitFor(() => expect(choosePathButton).toBeEnabled());
     await userEvent.click(choosePathButton);
 
+    const picker = await screen.findByRole("dialog", { name: "Select workspace folder" });
+    await userEvent.click(within(picker).getByRole("button", { name: /NewWorkspace/ }));
+    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+
     await waitFor(() => {
       expect(pathInput).toHaveValue("C:/Users/fonla/Documents/Repos/NewWorkspace");
       expect(nameInput).toHaveValue("NewWorkspace");
     });
 
-    await userEvent.upload(
-      within(dialog).getByLabelText("Workspace icon file"),
-      new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])], "workspace-logo.png", {
-        type: "image/png",
-      }),
-    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "Upload icon" }));
+    const iconPicker = await screen.findByRole("dialog", { name: "Select workspace icon" });
+    await userEvent.click(within(iconPicker).getByRole("button", { name: /workspace-logo\.png/ }));
+    await userEvent.click(within(iconPicker).getByRole("button", { name: "Select" }));
 
     await waitFor(() => {
       expect(within(dialog).getByText("workspace-logo.png")).toBeInTheDocument();
@@ -863,7 +865,7 @@ describe("app-workspaces verification surfaces", () => {
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
   });
 
-  it("adds a workspace with an empty icon file as the folder icon", async () => {
+  it("adds a workspace without an icon as the folder icon", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -879,13 +881,7 @@ describe("app-workspaces verification surfaces", () => {
       "C:/Users/fonla/Documents/Repos/NewWorkspace",
     );
 
-    await userEvent.upload(
-      within(dialog).getByLabelText("Workspace icon file"),
-      new File([], "empty-logo.png", { type: "image/png" }),
-    );
-
     expect(within(dialog).getByText("Folder icon")).toBeInTheDocument();
-    expect(within(dialog).queryByText("empty-logo.png")).not.toBeInTheDocument();
 
     await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
 

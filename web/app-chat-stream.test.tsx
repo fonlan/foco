@@ -2669,14 +2669,10 @@ describe("app-chat-stream verification surfaces", () => {
     await screen.findByText("Tool run");
     const addAttachmentButton = screen.getByRole("button", { name: "Add attachment" });
     await waitFor(() => expect(addAttachmentButton).toBeEnabled());
-    const fileInput = document.querySelector<HTMLInputElement>(
-      'input[type="file"][multiple]',
-    );
-    expect(fileInput).not.toBeNull();
-    await userEvent.upload(
-      fileInput as HTMLInputElement,
-      new File(["Hello"], "note.txt", { type: "text/plain" }),
-    );
+    await userEvent.click(addAttachmentButton);
+    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+    await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
+    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Model"));
@@ -2726,14 +2722,10 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await screen.findByText("Tool run");
-    const fileInput = document.querySelector<HTMLInputElement>(
-      'input[type="file"][multiple]',
-    );
-    expect(fileInput).not.toBeNull();
-    await userEvent.upload(
-      fileInput as HTMLInputElement,
-      new File(["png"], "screen.png", { type: "image/png" }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+    await userEvent.click(within(picker).getByRole("button", { name: /screen\.png/ }));
+    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
 
     expect(
       await screen.findByText(
@@ -2780,14 +2772,10 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await screen.findByText("Tool run");
-    const fileInput = document.querySelector<HTMLInputElement>(
-      'input[type="file"][multiple]',
-    );
-    expect(fileInput).not.toBeNull();
-    await userEvent.upload(
-      fileInput as HTMLInputElement,
-      new File(["png"], "screen.png", { type: "image/png" }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+    await userEvent.click(within(picker).getByRole("button", { name: /screen\.png/ }));
+    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
 
     expect(await screen.findByText("screen.png")).toBeInTheDocument();
     expect(

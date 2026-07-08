@@ -61,8 +61,6 @@ fn run_macos_menu_bar_entrypoint_blocking(
         return Ok(());
     }
 
-    crate::platform::native_browser::install_macos_native_picker_dispatcher();
-
     let labels = tray_menu_labels(&loaded_config.config.app.language)?;
     let logs_dir = loaded_config.paths.logs_dir.clone();
     let config_dir = loaded_config.paths.root_dir.clone();

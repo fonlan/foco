@@ -31,7 +31,6 @@ import {
 } from "lucide-react";
 import {
   CSSProperties,
-  ChangeEvent as ReactChangeEvent,
   DragEvent as ReactDragEvent,
   FormEvent,
   MouseEvent as ReactMouseEvent,
@@ -95,6 +94,7 @@ import type {
   ContextMemoryState,
   ContextUsageRefreshRequest,
   ContextUsageResponse,
+  FilePickerTarget,
   GenerateWorkspaceSpecResponse,
   GitBranchesResponse,
   GitCommitMessageResponse,
@@ -214,13 +214,14 @@ import {
   workspaceNameFromPath,
 } from "./features/workspaces/workspace-helpers";
 import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
+import { FilePickerDialog, type FilePickerSelection } from "./features/file-picker/FilePickerDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
 import {
   activeSkillQuery,
   chatAttachmentPayload,
-  fileToBase64,
+  composerAttachmentFromSelectedFile,
   fileToComposerAttachment,
   formatFileSize,
   isSkillAvailableForWorkspace,
@@ -549,6 +550,16 @@ type ActiveMainTab =
       teamId: string;
       instanceId: string;
     };
+
+type FilePickerRequest = {
+  initialPath?: string | null;
+  mode: "file" | "directory";
+  multiple?: boolean;
+  readFiles?: boolean;
+  target: FilePickerTarget;
+  title: string;
+  onSelect: (selection: FilePickerSelection[]) => void;
+};
 
 type MainTabSummary =
   | (ChatTabSummary & { type: "chat" })
@@ -945,7 +956,7 @@ export function App() {
   const [workspaceSpecEnabled, setWorkspaceSpecEnabled] = useState(false);
   const [workspaceIconDraft, setWorkspaceIconDraft] =
     useState<WorkspaceIconDraft | null>(null);
-  const workspaceIconInputRef = useRef<HTMLInputElement | null>(null);
+  const [filePickerRequest, setFilePickerRequest] = useState<FilePickerRequest | null>(null);
   const [draftMessage, setDraftMessage] = useState("");
   const [draftAttachments, setDraftAttachments] = useState<ComposerAttachment[]>(
     [],
@@ -1064,7 +1075,6 @@ export function App() {
   const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
-  const [nativeBrowserToken, setNativeBrowserToken] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedProviderId, setSelectedProviderId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
@@ -1191,7 +1201,6 @@ export function App() {
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
-  const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
   const [isSelectingAttachments, setIsSelectingAttachments] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
     useState<QuestionRequestSummary | null>(null);
@@ -1685,7 +1694,6 @@ export function App() {
     authStatus && (!authStatus.enabled || authStatus.authenticated),
   );
   const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
-  const canUseNativePicker = nativeBrowserToken !== null;
   const language = settings?.general.language ?? "en";
   const theme = settings?.general.theme ?? "light";
   const t = useCallback<Translate>(
@@ -3095,35 +3103,6 @@ export function App() {
   }, [canUseApp, loadUpdateStatus, updateStatus?.autoCheckEnabled]);
 
   useEffect(() => {
-    const probePort = settings?.nativeTools.browserProbePort;
-    if (!canUseApp || typeof probePort !== "number") {
-      setNativeBrowserToken(null);
-      return;
-    }
-
-    let isCurrent = true;
-    let token: string;
-    try {
-      token = createNativeBrowserToken();
-    } catch (error) {
-      console.error(error);
-      setNativeBrowserToken(null);
-      return;
-    }
-    setNativeBrowserToken(null);
-
-    void probeNativeBrowser(probePort, token).then((available) => {
-      if (isCurrent) {
-        setNativeBrowserToken(available ? token : null);
-      }
-    });
-
-    return () => {
-      isCurrent = false;
-    };
-  }, [canUseApp, settings?.nativeTools.browserProbePort]);
-
-  useEffect(() => {
     if (!activeWorkspace?.id) {
       setWorkspaceFiles(null);
       setWorkspaceFilesError(null);
@@ -3954,62 +3933,113 @@ export function App() {
     setWorkspaceIconDraft(null);
   }
 
-  async function handleWorkspaceIconFileChange(
-    event: ReactChangeEvent<HTMLInputElement>,
-  ) {
-    const file = event.target.files?.[0] ?? null;
-    event.target.value = "";
+  async function handleWorkspaceIconPickerSelection(selection: FilePickerSelection[]) {
+    const file = selection[0]?.file;
     if (!file) {
       return;
     }
-    if (file.size === 0) {
+    if (file.sizeBytes === 0) {
       setWorkspaceIconDraft(null);
       return;
     }
-
-    try {
-      const contentBase64 = await fileToBase64(file);
-      setWorkspaceIconDraft({
-        contentBase64,
-        name: file.name,
-        previewUrl: file.type
-          ? `data:${file.type};base64,${contentBase64}`
-          : "",
-      });
-    } catch (readError) {
-      setError(errorMessage(readError));
+    if (!file.contentBase64) {
+      setError(t("Selected file content is missing."));
+      return;
     }
+    setWorkspaceIconDraft({
+      contentBase64: file.contentBase64,
+      name: file.name,
+      previewUrl: file.contentType
+        ? `data:${file.contentType};base64,${file.contentBase64}`
+        : "",
+    });
   }
 
-  async function handleSelectWorkspacePath() {
-    if (!nativeBrowserToken) {
-      setError(
-        t(
-          "Native file browsing is only available from a browser running on the Foco computer.",
-        ),
-      );
+  function handleSelectWorkspacePath() {
+    setFilePickerRequest({
+      initialPath: workspacePath,
+      mode: "directory",
+      target: workspaceMode === "ssh" && workspaceServerId
+        ? { kind: "remoteServer", serverId: workspaceServerId }
+        : { kind: "local" },
+      title: t("Select workspace folder"),
+      onSelect: (selection) => {
+        const selectedPath = selection[0]?.path;
+        if (!selectedPath) {
+          return;
+        }
+        if (workspaceMode === "ssh") {
+          setWorkspaceRemotePath(selectedPath);
+          return;
+        }
+        setWorkspacePath(selectedPath);
+        setWorkspaceName((current) =>
+          current.trim() ? current : workspaceNameFromPath(selectedPath),
+        );
+      },
+    });
+  }
+
+  function handleSelectWorkspaceIcon() {
+    setFilePickerRequest({
+      mode: "file",
+      readFiles: true,
+      target: workspaceMode === "ssh" && workspaceServerId
+        ? { kind: "remoteServer", serverId: workspaceServerId }
+        : { kind: "local" },
+      title: t("Select workspace icon"),
+      onSelect: (selection) => {
+        void handleWorkspaceIconPickerSelection(selection);
+      },
+    });
+  }
+
+  function handleSelectDraftAttachments() {
+    const target: FilePickerTarget = activeWorkspace?.id
+      ? { kind: "workspace", workspaceId: activeWorkspace.id }
+      : { kind: "local" };
+    setFilePickerRequest({
+      mode: "file",
+      multiple: true,
+      readFiles: true,
+      target,
+      title: t("Add attachment"),
+      onSelect: (selection) => {
+        void handleAddSelectedFileAttachments(
+          selection
+            .map((item) => item.file)
+            .filter((file): file is NonNullable<FilePickerSelection["file"]> => Boolean(file)),
+        );
+      },
+    });
+  }
+
+  async function handleAddSelectedFileAttachments(files: NonNullable<FilePickerSelection["file"]>[]) {
+    if (!files.length) {
       return;
     }
 
-    setIsSelectingWorkspacePath(true);
+    setIsSelectingAttachments(true);
     setError(null);
 
     try {
-      const data = await requestJson<{ path: string | null }>(
-        "/api/native/select-directory",
-        nativePickerRequestInit(nativeBrowserToken),
-      );
-
-      if (data.path) {
-        setWorkspacePath(data.path);
-        setWorkspaceName((current) =>
-          current.trim() ? current : workspaceNameFromPath(data.path ?? ""),
+      const attachments = files.map(composerAttachmentFromSelectedFile);
+      for (const attachment of attachments) {
+        const unsupportedMessage = unsupportedAttachmentMessage(
+          selectedModel,
+          attachment,
+          t,
         );
+        if (unsupportedMessage) {
+          setError(unsupportedMessage);
+          return;
+        }
       }
+      await handleAddDraftAttachments(attachments);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
-      setIsSelectingWorkspacePath(false);
+      setIsSelectingAttachments(false);
     }
   }
 
@@ -6685,35 +6715,6 @@ export function App() {
       await handleAddDraftAttachments(nextAttachments);
     } catch (readError) {
       setError(errorMessage(readError));
-    }
-  }
-
-  async function handleSelectDraftAttachments(files: File[]) {
-    if (!files.length) {
-      return;
-    }
-
-    setIsSelectingAttachments(true);
-    setError(null);
-
-    try {
-      for (const file of files) {
-        const unsupportedMessage = unsupportedFileAttachmentMessage(
-          selectedModel,
-          file,
-          t,
-        );
-        if (unsupportedMessage) {
-          setError(unsupportedMessage);
-          return;
-        }
-      }
-      const attachments = await Promise.all(files.map(fileToComposerAttachment));
-      await handleAddDraftAttachments(attachments);
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsSelectingAttachments(false);
     }
   }
 
@@ -9810,7 +9811,7 @@ export function App() {
     (messageId: string) => void handleGuideQueuedMessage(messageId),
   );
   const handleSelectDraftAttachmentsForChatPanel = useStableCallback(
-    (files: File[]) => void handleSelectDraftAttachments(files),
+    () => handleSelectDraftAttachments(),
   );
   const handleCancelRunForChatPanel = useStableCallback(
     () => void handleCancelRun(),
@@ -10118,11 +10119,9 @@ export function App() {
                   agentDefinitionsError={agentDefinitionsError}
                   defaultAgentRolePrompts={defaultAgentRolePrompts}
                   canLogout={canLogout}
-                  canUseNativePicker={canUseNativePicker}
                   activeWorkspaceId={activeWorkspace?.id ?? activeWorkspaceId ?? null}
                   activeSection={settingsSection}
                   isLoadingAgentDefinitions={isLoadingAgentDefinitions}
-                  nativeBrowserToken={nativeBrowserToken}
                   onAddWorkspace={openWorkspaceDialog}
                   onActiveSectionChange={openSettingsSection}
                   onCreateAgentDefinition={createAgentDefinition}
@@ -10802,7 +10801,6 @@ export function App() {
                     activeRunInfo.runId !== null &&
                     activeRunInfo.acceptingGuidance
                   }
-                  canUseNativePicker={canUseNativePicker}
                   draftAttachments={draftAttachments}
                   draftMessage={draftMessage}
                   draftUnsupportedAttachmentMessage={unsupportedDraftAttachmentMessage}
@@ -11030,13 +11028,10 @@ export function App() {
         )}
         {isWorkspaceDialogOpen ? (
           <WorkspaceDialog
-            canUseNativePicker={canUseNativePicker}
             iconDraft={workspaceIconDraft}
-            iconInputRef={workspaceIconInputRef}
             inlineServerHost={inlineRemoteServerHost}
             inlineServerName={inlineRemoteServerName}
             isCreatingInlineServer={isCreatingInlineRemoteServer}
-            isSelectingPath={isSelectingWorkspacePath}
             isSaving={isSavingWorkspace}
             isTestingConnection={isTestingWorkspaceConnection}
             mode={workspaceMode}
@@ -11044,7 +11039,6 @@ export function App() {
             onClearIcon={clearWorkspaceIconDraft}
             onClose={closeWorkspaceDialog}
             onCreateInlineServer={() => void createInlineRemoteServer()}
-            onIconFileChange={handleWorkspaceIconFileChange}
             onInlineServerHostChange={setInlineRemoteServerHost}
             onInlineServerNameChange={setInlineRemoteServerName}
             onModeChange={(nextMode) => {
@@ -11057,6 +11051,7 @@ export function App() {
             onNameChange={setWorkspaceName}
             onPathChange={workspaceMode === "ssh" ? setWorkspaceRemotePath : setWorkspacePath}
             onSelectPath={handleSelectWorkspacePath}
+            onSelectIcon={handleSelectWorkspaceIcon}
             onServerChange={setWorkspaceRemoteServer}
             onSpecEnabledChange={setWorkspaceSpecEnabled}
             onSubmit={handleWorkspaceSubmit}
@@ -11068,6 +11063,23 @@ export function App() {
             specEnabled={workspaceSpecEnabled}
             terminalShell={workspaceTerminalShell}
             testStages={workspaceTestStages}
+          />
+        ) : null}
+        {filePickerRequest ? (
+          <FilePickerDialog
+            initialPath={filePickerRequest.initialPath}
+            mode={filePickerRequest.mode}
+            multiple={filePickerRequest.multiple}
+            open={true}
+            readFiles={filePickerRequest.readFiles}
+            target={filePickerRequest.target}
+            title={filePickerRequest.title}
+            t={t}
+            onClose={() => setFilePickerRequest(null)}
+            onSelect={(selection) => {
+              setFilePickerRequest(null);
+              filePickerRequest.onSelect(selection);
+            }}
           />
         ) : null}
         {isBranchDialogOpen ? (
@@ -15339,16 +15351,6 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-
-
-function nativePickerRequestInit(nativeBrowserToken: string): RequestInit {
-  return {
-    body: JSON.stringify({ nativeBrowserToken }),
-    headers: { "Content-Type": "application/json" },
-    method: "POST",
-  };
-}
-
 function localRandomId(fallbackPrefix?: string) {
   const randomUUID = globalThis.crypto?.randomUUID;
   if (randomUUID) {
@@ -15367,74 +15369,4 @@ function requiredRandomUuid(label: string) {
   }
 
   return randomUUID.call(globalThis.crypto);
-}
-
-function createNativeBrowserToken() {
-  return requiredRandomUuid("native browser token").replace(/[^A-Za-z0-9_-]/g, "-");
-}
-
-function probeNativeBrowser(port: number, token: string): Promise<boolean> {
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    return Promise.resolve(false);
-  }
-
-  const query = `token=${encodeURIComponent(token)}&t=${Date.now()}`;
-  const urls = [
-    `http://127.0.0.1:${port}/api/native/browser-probe.svg?${query}`,
-    `http://localhost:${port}/api/native/browser-probe.svg?${query}`,
-    `http://[::1]:${port}/api/native/browser-probe.svg?${query}`,
-  ];
-
-  return new Promise((resolve) => {
-    let pending = urls.length;
-    let resolved = false;
-
-    const finish = (available: boolean) => {
-      if (resolved) {
-        return;
-      }
-      if (available) {
-        resolved = true;
-        resolve(true);
-        return;
-      }
-
-      pending -= 1;
-      if (pending === 0) {
-        resolved = true;
-        resolve(false);
-      }
-    };
-
-    for (const url of urls) {
-      void loadNativeProbeImage(url).then(finish);
-    }
-  });
-}
-
-function loadNativeProbeImage(url: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const image = new Image();
-    let settled = false;
-    const timeoutId = window.setTimeout(() => finish(false), 1500);
-
-    function finish(available: boolean) {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      window.clearTimeout(timeoutId);
-      image.onload = null;
-      image.onerror = null;
-      if (!available) {
-        image.src = "";
-      }
-      resolve(available);
-    }
-
-    image.onload = () => finish(true);
-    image.onerror = () => finish(false);
-    image.src = url;
-  });
 }

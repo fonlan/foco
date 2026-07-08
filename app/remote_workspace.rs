@@ -897,6 +897,14 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             post(remote_sidecar_file_rename),
         )
         .route(
+            "/api/remote/workspace/file-picker/list",
+            post(crate::http::file_picker::remote_sidecar_file_picker_list),
+        )
+        .route(
+            "/api/remote/workspace/file-picker/read-files",
+            post(crate::http::file_picker::remote_sidecar_file_picker_read_files),
+        )
+        .route(
             "/api/remote/workspace/memory",
             get(remote_sidecar_memory_list),
         )
@@ -1219,7 +1227,7 @@ fn remote_sidecar_remove_active_run(state: &RemoteSidecarState, run_id: &str) {
 }
 
 #[derive(Clone)]
-struct RemoteSidecarState {
+pub(crate) struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
     code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
@@ -1230,7 +1238,7 @@ struct RemoteSidecarState {
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     workspace_id: String,
-    workspace_path: String,
+    pub(crate) workspace_path: String,
 }
 
 /// Bearer token middleware for all sidecar HTTP routes.
@@ -1480,6 +1488,49 @@ async fn detect_or_cached_target(
     }
     normalize_target(&String::from_utf8_lossy(&output.stdout))
         .map_err(|message| remote_error(server_id, workspace_id, message))
+}
+
+pub(crate) async fn run_remote_file_picker_command(
+    state: &AppState,
+    server_id: &str,
+    command: &str,
+    payload: Value,
+) -> Result<Value, ApiError> {
+    if !matches!(
+        command,
+        crate::http::file_picker::FILE_PICKER_LIST_COMMAND
+            | crate::http::file_picker::FILE_PICKER_READ_FILES_COMMAND
+    ) {
+        return Err(ApiError::bad_request(
+            "unsupported remote file picker command",
+        ));
+    }
+    let config = config_snapshot(state)?;
+    let server = config
+        .remote_servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .cloned()
+        .ok_or_else(|| remote_error(server_id, None, "remote server was not found"))?;
+    let target = detect_or_cached_target(&server, server_id, None).await?;
+    let sidecar_command = ensure_sidecar_command(state, &server, server_id, None, &target).await?;
+    let script = format!("{sidecar_command} {}", shell_quote(command));
+    let input = serde_json::to_vec(&payload).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize remote file picker payload: {source}"
+        ))
+    })?;
+    let output = run_ssh_with_stdin(&server, &[script.as_str()], &input, server_id, None).await?;
+    if !output.status.success() {
+        return Err(remote_error(
+            server_id,
+            None,
+            format!("remote file picker failed: {}", output_text(&output)),
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|source| {
+        ApiError::bad_gateway(format!("invalid remote file picker response: {source}"))
+    })
 }
 
 async fn ensure_sidecar_command(

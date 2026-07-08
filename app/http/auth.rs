@@ -45,7 +45,6 @@ fn auth_route_is_public(path: &str) -> bool {
         || path == "/api/auth/status"
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
-        || path == "/api/native/browser-probe.svg"
         || !path.starts_with("/api/")
 }
 

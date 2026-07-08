@@ -67,6 +67,8 @@ import type {
   ConfiguredSkillSummary,
   ConfiguredWorkspaceSummary,
   EffectiveHookSummary,
+  FilePickerMode,
+  FilePickerTarget,
   GeneralFormState,
   HookConfig,
   HookHandler,
@@ -105,7 +107,6 @@ import type {
   ModelFormState,
   ModelMetadataRecord,
   ModelMetadataResponse,
-  NativeSelectedFile,
   Plan,
   PlanResponse,
   PlansResponse,
@@ -163,6 +164,7 @@ import {
   type VerticalTouchDragState,
 } from "../../shared/scroll-forwarding";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
+import { FilePickerDialog, type FilePickerSelection } from "../file-picker/FilePickerDialog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
 import {
   moveItemId,
@@ -179,6 +181,15 @@ type ProviderModelListState = {
 type UpdateConfirmState = {
   status: UpdateStatusSummary;
   source: "check" | "install";
+};
+
+type SettingsFilePickerRequest = {
+  initialPath?: string | null;
+  mode: FilePickerMode;
+  multiple?: boolean;
+  target: FilePickerTarget;
+  title: string;
+  onSelect: (selection: FilePickerSelection[]) => void;
 };
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
@@ -354,9 +365,7 @@ export function SettingsPanel({
   agentDefinitionsError,
   defaultAgentRolePrompts,
   canLogout,
-  canUseNativePicker,
   isLoadingAgentDefinitions,
-  nativeBrowserToken,
   onAddWorkspace,
   onActiveSectionChange,
   onCreateAgentDefinition,
@@ -375,9 +384,7 @@ export function SettingsPanel({
   agentDefinitionsError: string | null;
   defaultAgentRolePrompts: Record<string, string>;
   canLogout: boolean;
-  canUseNativePicker: boolean;
   isLoadingAgentDefinitions: boolean;
-  nativeBrowserToken: string | null;
   onAddWorkspace: () => void;
   onActiveSectionChange: (section: SettingsSection) => void;
   onCreateAgentDefinition: (definition: AgentDefinitionInput) => Promise<boolean>;
@@ -488,6 +495,8 @@ export function SettingsPanel({
   const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
     emptyWorkspaceForm(),
   );
+  const [settingsFilePickerRequest, setSettingsFilePickerRequest] =
+    useState<SettingsFilePickerRequest | null>(null);
   const [isLoadingWorkspaceSpecSettings, setIsLoadingWorkspaceSpecSettings] =
     useState(false);
   const [isWorkspaceSpecSettingsLoaded, setIsWorkspaceSpecSettingsLoaded] =
@@ -2389,41 +2398,25 @@ export function SettingsPanel({
     }));
   }
 
-  async function selectPromptFile() {
-    if (!nativeBrowserToken) {
-      setError(
-        t(
-          "Native file browsing is only available from a browser running on the Foco computer.",
-        ),
-      );
-      return;
-    }
-
+  function selectPromptFile() {
     setIsSelectingPromptFile(true);
-    setError(null);
-
-    try {
-      const data = await requestJson<{ files: NativeSelectedFile[] }>(
-        "/api/native/select-files",
-        nativePickerRequestInit(nativeBrowserToken),
-      );
-      setPromptSettingsForm((current) => {
-        const files = [...current.files];
-        for (const file of data.files) {
-          if (!files.includes(file.path)) {
-            files.push(file.path);
+    setSettingsFilePickerRequest({
+      mode: "file",
+      multiple: true,
+      target: { kind: "local" },
+      title: t("Select prompt file"),
+      onSelect: (selection) => {
+        setPromptSettingsForm((current) => {
+          const files = [...current.files];
+          for (const item of selection) {
+            if (!files.includes(item.path)) {
+              files.push(item.path);
+            }
           }
-        }
-        return {
-          ...current,
-          files,
-        };
-      });
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsSelectingPromptFile(false);
-    }
+          return { ...current, files };
+        });
+      },
+    });
   }
 
   async function clearBrowserPassword() {
@@ -3363,39 +3356,28 @@ export function SettingsPanel({
     }
   }
 
-  async function selectWorkspaceFormPath() {
-    if (!nativeBrowserToken) {
-      setError(
-        t(
-          "Native file browsing is only available from a browser running on the Foco computer.",
-        ),
-      );
-      return;
-    }
-
+  function selectWorkspaceFormPath() {
     setIsSelectingWorkspaceFormPath(true);
-    setError(null);
-
-    try {
-      const data = await requestJson<{ path: string | null }>(
-        "/api/native/select-directory",
-        nativePickerRequestInit(nativeBrowserToken),
-      );
-
-      if (data.path) {
+    setSettingsFilePickerRequest({
+      initialPath: workspaceForm.path,
+      mode: "directory",
+      target: workspaceForm.serverId
+        ? { kind: "remoteServer", serverId: workspaceForm.serverId }
+        : { kind: "local" },
+      title: t("Choose workspace path"),
+      onSelect: (selection) => {
+        const selectedPath = selection[0]?.path;
+        if (!selectedPath) {
+          return;
+        }
         setWorkspaceForm((current) => ({
           ...current,
-          name: current.name.trim()
-            ? current.name
-            : workspaceNameFromPath(data.path ?? ""),
-          path: data.path ?? current.path,
+          name: current.name.trim() ? current.name : workspaceNameFromPath(selectedPath),
+          path: selectedPath,
+          remotePath: current.serverId ? selectedPath : current.remotePath,
         }));
-      }
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsSelectingWorkspaceFormPath(false);
-    }
+      },
+    });
   }
 
   async function saveWorkspaceLogo(contentBase64: string) {
@@ -5460,13 +5442,9 @@ export function SettingsPanel({
                       <button
                         aria-label={t("Choose prompt file")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                        disabled={isSelectingPromptFile || !canUseNativePicker}
-                        onClick={() => void selectPromptFile()}
-                        title={
-                          canUseNativePicker
-                            ? t("Choose prompt file")
-                            : t("Local Foco browser required")
-                        }
+                        disabled={isSelectingPromptFile}
+                        onClick={selectPromptFile}
+                        title={t("Choose prompt file")}
                         type="button"
                       >
                         {isSelectingPromptFile ? (
@@ -8006,13 +7984,9 @@ export function SettingsPanel({
                           <button
                             aria-label={t("Choose workspace path")}
                             className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                            disabled={isSelectingWorkspaceFormPath || !canUseNativePicker}
-                            onClick={() => void selectWorkspaceFormPath()}
-                            title={
-                              canUseNativePicker
-                                ? t("Choose workspace path")
-                                : t("Local Foco browser required")
-                            }
+                            disabled={isSelectingWorkspaceFormPath}
+                            onClick={selectWorkspaceFormPath}
+                            title={t("Choose workspace path")}
                             type="button"
                           >
                             {isSelectingWorkspaceFormPath ? (
@@ -11416,6 +11390,29 @@ export function SettingsPanel({
                   </dl>
                 </div>
               </section>
+              {settingsFilePickerRequest ? (
+                <FilePickerDialog
+                  initialPath={settingsFilePickerRequest.initialPath}
+                  mode={settingsFilePickerRequest.mode}
+                  multiple={settingsFilePickerRequest.multiple}
+                  open={true}
+                  target={settingsFilePickerRequest.target}
+                  title={settingsFilePickerRequest.title}
+                  t={t}
+                  onClose={() => {
+                    setSettingsFilePickerRequest(null);
+                    setIsSelectingPromptFile(false);
+                    setIsSelectingWorkspaceFormPath(false);
+                  }}
+                  onSelect={(selection) => {
+                    const request = settingsFilePickerRequest;
+                    setSettingsFilePickerRequest(null);
+                    setIsSelectingPromptFile(false);
+                    setIsSelectingWorkspaceFormPath(false);
+                    request.onSelect(selection);
+                  }}
+                />
+              ) : null}
               {updateConfirm ? (
                 <>
                   <button
@@ -13819,12 +13816,4 @@ function isJsonValue(value: unknown): value is JsonValue {
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function nativePickerRequestInit(nativeBrowserToken: string): RequestInit {
-  return {
-    body: JSON.stringify({ nativeBrowserToken }),
-    headers: { "Content-Type": "application/json" },
-    method: "POST",
-  };
 }

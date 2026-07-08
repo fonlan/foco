@@ -171,7 +171,6 @@ function ChatPanelComponent({
   chatScrollKey,
   canGuideActiveRun,
   canRetryRun,
-  canUseNativePicker,
   contextUsage,
   draftAttachments,
   draftMessage,
@@ -232,7 +231,6 @@ function ChatPanelComponent({
   chatScrollKey: string;
   canGuideActiveRun: boolean;
   canRetryRun: boolean;
-  canUseNativePicker: boolean;
   contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
@@ -267,7 +265,7 @@ function ChatPanelComponent({
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
-  onSelectAttachments: (files: File[]) => void;
+  onSelectAttachments: () => void;
   onSubmit: (
     event: FormEvent<HTMLFormElement>,
     options?: { schedule?: boolean },
@@ -381,7 +379,6 @@ function ChatPanelComponent({
       }),
     [selectedSkillSet, skillQuery, skills],
   );
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
   const runningButtonSendsMessage = isSendingMessage && hasComposerDraft;
   const runningButtonLabel = runningButtonSendsMessage
@@ -923,24 +920,11 @@ function ChatPanelComponent({
               className={`message-composer-control-row ${canRetryRun ? "message-composer-actions-with-retry" : ""
                 }`}
             >
-              <input
-                ref={fileInputRef}
-                aria-hidden="true"
-                className="sr-only"
-                multiple
-                tabIndex={-1}
-                type="file"
-                onChange={(event) => {
-                  const files = Array.from(event.currentTarget.files ?? []);
-                  event.currentTarget.value = "";
-                  onSelectAttachments(files);
-                }}
-              />
               <button
                 aria-label={t("Add attachment")}
                 className="composer-tool-button"
                 disabled={isSelectingAttachments}
-                onClick={() => fileInputRef.current?.click()}
+                onClick={onSelectAttachments}
                 title={t("Add attachment")}
                 type="button"
               >
