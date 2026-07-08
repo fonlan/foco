@@ -1700,6 +1700,8 @@ struct ChatMessageSummary {
     content: String,
     created_at: String,
     reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
     session_mode: Option<String>,
     pending_mode: Option<String>,
     queued_run: Option<QueuedMessageRunSummary>,
@@ -8734,6 +8736,16 @@ fn assistant_reasoning_from_metadata(metadata_json: &str) -> Result<Option<Strin
     Ok(non_empty_string(reasoning))
 }
 
+fn assistant_status_from_metadata(metadata_json: &str) -> Result<Option<String>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    Ok(
+        match metadata.get("streamingState").and_then(Value::as_str) {
+            Some("streaming") => Some("streaming".to_string()),
+            _ => None,
+        },
+    )
+}
+
 fn assistant_memories_used_from_metadata(
     metadata_json: &str,
 ) -> Result<Vec<ChatMemoryUsedSummary>, ApiError> {
@@ -10095,6 +10107,11 @@ fn chat_message_summaries_for_chat(
         } else {
             None
         };
+        let status = if is_assistant_message {
+            assistant_status_from_metadata(&message.metadata_json)?
+        } else {
+            None
+        };
         let memories_used = if is_assistant_message {
             assistant_memories_used_from_metadata(&message.metadata_json)?
         } else {
@@ -10140,6 +10157,7 @@ fn chat_message_summaries_for_chat(
             content: message.content,
             created_at: message.created_at,
             reasoning,
+            status,
             session_mode,
             pending_mode,
             queued_run,

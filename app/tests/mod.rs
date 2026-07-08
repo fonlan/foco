@@ -6342,6 +6342,7 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
         matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think two.")
     );
     assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
+    assert_eq!(summary.status.as_deref(), Some("streaming"));
 
     let saved = database
         .message("assistant-1")
@@ -6361,6 +6362,26 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn assistant_status_from_metadata_only_exposes_streaming() {
+    assert_eq!(
+        assistant_status_from_metadata(r#"{"streamingState":"streaming"}"#)
+            .expect("streaming metadata")
+            .as_deref(),
+        Some("streaming"),
+    );
+    assert!(
+        assistant_status_from_metadata(r#"{"streamingState":"complete"}"#)
+            .expect("complete metadata")
+            .is_none()
+    );
+    assert!(
+        assistant_status_from_metadata(r#"{"streamingState":"failed"}"#)
+            .expect("failed metadata")
+            .is_none()
+    );
 }
 
 #[test]

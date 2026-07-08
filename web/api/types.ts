@@ -550,6 +550,7 @@ export type ChatMessageSummary = {
   content: string;
   createdAt: string;
   reasoning: string | null;
+  status?: "error" | "streaming";
   sessionMode?: "plan" | null;
   pendingMode?: "guidance" | "queued";
   queuedRun?: QueuedMessageRunSummary | null;

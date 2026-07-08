@@ -14950,7 +14950,11 @@ function normalizeActiveChatRunSummary(
   };
 }
 
-function normalizeChatMessageSummary(
+function normalizeChatMessageStatus(value: unknown): "error" | "streaming" | undefined {
+  return value === "error" || value === "streaming" ? value : undefined;
+}
+
+export function normalizeChatMessageSummary(
   message: ChatMessageSummary,
 ): ChatMessageSummary {
   const metrics = parseOptionalChatReplyMetrics(message.metrics);
@@ -14988,6 +14992,7 @@ function normalizeChatMessageSummary(
   const rawSessionMode = fieldValue(message, "sessionMode", "session_mode");
   const sessionMode: "plan" | null =
     rawSessionMode === "plan" ? "plan" : null;
+  const status = normalizeChatMessageStatus(fieldValue(message, "status"));
   const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
   const normalizedMessage = {
     ...message,
@@ -14998,6 +15003,7 @@ function normalizeChatMessageSummary(
     queuedRun,
     runBadges: [],
     sessionMode,
+    status,
     specUpdates,
     toolCalls,
     parts,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, mergeLoadedMessagesWithStreamingPlaceholders, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ActiveChatRunSummary, ActiveRunInfo, ShellMessage } from "./api/types";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import type { ActiveChatRunSummary, ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
   return {
@@ -105,6 +105,22 @@ describe("trimInactiveChatMessageCaches", () => {
     expect(result.messagesByKey["chat-3"]).toBe(messagesByKey["chat-3"]);
     expect(result.messagesByKey["chat-5"]).toBe(messagesByKey["chat-5"]);
     expect(result.messagesByKey["chat-6"]).toBe(messagesByKey["chat-6"]);
+  });
+});
+
+describe("normalizeChatMessageSummary", () => {
+  function summary(status: unknown): ChatMessageSummary {
+    return {
+      ...message("assistant-1"),
+      status: status as ChatMessageSummary["status"],
+    };
+  }
+
+  it("keeps only UI-supported loaded message statuses", () => {
+    expect(normalizeChatMessageSummary(summary("streaming")).status).toBe("streaming");
+    expect(normalizeChatMessageSummary(summary("error")).status).toBe("error");
+    expect(normalizeChatMessageSummary(summary("complete")).status).toBeUndefined();
+    expect(normalizeChatMessageSummary(summary(null)).status).toBeUndefined();
   });
 });
 
