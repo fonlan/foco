@@ -851,6 +851,36 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
   );
 }
 
+async function workspaceSummariesWithRemoteChats(
+  workspaces: WorkspaceSummary[],
+): Promise<WorkspaceSummary[]> {
+  return Promise.all(
+    workspaces.map(async (workspace) => {
+      if (!workspace.serverId) {
+        return workspace;
+      }
+      try {
+        const params = new URLSearchParams({ limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE) });
+        const data = await requestJson<WorkspaceChatsResponse>(
+          `/api/workspaces/${encodeURIComponent(workspace.id)}/chats?${params.toString()}`,
+        );
+        return {
+          ...workspace,
+          chatPagination: {
+            hasMore: data.hasMore,
+            limit: data.limit,
+            nextCursor: data.nextCursor,
+            total: data.total,
+          },
+          chats: data.chats,
+        };
+      } catch {
+        return workspace;
+      }
+    }),
+  );
+}
+
 function workspaceChatPagingFromWorkspaces(
   workspaces: WorkspaceSummary[],
 ): WorkspaceChatPagingState {
@@ -1972,16 +2002,17 @@ export function App() {
 
     try {
       const data = await requestJson<WorkspacesResponse>("/api/workspaces");
-      setWorkspaces(data.workspaces);
-      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
+      const workspacesWithRemoteChats = await workspaceSummariesWithRemoteChats(data.workspaces);
+      setWorkspaces(workspacesWithRemoteChats);
+      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(workspacesWithRemoteChats));
       setActiveWorkspaceId((current) =>
-        data.workspaces.some((workspace) => workspace.id === current)
+        workspacesWithRemoteChats.some((workspace) => workspace.id === current)
           ? current
           : data.activeWorkspaceId,
       );
       setExpandedWorkspaceId((current) =>
         current !== null &&
-          data.workspaces.some((workspace) => workspace.id === current)
+          workspacesWithRemoteChats.some((workspace) => workspace.id === current)
           ? current
           : data.activeWorkspaceId,
       );
@@ -13956,6 +13987,10 @@ function readSseFrames(
 function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
   if (!isObjectRecord(value) || typeof value.type !== "string") {
     return null;
+  }
+
+  if (isObjectRecord(value.value) && typeof value.value.type !== "string") {
+    return parseChatStreamEvent({ ...value.value, type: value.type });
   }
 
   if (value.type === "start") {

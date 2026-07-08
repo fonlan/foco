@@ -4005,6 +4005,36 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
     }
 }
 
+fn remote_chat_completion_event(
+    chat_id: &str,
+    assistant_message_id: &str,
+    text: &str,
+    reasoning: Option<&str>,
+    usage: Value,
+    model_id: &str,
+    provider_id: &str,
+    run_id: &str,
+) -> Value {
+    json!({
+        "type": "complete",
+        "chatId": chat_id,
+        "assistantMessageId": assistant_message_id,
+        "text": text,
+        "reasoning": reasoning,
+        "usage": usage,
+        "stopReason": null,
+        "metrics": {
+            "modelId": model_id,
+            "providerId": provider_id,
+            "totalLatencyMs": null,
+            "firstTokenLatencyMs": null,
+            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
+            "llmRequestIds": [run_id],
+        },
+        "memoriesUsed": [],
+    })
+}
+
 async fn remote_sidecar_chat_stream(
     State(state): State<RemoteSidecarState>,
     Json(payload): Json<Value>,
@@ -4166,26 +4196,26 @@ async fn remote_sidecar_chat_stream(
                         sequence: assistant_sequence,
                         metadata_json: Some(&metadata.to_string()),
                     });
+                    let completion_payload = remote_chat_completion_event(
+                        &chat_id,
+                        &assistant_message_id,
+                        &text,
+                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                        envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                        &model_id,
+                        &provider_id,
+                        &run_id,
+                    );
                     let _ = database.insert_run_event(NewRunEvent {
                         id: &unique_id("run-event"),
                         chat_id: &chat_id,
                         run_id: &run_id,
                         sequence,
                         event_type: "completion",
-                        payload_json: &json!({ "type": "complete", "chatId": chat_id, "assistantMessageId": assistant_message_id }).to_string(),
+                        payload_json: &completion_payload.to_string(),
                     });
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({
-                        "type": "complete",
-                        "chatId": chat_id,
-                        "assistantMessageId": assistant_message_id,
-                        "text": text,
-                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                        "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
-                        "stopReason": null,
-                        "metrics": { "startedAt": null, "completedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true), "durationMs": null },
-                        "memoriesUsed": [],
-                    })));
+                    yield Ok(remote_sse_json_event(sequence, completion_payload));
                     sequence += 1;
                     yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
                     break;
@@ -5685,6 +5715,32 @@ mod tests {
             remote_idempotency_key(&json!({ "idempotencyKey": "client-key" }), "fallback"),
             "client-key"
         );
+    }
+
+    #[test]
+    fn remote_chat_completion_event_matches_frontend_stream_shape() {
+        let event = remote_chat_completion_event(
+            "chat-1",
+            "msg-assistant-1",
+            "done",
+            None,
+            json!({
+                "inputTokens": 10,
+                "outputTokens": 3,
+                "cacheReadTokens": null,
+                "cacheWriteTokens": null,
+            }),
+            "model-1",
+            "provider-1",
+            "run-1",
+        );
+
+        assert_eq!(event["type"], "complete");
+        assert!(event.get("value").is_none());
+        assert_eq!(event["chatId"], "chat-1");
+        assert_eq!(event["metrics"]["modelId"], "model-1");
+        assert_eq!(event["metrics"]["providerId"], "provider-1");
+        assert_eq!(event["metrics"]["outputTokens"], 3);
     }
 
     #[tokio::test]
