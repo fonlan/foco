@@ -90,7 +90,8 @@ use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
     LlmContextCompressionMode, compress_all_runtime_tool_state,
     compress_runtime_tool_state_if_needed, context_message_groups, context_token_breakdown,
-    context_usage_segments, context_usage_segments_total, llm_context_compression_group_indices,
+    context_usage_segments, context_usage_segments_total, ensure_context_compression,
+    llm_context_compression_group_indices,
 };
 use crate::runtime::{
     QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
@@ -4298,6 +4299,50 @@ fn runtime_tool_state_compression_uses_total_context_threshold() {
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
+#[tokio::test]
+async fn context_compression_runtime_tool_state_events_precede_llm_events() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-context-compression-event-order-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        8,
+    );
+    context.context_budget.context_window = 1_000;
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    for batch_index in 0..4 {
+        append_test_runtime_tool_batch(&mut context, batch_index, 1_200);
+    }
+
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!(total_used_context_tokens >= 950);
+
+    let result = ensure_context_compression(&mut context)
+        .await
+        .expect("runtime compression should succeed without llm work");
+
+    assert!(result.runtime_tool_state_compressed);
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .map(|detail| (detail.kind.as_str(), detail.status.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("runtimeToolState", "start"),
+            ("runtimeToolState", "completed"),
+        ]
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
 
 #[tokio::test]
 async fn ensure_context_compression_skips_rule_snapshots_below_llm_threshold() {
@@ -4398,6 +4443,60 @@ fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
         ),
         vec![1, 2, 3]
     );
+}
+
+#[tokio::test]
+async fn ensure_context_compression_required_overflow_adds_runtime_events_before_llm_attempt() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-required-overflow-runtime-events-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        1,
+    );
+    context.context_budget.context_window = 10_000;
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    for batch_index in 0..4 {
+        append_test_runtime_tool_batch(&mut context, batch_index, 600);
+    }
+
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )
+    .expect("context groups");
+    let breakdown = context_token_breakdown(&message_groups);
+    assert!(breakdown.required_tokens > context.context_budget.available_message_tokens);
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!(total_used_context_tokens < 9_500);
+
+    let result = ensure_context_compression(&mut context)
+        .await
+        .expect("forced runtime compression should not require llm when overflow resolves");
+
+    assert!(result.runtime_tool_state_compressed);
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .map(|detail| (detail.kind.as_str(), detail.status.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("runtimeToolState", "start"),
+            ("runtimeToolState", "completed"),
+        ]
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[tokio::test]

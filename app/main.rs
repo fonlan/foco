@@ -2744,32 +2744,6 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             yield event;
                         }
-                        if compression_result.runtime_tool_state_compressed {
-                            let started_at = utc_timestamp();
-                            let completed_at = utc_timestamp();
-                            for status in ["start", "completed"] {
-                                let detail = ContextCompressionEventDetail {
-                                    status: status.to_string(),
-                                    kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
-                                    snapshot_id: None,
-                                    original_token_count: None,
-                                    summary_token_count: None,
-                                    started_at: Some(started_at.clone()),
-                                    completed_at: (status == "completed").then(|| completed_at.clone()),
-                                    provider_id: self.provider_id.clone(),
-                                    model_id: self.model_id.clone(),
-                                };
-                                let event = ChatSseEvent::ContextCompression {
-                                    assistant_message_id: self.assistant_message_id.clone(),
-                                    snapshot_id: None,
-                                    kind: detail.kind.clone(),
-                                    status: detail.status.clone(),
-                                    detail: Some(detail),
-                                };
-                                events.push(captured_event(&event));
-                                yield event;
-                            }
-                        }
                         let packed_messages = match pack_neutral_messages(
                             self.provider_request.messages.clone(),
                             &self.message_source_sequences,

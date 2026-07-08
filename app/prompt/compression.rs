@@ -105,8 +105,9 @@ pub(crate) async fn ensure_context_compression(
         &context.message_context_sources,
     )?;
 
-    let mut runtime_tool_state_compressed = compress_runtime_tool_state_if_needed(context, false)?;
     let mut events = Vec::new();
+    let mut runtime_tool_state_compressed =
+        compress_runtime_tool_state_with_events_if_needed(context, false, &mut events)?;
 
     let mut message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -136,7 +137,8 @@ pub(crate) async fn ensure_context_compression(
     let mut breakdown = context_token_breakdown(&message_groups);
     if breakdown.required_tokens > context.context_budget.available_message_tokens {
         if !runtime_tool_state_compressed {
-            runtime_tool_state_compressed |= compress_runtime_tool_state_if_needed(context, true)?;
+            runtime_tool_state_compressed |=
+                compress_runtime_tool_state_with_events_if_needed(context, true, &mut events)?;
         }
         message_groups = context_message_groups(
             &context.provider_request.messages,
@@ -190,6 +192,40 @@ fn context_compression_event_detail(
         provider_id: context.provider_id.clone(),
         model_id: context.model_id.clone(),
     }
+}
+
+fn compress_runtime_tool_state_with_events_if_needed(
+    context: &mut PreparedChatContext,
+    force: bool,
+    events: &mut Vec<ContextCompressionEventDetail>,
+) -> Result<bool, ApiError> {
+    let compression_started_at = utc_timestamp();
+    let compressed = compress_runtime_tool_state_if_needed(context, force)?;
+    if !compressed {
+        return Ok(false);
+    }
+
+    events.push(context_compression_event_detail(
+        "start",
+        CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+        None,
+        None,
+        None,
+        Some(compression_started_at.clone()),
+        None,
+        context,
+    ));
+    events.push(context_compression_event_detail(
+        "completed",
+        CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+        None,
+        None,
+        None,
+        Some(compression_started_at),
+        Some(utc_timestamp()),
+        context,
+    ));
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]
