@@ -152,6 +152,7 @@ export type ChatPanelHelpers = {
   formatFileSize: (sizeBytes: number) => string;
   formatJsonValue: (value: JsonValue) => string;
   formatNullableLatencySeconds: (value: number | null, language: string) => string;
+  formatReplyDuration: (value: number | null, language: string) => string;
   formatTokensPerSecond: (metrics: ChatReplyMetrics, language: string) => string;
   messageCopyText: (message: ShellMessage, parts: ChatMessagePart[]) => string;
   removeActiveSkillToken: (value: string) => string;
@@ -1978,20 +1979,13 @@ function ChatReplyMetricsLine({
   metrics: ChatReplyMetrics;
   onOpenApiRequests: (() => void) | null;
 }) {
-  const { formatNullableLatencySeconds, formatTokensPerSecond } = helpers;
+  const { formatReplyDuration, formatTokensPerSecond } = helpers;
   const { language, t } = useI18n();
   const values = [
     `${t("Model")}: ${metrics.modelId}`,
     `${t("Channel")}: ${metrics.providerId}`,
-    `${t("Total time")}: ${formatNullableLatencySeconds(
-      metrics.totalLatencyMs,
-      language,
-    )}`,
+    `${t("Total time")}: ${formatReplyDuration(metrics.totalLatencyMs, language)}`,
     `${t("tokens/s")}: ${formatTokensPerSecond(metrics, language)}`,
-    `${t("First token latency")}: ${formatNullableLatencySeconds(
-      metrics.firstTokenLatencyMs,
-      language,
-    )}`,
   ];
 
   return (

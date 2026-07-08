@@ -1157,16 +1157,14 @@ describe("app-chat-stream verification surfaces", () => {
       within(interruptedAssistantRow as HTMLElement).getByText("Channel: openai"),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText("Total time: 2 s"),
+      within(interruptedAssistantRow as HTMLElement).getByText("Total time: 2 sec"),
     ).toBeInTheDocument();
     expect(
       within(interruptedAssistantRow as HTMLElement).getByText("tokens/s: 5"),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText(
-        "First token latency: 0.25 s",
-      ),
-    ).toBeInTheDocument();
+      within(interruptedAssistantRow as HTMLElement).queryByText(/First token latency/),
+    ).not.toBeInTheDocument();
 
     await act(async () => {
       enqueueChatStreamEvent({

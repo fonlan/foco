@@ -9802,6 +9802,8 @@ export function App() {
       formatJsonValue,
       formatNullableLatencySeconds: (value, nextLanguage) =>
         formatNullableLatencySeconds(value, nextLanguage as AppLanguageId),
+      formatReplyDuration: (value, nextLanguage) =>
+        formatReplyDuration(value, nextLanguage as AppLanguageId),
       formatTokensPerSecond: (metrics, nextLanguage) =>
         formatTokensPerSecond(metrics, nextLanguage as AppLanguageId),
       messageCopyText,
@@ -13716,6 +13718,34 @@ function formatNullableLatencySeconds(
   return `${new Intl.NumberFormat(language, {
     maximumFractionDigits: 2,
   }).format(value / 1000)} s`;
+}
+
+function formatReplyDuration(
+  value: number | null,
+  language: AppLanguageId = "en",
+) {
+  if (value === null) {
+    return "n/a";
+  }
+
+  const roundedMs = Math.max(0, Math.round(value));
+  if (roundedMs < 1000) {
+    return `${new Intl.NumberFormat(language).format(roundedMs)} ms`;
+  }
+
+  const totalSeconds = Math.round(roundedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const format = new Intl.NumberFormat(language);
+  if (language.startsWith("zh")) {
+    return minutes > 0
+      ? `${format.format(minutes)} 分 ${format.format(seconds)} 秒`
+      : `${format.format(seconds)} 秒`;
+  }
+
+  return minutes > 0
+    ? `${format.format(minutes)} min ${format.format(seconds)} sec`
+    : `${format.format(seconds)} sec`;
 }
 
 function formatLatencySeconds(value: number, language: AppLanguageId = "en") {

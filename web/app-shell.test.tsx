@@ -267,9 +267,9 @@ describe("app-shell verification surfaces", () => {
     );
     expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
     expect(screen.getByText("Channel: openai")).toBeInTheDocument();
-    expect(screen.getByText("Total time: 2 s")).toBeInTheDocument();
+    expect(screen.getByText("Total time: 2 sec")).toBeInTheDocument();
     expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
-    expect(screen.getByText("First token latency: 0.25 s")).toBeInTheDocument();
+    expect(screen.queryByText(/First token latency/)).not.toBeInTheDocument();
     const memoriesUsedLabel = within(assistantBubble!).getByText("Memories used");
     const finalAnswer = getAssistantFinalAnswer(assistantBubble!);
     expect(
@@ -390,7 +390,7 @@ describe("app-shell verification surfaces", () => {
       "gpt-test",
     );
     expect(within(assistantBubble).queryByText("Model: gpt-test")).not.toBeInTheDocument();
-    expect(within(assistantBubble).queryByText("Total time: 2 s")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Total time: 2 sec")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("tokens/s: 20")).not.toBeInTheDocument();
     expect(screen.getByText("Need file context. Then answer.")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Memories used")).toBeInTheDocument();
@@ -443,6 +443,39 @@ describe("app-shell verification surfaces", () => {
     }
     expect(within(planBubble).getByText("Plan mode")).toHaveClass("message-run-badge");
     expect(within(normalBubble).queryByText("Plan mode")).not.toBeInTheDocument();
+  });
+
+  it("formats reply total duration human-readably", async () => {
+    const messagesWithLongReplyDuration = {
+      ...chatMessages,
+      messages: chatMessages.messages.map((message) =>
+        message.id === "message-assistant"
+          ? {
+              ...message,
+              metrics: message.metrics
+                ? { ...message.metrics, totalLatencyMs: 72_000 }
+                : message.metrics,
+            }
+          : message,
+      ),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...messagesWithLongReplyDuration, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    expect(await screen.findByText("Total time: 1 min 12 sec")).toBeInTheDocument();
   });
 
   it("keeps the thinking duration visible when reply latency is unavailable", async () => {
@@ -526,6 +559,7 @@ describe("app-shell verification surfaces", () => {
 
     expect(screen.queryByText("network error")).not.toBeInTheDocument();
     expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
+    expect(screen.getByText("Total time: 500 ms")).toBeInTheDocument();
   });
 
   it("shows LLM reconnect and context compression badges in the assistant bubble", async () => {
