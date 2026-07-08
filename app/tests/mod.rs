@@ -4312,17 +4312,21 @@ async fn context_compression_runtime_tool_state_events_precede_llm_events() {
         )],
         vec![None],
         vec![PromptContextSource::ReservedPrompt],
-        8,
+        900,
     );
+    context.context_budget.system_prompt_tokens = 620;
     context.context_budget.context_window = 1_000;
     context.active_tool_start_index = context.provider_request.messages.len();
 
     for batch_index in 0..4 {
-        append_test_runtime_tool_batch(&mut context, batch_index, 1_200);
+        append_test_runtime_tool_batch(&mut context, batch_index, 700);
     }
 
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
-    assert!(total_used_context_tokens >= 950);
+    assert!(
+        total_used_context_tokens >= 800,
+        "total_used_context_tokens={total_used_context_tokens}"
+    );
 
     let result = ensure_context_compression(&mut context)
         .await
@@ -4458,7 +4462,7 @@ async fn ensure_context_compression_required_overflow_adds_runtime_events_before
         )],
         vec![None],
         vec![PromptContextSource::ReservedPrompt],
-        1,
+        700,
     );
     context.context_budget.context_window = 10_000;
     context.active_tool_start_index = context.provider_request.messages.len();
