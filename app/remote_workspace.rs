@@ -3,13 +3,13 @@ use std::{
     convert::Infallible,
     fs, io,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -37,7 +37,9 @@ use foco_store::{
         NewMemorySource,
     },
     workspace::{
-        NewMessage, NewRunEvent, TodoGraphFilter, WorkspaceDatabase, workspace_database_path,
+        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewRunEvent, TodoGraphFilter, UpdateLlmRequestOutcome,
+        WorkspaceDatabase, workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -70,7 +72,6 @@ const SIDECAR_BINARY_NAME: &str = "foco";
 const CONTROL_WS_PATH: &str = "/api/remote/control/ws";
 const SIDECAR_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONTROL_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
-const CONTROL_WS_READ_TIMEOUT: Duration = Duration::from_secs(45);
 const SIDECAR_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 const SIDECAR_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
@@ -153,6 +154,22 @@ type BrokerWsWrite = futures_util::stream::SplitSink<
 >;
 type SharedBrokerWsWrite = Arc<AsyncMutex<BrokerWsWrite>>;
 type BrokerCancelRegistry = Arc<AsyncMutex<HashMap<String, oneshot::Sender<()>>>>;
+
+#[derive(Clone, Debug)]
+struct BrokerLlmAuditContext {
+    audit_path: PathBuf,
+    workspace_id: String,
+    chat_id: Option<String>,
+    chat_title: Option<String>,
+    request_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct BrokerLlmAuditEvent {
+    event_at: String,
+    event_type: String,
+    normalized_event: Value,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1459,6 +1476,33 @@ fn workspace_remote_path(workspace: &WorkspaceConfig, server_id: &str) -> Result
     }
 }
 
+pub(crate) fn workspace_audit_path(
+    profile_dir: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<PathBuf, ApiError> {
+    match workspace.location {
+        WorkspaceLocation::Local => Ok(workspace.path.clone()),
+        WorkspaceLocation::Ssh { .. } => {
+            let path = if workspace.path.as_os_str().is_empty() {
+                profile_dir
+                    .join(".foco")
+                    .join("remote-workspace-audit")
+                    .join(&workspace.id)
+            } else {
+                workspace.path.clone()
+            };
+            // ponytail: keep remote audit local to the main process; if offline remote stats are needed later, sync this DB to the sidecar.
+            fs::create_dir_all(&path).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to create remote workspace audit directory {}: {source}",
+                    path.display()
+                ))
+            })?;
+            Ok(path)
+        }
+    }
+}
+
 async fn detect_or_cached_target(
     server: &RemoteServerProfile,
     server_id: &str,
@@ -1990,18 +2034,10 @@ async fn connect_control_ws(
                                     break;
                                 }
                             }
-                            message = timeout(CONTROL_WS_READ_TIMEOUT, read.next()) => {
+                            message = read.next() => {
                                 let message = match message {
-                                    Ok(Some(message)) => message,
-                                    Ok(None) => break,
-                                    Err(_) => {
-                                        set_session_status(
-                                            &status,
-                                            RemoteConnectionState::Degraded,
-                                            Some("control WebSocket heartbeat timed out".to_string()),
-                                        );
-                                        break;
-                                    }
+                                    Some(message) => message,
+                                    None => break,
                                 };
                                 match message {
                                     Ok(tungstenite::Message::Ping(bytes)) => {
@@ -2187,11 +2223,188 @@ async fn handle_broker_request(
 /// local main dispatches through its own provider config and streams chunks back.
 /// ponytail: v1 does minimal payload validation; wire NeutralChatRequest fields
 /// loosely. Single-tool tool_use is not supported yet — only pure text streams.
+fn broker_llm_audit_context(
+    state: &AppState,
+    fallback_workspace_id: &str,
+    payload: &Value,
+) -> Option<BrokerLlmAuditContext> {
+    let workspace_id = payload
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_workspace_id)
+        .to_string();
+    let config = config_snapshot(state).ok()?;
+    let workspace = workspace_by_id(&config, &workspace_id).ok()?;
+    let audit_path = workspace_audit_path(&state.user_profile_dir, workspace).ok()?;
+    let chat_id = payload
+        .get("chatId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Some(BrokerLlmAuditContext {
+        audit_path,
+        workspace_id,
+        chat_id,
+        chat_title: payload
+            .get("chatTitle")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
+        request_id: payload
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                payload
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .to_string(),
+    })
+    .filter(|context| !context.request_id.is_empty())
+}
+
+fn insert_broker_llm_audit_start(
+    context: &BrokerLlmAuditContext,
+    provider_id: &str,
+    model_id: &str,
+    request_started_at: &str,
+    request_body_json: &str,
+) {
+    if let Err(error) = insert_broker_llm_audit_start_inner(
+        context,
+        provider_id,
+        model_id,
+        request_started_at,
+        request_body_json,
+    ) {
+        tracing::warn!(
+            request_id = %context.request_id,
+            workspace_id = %context.workspace_id,
+            error = %error,
+            "failed to insert brokered remote LLM audit start"
+        );
+    }
+}
+
+fn insert_broker_llm_audit_start_inner(
+    context: &BrokerLlmAuditContext,
+    provider_id: &str,
+    model_id: &str,
+    request_started_at: &str,
+    request_body_json: &str,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create(&context.audit_path)?;
+    if let (Some(chat_id), Some(title)) =
+        (context.chat_id.as_deref(), context.chat_title.as_deref())
+        && database.chat(chat_id)?.is_none()
+    {
+        database.insert_chat_with_metadata(chat_id, title, "{}")?;
+    }
+    if database.llm_request(&context.request_id)?.is_some() {
+        return Ok(());
+    }
+    database.insert_llm_request(NewLlmRequest {
+        id: &context.request_id,
+        workspace_id: &context.workspace_id,
+        chat_id: context.chat_id.as_deref(),
+        request_kind: "chat completion",
+        agent_team_id: None,
+        agent_instance_id: None,
+        agent_task_id: None,
+        agent_attempt_id: None,
+        provider_id,
+        model_id,
+        request_started_at,
+        first_token_at: None,
+        completed_at: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        first_token_latency_ms: None,
+        total_latency_ms: None,
+        status_code: None,
+        final_state: "running",
+        request_body_json: Some(request_body_json),
+        response_body_json: None,
+    })
+}
+
+struct BrokerLlmAuditOutcome<'a> {
+    final_state: &'a str,
+    first_token_at: Option<&'a str>,
+    completed_at: &'a str,
+    usage: Option<&'a NeutralUsage>,
+    first_token_latency_ms: Option<i64>,
+    total_latency_ms: i64,
+    response_body_json: &'a str,
+}
+
+fn finish_broker_llm_audit(
+    context: Option<&BrokerLlmAuditContext>,
+    outcome: BrokerLlmAuditOutcome<'_>,
+    events: &[BrokerLlmAuditEvent],
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if let Err(error) = finish_broker_llm_audit_inner(context, outcome, events) {
+        tracing::warn!(
+            request_id = %context.request_id,
+            workspace_id = %context.workspace_id,
+            error = %error,
+            "failed to finish brokered remote LLM audit"
+        );
+    }
+}
+
+fn finish_broker_llm_audit_inner(
+    context: &BrokerLlmAuditContext,
+    outcome: BrokerLlmAuditOutcome<'_>,
+    events: &[BrokerLlmAuditEvent],
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create(&context.audit_path)?;
+    database.update_llm_request_outcome(
+        &context.request_id,
+        UpdateLlmRequestOutcome {
+            first_token_at: outcome.first_token_at,
+            completed_at: Some(outcome.completed_at),
+            input_tokens: outcome.usage.and_then(|usage| usage.input_tokens),
+            output_tokens: outcome.usage.and_then(|usage| usage.output_tokens),
+            cache_read_tokens: outcome.usage.and_then(|usage| usage.cache_read_tokens),
+            cache_write_tokens: outcome.usage.and_then(|usage| usage.cache_write_tokens),
+            reasoning_tokens: outcome.usage.and_then(|usage| usage.reasoning_tokens),
+            first_token_latency_ms: outcome.first_token_latency_ms,
+            total_latency_ms: Some(outcome.total_latency_ms),
+            status_code: None,
+            final_state: outcome.final_state,
+            response_body_json: Some(outcome.response_body_json),
+        },
+    )?;
+    for (index, event) in events.iter().enumerate() {
+        let normalized_event_json = event.normalized_event.to_string();
+        database.insert_llm_request_event(NewLlmRequestEvent {
+            id: &unique_id("llm-event"),
+            llm_request_id: &context.request_id,
+            sequence: index as i64,
+            event_at: &event.event_at,
+            event_type: &event.event_type,
+            raw_chunk_json: None,
+            normalized_event_json: &normalized_event_json,
+        })?;
+    }
+    Ok(())
+}
+
 async fn broker_llm_stream(
     state: &AppState,
     write: &SharedBrokerWsWrite,
     _server_id: &str,
-    _workspace_id: &str,
+    workspace_id: &str,
     id: &str,
     payload: Value,
     cancel_rx: Option<oneshot::Receiver<()>>,
@@ -2272,10 +2485,53 @@ async fn broker_llm_stream(
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
     };
 
+    let audit_context = broker_llm_audit_context(state, workspace_id, &payload);
+    let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let request_started_instant = Instant::now();
+    let request_body_json = json!({
+        "providerId": provider_id,
+        "modelId": model_id,
+        "request": &request,
+    })
+    .to_string();
+    if let Some(context) = audit_context.as_ref() {
+        insert_broker_llm_audit_start(
+            context,
+            provider_id,
+            model_id,
+            &request_started_at,
+            &request_body_json,
+        );
+    }
+    let mut audit_events = vec![BrokerLlmAuditEvent {
+        event_at: request_started_at.clone(),
+        event_type: "start".to_string(),
+        normalized_event: json!({
+            "type": "start",
+            "providerId": provider_id,
+            "modelId": model_id,
+        }),
+    }];
+
     let mut cancel_rx = cancel_rx;
     let mut stream = match if let Some(cancel_rx) = cancel_rx.as_mut() {
         tokio::select! {
             _ = cancel_rx => {
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: completed_at.clone(),
+                    event_type: "error".to_string(),
+                    normalized_event: json!({ "type": "error", "code": "cancelled", "message": "broker request cancelled" }),
+                });
+                finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
+                    final_state: "failed",
+                    first_token_at: None,
+                    completed_at: &completed_at,
+                    usage: None,
+                    first_token_latency_ms: None,
+                    total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+                    response_body_json: &json!({ "error": { "code": "cancelled", "message": "broker request cancelled" } }).to_string(),
+                }, &audit_events);
                 let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
                 return;
             }
@@ -2286,7 +2542,29 @@ async fn broker_llm_stream(
     } {
         Ok(s) => s,
         Err(e) => {
-            let _ = send_broker_error(write, Some(id), "provider_error", format!("{e}")).await;
+            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let message = format!("{e}");
+            audit_events.push(BrokerLlmAuditEvent {
+                event_at: completed_at.clone(),
+                event_type: "error".to_string(),
+                normalized_event: json!({ "type": "error", "code": "provider_error", "message": message }),
+            });
+            let response_body_json =
+                json!({ "error": { "code": "provider_error", "message": message } }).to_string();
+            finish_broker_llm_audit(
+                audit_context.as_ref(),
+                BrokerLlmAuditOutcome {
+                    final_state: "failed",
+                    first_token_at: None,
+                    completed_at: &completed_at,
+                    usage: None,
+                    first_token_latency_ms: None,
+                    total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+                    response_body_json: &response_body_json,
+                },
+                &audit_events,
+            );
+            let _ = send_broker_error(write, Some(id), "provider_error", message).await;
             return;
         }
     };
@@ -2294,10 +2572,28 @@ async fn broker_llm_stream(
     tracing::info!(%provider_id, %model_id, request_id = %id, "remote sidecar broker llm stream started");
     let mut sequence = 0u64;
     let mut final_usage: Option<NeutralUsage> = None;
+    let mut first_token_at: Option<String> = None;
+    let mut first_token_latency_ms: Option<i64> = None;
     loop {
         let event = match if let Some(cancel_rx) = cancel_rx.as_mut() {
             tokio::select! {
                 _ = cancel_rx => {
+                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    audit_events.push(BrokerLlmAuditEvent {
+                        event_at: completed_at.clone(),
+                        event_type: "error".to_string(),
+                        normalized_event: json!({ "type": "error", "code": "cancelled", "message": "broker request cancelled" }),
+                    });
+                    let response_body_json = json!({ "error": { "code": "cancelled", "message": "broker request cancelled" } }).to_string();
+                    finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
+                        final_state: "failed",
+                        first_token_at: first_token_at.as_deref(),
+                        completed_at: &completed_at,
+                        usage: final_usage.as_ref(),
+                        first_token_latency_ms,
+                        total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+                        response_body_json: &response_body_json,
+                    }, &audit_events);
                     let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
                     return;
                 }
@@ -2308,7 +2604,29 @@ async fn broker_llm_stream(
         } {
             Some(Ok(e)) => e,
             Some(Err(e)) => {
-                let _ = send_broker_error(write, Some(id), "stream_error", format!("{e}")).await;
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let message = format!("{e}");
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: completed_at.clone(),
+                    event_type: "error".to_string(),
+                    normalized_event: json!({ "type": "error", "code": "stream_error", "message": message }),
+                });
+                let response_body_json =
+                    json!({ "error": { "code": "stream_error", "message": message } }).to_string();
+                finish_broker_llm_audit(
+                    audit_context.as_ref(),
+                    BrokerLlmAuditOutcome {
+                        final_state: "failed",
+                        first_token_at: first_token_at.as_deref(),
+                        completed_at: &completed_at,
+                        usage: final_usage.as_ref(),
+                        first_token_latency_ms,
+                        total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+                        response_body_json: &response_body_json,
+                    },
+                    &audit_events,
+                );
+                let _ = send_broker_error(write, Some(id), "stream_error", message).await;
                 return;
             }
             None => break,
@@ -2316,6 +2634,17 @@ async fn broker_llm_stream(
         match event {
             NeutralChatStreamEvent::TextDelta { delta } => {
                 sequence += 1;
+                if first_token_at.is_none() {
+                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    first_token_latency_ms =
+                        Some(request_started_instant.elapsed().as_millis() as i64);
+                    first_token_at = Some(now);
+                }
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    event_type: "text_delta".to_string(),
+                    normalized_event: json!({ "type": "textDelta", "delta": delta.clone() }),
+                });
                 let chunk = ControlEnvelope {
                     version: 1,
                     message_type: "stream".to_string(),
@@ -2352,6 +2681,17 @@ async fn broker_llm_stream(
             }
             NeutralChatStreamEvent::ReasoningDelta { delta } => {
                 sequence += 1;
+                if first_token_at.is_none() {
+                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    first_token_latency_ms =
+                        Some(request_started_instant.elapsed().as_millis() as i64);
+                    first_token_at = Some(now);
+                }
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    event_type: "reasoning_delta".to_string(),
+                    normalized_event: json!({ "type": "reasoningDelta", "delta": delta.clone() }),
+                });
                 let chunk = ControlEnvelope {
                     version: 1,
                     message_type: "stream".to_string(),
@@ -2370,6 +2710,11 @@ async fn broker_llm_stream(
             }
             NeutralChatStreamEvent::Usage { usage } => {
                 sequence += 1;
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    event_type: "usage".to_string(),
+                    normalized_event: json!({ "type": "usage", "usage": usage.clone() }),
+                });
                 let chunk = ControlEnvelope {
                     version: 1,
                     message_type: "stream".to_string(),
@@ -2394,16 +2739,60 @@ async fn broker_llm_stream(
                 stop_reason: _,
                 response_id: _,
             } => {
+                if let Some(usage) = usage.as_ref() {
+                    audit_events.push(BrokerLlmAuditEvent {
+                        event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        event_type: "complete".to_string(),
+                        normalized_event: json!({ "type": "complete", "usage": usage }),
+                    });
+                }
                 final_usage = usage;
             }
             NeutralChatStreamEvent::Start => {}
             NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {}
             NeutralChatStreamEvent::Error { message } => {
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                audit_events.push(BrokerLlmAuditEvent {
+                    event_at: completed_at.clone(),
+                    event_type: "error".to_string(),
+                    normalized_event: json!({ "type": "error", "code": "stream_error", "message": message }),
+                });
+                let response_body_json =
+                    json!({ "error": { "code": "stream_error", "message": message } }).to_string();
+                finish_broker_llm_audit(
+                    audit_context.as_ref(),
+                    BrokerLlmAuditOutcome {
+                        final_state: "failed",
+                        first_token_at: first_token_at.as_deref(),
+                        completed_at: &completed_at,
+                        usage: final_usage.as_ref(),
+                        first_token_latency_ms,
+                        total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+                        response_body_json: &response_body_json,
+                    },
+                    &audit_events,
+                );
                 let _ = send_broker_error(write, Some(id), "stream_error", message).await;
                 return;
             }
         }
     }
+
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let response_body_json = json!({ "status": "ok", "usage": final_usage.as_ref() }).to_string();
+    finish_broker_llm_audit(
+        audit_context.as_ref(),
+        BrokerLlmAuditOutcome {
+            final_state: "succeeded",
+            first_token_at: first_token_at.as_deref(),
+            completed_at: &completed_at,
+            usage: final_usage.as_ref(),
+            first_token_latency_ms,
+            total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
+            response_body_json: &response_body_json,
+        },
+        &audit_events,
+    );
 
     let response = ControlEnvelope {
         version: 1,
@@ -3697,6 +4086,27 @@ async fn remote_sidecar_chat_statistics(
     let code_change_stats = database
         .code_change_stats_for_chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let request_count = database
+        .llm_request_audit_count(LlmRequestAuditFilters {
+            chat_id: Some(&chat_id),
+            exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            ..LlmRequestAuditFilters::default()
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let llm_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            chat_id: Some(&chat_id),
+            exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            limit: Some(request_count),
+            offset: Some(0),
+            ..LlmRequestAuditFilters::default()
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let total_latency_ms = llm_rows
+        .iter()
+        .filter_map(|row| row.total_latency_ms)
+        .sum::<i64>();
+    let ai_summary = crate::llm_request_rows_summary(&llm_rows);
     Ok(Json(json!({
         "workspaceId": state.workspace_id,
         "chatId": chat_id,
@@ -3704,20 +4114,20 @@ async fn remote_sidecar_chat_statistics(
         "userMessageCount": user_message_count,
         "assistantMessageCount": assistant_message_count,
         "toolMessageCount": tool_message_count,
-        "totalRequests": 0,
-        "failedRequests": 0,
-        "totalInputTokens": 0,
-        "totalOutputTokens": 0,
-        "totalCacheReadTokens": 0,
-        "totalCacheWriteTokens": 0,
-        "totalTokens": 0,
-        "totalLatencyMs": 0,
-        "averageLatencyMs": null,
+        "totalRequests": ai_summary.total_requests,
+        "failedRequests": ai_summary.failed_requests,
+        "totalInputTokens": ai_summary.total_input_tokens,
+        "totalOutputTokens": ai_summary.total_output_tokens,
+        "totalCacheReadTokens": ai_summary.total_cache_read_tokens,
+        "totalCacheWriteTokens": ai_summary.total_cache_write_tokens,
+        "totalTokens": ai_summary.total_tokens,
+        "totalLatencyMs": total_latency_ms,
+        "averageLatencyMs": ai_summary.average_latency_ms,
         "memoryReferences": 0,
         "createdMemories": 0,
         "codeChangeStats": code_change_stats,
-        "modelBreakdown": [],
-        "providerBreakdown": [],
+        "modelBreakdown": ai_summary.model_breakdown,
+        "providerBreakdown": ai_summary.provider_breakdown,
         "toolBreakdown": [],
         "compression": {
             "snapshotCount": 0,
@@ -4108,6 +4518,60 @@ fn remote_sse_json_event(sequence: i64, event: Value) -> Event {
         .data(event.to_string())
 }
 
+fn remote_usage_i64(usage: &Value, key: &str) -> Option<i64> {
+    usage.get(key).and_then(Value::as_i64)
+}
+
+fn persist_sidecar_llm_audit(
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    chat_id: &str,
+    request_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    usage: &Value,
+    final_state: &str,
+    response_body: Value,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    if database.llm_request(request_id)?.is_none() {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let request_body_json = json!({
+            "providerId": provider_id,
+            "modelId": model_id,
+            "brokered": true,
+        })
+        .to_string();
+        let response_body_json = response_body.to_string();
+        database.insert_llm_request(NewLlmRequest {
+            id: request_id,
+            workspace_id,
+            chat_id: Some(chat_id),
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id,
+            model_id,
+            request_started_at: &now,
+            first_token_at: None,
+            completed_at: Some(&now),
+            input_tokens: remote_usage_i64(usage, "inputTokens"),
+            output_tokens: remote_usage_i64(usage, "outputTokens"),
+            cache_read_tokens: remote_usage_i64(usage, "cacheReadTokens"),
+            cache_write_tokens: remote_usage_i64(usage, "cacheWriteTokens"),
+            reasoning_tokens: remote_usage_i64(usage, "reasoningTokens"),
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state,
+            request_body_json: Some(&request_body_json),
+            response_body_json: Some(&response_body_json),
+        })?;
+    }
+    Ok(())
+}
+
 fn neutral_role_for_message(role: &str) -> NeutralChatRole {
     match role {
         "assistant" => NeutralChatRole::Assistant,
@@ -4162,6 +4626,12 @@ async fn remote_sidecar_chat_stream(
     let provider_id =
         remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
     let database = sidecar_workspace_database(&state)?;
+    let chat = database
+        .chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
+        })?;
     let user_message = database
         .message(&queued_user_message_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
@@ -4207,6 +4677,10 @@ async fn remote_sidecar_chat_stream(
     };
     remote_sidecar_set_active_run(&state, run);
     let broker_payload = json!({
+        "workspaceId": state.workspace_id,
+        "chatId": chat_id,
+        "chatTitle": chat.title,
+        "runId": run_id,
         "providerId": provider_id,
         "modelId": model_id,
         "messages": messages,
@@ -4317,9 +4791,18 @@ async fn remote_sidecar_chat_stream(
                             break;
                         }
                     };
+                    let usage = envelope.payload.get("usage").cloned().unwrap_or(Value::Null);
                     let metadata = json!({
                         "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
                         "parts": remote_chat_parts(&text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                        "metrics": {
+                            "modelId": model_id,
+                            "providerId": provider_id,
+                            "totalLatencyMs": null,
+                            "firstTokenLatencyMs": null,
+                            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
+                            "llmRequestIds": [run_id],
+                        },
                     });
                     let assistant_sequence = database
                         .message(&assistant_message_id)
@@ -4340,10 +4823,21 @@ async fn remote_sidecar_chat_stream(
                         &assistant_message_id,
                         &text,
                         (!reasoning.is_empty()).then_some(reasoning.as_str()),
-                        envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                        usage.clone(),
                         &model_id,
                         &provider_id,
                         &run_id,
+                    );
+                    let _ = persist_sidecar_llm_audit(
+                        &mut database,
+                        &stream_state.workspace_id,
+                        &chat_id,
+                        &run_id,
+                        &provider_id,
+                        &model_id,
+                        &usage,
+                        "succeeded",
+                        completion_payload.clone(),
                     );
                     let _ = database.insert_run_event(NewRunEvent {
                         id: &unique_id("run-event"),
@@ -4360,6 +4854,24 @@ async fn remote_sidecar_chat_stream(
                     break;
                 }
                 "error" => {
+                    if let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
+                        let message = envelope
+                            .payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("remote broker unavailable");
+                        let _ = persist_sidecar_llm_audit(
+                            &mut database,
+                            &stream_state.workspace_id,
+                            &chat_id,
+                            &run_id,
+                            &provider_id,
+                            &model_id,
+                            &Value::Null,
+                            "failed",
+                            json!({ "error": { "message": message } }),
+                        );
+                    }
                     sequence += 1;
                     yield Ok(remote_sse_json_event(sequence, json!({
                         "type": "error",
@@ -4460,13 +4972,59 @@ async fn remote_sidecar_context_usage(
 }
 
 async fn remote_sidecar_ai_statistics_detail(
-    State(_state): State<RemoteSidecarState>,
+    State(state): State<RemoteSidecarState>,
     AxumPath(request_id): AxumPath<String>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    Err(ApiError::bad_request(format!(
-        "remote AI statistics detail is unavailable while offline or uncached: {request_id}"
-    ))
-    .into_response())
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(ApiError::bad_request("request id must not be empty").into_response());
+    }
+    let database = sidecar_workspace_database(&state)?;
+    let request = database
+        .llm_request(request_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("LLM request was not found: {request_id}"))
+                .into_response()
+        })?;
+    let events = database
+        .llm_request_events(request_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(Json(json!({
+        "request": {
+            "id": request.id,
+            "workspaceId": state.workspace_id,
+            "workspaceName": state.workspace_id,
+            "chatId": request.chat_id,
+            "chatTitle": null,
+            "requestKind": request.request_kind,
+            "providerId": request.provider_id,
+            "modelId": request.model_id,
+            "requestStartedAt": request.request_started_at,
+            "firstTokenAt": request.first_token_at,
+            "completedAt": request.completed_at,
+            "inputTokens": request.input_tokens,
+            "outputTokens": request.output_tokens,
+            "cacheReadTokens": request.cache_read_tokens,
+            "cacheWriteTokens": request.cache_write_tokens,
+            "reasoningTokens": request.reasoning_tokens,
+            "cacheRatio": request.cache_ratio,
+            "firstTokenLatencyMs": request.first_token_latency_ms,
+            "totalLatencyMs": request.total_latency_ms,
+            "statusCode": request.status_code,
+            "finalState": request.final_state,
+            "requestBody": request.request_body_json.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+            "responseBody": request.response_body_json.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        },
+        "events": events.into_iter().map(|event| json!({
+            "id": event.id,
+            "sequence": event.sequence,
+            "eventAt": event.event_at,
+            "eventType": event.event_type,
+            "rawChunk": event.raw_chunk_json.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+            "normalizedEvent": serde_json::from_str::<Value>(&event.normalized_event_json).unwrap_or(Value::Null),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 async fn remote_sidecar_passthrough_unavailable() -> Result<Json<Value>, axum::response::Response> {
@@ -5878,6 +6436,91 @@ mod tests {
         assert_eq!(event["metrics"]["modelId"], "model-1");
         assert_eq!(event["metrics"]["providerId"], "provider-1");
         assert_eq!(event["metrics"]["outputTokens"], 3);
+    }
+
+    #[test]
+    fn brokered_llm_audit_is_readable_by_chat_statistics_filters() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = BrokerLlmAuditContext {
+            audit_path: workspace.path().to_path_buf(),
+            workspace_id: "remote-ws".to_string(),
+            chat_id: Some("chat-1".to_string()),
+            chat_title: Some("Remote chat".to_string()),
+            request_id: "remote-run-1".to_string(),
+        };
+        let started_at = "2026-07-08T00:00:00Z";
+        insert_broker_llm_audit_start(
+            &context,
+            "provider-1",
+            "model-1",
+            started_at,
+            &json!({ "request": true }).to_string(),
+        );
+        let usage = NeutralUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            cache_read_tokens: Some(2),
+            cache_write_tokens: Some(1),
+            reasoning_tokens: None,
+        };
+        finish_broker_llm_audit(
+            Some(&context),
+            BrokerLlmAuditOutcome {
+                final_state: "succeeded",
+                first_token_at: Some("2026-07-08T00:00:01Z"),
+                completed_at: "2026-07-08T00:00:02Z",
+                usage: Some(&usage),
+                first_token_latency_ms: Some(1000),
+                total_latency_ms: 2000,
+                response_body_json: &json!({ "ok": true }).to_string(),
+            },
+            &[BrokerLlmAuditEvent {
+                event_at: started_at.to_string(),
+                event_type: "start".to_string(),
+                normalized_event: json!({ "type": "start" }),
+            }],
+        );
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit db");
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("audit rows");
+        let summary = crate::llm_request_rows_summary(&rows);
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_input_tokens, 10);
+        assert_eq!(summary.total_output_tokens, 4);
+        assert_eq!(summary.failed_requests, 0);
+        assert_eq!(
+            database
+                .llm_request_events("remote-run-1")
+                .expect("events")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remote_workspace_audit_path_falls_back_to_profile_storage() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let workspace = WorkspaceConfig {
+            id: "remote-ws".to_string(),
+            name: "Remote".to_string(),
+            path: PathBuf::new(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "server-1".to_string(),
+                remote_path: "/srv/project".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "/bin/sh".to_string(),
+            common_commands: Vec::new(),
+        };
+        let path = workspace_audit_path(profile.path(), &workspace).expect("audit path");
+        assert!(path.ends_with(".foco/remote-workspace-audit/remote-ws"));
+        assert!(path.is_dir());
     }
 
     #[tokio::test]

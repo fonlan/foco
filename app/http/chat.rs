@@ -1693,6 +1693,7 @@ pub(crate) async fn ai_statistics(
     tracing::info!("AI statistics request started");
     let config_started_at = Instant::now();
     let config = config_snapshot(&state)?;
+    let profile_dir = state.user_profile_dir.clone();
     tracing::info!(
         elapsed_ms = config_started_at.elapsed().as_millis() as u64,
         workspace_count = config.workspaces.len(),
@@ -1701,7 +1702,7 @@ pub(crate) async fn ai_statistics(
     let filters = normalized_ai_statistics_query(query)?;
 
     let response = tokio::task::spawn_blocking(move || {
-        load_ai_statistics_response(config, filters, started_at)
+        load_ai_statistics_response(config, profile_dir, filters, started_at)
     })
     .await
     .map_err(|error| ApiError::internal(format!("AI statistics worker failed: {error}")))??;
@@ -1711,6 +1712,7 @@ pub(crate) async fn ai_statistics(
 
 fn load_ai_statistics_response(
     config: GlobalConfig,
+    profile_dir: PathBuf,
     filters: NormalizedAiStatisticsFilters,
     started_at: Instant,
 ) -> Result<AiStatisticsResponse, ApiError> {
@@ -1747,13 +1749,14 @@ fn load_ai_statistics_response(
             workspace_path = %workspace.path.display(),
             "AI statistics workspace scan started"
         );
+        let audit_path = crate::remote_workspace::workspace_audit_path(&profile_dir, workspace)?;
         let database_started_at = Instant::now();
         tracing::info!(
             workspace_id = %workspace.id,
-            workspace_path = %workspace.path.display(),
+            workspace_path = %audit_path.display(),
             "AI statistics workspace database open started"
         );
-        let database = open_workspace_database(&workspace.path)?;
+        let database = open_workspace_database(&audit_path)?;
         tracing::info!(
             workspace_id = %workspace.id,
             database_path = %database.database_path().display(),
@@ -2082,7 +2085,9 @@ pub(crate) async fn ai_statistics_detail(
         return Err(ApiError::bad_request("request id must not be empty"));
     }
 
-    let database = open_workspace_database(&workspace.path)?;
+    let audit_path =
+        crate::remote_workspace::workspace_audit_path(&state.user_profile_dir, workspace)?;
+    let database = open_workspace_database(&audit_path)?;
     let request = database
         .llm_request(request_id)
         .map_err(ApiError::from_workspace_error)?
