@@ -4369,6 +4369,37 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[test]
+fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "oldest".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "middle".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "newest".repeat(10)),
+    ];
+    let sequences = vec![None, Some(0), Some(1), Some(2)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 0 },
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::StoredMessage { sequence: 2 },
+    ];
+    let message_groups = context_message_groups(&messages, &sequences, &sources, messages.len())
+        .expect("context groups");
+
+    assert_eq!(
+        llm_context_compression_group_indices(&message_groups, LlmContextCompressionMode::Normal),
+        vec![1]
+    );
+    assert_eq!(
+        llm_context_compression_group_indices(
+            &message_groups,
+            LlmContextCompressionMode::RequiredOverflow
+        ),
+        vec![1, 2, 3]
+    );
+}
+
 #[tokio::test]
 async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-required-overflow-llm-test"));

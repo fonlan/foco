@@ -209,8 +209,8 @@ const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
 // Consecutive read-only exploration batches before telling the model to edit, ask, or finish.
 const READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD: usize = 16;
-// Number of newest chat messages kept verbatim when older history is compressed.
-const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
+// Number of newest compressible LLM request/message groups kept verbatim when older context is compressed.
+const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 2;
 // Number of newest in-progress tool batches kept verbatim inside a long agent run.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES: usize = 2;
 // Maximum runtime tool-state snapshots appended during one assistant run.
