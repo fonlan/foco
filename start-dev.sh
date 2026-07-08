@@ -12,6 +12,13 @@ fi
 
 SCRIPT_DIR="${0:A:h}"
 
+if lsof -nP -iTCP:"$FOCO_DEV_BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Backend port $FOCO_DEV_BACKEND_PORT is already in use:"
+  lsof -nP -iTCP:"$FOCO_DEV_BACKEND_PORT" -sTCP:LISTEN
+  echo "Stop that process or run: FOCO_DEV_BACKEND_PORT=<free-port> $0"
+  exit 1
+fi
+
 osascript - "$SCRIPT_DIR" "$FOCO_DEV_BACKEND_PORT" "$FOCO_DEV_CONFIG_DIR" "$FOCO_DEV_FRONTEND_PORT" <<'APPLESCRIPT'
 on run argv
   set repoRoot to item 1 of argv
