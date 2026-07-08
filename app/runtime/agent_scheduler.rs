@@ -53,6 +53,8 @@ const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
+const AGENT_TASK_DB_RETRY_ATTEMPTS: usize = 4;
+const AGENT_TASK_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
 const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
 const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
 
@@ -476,7 +478,17 @@ async fn run_coordinator_task(
             error = %error.message,
             "Coordinator task failed"
         );
-        let _ = fail_claimed_task(&workspace.path, &task_id, &error.message);
+        if let Err(persist_error) =
+            fail_claimed_task_with_retry(&workspace.path, &task_id, &error.message).await
+        {
+            tracing::error!(
+                workspace_id = %workspace.id,
+                task_id = %task_id,
+                attempt_id = %attempt_id,
+                error = %persist_error.message,
+                "failed to persist failed Coordinator task"
+            );
+        }
     }
     let _ = state.agent_scheduler.wake();
 }
@@ -643,9 +655,61 @@ async fn run_coordinator_task_inner(
         guidance_tx,
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
-    persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)?;
-    finish_claimed_task(&workspace.path, &task, attempt_id, outcome)?;
+    retry_agent_runtime_database_operation("persist Agent task context", || {
+        persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)
+    })
+    .await?;
+    retry_agent_runtime_database_operation("finish Agent task", || {
+        finish_claimed_task(&workspace.path, &task, attempt_id, outcome.clone())
+    })
+    .await?;
     crate::plan_runtime::sync_plan_phase_for_agent_task(state, workspace, &task.id).await
+}
+
+async fn retry_agent_runtime_database_operation<T, F>(
+    operation_name: &'static str,
+    mut operation: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut() -> Result<T, ApiError>,
+{
+    for attempt in 1..=AGENT_TASK_DB_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < AGENT_TASK_DB_RETRY_ATTEMPTS
+                    && is_workspace_database_concurrency_error(&error) =>
+            {
+                tracing::warn!(
+                    operation = operation_name,
+                    attempt,
+                    error = %error.message,
+                    "Agent runtime database operation hit concurrency limit; retrying"
+                );
+                time::sleep(AGENT_TASK_DB_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop always returns")
+}
+
+pub(crate) async fn fail_claimed_task_with_retry(
+    workspace_path: &Path,
+    task_id: &AgentTaskId,
+    message: &str,
+) -> Result<(), ApiError> {
+    retry_agent_runtime_database_operation("fail claimed Agent task", || {
+        fail_claimed_task(workspace_path, task_id, message)
+    })
+    .await
+}
+
+fn is_workspace_database_concurrency_error(error: &ApiError) -> bool {
+    error
+        .message
+        .contains("workspace database concurrency limit reached")
 }
 
 fn agent_task_model_selection(

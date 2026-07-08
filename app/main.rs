@@ -250,6 +250,8 @@ const PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX: &str = "Project Spec snapshot for thi
 const STABLE_MEMORY_CONFIDENCE_THRESHOLD: f64 = 0.85;
 // OpenAI prompt cache retention requested for main chat runs.
 const PROMPT_CACHE_RETENTION_24H: &str = "24h";
+// Maximum time to wait for a provider stream to open or yield its next event.
+const CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 // Agent tool name exposed for searching memory facts.
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 // Agent tool name exposed for writing manual memory notes.
@@ -2918,7 +2920,11 @@ impl PreparedChatContext {
                                 }
                                 continue;
                             }
-                            provider_stream = stream_chat(&self.provider_config, turn_request) => provider_stream,
+                            provider_stream = timeout(
+                                Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                                stream_chat(&self.provider_config, turn_request),
+                            ) => provider_stream
+                                .unwrap_or_else(|_| Err(provider_stream_idle_timeout_error())),
                         } {
                             Ok(provider_stream) => provider_stream,
                             Err(error) => {
@@ -3061,7 +3067,11 @@ impl PreparedChatContext {
                                     }
                                     continue;
                                 }
-                                event_result = provider_stream.next_event() => event_result,
+                                event_result = timeout(
+                                    Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                                    provider_stream.next_event(),
+                                ) => event_result
+                                    .unwrap_or_else(|_| Some(Err(provider_stream_idle_timeout_error()))),
                             }) else {
                                 break;
                             };
@@ -5817,6 +5827,15 @@ async fn failed_chat_audit_outcome(
 
 fn provider_status_code(error: &ProviderConfigError) -> Option<i64> {
     error.status_code().map(i64::from)
+}
+
+fn provider_stream_idle_timeout_error() -> ProviderConfigError {
+    ProviderConfigError::Connection {
+        message: format!(
+            "provider stream timed out after {CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS} ms without an event"
+        ),
+        status_code: None,
+    }
 }
 
 fn should_retry_provider_stream_error(

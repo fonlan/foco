@@ -7034,6 +7034,107 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_claimed_task_retries_after_database_gate_contention() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-fail-retry-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let team_id = foco_agent::AgentTeamId::new("agent-team-fail-retry").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-fail-retry").expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-fail-retry").expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-fail-retry").expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat("chat-fail-retry", "Fail retry")
+            .expect("chat insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-fail-retry").expect("definition id"),
+            revision: 1,
+            name: "Fail retry coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Fail gracefully.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-fail-retry",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .expect("claim")
+            .expect("claimed");
+    }
+
+    let gate_1 = open_workspace_database(&workspace_dir).expect("first gate holder");
+    let gate_2 = open_workspace_database(&workspace_dir).expect("second gate holder");
+    let retry_workspace_dir = workspace_dir.clone();
+    let retry_task_id = task_id.clone();
+    let retry = tokio::spawn(async move {
+        crate::runtime::fail_claimed_task_with_retry(
+            &retry_workspace_dir,
+            &retry_task_id,
+            "synthetic scheduler failure",
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    drop(gate_1);
+    drop(gate_2);
+    retry
+        .await
+        .expect("retry task joined")
+        .expect("failure persisted after retry");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Failed
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Failed
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 #[tokio::test]
 async fn agent_scheduler_exits_when_app_shutdown_signal_is_sent() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-shutdown-test"));
@@ -7169,6 +7270,71 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     .await
     .expect("cancel queued Coordinator task");
     assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    let running = crate::http::chat::queue_chat_message(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(QueueChatMessageRequest {
+            chat_id: Some("chat-agent-api".to_string()),
+            model_id: "client-selection".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Running Coordinator task".to_string(),
+            team_mode_enabled: false,
+            defer_start: false,
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue running Coordinator task")
+    .0;
+    let running_task_id = running.agent_task_id.expect("running Agent task id");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+    let running_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-api-running").expect("attempt id");
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let team = database
+            .agent_team_for_chat("chat-agent-api")
+            .expect("team lookup")
+            .expect("enabled team");
+        database
+            .claim_runnable_agent_task(&team.id, &running_task_id, &running_attempt_id)
+            .expect("claim running task")
+            .expect("claimed running task");
+    }
+    let cancel_request =
+        serde_json::from_value(json!({ "action": "cancel" })).expect("task action request");
+    let _response = crate::http::agents::agent_task_action(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), running_task_id.to_string())),
+        Json(cancel_request),
+    )
+    .await
+    .expect("cancel running Coordinator task without active run");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&running_task_id)
+            .expect("running task lookup")
+            .expect("running task")
+            .status,
+        foco_agent::AgentTaskStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&running_task_id)
+            .expect("attempts")
+            .into_iter()
+            .next()
+            .expect("attempt")
+            .status,
+        foco_agent::AgentAttemptStatus::Cancelled
+    );
+    drop(database);
 
     for (action, expected) in [
         ("pause", foco_agent::AgentTeamStatus::Paused),

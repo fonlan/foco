@@ -1007,18 +1007,51 @@ pub(crate) async fn agent_task_action(
             )));
         }
         AgentTaskAction::Cancel if task.status == AgentTaskStatus::Running => {
-            state
+            match state
                 .active_chat_runs
-                .cancel(&workspace_id, task.id.as_str())?;
-            insert_agent_event(
-                &mut database,
-                &task.team_id,
-                "task_cancel_requested",
-                Some(&task.owner_instance_id),
-                Some(&task.id),
-                None,
-                json!({}),
-            )?;
+                .cancel(&workspace_id, task.id.as_str())
+            {
+                Ok(()) => {
+                    insert_agent_event(
+                        &mut database,
+                        &task.team_id,
+                        "task_cancel_requested",
+                        Some(&task.owner_instance_id),
+                        Some(&task.id),
+                        None,
+                        json!({}),
+                    )?;
+                }
+                Err(error) if active_chat_run_not_found(&error, task.id.as_str()) => {
+                    database
+                        .update_agent_task_state(AgentTaskStateUpdate {
+                            team_id: &task.team_id,
+                            task_id: &task.id,
+                            expected_status: AgentTaskStatus::Running,
+                            transition: AgentTaskTransition::Cancel,
+                            result_json: None,
+                            error_json: Some(
+                                r#"{"message":"cancelled explicitly after active run handle was missing"}"#,
+                            ),
+                            interruption_reason: None,
+                        })
+                        .map_err(ApiError::from_workspace_error)?;
+                    insert_agent_event(
+                        &mut database,
+                        &task.team_id,
+                        "task_cancelled",
+                        Some(&task.owner_instance_id),
+                        Some(&task.id),
+                        None,
+                        json!({ "reason": "stale_active_run_missing" }),
+                    )?;
+                    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+                        &workspace.path,
+                        &task.id,
+                    )?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         AgentTaskAction::Cancel
             if matches!(
@@ -1162,6 +1195,10 @@ pub(crate) async fn agent_task_action(
         &database,
         &task.team_id,
     )?))
+}
+
+fn active_chat_run_not_found(error: &ApiError, run_id: &str) -> bool {
+    error.message == format!("active chat run was not found: {run_id}")
 }
 
 fn agent_team_snapshot_from_database(
