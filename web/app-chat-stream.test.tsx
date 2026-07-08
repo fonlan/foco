@@ -271,6 +271,36 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("ignores connecting chat stream progress events", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        message: "connecting to remote broker",
+        type: "connecting",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Remote answer.",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("Remote answer.")).toBeInTheDocument();
+    expect(screen.queryByText(/unknown event/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("refreshes assembled context usage after a stream completes", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

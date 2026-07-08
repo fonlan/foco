@@ -643,6 +643,7 @@ export type ChatStreamEvent =
     llmRequestId?: string;
     memoriesUsed: ChatMemoryUsedSummary[];
   }
+  | { type: "connecting"; message?: string }
   | { type: "textDelta"; assistantMessageId?: string; delta: string; reasoningDurationMs?: number | null }
   | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
   | {

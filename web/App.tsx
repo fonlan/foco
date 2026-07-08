@@ -7941,6 +7941,10 @@ export function App() {
           toolOutputDeltaBuffer.flush();
         }
 
+        if (streamEvent.type === "connecting") {
+          return;
+        }
+
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
           const startsNewAssistantBubble =
@@ -8890,6 +8894,10 @@ export function App() {
         }
         if (streamEvent.type !== "toolOutputDelta") {
           toolOutputDeltaBuffer.flush();
+        }
+
+        if (streamEvent.type === "connecting") {
+          return;
         }
 
         if (streamEvent.type === "start") {
@@ -14116,6 +14124,15 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       llmRequestId,
       memoriesUsed,
     };
+  }
+
+  if (value.type === "connecting") {
+    const message = optionalStringField(value, "message");
+    if (message === null) {
+      return null;
+    }
+
+    return message === undefined ? { type: "connecting" } : { type: "connecting", message };
   }
 
   if (value.type === "textDelta" || value.type === "text_delta") {
