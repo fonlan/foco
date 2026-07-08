@@ -96,6 +96,9 @@ describe("app-settings verification surfaces", () => {
       screen.queryByRole("button", { name: "Save skills" }),
     ).not.toBeInTheDocument();
     expect(screen.getByText("Global skill")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("checkbox", { name: "Enable skill gitmemo" })).toBeChecked();
+    });
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Update all store skills" })).toBeNull();
 
@@ -2414,8 +2417,8 @@ describe("app-settings verification surfaces", () => {
         "/api/skills/manual",
         expect.objectContaining({
           body: JSON.stringify({
-            disabled: [],
-            enabled: ["global:gitmemo"],
+            disabled: ["global:gitmemo"],
+            enabled: [],
             translationModelId: null,
           }),
           method: "POST",

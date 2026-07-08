@@ -531,9 +531,7 @@ export function SettingsPanel({
   const [hookTestPayload, setHookTestPayload] = useState(
     '{\n  "toolInput": {\n    "command": "git status"\n  }\n}',
   );
-  const [enabledSkillIds, setEnabledSkillIds] = useState<Set<string>>(
-    () => new Set(),
-  );
+  const [enabledSkillIds, setEnabledSkillIds] = useState<Set<string> | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -798,6 +796,9 @@ export function SettingsPanel({
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
   const skills = settings?.skills;
+  const currentEnabledSkillIds =
+    enabledSkillIds ??
+    new Set((skills?.detected ?? []).filter((skill) => skill.enabled).map((skill) => skill.key));
   const updateableStoreSkills = (skills?.detected ?? []).filter((skill) =>
     Boolean(skill.store?.updateable),
   );
@@ -1056,6 +1057,7 @@ export function SettingsPanel({
       syncSpecSettingsForm(data);
       syncPlanSettingsForm(data);
       syncMemorySettingsForm(data);
+      syncSkillsForm(data);
       setProviderForm((current) => ({
         ...current,
         kind: current.kind || defaultProviderKind(data.providerKinds),
@@ -4432,7 +4434,7 @@ export function SettingsPanel({
   }
 
   function toggleSkill(skillId: string, checked: boolean) {
-    const next = new Set(enabledSkillIds);
+    const next = new Set(currentEnabledSkillIds);
 
     if (checked) {
       next.add(skillId);
@@ -10607,7 +10609,7 @@ export function SettingsPanel({
                 <div className="divide-y divide-stone-100">
                   {skills?.detected.length ? (
                     skills.detected.map((skill) => {
-                      const enabled = enabledSkillIds.has(skill.key);
+                      const enabled = currentEnabledSkillIds.has(skill.key);
                       const isStoreUpdateable = Boolean(skill.store?.updateable);
                       const isUpdatingSkill = updatingSkillKey === skill.key;
 
