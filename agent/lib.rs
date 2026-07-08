@@ -989,10 +989,6 @@ pub struct ToolResourceLock {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContextBudgetError {
-    OutputExceedsWindow {
-        context_window: u64,
-        max_output_tokens: u64,
-    },
     ReservedExceedsWindow {
         context_window: u64,
         reserved_tokens: u64,
@@ -1298,15 +1294,7 @@ pub fn calculate_context_budget_with_safety(
     tool_schema_tokens: u64,
     safety_tokens: u64,
 ) -> Result<ContextBudget, ContextBudgetError> {
-    if max_output_tokens >= context_window {
-        return Err(ContextBudgetError::OutputExceedsWindow {
-            context_window,
-            max_output_tokens,
-        });
-    }
-
-    let reserved_tokens = max_output_tokens
-        .saturating_add(system_prompt_tokens)
+    let reserved_tokens = system_prompt_tokens
         .saturating_add(tool_schema_tokens)
         .saturating_add(safety_tokens);
 
@@ -1888,13 +1876,6 @@ pub fn context_compression_trigger_tokens(available_tokens: u64) -> u64 {
 impl fmt::Display for ContextBudgetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OutputExceedsWindow {
-                context_window,
-                max_output_tokens,
-            } => write!(
-                formatter,
-                "model max output tokens ({max_output_tokens}) must be smaller than context window ({context_window})"
-            ),
             Self::ReservedExceedsWindow {
                 context_window,
                 reserved_tokens,
@@ -2725,23 +2706,29 @@ mod tests {
     }
 
     #[test]
-    fn calculates_context_budget_from_model_limits() {
+    fn calculates_context_budget_from_input_context_window() {
         let budget =
             calculate_context_budget_with_safety(128_000, 16_384, 100, 300, 256).expect("budget");
+        let larger_output_budget =
+            calculate_context_budget_with_safety(128_000, 64_000, 100, 300, 256).expect("budget");
 
-        assert_eq!(budget.available_message_tokens, 110_960);
+        assert_eq!(budget.available_message_tokens, 127_344);
+        assert_eq!(
+            larger_output_budget.available_message_tokens,
+            budget.available_message_tokens
+        );
     }
 
     #[test]
     fn rejects_context_budget_when_reserved_tokens_exceed_window() {
-        let error = calculate_context_budget_with_safety(1_000, 800, 100, 80, 50)
+        let error = calculate_context_budget_with_safety(1_000, 800, 800, 151, 50)
             .expect_err("reserved tokens should exceed");
 
         assert_eq!(
             error,
             ContextBudgetError::ReservedExceedsWindow {
                 context_window: 1_000,
-                reserved_tokens: 1_030
+                reserved_tokens: 1_001
             }
         );
     }
