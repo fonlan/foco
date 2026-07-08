@@ -1768,24 +1768,24 @@ function ReasoningBlock({
   const toggleLabel = isExpanded ? t("Collapse thinking") : t("Expand thinking");
 
   return (
-    <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+    <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 p-2 text-stone-600">
       <button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
-        className="flex min-h-6 w-full min-w-0 items-center gap-2 text-left text-xs font-semibold text-stone-500 hover:text-stone-700"
+        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-stone-700 hover:text-stone-900"
         onClick={() => setIsExpanded((current) => !current)}
         title={toggleLabel}
         type="button"
       >
         {isExpanded ? (
-          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
+          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
         ) : (
-          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
+          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
         )}
-        <span className="shrink-0">{t("Thinking")}</span>
+        <span className="shrink-0 font-semibold">{t("Thinking")}</span>
         {isExpanded ? null : (
           <span
-            className="min-w-0 flex-1 truncate font-normal text-stone-600"
+            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
             title={preview}
           >
             {preview}
@@ -1801,7 +1801,7 @@ function ReasoningBlock({
         ) : null}
       </button>
       {isExpanded ? (
-        <div className="mt-1.5">
+        <div className="mt-2 border-l border-stone-200 pl-3 text-stone-700">
           <MarkdownContent
             content={reasoning}
             isUser={false}
