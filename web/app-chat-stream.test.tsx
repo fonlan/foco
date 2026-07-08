@@ -3785,6 +3785,123 @@ describe("app-chat-stream verification surfaces", () => {
     }
   });
 
+  it("silently clears a stale active run stream and reloads chat history", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...workspace.chats[0],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "stale-run",
+              workspaceId: "workspace-1",
+            },
+          },
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+    let messageRequests = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests += 1;
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: messageRequests === 1
+            ? {
+              acceptingGuidance: false,
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "stale-run",
+              workspaceId: "workspace-1",
+            }
+            : null,
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chat/runs/stale-run/stream") {
+        return jsonResponse(
+          { error: "active chat run was not found: stale-run" },
+          { status: 400 },
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyButton = (await within(workspaceList).findByText("Tool run")).closest(
+      "button",
+    );
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).includes("/api/workspaces/workspace-1/chat/runs/stale-run/stream"),
+        ),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(messageRequests).toBeGreaterThan(1));
+    await waitFor(() => expect(statusDot()).not.toHaveClass("session-status-dot-running"));
+    expect(screen.queryByText("active chat run was not found: stale-run")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument();
+  });
+
+  it("shows non-stale active run stream backend errors", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: {
+            acceptingGuidance: false,
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "broken-run",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/chat/runs/broken-run/stream") {
+        return jsonResponse(
+          { error: "stream exploded" },
+          { status: 500 },
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("stream exploded");
+  });
+
   it("keeps a pending ask_question dialog and draft through idle active run reconnect", async () => {
     (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
       .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;

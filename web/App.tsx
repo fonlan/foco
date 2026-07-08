@@ -7909,13 +7909,21 @@ export function App() {
         },
       );
       if (!response.ok) {
-        if (isReconnect && (response.status === 400 || response.status === 404)) {
-          console.debug("[chat-stream] active run stream missing during reconnect; refreshing messages", {
+        const message = await responseErrorMessage(response);
+        if (
+          (response.status === 400 || response.status === 404) &&
+          isStaleActiveRunError(message)
+        ) {
+          console.debug("[chat-stream] active run stream is stale; refreshing messages", {
             chatId: activeRun.chatId,
             runId: activeRun.runId,
             status: response.status,
             workspaceId: activeRun.workspaceId,
           });
+          setChatRunning(chatKey, false);
+          setActiveRunInfoForChatKey(chatKey, null);
+          clearLiveChatStatistics(chatKey);
+          clearWorkspaceChatActiveRun(activeRun.workspaceId, activeRun.chatId);
           await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
           return;
         }
@@ -7925,7 +7933,7 @@ export function App() {
           status: response.status,
           workspaceId: activeRun.workspaceId,
         });
-        throw new Error(await responseErrorMessage(response));
+        throw new Error(message);
       }
 
       await readChatStream(response, (streamEvent, meta) => {
@@ -13953,6 +13961,10 @@ class StreamIdleError extends Error {
 
 function isStreamIdleError(error: unknown) {
   return error instanceof StreamIdleError;
+}
+
+function isStaleActiveRunError(message: string) {
+  return message.startsWith("active chat run was not found");
 }
 
 function chatStreamIdleTimeoutMs() {
