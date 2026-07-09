@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -838,6 +838,68 @@ struct ControlEnvelope {
     timestamp: Option<String>,
 }
 
+#[derive(Clone)]
+struct RemoteActiveRunStream {
+    broker_request_id: Arc<Mutex<Option<String>>>,
+    events: Arc<Mutex<Vec<(i64, Value)>>>,
+    tx: tokio::sync::broadcast::Sender<(i64, Value)>,
+    finished: Arc<AtomicBool>,
+}
+
+impl RemoteActiveRunStream {
+    fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(512);
+        Self {
+            broker_request_id: Arc::new(Mutex::new(None)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            tx,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn record(&self, sequence: i64, payload: Value) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push((sequence, payload.clone()));
+        }
+        let _ = self.tx.send((sequence, payload));
+    }
+
+    fn snapshot_after(&self, sequence: i64) -> Vec<(i64, Value)> {
+        self.events
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|(event_sequence, _)| *event_sequence > sequence)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn last_sequence(&self) -> i64 {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|events| events.last().map(|(sequence, _)| *sequence))
+            .unwrap_or(0)
+    }
+
+    fn broker_request_id(&self) -> Option<String> {
+        self.broker_request_id.lock().ok().and_then(|id| id.clone())
+    }
+
+    fn set_broker_request_id(&self, id: String) {
+        if let Ok(mut broker_request_id) = self.broker_request_id.lock() {
+            *broker_request_id = Some(id);
+        }
+    }
+
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) async fn run_remote_sidecar_command_if_requested() -> AppResult<bool> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
@@ -898,6 +960,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         ws_count: ws_count.clone(),
         active_run_count: active_run_count.clone(),
         active_runs: active_runs.clone(),
+        active_run_streams: Arc::new(Mutex::new(HashMap::new())),
         broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
         broker_tx,
         shutdown_tx: shutdown_tx.clone(),
@@ -1267,6 +1330,128 @@ fn remote_sidecar_remove_active_run(state: &RemoteSidecarState, run_id: &str) {
     remote_sidecar_send_heartbeat(state);
 }
 
+fn remote_sidecar_insert_active_run_stream(
+    state: &RemoteSidecarState,
+    run_id: String,
+    _chat_id: String,
+) -> RemoteActiveRunStream {
+    let run_stream = RemoteActiveRunStream::new();
+    if let Ok(mut streams) = state.active_run_streams.lock() {
+        streams.insert(run_id, run_stream.clone());
+    }
+    run_stream
+}
+
+fn remote_sidecar_active_run_stream(
+    state: &RemoteSidecarState,
+    run_id: &str,
+) -> Option<RemoteActiveRunStream> {
+    state.active_run_streams.lock().ok()?.get(run_id).cloned()
+}
+
+fn remote_sidecar_record_run_event(
+    run_stream: &RemoteActiveRunStream,
+    sequence: i64,
+    payload: Value,
+) -> Event {
+    run_stream.record(sequence, payload.clone());
+    remote_sse_json_event(sequence, payload)
+}
+
+fn remote_sidecar_cancel_broker_request(
+    state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+) {
+    let Some(broker_request_id) = run_stream.broker_request_id() else {
+        return;
+    };
+    let cancel = ControlEnvelope {
+        version: 1,
+        message_type: "cancel".to_string(),
+        id: Some(broker_request_id),
+        method: None,
+        payload: json!({}),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = state.broker_tx.send(cancel);
+}
+
+fn remote_sidecar_finish_active_run(state: &RemoteSidecarState, run_id: &str) {
+    if let Ok(mut streams) = state.active_run_streams.lock() {
+        if let Some(run_stream) = streams.remove(run_id) {
+            run_stream.mark_finished();
+        }
+    }
+    remote_sidecar_remove_active_run(state, run_id);
+}
+
+fn remote_sidecar_cancel_active_run(
+    state: &RemoteSidecarState,
+    run_id: &str,
+    emit_events: bool,
+    remove_pending: bool,
+) {
+    let run_stream = state
+        .active_run_streams
+        .lock()
+        .ok()
+        .and_then(|mut streams| streams.remove(run_id));
+    if let Some(run_stream) = run_stream {
+        let broker_request_id = run_stream.broker_request_id();
+        remote_sidecar_cancel_broker_request(state, &run_stream);
+        if remove_pending {
+            if let Some(broker_request_id) = broker_request_id {
+                if let Ok(mut pending) = state.broker_pending.try_lock() {
+                    pending.remove(&broker_request_id);
+                }
+            }
+        }
+        if emit_events {
+            let mut sequence = run_stream.last_sequence();
+            sequence += 1;
+            run_stream.record(
+                sequence,
+                json!({
+                    "type": "error",
+                    "message": "remote run was cancelled",
+                }),
+            );
+            sequence += 1;
+            run_stream.record(sequence, json!({ "type": "streamEnd" }));
+        }
+        run_stream.mark_finished();
+    }
+    remote_sidecar_remove_active_run(state, run_id);
+}
+
+struct RemoteRunCleanupGuard {
+    state: RemoteSidecarState,
+    run_id: String,
+    disarmed: bool,
+}
+
+impl RemoteRunCleanupGuard {
+    fn new(state: RemoteSidecarState, run_id: String) -> Self {
+        Self {
+            state,
+            run_id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for RemoteRunCleanupGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            remote_sidecar_cancel_active_run(&self.state, &self.run_id, false, true);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RemoteSidecarState {
     token: String,
@@ -1275,6 +1460,7 @@ pub(crate) struct RemoteSidecarState {
     ws_count: Arc<AtomicUsize>,
     active_run_count: Arc<AtomicUsize>,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
+    active_run_streams: Arc<Mutex<HashMap<String, RemoteActiveRunStream>>>,
     broker_pending: Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<ControlEnvelope>>>>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
@@ -1851,6 +2037,8 @@ for cmdline in /proc/[0-9]*/cmdline; do
   printf '%s' "$cmd" | grep -F -- "--server-id $sid" >/dev/null || continue
   printf '%s' "$cmd" | grep -F -- "--workspace-id $wid" >/dev/null || continue
   printf '%s' "$cmd" | grep -F -- "--workspace-path $wpath" >/dev/null || continue
+  ppid="$(awk '{{print $4}}' "/proc/$pid/stat" 2>/dev/null || true)"
+  [ "$ppid" = "1" ] || continue
   kill "$pid" 2>/dev/null || true
 done
 "#,
@@ -1989,7 +2177,7 @@ async fn read_bootstrap(
         ));
     }
     tokio::spawn(async move {
-        let mut sink = Vec::new();
+        let mut sink = tokio::io::sink();
         let _ = tokio::io::copy(&mut reader, &mut sink).await;
     });
     serde_json::from_str(&line).map_err(|source| {
@@ -4075,21 +4263,20 @@ async fn remote_sidecar_workspace_chats(
     let code_change_stats = database
         .code_change_stats_for_chats(&chat_ids)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let chats = page
-        .chats
-        .into_iter()
-        .map(|chat| {
-            json!({
-                "id": chat.id,
-                "title": chat.title,
-                "createdAt": chat.created_at,
-                "updatedAt": chat.updated_at,
-                "codeChangeStats": code_change_stats.get(&chat.id).cloned().unwrap_or_default(),
-                "activeRun": remote_chat_active_run(&state, &chat.id),
-                "queuedRun": null,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut chats = Vec::new();
+    for chat in page.chats {
+        let queued_run = remote_chat_queued_run_for_chat(&database, &chat.id)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+        chats.push(json!({
+            "id": chat.id,
+            "title": chat.title,
+            "createdAt": chat.created_at,
+            "updatedAt": chat.updated_at,
+            "codeChangeStats": code_change_stats.get(&chat.id).cloned().unwrap_or_default(),
+            "activeRun": remote_chat_active_run(&state, &chat.id),
+            "queuedRun": queued_run,
+        }));
+    }
     Ok(Json(json!({
         "chats": chats,
         "total": page.total_count,
@@ -4442,6 +4629,31 @@ fn remote_message_queued_run(metadata_json: &str) -> Option<Value> {
         .cloned()
 }
 
+fn remote_chat_queued_run_for_chat(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+) -> Result<Option<Value>, foco_store::workspace::WorkspaceDatabaseError> {
+    let messages = database.messages_for_chat(chat_id)?;
+    for message in messages.into_iter().rev() {
+        if message.role != "user" {
+            continue;
+        }
+        let Some(mut queued_run) = remote_message_queued_run(&message.metadata_json) else {
+            continue;
+        };
+        if queued_run.get("status").and_then(Value::as_str) != Some("queued") {
+            continue;
+        }
+        if let Some(object) = queued_run.as_object_mut() {
+            object
+                .entry("content".to_string())
+                .or_insert_with(|| Value::String(message.content));
+        }
+        return Ok(Some(queued_run));
+    }
+    Ok(None)
+}
+
 fn remote_clear_message_queued_run(
     database: &mut WorkspaceDatabase,
     message_id: &str,
@@ -4548,6 +4760,7 @@ async fn remote_sidecar_chat_queue(
         "thinkingLevel": thinking_level,
         "skillIds": payload.get("skillIds").cloned().unwrap_or_else(|| json!([])),
         "sessionMode": session_mode,
+        "content": message,
         "idempotencyKey": idempotency_key,
     });
     let user_metadata = json!({
@@ -4590,10 +4803,10 @@ async fn remote_sidecar_chat_queue(
 
 async fn remote_sidecar_broker_request(
     state: &RemoteSidecarState,
+    id: &str,
     method: &str,
     payload: Value,
 ) -> Result<mpsc::UnboundedReceiver<ControlEnvelope>, axum::response::Response> {
-    let id = unique_id("broker-request");
     let deadline = tokio::time::Instant::now() + BROKER_OFFLINE_RUN_TIMEOUT;
     while state.ws_count.load(Ordering::Relaxed) == 0 {
         if tokio::time::Instant::now() >= deadline {
@@ -4605,17 +4818,17 @@ async fn remote_sidecar_broker_request(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    state.broker_pending.lock().await.insert(id.clone(), tx);
+    state.broker_pending.lock().await.insert(id.to_string(), tx);
     let envelope = ControlEnvelope {
         version: 1,
         message_type: "request".to_string(),
-        id: Some(id.clone()),
+        id: Some(id.to_string()),
         method: Some(method.to_string()),
         payload,
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
     if state.broker_tx.send(envelope).is_err() {
-        state.broker_pending.lock().await.remove(&id);
+        state.broker_pending.lock().await.remove(id);
         return Err(ApiError::bad_gateway("remote broker is unavailable").into_response());
     }
     Ok(rx)
@@ -4625,6 +4838,10 @@ fn remote_sse_json_event(sequence: i64, event: Value) -> Event {
     Event::default()
         .id(sequence.to_string())
         .data(event.to_string())
+}
+
+fn remote_stream_event_is_terminal(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("streamEnd")
 }
 
 fn remote_usage_i64(usage: &Value, key: &str) -> Option<i64> {
@@ -4761,6 +4978,7 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
+    let broker_request_id = unique_id("broker-request");
     let messages = database
         .messages_for_chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
@@ -4785,6 +5003,9 @@ async fn remote_sidecar_chat_stream(
         updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     };
     remote_sidecar_set_active_run(&state, run);
+    let run_stream =
+        remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
+    run_stream.set_broker_request_id(broker_request_id.clone());
     let broker_payload = json!({
         "workspaceId": state.workspace_id,
         "chatId": chat_id,
@@ -4796,11 +5017,13 @@ async fn remote_sidecar_chat_stream(
         "thinkingLevel": payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
     });
     let stream_state = state.clone();
+    let run_stream = run_stream.clone();
     let stream = async_stream::stream! {
+        let mut cleanup_guard = RemoteRunCleanupGuard::new(stream_state.clone(), run_id.clone());
         let mut sequence = 0_i64;
         let mut text = String::new();
         let mut reasoning = String::new();
-        yield Ok(remote_sse_json_event(sequence, json!({
+        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "start",
             "chatId": chat_id,
             "userMessageId": queued_user_message_id,
@@ -4809,21 +5032,22 @@ async fn remote_sidecar_chat_stream(
             "memoriesUsed": [],
         })));
         sequence += 1;
-        yield Ok(remote_sse_json_event(sequence, json!({
+        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "connecting",
             "message": "connecting to remote broker",
         })));
-        let mut broker_rx = match remote_sidecar_broker_request(&stream_state, "llm.stream", broker_payload).await {
+        let mut broker_rx = match remote_sidecar_broker_request(&stream_state, &broker_request_id, "llm.stream", broker_payload).await {
             Ok(rx) => rx,
             Err(_) => {
-                remote_sidecar_remove_active_run(&stream_state, &run_id);
                 sequence += 1;
-                yield Ok(remote_sse_json_event(sequence, json!({
+                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                     "type": "error",
                     "message": "remote broker is unavailable; wait for reconnect and retry",
                 })));
                 sequence += 1;
-                yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
                 return;
             }
         };
@@ -4840,14 +5064,15 @@ async fn remote_sidecar_chat_stream(
                 Ok(Some(envelope)) => envelope,
                 Ok(None) => break,
                 Err(_) => {
-                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                         "type": "error",
                         "message": "remote broker request timed out; retry to resume from persisted messages",
                     })));
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
                     break;
                 }
             };
@@ -4858,7 +5083,7 @@ async fn remote_sidecar_chat_stream(
                     if kind == "textDelta" {
                         text.push_str(delta);
                         sequence += 1;
-                        yield Ok(remote_sse_json_event(sequence, json!({
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "textDelta",
                             "assistantMessageId": assistant_message_id,
                             "delta": delta,
@@ -4866,14 +5091,14 @@ async fn remote_sidecar_chat_stream(
                     } else if kind == "reasoningDelta" {
                         reasoning.push_str(delta);
                         sequence += 1;
-                        yield Ok(remote_sse_json_event(sequence, json!({
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "reasoningDelta",
                             "assistantMessageId": assistant_message_id,
                             "delta": delta,
                         })));
                     } else if kind == "usageDelta" {
                         sequence += 1;
-                        yield Ok(remote_sse_json_event(sequence, json!({
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "usage",
                             "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
                         })));
@@ -4892,7 +5117,11 @@ async fn remote_sidecar_chat_stream(
                         Ok(database) => database,
                         Err(error) => {
                             sequence += 1;
-                            yield Ok(remote_sse_json_event(sequence, json!({ "type": "error", "message": error.to_string() })));
+                            yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "error", "message": error.to_string() })));
+                            sequence += 1;
+                            yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                            remote_sidecar_finish_active_run(&stream_state, &run_id);
+                            cleanup_guard.disarm();
                             break;
                         }
                     };
@@ -4953,11 +5182,12 @@ async fn remote_sidecar_chat_stream(
                         event_type: "completion",
                         payload_json: &completion_payload.to_string(),
                     });
-                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, completion_payload));
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, completion_payload));
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
                     break;
                 }
                 "error" => {
@@ -4979,20 +5209,22 @@ async fn remote_sidecar_chat_stream(
                             json!({ "error": { "message": message } }),
                         );
                     }
-                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                         "type": "error",
                         "message": envelope.payload.get("message").and_then(Value::as_str).unwrap_or("remote broker unavailable"),
                     })));
                     sequence += 1;
-                    yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
                     break;
                 }
                 _ => {}
             }
         }
-        remote_sidecar_remove_active_run(&stream_state, &run_id);
+        remote_sidecar_finish_active_run(&stream_state, &run_id);
+        cleanup_guard.disarm();
     };
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -5002,18 +5234,60 @@ async fn remote_sidecar_chat_stream(
 }
 
 async fn remote_sidecar_chat_run_stream(
-    State(_state): State<RemoteSidecarState>,
-    AxumPath(_run_id): AxumPath<String>,
+    State(state): State<RemoteSidecarState>,
+    AxumPath(run_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     axum::response::Response,
 > {
+    let after_sequence = query
+        .get("afterSequence")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let run_stream = remote_sidecar_active_run_stream(&state, &run_id).ok_or_else(|| {
+        ApiError::bad_request(format!("active chat run was not found: {run_id}")).into_response()
+    })?;
+    let mut rx = run_stream.tx.subscribe();
+    let replay = run_stream.snapshot_after(after_sequence);
     let stream = async_stream::stream! {
-        yield Ok(Event::default().data(json!({
-            "type": "error",
-            "message": "remote run is not active in this sidecar session; reload chat messages to recover persisted state",
-        }).to_string()));
-        yield Ok(Event::default().data(json!({ "type": "streamEnd" }).to_string()));
+        let mut last_sent_sequence = after_sequence;
+        for (sequence, event) in replay {
+            if sequence <= last_sent_sequence {
+                continue;
+            }
+            let terminal = remote_stream_event_is_terminal(&event);
+            yield Ok(remote_sse_json_event(sequence, event));
+            last_sent_sequence = sequence;
+            if terminal {
+                return;
+            }
+        }
+        while !run_stream.finished.load(Ordering::Relaxed) {
+            match rx.recv().await {
+                Ok((sequence, event)) => {
+                    if sequence <= last_sent_sequence {
+                        continue;
+                    }
+                    let terminal = remote_stream_event_is_terminal(&event);
+                    yield Ok(remote_sse_json_event(sequence, event));
+                    last_sent_sequence = sequence;
+                    if terminal {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let sequence = last_sent_sequence.saturating_add(1);
+                    yield Ok(remote_sse_json_event(sequence, json!({
+                        "type": "error",
+                        "message": "remote run stream history was truncated; reload chat messages to recover persisted state",
+                    })));
+                    yield Ok(remote_sse_json_event(sequence.saturating_add(1), json!({ "type": "streamEnd" })));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
     };
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -5023,29 +5297,21 @@ async fn remote_sidecar_chat_run_stream(
 }
 
 async fn remote_sidecar_chat_run_events_stream(
-    State(_state): State<RemoteSidecarState>,
-    AxumPath(_run_id): AxumPath<String>,
+    State(state): State<RemoteSidecarState>,
+    AxumPath(run_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     axum::response::Response,
 > {
-    remote_sidecar_chat_run_stream(State(_state), AxumPath(_run_id)).await
+    remote_sidecar_chat_run_stream(State(state), AxumPath(run_id), Query(query)).await
 }
 
 async fn remote_sidecar_chat_run_cancel(
     State(state): State<RemoteSidecarState>,
     AxumPath(run_id): AxumPath<String>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let cancel = ControlEnvelope {
-        version: 1,
-        message_type: "cancel".to_string(),
-        id: Some(run_id.clone()),
-        method: None,
-        payload: json!({}),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
-    let _ = state.broker_tx.send(cancel);
-    remote_sidecar_remove_active_run(&state, &run_id);
+    remote_sidecar_cancel_active_run(&state, &run_id, true, false);
     Ok(Json(json!({ "ok": true, "runId": run_id })))
 }
 
@@ -6469,6 +6735,33 @@ async fn remote_sidecar_plans_worktree_cleanup(
 mod tests {
     use super::*;
 
+    fn test_sidecar_state(
+        workspace_path: String,
+        ws_count: usize,
+    ) -> (
+        RemoteSidecarState,
+        tokio::sync::broadcast::Receiver<ControlEnvelope>,
+    ) {
+        let (broker_tx, broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(16);
+        (
+            RemoteSidecarState {
+                token: "token".to_string(),
+                last_config_hash: Arc::new(Mutex::new(None)),
+                code_graph_watcher: Arc::new(Mutex::new(None)),
+                ws_count: Arc::new(AtomicUsize::new(ws_count)),
+                active_run_count: Arc::new(AtomicUsize::new(0)),
+                active_runs: Arc::new(Mutex::new(Vec::new())),
+                active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+                broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+                broker_tx,
+                shutdown_tx: default_shutdown_tx(),
+                workspace_id: "workspace".to_string(),
+                workspace_path,
+            },
+            broker_rx,
+        )
+    }
+
     #[test]
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
@@ -6484,6 +6777,8 @@ mod tests {
         assert!(script.contains("grep -F -- \"--server-id $sid\""));
         assert!(script.contains("grep -F -- \"--workspace-id $wid\""));
         assert!(script.contains("grep -F -- \"--workspace-path $wpath\""));
+        assert!(script.contains("awk '{print $4}' \"/proc/$pid/stat\""));
+        assert!(script.contains("[ \"$ppid\" = \"1\" ] || continue"));
     }
 
     #[test]
@@ -6543,6 +6838,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
+            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -6579,6 +6875,153 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].sequence, 0);
         assert_eq!(messages[2].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_chats_exposes_queued_run_from_messages() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let queued = remote_sidecar_chat_queue(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "message": "hello from queue",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+                "idempotencyKey": "submit-1",
+            })),
+        )
+        .await
+        .expect("queue message")
+        .0;
+
+        let chats = remote_sidecar_workspace_chats(State(state), Query(HashMap::new()))
+            .await
+            .expect("workspace chats")
+            .0;
+        assert_eq!(chats["chats"][0]["id"], queued["chatId"]);
+        assert_eq!(chats["chats"][0]["queuedRun"]["status"], "queued");
+        assert_eq!(
+            chats["chats"][0]["queuedRun"]["content"],
+            "hello from queue"
+        );
+        assert_eq!(
+            chats["chats"][0]["queuedRun"]["userMessageId"],
+            queued["userMessageId"]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chat_run_stream_replays_buffered_events_after_sequence() {
+        let (state, _) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        run_stream.record(0, json!({ "type": "start", "chatId": "chat-1" }));
+        run_stream.record(
+            1,
+            json!({
+                "type": "textDelta",
+                "assistantMessageId": "assistant-1",
+                "delta": "hello",
+            }),
+        );
+        run_stream.record(2, json!({ "type": "streamEnd" }));
+        run_stream.mark_finished();
+
+        let response = remote_sidecar_chat_run_stream(
+            State(state),
+            AxumPath("run-1".to_string()),
+            Query(HashMap::from([(
+                "afterSequence".to_string(),
+                "0".to_string(),
+            )])),
+        )
+        .await
+        .expect("run stream");
+        let body = response.into_response().into_body();
+        let bytes = tokio::time::timeout(
+            Duration::from_millis(200),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("SSE body should finish")
+        .expect("SSE bytes");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(!text.contains("\"type\":\"start\""));
+        assert!(text.contains("\"type\":\"textDelta\""));
+        assert!(text.contains("\"type\":\"streamEnd\""));
+    }
+
+    #[tokio::test]
+    async fn remote_chat_run_cancel_uses_broker_request_id() {
+        let (state, mut broker_rx) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        run_stream.set_broker_request_id("broker-request-1".to_string());
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: "remote-run-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            },
+        );
+        while broker_rx.try_recv().is_ok() {}
+
+        let response = remote_sidecar_chat_run_cancel(
+            State(state.clone()),
+            AxumPath("remote-run-1".to_string()),
+        )
+        .await
+        .expect("cancel response")
+        .0;
+        assert_eq!(response["ok"], true);
+
+        let cancel = broker_rx.recv().await.expect("cancel envelope");
+        assert_eq!(cancel.message_type, "cancel");
+        assert_eq!(cancel.id.as_deref(), Some("broker-request-1"));
+        assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_run_cleanup_guard_removes_pending_broker_request() {
+        let (state, _broker_rx) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        run_stream.set_broker_request_id("broker-request-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state
+            .broker_pending
+            .lock()
+            .await
+            .insert("broker-request-1".to_string(), tx);
+
+        {
+            let _guard = RemoteRunCleanupGuard::new(state.clone(), "remote-run-1".to_string());
+        }
+
+        assert!(
+            state
+                .broker_pending
+                .lock()
+                .await
+                .get("broker-request-1")
+                .is_none()
+        );
+        assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
     }
 
     #[test]
@@ -6754,6 +7197,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
+            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -6790,6 +7234,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
+            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -6835,6 +7280,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(1)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
+            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -6844,6 +7290,7 @@ mod tests {
 
         let mut response_rx = remote_sidecar_broker_request(
             &state,
+            "broker-request-test",
             "llm.stream",
             json!({ "providerId": "provider", "modelId": "model", "messages": [] }),
         )
