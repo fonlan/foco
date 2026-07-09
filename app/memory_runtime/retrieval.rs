@@ -911,6 +911,17 @@ pub(crate) fn stored_prompt_context_record_memory_keys(
     })
 }
 
+pub(crate) fn stored_prompt_context_record_memory_summaries(
+    record: &PromptContextInjectionRecord,
+) -> Result<Vec<ChatMemoryUsedSummary>, ApiError> {
+    serde_json::from_str(&record.memory_summaries_json).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to parse stored prompt context injection '{}' memory summaries: {source}",
+            record.id
+        ))
+    })
+}
+
 pub(crate) fn persist_pending_prompt_context_injections(
     database: &mut WorkspaceDatabase,
     chat_id: &str,

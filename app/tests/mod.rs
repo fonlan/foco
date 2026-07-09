@@ -27,9 +27,9 @@ use foco_store::{
     },
     workspace::{
         LlmRequestAuditFilters, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphSymbol,
-        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession,
-        NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
-        WorkspaceSpecTriggerType,
+        NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
+        WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -13392,6 +13392,177 @@ fn chat_message_summary_includes_assistant_reply_metrics() {
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn chat_message_summary_prefers_prompt_context_memory_summaries() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-message-memory-source-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Memory source chat")
+        .expect("chat insert");
+    for (id, role, sequence, metadata_json) in [
+        ("user-1", "user", 0, Some("{}")),
+        (
+            "assistant-1",
+            "assistant",
+            1,
+            Some(
+                r#"{"memoriesUsed":[{"id":"metadata-fact","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Old metadata memory.","pinned":false,"source":"direct"}]}"#,
+            ),
+        ),
+        ("user-2", "user", 2, Some("{}")),
+        (
+            "assistant-2",
+            "assistant",
+            3,
+            Some(
+                r#"{"memoriesUsed":[{"id":"metadata-fact-2","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Old metadata memory 2.","pinned":false,"source":"direct"}]}"#,
+            ),
+        ),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id,
+                chat_id: "chat-1",
+                role,
+                content: role,
+                sequence,
+                metadata_json,
+            })
+            .expect("message insert");
+    }
+
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "stable-injection",
+            chat_id: "chat-1",
+            kind: "stable",
+            sequence: None,
+            messages_json: "[]",
+            memory_keys_json: r#"["workspace:stable-fact"]"#,
+            memory_summaries_json: r#"[{"id":"stable-fact","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Stable memory.","pinned":false,"source":"direct"}]"#,
+        })
+        .expect("stable prompt context insert");
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "turn-injection-1",
+            chat_id: "chat-1",
+            kind: "turn_memory",
+            sequence: Some(0),
+            messages_json: "[]",
+            memory_keys_json: r#"["workspace:turn-fact-1"]"#,
+            memory_summaries_json: r#"[{"id":"turn-fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Turn memory 1.","pinned":false,"source":"direct"}]"#,
+        })
+        .expect("turn prompt context insert");
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "turn-injection-2",
+            chat_id: "chat-1",
+            kind: "turn_memory",
+            sequence: Some(2),
+            messages_json: "[]",
+            memory_keys_json: r#"["workspace:turn-fact-2"]"#,
+            memory_summaries_json: r#"[{"id":"turn-fact-2","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Turn memory 2.","pinned":false,"source":"direct"}]"#,
+        })
+        .expect("turn prompt context insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries");
+    let assistant_summaries = summaries
+        .iter()
+        .filter(|summary| summary.role == "assistant")
+        .collect::<Vec<_>>();
+
+    assert_eq!(assistant_summaries.len(), 2);
+    assert_eq!(assistant_summaries[0].memories_used.len(), 2);
+    assert_eq!(assistant_summaries[0].memories_used[0].id, "stable-fact");
+    assert_eq!(assistant_summaries[0].memories_used[1].id, "turn-fact-1");
+    assert_eq!(assistant_summaries[1].memories_used.len(), 1);
+    assert_eq!(assistant_summaries[1].memories_used[0].id, "turn-fact-2");
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn chat_statistics_counts_prompt_context_memory_summaries() {
+    let prompt_injections = vec![
+        PromptContextInjectionRecord {
+            id: "stable-injection".to_string(),
+            chat_id: "chat-1".to_string(),
+            kind: "stable".to_string(),
+            sequence: None,
+            messages_json: "[]".to_string(),
+            memory_keys_json: r#"["workspace:legacy-a","workspace:legacy-b"]"#.to_string(),
+            memory_summaries_json: r#"[{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"A","pinned":false,"source":"direct"},{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"A duplicate","pinned":false,"source":"direct"}]"#.to_string(),
+            created_at: "2026-07-09T00:00:00Z".to_string(),
+        },
+        PromptContextInjectionRecord {
+            id: "turn-injection".to_string(),
+            chat_id: "chat-1".to_string(),
+            kind: "turn_memory".to_string(),
+            sequence: Some(0),
+            messages_json: "[]".to_string(),
+            memory_keys_json: r#"["workspace:legacy-c"]"#.to_string(),
+            memory_summaries_json: r#"[{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"A again","pinned":false,"source":"related"},{"id":"fact-2","scope":"chat","chatId":"chat-1","kind":"project_fact","fact":"B","pinned":false,"source":"direct"}]"#.to_string(),
+            created_at: "2026-07-09T00:00:01Z".to_string(),
+        },
+    ];
+
+    let response = chat_statistics_response(
+        "workspace-1",
+        "chat-1",
+        ChatMessageRoleCounts::default(),
+        Vec::new(),
+        prompt_injections,
+        Vec::new(),
+        Vec::new(),
+        &[],
+        0,
+        CodeChangeStats::default(),
+        Vec::new(),
+        0,
+    )
+    .expect("chat statistics response");
+
+    assert_eq!(response.memory_references, 2);
+}
+
+#[test]
+fn chat_statistics_ignores_legacy_memory_keys_when_summaries_are_empty() {
+    let prompt_injections = vec![PromptContextInjectionRecord {
+        id: "legacy-injection".to_string(),
+        chat_id: "chat-1".to_string(),
+        kind: "turn_memory".to_string(),
+        sequence: Some(0),
+        messages_json: "[]".to_string(),
+        memory_keys_json: r#"["workspace:legacy-a","workspace:legacy-b"]"#.to_string(),
+        memory_summaries_json: "[]".to_string(),
+        created_at: "2026-07-09T00:00:00Z".to_string(),
+    }];
+
+    let response = chat_statistics_response(
+        "workspace-1",
+        "chat-1",
+        ChatMessageRoleCounts::default(),
+        Vec::new(),
+        prompt_injections,
+        Vec::new(),
+        Vec::new(),
+        &[],
+        0,
+        CodeChangeStats::default(),
+        Vec::new(),
+        0,
+    )
+    .expect("chat statistics response");
+
+    assert_eq!(response.memory_references, 0);
 }
 
 #[test]

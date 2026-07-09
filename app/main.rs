@@ -116,7 +116,7 @@ use crate::memory_runtime::{
     memory_prompt_context, memory_retrieval_tool_definition, memory_target_status_for_prompt,
     memory_tool_definitions, memory_tool_timeout_ms, parse_memory_retrieval_output,
     persist_pending_prompt_context_injections, prompt_cache_key, queue_memory_extraction_job,
-    splice_resolved_memory, stored_prompt_context_record_memory_keys,
+    splice_resolved_memory, stored_prompt_context_record_memory_summaries,
     stored_stable_prompt_context_messages,
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
@@ -8296,7 +8296,7 @@ fn chat_statistics_response(
         .iter()
         .filter_map(|row| row.total_latency_ms)
         .sum::<i64>();
-    let memory_references = unique_prompt_context_memory_keys(&prompt_injections)? as i64;
+    let memory_references = unique_prompt_context_memory_summaries(&prompt_injections)? as i64;
     let compression =
         chat_compression_statistics(&compression_snapshots, runtime_tool_state_snapshot_count);
     let context_usage_timeline =
@@ -8343,19 +8343,22 @@ fn chat_message_role_counts(records: Vec<MessageRoleCountRecord>) -> ChatMessage
     counts
 }
 
-fn unique_prompt_context_memory_keys(
+fn unique_prompt_context_memory_summaries(
     prompt_injections: &[PromptContextInjectionRecord],
 ) -> Result<usize, ApiError> {
-    let mut keys = HashSet::new();
+    let mut memory_ids = HashSet::new();
 
     for injection in prompt_injections {
-        keys.extend(stored_prompt_context_record_memory_keys(injection)?);
+        for summary in stored_prompt_context_record_memory_summaries(injection)? {
+            let scope = summary.scope.trim();
+            let id = summary.id.trim();
+            if !scope.is_empty() && !id.is_empty() {
+                memory_ids.insert((scope.to_string(), id.to_string()));
+            }
+        }
     }
 
-    Ok(keys
-        .into_iter()
-        .filter(|key| !key.trim().is_empty())
-        .count())
+    Ok(memory_ids.len())
 }
 
 fn chat_compression_statistics(
@@ -9094,6 +9097,46 @@ fn assistant_memories_used_from_metadata(
     })
 }
 
+fn prompt_context_memory_summaries_by_assistant_sequence(
+    prompt_injections: &[PromptContextInjectionRecord],
+    first_assistant_sequence: Option<i64>,
+) -> Result<(HashMap<i64, Vec<ChatMemoryUsedSummary>>, bool), ApiError> {
+    let mut by_assistant_sequence = HashMap::<i64, Vec<ChatMemoryUsedSummary>>::new();
+    let mut has_memory_summaries = false;
+    let mut attached_stable_summaries = false;
+
+    for injection in prompt_injections {
+        let summaries = stored_prompt_context_record_memory_summaries(injection)?;
+        if summaries.is_empty() {
+            continue;
+        }
+        has_memory_summaries = true;
+
+        match injection.kind.as_str() {
+            "stable" if !attached_stable_summaries => {
+                if let Some(sequence) = first_assistant_sequence {
+                    by_assistant_sequence
+                        .entry(sequence)
+                        .or_default()
+                        .extend(summaries);
+                    attached_stable_summaries = true;
+                }
+            }
+            "turn_memory" => {
+                if let Some(sequence) = injection.sequence {
+                    by_assistant_sequence
+                        .entry(sequence + 1)
+                        .or_default()
+                        .extend(summaries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((by_assistant_sequence, has_memory_summaries))
+}
+
 fn assistant_spec_updates_from_metadata(
     metadata_json: &str,
 ) -> Result<Vec<ChatSpecUpdateSummary>, ApiError> {
@@ -9307,13 +9350,12 @@ fn assistant_parts_from_metadata(
 
 fn assistant_message_metadata_json(
     reasoning: Option<&str>,
-    memories_used: &[ChatMemoryUsedSummary],
+    _memories_used: &[ChatMemoryUsedSummary],
     code_change_stats: &CodeChangeStats,
     streaming_state: Option<&str>,
     parts: Option<&[StoredChatMessagePart]>,
 ) -> Result<String, ApiError> {
     if reasoning.is_none()
-        && memories_used.is_empty()
         && code_change_stats.additions == 0
         && code_change_stats.deletions == 0
         && streaming_state.is_none()
@@ -9328,9 +9370,6 @@ fn assistant_message_metadata_json(
             "reasoning".to_string(),
             Value::String(reasoning.to_string()),
         );
-    }
-    if !memories_used.is_empty() {
-        metadata.insert("memoriesUsed".to_string(), json!(memories_used));
     }
     if code_change_stats.additions > 0 || code_change_stats.deletions > 0 {
         metadata.insert("codeChangeStats".to_string(), json!(code_change_stats));
@@ -10419,6 +10458,18 @@ fn chat_message_summaries_for_chat(
         }
     }
 
+    let (mut memories_used_by_assistant_sequence, has_prompt_context_memory_summaries) =
+        prompt_context_memory_summaries_by_assistant_sequence(
+            &database
+                .prompt_context_injections_for_chat(chat_id)
+                .map_err(ApiError::from_workspace_error)?,
+            messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .map(|message| message.sequence)
+                .min(),
+        )?;
+
     let mut summaries = Vec::new();
     for message in messages {
         let Some(visible_role) =
@@ -10442,7 +10493,17 @@ fn chat_message_summaries_for_chat(
             None
         };
         let memories_used = if is_assistant_message {
-            assistant_memories_used_from_metadata(&message.metadata_json)?
+            memories_used_by_assistant_sequence
+                .remove(&message.sequence)
+                .filter(|memories| !memories.is_empty())
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    if has_prompt_context_memory_summaries {
+                        Ok(Vec::new())
+                    } else {
+                        assistant_memories_used_from_metadata(&message.metadata_json)
+                    }
+                })?
         } else {
             Vec::new()
         };
