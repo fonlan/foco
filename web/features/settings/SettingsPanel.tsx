@@ -11478,29 +11478,6 @@ export function SettingsPanel({
                   </dl>
                 </div>
               </section>
-              {settingsFilePickerRequest ? (
-                <FilePickerDialog
-                  initialPath={settingsFilePickerRequest.initialPath}
-                  mode={settingsFilePickerRequest.mode}
-                  multiple={settingsFilePickerRequest.multiple}
-                  open={true}
-                  target={settingsFilePickerRequest.target}
-                  title={settingsFilePickerRequest.title}
-                  t={t}
-                  onClose={() => {
-                    setSettingsFilePickerRequest(null);
-                    setIsSelectingPromptFile(false);
-                    setIsSelectingWorkspaceFormPath(false);
-                  }}
-                  onSelect={(selection) => {
-                    const request = settingsFilePickerRequest;
-                    setSettingsFilePickerRequest(null);
-                    setIsSelectingPromptFile(false);
-                    setIsSelectingWorkspaceFormPath(false);
-                    request.onSelect(selection);
-                  }}
-                />
-              ) : null}
               {updateConfirm ? (
                 <>
                   <button
@@ -11567,6 +11544,29 @@ export function SettingsPanel({
                 </>
               ) : null}
             </>
+          ) : null}
+          {settingsFilePickerRequest ? (
+            <FilePickerDialog
+              initialPath={settingsFilePickerRequest.initialPath}
+              mode={settingsFilePickerRequest.mode}
+              multiple={settingsFilePickerRequest.multiple}
+              open={true}
+              target={settingsFilePickerRequest.target}
+              title={settingsFilePickerRequest.title}
+              t={t}
+              onClose={() => {
+                setSettingsFilePickerRequest(null);
+                setIsSelectingPromptFile(false);
+                setIsSelectingWorkspaceFormPath(false);
+              }}
+              onSelect={(selection) => {
+                const request = settingsFilePickerRequest;
+                setSettingsFilePickerRequest(null);
+                setIsSelectingPromptFile(false);
+                setIsSelectingWorkspaceFormPath(false);
+                request.onSelect(selection);
+              }}
+            />
           ) : null}
         </div>
       </div>

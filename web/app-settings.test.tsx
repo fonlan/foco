@@ -1799,6 +1799,26 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("opens the prompt file picker from prompt settings", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    const choosePromptFileButton = screen.getByRole("button", { name: "Choose prompt file" });
+    await userEvent.click(choosePromptFileButton);
+
+    const dialog = await screen.findByRole("dialog", { name: "Select prompt file" });
+    expect(dialog).toBeInTheDocument();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Select prompt file" })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "Choose prompt file" })).not.toBeDisabled();
+  });
+
   it("hides the built-in image agent role prompt from prompt settings", async () => {
     renderApp();
 
