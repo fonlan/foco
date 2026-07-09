@@ -2306,8 +2306,12 @@ function commandOutputText(output: JsonValue | null) {
   return parts.length ? parts.join("\n") : null;
 }
 
-function successfulUpdateSpecMarkdown(toolCall: ChatToolCallSummary) {
-  if (toolCall.name !== "update_spec" || toolCall.isError || toolCall.status !== "completed") {
+function successfulSpecMarkdown(toolCall: ChatToolCallSummary) {
+  if (
+    (toolCall.name !== "read_spec" && toolCall.name !== "update_spec") ||
+    toolCall.isError ||
+    toolCall.status !== "completed"
+  ) {
     return null;
   }
   if (!isJsonRecord(toolCall.output)) {
@@ -2457,12 +2461,12 @@ function CompactToolCallView({
     return <EditFileDiffBlock diff={diff} />;
   }
 
-  const updateSpecMarkdown = successfulUpdateSpecMarkdown(toolCall);
-  if (updateSpecMarkdown !== null) {
+  const specMarkdown = successfulSpecMarkdown(toolCall);
+  if (specMarkdown !== null) {
     return (
       <div className="panel-scroll max-h-64 overflow-auto border-l border-stone-200 pl-3">
         <MarkdownContent
-          content={updateSpecMarkdown}
+          content={specMarkdown}
           isUser={false}
           selectedSkillPrefix={EMPTY_SELECTED_SKILL_PREFIX}
         />

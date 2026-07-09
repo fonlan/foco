@@ -741,6 +741,72 @@ describe("app-shell verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("renders successful read_spec contentMarkdown as markdown in compact mode", async () => {
+    const readSpecChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = readSpecChatMessages.messages[1];
+    const readSpecToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { injectEnabled: true },
+      name: "read_spec",
+      output: {
+        contentMarkdown: "# Current Spec\n\nA **bold** project note.",
+        enabled: true,
+        injectEnabled: true,
+        revision: 4,
+      },
+    };
+    assistantMessage.toolCalls = [readSpecToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: readSpecToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...readSpecChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Read Spec (read_spec)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(
+      await within(assistantBubble).findByRole("heading", { name: "Current Spec" }),
+    ).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("bold").tagName).toBe("STRONG");
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(
+      within(assistantBubble).queryByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"contentMarkdown"')),
+      ),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
+
+    expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"contentMarkdown": "# Current Spec')),
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("renders successful update_spec contentMarkdown as markdown in compact mode", async () => {
     const updateSpecChatMessages = JSON.parse(JSON.stringify(chatMessages));
     const assistantMessage = updateSpecChatMessages.messages[1];
