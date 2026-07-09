@@ -1594,12 +1594,17 @@ async fn remote_control_ws(
                     };
                     if matches!(envelope.message_type.as_str(), "response" | "error" | "stream") {
                         if let Some(id) = envelope.id.clone() {
-                            if let Some(tx) = state.broker_pending.lock().await.get(&id).cloned() {
-                                let terminal = envelope.message_type == "response" || envelope.message_type == "error";
-                                let _ = tx.send(envelope);
+                            let terminal = envelope.message_type == "response" || envelope.message_type == "error";
+                            let tx = {
+                                let mut pending = state.broker_pending.lock().await;
                                 if terminal {
-                                    state.broker_pending.lock().await.remove(&id);
+                                    pending.remove(&id)
+                                } else {
+                                    pending.get(&id).cloned()
                                 }
+                            };
+                            if let Some(tx) = tx {
+                                let _ = tx.send(envelope);
                             }
                         }
                         continue;
@@ -8166,6 +8171,74 @@ mod tests {
         assert!(text.contains("hello remote"));
         assert!(text.contains("\"type\":\"complete\""));
         assert!(text.contains("\"type\":\"streamEnd\""));
+    }
+
+    #[tokio::test]
+    async fn remote_control_ws_delivers_terminal_broker_response_without_deadlocking() {
+        let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
+        let state = RemoteSidecarState {
+            token: "token".to_string(),
+            last_config_hash: Arc::new(Mutex::new(None)),
+            runtime_config: Arc::new(Mutex::new(None)),
+            code_graph_watcher: Arc::new(Mutex::new(None)),
+            ws_count: Arc::new(AtomicUsize::new(0)),
+            active_run_count: Arc::new(AtomicUsize::new(0)),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            broker_tx,
+            shutdown_tx: default_shutdown_tx(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: "/tmp/workspace".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test ws");
+        let port = listener.local_addr().expect("local addr").port();
+        let app = Router::new()
+            .route("/ws", get(remote_control_ws))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test ws");
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state
+            .broker_pending
+            .lock()
+            .await
+            .insert("broker-request-1".to_string(), tx);
+        let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+            .await
+            .expect("connect test ws");
+        let response = ControlEnvelope {
+            version: 1,
+            message_type: "response".to_string(),
+            id: Some("broker-request-1".to_string()),
+            method: None,
+            payload: json!({ "ok": true }),
+            timestamp: None,
+        };
+        socket
+            .send(tungstenite::Message::Text(
+                serde_json::to_string(&response)
+                    .expect("response json")
+                    .into(),
+            ))
+            .await
+            .expect("send response");
+
+        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("pending response timeout")
+            .expect("pending response");
+        assert_eq!(envelope.message_type, "response");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(state.broker_pending.lock().await.is_empty());
+        })
+        .await
+        .expect("pending map lock should not deadlock");
+        server.abort();
     }
 
     #[tokio::test]
