@@ -2545,8 +2545,8 @@ function ContextMiniBarChart({
   return (
     <div className="context-mini-chart context-mini-chart-bars">
       {data.map((item, index) => (
-        <div className="context-mini-bar-row" key={item.id} title={valueFormatter(item.value)}>
-          <span className="context-mini-bar-label">{item.label}</span>
+        <div className="context-mini-bar-row" key={item.id} title={`${item.label}: ${valueFormatter(item.value)}`}>
+          <span className="context-mini-bar-label" title={item.label}>{item.label}</span>
           <span className="context-mini-bar-track">
             <span
               className="context-mini-bar-fill"
@@ -2556,7 +2556,7 @@ function ContextMiniBarChart({
               }}
             />
           </span>
-          <span className="context-mini-bar-value">{valueFormatter(item.value)}</span>
+          <span className="context-mini-bar-value" title={valueFormatter(item.value)}>{valueFormatter(item.value)}</span>
         </div>
       ))}
     </div>
