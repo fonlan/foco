@@ -87,6 +87,14 @@ pub(crate) struct MemoryDreamJobResult {
     pub(crate) failed_changes: usize,
 }
 
+struct StartedMemoryDreamJob {
+    job_id: String,
+    model_selection: Option<MemoryDreamModelSelection>,
+    model_resolution_error: Option<String>,
+    policy: MemoryDreamSafetyPolicy,
+    transcript: MemoryDreamTranscript,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryDreamModelSelection {
     pub(crate) model_id: String,
@@ -271,6 +279,27 @@ impl MemoryDreamTranscript {
         Ok(transcript)
     }
 
+    fn resume(request: MemoryDreamJobRequest<'_>, chat_id: String) -> Result<Self, ApiError> {
+        if !request.settings.create_transcript_chat {
+            return Ok(Self::disabled());
+        }
+        let Some(transcript_request) = request.transcript else {
+            return Ok(Self::disabled());
+        };
+
+        let database = WorkspaceDatabase::open_or_create(transcript_request.workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        let next_sequence = database
+            .next_message_sequence_for_chat(&chat_id)
+            .map_err(ApiError::from_workspace_error)?;
+
+        Ok(Self {
+            chat_id: Some(chat_id),
+            database: Some(database),
+            next_sequence,
+        })
+    }
+
     fn chat_id(&self) -> Option<&str> {
         self.chat_id.as_deref()
     }
@@ -324,11 +353,16 @@ pub(crate) async fn run_memory_dream_job(
     request: MemoryDreamJobRequest<'_>,
 ) -> Result<MemoryDreamJobResult, ApiError> {
     let started_at = Instant::now();
-    let policy = MemoryDreamSafetyPolicy::new(
-        request.settings.max_facts_per_run as usize,
-        request.settings.max_changes_per_run as usize,
-    )
-    .map_err(ApiError::from_memory_error)?;
+    let started = start_memory_dream_job(database, request)?;
+    let started = prepare_started_memory_dream_job(database, request, started.id)?;
+
+    finish_memory_dream_job(database, request, started, started_at).await
+}
+
+pub(crate) fn start_memory_dream_job(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+) -> Result<MemoryDreamJobRecord, ApiError> {
     let latest_success_at = database
         .latest_successful_dream_time(request.scope, request.workspace_id)
         .map_err(ApiError::from_memory_error)?;
@@ -361,6 +395,7 @@ pub(crate) async fn run_memory_dream_job(
         "triggerType": request.trigger_type.as_str(),
         "mode": request.mode.as_str(),
         "modelId": job_model_id,
+        "modelResolutionError": model_resolution_error,
         "latestSuccessfulDreamAt": latest_success_at,
         "maxFactsPerRun": request.settings.max_facts_per_run,
         "maxChangesPerRun": request.settings.max_changes_per_run,
@@ -392,7 +427,7 @@ pub(crate) async fn run_memory_dream_job(
         "Memory Dream job started"
     );
 
-    let mut transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
+    let transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
     if let Some(transcript_chat_id) = transcript.chat_id() {
         database
             .update_dream_job_status(UpdateMemoryDreamJob {
@@ -405,14 +440,85 @@ pub(crate) async fn run_memory_dream_job(
             .map_err(ApiError::from_memory_error)?;
     }
 
+    database
+        .dream_job(&job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))
+}
+
+pub(crate) async fn run_started_memory_dream_job(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    job_id: String,
+) -> Result<MemoryDreamJobResult, ApiError> {
+    let started_at = Instant::now();
+    let started = prepare_started_memory_dream_job(database, request, job_id)?;
+
+    finish_memory_dream_job(database, request, started, started_at).await
+}
+
+fn prepare_started_memory_dream_job(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    job_id: String,
+) -> Result<StartedMemoryDreamJob, ApiError> {
+    let policy = MemoryDreamSafetyPolicy::new(
+        request.settings.max_facts_per_run as usize,
+        request.settings.max_changes_per_run as usize,
+    )
+    .map_err(ApiError::from_memory_error)?;
+    let existing_job = database
+        .dream_job(&job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))?;
+    let mut model_resolution_error = None;
+    let model_selection = if request.mode == MemoryDreamRunMode::Llm {
+        match request.planner {
+            Some(planner) => resolve_memory_dream_model(
+                planner.config,
+                &planner.config.memory,
+                planner.chat_model_id,
+            )
+            .map(Some)
+            .unwrap_or_else(|error| {
+                model_resolution_error = Some(error.message);
+                None
+            }),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let transcript = if let Some(transcript_chat_id) = existing_job.transcript_chat_id {
+        MemoryDreamTranscript::resume(request, transcript_chat_id)?
+    } else {
+        MemoryDreamTranscript::disabled()
+    };
+
+    Ok(StartedMemoryDreamJob {
+        job_id,
+        model_selection,
+        model_resolution_error,
+        policy,
+        transcript,
+    })
+}
+
+async fn finish_memory_dream_job(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    mut started: StartedMemoryDreamJob,
+    started_at: Instant,
+) -> Result<MemoryDreamJobResult, ApiError> {
+    let job_id = started.job_id;
     let run_result = run_memory_dream_job_inner(
         database,
         &job_id,
         request,
-        model_selection,
-        model_resolution_error,
-        &policy,
-        &mut transcript,
+        started.model_selection,
+        started.model_resolution_error,
+        &started.policy,
+        &mut started.transcript,
     )
     .await;
     let output_summary_json = match run_result {
@@ -427,7 +533,7 @@ pub(crate) async fn run_memory_dream_job(
                     error_message: None,
                 })
                 .map_err(ApiError::from_memory_error)?;
-            transcript.record_json(
+            started.transcript.record_json(
                 "final status",
                 json!({
                     "status": MemoryDreamJobStatus::Completed.as_str(),
@@ -454,7 +560,7 @@ pub(crate) async fn run_memory_dream_job(
             let error_message = error.message.clone();
             let failure_summary = DreamRunSummary::failed(&error);
             let output_summary_json = failure_summary.to_json().to_string();
-            transcript.record_json(
+            started.transcript.record_json(
                 "final status",
                 json!({
                     "status": MemoryDreamJobStatus::Failed.as_str(),
@@ -483,10 +589,8 @@ pub(crate) async fn run_memory_dream_job(
     };
 
     let job = database
-        .dream_jobs_for_scope(request.scope, request.workspace_id, None, 1)
+        .dream_job(&job_id)
         .map_err(ApiError::from_memory_error)?
-        .into_iter()
-        .find(|job| job.id == job_id)
         .ok_or_else(|| ApiError::internal("memory Dream job was not found after completion"))?;
     let output_summary: Value =
         serde_json::from_str(&output_summary_json).unwrap_or_else(|_| json!({}));

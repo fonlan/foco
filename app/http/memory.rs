@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::memory_runtime::{
-    MemoryExtractionTask, memory_extraction_error_should_be_ignored, run_memory_dream_for_state,
-    run_memory_extraction_job,
+    MemoryExtractionTask, memory_extraction_error_should_be_ignored, run_memory_extraction_job,
+    spawn_manual_memory_dream_for_state,
 };
 use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
 use crate::*;
@@ -230,6 +230,7 @@ pub(crate) struct MemoryDreamRunResponse {
     job_id: String,
     status: String,
     transcript_chat_id: Option<String>,
+    job: MemoryDreamJobSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -1013,27 +1014,19 @@ pub(crate) async fn run_memory_dream(
         .filter(|value| !value.is_empty())
         .unwrap_or(config.memory.dream.mode.as_str());
     let mode = MemoryDreamRunMode::parse(mode).map_err(ApiError::from_memory_error)?;
-    let run_state = state.clone();
-    let run_config = config.clone();
-    let run_workspace_id = workspace_id.clone();
-    let result = tokio::spawn(async move {
-        run_memory_dream_for_state(
-            &run_state,
-            &run_config,
-            scope,
-            run_workspace_id.as_deref(),
-            MemoryDreamTriggerType::Manual,
-            mode,
-        )
-        .await
-    })
-    .await
-    .map_err(|source| ApiError::internal(format!("memory Dream task failed: {source}")))??;
+    let result =
+        spawn_manual_memory_dream_for_state(&state, &config, scope, workspace_id.as_deref(), mode)
+            .await?;
+    let transcript_workspace_id =
+        memory_dream_transcript_workspace_id(&config, result.transcript_chat_id.as_deref())?;
+    let database = open_dream_memory_database(&state, &config, scope, workspace_id.as_deref())?;
+    let job = memory_dream_job_summary(&database, result.clone(), transcript_workspace_id)?;
 
     Ok(Json(MemoryDreamRunResponse {
-        job_id: result.job.id,
-        status: result.job.status,
-        transcript_chat_id: result.job.transcript_chat_id,
+        job_id: result.id,
+        status: result.status,
+        transcript_chat_id: result.transcript_chat_id,
+        job,
     }))
 }
 

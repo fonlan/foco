@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use foco_store::{
     config::{GlobalConfig, WorkspaceConfig},
     memory::{
-        MemoryDatabase, MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope,
-        MemoryDreamTriggerType, UpdateMemoryDreamJob,
+        MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
+        MemoryDreamScope, MemoryDreamTriggerType, UpdateMemoryDreamJob,
     },
     workspace::{WorkspaceDatabase, workspace_database_path},
 };
@@ -14,7 +14,8 @@ use tokio::{task::JoinHandle, time};
 
 use crate::memory_runtime::dream::{
     MemoryDreamJobRequest, MemoryDreamJobResult, MemoryDreamPlannerRequest,
-    MemoryDreamTranscriptRequest, run_memory_dream_job,
+    MemoryDreamTranscriptRequest, run_memory_dream_job, run_started_memory_dream_job,
+    start_memory_dream_job,
 };
 use crate::*;
 
@@ -329,6 +330,173 @@ pub(crate) async fn run_memory_dream_for_state(
         run_memory_dream_guarded(state, config, scope, workspace_id, trigger_type, mode).await;
     state.memory_dream_runs.lock().await.remove(&active_key);
     result
+}
+
+pub(crate) async fn spawn_manual_memory_dream_for_state(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+    mode: MemoryDreamRunMode,
+) -> Result<MemoryDreamJobRecord, ApiError> {
+    let active_key = memory_dream_active_key(scope, workspace_id);
+    {
+        let mut active_runs = state.memory_dream_runs.lock().await;
+        if !active_runs.insert(active_key.clone()) {
+            return Err(ApiError::conflict("memory Dream is already running"));
+        }
+    }
+
+    let start_result = start_manual_memory_dream_guarded(state, config, scope, workspace_id, mode);
+    let job = match start_result {
+        Ok(job) => job,
+        Err(error) => {
+            state.memory_dream_runs.lock().await.remove(&active_key);
+            return Err(error);
+        }
+    };
+
+    let run_state = state.clone();
+    let run_config = config.clone();
+    let run_workspace_id = workspace_id.map(str::to_string);
+    let run_job_id = job.id.clone();
+    tokio::spawn(async move {
+        let result = run_started_memory_dream_guarded(
+            &run_state,
+            &run_config,
+            scope,
+            run_workspace_id.as_deref(),
+            MemoryDreamTriggerType::Manual,
+            mode,
+            run_job_id.clone(),
+        )
+        .await;
+        run_state.memory_dream_runs.lock().await.remove(&active_key);
+        if let Err(error) = result {
+            tracing::error!(
+                job_id = %run_job_id,
+                scope = scope.as_str(),
+                workspace_id = run_workspace_id.as_deref(),
+                error = %error.message,
+                "Manual Memory Dream background task failed"
+            );
+        }
+    });
+
+    Ok(job)
+}
+
+async fn run_started_memory_dream_guarded(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+    trigger_type: MemoryDreamTriggerType,
+    mode: MemoryDreamRunMode,
+    job_id: String,
+) -> Result<MemoryDreamJobResult, ApiError> {
+    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
+    let needs_runtime_workspace =
+        mode == MemoryDreamRunMode::Llm || config.memory.dream.create_transcript_chat;
+    let runtime_workspace =
+        memory_dream_runtime_workspace(config, scope, workspace_id, needs_runtime_workspace)?;
+    let planner = if mode == MemoryDreamRunMode::Llm {
+        let workspace = runtime_workspace.ok_or_else(|| {
+            ApiError::bad_request("LLM memory Dream requires a workspace for audit logging")
+        })?;
+        Some(MemoryDreamPlannerRequest {
+            config,
+            workspace_path: &workspace.path,
+            audit_workspace_id: &workspace.id,
+            audit_chat_id: None,
+            chat_model_id: None,
+        })
+    } else {
+        None
+    };
+    let transcript = if config.memory.dream.create_transcript_chat {
+        let workspace = runtime_workspace.ok_or_else(|| {
+            ApiError::bad_request("memory Dream transcript requires at least one workspace")
+        })?;
+        Some(MemoryDreamTranscriptRequest {
+            workspace_path: &workspace.path,
+        })
+    } else {
+        None
+    };
+
+    run_started_memory_dream_job(
+        &mut database,
+        MemoryDreamJobRequest {
+            scope,
+            workspace_id,
+            trigger_type,
+            mode,
+            model_id: config.memory.dream.model_id.as_deref(),
+            settings: &config.memory.dream,
+            config: Some(config),
+            global_memory_database_file: Some(&state.memory_database_file),
+            planner,
+            transcript,
+        },
+        job_id,
+    )
+    .await
+}
+
+fn start_manual_memory_dream_guarded(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+    mode: MemoryDreamRunMode,
+) -> Result<MemoryDreamJobRecord, ApiError> {
+    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
+    ensure_no_active_memory_dream_run(&database, scope, workspace_id)?;
+    let needs_runtime_workspace =
+        mode == MemoryDreamRunMode::Llm || config.memory.dream.create_transcript_chat;
+    let runtime_workspace =
+        memory_dream_runtime_workspace(config, scope, workspace_id, needs_runtime_workspace)?;
+    let planner = if mode == MemoryDreamRunMode::Llm {
+        let workspace = runtime_workspace.ok_or_else(|| {
+            ApiError::bad_request("LLM memory Dream requires a workspace for audit logging")
+        })?;
+        Some(MemoryDreamPlannerRequest {
+            config,
+            workspace_path: &workspace.path,
+            audit_workspace_id: &workspace.id,
+            audit_chat_id: None,
+            chat_model_id: None,
+        })
+    } else {
+        None
+    };
+    let transcript = if config.memory.dream.create_transcript_chat {
+        let workspace = runtime_workspace.ok_or_else(|| {
+            ApiError::bad_request("memory Dream transcript requires at least one workspace")
+        })?;
+        Some(MemoryDreamTranscriptRequest {
+            workspace_path: &workspace.path,
+        })
+    } else {
+        None
+    };
+
+    start_memory_dream_job(
+        &mut database,
+        MemoryDreamJobRequest {
+            scope,
+            workspace_id,
+            trigger_type: MemoryDreamTriggerType::Manual,
+            mode,
+            model_id: config.memory.dream.model_id.as_deref(),
+            settings: &config.memory.dream,
+            config: Some(config),
+            global_memory_database_file: Some(&state.memory_database_file),
+            planner,
+            transcript,
+        },
+    )
 }
 
 async fn run_memory_dream_guarded(

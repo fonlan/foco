@@ -31,7 +31,8 @@ pub(crate) use retrieval::{
     llm_memory_retrieval_candidates, memory_prompt_search, memory_prompt_search_terms,
     resolve_prompt_context_memory,
 };
-pub(crate) use scheduler::{MemoryDreamScheduler, run_memory_dream_for_state};
+pub(crate) use scheduler::{MemoryDreamScheduler, spawn_manual_memory_dream_for_state};
+
 pub(crate) use tools::memory_retrieval_tool_definition;
 #[cfg(test)]
 pub(crate) use tools::{

@@ -12159,6 +12159,33 @@ fn test_chat_outcome(final_state: &'static str) -> ChatAuditOutcome {
     }
 }
 
+async fn wait_for_workspace_dream_job_status(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+    status: MemoryDreamJobStatus,
+) -> foco_store::memory::MemoryDreamJobRecord {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let database = MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+            .expect("workspace memory database");
+        let job = database
+            .dream_job(job_id)
+            .expect("dream job lookup")
+            .expect("dream job exists");
+        if job.status == status.as_str() {
+            return job;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "dream job {job_id} did not reach status {} before timeout; current status was {}",
+                status.as_str(),
+                job.status
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn manual_memory_dream_http_runs_workspace_dream_and_lists_audit() {
     let profile = tempfile::tempdir().expect("profile");
@@ -12204,9 +12231,12 @@ async fn manual_memory_dream_http_runs_workspace_dream_and_lists_audit() {
         .await
         .expect("manual dream run");
     let run_response = serde_json::to_value(run_response).expect("run response json");
-    assert_eq!(run_response["status"], "completed");
+    assert_eq!(run_response["status"], "running");
+    assert_eq!(run_response["job"]["status"], "running");
     let job_id = run_response["jobId"].as_str().expect("job id").to_string();
     assert!(run_response["transcriptChatId"].as_str().is_some());
+    wait_for_workspace_dream_job_status(workspace.path(), &job_id, MemoryDreamJobStatus::Completed)
+        .await;
 
     let jobs_query: MemoryDreamJobsQuery =
         serde_json::from_value(json!({ "workspaceId": workspace_id })).expect("jobs query");
@@ -12239,6 +12269,40 @@ async fn manual_memory_dream_http_runs_workspace_dream_and_lists_audit() {
         changes_response["changes"][0]["targetFactIds"][0],
         "fact-expired"
     );
+}
+
+#[tokio::test]
+async fn manual_memory_dream_http_background_failure_marks_job_failed() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let run_request: MemoryDreamRunRequest = serde_json::from_value(json!({
+        "scope": "workspace",
+        "workspaceId": workspace_id,
+        "triggerType": "manual",
+        "mode": "llm"
+    }))
+    .expect("run request");
+    let Json(run_response) = run_memory_dream(State(state), Json(run_request))
+        .await
+        .expect("manual dream starts");
+    let run_response = serde_json::to_value(run_response).expect("run response json");
+    assert_eq!(run_response["status"], "running");
+    let job_id = run_response["jobId"].as_str().expect("job id").to_string();
+
+    let job = wait_for_workspace_dream_job_status(
+        workspace.path(),
+        &job_id,
+        MemoryDreamJobStatus::Failed,
+    )
+    .await;
+    assert!(job.error_message.as_deref().unwrap_or_default().len() > 0);
 }
 
 #[tokio::test]
