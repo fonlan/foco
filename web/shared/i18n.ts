@@ -85,6 +85,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Checking Sidecar version": "Checking Sidecar version",
     "Chat title generation model": "Chat title generation model",
     "Current chat model": "Current chat model",
+    "Show hidden files": "Show hidden files",
   },
   "zh-CN": {
     "Local workspace": "本地工作区",
@@ -425,6 +426,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select prompt file": "选择提示词文件",
     "Select a folder": "选择文件夹",
     "Select file": "选择文件",
+    "Show hidden files": "显示隐藏文件/文件夹",
     Up: "上一级",
     Loading: "正在加载",
     Select: "选择",

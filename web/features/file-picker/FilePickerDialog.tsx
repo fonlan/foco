@@ -51,6 +51,7 @@ export function FilePickerDialog({
   const [isConfirming, setIsConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshRevision, setRefreshRevision] = useState(0);
+  const [showHidden, setShowHidden] = useState(false);
   const targetIdentity = targetKey(target);
 
   useEffect(() => {
@@ -61,6 +62,7 @@ export function FilePickerDialog({
     setPath(nextPath);
     setDraftPath(nextPath);
     setSelectedPaths(new Set());
+    setShowHidden(false);
     setError(null);
   }, [initialPath, open, targetIdentity]);
 
@@ -79,6 +81,7 @@ export function FilePickerDialog({
         limit: FILE_PICKER_LIMIT,
         mode,
         path,
+        showHidden,
         target,
       }),
       headers: { "Content-Type": "application/json" },
@@ -107,7 +110,7 @@ export function FilePickerDialog({
       });
 
     return () => controller.abort();
-  }, [mode, open, path, refreshRevision, target, targetIdentity]);
+  }, [mode, open, path, refreshRevision, showHidden, target, targetIdentity]);
 
   const selectableEntries = useMemo(
     () => response?.entries.filter((entry) => isSelectable(entry, mode)) ?? [],
@@ -234,6 +237,16 @@ export function FilePickerDialog({
             <RefreshCw aria-hidden="true" className="size-4" />
           </button>
         </form>
+
+        <label className="flex items-center gap-2 border-b border-stone-100 px-4 py-2 text-xs font-medium text-stone-600">
+          <input
+            checked={showHidden}
+            className="size-4 rounded border-stone-300 text-stone-900 focus:ring-stone-300"
+            onChange={(event) => setShowHidden(event.target.checked)}
+            type="checkbox"
+          />
+          <span>{t("Show hidden files")}</span>
+        </label>
 
         <div className="flex items-center gap-2 border-b border-stone-100 px-4 py-2 text-xs text-stone-500">
           <button
