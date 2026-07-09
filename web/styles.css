@@ -2851,14 +2851,13 @@ body,
   background: var(--foco-panel);
   padding: 0.625rem;
   --context-bar-label-width: 4.25rem;
-  --context-bar-value-width: 3.25rem;
+  --context-bar-value-width: 4.75rem;
 }
 
 .context-mini-chart-bars {
   display: flex;
   flex-direction: column;
   gap: 0.375rem;
-  padding: 0;
 }
 
 .context-mini-bar-row {
