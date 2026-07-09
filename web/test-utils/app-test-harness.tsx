@@ -6,6 +6,7 @@ import type {
   ConfiguredSkillSummary,
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
+  MemoryDreamJobsResponse,
   Plan,
   QuestionRequestSummary,
   SettingsWorkspaceSpecJobSummary,
@@ -2193,6 +2194,7 @@ export const appTestState: {
   answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
+  memoryDreamJobsResponses: MemoryDreamJobsResponse[];
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
   lastManualWorkspaceRequest: Partial<ConfiguredWorkspaceSummary> | null;
@@ -2217,6 +2219,7 @@ export const appTestState: {
   answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
+  memoryDreamJobsResponses: [],
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
   lastManualWorkspaceRequest: null,
@@ -2531,6 +2534,7 @@ export function resetAppTestEnvironment() {
   appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
+  appTestState.memoryDreamJobsResponses = [];
   appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
   appTestState.lastManualWorkspaceRequest = null;
@@ -3506,6 +3510,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/memory/dream/jobs") {
+    const queuedResponse = appTestState.memoryDreamJobsResponses.shift();
+    if (queuedResponse) {
+      return jsonResponse(queuedResponse);
+    }
+
     const page = Number(requestUrl.searchParams.get("page") ?? "1");
     const pageSize = Math.min(
       200,
@@ -3525,8 +3534,9 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/memory/dream/run") {
     return jsonResponse({
+      job: { ...memoryDreamJob, completedAt: null, status: "running" },
       jobId: memoryDreamJob.id,
-      status: "queued",
+      status: "running",
       transcriptChatId: memoryDreamJob.transcriptChatId,
     });
   }

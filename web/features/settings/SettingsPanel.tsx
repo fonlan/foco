@@ -332,6 +332,8 @@ const PROVIDER_SERVICE_PRESETS: ProviderServicePreset[] = [
 
 const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 
+const MEMORY_DREAM_POLL_INTERVAL_MS = 3000;
+
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
 type SkillStoreUpdateResponse = {
@@ -1237,6 +1239,28 @@ export function SettingsPanel({
     }
   }, []);
 
+  const showOptimisticMemoryDreamJob = useCallback((job: MemoryDreamJobSummary) => {
+    setMemoryDreamPage(1);
+    setMemoryDreamJobs((current) =>
+      [job, ...current.filter((item) => item.id !== job.id)].slice(
+        0,
+        memoryDreamPageSize,
+      ),
+    );
+    setMemoryDreamMeta((current) => {
+      const totalCount = Math.max(current.totalCount + 1, 1);
+      return {
+        page: 1,
+        pageSize: memoryDreamPageSize,
+        totalCount,
+        totalPages: Math.max(1, Math.ceil(totalCount / memoryDreamPageSize)),
+      };
+    });
+    setMemoryDreamDetailJobSnapshot((current) =>
+      current?.id === job.id ? job : current,
+    );
+  }, [memoryDreamPageSize]);
+
   const loadSpecJobs = useCallback(async () => {
     setIsLoadingSpecJobs(true);
     setError(null);
@@ -1351,6 +1375,18 @@ export function SettingsPanel({
       void loadMemoryDreamJobs();
     }
   }, [activeSection, loadMemoryDreamJobs]);
+
+  useEffect(() => {
+    if (activeSection !== "memory" || activeMemoryDreamJobKeys.size === 0) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadMemoryDreamJobs();
+    }, MEMORY_DREAM_POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [activeMemoryDreamJobKeys.size, activeSection, loadMemoryDreamJobs]);
 
   useEffect(() => {
     if (activeSection === "spec") {
@@ -2590,9 +2626,10 @@ export function SettingsPanel({
     const runKey = memoryDreamJobKey(scope, workspaceId);
     setMemoryDreamRunKey(runKey);
     setMemoryDreamError(null);
+    let runError: string | null = null;
 
     try {
-      await requestJson<MemoryDreamRunResponse>("/api/memory/dream/run", {
+      const data = await requestJson<MemoryDreamRunResponse>("/api/memory/dream/run", {
         body: JSON.stringify({
           scope,
           ...(workspaceId ? { workspaceId } : {}),
@@ -2602,11 +2639,19 @@ export function SettingsPanel({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      await loadMemoryDreamJobs(1);
+      if (data.job) {
+        showOptimisticMemoryDreamJob(data.job);
+      }
     } catch (requestError) {
-      setMemoryDreamError(errorMessage(requestError));
+      runError = errorMessage(requestError);
+      setMemoryDreamError(runError);
     } finally {
       setMemoryDreamRunKey(null);
+      void loadMemoryDreamJobs(1).then(() => {
+        if (runError) {
+          setMemoryDreamError(runError);
+        }
+      });
     }
   }
 

@@ -1779,6 +1779,7 @@ export type MemoryDreamRunResponse = {
   jobId: string;
   status: MemoryDreamJobStatus;
   transcriptChatId: string | null;
+  job?: MemoryDreamJobSummary;
 };
 
 export type MemoryDreamChangeSummary = {

@@ -2,7 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ConfiguredSkillSummary } from "./api/types";
+import type { ConfiguredSkillSummary, MemoryDreamJobSummary } from "./api/types";
 import {
   activeMemory,
   agentDefinitions,
@@ -1277,6 +1277,10 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.click(screen.getByLabelText("Enable Dream"));
+    const dreamJobCallsBeforeRun = fetchMock.mock.calls.filter(([input]) => {
+      const url = new URL(String(input), "http://localhost");
+      return url.pathname === "/api/memory/dream/jobs";
+    }).length;
     await userEvent.click(screen.getByRole("button", { name: "Run workspace Dream now" }));
     await userEvent.click(screen.getByRole("button", { name: "Run global Dream now" }));
 
@@ -1296,12 +1300,120 @@ describe("app-settings verification surfaces", () => {
         triggerType: "manual",
         mode: "llm",
       });
+      expect(
+        fetchMock.mock.calls.filter(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return url.pathname === "/api/memory/dream/jobs";
+        }).length,
+      ).toBeGreaterThan(dreamJobCallsBeforeRun);
     });
 
     await userEvent.click(screen.getByRole("button", { name: "Open transcript" }));
     expect(await screen.findByText(/job started/)).toBeInTheDocument();
     expect(screen.queryByText("API overview")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
+  });
+
+  it("polls Dream history until an active manual run reaches a terminal status", async () => {
+    const runningDreamJob: MemoryDreamJobSummary = {
+      ...(memoryDreamJob as MemoryDreamJobSummary),
+      changeCounts: {
+        added: 0,
+        expired: 0,
+        rejected: 0,
+        superseded: 0,
+        updated: 0,
+      },
+      completedAt: null,
+      status: "running",
+      summary: null,
+    };
+    const completedDreamJob = memoryDreamJob as MemoryDreamJobSummary;
+    const terminalFailedDreamJob = failedMemoryDreamJob as MemoryDreamJobSummary;
+    appTestState.memoryDreamJobsResponses = [
+      {
+        jobs: [completedDreamJob, terminalFailedDreamJob],
+        page: 1,
+        pageSize: 10,
+        totalCount: 2,
+        totalPages: 1,
+      },
+      {
+        jobs: [runningDreamJob, terminalFailedDreamJob],
+        page: 1,
+        pageSize: 10,
+        totalCount: 2,
+        totalPages: 1,
+      },
+      {
+        jobs: [terminalFailedDreamJob, completedDreamJob],
+        page: 1,
+        pageSize: 10,
+        totalCount: 2,
+        totalPages: 1,
+      },
+    ];
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+    expect(await screen.findByText("Dream history")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return url.pathname === "/api/memory/dream/jobs";
+        }).length,
+      ).toBeGreaterThanOrEqual(1);
+    });
+
+    await userEvent.click(screen.getByLabelText("Enable memory"));
+    await userEvent.click(screen.getByLabelText("Enable Dream"));
+
+    let dreamPoll: (() => void) | null = null;
+    const originalSetInterval = window.setInterval.bind(window);
+    const pollIntervalId = 7300 as unknown as ReturnType<typeof window.setInterval>;
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+    vi.spyOn(window, "setInterval").mockImplementation(((
+      ...args: Parameters<typeof window.setInterval>
+    ) => {
+      const [handler, timeout] = args;
+      if (timeout === 3000 && typeof handler === "function") {
+        dreamPoll = () => handler();
+        return pollIntervalId;
+      }
+      return (originalSetInterval as (...intervalArgs: unknown[]) => unknown)(
+        ...args,
+      ) as ReturnType<typeof window.setInterval>;
+    }) as typeof window.setInterval);
+
+    await userEvent.click(screen.getByRole("button", { name: "Run workspace Dream now" }));
+    expect(await screen.findByText("Running")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(dreamPoll).not.toBeNull();
+      expect(
+        fetchMock.mock.calls.filter(([input]) => {
+          const url = new URL(String(input), "http://localhost");
+          return url.pathname === "/api/memory/dream/jobs";
+        }).length,
+      ).toBeGreaterThanOrEqual(2);
+    });
+
+    const poll = dreamPoll as (() => void) | null;
+    if (!poll) {
+      throw new Error("Expected Dream history polling interval to be registered");
+    }
+    await act(async () => {
+      poll();
+    });
+
+    expect(await screen.findByText("Failed")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText("Running")).not.toBeInTheDocument();
+      expect(clearIntervalSpy).toHaveBeenCalledWith(pollIntervalId);
+    });
   });
 
   it("creates and edits manual memories", async () => {
