@@ -472,7 +472,7 @@ pub(crate) async fn prepare_prompt_context(
     if let Some(extra_prompt_message) = extra_prompt_message {
         neutral_messages.push(extra_prompt_message);
         message_source_sequences.push(None);
-        message_context_sources.push(PromptContextSource::StableInjection);
+        message_context_sources.push(PromptContextSource::ReservedPrompt);
     }
     let stable_insert_index = neutral_messages.len();
     for stable_context_message in stable_context_messages.drain(..) {

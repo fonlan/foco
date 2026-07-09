@@ -7922,6 +7922,7 @@ Only load this when matched.
 
     let mut config = prompt_test_config(workspace_dir.clone());
     config.memory.enabled = true;
+    config.prompts.extra_text = "Queued extra prompt.\n".to_string();
     let workspace_id = config.workspaces[0].id.clone();
     let state = test_app_state(config.clone(), profile_dir.clone());
 
@@ -7963,6 +7964,11 @@ Only load this when matched.
                 .contains("## Environment Context")
         );
         assert!(!context_injections[0].messages_json.contains("## Skills"));
+        assert!(
+            !context_injections[0]
+                .messages_json
+                .contains(EXTRA_PROMPT_MESSAGE_PREFIX)
+        );
         assert_eq!(context_injections[0].memory_keys_json, "[]");
     }
 
@@ -7995,6 +8001,32 @@ Only load this when matched.
             .request_body_json
             .contains("- Name: \\\"deferredmemo\\\";")
     );
+    assert_eq!(
+        scheduler_context
+            .request_body_json
+            .matches("## Extra Prompt Context")
+            .count(),
+        1
+    );
+    assert_eq!(
+        scheduler_context
+            .request_body_json
+            .matches(EXTRA_PROMPT_MESSAGE_PREFIX)
+            .count(),
+        1
+    );
+
+    let prompt_cache_key = prompt_cache_key(
+        &scheduler_context.workspace_id,
+        &queued.chat_id,
+        &scheduler_context.provider_id,
+        &scheduler_context.model_id,
+        &scheduler_context.provider_request,
+        &scheduler_context.message_source_sequences,
+        &scheduler_context.message_context_sources,
+    )
+    .expect("prompt cache key");
+    assert!(!prompt_cache_key.is_empty());
 
     drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
