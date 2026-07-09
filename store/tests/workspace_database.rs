@@ -5984,6 +5984,39 @@ fn stores_prompt_context_injections_for_chat_replay() {
 }
 
 #[test]
+fn prompt_context_injection_memory_summaries_round_trip_structured_json() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-1", "Memory summary chat")
+        .expect("chat insert");
+
+    let memory_summaries_json = r#"[{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Structured summary","pinned":false,"source":"direct"}]"#;
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "turn-1",
+            chat_id: "chat-1",
+            kind: "turn_memory",
+            sequence: Some(0),
+            messages_json: r#"[{"role":"user","content":"Memory context"}]"#,
+            memory_keys_json: r#"["workspace:fact-1"]"#,
+            memory_summaries_json,
+        })
+        .expect("prompt context injection insert");
+
+    let injections = database
+        .prompt_context_injections_for_chat("chat-1")
+        .expect("injections");
+    assert_eq!(injections.len(), 1);
+    assert_eq!(injections[0].memory_summaries_json, memory_summaries_json);
+
+    let parsed: Value = serde_json::from_str(&injections[0].memory_summaries_json)
+        .expect("memory summaries json should parse");
+    assert_eq!(parsed[0]["id"], "fact-1");
+    assert_eq!(parsed[0]["source"], "direct");
+}
+
+#[test]
 fn migrates_prompt_context_injection_memory_summaries_default() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let database_path = workspace_database_path(workspace.path());

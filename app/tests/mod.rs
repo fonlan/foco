@@ -8042,6 +8042,139 @@ Only load this when matched.
 }
 
 #[tokio::test]
+async fn queued_chat_deferred_memory_summaries_show_on_assistant_summary() {
+    let workspace_dir = env::temp_dir().join(unique_id(
+        "foco-queued-deferred-memory-summary-workspace-test",
+    ));
+    let profile_dir = env::temp_dir().join(unique_id(
+        "foco-queued-deferred-memory-summary-profile-test",
+    ));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.memory.enabled = true;
+    config.memory.retrieval_mode = "fts".to_string();
+    config.app.chat_title_generation_model_id = Some("disabled".to_string());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            chat_title_override: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Need deferred recall memory".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+            agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
+            correlation_id: None,
+            origin: crate::http::chat::QueuedChatMessageOrigin::User,
+        },
+    )
+    .await
+    .expect("queue message");
+
+    {
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory,
+            "source-deferred-recall",
+            "fact-deferred-recall",
+            MemoryScope::Chat,
+            Some(&queued.chat_id),
+            "Deferred recall memory should appear in the assistant bubble.",
+            false,
+        );
+    }
+
+    let mut scheduler_context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: Some(queued.user_message_id.clone()),
+            run_id_override: Some(queued.agent_task_id.expect("agent task id").to_string()),
+            visible_assistant_message_id: Some(queued.assistant_message_id.clone()),
+            visible_assistant_sequence: Some(1),
+            chat_id: Some(queued.chat_id.clone()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Need deferred recall memory".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("scheduler chat context");
+    assert!(scheduler_context.pending_memory_retrieval.is_some());
+
+    scheduler_context
+        .resolve_pending_memory(&config)
+        .await
+        .expect("resolve deferred memory");
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let context_injections = database
+        .prompt_context_injections_for_chat(&queued.chat_id)
+        .expect("context injections");
+    assert!(context_injections.iter().any(|injection| {
+        injection.kind == "turn_memory"
+            && injection
+                .memory_summaries_json
+                .contains("fact-deferred-recall")
+    }));
+
+    database
+        .insert_message(NewMessage {
+            id: &scheduler_context.assistant_message_id,
+            chat_id: &queued.chat_id,
+            role: "assistant",
+            content: "Done.",
+            sequence: scheduler_context.assistant_sequence,
+            metadata_json: Some("{}"),
+        })
+        .expect("assistant message insert");
+    let messages = database
+        .messages_for_chat(&queued.chat_id)
+        .expect("messages");
+    let assistant_summary = chat_message_summaries(
+        &mut database,
+        &workspace_dir,
+        None,
+        &queued.chat_id,
+        messages,
+    )
+    .expect("message summaries")
+    .into_iter()
+    .find(|summary| summary.role == "assistant")
+    .expect("assistant summary");
+
+    assert_eq!(assistant_summary.memories_used.len(), 1);
+    assert_eq!(
+        assistant_summary.memories_used[0].id,
+        "fact-deferred-recall"
+    );
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_plan_phase_reuses_existing_worktree_relative_path() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-plan-worktree-reuse-profile"));
@@ -13563,6 +13696,84 @@ fn chat_statistics_ignores_legacy_memory_keys_when_summaries_are_empty() {
     .expect("chat statistics response");
 
     assert_eq!(response.memory_references, 0);
+}
+
+#[test]
+fn prompt_context_memory_summaries_drive_statistics_and_assistant_summary() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-single-source-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Memory single source chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Use memory.",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("user message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Done.",
+            sequence: 1,
+            metadata_json: Some(
+                r#"{"memoriesUsed":[{"id":"legacy-metadata-fact","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Legacy metadata should not win.","pinned":false,"source":"direct"}]}"#,
+            ),
+        })
+        .expect("assistant message insert");
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "turn-memory-1",
+            chat_id: "chat-1",
+            kind: "turn_memory",
+            sequence: Some(0),
+            messages_json: "[]",
+            memory_keys_json: r#"["workspace:legacy-key"]"#,
+            memory_summaries_json: r#"[{"id":"summary-fact","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Summary fact should drive both surfaces.","pinned":false,"source":"direct"}]"#,
+        })
+        .expect("prompt context injection insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let assistant_summary =
+        chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+            .expect("message summaries")
+            .into_iter()
+            .find(|summary| summary.role == "assistant")
+            .expect("assistant summary");
+    let prompt_injections = database
+        .prompt_context_injections_for_chat("chat-1")
+        .expect("prompt injections");
+    let statistics = chat_statistics_response(
+        "workspace-1",
+        "chat-1",
+        ChatMessageRoleCounts::default(),
+        Vec::new(),
+        prompt_injections,
+        Vec::new(),
+        Vec::new(),
+        &[],
+        0,
+        CodeChangeStats::default(),
+        Vec::new(),
+        0,
+    )
+    .expect("chat statistics response");
+
+    assert_eq!(statistics.memory_references, 1);
+    assert_eq!(assistant_summary.memories_used.len(), 1);
+    assert_eq!(assistant_summary.memories_used[0].id, "summary-fact");
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[test]
