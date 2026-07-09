@@ -26,6 +26,7 @@ use axum::{
     routing::{any, get, patch, post, put},
 };
 use chrono::{SecondsFormat, Utc};
+use foco_agent::{build_memory_prompt_section, build_project_spec_prompt_section};
 use foco_providers::{
     NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent, NeutralUsage,
     stream_chat,
@@ -39,7 +40,7 @@ use foco_store::{
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
         NewLlmRequestEvent, NewMessage, NewRunEvent, TodoGraphFilter, UpdateLlmRequestOutcome,
-        WorkspaceDatabase, workspace_database_path,
+        WorkspaceDatabase, WorkspaceSpecPromptPlan, WorkspaceSpecSettings, workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -63,7 +64,15 @@ use std::os::windows::process::CommandExt;
 use crate::{
     ApiError, AppResult, AppState, config_snapshot,
     http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
-    runtime::{build_sidecar_runtime_config_bundle, execute_image_tool, execute_web_tool},
+    markdown_code_block, neutral_text_message,
+    prompt::{
+        active_system_prompt, agents_prompt_messages, configured_extra_prompt_message,
+        environment_context_message,
+    },
+    runtime::{
+        SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle, execute_image_tool,
+        execute_web_tool,
+    },
     save_config, unique_id, workspace_by_id,
 };
 
@@ -956,6 +965,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         last_config_hash: Arc::new(Mutex::new(None)),
+        runtime_config: Arc::new(Mutex::new(None)),
         code_graph_watcher: Arc::new(Mutex::new(None)),
         ws_count: ws_count.clone(),
         active_run_count: active_run_count.clone(),
@@ -1456,6 +1466,7 @@ impl Drop for RemoteRunCleanupGuard {
 pub(crate) struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
+    runtime_config: Arc<Mutex<Option<SidecarRuntimeConfigBundle>>>,
     code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
     ws_count: Arc<AtomicUsize>,
     active_run_count: Arc<AtomicUsize>,
@@ -1510,6 +1521,22 @@ async fn remote_sidecar_shutdown(State(state): State<RemoteSidecarState>) -> Jso
     Json(json!({ "ok": true }))
 }
 
+async fn remote_sidecar_fail_pending_broker_requests(state: &RemoteSidecarState, message: &str) {
+    let mut pending = state.broker_pending.lock().await;
+    let entries = pending.drain().collect::<Vec<_>>();
+    drop(pending);
+    for (id, tx) in entries {
+        let _ = tx.send(ControlEnvelope {
+            version: 1,
+            message_type: "error".to_string(),
+            id: Some(id),
+            method: None,
+            payload: json!({ "message": message }),
+            timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+        });
+    }
+}
+
 async fn remote_control_ws(
     State(state): State<RemoteSidecarState>,
     ws: WebSocketUpgrade,
@@ -1558,12 +1585,26 @@ async fn remote_control_ws(
                     if envelope.message_type == "config"
                         && envelope.method.as_deref() == Some("config.sync")
                     {
-                        let hash = envelope
-                            .payload
-                            .get("hash")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
+                        let bundle = serde_json::from_value::<SidecarRuntimeConfigBundle>(
+                            envelope.payload.clone(),
+                        )
+                        .ok();
+                        let hash = bundle
+                            .as_ref()
+                            .map(|bundle| bundle.hash.clone())
+                            .or_else(|| {
+                                envelope
+                                    .payload
+                                    .get("hash")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        if let Some(bundle) = bundle {
+                            if let Ok(mut runtime_config) = state.runtime_config.lock() {
+                                *runtime_config = Some(bundle);
+                            }
+                        }
                         if let Ok(mut last_config_hash) = state.last_config_hash.lock() {
                             *last_config_hash = Some(hash.clone());
                         }
@@ -1597,7 +1638,13 @@ async fn remote_control_ws(
                 }
             }
         }
-        state.ws_count.fetch_sub(1, Ordering::Relaxed);
+        if state.ws_count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            remote_sidecar_fail_pending_broker_requests(
+                &state,
+                "remote broker disconnected; retry after reconnect",
+            )
+            .await;
+        }
     })
     .into_response()
 }
@@ -2735,33 +2782,37 @@ async fn broker_llm_stream(
         }
     };
 
-    // Parse the NeutralChatRequest from payload
-    let messages: Vec<NeutralChatMessage> = payload
-        .get("messages")
-        .and_then(|m| serde_json::from_value(m.clone()).ok())
-        .unwrap_or_default();
-    let tools: Vec<foco_providers::NeutralToolDefinition> = payload
-        .get("tools")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let request = NeutralChatRequest {
-        model_id: model_id.to_string(),
-        messages,
-        tools,
-        thinking_level: payload
-            .get("thinkingLevel")
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-        max_output_tokens: payload
-            .get("maxOutputTokens")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        prompt_cache_key: payload
-            .get("promptCacheKey")
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-        prompt_cache_retention: payload
-            .get("promptCacheRetention")
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-    };
+    let request = payload
+        .get("request")
+        .and_then(|request| serde_json::from_value::<NeutralChatRequest>(request.clone()).ok())
+        .unwrap_or_else(|| {
+            let messages: Vec<NeutralChatMessage> = payload
+                .get("messages")
+                .and_then(|m| serde_json::from_value(m.clone()).ok())
+                .unwrap_or_default();
+            let tools: Vec<foco_providers::NeutralToolDefinition> = payload
+                .get("tools")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            NeutralChatRequest {
+                model_id: model_id.to_string(),
+                messages,
+                tools,
+                thinking_level: payload
+                    .get("thinkingLevel")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                max_output_tokens: payload
+                    .get("maxOutputTokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok()),
+                prompt_cache_key: payload
+                    .get("promptCacheKey")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                prompt_cache_retention: payload
+                    .get("promptCacheRetention")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            }
+        });
 
     let audit_context = broker_llm_audit_context(state, workspace_id, &payload);
     let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -4908,6 +4959,185 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
     }
 }
 
+fn remote_sidecar_provider_request(
+    state: &RemoteSidecarState,
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    assistant_message_id: &str,
+    model_id: &str,
+    thinking_level: Value,
+) -> Result<NeutralChatRequest, axum::response::Response> {
+    let raw_messages = database
+        .messages_for_chat(chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .filter(|message| message.role != "assistant" || message.id != assistant_message_id)
+        .map(|message| NeutralChatMessage {
+            role: neutral_role_for_message(&message.role),
+            content: message.content,
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        })
+        .collect::<Vec<_>>();
+
+    let Some(bundle) = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone())
+    else {
+        return Ok(NeutralChatRequest {
+            model_id: model_id.to_string(),
+            messages: raw_messages,
+            tools: Vec::new(),
+            thinking_level: serde_json::from_value(thinking_level).ok(),
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        });
+    };
+    let payload = &bundle.payload;
+    let Some(model) = payload.models.iter().find(|model| model.id == model_id) else {
+        return Ok(NeutralChatRequest {
+            model_id: model_id.to_string(),
+            messages: raw_messages,
+            tools: Vec::new(),
+            thinking_level: serde_json::from_value(thinking_level).ok(),
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        });
+    };
+
+    let workspace_path = Path::new(&state.workspace_path);
+    let mut messages = Vec::with_capacity(raw_messages.len() + 8);
+    messages.push(neutral_text_message(
+        NeutralChatRole::System,
+        active_system_prompt(&payload.prompts, &model.system_prompt_name)
+            .map_err(|e| e.into_response())?,
+    ));
+    messages.push(neutral_text_message(
+        NeutralChatRole::System,
+        build_project_spec_prompt_section(),
+    ));
+    if payload.memory.enabled {
+        messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            build_memory_prompt_section(),
+        ));
+    }
+    for message in sidecar_selected_skill_messages(&bundle) {
+        messages.push(message);
+    }
+    if let Some(message) = configured_extra_prompt_message(&payload.prompts) {
+        messages.push(message);
+    }
+    if let Ok(mut agent_messages) = agents_prompt_messages(workspace_path) {
+        messages.append(&mut agent_messages);
+    }
+    if let Ok(message) = environment_context_message(workspace_path) {
+        messages.push(message);
+    }
+    if let Some(message) = remote_project_spec_context_message(database, chat_id)? {
+        messages.push(message);
+    }
+    messages.extend(raw_messages);
+
+    // ponytail: remote sidecar v1 sends no tool schemas because tool-call execution
+    // is not wired through the broker yet; add schemas together with a tool loop.
+    Ok(NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages,
+        tools: Vec::new(),
+        thinking_level: serde_json::from_value(thinking_level)
+            .ok()
+            .or_else(|| model.thinking_level.clone()),
+        max_output_tokens: model
+            .limits
+            .as_ref()
+            .and_then(|limits| u32::try_from(limits.max_output_tokens).ok()),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    })
+}
+
+fn sidecar_selected_skill_messages(bundle: &SidecarRuntimeConfigBundle) -> Vec<NeutralChatMessage> {
+    if bundle.payload.selected_skills.is_empty() {
+        return Vec::new();
+    }
+    let entries = bundle
+        .payload
+        .selected_skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "## Skill: {}\n\nPath: `{}`\n\n{}",
+                skill.name,
+                skill.path,
+                skill.content_markdown.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    vec![neutral_text_message(
+        NeutralChatRole::Developer,
+        format!("## Selected Skills\n\n{entries}"),
+    )]
+}
+
+fn remote_project_spec_context_message(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+) -> Result<Option<NeutralChatMessage>, axum::response::Response> {
+    if let Some(snapshot) = database
+        .chat_spec_snapshot(chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    {
+        return Ok(remote_project_spec_message(
+            snapshot.spec_revision,
+            &snapshot.content_markdown,
+        ));
+    }
+    let Some(spec) = database
+        .workspace_spec()
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    else {
+        return Ok(None);
+    };
+    let settings = WorkspaceSpecSettings {
+        enabled: spec.enabled,
+        inject_enabled: spec.inject_enabled,
+    };
+    if WorkspaceSpecPromptPlan::for_chat(settings, false)
+        != WorkspaceSpecPromptPlan::ReadWorkspaceSpecAndSaveSnapshot
+    {
+        return Ok(None);
+    }
+    Ok(remote_project_spec_message(
+        spec.revision,
+        &spec.content_markdown,
+    ))
+}
+
+fn remote_project_spec_message(
+    revision: u64,
+    content_markdown: &str,
+) -> Option<NeutralChatMessage> {
+    if content_markdown.trim().is_empty() {
+        return None;
+    }
+    Some(neutral_text_message(
+        NeutralChatRole::User,
+        format!(
+            "## Project Spec Context\n\nSource: Project Spec snapshot for this chat:\n\nRevision: {revision}\n\n{}",
+            markdown_code_block("markdown", content_markdown)
+        ),
+    ))
+}
+
 fn remote_chat_completion_event(
     chat_id: &str,
     assistant_message_id: &str,
@@ -4979,21 +5209,14 @@ async fn remote_sidecar_chat_stream(
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
     let broker_request_id = unique_id("broker-request");
-    let messages = database
-        .messages_for_chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-        .into_iter()
-        .filter(|message| message.role != "assistant" || message.id != assistant_message_id)
-        .map(|message| NeutralChatMessage {
-            role: neutral_role_for_message(&message.role),
-            content: message.content,
-            attachments: Vec::new(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        })
-        .collect::<Vec<_>>();
+    let provider_request = remote_sidecar_provider_request(
+        &state,
+        &database,
+        &chat_id,
+        &assistant_message_id,
+        &model_id,
+        payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+    )?;
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -5013,8 +5236,7 @@ async fn remote_sidecar_chat_stream(
         "runId": run_id,
         "providerId": provider_id,
         "modelId": model_id,
-        "messages": messages,
-        "thinkingLevel": payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+        "request": provider_request,
     });
     let stream_state = state.clone();
     let run_stream = run_stream.clone();
@@ -6747,6 +6969,7 @@ mod tests {
             RemoteSidecarState {
                 token: "token".to_string(),
                 last_config_hash: Arc::new(Mutex::new(None)),
+                runtime_config: Arc::new(Mutex::new(None)),
                 code_graph_watcher: Arc::new(Mutex::new(None)),
                 ws_count: Arc::new(AtomicUsize::new(ws_count)),
                 active_run_count: Arc::new(AtomicUsize::new(0)),
@@ -6834,6 +7057,7 @@ mod tests {
         let state = RemoteSidecarState {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
+            runtime_config: Arc::new(Mutex::new(None)),
             code_graph_watcher: Arc::new(Mutex::new(None)),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
@@ -7193,6 +7417,7 @@ mod tests {
         let state = RemoteSidecarState {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
+            runtime_config: Arc::new(Mutex::new(None)),
             code_graph_watcher: Arc::new(Mutex::new(None)),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
@@ -7230,6 +7455,7 @@ mod tests {
         let state = RemoteSidecarState {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
+            runtime_config: Arc::new(Mutex::new(None)),
             code_graph_watcher: Arc::new(Mutex::new(None)),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
@@ -7271,11 +7497,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_sidecar_fails_pending_requests_when_broker_disconnects() {
+        let (state, _) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state
+            .broker_pending
+            .lock()
+            .await
+            .insert("broker-request-1".to_string(), tx);
+
+        remote_sidecar_fail_pending_broker_requests(
+            &state,
+            "remote broker disconnected; retry after reconnect",
+        )
+        .await;
+
+        let envelope = rx.recv().await.expect("pending request error");
+        assert_eq!(envelope.message_type, "error");
+        assert_eq!(envelope.id.as_deref(), Some("broker-request-1"));
+        assert!(
+            envelope.payload["message"]
+                .as_str()
+                .expect("message")
+                .contains("disconnected")
+        );
+        assert!(state.broker_pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn remote_sidecar_provider_request_includes_synced_system_prompt() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .prompts
+            .system_prompts
+            .push(foco_store::config::SystemPromptSettings {
+                name: "RemoteSystem".to_string(),
+                content: "remote system prompt marker".to_string(),
+            });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: "RemoteSystem".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &config, "workspace", None, 1)
+                .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let request = remote_sidecar_provider_request(
+            &state,
+            &database,
+            "chat-1",
+            "msg-assistant-1",
+            "model-1",
+            Value::Null,
+        )
+        .expect("provider request");
+
+        assert_eq!(request.messages[0].role, NeutralChatRole::System);
+        assert!(
+            request.messages[0]
+                .content
+                .contains("remote system prompt marker")
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("## Environment Context"))
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.role == NeutralChatRole::User && message.content == "hello")
+        );
+    }
+
+    #[tokio::test]
     async fn llm_stream_broker_rpc_round_trips_through_pending_channel() {
         let (broker_tx, mut broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
+            runtime_config: Arc::new(Mutex::new(None)),
             code_graph_watcher: Arc::new(Mutex::new(None)),
             ws_count: Arc::new(AtomicUsize::new(1)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
