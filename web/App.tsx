@@ -10496,11 +10496,9 @@ export function App() {
                               </span>
                               <span className="min-w-0 flex-1 text-left">
                                 <span className="block truncate">{workspace.name}</span>
-                                {isRemoteWorkspace ? (
-                                  <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
-                                    {workspace.displayPath}
-                                  </span>
-                                ) : null}
+                                <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
+                                  {workspace.displayPath}
+                                </span>
                               </span>
                             </button>
                             <button

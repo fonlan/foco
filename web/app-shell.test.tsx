@@ -1720,7 +1720,10 @@ describe("app-shell verification surfaces", () => {
   it("expands a collapsed workspace without adding a placeholder chat row", async () => {
     renderApp();
 
-    const workspaceToggle = await screen.findByRole("button", { name: "Default" });
+    const workspaceToggle = await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
     await userEvent.click(workspaceToggle);
     expect(workspaceToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("Tool run")).not.toBeInTheDocument();
@@ -1812,8 +1815,14 @@ describe("app-shell verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    const defaultToggle = await screen.findByRole("button", { name: "Default" });
-    const sideToggle = screen.getByRole("button", { name: "Side project" });
+    const defaultToggle = await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
+    const sideToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Side project" }),
     );
@@ -1853,8 +1862,14 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
 
-    const defaultToggle = screen.getByRole("button", { name: "Default" });
-    const sideToggle = screen.getByRole("button", { name: "Side project" });
+    const defaultToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
+    const sideToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     await userEvent.click(sideToggle);
     await userEvent.click(await screen.findByText("Side note"));
 
@@ -1869,8 +1884,14 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
 
-    const defaultToggle = screen.getByRole("button", { name: "Default" });
-    const sideToggle = screen.getByRole("button", { name: "Side project" });
+    const defaultToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
+    const sideToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
 
     expect(defaultToggle).toHaveAttribute("aria-expanded", "true");
 
@@ -1908,7 +1929,10 @@ describe("app-shell verification surfaces", () => {
     expect(screen.queryByText("Older chat 9")).not.toBeInTheDocument();
     expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
 
-    const defaultToggle = screen.getByRole("button", { name: "Default" });
+    const defaultToggle = screen.getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
     await userEvent.click(defaultToggle);
     expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("Older chat 4")).not.toBeInTheDocument();

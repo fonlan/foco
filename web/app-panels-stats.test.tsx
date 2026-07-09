@@ -1457,14 +1457,24 @@ describe("app-panels-stats verification surfaces", () => {
       expect(autoRunCheckbox).toBeChecked();
     });
 
-    await user.click(screen.getByRole("button", { name: "Side project" }));
+    await user.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+      }),
+    );
     await user.click(screen.getByRole("button", { name: /Side note/ }));
 
     await waitFor(() => {
       expect(autoRunCheckbox).not.toBeChecked();
     });
 
-    await user.click(screen.getByRole("button", { name: "Default" }));
+    await user.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+      }),
+    );
     await user.click(screen.getByRole("tab", { name: /Tool run/ }));
 
     await waitFor(() => {
@@ -2428,12 +2438,22 @@ describe("app-panels-stats verification surfaces", () => {
       ),
     ).toHaveLength(1);
 
-    await userEvent.click(screen.getByRole("button", { name: "Side project" }));
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+      }),
+    );
     await userEvent.click(screen.getByRole("button", { name: /Side note/ }));
     expect(screen.getByRole("button", { name: "Open terminal" })).toBeInTheDocument();
     expect(closeSpy).not.toHaveBeenCalled();
 
-    await userEvent.click(screen.getByRole("button", { name: "Default" }));
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+      }),
+    );
     await userEvent.click(screen.getByRole("button", { name: /Tool run/ }));
     expect(screen.getAllByRole("button", { name: "Close terminal" })).toHaveLength(2);
     expect(closeSpy).not.toHaveBeenCalled();

@@ -53,7 +53,10 @@ function configuredWorkspace(item: WorkspaceFixture, isDefault = false) {
 
 function workspaceButton(name: string) {
   const workspaceList = screen.getByRole("navigation", { name: "Workspace list" });
-  return within(workspaceList).getByRole("button", { name });
+  return within(workspaceList).getByRole("button", {
+    name: (accessibleName, element) =>
+      element.hasAttribute("aria-expanded") && accessibleName.startsWith(name),
+  });
 }
 
 function workspaceDragContainer(name: string) {
@@ -85,6 +88,37 @@ function dragDataTransfer() {
 
 describe("app-workspaces verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
+
+  it("shows local and remote workspace paths under the workspace name", async () => {
+    const remoteWorkspace = {
+      ...secondaryWorkspace,
+      chats: [],
+      connectionStatus: "ready",
+      displayPath: "server:/home/fonla/repos/remote-project",
+      id: "workspace-remote",
+      name: "Remote project",
+      path: "server:/home/fonla/repos/remote-project",
+      remotePath: "/home/fonla/repos/remote-project",
+      serverId: "server-1",
+      serverName: "dev-box",
+    };
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", { name: "Workspace list" });
+    const localButton = await within(workspaceList).findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
+    const remoteButton = within(workspaceList).getByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Remote project"),
+    });
+
+    expect(within(localButton).getByText(workspace.displayPath)).toBeInTheDocument();
+    expect(within(remoteButton).getByText(remoteWorkspace.displayPath)).toBeInTheDocument();
+  });
 
   it("reorders main workspace buttons within a pinned group and shares the saved order with settings", async () => {
     const thirdWorkspace = {
@@ -122,7 +156,10 @@ describe("app-workspaces verification surfaces", () => {
     renderApp();
 
     await screen.findByRole("navigation", { name: "Workspace list" });
-    await screen.findByRole("button", { name: "Side project" });
+    await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     fireEvent.dragStart(workspaceDragContainer("Side project"), {
       dataTransfer: dragDataTransfer(),
     });
@@ -190,7 +227,10 @@ describe("app-workspaces verification surfaces", () => {
 
     renderApp();
 
-    await screen.findByRole("button", { name: "Side project" });
+    await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     fireEvent.dragStart(workspaceDragContainer("Side project"), {
       dataTransfer: dragDataTransfer(),
     });
@@ -233,7 +273,10 @@ describe("app-workspaces verification surfaces", () => {
 
     renderApp();
 
-    await screen.findByRole("button", { name: "Side project" });
+    await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     fireEvent.dragStart(workspaceDragContainer("Side project"), {
       dataTransfer: dragDataTransfer(),
     });
@@ -276,7 +319,10 @@ describe("app-workspaces verification surfaces", () => {
     renderApp();
 
     await screen.findByRole("navigation", { name: "Workspace list" });
-    await screen.findByRole("button", { name: "Side project" });
+    await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+    });
     fireEvent.dragStart(workspaceDragContainer("Side project"), {
       dataTransfer: dragDataTransfer(),
     });
@@ -451,8 +497,16 @@ describe("app-workspaces verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    await within(workspaceList).findByRole("button", { name: "Default" });
-    await userEvent.click(within(workspaceList).getByRole("button", { name: "Default" }));
+    await within(workspaceList).findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+    });
+    await userEvent.click(
+      within(workspaceList).getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+      }),
+    );
     await userEvent.click(
       within(workspaceList).getByRole("button", { name: "New chat in Default" }),
     );
