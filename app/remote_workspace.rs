@@ -1372,6 +1372,25 @@ fn remote_sidecar_record_run_event(
     remote_sse_json_event(sequence, payload)
 }
 
+fn remote_sidecar_snapshot_run_events(
+    run_stream: &RemoteActiveRunStream,
+    last_yielded_sequence: &mut i64,
+) -> Vec<(Event, bool)> {
+    let mut events = Vec::new();
+    for (sequence, event) in run_stream.snapshot_after(*last_yielded_sequence) {
+        if sequence <= *last_yielded_sequence {
+            continue;
+        }
+        let terminal = remote_stream_event_is_terminal(&event);
+        events.push((remote_sse_json_event(sequence, event), terminal));
+        *last_yielded_sequence = sequence;
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
 fn remote_sidecar_cancel_broker_request(
     state: &RemoteSidecarState,
     run_stream: &RemoteActiveRunStream,
@@ -5844,6 +5863,7 @@ async fn remote_sidecar_chat_stream(
             "type": "connecting",
             "message": "connecting to remote broker",
         })));
+        let mut last_yielded_sequence = sequence;
 
         loop {
             let broker_request_id = unique_id("broker-request");
@@ -5872,7 +5892,7 @@ async fn remote_sidecar_chat_stream(
                     return;
                 }
             };
-            match remote_sidecar_run_broker_llm_turn(
+            let llm_turn = remote_sidecar_run_broker_llm_turn(
                 &stream_state,
                 &run_stream,
                 &broker_request_id,
@@ -5888,13 +5908,27 @@ async fn remote_sidecar_chat_stream(
                 &mut text,
                 &mut reasoning,
                 &mut sequence,
-            ).await {
+            ).await;
+            let mut reached_terminal_event = false;
+            for (event, terminal) in remote_sidecar_snapshot_run_events(&run_stream, &mut last_yielded_sequence) {
+                yield Ok(event);
+                if terminal {
+                    reached_terminal_event = true;
+                    break;
+                }
+            }
+            match llm_turn {
                 Ok(None) => {
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
                     break;
                 }
                 Ok(Some((tool_calls, _usage))) => {
+                    if reached_terminal_event {
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        cleanup_guard.disarm();
+                        break;
+                    }
                     let allowed_tools = remote_sidecar_executable_tool_names();
                     tool_rounds += 1;
                     if tool_rounds > REMOTE_SIDECAR_MAX_TOOL_ROUNDS {
@@ -6009,6 +6043,7 @@ async fn remote_sidecar_chat_stream(
                     for event in followup_sse_events {
                         sequence += 1;
                         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, event));
+                        last_yielded_sequence = sequence;
                     }
 
                     current_request = NeutralChatRequest {
@@ -8030,6 +8065,107 @@ mod tests {
         .expect("handler should return SSE before broker reconnects")
         .expect("SSE response");
         drop(response);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_flushes_broker_events_to_initial_sse() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            assert_eq!(request.method.as_deref(), Some("llm.stream"));
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "hello remote",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send text delta");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "usage": {
+                            "inputTokens": 4,
+                            "outputTokens": 2,
+                            "cacheReadTokens": null,
+                            "cacheWriteTokens": null,
+                        },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send completion");
+        });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("initial SSE body should finish")
+        .expect("SSE bytes");
+        broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"start\""));
+        assert!(text.contains("\"type\":\"connecting\""));
+        assert!(text.contains("\"type\":\"textDelta\""));
+        assert!(text.contains("hello remote"));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains("\"type\":\"streamEnd\""));
     }
 
     #[tokio::test]
