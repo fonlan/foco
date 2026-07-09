@@ -28,8 +28,8 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{build_memory_prompt_section, build_project_spec_prompt_section};
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent, NeutralUsage,
-    stream_chat,
+    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent,
+    NeutralToolDefinition, NeutralUsage, stream_chat,
 };
 use foco_store::{
     config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation},
@@ -64,10 +64,10 @@ use std::os::windows::process::CommandExt;
 use crate::{
     ApiError, AppResult, AppState, config_snapshot,
     http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
-    markdown_code_block, neutral_text_message,
+    markdown_code_block, neutral_text_message, neutral_tool_definition,
     prompt::{
-        active_system_prompt, agents_prompt_messages, configured_extra_prompt_message,
-        environment_context_message,
+        active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
+        configured_extra_prompt_message, environment_context_message,
     },
     runtime::{
         SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle, execute_image_tool,
@@ -4959,6 +4959,40 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
     }
 }
 
+fn remote_sidecar_executable_tool_schemas() -> Vec<NeutralToolDefinition> {
+    builtin_tool_definitions_for_runtime(true, false)
+        .into_iter()
+        .filter(|tool| {
+            matches!(classify_tool_route(tool.name), ToolRoute::SidecarLocal)
+                && !matches!(
+                    tool.name,
+                    "write_file"
+                        | "edit_file"
+                        | "create_todo_graph"
+                        | "update_todo_graph"
+                        | "get_todo_graph"
+                        | "create_plan"
+                        | "get_plans"
+                        | "update_plan"
+                        | "update_plan_step"
+                        | "delete_plan"
+                        | "read_spec"
+                        | "update_spec"
+                        | "agent_list"
+                        | "agent_get_task"
+                        | "agent_send_message"
+                        | "agent_delegate_task"
+                        | "agent_cancel_task"
+                        | "agent_wait_tasks"
+                        | "agent_transfer_task"
+                        | "agent_create_instances"
+                        | "sleep"
+                )
+        })
+        .map(neutral_tool_definition)
+        .collect()
+}
+
 fn remote_sidecar_provider_request(
     state: &RemoteSidecarState,
     database: &WorkspaceDatabase,
@@ -4992,7 +5026,7 @@ fn remote_sidecar_provider_request(
         return Ok(NeutralChatRequest {
             model_id: model_id.to_string(),
             messages: raw_messages,
-            tools: Vec::new(),
+            tools: remote_sidecar_executable_tool_schemas(),
             thinking_level: serde_json::from_value(thinking_level).ok(),
             max_output_tokens: None,
             prompt_cache_key: None,
@@ -5004,7 +5038,7 @@ fn remote_sidecar_provider_request(
         return Ok(NeutralChatRequest {
             model_id: model_id.to_string(),
             messages: raw_messages,
-            tools: Vec::new(),
+            tools: remote_sidecar_executable_tool_schemas(),
             thinking_level: serde_json::from_value(thinking_level).ok(),
             max_output_tokens: None,
             prompt_cache_key: None,
@@ -5046,12 +5080,11 @@ fn remote_sidecar_provider_request(
     }
     messages.extend(raw_messages);
 
-    // ponytail: remote sidecar v1 sends no tool schemas because tool-call execution
-    // is not wired through the broker yet; add schemas together with a tool loop.
+    // ponytail: keep the remote schema list to tools with a real Phase 1 execution path.
     Ok(NeutralChatRequest {
         model_id: model_id.to_string(),
         messages,
-        tools: Vec::new(),
+        tools: remote_sidecar_executable_tool_schemas(),
         thinking_level: serde_json::from_value(thinking_level)
             .ok()
             .or_else(|| model.thinking_level.clone()),
@@ -7525,6 +7558,56 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_executable_tool_schemas_expose_only_phase1_tools() {
+        let tools = remote_sidecar_executable_tool_schemas();
+        let tool_names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<HashSet<_>>();
+
+        for expected in ["read_file", "find_files", "search_text", "run_command"] {
+            assert!(
+                tool_names.contains(expected),
+                "missing tool schema: {expected}"
+            );
+        }
+        for expected in [
+            "graph_find_symbols",
+            "graph_find_callers",
+            "graph_find_callees",
+            "graph_find_references",
+            "graph_related_files",
+            "graph_explore",
+        ] {
+            assert!(
+                tool_names.contains(expected),
+                "missing tool schema: {expected}"
+            );
+        }
+
+        for unexpected in [
+            "write_file",
+            "edit_file",
+            "ask_question",
+            "web_search",
+            "web_fetch",
+            "image_gen",
+            "memory_search",
+            "memory_write",
+            "read_spec",
+            "update_spec",
+            "create_todo_graph",
+            "update_todo_graph",
+            "get_todo_graph",
+        ] {
+            assert!(
+                !tool_names.contains(unexpected),
+                "unexpected tool schema leaked: {unexpected}"
+            );
+        }
+    }
+
+    #[test]
     fn remote_sidecar_provider_request_includes_synced_system_prompt() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
@@ -7602,6 +7685,23 @@ mod tests {
                 .content
                 .contains("remote system prompt marker")
         );
+        let tool_names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<HashSet<_>>();
+        for expected in ["read_file", "find_files", "search_text"] {
+            assert!(
+                tool_names.contains(expected),
+                "missing tool schema: {expected}"
+            );
+        }
+        for unexpected in ["ask_question", "web_search", "memory_search", "write_file"] {
+            assert!(
+                !tool_names.contains(unexpected),
+                "unexpected tool schema leaked: {unexpected}"
+            );
+        }
         assert!(
             request
                 .messages
