@@ -78,7 +78,6 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const BROKER_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -1318,7 +1317,18 @@ async fn remote_control_ws(
             tokio::select! {
                 msg = receiver.next() => {
                     let Some(Ok(message)) = msg else { break };
-                    let Message::Text(text) = message else { continue };
+                    let text = match message {
+                        Message::Text(text) => text,
+                        Message::Ping(bytes) => {
+                            if sender.send(Message::Pong(bytes)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Message::Pong(_) => continue,
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
                     let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
                         continue;
                     };
@@ -4704,14 +4714,9 @@ async fn remote_sidecar_chat_stream(
             "type": "connecting",
             "message": "connecting to remote broker",
         })));
-        let mut broker_rx = match timeout(
-            BROKER_STREAM_CONNECT_TIMEOUT,
-            remote_sidecar_broker_request(&stream_state, "llm.stream", broker_payload),
-        )
-        .await
-        {
-            Ok(Ok(rx)) => rx,
-            Ok(Err(_)) | Err(_) => {
+        let mut broker_rx = match remote_sidecar_broker_request(&stream_state, "llm.stream", broker_payload).await {
+            Ok(rx) => rx,
+            Err(_) => {
                 sequence += 1;
                 yield Ok(remote_sse_json_event(sequence, json!({
                     "type": "error",
@@ -6573,6 +6578,51 @@ mod tests {
         .expect("handler should return SSE before broker reconnects")
         .expect("SSE response");
         drop(response);
+    }
+
+    #[tokio::test]
+    async fn remote_control_ws_replies_to_ping_frames() {
+        let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
+        let state = RemoteSidecarState {
+            token: "token".to_string(),
+            last_config_hash: Arc::new(Mutex::new(None)),
+            code_graph_watcher: Arc::new(Mutex::new(None)),
+            ws_count: Arc::new(AtomicUsize::new(0)),
+            active_run_count: Arc::new(AtomicUsize::new(0)),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+            broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            broker_tx,
+            shutdown_tx: default_shutdown_tx(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: "/tmp/workspace".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test ws");
+        let port = listener.local_addr().expect("local addr").port();
+        let app = Router::new()
+            .route("/ws", get(remote_control_ws))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test ws");
+        });
+
+        let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{port}/ws"))
+            .await
+            .expect("connect test ws");
+        socket
+            .send(tungstenite::Message::Ping(vec![1_u8, 2].into()))
+            .await
+            .expect("send ping");
+        let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("pong timeout")
+            .expect("pong message")
+            .expect("pong ok");
+        assert!(
+            matches!(message, tungstenite::Message::Pong(bytes) if bytes.as_ref() == [1_u8, 2])
+        );
+        server.abort();
     }
 
     #[tokio::test]
