@@ -57,8 +57,9 @@ pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
     RepeatedToolCallDetector, execute_tool_calls_parallel, is_agent_tool_name, pending_tool_calls,
 };
+pub(crate) use tool_execution::execute_tool;
 #[cfg(test)]
-pub(crate) use tool_execution::{execute_tool, wait_for_tool_resource_lock};
+pub(crate) use tool_execution::wait_for_tool_resource_lock;
 pub(crate) use tool_locks::{
     ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
     ToolResourceLockRegistry,
