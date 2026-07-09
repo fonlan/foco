@@ -63,6 +63,13 @@ const MERMAID_CONFIG: Record<string, unknown> = {
 let mermaidRuntimePromise: Promise<MermaidRuntime> | null = null;
 
 const MARKDOWN_COMPONENTS: Components = {
+  a({ children, node: _node, ...props }) {
+    return (
+      <a rel="noreferrer" target="_blank" {...props}>
+        {children}
+      </a>
+    );
+  },
   img({ alt, ...props }) {
     return <img alt={alt ?? ""} loading="lazy" {...props} />;
   },
