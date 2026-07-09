@@ -627,6 +627,47 @@ describe("app-shell verification surfaces", () => {
     expect(screen.getByText("Total time: 500 ms")).toBeInTheDocument();
   });
 
+  it("treats a transport close after completion as a finished chat stream", async () => {
+    renderApp();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "finish before remote close",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        text: "Remote answer made it through.",
+        type: "complete",
+        metrics: {
+          firstTokenLatencyMs: 100,
+          modelId: "gpt-test",
+          outputTokens: 5,
+          providerId: "openai",
+          totalLatencyMs: 500,
+        },
+        reasoning: null,
+        stopReason: null,
+        usage: null,
+      });
+    });
+
+    expect(await screen.findByText("Remote answer made it through.")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.error(new TypeError("network error"));
+    });
+
+    await waitFor(() => expect(screen.queryByText("network error")).not.toBeInTheDocument());
+    expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
+    expect(screen.getByText("Total time: 500 ms")).toBeInTheDocument();
+  });
+
   it("shows LLM reconnect and context compression badges in the assistant bubble", async () => {
     renderApp();
 

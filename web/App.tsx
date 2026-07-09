@@ -14031,20 +14031,34 @@ async function readChatStream(
   // ponytail: fixed threshold; if backend keep-alive becomes configurable, derive this from server capabilities.
   const idleTimeoutMs = options.idleTimeoutMs ?? chatStreamIdleTimeoutMs();
   let buffer = "";
+  let sawCompletionEvent = false;
   let shouldStopReading = false;
   const handleEvent = (event: ChatStreamEvent, meta: ChatStreamFrameMeta) => {
     onEvent(event, meta);
+    if (event.type === "complete") {
+      sawCompletionEvent = true;
+    }
     if (event.type === "streamEnd") {
       shouldStopReading = true;
     }
   };
 
   while (!shouldStopReading) {
-    const { done, value } = await readStreamChunkWithIdleTimeout(
-      reader,
-      idleTimeoutMs,
-      options.signal,
-    );
+    let readResult: ReadableStreamReadResult<Uint8Array>;
+    try {
+      readResult = await readStreamChunkWithIdleTimeout(
+        reader,
+        idleTimeoutMs,
+        options.signal,
+      );
+    } catch (error) {
+      if (sawCompletionEvent && isChatStreamTransportCloseError(error)) {
+        return;
+      }
+      throw error;
+    }
+
+    const { done, value } = readResult;
 
     if (done) {
       break;
@@ -14055,12 +14069,25 @@ async function readChatStream(
   }
 
   if (shouldStopReading) {
-    await reader.cancel();
+    try {
+      await reader.cancel();
+    } catch (error) {
+      if (!isChatStreamTransportCloseError(error)) {
+        throw error;
+      }
+    }
     return;
   }
 
   buffer += decoder.decode();
   readSseFrames(`${buffer}\n\n`, handleEvent);
+}
+
+function isChatStreamTransportCloseError(error: unknown) {
+  return (
+    error instanceof TypeError ||
+    (error instanceof DOMException && error.name === "NetworkError")
+  );
 }
 
 function readStreamChunkWithIdleTimeout(
