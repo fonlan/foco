@@ -304,6 +304,7 @@ CREATE TABLE prompt_context_injections (
     sequence INTEGER CHECK (sequence IS NULL OR sequence >= 0),
     messages_json TEXT NOT NULL CHECK (length(messages_json) > 0),
     memory_keys_json TEXT NOT NULL CHECK (length(memory_keys_json) > 0),
+    memory_summaries_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     CHECK ((kind = 'stable' AND sequence IS NULL) OR (kind = 'turn_memory' AND sequence IS NOT NULL))
 );
@@ -1245,6 +1246,11 @@ CREATE INDEX llm_requests_request_kind_idx ON llm_requests (request_kind);
 pub(crate) const MIGRATION_029: &str = r#"
 ALTER TABLE workspace_spec_jobs
     ADD COLUMN chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL;
+"#;
+
+pub(crate) const MIGRATION_030: &str = r#"
+ALTER TABLE prompt_context_injections
+    ADD COLUMN memory_summaries_json TEXT NOT NULL DEFAULT '[]';
 "#;
 
 #[cfg(test)]

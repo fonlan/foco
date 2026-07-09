@@ -407,6 +407,10 @@ pub(crate) async fn prepare_prompt_context(
                 .as_ref()
                 .map(|context| context.stable_memory_keys.clone())
                 .unwrap_or_default(),
+            memory_summaries: memory_context
+                .as_ref()
+                .map(|context| context.stable_memory_summaries.clone())
+                .unwrap_or_default(),
         });
     }
     if !defer_memory && !current_turn_memory_messages.is_empty() {
@@ -417,6 +421,10 @@ pub(crate) async fn prepare_prompt_context(
             memory_keys: memory_context
                 .as_ref()
                 .map(|context| context.turn_memory_keys.clone())
+                .unwrap_or_default(),
+            memory_summaries: memory_context
+                .as_ref()
+                .map(|context| context.turn_memory_summaries.clone())
                 .unwrap_or_default(),
         });
     }

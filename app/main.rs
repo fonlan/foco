@@ -2098,6 +2098,7 @@ struct PendingPromptContextInjection {
     sequence: Option<i64>,
     messages: Vec<NeutralChatMessage>,
     memory_keys: Vec<String>,
+    memory_summaries: Vec<ChatMemoryUsedSummary>,
 }
 
 fn pending_stable_prompt_context_injection_from_prompt_context(
@@ -2124,6 +2125,7 @@ fn pending_stable_prompt_context_injection_from_prompt_context(
         // ponytail: queued chat only backfills non-memory stable context here;
         // deferred memory stays on resolve_pending_memory's existing path.
         memory_keys: Vec::new(),
+        memory_summaries: Vec::new(),
     })
 }
 
@@ -2164,6 +2166,8 @@ struct MemoryPromptContext {
     budget_tokens: u64,
     stable_memory_keys: Vec<String>,
     turn_memory_keys: Vec<String>,
+    stable_memory_summaries: Vec<ChatMemoryUsedSummary>,
+    turn_memory_summaries: Vec<ChatMemoryUsedSummary>,
 }
 
 struct RetrievedMemoryContext {
@@ -4633,9 +4637,10 @@ impl PreparedChatContext {
         // synchronously for the context-preview path.
         let mut pending_injections = Vec::new();
         if pending.split_stable_memory {
-            if let Some(injection) = self
-                .deferred_stable_prompt_context_injection(memory_context.stable_memory_keys.clone())
-            {
+            if let Some(injection) = self.deferred_stable_prompt_context_injection(
+                memory_context.stable_memory_keys.clone(),
+                memory_context.stable_memory_summaries.clone(),
+            ) {
                 pending_injections.push(injection);
             }
         }
@@ -4659,6 +4664,7 @@ impl PreparedChatContext {
                     })
                     .collect(),
                 memory_keys: memory_context.turn_memory_keys.clone(),
+                memory_summaries: memory_context.turn_memory_summaries.clone(),
             });
         }
         if !pending_injections.is_empty() {
@@ -4691,6 +4697,7 @@ impl PreparedChatContext {
     fn deferred_stable_prompt_context_injection(
         &self,
         memory_keys: Vec<String>,
+        memory_summaries: Vec<ChatMemoryUsedSummary>,
     ) -> Option<PendingPromptContextInjection> {
         let stable_messages = self
             .provider_request
@@ -4711,6 +4718,7 @@ impl PreparedChatContext {
             sequence: None,
             messages: stable_messages,
             memory_keys,
+            memory_summaries,
         })
     }
 
@@ -4718,7 +4726,9 @@ impl PreparedChatContext {
         &self,
         memory_keys: Vec<String>,
     ) -> Result<(), ApiError> {
-        let Some(injection) = self.deferred_stable_prompt_context_injection(memory_keys) else {
+        let Some(injection) =
+            self.deferred_stable_prompt_context_injection(memory_keys, Vec::new())
+        else {
             return Ok(());
         };
         let mut database = WorkspaceDatabase::open_or_create(&self.workspace_path)

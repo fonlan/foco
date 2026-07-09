@@ -60,13 +60,13 @@ use workspace_schema::{
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, MIGRATION_026, MIGRATION_027,
-    MIGRATION_028, MIGRATION_029, Migration,
+    MIGRATION_028, MIGRATION_029, MIGRATION_030, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 29;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 30;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -248,6 +248,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 29,
         sql: MIGRATION_029,
+    },
+    Migration {
+        version: 30,
+        sql: MIGRATION_030,
     },
 ];
 
@@ -5944,8 +5948,8 @@ impl WorkspaceDatabase {
         self.connection
             .execute(
                 "INSERT INTO prompt_context_injections
-                    (id, chat_id, kind, sequence, messages_json, memory_keys_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     injection.id,
                     injection.chat_id,
@@ -5953,6 +5957,7 @@ impl WorkspaceDatabase {
                     injection.sequence,
                     injection.messages_json,
                     injection.memory_keys_json,
+                    injection.memory_summaries_json,
                     created_at
                 ],
             )
@@ -5968,7 +5973,7 @@ impl WorkspaceDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, created_at
+                "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at
                  FROM prompt_context_injections
                  WHERE chat_id = ?1
                  ORDER BY
@@ -5987,7 +5992,8 @@ impl WorkspaceDatabase {
                     sequence: row.get(3)?,
                     messages_json: row.get(4)?,
                     memory_keys_json: row.get(5)?,
-                    created_at: row.get(6)?,
+                    memory_summaries_json: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -12479,6 +12485,15 @@ fn run_migrations(
                         database_path,
                         "workspace_spec_jobs",
                         "chat_id",
+                    )?
+            }
+            30 => {
+                !table_exists(&transaction, database_path, "prompt_context_injections")?
+                    || table_has_column(
+                        &transaction,
+                        database_path,
+                        "prompt_context_injections",
+                        "memory_summaries_json",
                     )?
             }
             _ => false,

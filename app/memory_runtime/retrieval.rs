@@ -162,6 +162,8 @@ pub(crate) async fn memory_prompt_context(
             budget_tokens,
             stable_memory_keys: Vec::new(),
             turn_memory_keys: Vec::new(),
+            stable_memory_summaries: Vec::new(),
+            turn_memory_summaries: Vec::new(),
         });
     }
 
@@ -254,8 +256,10 @@ pub(crate) async fn memory_prompt_context(
                 .map(neutral_message_estimated_tokens)
                 .unwrap_or(0),
         );
-    let mut memories_used = stable_context.memories_used;
-    memories_used.extend(turn_context.memories_used);
+    let stable_memory_summaries = stable_context.memories_used.clone();
+    let turn_memory_summaries = turn_context.memories_used.clone();
+    let mut memories_used = stable_memory_summaries.clone();
+    memories_used.extend(turn_memory_summaries.clone());
 
     Ok(MemoryPromptContext {
         stable_message: stable_context.message,
@@ -265,6 +269,8 @@ pub(crate) async fn memory_prompt_context(
         budget_tokens,
         stable_memory_keys: stable_context.memory_keys,
         turn_memory_keys: turn_context.memory_keys,
+        stable_memory_summaries,
+        turn_memory_summaries,
     })
 }
 
@@ -925,6 +931,12 @@ pub(crate) fn persist_pending_prompt_context_injections(
                 "failed to serialize prompt context injection memory keys: {source}"
             ))
         })?;
+        let memory_summaries_json =
+            serde_json::to_string(&injection.memory_summaries).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to serialize prompt context injection memory summaries: {source}"
+                ))
+            })?;
 
         database
             .insert_prompt_context_injection(NewPromptContextInjection {
@@ -934,6 +946,7 @@ pub(crate) fn persist_pending_prompt_context_injections(
                 sequence: injection.sequence,
                 messages_json: &messages_json,
                 memory_keys_json: &memory_keys_json,
+                memory_summaries_json: &memory_summaries_json,
             })
             .map_err(ApiError::from_workspace_error)?;
     }

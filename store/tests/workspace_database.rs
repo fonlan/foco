@@ -5955,6 +5955,7 @@ fn stores_prompt_context_injections_for_chat_replay() {
             sequence: None,
             messages_json: r#"[{"role":"system","content":"Stable memory"}]"#,
             memory_keys_json: r#"["workspace:fact-1"]"#,
+            memory_summaries_json: r#"[{"id":"fact-1"}]"#,
         })
         .expect("stable injection");
     database
@@ -5965,6 +5966,7 @@ fn stores_prompt_context_injections_for_chat_replay() {
             sequence: Some(0),
             messages_json: r#"[{"role":"user","content":"Turn memory"}]"#,
             memory_keys_json: r#"["chat:fact-2"]"#,
+            memory_summaries_json: r#"[{"id":"fact-2"}]"#,
         })
         .expect("turn injection");
 
@@ -5978,6 +5980,62 @@ fn stores_prompt_context_injections_for_chat_replay() {
     assert_eq!(injections[1].kind, "turn_memory");
     assert_eq!(injections[1].sequence, Some(0));
     assert_eq!(injections[1].memory_keys_json, r#"["chat:fact-2"]"#);
+    assert_eq!(injections[1].memory_summaries_json, r#"[{"id":"fact-2"}]"#);
+}
+
+#[test]
+fn migrates_prompt_context_injection_memory_summaries_default() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v29 database");
+    connection
+        .execute_batch(
+            r#"CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE prompt_context_injections (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN ('stable', 'turn_memory')),
+                sequence INTEGER CHECK (sequence IS NULL OR sequence >= 0),
+                messages_json TEXT NOT NULL CHECK (length(messages_json) > 0),
+                memory_keys_json TEXT NOT NULL CHECK (length(memory_keys_json) > 0),
+                created_at TEXT NOT NULL,
+                CHECK ((kind = 'stable' AND sequence IS NULL) OR (kind = 'turn_memory' AND sequence IS NOT NULL))
+             );
+             INSERT INTO chats (id, title, created_at, updated_at)
+                VALUES ('chat-1', 'Existing', '2026-07-09T00:00:00Z', '2026-07-09T00:00:00Z');
+             INSERT INTO prompt_context_injections
+                (id, chat_id, kind, sequence, messages_json, memory_keys_json, created_at)
+                VALUES ('inj-1', 'chat-1', 'turn_memory', 0, '[{"role":"user","content":"Memory"}]', '["workspace:fact-1"]', '2026-07-09T00:00:00Z');
+             PRAGMA user_version = 29;"#,
+        )
+        .expect("v29 prompt context schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(column_exists(
+        &connection,
+        "prompt_context_injections",
+        "memory_summaries_json"
+    ));
+    let memory_summaries_json: String = connection
+        .query_row(
+            "SELECT memory_summaries_json FROM prompt_context_injections WHERE id = 'inj-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("memory summaries default");
+    assert_eq!(memory_summaries_json, "[]");
 }
 
 #[test]
@@ -9261,6 +9319,22 @@ fn table_exists(connection: &Connection, table: &str) -> bool {
             |row| row.get::<_, bool>(0),
         )
         .expect("table exists query")
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> bool {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("table info statement");
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("table info rows");
+
+    for name in columns {
+        if name.expect("column name") == column {
+            return true;
+        }
+    }
+    false
 }
 
 fn add_workspace_chats_table(connection: &Connection) {

@@ -1002,6 +1002,7 @@ pub struct NewPromptContextInjection<'a> {
     pub sequence: Option<i64>,
     pub messages_json: &'a str,
     pub memory_keys_json: &'a str,
+    pub memory_summaries_json: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1012,6 +1013,7 @@ pub struct PromptContextInjectionRecord {
     pub sequence: Option<i64>,
     pub messages_json: String,
     pub memory_keys_json: String,
+    pub memory_summaries_json: String,
     pub created_at: String,
 }
 
