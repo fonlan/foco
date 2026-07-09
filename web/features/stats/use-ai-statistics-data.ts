@@ -18,7 +18,7 @@ export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
     pageSize: "20",
     providerId: "",
     requestIds: "",
-    startedAfter: "",
+    startedAfter: defaultStartedAfterDatetimeLocal(),
     startedBefore: "",
     status: "",
     workspaceId: "",
@@ -317,4 +317,14 @@ function datetimeLocalToRfc3339(value: string) {
   }
 
   return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function defaultStartedAfterDatetimeLocal() {
+  const date = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
 }

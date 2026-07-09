@@ -31,6 +31,27 @@ describe("useAiStatisticsData", () => {
     vi.mocked(navigator.clipboard.writeText).mockResolvedValue(undefined);
   });
 
+  it("defaults startedAfter to the last 7 days", async () => {
+    const before = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    let hook: ReturnType<typeof useAiStatisticsData> | null = null;
+    render(<HookProbe onHook={(value) => (hook = value)} />);
+    await act(async () => undefined);
+    const after = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    const startedAfter = hook?.filters.startedAfter ?? "";
+    expect(startedAfter).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+    expect(hook?.filters.startedBefore).toBe("");
+
+    const startedAfterMs = new Date(startedAfter).getTime();
+    expect(startedAfterMs).toBeGreaterThanOrEqual(before - 60_000);
+    expect(startedAfterMs).toBeLessThanOrEqual(after + 60_000);
+
+    const fetchMock = vi.mocked(fetch);
+    expect(fetchMock).toHaveBeenCalled();
+    const requestUrl = String(fetchMock.mock.calls[0]?.[0] ?? "");
+    expect(requestUrl).toContain("startedAfter=");
+  });
+
   it("clears the previous copied timeout before scheduling another one", async () => {
     const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
     let hook: ReturnType<typeof useAiStatisticsData> | null = null;
