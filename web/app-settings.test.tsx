@@ -454,6 +454,58 @@ describe("app-settings verification surfaces", () => {
     expect(within(specHistorySection as HTMLElement).getByText("revision 4 / 512 bytes")).toBeInTheDocument();
     expect(within(specHistorySection as HTMLElement).getByText("Showing 1-4 of 4")).toBeInTheDocument();
 
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          errorMessage: "stale_revision",
+          id: "workspace-spec-job-skipped-stale",
+          status: "skipped",
+        },
+      },
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          errorMessage: "workspace_spec_disabled",
+          id: "workspace-spec-job-skipped-disabled",
+          status: "skipped",
+        },
+      },
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          errorMessage: "no_update_needed",
+          id: "workspace-spec-job-skipped-no-update",
+          status: "skipped",
+        },
+      },
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          errorMessage: "custom_reason",
+          id: "workspace-spec-job-skipped-custom",
+          status: "skipped",
+        },
+      },
+      failedJob,
+    ];
+    await userEvent.click(within(specHistorySection as HTMLElement).getByLabelText("Refresh Spec job history"));
+    await waitFor(() =>
+      expect(
+        within(specHistorySection as HTMLElement).getByText(
+          "Spec changed before this job could write",
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(within(specHistorySection as HTMLElement).getByText("Workspace Spec is disabled")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("No update needed")).toBeInTheDocument();
+    expect(within(specHistorySection as HTMLElement).getByText("custom_reason")).toBeInTheDocument();
+
     await userEvent.click(
       within(specHistorySection as HTMLElement).getByRole("button", {
         name: "Retry Spec job",

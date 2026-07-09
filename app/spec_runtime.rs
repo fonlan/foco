@@ -554,41 +554,11 @@ async fn run_workspace_spec_update_job_inner(
     workspace_path: &std::path::Path,
     job: WorkspaceSpecJobRecord,
 ) -> Result<(), ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    let Some(spec) = database
-        .workspace_spec()
-        .map_err(ApiError::from_workspace_error)?
-        .filter(|spec| spec.enabled && !spec.content_markdown.trim().is_empty())
+    let Some((base_revision, input_summary)) =
+        prepare_workspace_spec_update_job_input(workspace_id, workspace_path, &job)?
     else {
-        database
-            .mark_workspace_spec_job_skipped(&job.id, "workspace_spec_disabled")
-            .map_err(ApiError::from_workspace_error)?;
-        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
         return Ok(());
     };
-    let base_revision = job.base_revision.unwrap_or(spec.revision);
-    if WorkspaceSpecWriteDecision::for_job_output(base_revision, spec.revision)
-        != WorkspaceSpecWriteDecision::WriteFullReplacement
-    {
-        database
-            .mark_workspace_spec_job_skipped(&job.id, "stale_revision")
-            .map_err(ApiError::from_workspace_error)?;
-        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
-        return Ok(());
-    }
-
-    let input_summary: WorkspaceSpecUpdateInput = serde_json::from_str(&job.input_summary_json)
-        .map_err(|source| {
-            ApiError::internal(format!(
-                "invalid persisted workspace spec update input: {source}"
-            ))
-        })?;
-    database
-        .mark_workspace_spec_job_running(&job.id)
-        .map_err(ApiError::from_workspace_error)?;
-    log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
-    drop(database);
 
     let model = resolve_workspace_spec_model(config, job.model_id.as_deref())?;
     let request = workspace_spec_update_provider_request(
@@ -637,6 +607,59 @@ async fn run_workspace_spec_update_job_inner(
         log_workspace_spec_job_status_at_path(workspace_path, workspace_id, &job.id);
     }
     result
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_workspace_spec_update_job(
+    workspace_id: &str,
+    workspace_path: &std::path::Path,
+    job: WorkspaceSpecJobRecord,
+) -> Result<Option<(u64, WorkspaceSpecUpdateInput)>, ApiError> {
+    prepare_workspace_spec_update_job_input(workspace_id, workspace_path, &job)
+}
+
+fn prepare_workspace_spec_update_job_input(
+    workspace_id: &str,
+    workspace_path: &std::path::Path,
+    job: &WorkspaceSpecJobRecord,
+) -> Result<Option<(u64, WorkspaceSpecUpdateInput)>, ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(spec) = database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?
+        .filter(|spec| spec.enabled && !spec.content_markdown.trim().is_empty())
+    else {
+        database
+            .mark_workspace_spec_job_skipped(&job.id, "workspace_spec_disabled")
+            .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
+        return Ok(None);
+    };
+    let base_revision = spec.revision;
+    let mut input_summary: WorkspaceSpecUpdateInput = serde_json::from_str(&job.input_summary_json)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "invalid persisted workspace spec update input: {source}"
+            ))
+        })?;
+    input_summary.workspace_id = workspace_id.to_string();
+    input_summary.current_spec_revision = base_revision;
+    input_summary.current_spec_markdown = spec.content_markdown;
+    let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize workspace spec update input: {source}"
+        ))
+    })?;
+    database
+        .update_workspace_spec_job_prepared_input(&job.id, base_revision, &input_summary_json)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .mark_workspace_spec_job_running(&job.id)
+        .map_err(ApiError::from_workspace_error)?;
+    log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
+
+    Ok(Some((base_revision, input_summary)))
 }
 
 #[cfg(test)]
@@ -720,21 +743,7 @@ fn prepare_workspace_spec_generation_job(
         log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
         return Ok(None);
     };
-    let base_revision = job.base_revision.unwrap_or(spec.revision);
-    if WorkspaceSpecWriteDecision::for_job_output(base_revision, spec.revision)
-        != WorkspaceSpecWriteDecision::WriteFullReplacement
-    {
-        database
-            .mark_workspace_spec_job_skipped(job_id, "stale_revision")
-            .map_err(ApiError::from_workspace_error)?;
-        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
-        return Ok(None);
-    }
-
-    database
-        .mark_workspace_spec_job_running(job_id)
-        .map_err(ApiError::from_workspace_error)?;
-    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+    let base_revision = spec.revision;
     let input_summary =
         collect_workspace_spec_input(config, workspace_id, workspace_path, base_revision)?;
     let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
@@ -743,8 +752,12 @@ fn prepare_workspace_spec_generation_job(
         ))
     })?;
     database
-        .update_workspace_spec_job_input_summary(job_id, &input_summary_json)
+        .update_workspace_spec_job_prepared_input(job_id, base_revision, &input_summary_json)
         .map_err(ApiError::from_workspace_error)?;
+    database
+        .mark_workspace_spec_job_running(job_id)
+        .map_err(ApiError::from_workspace_error)?;
+    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
 
     let model = resolve_workspace_spec_model(config, job.model_id.as_deref())?;
     let request = workspace_spec_provider_request(

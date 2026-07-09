@@ -101,7 +101,7 @@ use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 use crate::spec_runtime::{
     WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
-    prepare_workspace_spec_job, queue_workspace_spec_update_job,
+    prepare_workspace_spec_job, prepare_workspace_spec_update_job, queue_workspace_spec_update_job,
     workspace_spec_running_job_is_stale, workspace_spec_update_queue_decision,
 };
 
@@ -11376,6 +11376,133 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
     assert_eq!(job.status, "completed");
     assert!(job.input_summary_json.contains("public_api"));
     assert!(job.input_summary_json.contains("README.md"));
+}
+
+#[test]
+fn workspace_spec_generation_prepare_refreshes_stale_retry_revision() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = prompt_test_config(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-refresh-retry-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nCurrent before retry.")
+            .expect("seed current spec");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("spec job");
+    }
+
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare spec job")
+            .expect("prepared job");
+
+    assert_eq!(prepared.base_revision, 1);
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let job = database
+        .workspace_spec_job(job_id)
+        .expect("spec job lookup")
+        .expect("spec job");
+    assert_eq!(job.status, "running");
+    assert_eq!(job.base_revision, Some(1));
+    assert!(job.input_summary_json.contains(r#""baseRevision":1"#));
+}
+
+#[test]
+fn workspace_spec_update_prepare_refreshes_revision_but_output_still_skips_if_stale() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-project-spec-update-retry-refresh-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, true);
+    let context = workspace_spec_update_test_context(workspace_dir.clone());
+    let workspace_id = context.workspace_id.clone();
+    queue_workspace_spec_update_job(&context, "succeeded").expect("queue spec update");
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let job = database
+        .workspace_spec_jobs(1)
+        .expect("workspace spec jobs")
+        .pop()
+        .expect("queued spec job");
+    assert_eq!(job.base_revision, Some(1));
+    database
+        .update_workspace_spec_content(1, "# Project Spec\n\nCurrent before retry request.")
+        .expect("manual spec edit before prepare");
+    drop(database);
+
+    let (base_revision, input_summary) =
+        prepare_workspace_spec_update_job(&workspace_id, &workspace_dir, job.clone())
+            .expect("prepare update job")
+            .expect("prepared update job");
+    assert_eq!(base_revision, 2);
+    assert_eq!(input_summary.current_spec_revision, 2);
+    assert!(
+        input_summary
+            .current_spec_markdown
+            .contains("Current before retry request")
+    );
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let refreshed_job = database
+        .workspace_spec_job(&job.id)
+        .expect("workspace spec job")
+        .expect("spec job");
+    assert_eq!(refreshed_job.status, "running");
+    assert_eq!(refreshed_job.base_revision, Some(2));
+    assert!(
+        refreshed_job
+            .input_summary_json
+            .contains("Current before retry request")
+    );
+    database
+        .update_workspace_spec_content(2, "# Project Spec\n\nManual edit after request wins.")
+        .expect("manual spec edit after prepare");
+    drop(database);
+
+    apply_workspace_spec_update_job_output(
+        &workspace_dir,
+        &job.id,
+        base_revision,
+        json!({
+            "updateNeeded": true,
+            "contentMarkdown": "# Project Spec\n\nModel update loses."
+        }),
+    )
+    .expect("apply stale spec update");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let spec = database
+        .workspace_spec()
+        .expect("workspace spec")
+        .expect("spec row");
+    assert_eq!(spec.revision, 3);
+    assert!(
+        spec.content_markdown
+            .contains("Manual edit after request wins")
+    );
+    let job = database
+        .workspace_spec_job(&job.id)
+        .expect("workspace spec job")
+        .expect("spec job");
+    assert_eq!(job.status, "skipped");
+    assert_eq!(job.error_message.as_deref(), Some("stale_revision"));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[test]

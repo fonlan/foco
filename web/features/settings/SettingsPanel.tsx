@@ -13532,6 +13532,9 @@ function specJobResultLabel(
   if (job.status === "failed") {
     return job.errorMessage ?? t("Spec job failed");
   }
+  if (job.status === "skipped") {
+    return specJobSkippedReasonLabel(job.errorMessage, t);
+  }
   if (job.status !== "completed") {
     return "";
   }
@@ -13547,6 +13550,18 @@ function specJobResultLabel(
     parts.push(t("{count} bytes", { count: formatNumber(contentBytes, language) }));
   }
   return parts.join(" / ");
+}
+
+function specJobSkippedReasonLabel(reason: string | null, t: Translate) {
+  if (!reason) {
+    return t("Skipped");
+  }
+  const labels: Record<string, string> = {
+    stale_revision: "Spec changed before this job could write",
+    workspace_spec_disabled: "Workspace Spec is disabled",
+    no_update_needed: "No update needed",
+  };
+  return labels[reason] ? t(labels[reason]) : reason;
 }
 
 function jsonObject(value: JsonValue | null): Record<string, JsonValue> | null {

@@ -1234,6 +1234,35 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn update_workspace_spec_job_prepared_input(
+        &mut self,
+        id: &str,
+        base_revision: u64,
+        input_summary_json: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let base_revision = workspace_spec_revision_to_i64(base_revision, "base_revision")?;
+        let input_summary_json =
+            redact_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET base_revision = ?2,
+                     input_summary_json = ?3
+                 WHERE id = ?1",
+                params![id, base_revision, input_summary_json],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(updated > 0)
+    }
+
     pub fn mark_workspace_spec_job_running(
         &mut self,
         id: &str,

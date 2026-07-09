@@ -2388,6 +2388,13 @@ fn workspace_spec_jobs_redact_audit_json_fields() {
         )
         .expect("update input");
     database
+        .update_workspace_spec_job_prepared_input(
+            "spec-job-1",
+            7,
+            r#"{"headers":{"authorization":"Bearer newer"},"sourceFiles":[{"content":"password in source text stays as evidence"}]}"#,
+        )
+        .expect("update prepared input");
+    database
         .mark_workspace_spec_job_completed(
             "spec-job-1",
             Some(r#"{"response":{"password":"secret"},"contentBytes":12}"#),
@@ -2397,8 +2404,9 @@ fn workspace_spec_jobs_redact_audit_json_fields() {
         .workspace_spec_job("spec-job-1")
         .expect("job lookup")
         .expect("spec job");
+    assert_eq!(job.base_revision, Some(7));
     let input: Value = serde_json::from_str(&job.input_summary_json).expect("updated input json");
-    assert_eq!(input["cookie"], "[REDACTED]");
+    assert_eq!(input["headers"]["authorization"], "[REDACTED]");
     assert_eq!(
         input["sourceFiles"][0]["content"],
         "password in source text stays as evidence"
