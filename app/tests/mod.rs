@@ -3910,6 +3910,44 @@ fn context_message_groups_do_not_double_count_reserved_prompt_tokens() {
 }
 
 #[test]
+fn context_message_groups_do_not_group_agent_current_task_with_persisted_history() {
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "old answer".repeat(40)),
+        neutral_text_message(NeutralChatRole::User, "agent task".to_string()),
+        neutral_text_message(NeutralChatRole::User, "new user turn".to_string()),
+    ];
+    let message_source_sequences = vec![None, Some(1), Some(1), Some(2)];
+    let message_context_sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::AgentCurrentTask { sequence: 1 },
+        PromptContextSource::CurrentUser { sequence: 2 },
+    ];
+
+    let groups = context_message_groups(
+        &messages,
+        &message_source_sequences,
+        &message_context_sources,
+        messages.len(),
+    )
+    .expect("message groups");
+    let history_group = groups
+        .iter()
+        .find(|group| group.source_bucket == PromptContextSourceBucket::PersistedHistory)
+        .expect("persisted history group");
+    let task_group = groups
+        .iter()
+        .find(|group| group.source_bucket == PromptContextSourceBucket::AgentCurrentTask)
+        .expect("agent current task group");
+
+    assert!(!history_group.must_keep);
+    assert_eq!(history_group.message_indices, vec![1]);
+    assert!(task_group.must_keep);
+    assert_eq!(task_group.message_indices, vec![2]);
+}
+
+#[test]
 fn context_token_breakdown_handles_every_source_bucket() {
     // Guards against a repeat of the panic where a source bucket existed on the
     // enum but was missing from the SOURCES list inside context_token_breakdown.

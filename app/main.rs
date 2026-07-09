@@ -2223,6 +2223,7 @@ enum PromptContextSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PromptContextGroupKey {
     MessageSequence(i64),
+    AgentCurrentTask(i64),
     RuntimeToolBatch(usize),
 }
 

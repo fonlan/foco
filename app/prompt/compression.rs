@@ -1847,9 +1847,11 @@ pub(crate) fn context_message_groups(
 fn prompt_context_group_key(source: &PromptContextSource) -> Option<PromptContextGroupKey> {
     match source {
         PromptContextSource::StoredMessage { sequence }
-        | PromptContextSource::AgentCurrentTask { sequence }
         | PromptContextSource::TurnMemory { sequence } => {
             Some(PromptContextGroupKey::MessageSequence(*sequence))
+        }
+        PromptContextSource::AgentCurrentTask { sequence } => {
+            Some(PromptContextGroupKey::AgentCurrentTask(*sequence))
         }
         PromptContextSource::RuntimeToolState { batch_index } => {
             Some(PromptContextGroupKey::RuntimeToolBatch(*batch_index))
