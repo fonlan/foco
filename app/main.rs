@@ -767,6 +767,7 @@ async fn run_server_until_shutdown(
     scheduled_task_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
+    let remote_workspace_manager = state.remote_workspace_manager.clone();
     let app = crate::http::router::app_router(state);
     let bind_started_at = Instant::now();
     tracing::info!(%addr, "HTTP listener bind started");
@@ -802,6 +803,7 @@ async fn run_server_until_shutdown(
         app_shutdown_rx,
         terminal_shutdown_tx,
         mcp_registry,
+        remote_workspace_manager,
     ))
     .await;
     if server_result.is_err() {
@@ -978,6 +980,7 @@ async fn shutdown_signal(
     mut app_shutdown_rx: watch::Receiver<bool>,
     terminal_shutdown_tx: broadcast::Sender<()>,
     mcp_registry: Arc<McpRegistry>,
+    remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
 ) {
     tokio::select! {
         ctrl_c = tokio::signal::ctrl_c() => {
@@ -998,6 +1001,9 @@ async fn shutdown_signal(
 
     tracing::info!("shutdown requested; closing terminal sessions");
     let _ = terminal_shutdown_tx.send(());
+    if let Err(error) = remote_workspace_manager.disconnect_all().await {
+        tracing::warn!(error = %error.message(), "failed to stop remote workspace sessions");
+    }
     if let Err(error) = mcp_registry.stop_all().await {
         tracing::warn!(error = %error, "failed to stop MCP servers");
     }

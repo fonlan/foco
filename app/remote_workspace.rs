@@ -384,6 +384,7 @@ impl RemoteWorkspaceManager {
             &token,
         )
         .await?;
+        stop_stale_remote_sidecars(&server, server_id, workspace_id, &remote_path).await?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -540,6 +541,29 @@ impl RemoteWorkspaceManager {
             session.stop().await;
         }
         self.set_status(server_id, None, RemoteConnectionState::Disconnected, None)?;
+        Ok(())
+    }
+
+    pub(crate) async fn disconnect_all(&self) -> Result<(), ApiError> {
+        let removed = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+            sessions
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>()
+        };
+        for session in removed {
+            self.set_status(
+                &session.server_id,
+                Some(&session.workspace_id),
+                RemoteConnectionState::Disconnected,
+                None,
+            )?;
+            session.stop().await;
+        }
         Ok(())
     }
 
@@ -1806,6 +1830,62 @@ async fn ensure_remote_session_file(
         ));
     }
     Ok(path)
+}
+
+fn stale_remote_sidecar_cleanup_script(
+    server_id: &str,
+    workspace_id: &str,
+    remote_path: &str,
+) -> String {
+    format!(
+        r#"set -eu
+sid={server_id}
+wid={workspace_id}
+wpath={remote_path}
+for cmdline in /proc/[0-9]*/cmdline; do
+  pid="${{cmdline#/proc/}}"
+  pid="${{pid%/cmdline}}"
+  cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)"
+  [ -n "$cmd" ] || continue
+  printf '%s' "$cmd" | grep -F -- '--remote-sidecar' >/dev/null || continue
+  printf '%s' "$cmd" | grep -F -- "--server-id $sid" >/dev/null || continue
+  printf '%s' "$cmd" | grep -F -- "--workspace-id $wid" >/dev/null || continue
+  printf '%s' "$cmd" | grep -F -- "--workspace-path $wpath" >/dev/null || continue
+  kill "$pid" 2>/dev/null || true
+done
+"#,
+        server_id = shell_quote(server_id),
+        workspace_id = shell_quote(workspace_id),
+        remote_path = shell_quote(remote_path),
+    )
+}
+
+async fn stop_stale_remote_sidecars(
+    server: &RemoteServerProfile,
+    server_id: &str,
+    workspace_id: &str,
+    remote_path: &str,
+) -> Result<(), ApiError> {
+    let script = stale_remote_sidecar_cleanup_script(server_id, workspace_id, remote_path);
+    let output = run_ssh_output(
+        server,
+        &[script.as_str()],
+        true,
+        server_id,
+        Some(workspace_id),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(remote_error(
+            server_id,
+            Some(workspace_id),
+            format!(
+                "failed to stop stale remote sidecars: {}",
+                output_text(&output)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -4362,6 +4442,25 @@ fn remote_message_queued_run(metadata_json: &str) -> Option<Value> {
         .cloned()
 }
 
+fn remote_clear_message_queued_run(
+    database: &mut WorkspaceDatabase,
+    message_id: &str,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let Some(message) = database.message(message_id)? else {
+        return Ok(());
+    };
+    let Ok(mut metadata) = serde_json::from_str::<Value>(&message.metadata_json) else {
+        return Ok(());
+    };
+    let Some(object) = metadata.as_object_mut() else {
+        return Ok(());
+    };
+    if object.remove("queuedRun").is_none() {
+        return Ok(());
+    }
+    database.update_message_metadata(message_id, &metadata.to_string())
+}
+
 async fn remote_sidecar_chat_queue(
     State(state): State<RemoteSidecarState>,
     Json(payload): Json<Value>,
@@ -4717,6 +4816,7 @@ async fn remote_sidecar_chat_stream(
         let mut broker_rx = match remote_sidecar_broker_request(&stream_state, "llm.stream", broker_payload).await {
             Ok(rx) => rx,
             Err(_) => {
+                remote_sidecar_remove_active_run(&stream_state, &run_id);
                 sequence += 1;
                 yield Ok(remote_sse_json_event(sequence, json!({
                     "type": "error",
@@ -4724,7 +4824,6 @@ async fn remote_sidecar_chat_stream(
                 })));
                 sequence += 1;
                 yield Ok(remote_sse_json_event(sequence, json!({ "type": "streamEnd" })));
-                remote_sidecar_remove_active_run(&stream_state, &run_id);
                 return;
             }
         };
@@ -4741,6 +4840,7 @@ async fn remote_sidecar_chat_stream(
                 Ok(Some(envelope)) => envelope,
                 Ok(None) => break,
                 Err(_) => {
+                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
                     yield Ok(remote_sse_json_event(sequence, json!({
                         "type": "error",
@@ -4823,6 +4923,7 @@ async fn remote_sidecar_chat_stream(
                         sequence: assistant_sequence,
                         metadata_json: Some(&metadata.to_string()),
                     });
+                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
                     let completion_payload = remote_chat_completion_event(
                         &chat_id,
                         &assistant_message_id,
@@ -4852,6 +4953,7 @@ async fn remote_sidecar_chat_stream(
                         event_type: "completion",
                         payload_json: &completion_payload.to_string(),
                     });
+                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
                     yield Ok(remote_sse_json_event(sequence, completion_payload));
                     sequence += 1;
@@ -4877,6 +4979,7 @@ async fn remote_sidecar_chat_stream(
                             json!({ "error": { "message": message } }),
                         );
                     }
+                    remote_sidecar_remove_active_run(&stream_state, &run_id);
                     sequence += 1;
                     yield Ok(remote_sse_json_event(sequence, json!({
                         "type": "error",
@@ -6372,6 +6475,18 @@ mod tests {
     }
 
     #[test]
+    fn stale_remote_sidecar_cleanup_script_matches_workspace_identity() {
+        let script = stale_remote_sidecar_cleanup_script("server-1", "workspace-1", "/srv/project");
+        assert!(script.contains("sid='server-1'"));
+        assert!(script.contains("wid='workspace-1'"));
+        assert!(script.contains("wpath='/srv/project'"));
+        assert!(script.contains("grep -F -- '--remote-sidecar'"));
+        assert!(script.contains("grep -F -- \"--server-id $sid\""));
+        assert!(script.contains("grep -F -- \"--workspace-id $wid\""));
+        assert!(script.contains("grep -F -- \"--workspace-path $wpath\""));
+    }
+
+    #[test]
     fn sidecar_options_require_context() {
         let error = RemoteSidecarOptions::parse(&["--server-id".to_string(), "srv".to_string()])
             .unwrap_err();
@@ -6415,6 +6530,91 @@ mod tests {
             remote_idempotency_key(&json!({ "idempotencyKey": "client-key" }), "fallback"),
             "client-key"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_queue_treats_distinct_client_keys_as_distinct_turns() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
+        let state = RemoteSidecarState {
+            token: "token".to_string(),
+            last_config_hash: Arc::new(Mutex::new(None)),
+            code_graph_watcher: Arc::new(Mutex::new(None)),
+            ws_count: Arc::new(AtomicUsize::new(0)),
+            active_run_count: Arc::new(AtomicUsize::new(0)),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+            broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            broker_tx,
+            shutdown_tx: default_shutdown_tx(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: workspace.path().to_string_lossy().to_string(),
+        };
+        let base_payload = json!({
+            "chatId": "chat-1",
+            "message": "hello",
+            "modelId": "model-1",
+            "providerId": "provider-1",
+        });
+        let mut first_payload = base_payload.clone();
+        first_payload["idempotencyKey"] = json!("submit-1");
+        let mut second_payload = base_payload;
+        second_payload["idempotencyKey"] = json!("submit-2");
+
+        let first = remote_sidecar_chat_queue(State(state.clone()), Json(first_payload))
+            .await
+            .expect("first queue")
+            .0;
+        let second = remote_sidecar_chat_queue(State(state.clone()), Json(second_payload))
+            .await
+            .expect("second queue")
+            .0;
+
+        assert_ne!(first["userMessageId"], second["userMessageId"]);
+        assert_ne!(first["assistantMessageId"], second["assistantMessageId"]);
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let messages = database
+            .messages_for_chat("chat-1")
+            .expect("messages for chat");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].sequence, 0);
+        assert_eq!(messages[2].sequence, 2);
+    }
+
+    #[test]
+    fn remote_clear_message_queued_run_preserves_other_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "parts": [{ "type": "text", "text": "hello" }],
+                        "queuedRun": { "status": "queued" },
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+
+        remote_clear_message_queued_run(&mut database, "msg-user-1").expect("clear queued run");
+
+        let message = database
+            .message("msg-user-1")
+            .expect("message lookup")
+            .expect("message");
+        let metadata: Value =
+            serde_json::from_str(&message.metadata_json).expect("message metadata");
+        assert!(metadata.get("queuedRun").is_none());
+        assert_eq!(metadata["parts"][0]["text"], "hello");
     }
 
     #[test]

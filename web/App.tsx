@@ -6876,11 +6876,13 @@ export function App() {
     request: RetryRunRequest,
     options: { deferStart?: boolean } = {},
   ): Promise<QueueChatMessageResponse> {
+    const idempotencyKey = request.idempotencyKey ?? localRandomId("queue");
     return requestJson<QueueChatMessageResponse>(
       `/api/workspaces/${encodeURIComponent(request.workspaceId)}/chat/queue`,
       {
         body: JSON.stringify({
           chatId: request.chatId,
+          idempotencyKey,
           message: request.content,
           attachments: request.attachments,
           modelId: request.modelId,

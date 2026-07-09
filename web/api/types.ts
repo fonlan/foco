@@ -2243,6 +2243,7 @@ export type RetryRunRequest = {
   skillIds: string[];
   sessionMode?: "plan";
   teamModeEnabled?: boolean;
+  idempotencyKey?: string;
   localChatKey?: string;
   pendingUserMessageId?: string;
   queuedUserMessageId?: string;
