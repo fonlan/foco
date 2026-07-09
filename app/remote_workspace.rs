@@ -27,9 +27,10 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{build_memory_prompt_section, build_project_spec_prompt_section};
+use foco_mcp::McpRegistry;
 use foco_providers::{
     NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent,
-    NeutralToolDefinition, NeutralUsage, stream_chat,
+    NeutralToolCall, NeutralToolDefinition, NeutralUsage, stream_chat,
 };
 use foco_store::{
     config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation},
@@ -63,6 +64,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::{
     ApiError, AppResult, AppState, config_snapshot,
+    hooks::HookRuntime,
     http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
     markdown_code_block, neutral_text_message, neutral_tool_definition,
     prompt::{
@@ -70,8 +72,9 @@ use crate::{
         configured_extra_prompt_message, environment_context_message,
     },
     runtime::{
-        SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle, execute_image_tool,
-        execute_web_tool,
+        QuestionRegistry, SidecarRuntimeConfigBundle, ToolOutputDeltaEvent,
+        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
+        execute_tool, execute_web_tool,
     },
     save_config, unique_id, workspace_by_id,
 };
@@ -87,6 +90,7 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REMOTE_SIDECAR_MAX_TOOL_ROUNDS: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -5001,21 +5005,9 @@ fn remote_sidecar_provider_request(
     model_id: &str,
     thinking_level: Value,
 ) -> Result<NeutralChatRequest, axum::response::Response> {
-    let raw_messages = database
-        .messages_for_chat(chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-        .into_iter()
-        .filter(|message| message.role != "assistant" || message.id != assistant_message_id)
-        .map(|message| NeutralChatMessage {
-            role: neutral_role_for_message(&message.role),
-            content: message.content,
-            attachments: Vec::new(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        })
-        .collect::<Vec<_>>();
+    let raw_messages =
+        remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
 
     let Some(bundle) = state
         .runtime_config
@@ -5119,6 +5111,520 @@ fn sidecar_selected_skill_messages(bundle: &SidecarRuntimeConfigBundle) -> Vec<N
         NeutralChatRole::Developer,
         format!("## Selected Skills\n\n{entries}"),
     )]
+}
+
+fn remote_sidecar_chat_messages_for_request(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    assistant_message_id: &str,
+) -> Result<Vec<NeutralChatMessage>, foco_store::workspace::WorkspaceDatabaseError> {
+    let messages = database.messages_for_chat(chat_id)?;
+    let tool_calls = database.tool_calls_for_chat(chat_id)?;
+    let mut tool_calls_by_message = HashMap::<String, Vec<_>>::new();
+    for tool_call in tool_calls {
+        let Some(message_id) = tool_call.message_id.clone() else {
+            continue;
+        };
+        tool_calls_by_message
+            .entry(message_id)
+            .or_default()
+            .push(tool_call);
+    }
+
+    let mut raw_messages = Vec::new();
+    for message in messages {
+        if message.role == "assistant" && message.id == assistant_message_id {
+            continue;
+        }
+        let metadata = serde_json::from_str::<Value>(&message.metadata_json).unwrap_or(Value::Null);
+        let reasoning = metadata
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+        let mut tool_message_parts = Vec::new();
+        let mut assistant_tool_calls = Vec::new();
+        if message.role == "assistant"
+            && let Some(tool_records) = tool_calls_by_message.remove(&message.id)
+        {
+            for tool_record in tool_records {
+                assistant_tool_calls.push(remote_neutral_tool_call_from_record(&tool_record));
+                if let Some(result) = tool_record.result {
+                    tool_message_parts.push(NeutralChatMessage {
+                        role: NeutralChatRole::Tool,
+                        content: result.output_json,
+                        attachments: Vec::new(),
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(tool_record.id.clone()),
+                        tool_name: Some(tool_record.tool_name.clone()),
+                    });
+                }
+            }
+        }
+        raw_messages.push(NeutralChatMessage {
+            role: neutral_role_for_message(&message.role),
+            content: message.content,
+            attachments: Vec::new(),
+            reasoning,
+            tool_calls: assistant_tool_calls,
+            tool_call_id: None,
+            tool_name: None,
+        });
+        raw_messages.extend(tool_message_parts);
+    }
+
+    Ok(raw_messages)
+}
+
+fn remote_neutral_tool_call_from_record(
+    tool_call: &foco_store::workspace::ToolCallWithResultRecord,
+) -> NeutralToolCall {
+    NeutralToolCall {
+        call_id: tool_call.id.clone(),
+        name: tool_call.tool_name.clone(),
+        arguments: serde_json::from_str(&tool_call.input_json).unwrap_or(Value::Null),
+        thought_signatures: None,
+    }
+}
+
+fn remote_sidecar_executable_tool_names() -> HashSet<String> {
+    remote_sidecar_executable_tool_schemas()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+}
+
+fn remote_sidecar_capture_pending_tool_calls(
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+) -> Vec<Value> {
+    let allowed_tools = remote_sidecar_executable_tool_names();
+    let mut events = Vec::new();
+    for tool_call in tool_calls {
+        if !allowed_tools.contains(tool_call.name.as_str()) {
+            continue;
+        }
+        events.push(json!({
+            "type": "toolCall",
+            "assistantMessageId": assistant_message_id,
+            "toolCall": {
+                "id": tool_call.call_id,
+                "name": tool_call.name,
+                "status": "running",
+                "input": tool_call.arguments,
+                "output": Value::Null,
+                "isError": false,
+            },
+        }));
+    }
+    if events.is_empty() {
+        return Vec::new();
+    }
+    events
+}
+
+fn remote_sidecar_record_pending_tool_calls(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let allowed_tools = remote_sidecar_executable_tool_names();
+    for tool_call in tool_calls {
+        if !allowed_tools.contains(tool_call.name.as_str()) {
+            continue;
+        }
+        let input_json =
+            serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "null".to_string());
+        database.upsert_tool_call(foco_store::workspace::NewToolCall {
+            id: &tool_call.call_id,
+            chat_id,
+            run_id,
+            message_id: Some(assistant_message_id),
+            tool_name: &tool_call.name,
+            input_json: &input_json,
+            status: "running",
+            started_at: &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            completed_at: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn remote_sidecar_record_tool_result(
+    database: &mut WorkspaceDatabase,
+    tool_call: &NeutralToolCall,
+    output: &Value,
+    is_error: bool,
+    started_at: &str,
+    completed_at: &str,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let output_json = serde_json::to_string(output).unwrap_or_else(|_| "null".to_string());
+    let result_id = format!("{}-result", tool_call.call_id);
+    database.upsert_tool_result(foco_store::workspace::NewToolResult {
+        id: &result_id,
+        tool_call_id: &tool_call.call_id,
+        output_json: &output_json,
+        is_error,
+        created_at: completed_at,
+    })?;
+    database.complete_tool_call(
+        &tool_call.call_id,
+        if is_error { "error" } else { "completed" },
+        completed_at,
+    )?;
+    let _ = started_at;
+    Ok(())
+}
+
+async fn remote_sidecar_execute_tool_call(
+    state: &RemoteSidecarState,
+    tool_call: NeutralToolCall,
+    chat_id: &str,
+    run_id: &str,
+    assistant_message_id: &str,
+) -> (Value, bool, String, String, Vec<Value>) {
+    // ponytail: remote sidecar reuses the shared execute_tool path one call at a time.
+    // Ceiling: this duplicates a thin slice of main chat wiring; if remote tools grow
+    // parallelism/question hooks, extract a dedicated remote tool runtime helper.
+    let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let tool_output_events = Arc::new(AsyncMutex::new(Vec::<Value>::new()));
+    let question_events = Arc::new(AsyncMutex::new(Vec::<Value>::new()));
+    let (tool_output_tx, mut tool_output_rx) = mpsc::unbounded_channel::<ToolOutputDeltaEvent>();
+    let (question_tx, mut question_rx) = mpsc::unbounded_channel();
+    let tool_output_events_task = tool_output_events.clone();
+    let tool_call_id_for_output = tool_call.call_id.clone();
+    let assistant_message_id_for_output = assistant_message_id.to_string();
+    let tool_output_collector = tokio::spawn(async move {
+        while let Some(event) = tool_output_rx.recv().await {
+            let stream = match event.stream {
+                foco_tools::ToolOutputStream::Stdout => "stdout",
+                foco_tools::ToolOutputStream::Stderr => "stderr",
+            };
+            tool_output_events_task.lock().await.push(json!({
+                "type": "toolOutputDelta",
+                "assistantMessageId": assistant_message_id_for_output,
+                "toolCallId": tool_call_id_for_output,
+                "stream": stream,
+                "delta": event.delta,
+            }));
+        }
+    });
+    let question_events_task = question_events.clone();
+    let assistant_message_id_for_question = assistant_message_id.to_string();
+    let question_collector = tokio::spawn(async move {
+        while let Some(request) = question_rx.recv().await {
+            question_events_task.lock().await.push(json!({
+                "type": "questionRequest",
+                "assistantMessageId": assistant_message_id_for_question,
+                "request": request,
+            }));
+        }
+    });
+
+    let global_config = foco_store::config::GlobalConfig::first_run(workspace_path.clone());
+    let mcp_registry = Arc::new(McpRegistry::default());
+    let hook_runtime = HookRuntime::new(mcp_registry.clone());
+    let execution = execute_tool(
+        mcp_registry,
+        hook_runtime,
+        &foco_store::config::HookConfig::default(),
+        false,
+        &global_config,
+        &foco_providers::ProviderConnectionConfig {
+            kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+                .expect("openai responses kind"),
+            base_url: None,
+            api_key: None,
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        },
+        &foco_store::config::WebSearchSettings::default(),
+        QuestionRegistry::default(),
+        question_tx.clone(),
+        crate::memory_runtime::MemoryToolContext {
+            enabled: false,
+            workspace_path: workspace_path.clone(),
+            global_memory_database_file: workspace_path
+                .join(".foco/remote-sidecar-disabled-memory.sqlite"),
+            chat_id: chat_id.to_string(),
+            run_id: run_id.to_string(),
+            tool_call_id: tool_call.call_id.clone(),
+            target_status: MemoryStatus::Pending,
+            memory_settings: foco_store::config::MemorySettings::default(),
+        },
+        None,
+        ToolResourceLockRegistry::default(),
+        foco_tools::ToolCancellationToken::default(),
+        tool_output_tx.clone(),
+        assistant_message_id,
+        &state.workspace_id,
+        &workspace_path,
+        &workspace_path,
+        chat_id,
+        None,
+        run_id,
+        "remote-sidecar-tool-loop",
+        "remote-sidecar",
+        0,
+        &tool_call.call_id,
+        &tool_call.name,
+        tool_call.arguments.clone(),
+    )
+    .await;
+
+    drop(question_tx);
+    drop(tool_output_tx);
+    let _ = question_collector.await;
+    let _ = tool_output_collector.await;
+
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut followup_events = tool_output_events.lock().await.clone();
+    followup_events.extend(question_events.lock().await.clone());
+    let is_error = execution.execution.is_error;
+    let output = execution.execution.output;
+    (output, is_error, started_at, completed_at, followup_events)
+}
+
+async fn remote_sidecar_run_broker_llm_turn(
+    state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+    broker_request_id: &str,
+    broker_payload: Value,
+    run_id: &str,
+    chat_id: &str,
+    assistant_message_id: &str,
+    queued_user_message_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    database: &mut WorkspaceDatabase,
+    text: &mut String,
+    reasoning: &mut String,
+    sequence: &mut i64,
+) -> Result<Option<(Vec<NeutralToolCall>, Value)>, ()> {
+    let mut broker_rx =
+        remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
+            .await
+            .map_err(|_| ())?;
+    loop {
+        let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                *sequence += 1;
+                run_stream.record(*sequence, json!({
+                    "type": "error",
+                    "message": "remote broker request timed out; retry to resume from persisted messages",
+                }));
+                *sequence += 1;
+                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                return Err(());
+            }
+        };
+        match envelope.message_type.as_str() {
+            "stream" => {
+                let kind = envelope
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let delta = envelope
+                    .payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind == "textDelta" {
+                    text.push_str(delta);
+                    *sequence += 1;
+                    run_stream.record(
+                        *sequence,
+                        json!({
+                            "type": "textDelta",
+                            "assistantMessageId": assistant_message_id,
+                            "delta": delta,
+                        }),
+                    );
+                } else if kind == "reasoningDelta" {
+                    reasoning.push_str(delta);
+                    *sequence += 1;
+                    run_stream.record(
+                        *sequence,
+                        json!({
+                            "type": "reasoningDelta",
+                            "assistantMessageId": assistant_message_id,
+                            "delta": delta,
+                        }),
+                    );
+                } else if kind == "usageDelta" {
+                    *sequence += 1;
+                    run_stream.record(
+                        *sequence,
+                        json!({
+                            "type": "usage",
+                            "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                } else if kind == "toolCall" {
+                    let Some(tool_value) = envelope.payload.get("toolCall") else {
+                        continue;
+                    };
+                    let Ok(tool_call) =
+                        serde_json::from_value::<NeutralToolCall>(tool_value.clone())
+                    else {
+                        continue;
+                    };
+                    let pending_payload = json!({
+                        "type": "toolCall",
+                        "assistantMessageId": assistant_message_id,
+                        "toolCall": {
+                            "id": tool_call.call_id.clone(),
+                            "name": tool_call.name.clone(),
+                            "status": "running",
+                            "input": tool_call.arguments.clone(),
+                            "output": Value::Null,
+                            "isError": false,
+                        },
+                    });
+                    remote_sidecar_record_pending_tool_calls(
+                        database,
+                        chat_id,
+                        run_id,
+                        assistant_message_id,
+                        std::slice::from_ref(&tool_call),
+                    )
+                    .map_err(|_| ())?;
+                    *sequence += 1;
+                    run_stream.record(*sequence, pending_payload);
+                }
+                remote_sidecar_set_active_run(
+                    state,
+                    RemoteActiveRunSummary {
+                        run_id: run_id.to_string(),
+                        chat_id: chat_id.to_string(),
+                        last_sequence: Some(*sequence),
+                        accepting_guidance: true,
+                        broker_status: "connected".to_string(),
+                        updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    },
+                );
+            }
+            "response" => {
+                let usage = envelope
+                    .payload
+                    .get("usage")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let tool_calls = envelope
+                    .payload
+                    .get("toolCalls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
+                    .unwrap_or_default();
+                if tool_calls.is_empty() {
+                    let metadata = json!({
+                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                        "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                        "metrics": {
+                            "modelId": model_id,
+                            "providerId": provider_id,
+                            "totalLatencyMs": null,
+                            "firstTokenLatencyMs": null,
+                            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
+                            "llmRequestIds": [run_id],
+                        },
+                    });
+                    let assistant_sequence = database
+                        .message(assistant_message_id)
+                        .ok()
+                        .flatten()
+                        .map(|message| message.sequence)
+                        .unwrap_or_else(|| {
+                            database
+                                .next_message_sequence_for_chat(chat_id)
+                                .unwrap_or(0)
+                        });
+                    let _ = database.upsert_message_content(NewMessage {
+                        id: assistant_message_id,
+                        chat_id,
+                        role: "assistant",
+                        content: text,
+                        sequence: assistant_sequence,
+                        metadata_json: Some(&metadata.to_string()),
+                    });
+                    let _ = remote_clear_message_queued_run(database, queued_user_message_id);
+                    let completion_payload = remote_chat_completion_event(
+                        chat_id,
+                        assistant_message_id,
+                        text,
+                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                        usage.clone(),
+                        model_id,
+                        provider_id,
+                        run_id,
+                    );
+                    let _ = persist_sidecar_llm_audit(
+                        database,
+                        &state.workspace_id,
+                        chat_id,
+                        run_id,
+                        provider_id,
+                        model_id,
+                        &usage,
+                        "succeeded",
+                        completion_payload.clone(),
+                    );
+                    let _ = database.insert_run_event(NewRunEvent {
+                        id: &unique_id("run-event"),
+                        chat_id,
+                        run_id,
+                        sequence: *sequence,
+                        event_type: "completion",
+                        payload_json: &completion_payload.to_string(),
+                    });
+                    *sequence += 1;
+                    run_stream.record(*sequence, completion_payload);
+                    *sequence += 1;
+                    run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                    return Ok(None);
+                }
+                return Ok(Some((tool_calls, usage)));
+            }
+            "error" => {
+                let message = envelope
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote broker unavailable");
+                let _ = persist_sidecar_llm_audit(
+                    database,
+                    &state.workspace_id,
+                    chat_id,
+                    run_id,
+                    provider_id,
+                    model_id,
+                    &Value::Null,
+                    "failed",
+                    json!({ "error": { "message": message } }),
+                );
+                *sequence += 1;
+                run_stream.record(
+                    *sequence,
+                    json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                );
+                *sequence += 1;
+                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                return Err(());
+            }
+            _ => {}
+        }
+    }
 }
 
 fn remote_project_spec_context_message(
@@ -5241,8 +5747,7 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
-    let broker_request_id = unique_id("broker-request");
-    let provider_request = remote_sidecar_provider_request(
+    let initial_provider_request = remote_sidecar_provider_request(
         &state,
         &database,
         &chat_id,
@@ -5261,16 +5766,6 @@ async fn remote_sidecar_chat_stream(
     remote_sidecar_set_active_run(&state, run);
     let run_stream =
         remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
-    run_stream.set_broker_request_id(broker_request_id.clone());
-    let broker_payload = json!({
-        "workspaceId": state.workspace_id,
-        "chatId": chat_id,
-        "chatTitle": chat.title,
-        "runId": run_id,
-        "providerId": provider_id,
-        "modelId": model_id,
-        "request": provider_request,
-    });
     let stream_state = state.clone();
     let run_stream = run_stream.clone();
     let stream = async_stream::stream! {
@@ -5291,191 +5786,189 @@ async fn remote_sidecar_chat_stream(
             "type": "connecting",
             "message": "connecting to remote broker",
         })));
-        let mut broker_rx = match remote_sidecar_broker_request(&stream_state, &broker_request_id, "llm.stream", broker_payload).await {
-            Ok(rx) => rx,
-            Err(_) => {
-                sequence += 1;
-                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                    "type": "error",
-                    "message": "remote broker is unavailable; wait for reconnect and retry",
-                })));
-                sequence += 1;
-                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                remote_sidecar_finish_active_run(&stream_state, &run_id);
-                cleanup_guard.disarm();
-                return;
-            }
-        };
-        remote_sidecar_set_active_run(&stream_state, RemoteActiveRunSummary {
-            run_id: run_id.clone(),
-            chat_id: chat_id.clone(),
-            last_sequence: Some(sequence),
-            accepting_guidance: true,
-            broker_status: "connected".to_string(),
-            updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        });
+
+        let mut current_request = initial_provider_request;
+        let mut tool_rounds = 0_usize;
         loop {
-            let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
-                Ok(Some(envelope)) => envelope,
-                Ok(None) => break,
-                Err(_) => {
+            let broker_request_id = unique_id("broker-request");
+            run_stream.set_broker_request_id(broker_request_id.clone());
+            let broker_payload = json!({
+                "workspaceId": stream_state.workspace_id,
+                "chatId": chat_id,
+                "chatTitle": chat.title,
+                "runId": run_id,
+                "providerId": provider_id,
+                "modelId": model_id,
+                "request": current_request,
+            });
+            let mut database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
+                Ok(database) => database,
+                Err(error) => {
                     sequence += 1;
                     yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                         "type": "error",
-                        "message": "remote broker request timed out; retry to resume from persisted messages",
+                        "message": error.to_string(),
                     })));
                     sequence += 1;
                     yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
-                    break;
+                    return;
                 }
             };
-            match envelope.message_type.as_str() {
-                "stream" => {
-                    let kind = envelope.payload.get("kind").and_then(Value::as_str).unwrap_or("");
-                    let delta = envelope.payload.get("delta").and_then(Value::as_str).unwrap_or("");
-                    if kind == "textDelta" {
-                        text.push_str(delta);
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                            "type": "textDelta",
-                            "assistantMessageId": assistant_message_id,
-                            "delta": delta,
-                        })));
-                    } else if kind == "reasoningDelta" {
-                        reasoning.push_str(delta);
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                            "type": "reasoningDelta",
-                            "assistantMessageId": assistant_message_id,
-                            "delta": delta,
-                        })));
-                    } else if kind == "usageDelta" {
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                            "type": "usage",
-                            "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
-                        })));
-                    }
-                    remote_sidecar_set_active_run(&stream_state, RemoteActiveRunSummary {
-                        run_id: run_id.clone(),
-                        chat_id: chat_id.clone(),
-                        last_sequence: Some(sequence),
-                        accepting_guidance: true,
-                        broker_status: "connected".to_string(),
-                        updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                    });
-                }
-                "response" => {
-                    let mut database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
-                        Ok(database) => database,
-                        Err(error) => {
-                            sequence += 1;
-                            yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "error", "message": error.to_string() })));
-                            sequence += 1;
-                            yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                            remote_sidecar_finish_active_run(&stream_state, &run_id);
-                            cleanup_guard.disarm();
-                            break;
-                        }
-                    };
-                    let usage = envelope.payload.get("usage").cloned().unwrap_or(Value::Null);
-                    let metadata = json!({
-                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                        "parts": remote_chat_parts(&text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
-                        "metrics": {
-                            "modelId": model_id,
-                            "providerId": provider_id,
-                            "totalLatencyMs": null,
-                            "firstTokenLatencyMs": null,
-                            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
-                            "llmRequestIds": [run_id],
-                        },
-                    });
-                    let assistant_sequence = database
-                        .message(&assistant_message_id)
-                        .ok()
-                        .flatten()
-                        .map(|message| message.sequence)
-                        .unwrap_or_else(|| database.next_message_sequence_for_chat(&chat_id).unwrap_or(0));
-                    let _ = database.upsert_message_content(NewMessage {
-                        id: &assistant_message_id,
-                        chat_id: &chat_id,
-                        role: "assistant",
-                        content: &text,
-                        sequence: assistant_sequence,
-                        metadata_json: Some(&metadata.to_string()),
-                    });
-                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-                    let completion_payload = remote_chat_completion_event(
-                        &chat_id,
-                        &assistant_message_id,
-                        &text,
-                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
-                        usage.clone(),
-                        &model_id,
-                        &provider_id,
-                        &run_id,
-                    );
-                    let _ = persist_sidecar_llm_audit(
-                        &mut database,
-                        &stream_state.workspace_id,
-                        &chat_id,
-                        &run_id,
-                        &provider_id,
-                        &model_id,
-                        &usage,
-                        "succeeded",
-                        completion_payload.clone(),
-                    );
-                    let _ = database.insert_run_event(NewRunEvent {
-                        id: &unique_id("run-event"),
-                        chat_id: &chat_id,
-                        run_id: &run_id,
-                        sequence,
-                        event_type: "completion",
-                        payload_json: &completion_payload.to_string(),
-                    });
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, completion_payload));
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+            match remote_sidecar_run_broker_llm_turn(
+                &stream_state,
+                &run_stream,
+                &broker_request_id,
+                broker_payload,
+                &run_id,
+                &chat_id,
+                &assistant_message_id,
+                &queued_user_message_id,
+                &provider_id,
+                &model_id,
+                &mut database,
+                &mut text,
+                &mut reasoning,
+                &mut sequence,
+            ).await {
+                Ok(None) => {
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
                     break;
                 }
-                "error" => {
-                    if let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
-                        let message = envelope
-                            .payload
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("remote broker unavailable");
-                        let _ = persist_sidecar_llm_audit(
-                            &mut database,
-                            &stream_state.workspace_id,
+                Ok(Some((tool_calls, _usage))) => {
+                    let allowed_tools = remote_sidecar_executable_tool_names();
+                    tool_rounds += 1;
+                    if tool_rounds > REMOTE_SIDECAR_MAX_TOOL_ROUNDS {
+                        sequence += 1;
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
+                            "type": "error",
+                            "message": format!("remote tool round limit reached after {REMOTE_SIDECAR_MAX_TOOL_ROUNDS} rounds"),
+                        })));
+                        sequence += 1;
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        cleanup_guard.disarm();
+                        break;
+                    }
+
+                    let mut next_messages = current_request.messages.clone();
+                    next_messages.push(NeutralChatMessage {
+                        role: NeutralChatRole::Assistant,
+                        content: text.clone(),
+                        attachments: Vec::new(),
+                        reasoning: (!reasoning.is_empty()).then_some(reasoning.clone()),
+                        tool_calls: tool_calls.clone(),
+                        tool_call_id: None,
+                        tool_name: None,
+                    });
+
+                    let runnable_tool_calls = tool_calls
+                        .iter()
+                        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let _ = remote_sidecar_record_pending_tool_calls(
+                        &mut database,
+                        &chat_id,
+                        &run_id,
+                        &assistant_message_id,
+                        &runnable_tool_calls,
+                    );
+                    let mut followup_sse_events = remote_sidecar_capture_pending_tool_calls(
+                        &assistant_message_id,
+                        &runnable_tool_calls,
+                    );
+                    for tool_call in &tool_calls {
+                        if !allowed_tools.contains(tool_call.name.as_str()) {
+                            let output = json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) });
+                            let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                            let _ = remote_sidecar_record_tool_result(
+                                &mut database,
+                                tool_call,
+                                &output,
+                                true,
+                                &started_at,
+                                &completed_at,
+                            );
+                            followup_sse_events.push(json!({
+                                "type": "toolResult",
+                                "assistantMessageId": assistant_message_id,
+                                "toolCallId": tool_call.call_id,
+                                "output": output,
+                                "isError": true,
+                                "startedAt": started_at,
+                                "completedAt": completed_at,
+                            }));
+                            next_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Tool,
+                                content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: Some(tool_call.call_id.clone()),
+                                tool_name: Some(tool_call.name.clone()),
+                            });
+                            continue;
+                        }
+                        let (output, is_error, started_at, completed_at, mut extra_events) = remote_sidecar_execute_tool_call(
+                            &stream_state,
+                            tool_call.clone(),
                             &chat_id,
                             &run_id,
-                            &provider_id,
-                            &model_id,
-                            &Value::Null,
-                            "failed",
-                            json!({ "error": { "message": message } }),
+                            &assistant_message_id,
+                        ).await;
+                        let _ = remote_sidecar_record_tool_result(
+                            &mut database,
+                            tool_call,
+                            &output,
+                            is_error,
+                            &started_at,
+                            &completed_at,
                         );
+                        followup_sse_events.append(&mut extra_events);
+                        followup_sse_events.push(json!({
+                            "type": "toolResult",
+                            "assistantMessageId": assistant_message_id,
+                            "toolCallId": tool_call.call_id,
+                            "output": output,
+                            "isError": is_error,
+                            "startedAt": started_at,
+                            "completedAt": completed_at,
+                        }));
+                        next_messages.push(NeutralChatMessage {
+                            role: NeutralChatRole::Tool,
+                            content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
+                            attachments: Vec::new(),
+                            reasoning: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(tool_call.call_id.clone()),
+                            tool_name: Some(tool_call.name.clone()),
+                        });
                     }
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                        "type": "error",
-                        "message": envelope.payload.get("message").and_then(Value::as_str).unwrap_or("remote broker unavailable"),
-                    })));
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+
+                    for event in followup_sse_events {
+                        sequence += 1;
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, event));
+                    }
+
+                    current_request = NeutralChatRequest {
+                        model_id: current_request.model_id.clone(),
+                        messages: next_messages,
+                        tools: current_request.tools.clone(),
+                        thinking_level: current_request.thinking_level.clone(),
+                        max_output_tokens: current_request.max_output_tokens,
+                        prompt_cache_key: current_request.prompt_cache_key.clone(),
+                        prompt_cache_retention: current_request.prompt_cache_retention.clone(),
+                    };
+                }
+                Err(()) => {
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
                     break;
                 }
-                _ => {}
             }
         }
         remote_sidecar_finish_active_run(&stream_state, &run_id);
@@ -7605,6 +8098,80 @@ mod tests {
                 "unexpected tool schema leaked: {unexpected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_for_request_replays_tool_round_trip() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(&json!({ "reasoning": "thinking" }).to_string()),
+            })
+            .expect("insert assistant placeholder");
+        remote_sidecar_record_pending_tool_calls(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "msg-assistant-1",
+            &[NeutralToolCall {
+                call_id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "Cargo.toml", "startLine": null, "endLine": null }),
+                thought_signatures: None,
+            }],
+        )
+        .expect("record tool call");
+        remote_sidecar_record_tool_result(
+            &mut database,
+            &NeutralToolCall {
+                call_id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "Cargo.toml", "startLine": null, "endLine": null }),
+                thought_signatures: None,
+            },
+            &json!({ "content": "[package]" }),
+            false,
+            "2026-07-09T00:00:00Z",
+            "2026-07-09T00:00:01Z",
+        )
+        .expect("record tool result");
+
+        let messages =
+            remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
+                .expect("chat messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, NeutralChatRole::User);
+        assert_eq!(messages[1].role, NeutralChatRole::Assistant);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].call_id, "call-1");
+        assert_eq!(messages[1].reasoning.as_deref(), Some("thinking"));
+        assert_eq!(messages[2].role, NeutralChatRole::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[2].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(
+            messages[2].content,
+            json!({ "content": "[package]" }).to_string()
+        );
     }
 
     #[test]
