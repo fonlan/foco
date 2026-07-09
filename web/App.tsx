@@ -1997,6 +1997,43 @@ export function App() {
     },
   );
 
+  const syncOpenChatTabTitlesFromWorkspaces = useCallback(
+    (nextWorkspaces: WorkspaceSummary[]) => {
+      const titleByChatKey = new Map<string, string>();
+      for (const workspace of nextWorkspaces) {
+        for (const chat of workspace.chats) {
+          const title = chat.title.trim();
+          if (title) {
+            titleByChatKey.set(chatRunKey(workspace.id, chat.id), title);
+          }
+        }
+      }
+
+      if (titleByChatKey.size === 0) {
+        return;
+      }
+
+      setOpenChatTabs((current) => {
+        let changed = false;
+        const nextTabs = current.map((tab) => {
+          const nextTitle = titleByChatKey.get(chatRunKey(tab.workspaceId, tab.chatId));
+          if (!nextTitle || tab.fallbackTitle === nextTitle) {
+            return tab;
+          }
+          changed = true;
+          return { ...tab, fallbackTitle: nextTitle };
+        });
+
+        if (!changed) {
+          return current;
+        }
+        openChatTabsRef.current = nextTabs;
+        return nextTabs;
+      });
+    },
+    [],
+  );
+
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
     setError(null);
@@ -2005,6 +2042,7 @@ export function App() {
       const data = await requestJson<WorkspacesResponse>("/api/workspaces");
       const workspacesWithRemoteChats = await workspaceSummariesWithRemoteChats(data.workspaces);
       setWorkspaces(workspacesWithRemoteChats);
+      syncOpenChatTabTitlesFromWorkspaces(workspacesWithRemoteChats);
       setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(workspacesWithRemoteChats));
       setActiveWorkspaceId((current) =>
         workspacesWithRemoteChats.some((workspace) => workspace.id === current)
@@ -2022,7 +2060,7 @@ export function App() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [syncOpenChatTabTitlesFromWorkspaces]);
 
   const loadSettings = useCallback(async () => {
     setIsLoadingSettings(true);

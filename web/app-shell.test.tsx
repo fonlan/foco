@@ -10,6 +10,7 @@ import {
   sideProjectComposerPlaceholder,
   chatMemory,
   chatMessages,
+  chatSummary,
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
@@ -131,6 +132,50 @@ describe("app-shell verification surfaces", () => {
       expect(workspaceRequestCount()).toBeGreaterThan(initialWorkspaceRequests);
     });
     expect(await screen.findByText("Refreshed chat")).toBeInTheDocument();
+  });
+
+  it("syncs open chat tab titles from refreshed workspace chats", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(screen.getByText("Second chat"));
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
+    expect(within(tabList).getByRole("tab", { name: /Second chat/ })).toBeInTheDocument();
+
+    const generatedTitle = "Generated title";
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          chatSummary(
+            "chat-1",
+            generatedTitle,
+            "2026-06-05T10:00:00Z",
+            "2026-06-05T10:06:00Z",
+          ),
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    expect(await within(workspaceList).findByText(generatedTitle)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(within(tabList).getByRole("tab", { name: /Generated title/ })).toBeInTheDocument();
+    });
+    expect(within(tabList).queryByRole("tab", { name: /Tool run/ })).not.toBeInTheDocument();
+
+    const tabTitles = within(tabList)
+      .getAllByRole("tab")
+      .map((tab) => tab.textContent ?? "");
+    expect(tabTitles[0]).toContain(generatedTitle);
+    expect(tabTitles[1]).toContain("Second chat");
   });
 
   it("renders the workspace sidebar and persisted chat tool results", async () => {
