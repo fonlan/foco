@@ -22,7 +22,6 @@ use foco_store::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::git_backend::{
@@ -39,7 +38,6 @@ const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "# Default Coding Agent\n\n## Identity
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
 const CHAT_TITLE_GENERATION_REQUEST_KIND: &str = "chat title generation";
-const CHAT_TITLE_GENERATION_TOOL_NAME: &str = "submit_chat_title";
 const CHAT_TITLE_GENERATION_TIMEOUT_MS: u64 = 15_000;
 const CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 64;
 const CHAT_TITLE_GENERATION_MAX_INPUT_CHARS: usize = 4_000;
@@ -922,7 +920,7 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         &input.attachment_names,
         &input.app_language,
     );
-    let tool_arguments = audited_provider_tool_request(
+    let title_text = audited_provider_text_request(
         &input.workspace_path,
         &input.workspace_id,
         Some(&input.chat_id),
@@ -930,14 +928,12 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         &provider_config,
         request,
         CHAT_TITLE_GENERATION_REQUEST_KIND,
-        CHAT_TITLE_GENERATION_TOOL_NAME,
-        "chat title submission tool",
         CHAT_TITLE_GENERATION_TIMEOUT_MS,
         0,
         api_audit_save_details(&input.config),
     )
     .await?;
-    let Some(title) = parse_generated_chat_title(&tool_arguments) else {
+    let Some(title) = clean_generated_chat_title(&title_text) else {
         return Ok(());
     };
     if title == input.placeholder_title {
@@ -1055,7 +1051,7 @@ pub(crate) fn chat_title_generation_provider_request(
             neutral_text_message(
                 foco_providers::NeutralChatRole::System,
                 format!(
-                    "Generate a short title for the user's new chat. Return only by calling the tool. Title language must match the current Foco app language setting: {title_language}. Keep it under 8 words or 24 CJK characters. Do not include quotes, punctuation padding, or file extensions unless essential."
+                    "Generate a short title for the user's new chat. Return only the title text. Do not explain. Do not use quotes. Do not use markdown. Do not call tools. Title language must match the current Foco app language setting: {title_language}. Keep it under 8 words or 24 CJK characters. Do not include punctuation padding or file extensions unless essential."
                 ),
             ),
             neutral_text_message(
@@ -1063,7 +1059,7 @@ pub(crate) fn chat_title_generation_provider_request(
                 chat_title_generation_user_input(user_message, attachment_names),
             ),
         ],
-        tools: vec![chat_title_generation_tool_definition()],
+        tools: Vec::new(),
         thinking_level: None,
         max_output_tokens: Some(CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
@@ -1109,29 +1105,6 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
         .last()
         .unwrap_or(0);
     &value[..boundary]
-}
-
-fn chat_title_generation_tool_definition() -> foco_providers::NeutralToolDefinition {
-    foco_providers::NeutralToolDefinition {
-        name: CHAT_TITLE_GENERATION_TOOL_NAME.to_string(),
-        description: "Submit exactly one concise generated chat title.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "A concise title for the chat."
-                }
-            },
-            "required": ["title"]
-        }),
-        strict: true,
-    }
-}
-
-pub(crate) fn parse_generated_chat_title(arguments: &Value) -> Option<String> {
-    clean_generated_chat_title(arguments.get("title")?.as_str()?)
 }
 
 pub(crate) fn clean_generated_chat_title(raw_title: &str) -> Option<String> {

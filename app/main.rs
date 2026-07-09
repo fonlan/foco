@@ -4890,6 +4890,169 @@ pub(crate) async fn generate_git_commit_message(
     Ok(GitCommitMessageResponse { message })
 }
 
+pub(crate) async fn audited_provider_text_request(
+    workspace_path: &Path,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    request_kind: &str,
+    timeout_ms: u64,
+    retry_count: u32,
+    save_details: bool,
+) -> Result<String, ApiError> {
+    let request_body_json = serialize_provider_request(&request)?;
+
+    for attempt_index in 0..=retry_count {
+        let request_id = unique_id("llm");
+        let request_started_at = utc_timestamp();
+        let started_at = Instant::now();
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: &request_id,
+                workspace_id,
+                chat_id,
+                request_kind,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id,
+                model_id: &request.model_id,
+                request_started_at: &request_started_at,
+                first_token_at: None,
+                completed_at: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: None,
+                status_code: None,
+                final_state: "running",
+                request_body_json: api_audit_detail_json(&request_body_json, save_details),
+                response_body_json: None,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("{request_id}-event-0"),
+                llm_request_id: &request_id,
+                sequence: 0,
+                event_at: &request_started_at,
+                event_type: "start",
+                raw_chunk_json: None,
+                normalized_event_json: &json!({
+                    "type": "start",
+                    "requestKind": request_kind,
+                    "llmRequestId": &request_id,
+                    "workspaceId": workspace_id,
+                    "chatId": chat_id,
+                    "attempt": attempt_index + 1,
+                    "maxAttempts": retry_count + 1,
+                })
+                .to_string(),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        drop(database);
+
+        let result = run_provider_stream_for_text(
+            provider_config,
+            request.clone(),
+            request_kind,
+            timeout_ms,
+        )
+        .await;
+        let completed_at = utc_timestamp();
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+
+        match result {
+            Ok(AuditedTextStreamOutcome {
+                text,
+                events,
+                usage,
+                first_token_at,
+                first_token_latency_ms,
+                response_body_json,
+            }) => {
+                database
+                    .update_llm_request_outcome(
+                        &request_id,
+                        UpdateLlmRequestOutcome {
+                            first_token_at: first_token_at.as_deref(),
+                            completed_at: Some(&completed_at),
+                            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                            cache_read_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.cache_read_tokens),
+                            cache_write_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.cache_write_tokens),
+                            reasoning_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.reasoning_tokens),
+                            first_token_latency_ms,
+                            total_latency_ms: Some(elapsed_millis(started_at)),
+                            status_code: Some(200),
+                            final_state: "succeeded",
+                            response_body_json: api_audit_detail_json(
+                                &response_body_json,
+                                save_details,
+                            ),
+                        },
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                persist_audited_provider_events(
+                    &mut database,
+                    &request_id,
+                    &events,
+                    1,
+                    save_details,
+                )?;
+                return Ok(text);
+            }
+            Err(error) => {
+                let error_body_json = json!({ "error": &error.message }).to_string();
+                database
+                    .update_llm_request_outcome(
+                        &request_id,
+                        UpdateLlmRequestOutcome {
+                            first_token_at: None,
+                            completed_at: Some(&completed_at),
+                            input_tokens: None,
+                            output_tokens: None,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            reasoning_tokens: None,
+                            first_token_latency_ms: None,
+                            total_latency_ms: Some(elapsed_millis(started_at)),
+                            status_code: error.status_code,
+                            final_state: "failed",
+                            response_body_json: api_audit_detail_json(
+                                &error_body_json,
+                                save_details,
+                            ),
+                        },
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                if attempt_index >= retry_count {
+                    return Err(ApiError::internal(error.message));
+                }
+            }
+        }
+    }
+
+    Err(ApiError::internal(format!(
+        "{request_kind} failed without an attempt result"
+    )))
+}
+
 pub(crate) async fn audited_provider_tool_request(
     workspace_path: &Path,
     workspace_id: &str,
@@ -5057,6 +5220,15 @@ pub(crate) async fn audited_provider_tool_request(
     )))
 }
 
+struct AuditedTextStreamOutcome {
+    text: String,
+    events: Vec<NeutralChatStreamEvent>,
+    usage: Option<NeutralUsage>,
+    first_token_at: Option<String>,
+    first_token_latency_ms: Option<i64>,
+    response_body_json: String,
+}
+
 struct AuditedToolStreamOutcome {
     tool_arguments: Value,
     events: Vec<NeutralChatStreamEvent>,
@@ -5078,6 +5250,138 @@ impl AuditedProviderError {
             status_code,
         }
     }
+}
+
+async fn run_provider_stream_for_text(
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    request_kind: &str,
+    timeout_ms: u64,
+) -> Result<AuditedTextStreamOutcome, AuditedProviderError> {
+    let started_at = Instant::now();
+    let mut stream = timeout(
+        Duration::from_millis(timeout_ms),
+        stream_chat(provider_config, request),
+    )
+    .await
+    .map_err(|_| {
+        AuditedProviderError::new(
+            format!("{request_kind} timed out after {timeout_ms} ms"),
+            None,
+        )
+    })?
+    .map_err(|source| {
+        AuditedProviderError::new(source.to_string(), provider_status_code(&source))
+    })?;
+    let mut output_text = String::new();
+    let mut events = Vec::new();
+    let mut final_usage = None;
+    let mut first_token_at = None;
+    let mut first_token_latency_ms = None;
+    let mut completion_json = None;
+
+    loop {
+        let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
+            .await
+            .map_err(|_| {
+                AuditedProviderError::new(
+                    format!("{request_kind} timed out after {timeout_ms} ms"),
+                    None,
+                )
+            })?
+        else {
+            break;
+        };
+        let event = event_result.map_err(|source| {
+            AuditedProviderError::new(
+                format!("{request_kind} stream failed: {source}"),
+                provider_status_code(&source),
+            )
+        })?;
+        events.push(event.clone());
+
+        match event {
+            NeutralChatStreamEvent::Start => {}
+            NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+            }
+            NeutralChatStreamEvent::Usage { usage } => {
+                final_usage = Some(usage);
+            }
+            NeutralChatStreamEvent::TextDelta { delta } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                output_text.push_str(&delta);
+            }
+            NeutralChatStreamEvent::ToolCall { tool_call } => {
+                return Err(AuditedProviderError::new(
+                    format!(
+                        "{request_kind} called unsupported tool '{}'",
+                        tool_call.name
+                    ),
+                    None,
+                ));
+            }
+            NeutralChatStreamEvent::Complete {
+                text,
+                usage,
+                stop_reason,
+                response_id,
+                tool_calls,
+                ..
+            } => {
+                if let Some(tool_call) = tool_calls.into_iter().next() {
+                    return Err(AuditedProviderError::new(
+                        format!(
+                            "{request_kind} completed with unsupported tool '{}'",
+                            tool_call.name
+                        ),
+                        None,
+                    ));
+                }
+                if output_text.is_empty() && !text.is_empty() {
+                    output_text.push_str(&text);
+                }
+                if let Some(usage) = usage {
+                    final_usage = Some(usage);
+                }
+                completion_json = Some(
+                    json!({
+                        "requestKind": request_kind,
+                        "text": output_text,
+                        "usage": final_usage,
+                        "stopReason": stop_reason,
+                        "responseId": response_id,
+                    })
+                    .to_string(),
+                );
+                break;
+            }
+            NeutralChatStreamEvent::Error { message } => {
+                return Err(AuditedProviderError::new(
+                    format!("{request_kind} stream error: {message}"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    if output_text.trim().is_empty() {
+        return Err(AuditedProviderError::new(
+            format!("{request_kind} returned empty text"),
+            None,
+        ));
+    }
+
+    Ok(AuditedTextStreamOutcome {
+        text: output_text,
+        events,
+        usage: final_usage,
+        first_token_at,
+        first_token_latency_ms,
+        response_body_json: completion_json
+            .unwrap_or_else(|| json!({ "requestKind": request_kind }).to_string()),
+    })
 }
 
 async fn run_provider_stream_for_tool(

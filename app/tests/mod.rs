@@ -1958,7 +1958,7 @@ fn chat_title_generation_model_selection_uses_configured_model_or_current_chat_m
 }
 
 #[test]
-fn chat_title_generation_provider_request_uses_tool_only_small_output() {
+fn chat_title_generation_provider_request_uses_plain_text_small_output() {
     let request = crate::http::chat::chat_title_generation_provider_request(
         "model",
         "请帮我修一下远程 sidecar 安装并发的问题",
@@ -1969,9 +1969,17 @@ fn chat_title_generation_provider_request_uses_tool_only_small_output() {
     assert_eq!(request.model_id, "model");
     assert_eq!(request.max_output_tokens, Some(64));
     assert_eq!(request.thinking_level, None);
-    assert_eq!(request.tools.len(), 1);
-    assert_eq!(request.tools[0].name, "submit_chat_title");
+    assert!(request.tools.is_empty());
     assert!(request.messages[0].content.contains("English"));
+    assert!(
+        request.messages[0]
+            .content
+            .contains("Return only the title text")
+    );
+    assert!(request.messages[0].content.contains("Do not explain"));
+    assert!(request.messages[0].content.contains("Do not use quotes"));
+    assert!(request.messages[0].content.contains("Do not use markdown"));
+    assert!(request.messages[0].content.contains("Do not call tools"));
     assert!(!request.messages[0].content.contains("user's message"));
     assert!(request.messages[1].content.contains("debug.log"));
 
