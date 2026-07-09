@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     fs, io,
     net::SocketAddr,
@@ -2574,8 +2574,8 @@ async fn handle_broker_request(
 
 /// Handle `llm.stream`: sidecar sends a provider+model+NeutralChatRequest,
 /// local main dispatches through its own provider config and streams chunks back.
-/// ponytail: v1 does minimal payload validation; wire NeutralChatRequest fields
-/// loosely. Single-tool tool_use is not supported yet — only pure text streams.
+/// Payload accepts either the current `request` shape or the older loose
+/// `messages`/`tools` fields for sidecar compatibility.
 fn broker_llm_audit_context(
     state: &AppState,
     fallback_workspace_id: &str,
@@ -2929,6 +2929,7 @@ async fn broker_llm_stream(
     tracing::info!(%provider_id, %model_id, request_id = %id, "remote sidecar broker llm stream started");
     let mut sequence = 0u64;
     let mut final_usage: Option<NeutralUsage> = None;
+    let mut final_tool_calls = Vec::<NeutralToolCall>::new();
     let mut first_token_at: Option<String> = None;
     let mut first_token_latency_ms: Option<i64> = None;
     loop {
@@ -3019,6 +3020,8 @@ async fn broker_llm_stream(
                 }
             }
             NeutralChatStreamEvent::ToolCall { tool_call } => {
+                final_tool_calls =
+                    merge_remote_tool_calls(&final_tool_calls, std::slice::from_ref(&tool_call));
                 sequence += 1;
                 let chunk = ControlEnvelope {
                     version: 1,
@@ -3091,7 +3094,7 @@ async fn broker_llm_stream(
             NeutralChatStreamEvent::Complete {
                 text: _,
                 reasoning: _,
-                tool_calls: _,
+                tool_calls,
                 usage,
                 stop_reason: _,
                 response_id: _,
@@ -3100,9 +3103,14 @@ async fn broker_llm_stream(
                     audit_events.push(BrokerLlmAuditEvent {
                         event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                         event_type: "complete".to_string(),
-                        normalized_event: json!({ "type": "complete", "usage": usage }),
+                        normalized_event: json!({
+                            "type": "complete",
+                            "usage": usage,
+                            "toolCalls": tool_calls,
+                        }),
                     });
                 }
+                final_tool_calls = merge_remote_tool_calls(&final_tool_calls, &tool_calls);
                 final_usage = usage;
             }
             NeutralChatStreamEvent::Start => {}
@@ -3136,7 +3144,12 @@ async fn broker_llm_stream(
     }
 
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let response_body_json = json!({ "status": "ok", "usage": final_usage.as_ref() }).to_string();
+    let response_body_json = json!({
+        "status": "ok",
+        "usage": final_usage.as_ref(),
+        "toolCalls": final_tool_calls,
+    })
+    .to_string();
     finish_broker_llm_audit(
         audit_context.as_ref(),
         BrokerLlmAuditOutcome {
@@ -3159,6 +3172,7 @@ async fn broker_llm_stream(
         payload: json!({
             "status": "ok",
             "usage": final_usage,
+            "toolCalls": final_tool_calls,
         }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
@@ -5272,6 +5286,17 @@ fn remote_sidecar_executable_tool_names() -> HashSet<String> {
         .collect()
 }
 
+fn merge_remote_tool_calls(
+    existing: &[NeutralToolCall],
+    incoming: &[NeutralToolCall],
+) -> Vec<NeutralToolCall> {
+    let mut merged = BTreeMap::<String, NeutralToolCall>::new();
+    for tool_call in existing.iter().chain(incoming.iter()) {
+        merged.insert(tool_call.call_id.clone(), tool_call.clone());
+    }
+    merged.into_values().collect()
+}
+
 fn remote_sidecar_capture_pending_tool_calls(
     assistant_message_id: &str,
     tool_calls: &[NeutralToolCall],
@@ -5488,6 +5513,7 @@ async fn remote_sidecar_run_broker_llm_turn(
         remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
             .await
             .map_err(|_| ())?;
+    let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
     loop {
         let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
             Ok(Some(envelope)) => envelope,
@@ -5555,6 +5581,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                     else {
                         continue;
                     };
+                    collected_tool_calls = merge_remote_tool_calls(
+                        &collected_tool_calls,
+                        std::slice::from_ref(&tool_call),
+                    );
                     let pending_payload = json!({
                         "type": "toolCall",
                         "assistantMessageId": assistant_message_id,
@@ -5596,12 +5626,14 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("usage")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let tool_calls = envelope
+                let response_tool_calls = envelope
                     .payload
                     .get("toolCalls")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
                     .unwrap_or_default();
+                let tool_calls =
+                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls);
                 if tool_calls.is_empty() {
                     let metadata = json!({
                         "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
@@ -8171,6 +8203,143 @@ mod tests {
         assert!(text.contains("hello remote"));
         assert!(text.contains("\"type\":\"complete\""));
         assert!(text.contains("\"type\":\"streamEnd\""));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_llm_turn_uses_streamed_tool_call_when_response_omits_it() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        let request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "hello".to_string(),
+            )],
+            tools: remote_sidecar_executable_tool_schemas(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "toolCall",
+                        "toolCall": {
+                            "callId": "call-1",
+                            "name": "read_file",
+                            "arguments": { "path": "Cargo.toml", "startLine": null, "endLine": null }
+                        }
+                    }),
+                    timestamp: None,
+                })
+                .expect("send streamed tool call");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 4, "outputTokens": 2 },
+                        "toolCalls": []
+                    }),
+                    timestamp: None,
+                })
+                .expect("send response without tool calls");
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut sequence = 0_i64;
+        let result = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-1",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-1",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &request,
+            &mut database,
+            &mut text,
+            &mut reasoning,
+            &mut sequence,
+        )
+        .await
+        .expect("llm turn should succeed")
+        .expect("tool call should request followup");
+        broker.await.expect("broker task");
+
+        assert_eq!(result.0.len(), 1);
+        assert_eq!(result.0[0].call_id, "call-1");
+        assert_eq!(result.0[0].name, "read_file");
+        let tool_calls = database
+            .tool_calls_for_message("msg-assistant-1")
+            .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].status, "running");
+        assert!(
+            run_stream
+                .snapshot_after(0)
+                .iter()
+                .any(|(_, event)| event.get("type").and_then(Value::as_str) == Some("toolCall"))
+        );
     }
 
     #[tokio::test]
