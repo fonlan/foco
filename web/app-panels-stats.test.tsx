@@ -3884,11 +3884,10 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Go to page 2" }));
 
-    await waitFor(() =>
-      expect(window.location.pathname + window.location.search).toBe(
-        "/stats?page=2",
-      ),
-    );
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/stats");
+      expect(new URLSearchParams(window.location.search).get("page")).toBe("2");
+    });
     await waitFor(() =>
       expect(
         aiStatisticsCallUrls().some(
