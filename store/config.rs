@@ -364,6 +364,7 @@ impl GlobalConfig {
                 directories: Vec::new(),
                 detected: Vec::new(),
                 disabled: Vec::new(),
+                disabled_locations: Vec::new(),
                 enabled: Vec::new(),
                 translation_model_id: None,
             },
@@ -687,6 +688,9 @@ impl GlobalConfig {
         }
         for skill_id in &self.skills.disabled {
             validate_id(config_path, "skills.disabled", skill_id)?;
+        }
+        for location_id in &self.skills.disabled_locations {
+            validate_skill_location_id(config_path, location_id)?;
         }
         validate_skill_translation_model(
             config_path,
@@ -1337,6 +1341,9 @@ pub struct SkillConfig {
     pub disabled: Vec<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_locations: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub enabled: Vec<String>,
     #[serde(default)]
     #[serde(rename = "translationModelId", skip_serializing_if = "Option::is_none")]
@@ -1700,6 +1707,30 @@ fn validate_skill_scope(config_path: Option<&Path>, scope: &str) -> Result<(), C
             config_path,
             format!("skills.detected.scope '{scope}' is unsupported; expected global or workspace"),
         ),
+    }
+}
+
+fn validate_skill_location_id(
+    config_path: Option<&Path>,
+    location_id: &str,
+) -> Result<(), ConfigError> {
+    let valid = location_id == "global:agents"
+        || location_id
+            .strip_prefix("workspace:")
+            .and_then(|value| value.split_once(':'))
+            .is_some_and(|(workspace_id, location)| {
+                !workspace_id.is_empty()
+                    && !workspace_id.chars().any(char::is_whitespace)
+                    && matches!(location, "agents" | "claude")
+            });
+
+    if valid {
+        Ok(())
+    } else {
+        invalid_config(
+            config_path,
+            format!("skills.disabled_locations contains invalid skill location id '{location_id}'"),
+        )
     }
 }
 
@@ -3433,7 +3464,63 @@ mod tests {
 
         assert_eq!(loaded.config.skills.enabled, vec!["legacy-skill"]);
         assert!(loaded.config.skills.disabled.is_empty());
+        assert!(loaded.config.skills.disabled_locations.is_empty());
         assert!(loaded.config.skills.directories.is_empty());
+    }
+
+    #[test]
+    fn disabled_skill_locations_round_trip_and_accept_removed_workspace_ids() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+        loaded.config.skills.disabled_locations = vec![
+            "global:agents".to_string(),
+            "workspace:removed-workspace:claude".to_string(),
+        ];
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("disabled locations should save");
+        let serialized = fs::read_to_string(&loaded.paths.config_file)
+            .expect("serialized config should be readable");
+        assert!(serialized.contains("\"disabled_locations\""));
+
+        let reloaded = load_global_config(&loaded.paths.config_file)
+            .expect("disabled locations should reload");
+
+        assert_eq!(
+            reloaded.skills.disabled_locations,
+            vec![
+                "global:agents".to_string(),
+                "workspace:removed-workspace:claude".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_disabled_skill_locations_are_omitted_from_config() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("empty disabled locations should save");
+        let serialized = fs::read_to_string(&loaded.paths.config_file)
+            .expect("serialized config should be readable");
+
+        assert!(!serialized.contains("\"disabled_locations\""));
+    }
+
+    #[test]
+    fn invalid_disabled_skill_location_is_rejected() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+        loaded.config.skills.disabled_locations = vec!["/tmp/skills".to_string()];
+
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("absolute path must not be accepted as a location id");
+
+        assert!(error.to_string().contains("invalid skill location id"));
     }
 
     #[test]

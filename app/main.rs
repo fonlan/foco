@@ -192,8 +192,10 @@ pub(crate) use settings_runtime::{
 pub(crate) use skills::parse_skill_markdown;
 pub(crate) use skills::{
     SkillDiscoveryErrorSummary, deletable_skill_directory_for_path, discover_skills,
-    enabled_skill_frontmatter_messages, merge_disabled_skill_keys, message_with_selected_skills,
-    normalize_manual_disabled_skill_ids, parse_skill_file, refresh_derived_enabled_skills,
+    discover_skills_in_all_locations, enabled_skill_frontmatter_messages,
+    merge_disabled_skill_keys, merge_manual_disabled_skill_keys, message_with_selected_skills,
+    normalize_manual_disabled_skill_ids, parse_skill_file,
+    preserve_disabled_skill_keys_for_hidden_locations, refresh_derived_enabled_skills,
     skill_is_disabled, skill_is_required_disabled, skill_search_roots,
 };
 #[cfg(test)]

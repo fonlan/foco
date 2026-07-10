@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ApiError;
 use crate::skills::{
-    discover_skills, parse_skill_file, skill_is_disabled, skill_is_required_disabled,
+    discover_skills_in_all_locations, parse_skill_file, skill_is_disabled,
+    skill_is_required_disabled,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -104,7 +105,7 @@ fn selected_skill_content(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, &config.workspaces);
+    let discovery = discover_skills_in_all_locations(user_profile_dir, &config.workspaces);
     let required_disabled_ids = discovery
         .required_disabled
         .iter()

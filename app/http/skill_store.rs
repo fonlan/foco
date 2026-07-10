@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 use crate::{
     ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
     discover_skills, markdown_code_block, merge_disabled_skill_keys, neutral_text_message,
-    provider_connection_config, refresh_derived_enabled_skills, save_config, settings_response,
-    skills::parse_skill_markdown, unique_id, workspace_by_id,
+    preserve_disabled_skill_keys_for_hidden_locations, provider_connection_config,
+    refresh_derived_enabled_skills, save_config, settings_response, skills::parse_skill_markdown,
+    unique_id, workspace_by_id,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -1072,7 +1073,7 @@ pub(crate) async fn skill_store_update(
     Json(request): Json<SkillStoreUpdateRequest>,
 ) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     let skill = discovery
         .skills
         .iter()
@@ -1105,7 +1106,7 @@ pub(crate) async fn skill_store_update_all(
     State(state): State<AppState>,
 ) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     let client = SkillStoreClient::from_env();
     let mut results = Vec::new();
 
@@ -1141,13 +1142,16 @@ fn refresh_skill_discovery(
     state: &AppState,
     config: &mut GlobalConfig,
 ) -> Result<Vec<SkillSettings>, ApiError> {
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     config.skills.detected = discovery.skills.clone();
-    config.skills.disabled = merge_disabled_skill_keys(
-        std::mem::take(&mut config.skills.disabled),
+    let existing_disabled = std::mem::take(&mut config.skills.disabled);
+    let disabled = merge_disabled_skill_keys(
+        preserve_disabled_skill_keys_for_hidden_locations(existing_disabled, &discovery.skills),
         &discovery.required_disabled,
     );
-    refresh_derived_enabled_skills(config);
+    config.skills.disabled = disabled.clone();
+    refresh_derived_enabled_skills(config, &state.user_profile_dir);
+    config.skills.disabled = disabled;
     Ok(discovery.skills)
 }
 

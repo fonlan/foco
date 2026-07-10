@@ -28,6 +28,7 @@ pub(crate) struct SkillDiscovery {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SkillSearchRoot {
+    pub(crate) id: String,
     pub(crate) directory: PathBuf,
     scope: &'static str,
     workspace_id: Option<String>,
@@ -69,7 +70,7 @@ pub(crate) fn message_with_selected_skills(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(user_profile_dir, config);
     let required_disabled_ids = discovery
         .required_disabled
         .iter()
@@ -251,24 +252,66 @@ pub(crate) fn merge_disabled_skill_keys(
     disabled
 }
 
-pub(crate) fn refresh_derived_enabled_skills(config: &mut GlobalConfig) {
+pub(crate) fn preserve_disabled_skill_keys_for_hidden_locations(
+    existing_disabled: Vec<String>,
+    discovered_skills: &[SkillSettings],
+) -> Vec<String> {
+    let visible_keys = discovered_skills
+        .iter()
+        .map(|skill| skill.key.as_str())
+        .collect::<HashSet<_>>();
+
+    existing_disabled
+        .into_iter()
+        .filter(|key| !visible_keys.contains(key.as_str()))
+        .collect()
+}
+
+pub(crate) fn merge_manual_disabled_skill_keys(
+    existing_disabled: Vec<String>,
+    requested_disabled: Vec<String>,
+    discovered_skills: &[SkillSettings],
+) -> Vec<String> {
+    let mut disabled =
+        preserve_disabled_skill_keys_for_hidden_locations(existing_disabled, discovered_skills);
+    disabled.extend(requested_disabled);
+    disabled.sort();
+    disabled.dedup();
+    disabled
+}
+
+pub(crate) fn refresh_derived_enabled_skills(config: &mut GlobalConfig, user_profile_dir: &Path) {
     let disabled_ids = config
         .skills
         .disabled
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let discovery = discover_skills(user_profile_dir, config);
 
-    config.skills.enabled = config
+    config.skills.enabled = discovery
         .skills
-        .detected
         .iter()
         .filter(|skill| !skill_is_disabled(skill, &disabled_ids))
         .map(|skill| skill.key.clone())
         .collect();
 }
 
-pub(crate) fn discover_skills(
+pub(crate) fn discover_skills(user_profile_dir: &Path, config: &GlobalConfig) -> SkillDiscovery {
+    let disabled_location_ids = config
+        .skills
+        .disabled_locations
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    discover_skills_in_roots(
+        skill_search_roots(user_profile_dir, &config.workspaces)
+            .into_iter()
+            .filter(|root| !disabled_location_ids.contains(root.id.as_str())),
+    )
+}
+
+pub(crate) fn discover_skills_in_all_locations(
     user_profile_dir: &Path,
     workspaces: &[WorkspaceConfig],
 ) -> SkillDiscovery {
@@ -282,12 +325,14 @@ pub(crate) fn discover_workspace_skills_for_path(
 ) -> SkillDiscovery {
     let roots = [
         SkillSearchRoot {
+            id: workspace_skill_location_id(workspace_id, "agents"),
             directory: workspace_path.join(".agents").join("skills"),
             scope: SKILL_SCOPE_WORKSPACE,
             workspace_id: Some(workspace_id.to_string()),
             workspace_name: Some(workspace_name.to_string()),
         },
         SkillSearchRoot {
+            id: workspace_skill_location_id(workspace_id, "claude"),
             directory: workspace_path.join(".claude").join("skills"),
             scope: SKILL_SCOPE_WORKSPACE,
             workspace_id: Some(workspace_id.to_string()),
@@ -420,6 +465,7 @@ pub(crate) fn skill_search_roots(
     let mut roots = Vec::new();
 
     roots.push(SkillSearchRoot {
+        id: "global:agents".to_string(),
         directory: user_profile_dir.join(".agents").join("skills"),
         scope: SKILL_SCOPE_GLOBAL,
         workspace_id: None,
@@ -430,11 +476,12 @@ pub(crate) fn skill_search_roots(
         let Some(workspace_path) = workspace.local_path() else {
             continue;
         };
-        for directory in [
-            workspace_path.join(".agents").join("skills"),
-            workspace_path.join(".claude").join("skills"),
+        for (location, directory) in [
+            ("agents", workspace_path.join(".agents").join("skills")),
+            ("claude", workspace_path.join(".claude").join("skills")),
         ] {
             roots.push(SkillSearchRoot {
+                id: workspace_skill_location_id(&workspace.id, location),
                 directory,
                 scope: SKILL_SCOPE_WORKSPACE,
                 workspace_id: Some(workspace.id.clone()),
@@ -444,6 +491,10 @@ pub(crate) fn skill_search_roots(
     }
 
     roots
+}
+
+fn workspace_skill_location_id(workspace_id: &str, location: &str) -> String {
+    format!("workspace:{workspace_id}:{location}")
 }
 
 pub(crate) fn deletable_skill_directory_for_path(
@@ -851,7 +902,7 @@ pub(crate) fn enabled_skill_frontmatter_messages(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(user_profile_dir, config);
     let required_disabled_ids = discovery
         .required_disabled
         .iter()

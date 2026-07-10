@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
 use crate::platform::tray::tray_menu_labels;
@@ -277,6 +277,7 @@ pub(crate) struct ManualMcpServerRequest {
 pub(crate) struct ManualSkillsRequest {
     pub(crate) disabled: Option<Vec<String>>,
     pub(crate) enabled: Option<Vec<String>>,
+    pub(crate) disabled_location_ids: Option<Vec<String>>,
     pub(crate) translation_model_id: Option<Option<String>>,
 }
 
@@ -617,9 +618,18 @@ pub(crate) struct ConfiguredMcpServerSummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillsSettingsSummary {
     pub(crate) directories: Vec<String>,
+    pub(crate) locations: Vec<SkillLocationSummary>,
     pub(crate) detected: Vec<ConfiguredSkillSummary>,
     pub(crate) errors: Vec<SkillDiscoveryErrorSummary>,
     pub(crate) translation_model_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillLocationSummary {
+    pub(crate) id: String,
+    pub(crate) path: String,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -2140,24 +2150,66 @@ pub(crate) async fn save_skills(
     let ManualSkillsRequest {
         disabled,
         enabled,
+        disabled_location_ids,
         translation_model_id,
     } = request;
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let all_roots = skill_search_roots(&state.user_profile_dir, &config.workspaces);
+    let available_location_ids = all_roots
+        .iter()
+        .map(|root| root.id.as_str())
+        .collect::<HashSet<_>>();
+    let current_location_ids = config
+        .skills
+        .disabled_locations
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Some(requested_location_ids) = disabled_location_ids {
+        let mut normalized_location_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for location_id in requested_location_ids {
+            let location_id = location_id.trim();
+            if location_id.is_empty() {
+                continue;
+            }
+            if !available_location_ids.contains(location_id)
+                && !current_location_ids.contains(location_id)
+            {
+                return Err(ApiError::bad_request(format!(
+                    "skill location was not found: {location_id}"
+                )));
+            }
+            if seen.insert(location_id.to_string()) {
+                normalized_location_ids.push(location_id.to_string());
+            }
+        }
+        config.skills.disabled_locations = normalized_location_ids;
+    }
+
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     let disabled = if disabled.is_none() && enabled.is_none() {
         config.skills.disabled.clone()
     } else {
-        normalize_manual_disabled_skill_ids(disabled, enabled, &discovery.skills)?
+        let requested_disabled =
+            normalize_manual_disabled_skill_ids(disabled, enabled, &discovery.skills)?;
+        merge_manual_disabled_skill_keys(
+            config.skills.disabled.clone(),
+            requested_disabled,
+            &discovery.skills,
+        )
     };
 
     config.skills.directories.clear();
     config.skills.detected = discovery.skills;
-    config.skills.disabled = merge_disabled_skill_keys(disabled, &discovery.required_disabled);
+    let disabled = merge_disabled_skill_keys(disabled, &discovery.required_disabled);
+    config.skills.disabled = disabled.clone();
     if let Some(model_id) = translation_model_id {
         config.skills.translation_model_id = model_id
             .map(|model_id| model_id.trim().to_string())
             .filter(|model_id| !model_id.is_empty());
     }
-    refresh_derived_enabled_skills(&mut config);
+    refresh_derived_enabled_skills(&mut config, &state.user_profile_dir);
+    config.skills.disabled = disabled;
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -2171,12 +2223,19 @@ pub(crate) async fn refresh_skills(
     State(state): State<AppState>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
 
     config.skills.detected = discovery.skills;
-    config.skills.disabled =
-        merge_disabled_skill_keys(config.skills.disabled.clone(), &discovery.required_disabled);
-    refresh_derived_enabled_skills(&mut config);
+    let disabled = merge_disabled_skill_keys(
+        preserve_disabled_skill_keys_for_hidden_locations(
+            config.skills.disabled.clone(),
+            &config.skills.detected,
+        ),
+        &discovery.required_disabled,
+    );
+    config.skills.disabled = disabled.clone();
+    refresh_derived_enabled_skills(&mut config, &state.user_profile_dir);
+    config.skills.disabled = disabled;
 
     save_config(&state, config.clone())?;
 
@@ -2194,7 +2253,7 @@ pub(crate) async fn delete_skill(
         return Err(ApiError::bad_request("skill id must not be empty"));
     }
 
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     let skill = discovery
         .skills
         .iter()
@@ -2213,11 +2272,18 @@ pub(crate) async fn delete_skill(
     })?;
 
     config.skills.disabled.retain(|key| key != &skill.key);
-    let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(&state.user_profile_dir, &config);
     config.skills.detected = discovery.skills;
-    config.skills.disabled =
-        merge_disabled_skill_keys(config.skills.disabled.clone(), &discovery.required_disabled);
-    refresh_derived_enabled_skills(&mut config);
+    let disabled = merge_disabled_skill_keys(
+        preserve_disabled_skill_keys_for_hidden_locations(
+            config.skills.disabled.clone(),
+            &config.skills.detected,
+        ),
+        &discovery.required_disabled,
+    );
+    config.skills.disabled = disabled.clone();
+    refresh_derived_enabled_skills(&mut config, &state.user_profile_dir);
+    config.skills.disabled = disabled;
 
     save_config(&state, config.clone())?;
 

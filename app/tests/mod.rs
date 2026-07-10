@@ -51,10 +51,11 @@ use crate::http::{
     settings::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
         DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
-        ManualPromptSettingsRequest, TestModelRequest, UpdateAgentDefinitionRequest,
-        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
-        default_plan_mode_system_prompt, filter_provider_model_ids, model_test_execution_options,
-        model_test_probe, model_test_provider_request, normalize_chat_title_generation_model_id,
+        ManualPromptSettingsRequest, ManualSkillsRequest, TestModelRequest,
+        UpdateAgentDefinitionRequest, associate_provider_with_local_models,
+        can_save_new_provider_after_model_list_error, default_plan_mode_system_prompt,
+        filter_provider_model_ids, model_test_execution_options, model_test_probe,
+        model_test_provider_request, normalize_chat_title_generation_model_id, save_skills,
         test_model,
     },
     skill_store::{
@@ -2323,7 +2324,7 @@ description:
     .expect("skill file write");
 
     let config = GlobalConfig::first_run(workspace_dir);
-    let discovery = discover_skills(&profile_dir, &config.workspaces);
+    let discovery = discover_skills_in_all_locations(&profile_dir, &config.workspaces);
 
     assert_eq!(discovery.skills.len(), 1);
     assert_eq!(discovery.skills[0].key, "global:broken");
@@ -3703,7 +3704,7 @@ fn discover_skills_ignores_missing_directories() {
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }];
-    let discovery = discover_skills(&profile_dir, &workspaces);
+    let discovery = discover_skills_in_all_locations(&profile_dir, &workspaces);
 
     assert!(discovery.errors.is_empty());
     assert!(discovery.skills.is_empty());
@@ -18136,7 +18137,8 @@ fn discover_skills_reports_non_directory_paths() {
     fs::create_dir_all(profile_dir.join(".agents")).expect("profile skill parent");
     fs::write(&skill_path, "not a directory").expect("skill path file write");
 
-    let discovery = discover_skills(&profile_dir, &[]);
+    let config = GlobalConfig::first_run(env::temp_dir());
+    let discovery = discover_skills_in_all_locations(&profile_dir, &config.workspaces);
 
     assert_eq!(discovery.errors.len(), 1);
     assert!(discovery.errors[0].message.contains("not a directory"));
@@ -18175,6 +18177,21 @@ fn manual_skill_save_derives_disabled_keys_from_enabled_keys() {
     .expect("disabled skill ids");
 
     assert_eq!(disabled, vec!["workspace:default:gitmemo"]);
+}
+
+#[test]
+fn manual_skill_save_preserves_disabled_keys_from_hidden_locations() {
+    let discovered = vec![test_skill_settings("global:gitmemo", "gitmemo")];
+    let disabled = merge_manual_disabled_skill_keys(
+        vec![
+            "global:gitmemo".to_string(),
+            "workspace:default:claude-only".to_string(),
+        ],
+        Vec::new(),
+        &discovered,
+    );
+
+    assert_eq!(disabled, vec!["workspace:default:claude-only".to_string()]);
 }
 
 #[test]
@@ -18677,7 +18694,8 @@ fn skill_store_install_discovers_written_skill() {
         .expect_err("second install without overwrite should conflict");
     assert!(conflict.message().contains("already exists"));
 
-    let discovery = discover_skills(&profile_dir, &[]);
+    let config = GlobalConfig::first_run(env::temp_dir());
+    let discovery = discover_skills_in_all_locations(&profile_dir, &config.workspaces);
 
     assert!(discovery.errors.is_empty());
     assert_eq!(install_path, target_root.join("gitmemo"));
@@ -19027,7 +19045,7 @@ description: Project memory.
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }];
-    let discovery = discover_skills(&profile_dir, &workspaces);
+    let discovery = discover_skills_in_all_locations(&profile_dir, &workspaces);
 
     assert!(discovery.errors.is_empty());
     assert_eq!(discovery.skills.len(), 1);
@@ -19043,6 +19061,240 @@ description: Project memory.
 
     fs::remove_dir_all(profile_dir).expect("remove profile directory");
     fs::remove_dir_all(workspace_dir).expect("remove skill test directory");
+}
+
+#[test]
+fn disabled_skill_location_hides_its_skills_and_can_be_reenabled() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-disabled-skill-location-profile-test"));
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-disabled-skill-location-workspace-test"));
+    let global_skill = profile_dir
+        .join(".agents")
+        .join("skills")
+        .join("global-skill")
+        .join("SKILL.md");
+    let agents_skill = workspace_dir
+        .join(".agents")
+        .join("skills")
+        .join("agents-skill")
+        .join("SKILL.md");
+    let claude_skill = workspace_dir
+        .join(".claude")
+        .join("skills")
+        .join("claude-skill")
+        .join("SKILL.md");
+    let content =
+        |name: &str| format!("---\nname: {name}\ndescription: {name}.\n---\n\nUse {name}.\n");
+
+    for (path, name) in [
+        (&global_skill, "global-skill"),
+        (&agents_skill, "agents-skill"),
+        (&claude_skill, "claude-skill"),
+    ] {
+        fs::create_dir_all(path.parent().expect("skill parent")).expect("skill parent directory");
+        fs::write(path, content(name)).expect("skill file write");
+    }
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    let all_skills = discover_skills(&profile_dir, &config);
+    assert_eq!(all_skills.skills.len(), 3);
+
+    config.skills.disabled_locations = vec!["workspace:default:claude".to_string()];
+    let disabled_claude = discover_skills(&profile_dir, &config);
+    assert!(
+        disabled_claude
+            .skills
+            .iter()
+            .all(|skill| skill.key != "workspace:default:claude-skill")
+    );
+    assert!(
+        disabled_claude
+            .skills
+            .iter()
+            .any(|skill| skill.key == "global:global-skill")
+    );
+    assert!(
+        disabled_claude
+            .skills
+            .iter()
+            .any(|skill| skill.key == "workspace:default:agents-skill")
+    );
+
+    config.skills.disabled_locations = vec!["global:agents".to_string()];
+    let disabled_global = discover_skills(&profile_dir, &config);
+    assert!(
+        disabled_global
+            .skills
+            .iter()
+            .all(|skill| skill.key != "global:global-skill")
+    );
+    assert!(
+        disabled_global
+            .skills
+            .iter()
+            .any(|skill| skill.key == "workspace:default:agents-skill")
+    );
+    assert!(
+        disabled_global
+            .skills
+            .iter()
+            .any(|skill| skill.key == "workspace:default:claude-skill")
+    );
+
+    config.skills.disabled_locations.clear();
+    let reenabled = discover_skills(&profile_dir, &config);
+    assert!(
+        reenabled
+            .skills
+            .iter()
+            .any(|skill| skill.key == "workspace:default:claude-skill")
+    );
+
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn skill_location_summary_reports_stable_ids_and_enabled_state() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-location-summary-profile-test"));
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-skill-location-summary-workspace-test"));
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.skills.disabled_locations = vec!["workspace:default:agents".to_string()];
+
+    let summary = skills_settings_summary(&config, &profile_dir);
+
+    assert_eq!(summary.locations.len(), 3);
+    assert!(
+        summary
+            .locations
+            .iter()
+            .any(|location| location.id == "global:agents" && location.enabled)
+    );
+    assert!(
+        summary
+            .locations
+            .iter()
+            .any(|location| location.id == "workspace:default:agents" && !location.enabled)
+    );
+    assert!(
+        summary
+            .locations
+            .iter()
+            .any(|location| location.id == "workspace:default:claude" && location.enabled)
+    );
+
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn skill_location_save_round_trips_and_preserves_hidden_skill_preferences() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-location-save-profile-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-skill-location-save-workspace-test"));
+    let global_skill = profile_dir
+        .join(".agents")
+        .join("skills")
+        .join("global-skill")
+        .join("SKILL.md");
+    let claude_skill = workspace_dir
+        .join(".claude")
+        .join("skills")
+        .join("claude-skill")
+        .join("SKILL.md");
+    for (path, name) in [
+        (&global_skill, "global-skill"),
+        (&claude_skill, "claude-skill"),
+    ] {
+        fs::create_dir_all(path.parent().expect("skill parent")).expect("skill parent directory");
+        fs::write(
+            path,
+            format!("---\nname: {name}\ndescription: {name}.\n---\n\nUse {name}.\n"),
+        )
+        .expect("skill file write");
+    }
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+    let state = test_app_state(
+        GlobalConfig::first_run(workspace_dir.clone()),
+        profile_dir.clone(),
+    );
+
+    let Json(_seed) = save_skills(
+        State(state.clone()),
+        Json(ManualSkillsRequest {
+            disabled: Some(vec!["workspace:default:claude-skill".to_string()]),
+            enabled: None,
+            disabled_location_ids: None,
+            translation_model_id: None,
+        }),
+    )
+    .await
+    .expect("save hidden skill preference before disabling location");
+    let stored_before_location_disable = state
+        .config
+        .lock()
+        .expect("config lock")
+        .skills
+        .disabled
+        .clone();
+    assert!(
+        stored_before_location_disable
+            .iter()
+            .any(|key| key == "workspace:default:claude-skill")
+    );
+
+    let Json(disabled_location) = save_skills(
+        State(state.clone()),
+        Json(ManualSkillsRequest {
+            disabled: None,
+            enabled: None,
+            disabled_location_ids: Some(vec!["workspace:default:claude".to_string()]),
+            translation_model_id: None,
+        }),
+    )
+    .await
+    .expect("disable skill location");
+    assert!(
+        disabled_location
+            .skills
+            .detected
+            .iter()
+            .all(|skill| skill.key != "workspace:default:claude-skill")
+    );
+    assert!(
+        state
+            .config
+            .lock()
+            .expect("config lock")
+            .skills
+            .disabled
+            .iter()
+            .any(|key| key == "workspace:default:claude-skill")
+    );
+
+    let Json(reenabled) = save_skills(
+        State(state.clone()),
+        Json(ManualSkillsRequest {
+            disabled: None,
+            enabled: None,
+            disabled_location_ids: Some(Vec::new()),
+            translation_model_id: None,
+        }),
+    )
+    .await
+    .expect("reenable skill location");
+    let reenabled_skill = reenabled
+        .skills
+        .detected
+        .iter()
+        .find(|skill| skill.key == "workspace:default:claude-skill")
+        .expect("re-enabled skill should be rediscovered");
+    assert!(!reenabled_skill.enabled);
+
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 fn test_skill_settings(key: &str, id: &str) -> SkillSettings {

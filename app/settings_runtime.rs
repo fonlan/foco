@@ -606,7 +606,14 @@ pub(crate) fn skills_settings_summary(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, &config.workspaces);
+    let disabled_location_ids = config
+        .skills
+        .disabled_locations
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let all_roots = skill_search_roots(user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(user_profile_dir, config);
     let required_disabled_skill_ids = discovery
         .required_disabled
         .iter()
@@ -614,9 +621,17 @@ pub(crate) fn skills_settings_summary(
         .collect::<HashSet<_>>();
 
     SkillsSettingsSummary {
-        directories: skill_search_roots(user_profile_dir, &config.workspaces)
+        directories: all_roots
             .iter()
             .map(|root| display_path(&root.directory))
+            .collect(),
+        locations: all_roots
+            .iter()
+            .map(|root| crate::http::settings::SkillLocationSummary {
+                id: root.id.clone(),
+                path: display_path(&root.directory),
+                enabled: !disabled_location_ids.contains(root.id.as_str()),
+            })
             .collect(),
         detected: discovery
             .skills
