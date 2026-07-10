@@ -82,6 +82,13 @@ pub struct PlanAutoRunCandidateRecord {
     pub action: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanAutoRunSelection {
+    Candidate(PlanAutoRunCandidateRecord),
+    BlockedByCancelledPhase { plan_id: String, phase_id: String },
+    Idle,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewAgentTask<'a> {
     pub id: &'a AgentTaskId,

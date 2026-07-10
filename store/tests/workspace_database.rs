@@ -782,12 +782,79 @@ fn plan_auto_run_candidate_selects_next_runnable_plan() {
     create_auto_run_test_plan(&mut database, "ready", "ready");
     create_auto_run_test_plan(&mut database, "failed", "failed");
 
-    let candidate = database
+    let candidate = match database
         .next_plan_auto_run_candidate()
         .expect("candidate query")
-        .expect("candidate");
+    {
+        foco_store::workspace::PlanAutoRunSelection::Candidate(candidate) => candidate,
+        other => panic!("expected candidate, got {other:?}"),
+    };
     assert_eq!(candidate.plan_id, "paused");
     assert_eq!(candidate.action, "resume");
+}
+
+#[test]
+fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_candidates() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    for (index, status) in ["draft", "ready", "failed", "paused"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("candidate-{index}");
+        create_auto_run_test_plan(&mut database, &id, status);
+        let selection = database
+            .next_plan_auto_run_candidate()
+            .expect("candidate selection");
+        let foco_store::workspace::PlanAutoRunSelection::Candidate(candidate) = selection else {
+            panic!("expected candidate for {status}, got {selection:?}");
+        };
+        assert_eq!(candidate.plan_id, id);
+        assert_eq!(
+            candidate.action,
+            if status == "paused" {
+                "resume"
+            } else {
+                "start"
+            }
+        );
+        database.delete_plan(&id).expect("delete candidate plan");
+    }
+}
+
+#[test]
+fn plan_auto_run_cancelled_phase_blocks_later_plan_and_is_not_busy() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    create_auto_run_test_plan(&mut database, "blocked", "ready");
+    create_auto_run_test_plan(&mut database, "later", "ready");
+    database
+        .transition_plan("blocked", "start")
+        .expect("start blocked plan");
+    database
+        .cancel_plan_phase_by_id("blocked", "blocked-phase", "user cancelled phase")
+        .expect("cancel blocked phase");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("re-enable auto-run");
+
+    assert_eq!(
+        database
+            .next_plan_auto_run_candidate()
+            .expect("candidate selection"),
+        foco_store::workspace::PlanAutoRunSelection::BlockedByCancelledPhase {
+            plan_id: "blocked".to_string(),
+            phase_id: "blocked-phase".to_string(),
+        }
+    );
+    let state = database.plan_auto_run_state().expect("auto-run state");
+    assert!(state.enabled);
+    assert!(!state.busy);
+    assert!(!database.disable_plan_auto_run_if_idle().expect("not idle"));
 }
 
 #[test]
@@ -824,11 +891,11 @@ fn plan_auto_run_marks_running_plan_busy_without_candidate() {
         .expect("enable auto-run");
 
     assert!(database.plan_auto_run_has_in_flight().expect("in flight"));
-    assert!(
+    assert_eq!(
         database
             .next_plan_auto_run_candidate()
-            .expect("candidate query")
-            .is_none()
+            .expect("candidate query"),
+        foco_store::workspace::PlanAutoRunSelection::Idle
     );
     assert!(database.plan_auto_run_state().expect("state").busy);
 }

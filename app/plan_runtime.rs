@@ -95,8 +95,25 @@ pub(crate) async fn transition_plan_action(
     }
 
     let config = config_snapshot(state)?;
-    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
+    {
+        let database = open_workspace_database(&workspace.path)?;
+        let plan = database
+            .plan(plan_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("plan was not found: {}", plan_id.trim()))
+            })?;
+        if let Some(phase) = plan.phases.iter().find(|phase| phase.status != "completed")
+            && phase.status == "cancelled"
+        {
+            return Err(ApiError::bad_request(format!(
+                "plan phase '{}' was cancelled; use Retry for that phase before starting or resuming the plan",
+                phase.id
+            )));
+        }
+    }
+    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let plan = {
         let mut database = open_workspace_database(&workspace.path)?;
         database
@@ -215,7 +232,10 @@ pub(crate) async fn retry_plan_phase(
     )
     .await
     {
-        Ok(plan) => Ok(plan),
+        Ok(plan) => {
+            state.plan_auto_run_scheduler.wake()?;
+            Ok(plan)
+        }
         Err(error) => {
             fail_plan_phase_dispatch_error(&workspace, &plan, &error)?;
             Err(error)

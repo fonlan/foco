@@ -31,9 +31,10 @@ use foco_store::{
     },
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewCodeGraphFileIndex,
-        NewCodeGraphImport, NewCodeGraphSymbol, NewPromptContextInjection, NewRunEvent,
-        NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewWorkspaceSpecJob,
-        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
+        NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
+        NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
+        WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -1062,6 +1063,102 @@ async fn tool_resource_registry_keeps_memory_locks_global() {
         .await
         .expect("global memory write lock should be released")
         .expect("global memory read waiter should not panic");
+}
+
+#[tokio::test]
+async fn cancelled_phase_blocks_manual_resume_without_dispatch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.providers.clear();
+    config.models.clear();
+    config.agent_definitions.push(AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-default").expect("definition id"),
+        revision: 1,
+        name: "Default agent".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Run the plan phase.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    });
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .create_plan(NewPlan {
+                id: "manual-cancelled-barrier",
+                title: "Manual cancelled barrier",
+                overview: "Resume must require Retry.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    NewPlanPhase {
+                        id: "manual-cancelled-phase",
+                        title: "Cancelled phase",
+                        summary: "Cancel before resume.",
+                        steps: vec![NewPlanStep {
+                            id: "manual-cancelled-step",
+                            title: "Cancelled step",
+                            detail: "Do not dispatch.",
+                            acceptance: vec!["retry required".to_string()],
+                        }],
+                    },
+                    NewPlanPhase {
+                        id: "manual-later-phase",
+                        title: "Later phase",
+                        summary: "Must remain pending.",
+                        steps: vec![NewPlanStep {
+                            id: "manual-later-step",
+                            title: "Later step",
+                            detail: "Wait.",
+                            acceptance: vec!["not dispatched".to_string()],
+                        }],
+                    },
+                ],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("manual-cancelled-barrier", "start")
+            .expect("start plan");
+        database
+            .cancel_plan_phase_by_id(
+                "manual-cancelled-barrier",
+                "manual-cancelled-phase",
+                "user cancelled",
+            )
+            .expect("cancel phase");
+    }
+
+    let error = crate::plan_runtime::transition_plan_action(
+        &state,
+        &workspace_id,
+        "manual-cancelled-barrier",
+        "resume",
+    )
+    .await
+    .expect_err("cancelled phase must block resume");
+    assert!(error.message.contains("Retry"), "{}", error.message);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let plan = database
+        .plan("manual-cancelled-barrier")
+        .expect("plan lookup")
+        .expect("plan");
+    assert_eq!(plan.status, "paused");
+    assert_eq!(plan.phases[0].status, "cancelled");
+    assert_eq!(plan.phases[1].status, "pending");
+    assert!(
+        plan.phases
+            .iter()
+            .all(|phase| phase.agent_task_id.is_none())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -21251,7 +21348,7 @@ async fn memory_enabled_http_validates_scope_location_and_missing_fact() {
     app_task.abort();
 }
 
-fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
+pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let (terminal_shutdown_tx, _) = broadcast::channel(1);
     let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());

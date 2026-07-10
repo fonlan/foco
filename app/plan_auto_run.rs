@@ -1,10 +1,8 @@
 use std::time::Duration;
 
-#[cfg(test)]
-use foco_store::workspace::PlanAutoRunCandidateRecord;
 use foco_store::{
     config::WorkspaceConfig,
-    workspace::{PlanAutoRunStateRecord, PlanPatch},
+    workspace::{PlanAutoRunSelection, PlanAutoRunStateRecord, PlanPatch},
 };
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
@@ -108,7 +106,7 @@ async fn dispatch_next_plan_auto_run(
     state: &AppState,
     workspace: &WorkspaceConfig,
 ) -> Result<PlanAutoRunDispatch, ApiError> {
-    let candidate = {
+    let selection = {
         let mut database = open_workspace_database(&workspace.path)?;
         if !database
             .plan_auto_run_state()
@@ -123,19 +121,37 @@ async fn dispatch_next_plan_auto_run(
         {
             return Ok(PlanAutoRunDispatch::Blocked);
         }
-        let candidate = database
+        let selection = database
             .next_plan_auto_run_candidate()
             .map_err(ApiError::from_workspace_error)?;
-        if candidate.is_none() {
-            database
-                .disable_plan_auto_run_if_idle()
-                .map_err(ApiError::from_workspace_error)?;
+        match &selection {
+            PlanAutoRunSelection::Idle => {
+                database
+                    .disable_plan_auto_run_if_idle()
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            PlanAutoRunSelection::BlockedByCancelledPhase { plan_id, phase_id } => {
+                database
+                    .set_plan_auto_run_enabled(false)
+                    .map_err(ApiError::from_workspace_error)?;
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    plan_id,
+                    phase_id,
+                    "Plan auto-run stopped at cancelled phase barrier"
+                );
+            }
+            PlanAutoRunSelection::Candidate(_) => {}
         }
-        candidate
+        selection
     };
 
-    let Some(candidate) = candidate else {
-        return Ok(PlanAutoRunDispatch::Idle);
+    let candidate = match selection {
+        PlanAutoRunSelection::Candidate(candidate) => candidate,
+        PlanAutoRunSelection::BlockedByCancelledPhase { .. } => {
+            return Ok(PlanAutoRunDispatch::Blocked);
+        }
+        PlanAutoRunSelection::Idle => return Ok(PlanAutoRunDispatch::Idle),
     };
 
     match crate::plan_runtime::transition_plan_action(
@@ -215,27 +231,38 @@ pub(crate) fn set_plan_auto_run_enabled(
 #[cfg(test)]
 pub(crate) fn choose_plan_auto_run_candidate(
     plans: &[foco_store::workspace::PlanRecord],
-) -> Option<PlanAutoRunCandidateRecord> {
-    plans
-        .iter()
-        .filter_map(|plan| match plan.status.as_str() {
-            "draft" | "ready" | "failed" => Some(PlanAutoRunCandidateRecord {
-                plan_id: plan.id.clone(),
-                action: "start".to_string(),
-            }),
-            "paused" => Some(PlanAutoRunCandidateRecord {
-                plan_id: plan.id.clone(),
-                action: "resume".to_string(),
-            }),
-            _ => None,
-        })
-        .next()
+) -> PlanAutoRunSelection {
+    let Some(plan) = plans.iter().find(|plan| {
+        matches!(
+            plan.status.as_str(),
+            "draft" | "ready" | "failed" | "paused"
+        )
+    }) else {
+        return PlanAutoRunSelection::Idle;
+    };
+    if let Some(phase) = plan.phases.iter().find(|phase| phase.status != "completed")
+        && phase.status == "cancelled"
+    {
+        return PlanAutoRunSelection::BlockedByCancelledPhase {
+            plan_id: plan.id.clone(),
+            phase_id: phase.id.clone(),
+        };
+    }
+    let action = if plan.status == "paused" {
+        "resume"
+    } else {
+        "start"
+    };
+    PlanAutoRunSelection::Candidate(foco_store::workspace::PlanAutoRunCandidateRecord {
+        plan_id: plan.id.clone(),
+        action: action.to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foco_store::workspace::PlanRecord;
+    use foco_store::workspace::{PlanPhaseRecord, PlanRecord};
 
     fn plan(id: &str, status: &str) -> PlanRecord {
         PlanRecord {
@@ -257,6 +284,191 @@ mod tests {
         }
     }
 
+    fn phase(id: &str, status: &str, sequence: i64) -> PlanPhaseRecord {
+        PlanPhaseRecord {
+            id: id.to_string(),
+            plan_id: "plan".to_string(),
+            sequence,
+            title: id.to_string(),
+            summary: String::new(),
+            status: status.to_string(),
+            implementation_chat_id: None,
+            agent_team_id: None,
+            agent_task_id: None,
+            commit_id: None,
+            merge_attempt_count: 0,
+            error_message: None,
+            started_at: None,
+            completed_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: Vec::new(),
+            attempts: Vec::new(),
+        }
+    }
+
+    fn candidate(
+        selection: PlanAutoRunSelection,
+    ) -> foco_store::workspace::PlanAutoRunCandidateRecord {
+        match selection {
+            PlanAutoRunSelection::Candidate(candidate) => candidate,
+            other => panic!("expected candidate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_disables_auto_run_at_cancelled_phase_barrier_without_dispatch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let config = foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+        let mut state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        state.agent_scheduler = agent_scheduler;
+        {
+            let mut database =
+                foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+                    .expect("database");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: "blocked-plan",
+                    title: "Blocked plan",
+                    overview: "Cancelled phase blocks queue.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: "cancelled-phase",
+                        title: "Cancelled phase",
+                        summary: "Stop here.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "cancelled-step",
+                            title: "Cancelled step",
+                            detail: "Do not dispatch.",
+                            acceptance: vec!["blocked".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create plan");
+            database
+                .transition_plan("blocked-plan", "start")
+                .expect("start plan");
+            database
+                .cancel_plan_phase_by_id("blocked-plan", "cancelled-phase", "user cancelled")
+                .expect("cancel phase");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: "later-plan",
+                    title: "Later plan",
+                    overview: "Must not be skipped to.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: "later-phase",
+                        title: "Later phase",
+                        summary: "Wait.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "later-step",
+                            title: "Later step",
+                            detail: "Do not dispatch.",
+                            acceptance: vec!["pending".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create later plan");
+            database
+                .set_plan_auto_run_enabled(true)
+                .expect("enable auto-run");
+        }
+
+        assert!(!dispatch_plan_auto_run(&state).await.expect("dispatch scan"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), agent_scheduler_rx.recv())
+                .await
+                .is_err()
+        );
+        let mut database =
+            foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database");
+        let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(!auto_run.enabled);
+        assert!(!auto_run.busy);
+        database
+            .set_plan_auto_run_enabled(true)
+            .expect("re-enable auto-run");
+        drop(database);
+
+        assert!(
+            !dispatch_plan_auto_run(&state)
+                .await
+                .expect("repeat dispatch scan")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), agent_scheduler_rx.recv())
+                .await
+                .is_err()
+        );
+        let database = foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database");
+        let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(!auto_run.enabled);
+        assert!(!auto_run.busy);
+        let blocked = database
+            .plan("blocked-plan")
+            .expect("blocked plan lookup")
+            .expect("blocked plan");
+        let later = database
+            .plan("later-plan")
+            .expect("later plan lookup")
+            .expect("later plan");
+        assert_eq!(blocked.status, "paused");
+        assert_eq!(blocked.phases[0].status, "cancelled");
+        assert_eq!(later.status, "ready");
+        assert_eq!(later.phases[0].status, "pending");
+        assert!(later.phases[0].agent_task_id.is_none());
+    }
+
+    #[test]
+    fn sidecar_store_action_preserves_cancelled_phase_barrier() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database =
+            foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "remote-barrier",
+                title: "Remote barrier",
+                overview: "Sidecar actions share store semantics.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "remote-cancelled-phase",
+                    title: "Cancelled phase",
+                    summary: "Retry is required.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "remote-cancelled-step",
+                        title: "Cancelled step",
+                        detail: "Do not skip.",
+                        acceptance: vec!["blocked".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("remote-barrier", "start")
+            .expect("start plan");
+        database
+            .cancel_plan_phase_by_id(
+                "remote-barrier",
+                "remote-cancelled-phase",
+                "remote user cancelled",
+            )
+            .expect("cancel phase");
+
+        let error = database
+            .transition_plan("remote-barrier", "resume")
+            .expect_err("sidecar store transition must require Retry");
+        assert!(error.to_string().contains("Retry"), "{error}");
+    }
+
     #[test]
     fn plan_auto_run_candidate_matches_frontend_order() {
         let plans = vec![
@@ -266,7 +478,7 @@ mod tests {
             plan("ready", "ready"),
         ];
 
-        let candidate = choose_plan_auto_run_candidate(&plans).expect("candidate");
+        let candidate = candidate(choose_plan_auto_run_candidate(&plans));
         assert_eq!(candidate.plan_id, "paused");
         assert_eq!(candidate.action, "resume");
     }
@@ -274,8 +486,7 @@ mod tests {
     #[test]
     fn plan_auto_run_candidate_starts_draft_ready_and_failed() {
         for status in ["draft", "ready", "failed"] {
-            let candidate =
-                choose_plan_auto_run_candidate(&[plan(status, status)]).expect("candidate");
+            let candidate = candidate(choose_plan_auto_run_candidate(&[plan(status, status)]));
             assert_eq!(candidate.plan_id, status);
             assert_eq!(candidate.action, "start");
         }
@@ -290,6 +501,41 @@ mod tests {
             plan("cancelled", "cancelled"),
         ];
 
-        assert!(choose_plan_auto_run_candidate(&plans).is_none());
+        assert_eq!(
+            choose_plan_auto_run_candidate(&plans),
+            PlanAutoRunSelection::Idle
+        );
+    }
+
+    #[test]
+    fn plan_auto_run_candidate_stops_at_cancelled_phase_barrier() {
+        let mut blocked = plan("blocked", "paused");
+        blocked.phases = vec![
+            phase("completed-phase", "completed", 0),
+            phase("cancelled-phase", "cancelled", 1),
+            phase("pending-phase", "pending", 2),
+        ];
+        let plans = vec![blocked, plan("later-ready", "ready")];
+
+        assert_eq!(
+            choose_plan_auto_run_candidate(&plans),
+            PlanAutoRunSelection::BlockedByCancelledPhase {
+                plan_id: "blocked".to_string(),
+                phase_id: "cancelled-phase".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_auto_run_candidate_allows_paused_plan_without_cancelled_barrier() {
+        let mut paused = plan("paused", "paused");
+        paused.phases = vec![
+            phase("completed-phase", "completed", 0),
+            phase("pending-phase", "pending", 1),
+        ];
+
+        let candidate = candidate(choose_plan_auto_run_candidate(&[paused]));
+        assert_eq!(candidate.plan_id, "paused");
+        assert_eq!(candidate.action, "resume");
     }
 }

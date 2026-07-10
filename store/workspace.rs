@@ -46,9 +46,9 @@ pub use workspace_records::{
     NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
     NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
     NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListOrder,
-    PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch,
-    PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
+    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
+    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
     RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
     ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
     ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
@@ -740,8 +740,10 @@ impl WorkspaceDatabase {
 
     pub fn plan_auto_run_state(&self) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
         let enabled = self.workspace_metadata("plan_auto_run_enabled")?.as_deref() == Some("true");
-        let busy =
-            self.next_plan_auto_run_candidate()?.is_some() || self.plan_auto_run_has_in_flight()?;
+        let busy = matches!(
+            self.next_plan_auto_run_candidate()?,
+            PlanAutoRunSelection::Candidate(_)
+        ) || self.plan_auto_run_has_in_flight()?;
         Ok(PlanAutoRunStateRecord { enabled, busy })
     }
 
@@ -758,34 +760,61 @@ impl WorkspaceDatabase {
 
     pub fn next_plan_auto_run_candidate(
         &self,
-    ) -> Result<Option<PlanAutoRunCandidateRecord>, WorkspaceDatabaseError> {
-        self.connection
+    ) -> Result<PlanAutoRunSelection, WorkspaceDatabaseError> {
+        let plan = self
+            .connection
             .query_row(
                 "SELECT id, status FROM plans
                  WHERE status IN ('draft', 'ready', 'failed', 'paused')
                  ORDER BY sort_order ASC, created_at ASC, id ASC
                  LIMIT 1",
                 [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some((plan_id, status)) = plan else {
+            return Ok(PlanAutoRunSelection::Idle);
+        };
+        let cancelled_phase_id = self
+            .connection
+            .query_row(
+                "SELECT id, status
+                 FROM plan_phases
+                 WHERE plan_id = ?1 AND status <> 'completed'
+                 ORDER BY sequence ASC
+                 LIMIT 1",
+                params![plan_id.as_str()],
                 |row| {
-                    let plan_id = row.get::<_, String>(0)?;
-                    let status = row.get::<_, String>(1)?;
-                    let action = if status == "paused" {
-                        "resume"
-                    } else {
-                        "start"
-                    };
-                    Ok(PlanAutoRunCandidateRecord {
-                        plan_id,
-                        action: action.to_string(),
-                    })
+                    let phase_id = row.get::<_, String>(0)?;
+                    let phase_status = row.get::<_, String>(1)?;
+                    Ok((phase_id, phase_status))
                 },
             )
             .optional()
-            .map_err(|source| self.sqlite_error(source))
+            .map_err(|source| self.sqlite_error(source))?
+            .and_then(|(phase_id, phase_status)| (phase_status == "cancelled").then_some(phase_id));
+        if let Some(phase_id) = cancelled_phase_id {
+            return Ok(PlanAutoRunSelection::BlockedByCancelledPhase { plan_id, phase_id });
+        }
+        let action = if status == "paused" {
+            "resume"
+        } else {
+            "start"
+        };
+        Ok(PlanAutoRunSelection::Candidate(
+            PlanAutoRunCandidateRecord {
+                plan_id,
+                action: action.to_string(),
+            },
+        ))
     }
 
     pub fn disable_plan_auto_run_if_idle(&mut self) -> Result<bool, WorkspaceDatabaseError> {
-        if self.next_plan_auto_run_candidate()?.is_some() {
+        if !matches!(
+            self.next_plan_auto_run_candidate()?,
+            PlanAutoRunSelection::Idle
+        ) {
             return Ok(false);
         }
         self.set_workspace_metadata("plan_auto_run_enabled", "false")?;
@@ -3252,7 +3281,7 @@ impl WorkspaceDatabase {
         if next_phase.status == "cancelled" {
             return Err(WorkspaceDatabaseError::InvalidPlan {
                 message: format!(
-                    "plan phase '{}' was cancelled and must be retried explicitly",
+                    "plan phase '{}' was cancelled and must be retried explicitly with Retry before starting or resuming the plan",
                     next_phase.id
                 ),
             });

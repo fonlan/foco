@@ -593,7 +593,6 @@ pub(crate) async fn retry_plan_phase(
         },
     )
     .await?;
-    state.plan_auto_run_scheduler.wake()?;
 
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),
