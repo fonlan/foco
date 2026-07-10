@@ -851,6 +851,19 @@ pub(crate) async fn queue_chat_message_internal(
         team_mode_enabled,
         origin_metadata.as_ref(),
     )?;
+    let chat_queued_run_json = json!({
+        "status": "queued",
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": assistant_sequence,
+        "modelId": requested_model_id,
+        "providerId": requested_provider_id,
+        "thinkingLevel": requested_thinking_level,
+        "skillIds": requested_skill_ids,
+        "sessionMode": requested_session_mode,
+        "content": message,
+    })
+    .to_string();
 
     let (chat_id, chat_title) = if prompt_context.is_new_chat {
         let chat_id = prompt_context
@@ -1049,6 +1062,11 @@ pub(crate) async fn queue_chat_message_internal(
             metadata_json: Some(&user_metadata_json),
         })
         .map_err(ApiError::from_workspace_error)?;
+    if !prompt_context.is_new_chat {
+        database
+            .set_chat_queued_run(&chat_id, &chat_queued_run_json)
+            .map_err(ApiError::from_workspace_error)?;
+    }
     if agent_task_id.is_some() && !defer_start {
         state.agent_scheduler.wake()?;
     }

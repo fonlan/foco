@@ -3652,6 +3652,44 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn set_chat_queued_run(
+        &mut self,
+        chat_id: &str,
+        queued_run_json: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let chat =
+            self.chat(chat_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                })?;
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        let queued_run = serde_json::from_str::<Value>(queued_run_json).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat queued run is invalid JSON: {source}"),
+            }
+        })?;
+        if !queued_run.is_object() {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "chat queued run must be an object".to_string(),
+            });
+        }
+        chat_metadata.insert(QUEUED_CHAT_METADATA_KEY.to_string(), queued_run);
+        let metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat metadata is invalid JSON: {source}"),
+            }
+        })?;
+
+        self.connection
+            .execute(
+                "UPDATE chats SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![metadata_json, now_timestamp(), chat_id],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
     pub fn update_chat_title_if_current(
         &mut self,
         id: &str,

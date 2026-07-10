@@ -1684,7 +1684,9 @@ pub(crate) fn persist_running_llm_request(
     if let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
         && !queued_chat_run_matches_context(&database, context, queued_user_message_id)?
     {
-        return Ok(());
+        return Err(ApiError::conflict(
+            "chat run is no longer current because its queued run was replaced",
+        ));
     }
     database
         .insert_llm_request(NewLlmRequest {

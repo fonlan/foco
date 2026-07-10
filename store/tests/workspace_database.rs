@@ -3595,6 +3595,35 @@ fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
 }
 
 #[test]
+fn set_chat_queued_run_adds_run_to_existing_chat_metadata() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat_with_metadata("chat-existing", "Existing chat", r#"{"kind":"normal"}"#)
+        .expect("chat insert");
+
+    database
+        .set_chat_queued_run(
+            "chat-existing",
+            r#"{"status":"queued","userMessageId":"user-2","assistantMessageId":"assistant-2","assistantSequence":3,"modelId":"model"}"#,
+        )
+        .expect("set queued run");
+
+    let metadata: Value = serde_json::from_str(
+        &database
+            .chat("chat-existing")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    assert_eq!(metadata["kind"], "normal");
+    assert_eq!(metadata["queuedRun"]["userMessageId"], "user-2");
+    assert_eq!(metadata["queuedRun"]["assistantMessageId"], "assistant-2");
+}
+
+#[test]
 fn repository_helpers_round_trip_todo_graphs() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

@@ -7774,6 +7774,20 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         user_metadata["queuedRun"]["modelId"],
         json!("client-selection")
     );
+    let chat = database
+        .chat("chat-agent-api")
+        .expect("chat lookup")
+        .expect("chat");
+    let chat_metadata =
+        parse_json_value(&chat.metadata_json, "chat metadata").expect("chat metadata");
+    assert_eq!(
+        chat_metadata["queuedRun"]["userMessageId"],
+        json!(queued.user_message_id)
+    );
+    assert_eq!(
+        chat_metadata["queuedRun"]["assistantMessageId"],
+        json!(queued.assistant_message_id)
+    );
     drop(database);
     let cancel_request =
         serde_json::from_value(json!({ "action": "cancel" })).expect("task action request");
@@ -9972,6 +9986,53 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
     assert!(user_summary.queued_run.is_none());
 
     drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn persist_running_llm_request_rejects_replaced_queued_run() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-stale-audit-start-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat_with_metadata(
+                "chat-1",
+                "Replaced queued run",
+                r#"{"queuedRun":{"status":"running","userMessageId":"user-new","assistantMessageId":"assistant-new","assistantSequence":3,"modelId":"gpt-5.4"}}"#,
+            )
+            .expect("chat insert");
+    }
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Old".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.queued_user_message_id = Some("user-old".to_string());
+    context.assistant_message_id = "assistant-old".to_string();
+
+    let error =
+        persist_running_llm_request(&context, "request-old", "2026-07-10T10:00:00Z", "{}", &[])
+            .expect_err("replaced queued run must reject audit start");
+
+    assert_eq!(
+        error.message,
+        "chat run is no longer current because its queued run was replaced"
+    );
+    assert!(
+        WorkspaceDatabase::open_or_create(&workspace_dir)
+            .expect("workspace database")
+            .llm_request("request-old")
+            .expect("audit request read")
+            .is_none()
+    );
+
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
