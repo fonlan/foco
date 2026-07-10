@@ -1,4 +1,9 @@
-use std::{fs, sync::mpsc, thread, time::Duration};
+use std::{
+    fs,
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::Duration,
+};
 
 use foco_agent::{
     AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentExecutionWorkspaceMode,
@@ -109,6 +114,40 @@ fn creates_workspace_foco_database_and_runs_migrations() {
             "{table} table should exist"
         );
     }
+}
+
+#[test]
+fn concurrent_first_open_serializes_workspace_migrations() {
+    const THREAD_COUNT: usize = 8;
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+    let threads = (0..THREAD_COUNT)
+        .map(|_| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                    .and_then(|database| database.schema_version())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        let schema_version = thread
+            .join()
+            .expect("workspace database open thread")
+            .expect("concurrent workspace database open");
+        assert_eq!(schema_version, WORKSPACE_SCHEMA_VERSION);
+    }
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
 }
 
 #[test]

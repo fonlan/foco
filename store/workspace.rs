@@ -12447,13 +12447,21 @@ fn run_migrations(
         create_migration_backup(connection, database_path, current_version)?;
     }
 
-    let transaction =
-        connection
-            .transaction()
-            .map_err(|source| WorkspaceDatabaseError::Sqlite {
-                path: database_path.to_path_buf(),
-                source,
-            })?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| WorkspaceDatabaseError::Sqlite {
+            path: database_path.to_path_buf(),
+            source,
+        })?;
+    let current_version = schema_version(&transaction, database_path)?;
+
+    if current_version > WORKSPACE_SCHEMA_VERSION {
+        return Err(WorkspaceDatabaseError::UnsupportedSchemaVersion {
+            path: database_path.to_path_buf(),
+            found: current_version,
+            latest: WORKSPACE_SCHEMA_VERSION,
+        });
+    }
 
     for migration in MIGRATIONS
         .iter()
