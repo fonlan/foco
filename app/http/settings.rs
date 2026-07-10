@@ -85,6 +85,7 @@ pub(crate) struct ManualGeneralSettingsRequest {
     pub(crate) default_team_mode_enabled: Option<bool>,
     pub(crate) api_audit: Option<ManualApiAuditSettingsRequest>,
     pub(crate) chat_title_generation_model_id: Option<String>,
+    pub(crate) runtime_tool_state_compression_enabled: Option<bool>,
     pub(crate) listen_host: String,
     pub(crate) listen_port: u32,
     pub(crate) llm_request_retry_count: Option<u32>,
@@ -363,6 +364,7 @@ pub(crate) struct GeneralSettingsSummary {
     pub(crate) auto_start_enabled: bool,
     pub(crate) default_team_mode_enabled: bool,
     pub(crate) chat_title_generation_model_id: Option<String>,
+    pub(crate) runtime_tool_state_compression_enabled: bool,
     pub(crate) api_audit: ApiAuditSettingsSummary,
     pub(crate) web_server: WebServerSettingsSummary,
     pub(crate) llm_request_retry_count: u32,
@@ -1449,6 +1451,9 @@ pub(crate) async fn save_general_settings(
         &config,
         request.chat_title_generation_model_id.as_deref(),
     )?;
+    if let Some(enabled) = request.runtime_tool_state_compression_enabled {
+        config.app.runtime_tool_state_compression_enabled = enabled;
+    }
     config.app.language = normalize_app_language(&request.language)?;
     config.app.theme = normalize_app_theme(&request.theme)?;
     if let Some(hook_audit_enabled) = request.hook_audit_enabled {

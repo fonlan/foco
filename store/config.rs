@@ -342,6 +342,7 @@ impl GlobalConfig {
                 theme: DEFAULT_APP_THEME.to_string(),
                 llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
                 chat_title_generation_model_id: default_chat_title_generation_model_id(),
+                runtime_tool_state_compression_enabled: false,
                 auto_start_enabled: false,
                 auto_update_check_enabled: false,
                 default_team_mode_enabled: true,
@@ -737,6 +738,8 @@ pub struct AppSettings {
     pub llm_request_retry_count: u32,
     #[serde(default = "default_chat_title_generation_model_id")]
     pub chat_title_generation_model_id: Option<String>,
+    #[serde(default)]
+    pub runtime_tool_state_compression_enabled: bool,
     #[serde(default)]
     pub auto_start_enabled: bool,
     #[serde(default)]
@@ -4268,6 +4271,7 @@ mod tests {
             .expect("app object");
         app.remove("auto_update_check_enabled");
         app.remove("chat_title_generation_model_id");
+        app.remove("runtime_tool_state_compression_enabled");
         fs::write(
             &paths.config_file,
             serde_json::to_string_pretty(&json).expect("serialize config"),
@@ -4281,6 +4285,7 @@ mod tests {
             loaded.app.chat_title_generation_model_id.as_deref(),
             Some(CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL)
         );
+        assert!(!loaded.app.runtime_tool_state_compression_enabled);
     }
 
     #[test]

@@ -1856,6 +1856,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
             api_audit: None,
             auto_start_enabled: None,
             chat_title_generation_model_id: None,
+            runtime_tool_state_compression_enabled: None,
             clear_password: None,
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -1876,6 +1877,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
             api_audit: None,
             auto_start_enabled: None,
             chat_title_generation_model_id: None,
+            runtime_tool_state_compression_enabled: None,
             clear_password: None,
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -1902,6 +1904,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
             api_audit: None,
             auto_start_enabled: None,
             chat_title_generation_model_id: None,
+            runtime_tool_state_compression_enabled: None,
             clear_password: Some(true),
             default_team_mode_enabled: None,
             hook_audit_enabled: None,
@@ -4538,6 +4541,10 @@ fn runtime_tool_state_compression_uses_total_context_threshold() {
         900,
     );
     context.context_budget.system_prompt_tokens = 620;
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
     context.active_tool_start_index = context.provider_request.messages.len();
 
     for batch_index in 0..4 {
@@ -4560,6 +4567,38 @@ fn runtime_tool_state_compression_uses_total_context_threshold() {
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
+
+#[test]
+fn runtime_tool_state_compression_disabled_skips_non_forced_compression() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-disabled-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        900,
+    );
+    context.context_budget.system_prompt_tokens = 620;
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    for batch_index in 0..4 {
+        append_test_runtime_tool_batch(&mut context, batch_index, 600);
+    }
+
+    assert!(prepared_context_total_used_tokens(&context) >= 800);
+    assert!(
+        !compress_runtime_tool_state_if_needed(&mut context, false)
+            .expect("disabled runtime compression")
+    );
+    assert!(compress_runtime_tool_state_if_needed(&mut context, true).expect("forced compression"));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 #[tokio::test]
 async fn context_compression_runtime_tool_state_events_precede_llm_events() {
     let workspace_dir =
@@ -4577,6 +4616,10 @@ async fn context_compression_runtime_tool_state_events_precede_llm_events() {
     );
     context.context_budget.system_prompt_tokens = 620;
     context.context_budget.context_window = 1_000;
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
     context.active_tool_start_index = context.provider_request.messages.len();
 
     for batch_index in 0..4 {

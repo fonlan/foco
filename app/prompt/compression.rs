@@ -713,6 +713,15 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
     context: &mut PreparedChatContext,
     force: bool,
 ) -> Result<bool, ApiError> {
+    if !force
+        && !context
+            .global_config
+            .app
+            .runtime_tool_state_compression_enabled
+    {
+        return Ok(false);
+    }
+
     validate_prompt_context_lengths(
         &context.provider_request.messages,
         &context.message_source_sequences,
