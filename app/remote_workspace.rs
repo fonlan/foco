@@ -4988,8 +4988,82 @@ fn remote_stream_event_is_terminal(event: &Value) -> bool {
     event.get("type").and_then(Value::as_str) == Some("streamEnd")
 }
 
-fn remote_usage_i64(usage: &Value, key: &str) -> Option<i64> {
-    usage.get(key).and_then(Value::as_i64)
+fn remote_elapsed_millis(started_at: Instant) -> i64 {
+    i64::try_from(started_at.elapsed().as_millis())
+        .expect("remote run latency should fit in i64 milliseconds")
+}
+
+fn merge_remote_usage(total: &mut NeutralUsage, next: &NeutralUsage) {
+    add_remote_usage_tokens(&mut total.input_tokens, next.input_tokens);
+    add_remote_usage_tokens(&mut total.output_tokens, next.output_tokens);
+    add_remote_usage_tokens(&mut total.cache_read_tokens, next.cache_read_tokens);
+    add_remote_usage_tokens(&mut total.cache_write_tokens, next.cache_write_tokens);
+    add_remote_usage_tokens(&mut total.reasoning_tokens, next.reasoning_tokens);
+}
+
+fn add_remote_usage_tokens(total: &mut Option<i64>, next: Option<i64>) {
+    if let Some(next) = next {
+        *total = Some(total.unwrap_or(0) + next);
+    }
+}
+
+struct RemoteSidecarRunMetrics {
+    started_at: Instant,
+    request_started_at: String,
+    first_token_at: Option<String>,
+    first_token_latency_ms: Option<i64>,
+    usage: NeutralUsage,
+}
+
+impl RemoteSidecarRunMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            request_started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            first_token_at: None,
+            first_token_latency_ms: None,
+            usage: NeutralUsage::default(),
+        }
+    }
+
+    fn capture_first_output(&mut self) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+            self.first_token_latency_ms = Some(remote_elapsed_millis(self.started_at));
+        }
+    }
+
+    fn merge_usage_value(&mut self, usage: &Value) {
+        let Ok(next) = serde_json::from_value::<NeutralUsage>(usage.clone()) else {
+            return;
+        };
+        merge_remote_usage(&mut self.usage, &next);
+    }
+
+    fn total_latency_ms(&self) -> i64 {
+        remote_elapsed_millis(self.started_at).max(1)
+    }
+
+    fn usage_value(&self) -> Value {
+        serde_json::to_value(&self.usage).expect("neutral usage should serialize")
+    }
+}
+
+fn remote_chat_metrics(
+    model_id: &str,
+    provider_id: &str,
+    run_id: &str,
+    run_metrics: &RemoteSidecarRunMetrics,
+    total_latency_ms: i64,
+) -> Value {
+    json!({
+        "modelId": model_id,
+        "providerId": provider_id,
+        "totalLatencyMs": total_latency_ms,
+        "firstTokenLatencyMs": run_metrics.first_token_latency_ms,
+        "outputTokens": run_metrics.usage.output_tokens,
+        "llmRequestIds": [run_id],
+    })
 }
 
 fn persist_sidecar_llm_audit(
@@ -5000,20 +5074,21 @@ fn persist_sidecar_llm_audit(
     provider_id: &str,
     model_id: &str,
     request: Option<&NeutralChatRequest>,
-    usage: &Value,
+    run_metrics: &RemoteSidecarRunMetrics,
+    completed_at: &str,
+    total_latency_ms: i64,
     final_state: &str,
     response_body: Value,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let request_body_json = json!({
+        "providerId": provider_id,
+        "modelId": model_id,
+        "brokered": true,
+        "request": request,
+    })
+    .to_string();
+    let response_body_json = response_body.to_string();
     if database.llm_request(request_id)?.is_none() {
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let request_body_json = json!({
-            "providerId": provider_id,
-            "modelId": model_id,
-            "brokered": true,
-            "request": request,
-        })
-        .to_string();
-        let response_body_json = response_body.to_string();
         database.insert_llm_request(NewLlmRequest {
             id: request_id,
             workspace_id,
@@ -5025,21 +5100,39 @@ fn persist_sidecar_llm_audit(
             agent_attempt_id: None,
             provider_id,
             model_id,
-            request_started_at: &now,
-            first_token_at: None,
-            completed_at: Some(&now),
-            input_tokens: remote_usage_i64(usage, "inputTokens"),
-            output_tokens: remote_usage_i64(usage, "outputTokens"),
-            cache_read_tokens: remote_usage_i64(usage, "cacheReadTokens"),
-            cache_write_tokens: remote_usage_i64(usage, "cacheWriteTokens"),
-            reasoning_tokens: remote_usage_i64(usage, "reasoningTokens"),
-            first_token_latency_ms: None,
-            total_latency_ms: None,
+            request_started_at: &run_metrics.request_started_at,
+            first_token_at: run_metrics.first_token_at.as_deref(),
+            completed_at: Some(completed_at),
+            input_tokens: run_metrics.usage.input_tokens,
+            output_tokens: run_metrics.usage.output_tokens,
+            cache_read_tokens: run_metrics.usage.cache_read_tokens,
+            cache_write_tokens: run_metrics.usage.cache_write_tokens,
+            reasoning_tokens: run_metrics.usage.reasoning_tokens,
+            first_token_latency_ms: run_metrics.first_token_latency_ms,
+            total_latency_ms: Some(total_latency_ms),
             status_code: None,
             final_state,
             request_body_json: Some(&request_body_json),
             response_body_json: Some(&response_body_json),
         })?;
+    } else {
+        database.update_llm_request_outcome(
+            request_id,
+            UpdateLlmRequestOutcome {
+                first_token_at: run_metrics.first_token_at.as_deref(),
+                completed_at: Some(completed_at),
+                input_tokens: run_metrics.usage.input_tokens,
+                output_tokens: run_metrics.usage.output_tokens,
+                cache_read_tokens: run_metrics.usage.cache_read_tokens,
+                cache_write_tokens: run_metrics.usage.cache_write_tokens,
+                reasoning_tokens: run_metrics.usage.reasoning_tokens,
+                first_token_latency_ms: run_metrics.first_token_latency_ms,
+                total_latency_ms: Some(total_latency_ms),
+                status_code: None,
+                final_state,
+                response_body_json: Some(&response_body_json),
+            },
+        )?;
     }
     Ok(())
 }
@@ -5507,8 +5600,9 @@ async fn remote_sidecar_run_broker_llm_turn(
     database: &mut WorkspaceDatabase,
     text: &mut String,
     reasoning: &mut String,
+    run_metrics: &mut RemoteSidecarRunMetrics,
     sequence: &mut i64,
-) -> Result<Option<(Vec<NeutralToolCall>, Value)>, ()> {
+) -> Result<Option<Vec<NeutralToolCall>>, ()> {
     let mut broker_rx =
         remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
             .await
@@ -5519,11 +5613,32 @@ async fn remote_sidecar_run_broker_llm_turn(
             Ok(Some(envelope)) => envelope,
             Ok(None) => return Ok(None),
             Err(_) => {
+                let message =
+                    "remote broker request timed out; retry to resume from persisted messages";
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = run_metrics.total_latency_ms();
+                let _ = persist_sidecar_llm_audit(
+                    database,
+                    &state.workspace_id,
+                    chat_id,
+                    run_id,
+                    provider_id,
+                    model_id,
+                    Some(request),
+                    run_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "failed",
+                    json!({ "error": { "message": message } }),
+                );
                 *sequence += 1;
-                run_stream.record(*sequence, json!({
-                    "type": "error",
-                    "message": "remote broker request timed out; retry to resume from persisted messages",
-                }));
+                run_stream.record(
+                    *sequence,
+                    json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                );
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
                 return Err(());
@@ -5542,6 +5657,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if kind == "textDelta" {
+                    run_metrics.capture_first_output();
                     text.push_str(delta);
                     *sequence += 1;
                     run_stream.record(
@@ -5553,6 +5669,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         }),
                     );
                 } else if kind == "reasoningDelta" {
+                    run_metrics.capture_first_output();
                     reasoning.push_str(delta);
                     *sequence += 1;
                     run_stream.record(
@@ -5581,6 +5698,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     else {
                         continue;
                     };
+                    run_metrics.capture_first_output();
                     collected_tool_calls = merge_remote_tool_calls(
                         &collected_tool_calls,
                         std::slice::from_ref(&tool_call),
@@ -5626,6 +5744,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("usage")
                     .cloned()
                     .unwrap_or(Value::Null);
+                run_metrics.merge_usage_value(&usage);
                 let response_tool_calls = envelope
                     .payload
                     .get("toolCalls")
@@ -5634,18 +5753,24 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .unwrap_or_default();
                 let tool_calls =
                     merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls);
+                if !tool_calls.is_empty() {
+                    run_metrics.capture_first_output();
+                }
                 if tool_calls.is_empty() {
+                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let total_latency_ms = run_metrics.total_latency_ms();
+                    let metrics = remote_chat_metrics(
+                        model_id,
+                        provider_id,
+                        run_id,
+                        run_metrics,
+                        total_latency_ms,
+                    );
+                    let usage = run_metrics.usage_value();
                     let metadata = json!({
                         "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
                         "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
-                        "metrics": {
-                            "modelId": model_id,
-                            "providerId": provider_id,
-                            "totalLatencyMs": null,
-                            "firstTokenLatencyMs": null,
-                            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
-                            "llmRequestIds": [run_id],
-                        },
+                        "metrics": metrics,
                     });
                     let assistant_sequence = database
                         .message(assistant_message_id)
@@ -5672,9 +5797,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         text,
                         (!reasoning.is_empty()).then_some(reasoning.as_str()),
                         usage.clone(),
-                        model_id,
-                        provider_id,
-                        run_id,
+                        metrics.clone(),
                     );
                     let _ = persist_sidecar_llm_audit(
                         database,
@@ -5684,7 +5807,9 @@ async fn remote_sidecar_run_broker_llm_turn(
                         provider_id,
                         model_id,
                         Some(request),
-                        &usage,
+                        run_metrics,
+                        &completed_at,
+                        total_latency_ms,
                         "succeeded",
                         completion_payload.clone(),
                     );
@@ -5702,7 +5827,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     run_stream.record(*sequence, json!({ "type": "streamEnd" }));
                     return Ok(None);
                 }
-                return Ok(Some((tool_calls, usage)));
+                return Ok(Some(tool_calls));
             }
             "error" => {
                 let message = envelope
@@ -5710,6 +5835,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("remote broker unavailable");
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = run_metrics.total_latency_ms();
                 let _ = persist_sidecar_llm_audit(
                     database,
                     &state.workspace_id,
@@ -5718,7 +5845,9 @@ async fn remote_sidecar_run_broker_llm_turn(
                     provider_id,
                     model_id,
                     Some(request),
-                    &Value::Null,
+                    run_metrics,
+                    &completed_at,
+                    total_latency_ms,
                     "failed",
                     json!({ "error": { "message": message } }),
                 );
@@ -5795,9 +5924,7 @@ fn remote_chat_completion_event(
     text: &str,
     reasoning: Option<&str>,
     usage: Value,
-    model_id: &str,
-    provider_id: &str,
-    run_id: &str,
+    metrics: Value,
 ) -> Value {
     json!({
         "type": "complete",
@@ -5807,14 +5934,7 @@ fn remote_chat_completion_event(
         "reasoning": reasoning,
         "usage": usage,
         "stopReason": null,
-        "metrics": {
-            "modelId": model_id,
-            "providerId": provider_id,
-            "totalLatencyMs": null,
-            "firstTokenLatencyMs": null,
-            "outputTokens": usage.get("outputTokens").cloned().unwrap_or(Value::Null),
-            "llmRequestIds": [run_id],
-        },
+        "metrics": metrics,
         "memoriesUsed": [],
     })
 }
@@ -5885,6 +6005,7 @@ async fn remote_sidecar_chat_stream(
         let mut sequence = 0_i64;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut current_request = initial_provider_request;
         let mut tool_rounds = 0_usize;
         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
@@ -5944,6 +6065,7 @@ async fn remote_sidecar_chat_stream(
                 &mut database,
                 &mut text,
                 &mut reasoning,
+                &mut run_metrics,
                 &mut sequence,
             ).await;
             let mut reached_terminal_event = false;
@@ -5960,7 +6082,7 @@ async fn remote_sidecar_chat_stream(
                     cleanup_guard.disarm();
                     break;
                 }
-                Ok(Some((tool_calls, _usage))) => {
+                Ok(Some(tool_calls)) => {
                     if reached_terminal_event {
                         remote_sidecar_finish_active_run(&stream_state, &run_id);
                         cleanup_guard.disarm();
@@ -5969,10 +6091,30 @@ async fn remote_sidecar_chat_stream(
                     let allowed_tools = remote_sidecar_executable_tool_names();
                     tool_rounds += 1;
                     if tool_rounds > REMOTE_SIDECAR_MAX_TOOL_ROUNDS {
+                        let message = format!(
+                            "remote tool round limit reached after {REMOTE_SIDECAR_MAX_TOOL_ROUNDS} rounds"
+                        );
+                        let completed_at =
+                            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        let total_latency_ms = run_metrics.total_latency_ms();
+                        let _ = persist_sidecar_llm_audit(
+                            &mut database,
+                            &stream_state.workspace_id,
+                            &chat_id,
+                            &run_id,
+                            &provider_id,
+                            &model_id,
+                            Some(&current_request),
+                            &run_metrics,
+                            &completed_at,
+                            total_latency_ms,
+                            "failed",
+                            json!({ "error": { "message": message } }),
+                        );
                         sequence += 1;
                         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "error",
-                            "message": format!("remote tool round limit reached after {REMOTE_SIDECAR_MAX_TOOL_ROUNDS} rounds"),
+                            "message": message,
                         })));
                         sequence += 1;
                         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
@@ -7952,9 +8094,14 @@ mod tests {
                 "cacheReadTokens": null,
                 "cacheWriteTokens": null,
             }),
-            "model-1",
-            "provider-1",
-            "run-1",
+            json!({
+                "modelId": "model-1",
+                "providerId": "provider-1",
+                "totalLatencyMs": 1200,
+                "firstTokenLatencyMs": 250,
+                "outputTokens": 3,
+                "llmRequestIds": ["run-1"],
+            }),
         );
 
         assert_eq!(event["type"], "complete");
@@ -7962,7 +8109,32 @@ mod tests {
         assert_eq!(event["chatId"], "chat-1");
         assert_eq!(event["metrics"]["modelId"], "model-1");
         assert_eq!(event["metrics"]["providerId"], "provider-1");
+        assert_eq!(event["metrics"]["totalLatencyMs"], 1200);
+        assert_eq!(event["metrics"]["firstTokenLatencyMs"], 250);
         assert_eq!(event["metrics"]["outputTokens"], 3);
+    }
+
+    #[test]
+    fn remote_sidecar_run_metrics_merge_usage_without_inventing_missing_tokens() {
+        let mut metrics = RemoteSidecarRunMetrics::new();
+        metrics.merge_usage_value(&json!({
+            "inputTokens": 10,
+            "outputTokens": 2,
+            "cacheReadTokens": null,
+            "cacheWriteTokens": 1,
+        }));
+        metrics.merge_usage_value(&json!({
+            "inputTokens": 6,
+            "outputTokens": 3,
+            "cacheReadTokens": 4,
+            "cacheWriteTokens": null,
+        }));
+
+        assert_eq!(metrics.usage.input_tokens, Some(16));
+        assert_eq!(metrics.usage.output_tokens, Some(5));
+        assert_eq!(metrics.usage.cache_read_tokens, Some(4));
+        assert_eq!(metrics.usage.cache_write_tokens, Some(1));
+        assert_eq!(metrics.usage.reasoning_tokens, None);
     }
 
     #[test]
@@ -8202,7 +8374,35 @@ mod tests {
         assert!(text.contains("\"type\":\"textDelta\""));
         assert!(text.contains("hello remote"));
         assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains("\"totalLatencyMs\":"));
+        assert!(!text.contains("\"totalLatencyMs\":null"));
+        assert!(text.contains("\"firstTokenLatencyMs\":"));
+        assert!(!text.contains("\"firstTokenLatencyMs\":null"));
+        assert!(text.contains("\"outputTokens\":2"));
         assert!(text.contains("\"type\":\"streamEnd\""));
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant message lookup")
+            .expect("assistant message");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        assert!(metadata["metrics"]["totalLatencyMs"].as_i64().unwrap_or(0) > 0);
+        assert!(metadata["metrics"]["firstTokenLatencyMs"].is_number());
+        assert_eq!(metadata["metrics"]["outputTokens"], 2);
+        let audit = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("audit rows")
+            .into_iter()
+            .next()
+            .expect("audit row");
+        assert_eq!(audit.output_tokens, Some(2));
+        assert!(audit.first_token_latency_ms.is_some());
+        assert!(audit.total_latency_ms.unwrap_or(0) > 0);
     }
 
     #[tokio::test]
@@ -8303,6 +8503,7 @@ mod tests {
 
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut sequence = 0_i64;
         let result = remote_sidecar_run_broker_llm_turn(
             &state,
@@ -8319,6 +8520,7 @@ mod tests {
             &mut database,
             &mut text,
             &mut reasoning,
+            &mut run_metrics,
             &mut sequence,
         )
         .await
@@ -8326,9 +8528,12 @@ mod tests {
         .expect("tool call should request followup");
         broker.await.expect("broker task");
 
-        assert_eq!(result.0.len(), 1);
-        assert_eq!(result.0[0].call_id, "call-1");
-        assert_eq!(result.0[0].name, "read_file");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].call_id, "call-1");
+        assert_eq!(result[0].name, "read_file");
+        assert_eq!(run_metrics.usage.input_tokens, Some(4));
+        assert_eq!(run_metrics.usage.output_tokens, Some(2));
+        assert!(run_metrics.first_token_latency_ms.is_some());
         let tool_calls = database
             .tool_calls_for_message("msg-assistant-1")
             .expect("tool calls");
@@ -8742,6 +8947,12 @@ mod tests {
         let response_body =
             json!({ "type": "complete", "metrics": { "llmRequestIds": ["remote-run-1"] } });
 
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        run_metrics.capture_first_output();
+        run_metrics.merge_usage_value(&json!({ "inputTokens": 12, "outputTokens": 5 }));
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let total_latency_ms = 1250;
+
         persist_sidecar_llm_audit(
             &mut database,
             "workspace",
@@ -8750,7 +8961,9 @@ mod tests {
             "provider-1",
             "model-1",
             Some(&request),
-            &json!({ "inputTokens": 12, "outputTokens": 5 }),
+            &run_metrics,
+            &completed_at,
+            total_latency_ms,
             "succeeded",
             response_body.clone(),
         )
@@ -8769,6 +8982,13 @@ mod tests {
         .expect("request body parse");
         assert_eq!(request_body["providerId"], "provider-1");
         assert_eq!(request_body["modelId"], "model-1");
+        assert_eq!(record.input_tokens, Some(12));
+        assert_eq!(record.output_tokens, Some(5));
+        assert_eq!(
+            record.first_token_latency_ms,
+            run_metrics.first_token_latency_ms
+        );
+        assert_eq!(record.total_latency_ms, Some(total_latency_ms));
         assert_eq!(
             request_body["request"]["messages"][1]["tool_calls"][0]["name"],
             "read_file"
