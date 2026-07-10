@@ -1678,6 +1678,8 @@ fn queue_chat_derived_effects(
             "assistantMessageId": context.assistant_message_id,
             "modelId": context.model_id,
             "providerId": context.provider_id,
+            "memoryTargetStatus": context.memory_target_status.as_str(),
+            "codeChangeStats": context.code_change_stats,
         })
         .to_string();
         database

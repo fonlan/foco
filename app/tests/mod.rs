@@ -9925,6 +9925,9 @@ fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration()
             })
             .expect("user message");
         database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        database
             .update_workspace_spec_content(0, "# Project Spec\n\nExisting")
             .expect("seed spec");
         let definition = AgentDefinitionSettings {
@@ -10073,6 +10076,62 @@ fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration()
     );
     drop(memory_database);
     drop(database);
+
+    let mut config = context.global_config.clone();
+    config.workspaces.push(WorkspaceConfig {
+        id: context.workspace_id.clone(),
+        name: "Plan effects".to_string(),
+        path: workspace_dir.clone(),
+        location: WorkspaceLocation::Local,
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    config.memory = context.memory_settings.clone();
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-derived-effects-profile"));
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let state = test_app_state(config, profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .confirm_plan_phase_derived_effects_integration(&attempt_id)
+            .expect("confirm integration");
+    }
+    let workspace = state.config.lock().expect("config lock").workspaces[0].clone();
+    assert_eq!(
+        crate::plan_runtime::release_confirmed_plan_derived_effects_without_runners(
+            &state, &workspace
+        )
+        .expect("release effects"),
+        1
+    );
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    assert_eq!(
+        database
+            .plan_phase_derived_effects(&attempt_id)
+            .expect("effects")
+            .expect("effects record")
+            .status,
+        "released"
+    );
+    assert_eq!(
+        database.workspace_spec_jobs(10).expect("spec jobs").len(),
+        1
+    );
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("memory database");
+    assert_eq!(
+        memory_database
+            .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Queued), 10)
+            .expect("memory jobs")
+            .len(),
+        1
+    );
+    drop(memory_database);
+    drop(database);
+    fs::remove_dir_all(profile_dir).expect("remove profile directory");
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 

@@ -16,7 +16,8 @@ pub(crate) use extraction::{
 pub(crate) use extraction::{
     MemoryExtractionTask, call_memory_retrieval_provider,
     memory_extraction_error_should_be_ignored, memory_target_status_for_prompt,
-    parse_memory_retrieval_output, queue_memory_extraction_job, run_memory_extraction_job,
+    parse_memory_retrieval_output, queue_integrated_plan_memory_extraction,
+    queue_memory_extraction_job, run_memory_extraction_job,
 };
 pub(crate) use retrieval::{
     RetrievedMemoryFact, active_prompt_context_memory_keys, chat_extracted_memory_summary,

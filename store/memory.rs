@@ -1171,18 +1171,40 @@ impl MemoryDatabase {
         &mut self,
         job: NewMemoryExtractionJob<'_>,
     ) -> Result<(), MemoryDatabaseError> {
+        self.insert_extraction_job_inner(job, false)
+    }
+
+    pub fn insert_extraction_job_if_absent(
+        &mut self,
+        job: NewMemoryExtractionJob<'_>,
+    ) -> Result<(), MemoryDatabaseError> {
+        self.insert_extraction_job_inner(job, true)
+    }
+
+    fn insert_extraction_job_inner(
+        &mut self,
+        job: NewMemoryExtractionJob<'_>,
+        ignore_existing: bool,
+    ) -> Result<(), MemoryDatabaseError> {
         self.validate_scope(job.scope)?;
         validate_extraction_job(&job)?;
         let now = now_timestamp();
         let input_json = redact_memory_json(job.input_json, "memory_extraction_jobs.input_json")?;
         let output_json =
             redact_optional_memory_json(job.output_json, "memory_extraction_jobs.output_json")?;
+        let insert = if ignore_existing {
+            "INSERT OR IGNORE INTO memory_extraction_jobs
+                (id, scope, chat_id, status, model_id, input_json, output_json, error_message, created_at, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)"
+        } else {
+            "INSERT INTO memory_extraction_jobs
+                (id, scope, chat_id, status, model_id, input_json, output_json, error_message, created_at, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)"
+        };
 
         self.connection
             .execute(
-                "INSERT INTO memory_extraction_jobs
-                    (id, scope, chat_id, status, model_id, input_json, output_json, error_message, created_at, started_at, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
+                insert,
                 params![
                     job.id,
                     job.scope.as_str(),

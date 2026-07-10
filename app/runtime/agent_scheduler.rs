@@ -257,6 +257,9 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
         database
             .reconcile_plan_phase_attempts_for_terminal_phases()
             .map_err(ApiError::from_workspace_error)?;
+        database
+            .discard_terminal_plan_phase_derived_effects(RESTART_INTERRUPTION_REASON)
+            .map_err(ApiError::from_workspace_error)?;
         for instance in database
             .isolated_agent_instances()
             .map_err(ApiError::from_workspace_error)?
@@ -285,6 +288,9 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 }),
             )?;
         }
+    }
+    if let Err(error) = crate::plan_runtime::reconcile_plan_derived_effects(state) {
+        tracing::warn!(error = %error.message, "failed to reconcile integrated plan derived effects");
     }
     Ok(())
 }

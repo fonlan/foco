@@ -640,6 +640,8 @@ pub struct PlanPhaseDerivedEffectsRecord {
     pub assistant_message_id: String,
     pub status: String,
     pub context_json: String,
+    pub integration_confirmed_at: Option<String>,
+    pub terminal_reason: Option<String>,
     pub released_at: Option<String>,
     pub discarded_at: Option<String>,
     pub created_at: String,

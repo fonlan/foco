@@ -1293,6 +1293,17 @@ CREATE UNIQUE INDEX plan_phase_derived_effects_task_idx
 ON plan_phase_derived_effects(agent_task_id);
 "#;
 
+pub(crate) const MIGRATION_034: &str = r#"
+ALTER TABLE plan_phase_derived_effects
+    ADD COLUMN integration_confirmed_at TEXT;
+
+ALTER TABLE plan_phase_derived_effects
+    ADD COLUMN terminal_reason TEXT;
+
+CREATE INDEX plan_phase_derived_effects_integration_idx
+ON plan_phase_derived_effects(status, integration_confirmed_at, created_at);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

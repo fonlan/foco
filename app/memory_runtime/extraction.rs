@@ -111,6 +111,14 @@ pub(crate) fn queue_memory_extraction_job(
     context: &PreparedChatContext,
     final_state: &str,
 ) -> Result<(), ApiError> {
+    queue_memory_extraction_job_with_id(context, final_state, None)
+}
+
+fn queue_memory_extraction_job_with_id(
+    context: &PreparedChatContext,
+    final_state: &str,
+    job_id: Option<&str>,
+) -> Result<(), ApiError> {
     if final_state != "succeeded" || !should_queue_memory_extraction(&context.memory_settings) {
         return Ok(());
     }
@@ -140,10 +148,12 @@ pub(crate) fn queue_memory_extraction_job(
     let mut memory_database =
         MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
             .map_err(ApiError::from_memory_error)?;
-    let job_id = unique_id("memory-extraction");
+    let job_id = job_id
+        .map(str::to_string)
+        .unwrap_or_else(|| unique_id("memory-extraction"));
 
     memory_database
-        .insert_extraction_job(NewMemoryExtractionJob {
+        .insert_extraction_job_if_absent(NewMemoryExtractionJob {
             id: &job_id,
             scope: MemoryScope::Chat,
             chat_id: Some(&context.chat_id),
@@ -192,6 +202,82 @@ pub(crate) fn queue_memory_extraction_job(
         }
     });
 
+    Ok(())
+}
+
+pub(crate) fn queue_integrated_plan_memory_extraction(
+    context: &PlanPhaseDerivedEffectsContext,
+    workspace_path: &std::path::Path,
+    global_memory_database_file: &std::path::Path,
+    config: &GlobalConfig,
+    job_id: &str,
+    spawn_runner: bool,
+) -> Result<(), ApiError> {
+    if !should_queue_memory_extraction(&config.memory) {
+        return Ok(());
+    }
+    let target_status =
+        MemoryStatus::parse(&context.memory_target_status).map_err(ApiError::from_memory_error)?;
+    let target_status =
+        memory_extraction_target_status(&config.memory.extraction_mode, target_status);
+    let model_id = config
+        .memory
+        .extraction_model_id
+        .as_deref()
+        .unwrap_or(&context.model_id);
+    let input_json = json!({
+        "trigger": "plan_phase_integrated",
+        "targetStatus": target_status.as_str(),
+        "workspaceId": context.workspace_id,
+        "chatId": context.chat_id,
+        "runId": context.run_id,
+        "userMessageId": context.user_message_id,
+        "assistantMessageId": context.assistant_message_id,
+        "chatModelId": context.model_id,
+        "extractionModelId": model_id,
+        "providerId": context.provider_id,
+    })
+    .to_string();
+    let mut memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+    memory_database
+        .insert_extraction_job_if_absent(NewMemoryExtractionJob {
+            id: job_id,
+            scope: MemoryScope::Chat,
+            chat_id: Some(&context.chat_id),
+            status: MemoryExtractionJobStatus::Queued,
+            model_id: Some(model_id),
+            input_json: &input_json,
+            output_json: None,
+            error_message: None,
+        })
+        .map_err(ApiError::from_memory_error)?;
+
+    if !spawn_runner {
+        return Ok(());
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Ok(());
+    };
+    let task = MemoryExtractionTask {
+        job_id: job_id.to_string(),
+        workspace_id: context.workspace_id.clone(),
+        workspace_path: workspace_path.to_path_buf(),
+        global_memory_database_file: global_memory_database_file.to_path_buf(),
+        chat_id: context.chat_id.clone(),
+        run_id: context.run_id.clone(),
+        user_message_id: context.user_message_id.clone(),
+        assistant_message_id: context.assistant_message_id.clone(),
+        model_id: model_id.to_string(),
+        target_status,
+        config: config.clone(),
+    };
+    handle.spawn(async move {
+        if let Err(error) = run_memory_extraction_job(task).await {
+            tracing::warn!(error = %error.message, "integrated plan memory extraction failed");
+        }
+    });
     Ok(())
 }
 

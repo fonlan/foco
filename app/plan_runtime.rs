@@ -215,6 +215,14 @@ pub(crate) async fn retry_plan_phase(
                 selection.thinking_level.as_deref(),
             )
             .map_err(ApiError::from_workspace_error)?;
+        database
+            .discard_superseded_plan_phase_derived_effects(
+                &plan.id,
+                &phase.id,
+                &attempt.id,
+                "superseded by plan phase retry",
+            )
+            .map_err(ApiError::from_workspace_error)?;
         let plan = database
             .plan(&plan.id)
             .map_err(ApiError::from_workspace_error)?
@@ -241,6 +249,141 @@ pub(crate) async fn retry_plan_phase(
             Err(error)
         }
     }
+}
+
+fn plan_phase_attempt_id_for_task(
+    database: &WorkspaceDatabase,
+    task_id: &AgentTaskId,
+) -> Result<Option<String>, ApiError> {
+    database
+        .plan_phase_attempt_for_agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)
+        .map(|attempt| attempt.map(|attempt| attempt.id))
+}
+
+fn discard_plan_derived_effects_for_task(
+    workspace: &WorkspaceConfig,
+    task_id: &AgentTaskId,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let mut database = open_workspace_database(&workspace.path)?;
+    let Some(attempt_id) = plan_phase_attempt_id_for_task(&database, task_id)? else {
+        return Ok(());
+    };
+    database
+        .discard_plan_phase_derived_effects(&attempt_id, reason)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+fn discard_plan_derived_effects_for_phase(
+    workspace: &WorkspaceConfig,
+    plan_id: &str,
+    phase_id: &str,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let mut database = open_workspace_database(&workspace.path)?;
+    database
+        .discard_plan_phase_derived_effects_for_phase(plan_id, phase_id, reason)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+fn confirm_plan_derived_effects_for_phase(
+    workspace: &WorkspaceConfig,
+    plan_id: &str,
+    phase_id: &str,
+) -> Result<(), ApiError> {
+    let mut database = open_workspace_database(&workspace.path)?;
+    database
+        .confirm_latest_completed_plan_phase_derived_effects(plan_id, phase_id)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+fn confirm_plan_derived_effects_for_task(
+    workspace: &WorkspaceConfig,
+    task_id: &AgentTaskId,
+) -> Result<(), ApiError> {
+    let mut database = open_workspace_database(&workspace.path)?;
+    let Some(attempt_id) = plan_phase_attempt_id_for_task(&database, task_id)? else {
+        return Ok(());
+    };
+    database
+        .confirm_plan_phase_derived_effects_integration(&attempt_id)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+fn release_confirmed_plan_derived_effects_inner(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    spawn_runners: bool,
+) -> Result<usize, ApiError> {
+    let config = config_snapshot(state)?;
+    let effects = {
+        let database = open_workspace_database(&workspace.path)?;
+        database
+            .releasable_plan_phase_derived_effects()
+            .map_err(ApiError::from_workspace_error)?
+    };
+    let mut released = 0;
+    for effect in effects {
+        let context: PlanPhaseDerivedEffectsContext = serde_json::from_str(&effect.context_json)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to decode plan phase derived effects '{}': {source}",
+                    effect.attempt_id
+                ))
+            })?;
+        let memory_job_id = format!("plan-derived-memory-{}", effect.attempt_id);
+        queue_integrated_plan_memory_extraction(
+            &context,
+            &workspace.path,
+            &state.memory_database_file,
+            &config,
+            &memory_job_id,
+            spawn_runners,
+        )?;
+        let spec_job_id = format!("plan-derived-spec-{}", effect.attempt_id);
+        crate::spec_runtime::queue_integrated_plan_workspace_spec_update(
+            &context,
+            &workspace.path,
+            &config,
+            &spec_job_id,
+            spawn_runners,
+        )?;
+        let mut database = open_workspace_database(&workspace.path)?;
+        database
+            .mark_plan_phase_derived_effects_released(&effect.attempt_id)
+            .map_err(ApiError::from_workspace_error)?;
+        released += 1;
+    }
+    Ok(released)
+}
+
+pub(crate) fn release_confirmed_plan_derived_effects(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+) -> Result<usize, ApiError> {
+    release_confirmed_plan_derived_effects_inner(state, workspace, true)
+}
+
+#[cfg(test)]
+pub(crate) fn release_confirmed_plan_derived_effects_without_runners(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+) -> Result<usize, ApiError> {
+    release_confirmed_plan_derived_effects_inner(state, workspace, false)
+}
+
+pub(crate) fn reconcile_plan_derived_effects(state: &AppState) -> Result<usize, ApiError> {
+    let config = config_snapshot(state)?;
+    let mut released = 0;
+    for workspace in &config.workspaces {
+        released += release_confirmed_plan_derived_effects(state, workspace)?;
+    }
+    Ok(released)
 }
 
 pub(crate) async fn sync_plan_phase_for_agent_task(
@@ -288,6 +431,8 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
                     database
                         .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
                         .map_err(ApiError::from_workspace_error)?;
+                    drop(database);
+                    discard_plan_derived_effects_for_task(workspace, task_id, &error.message)?;
                     return Ok(());
                 }
             };
@@ -298,6 +443,12 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
                     .map_err(ApiError::from_workspace_error)?
             };
             if let Some(plan) = plan {
+                if plan.status == "implemented" {
+                    // The final phase becomes workspace-visible only after shared merge succeeds.
+                } else {
+                    confirm_plan_derived_effects_for_task(workspace, task_id)?;
+                    release_confirmed_plan_derived_effects(state, workspace)?;
+                }
                 continue_plan_if_ready(state, workspace, plan).await?;
             }
         }
@@ -307,6 +458,8 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
             database
                 .fail_plan_phase_run(task_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_task(workspace, task_id, &message)?;
         }
         AgentTaskStatus::Cancelled => {
             let message = agent_task_error_message(&task);
@@ -314,6 +467,8 @@ pub(crate) async fn sync_plan_phase_for_agent_task(
             database
                 .cancel_plan_phase_run(task_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_task(workspace, task_id, &message)?;
         }
         AgentTaskStatus::Queued | AgentTaskStatus::Running | AgentTaskStatus::Waiting => {}
     }
@@ -379,6 +534,13 @@ async fn sync_plan_merge_task(
                                 &error.message,
                             )
                             .map_err(ApiError::from_workspace_error)?;
+                        drop(database);
+                        discard_plan_derived_effects_for_phase(
+                            workspace,
+                            &target.plan_id,
+                            &target.phase_id,
+                            &error.message,
+                        )?;
                     }
                     return Ok(());
                 }
@@ -400,6 +562,8 @@ async fn sync_plan_merge_task(
                     .record_plan_shared_merge_commit(&target.plan_id, &shared_merge_commit_id)
                     .map_err(ApiError::from_workspace_error)?
             };
+            confirm_plan_derived_effects_for_phase(workspace, &target.plan_id, &target.phase_id)?;
+            release_confirmed_plan_derived_effects(state, workspace)?;
             if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree {
                 delete_instance_worktree(workspace, instance, true)?;
             }
@@ -412,6 +576,13 @@ async fn sync_plan_merge_task(
             database
                 .fail_plan_phase_by_id(&target.plan_id, &target.phase_id, &message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_phase(
+                workspace,
+                &target.plan_id,
+                &target.phase_id,
+                &message,
+            )?;
         }
         AgentTaskStatus::Queued | AgentTaskStatus::Running | AgentTaskStatus::Waiting => {}
     }
@@ -484,6 +655,8 @@ async fn dispatch_plan_merge(
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
     };
@@ -495,6 +668,8 @@ async fn dispatch_plan_merge(
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
         (_, None) => {
@@ -503,6 +678,8 @@ async fn dispatch_plan_merge(
             database
                 .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
     };
@@ -706,6 +883,9 @@ async fn finalize_plan_worktree(
             database
                 .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
                 .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            confirm_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id)?;
+            release_confirmed_plan_derived_effects(state, workspace)?;
             delete_plan_worktrees(workspace, plan, true)
         }
         Err(error) => {
@@ -725,6 +905,13 @@ async fn finalize_plan_worktree(
                 database
                     .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
+                drop(database);
+                discard_plan_derived_effects_for_phase(
+                    workspace,
+                    &phase.plan_id,
+                    &phase.id,
+                    &error.message,
+                )?;
                 Ok(())
             }
         }

@@ -63,13 +63,13 @@ use workspace_schema::{
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    MIGRATION_033, Migration,
+    MIGRATION_033, MIGRATION_034, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 33;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 34;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -268,6 +268,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 33,
         sql: MIGRATION_033,
+    },
+    Migration {
+        version: 34,
+        sql: MIGRATION_034,
     },
 ];
 
@@ -1025,6 +1029,21 @@ impl WorkspaceDatabase {
         &mut self,
         job: NewWorkspaceSpecJob<'_>,
     ) -> Result<WorkspaceSpecJobRecord, WorkspaceDatabaseError> {
+        self.insert_workspace_spec_job_inner(job, false)
+    }
+
+    pub fn insert_workspace_spec_job_if_absent(
+        &mut self,
+        job: NewWorkspaceSpecJob<'_>,
+    ) -> Result<WorkspaceSpecJobRecord, WorkspaceDatabaseError> {
+        self.insert_workspace_spec_job_inner(job, true)
+    }
+
+    fn insert_workspace_spec_job_inner(
+        &mut self,
+        job: NewWorkspaceSpecJob<'_>,
+        ignore_existing: bool,
+    ) -> Result<WorkspaceSpecJobRecord, WorkspaceDatabaseError> {
         WorkspaceSpecTriggerType::parse(job.trigger_type)?;
         let input_summary_json = job.input_summary_json.unwrap_or("{}");
         let input_summary_json =
@@ -1034,13 +1053,21 @@ impl WorkspaceDatabase {
             .map(|revision| workspace_spec_revision_to_i64(revision, "base_revision"))
             .transpose()?;
         let now = now_timestamp();
+        let insert = if ignore_existing {
+            "INSERT OR IGNORE INTO workspace_spec_jobs
+                (id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                 input_summary_json, created_at)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8)"
+        } else {
+            "INSERT INTO workspace_spec_jobs
+                (id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                 input_summary_json, created_at)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8)"
+        };
 
         self.connection
             .execute(
-                "INSERT INTO workspace_spec_jobs
-                    (id, trigger_type, status, chat_id, run_id, model_id, base_revision,
-                     input_summary_json, created_at)
-                 VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8)",
+                insert,
                 params![
                     job.id,
                     job.trigger_type,
@@ -2647,7 +2674,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
                         user_message_id, assistant_message_id, status, context_json,
-                        released_at, discarded_at, created_at, updated_at
+                        integration_confirmed_at, terminal_reason, released_at, discarded_at,
+                        created_at, updated_at
                  FROM plan_phase_derived_effects
                  WHERE attempt_id = ?1",
                 params![attempt_id.trim()],
@@ -2665,7 +2693,8 @@ impl WorkspaceDatabase {
             .prepare(
                 "SELECT attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
                         user_message_id, assistant_message_id, status, context_json,
-                        released_at, discarded_at, created_at, updated_at
+                        integration_confirmed_at, terminal_reason, released_at, discarded_at,
+                        created_at, updated_at
                  FROM plan_phase_derived_effects
                  WHERE status = 'awaiting_integration'
                  ORDER BY created_at ASC, attempt_id ASC",
@@ -2675,6 +2704,193 @@ impl WorkspaceDatabase {
             .query_map([], plan_phase_derived_effects_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn releasable_plan_phase_derived_effects(
+        &self,
+    ) -> Result<Vec<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
+                        user_message_id, assistant_message_id, status, context_json,
+                        integration_confirmed_at, terminal_reason, released_at, discarded_at,
+                        created_at, updated_at
+                 FROM plan_phase_derived_effects
+                 WHERE status = 'awaiting_integration'
+                   AND integration_confirmed_at IS NOT NULL
+                 ORDER BY created_at ASC, attempt_id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], plan_phase_derived_effects_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn confirm_plan_phase_derived_effects_integration(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<Option<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET integration_confirmed_at = COALESCE(integration_confirmed_at, ?2),
+                     updated_at = ?2
+                 WHERE attempt_id = ?1 AND status = 'awaiting_integration'",
+                params![attempt_id.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan_phase_derived_effects(attempt_id)
+    }
+
+    pub fn confirm_latest_completed_plan_phase_derived_effects(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+    ) -> Result<Option<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let attempt_id = self
+            .connection
+            .query_row(
+                "SELECT effects.attempt_id
+                 FROM plan_phase_derived_effects AS effects
+                 JOIN plan_phase_attempts AS attempt ON attempt.id = effects.attempt_id
+                 WHERE effects.plan_id = ?1 AND effects.phase_id = ?2
+                   AND effects.status = 'awaiting_integration'
+                   AND attempt.status = 'completed'
+                 ORDER BY attempt.sequence DESC
+                 LIMIT 1",
+                params![plan_id.trim(), phase_id.trim()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        match attempt_id {
+            Some(attempt_id) => self.confirm_plan_phase_derived_effects_integration(&attempt_id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn discard_plan_phase_derived_effects(
+        &mut self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET status = 'discarded',
+                     terminal_reason = ?2,
+                     discarded_at = COALESCE(discarded_at, ?3),
+                     updated_at = ?3
+                 WHERE attempt_id = ?1 AND status = 'awaiting_integration'",
+                params![attempt_id.trim(), reason.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan_phase_derived_effects(attempt_id)
+    }
+
+    pub fn mark_plan_phase_derived_effects_released(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<Option<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET status = 'released',
+                     terminal_reason = NULL,
+                     released_at = COALESCE(released_at, ?2),
+                     updated_at = ?2
+                 WHERE attempt_id = ?1
+                   AND status = 'awaiting_integration'
+                   AND integration_confirmed_at IS NOT NULL",
+                params![attempt_id.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan_phase_derived_effects(attempt_id)
+    }
+
+    pub fn discard_plan_phase_derived_effects_for_phase(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        reason: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET status = 'discarded',
+                     terminal_reason = ?3,
+                     discarded_at = COALESCE(discarded_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND phase_id = ?2
+                   AND status = 'awaiting_integration'
+                   AND integration_confirmed_at IS NULL",
+                params![plan_id.trim(), phase_id.trim(), reason.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn discard_terminal_plan_phase_derived_effects(
+        &mut self,
+        default_reason: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET status = 'discarded',
+                     terminal_reason = COALESCE((
+                         SELECT attempt.error_message
+                         FROM plan_phase_attempts AS attempt
+                         WHERE attempt.id = plan_phase_derived_effects.attempt_id
+                     ), ?1),
+                     discarded_at = COALESCE(discarded_at, ?2),
+                     updated_at = ?2
+                 WHERE status = 'awaiting_integration'
+                   AND integration_confirmed_at IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM plan_phase_attempts AS attempt
+                       WHERE attempt.id = plan_phase_derived_effects.attempt_id
+                         AND attempt.status IN ('failed', 'cancelled', 'interrupted')
+                   )",
+                params![default_reason.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn discard_superseded_plan_phase_derived_effects(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        current_attempt_id: &str,
+        reason: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phase_derived_effects
+                 SET status = 'discarded',
+                     terminal_reason = ?4,
+                     discarded_at = COALESCE(discarded_at, ?5),
+                     updated_at = ?5
+                 WHERE plan_id = ?1 AND phase_id = ?2 AND attempt_id <> ?3
+                   AND status = 'awaiting_integration'",
+                params![
+                    plan_id.trim(),
+                    phase_id.trim(),
+                    current_attempt_id.trim(),
+                    reason.trim(),
+                    now,
+                ],
+            )
             .map_err(|source| self.sqlite_error(source))
     }
 
@@ -12334,10 +12550,12 @@ fn plan_phase_derived_effects_from_row(
         assistant_message_id: row.get(7)?,
         status: row.get(8)?,
         context_json: row.get(9)?,
-        released_at: row.get(10)?,
-        discarded_at: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        integration_confirmed_at: row.get(10)?,
+        terminal_reason: row.get(11)?,
+        released_at: row.get(12)?,
+        discarded_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 

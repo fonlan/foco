@@ -116,9 +116,9 @@ use crate::memory_runtime::{
     chat_extracted_memory_summary, execute_memory_tool, expire_due_memories, is_memory_tool_name,
     memory_prompt_context, memory_retrieval_tool_definition, memory_target_status_for_prompt,
     memory_tool_definitions, memory_tool_timeout_ms, parse_memory_retrieval_output,
-    persist_pending_prompt_context_injections, prompt_cache_key, queue_memory_extraction_job,
-    splice_resolved_memory, stored_prompt_context_record_memory_summaries,
-    stored_stable_prompt_context_messages,
+    persist_pending_prompt_context_injections, prompt_cache_key,
+    queue_integrated_plan_memory_extraction, queue_memory_extraction_job, splice_resolved_memory,
+    stored_prompt_context_record_memory_summaries, stored_stable_prompt_context_messages,
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
@@ -2035,6 +2035,21 @@ struct PlanPhaseRunProvenance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlanPhaseIntegrationStatus {
     AwaitingIntegration,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanPhaseDerivedEffectsContext {
+    workspace_id: String,
+    chat_id: String,
+    run_id: String,
+    user_message_id: String,
+    assistant_message_id: String,
+    model_id: String,
+    provider_id: String,
+    memory_target_status: String,
+    #[serde(default)]
+    code_change_stats: CodeChangeStats,
 }
 
 #[derive(Clone)]

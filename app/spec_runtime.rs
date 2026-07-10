@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, PreparedChatContext, api_audit_save_details, audited_provider_tool_request,
-    config_snapshot, markdown_code_block, neutral_text_message, provider_connection_config,
-    unique_id, workspace_by_id,
+    ApiError, AppState, PlanPhaseDerivedEffectsContext, PreparedChatContext,
+    api_audit_save_details, audited_provider_tool_request, config_snapshot, markdown_code_block,
+    neutral_text_message, provider_connection_config, unique_id, workspace_by_id,
 };
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
@@ -336,6 +336,14 @@ pub(crate) fn queue_workspace_spec_update_job(
     context: &PreparedChatContext,
     final_state: &str,
 ) -> Result<(), ApiError> {
+    queue_workspace_spec_update_job_with_id(context, final_state, None)
+}
+
+pub(crate) fn queue_workspace_spec_update_job_with_id(
+    context: &PreparedChatContext,
+    final_state: &str,
+    job_id: Option<&str>,
+) -> Result<(), ApiError> {
     match workspace_spec_update_queue_decision(
         final_state,
         context.agent_primary_chat_output,
@@ -400,9 +408,12 @@ pub(crate) fn queue_workspace_spec_update_job(
             "failed to serialize workspace spec update input: {source}"
         ))
     })?;
+    let job_id = job_id
+        .map(str::to_string)
+        .unwrap_or_else(|| unique_id("workspace-spec-job"));
     let job = database
-        .insert_workspace_spec_job(NewWorkspaceSpecJob {
-            id: &unique_id("workspace-spec-job"),
+        .insert_workspace_spec_job_if_absent(NewWorkspaceSpecJob {
+            id: &job_id,
             trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
             chat_id: Some(&context.chat_id),
             run_id: Some(&context.llm_request_id),
@@ -429,6 +440,89 @@ pub(crate) fn queue_workspace_spec_update_job(
         );
     }
 
+    Ok(())
+}
+
+pub(crate) fn queue_integrated_plan_workspace_spec_update(
+    context: &PlanPhaseDerivedEffectsContext,
+    workspace_path: &std::path::Path,
+    config: &GlobalConfig,
+    job_id: &str,
+    spawn_runner: bool,
+) -> Result<(), ApiError> {
+    if !config.spec.auto_enabled {
+        return Ok(());
+    }
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(spec) = database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if !spec.enabled || spec.content_markdown.trim().is_empty() {
+        return Ok(());
+    }
+    let input = WorkspaceSpecUpdateInput {
+        workspace_id: context.workspace_id.clone(),
+        chat_id: context.chat_id.clone(),
+        current_spec_revision: spec.revision,
+        user_message_id: context.user_message_id.clone(),
+        assistant_message_id: context.assistant_message_id.clone(),
+        run_id: context.run_id.clone(),
+        code_change_stats: (context.code_change_stats.additions > 0
+            || context.code_change_stats.deletions > 0)
+            .then_some(context.code_change_stats.clone()),
+        chat_excerpt: WorkspaceSpecChatExcerptInput {
+            user: compact_text(
+                &message_content(&database, &context.user_message_id)?,
+                WORKSPACE_SPEC_CHAT_EXCERPT_MAX_CHARS,
+            )
+            .0,
+            user_truncated: false,
+            assistant: compact_text(
+                &message_content(&database, &context.assistant_message_id)?,
+                WORKSPACE_SPEC_CHAT_EXCERPT_MAX_CHARS,
+            )
+            .0,
+            assistant_truncated: false,
+        },
+        current_spec_markdown: spec.content_markdown,
+    };
+    let input_summary_json = serde_json::to_string(&input).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize workspace spec update input: {source}"
+        ))
+    })?;
+    let running_job_exists = database
+        .running_workspace_spec_job()
+        .map_err(ApiError::from_workspace_error)?
+        .is_some();
+    database
+        .insert_workspace_spec_job_if_absent(NewWorkspaceSpecJob {
+            id: job_id,
+            trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.run_id),
+            model_id: config
+                .spec
+                .generation_model_id
+                .as_deref()
+                .or(Some(context.model_id.as_str())),
+            base_revision: Some(spec.revision),
+            input_summary_json: Some(&input_summary_json),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    drop(database);
+    if spawn_runner && !running_job_exists {
+        spawn_workspace_spec_job(
+            config.clone(),
+            context.workspace_id.clone(),
+            workspace_path.to_path_buf(),
+            job_id.to_string(),
+        );
+    }
     Ok(())
 }
 

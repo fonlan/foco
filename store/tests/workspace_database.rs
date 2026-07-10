@@ -1372,14 +1372,151 @@ fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
             .expect("duplicate effects");
         assert_eq!(first, duplicate);
         assert_eq!(first.status, "awaiting_integration");
+        assert!(first.integration_confirmed_at.is_none());
+        let confirmed = database
+            .confirm_plan_phase_derived_effects_integration(&attempt.id)
+            .expect("confirm integration")
+            .expect("confirmed effects");
+        assert!(confirmed.integration_confirmed_at.is_some());
+        assert_eq!(
+            database
+                .releasable_plan_phase_derived_effects()
+                .expect("releasable effects")
+                .len(),
+            1
+        );
     }
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
     let pending = database
         .awaiting_plan_phase_derived_effects()
         .expect("pending effects");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].attempt_id, attempt_id);
+    assert!(pending[0].integration_confirmed_at.is_some());
+    let released = database
+        .mark_plan_phase_derived_effects_released(&attempt_id)
+        .expect("mark released")
+        .expect("released effects");
+    assert_eq!(released.status, "released");
+    assert!(released.released_at.is_some());
+    assert!(
+        database
+            .releasable_plan_phase_derived_effects()
+            .expect("no releasable effects")
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_plan_phase_attempt_discards_unconfirmed_derived_effects() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-terminal-effects",
+            title: "Terminal effects",
+            overview: "Discard failed work.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-terminal-effects-phase",
+                title: "Phase",
+                summary: "Fail safely.",
+                steps: vec![NewPlanStep {
+                    id: "plan-terminal-effects-step",
+                    title: "Work",
+                    detail: "Do work.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-terminal-effects", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-terminal-effects",
+            "plan-terminal-effects-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-terminal-effects", "terminal-effects");
+    database
+        .upsert_message_content(NewMessage {
+            id: "user-terminal-effects",
+            chat_id: "chat-terminal-effects",
+            role: "user",
+            content: "Implement",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message");
+    database
+        .upsert_message_content(NewMessage {
+            id: "assistant-terminal-effects",
+            chat_id: "chat-terminal-effects",
+            role: "assistant",
+            content: "Failed",
+            sequence: 1,
+            metadata_json: None,
+        })
+        .expect("assistant message");
+    let task_id = AgentTaskId::new("agent-task-terminal-effects").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-terminal-effects", &team_id, &task_id)
+        .expect("attach attempt");
+    database
+        .insert_plan_phase_derived_effects(NewPlanPhaseDerivedEffects {
+            attempt_id: &attempt.id,
+            plan_id: &attempt.plan_id,
+            phase_id: &attempt.phase_id,
+            agent_task_id: &task_id,
+            chat_id: "chat-terminal-effects",
+            run_id: task_id.as_str(),
+            user_message_id: "user-terminal-effects",
+            assistant_message_id: "assistant-terminal-effects",
+            context_json: "{}",
+        })
+        .expect("insert effects");
+    database
+        .fail_plan_phase_run(&task_id, "attempt failed")
+        .expect("fail attempt");
+    assert_eq!(
+        database
+            .discard_terminal_plan_phase_derived_effects("terminal attempt")
+            .expect("discard terminal effects"),
+        1
+    );
+    assert_eq!(
+        database
+            .discard_terminal_plan_phase_derived_effects("terminal attempt")
+            .expect("discard terminal effects again"),
+        0
+    );
+    let effects = database
+        .plan_phase_derived_effects(&attempt.id)
+        .expect("effects")
+        .expect("effects record");
+    assert_eq!(effects.status, "discarded");
+    assert_eq!(effects.terminal_reason.as_deref(), Some("attempt failed"));
+    assert!(effects.discarded_at.is_some());
 }
 
 #[test]
