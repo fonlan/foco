@@ -21,9 +21,9 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
-    build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
-    calculate_context_budget, estimate_json_tokens, estimate_text_tokens, pack_context,
-    plan_tool_execution,
+    AgentTaskId, build_available_tools_prompt, build_memory_prompt_section,
+    build_project_spec_prompt_section, calculate_context_budget, estimate_json_tokens,
+    estimate_text_tokens, pack_context, plan_tool_execution,
 };
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
@@ -2023,6 +2023,20 @@ enum ChatSseEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+struct PlanPhaseRunProvenance {
+    plan_id: String,
+    phase_id: String,
+    attempt_id: String,
+    agent_task_id: AgentTaskId,
+    integration_status: PlanPhaseIntegrationStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanPhaseIntegrationStatus {
+    AwaitingIntegration,
+}
+
 #[derive(Clone)]
 struct PreparedChatContext {
     workspace_id: String,
@@ -2038,6 +2052,7 @@ struct PreparedChatContext {
     llm_request_id: String,
     assistant_sequence: i64,
     agent_associations: AgentRunAssociations,
+    plan_phase_provenance: Option<PlanPhaseRunProvenance>,
     agent_definition_snapshot: Option<Value>,
     agent_task_input: Option<Value>,
     agent_unread_messages: Vec<Value>,
@@ -4560,6 +4575,7 @@ async fn prepare_chat_context(
         llm_request_id,
         assistant_sequence,
         agent_associations: AgentRunAssociations::default(),
+        plan_phase_provenance: None,
         agent_definition_snapshot: None,
         agent_task_input: None,
         agent_unread_messages: Vec::new(),

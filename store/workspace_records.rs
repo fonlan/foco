@@ -86,13 +86,21 @@ pub struct PlanAutoRunCandidateRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanAutoRunSelection {
     Candidate(PlanAutoRunCandidateRecord),
-    WaitingForReady { plan_id: String },
+    WaitingForReady {
+        plan_id: String,
+    },
     WaitingForRetry {
         plan_id: String,
         phase_id: Option<String>,
     },
-    BlockedByCancelledPhase { plan_id: String, phase_id: String },
-    Running { plan_id: String, phase_id: Option<String> },
+    BlockedByCancelledPhase {
+        plan_id: String,
+        phase_id: String,
+    },
+    Running {
+        plan_id: String,
+        phase_id: Option<String>,
+    },
     Idle,
 }
 
@@ -603,6 +611,37 @@ pub struct PlanPhaseAttemptRecord {
     pub error_message: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlanPhaseDerivedEffects<'a> {
+    pub attempt_id: &'a str,
+    pub plan_id: &'a str,
+    pub phase_id: &'a str,
+    pub agent_task_id: &'a AgentTaskId,
+    pub chat_id: &'a str,
+    pub run_id: &'a str,
+    pub user_message_id: &'a str,
+    pub assistant_message_id: &'a str,
+    pub context_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanPhaseDerivedEffectsRecord {
+    pub attempt_id: String,
+    pub plan_id: String,
+    pub phase_id: String,
+    pub agent_task_id: AgentTaskId,
+    pub chat_id: String,
+    pub run_id: String,
+    pub user_message_id: String,
+    pub assistant_message_id: String,
+    pub status: String,
+    pub context_json: String,
+    pub released_at: Option<String>,
+    pub discarded_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

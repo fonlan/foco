@@ -619,6 +619,18 @@ async fn run_coordinator_task_inner(
         task_id: Some(task.id.clone()),
         attempt_id: Some(attempt_id.clone()),
     };
+    let database = open_workspace_database(&workspace.path)?;
+    chat_context.plan_phase_provenance = database
+        .plan_phase_attempt_for_agent_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?
+        .map(|plan_attempt| PlanPhaseRunProvenance {
+            plan_id: plan_attempt.plan_id,
+            phase_id: plan_attempt.phase_id,
+            attempt_id: plan_attempt.id,
+            agent_task_id: task.id.clone(),
+            integration_status: PlanPhaseIntegrationStatus::AwaitingIntegration,
+        });
+    drop(database);
     chat_context.agent_definition_snapshot = Some(
         serde_json::to_value(&instance.definition_snapshot).map_err(|source| {
             ApiError::internal(format!(

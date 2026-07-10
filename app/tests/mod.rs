@@ -11,9 +11,10 @@ use axum::{
     response::IntoResponse,
 };
 use foco_agent::{
-    AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunExecutor, AgentRunFuture,
-    AgentRunInput, AgentRunOutcome, AgentRunTask, ToolResource, ToolResourceAccess,
-    ToolResourceLock, build_default_system_prompt, context_compression_trigger_tokens,
+    AgentInstanceId, AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunExecutor,
+    AgentRunFuture, AgentRunInput, AgentRunOutcome, AgentRunTask, AgentTeamId, ToolResource,
+    ToolResourceAccess, ToolResourceLock, build_default_system_prompt,
+    context_compression_trigger_tokens,
 };
 use foco_providers::{
     OPENAI_CHAT_KIND, ProviderModelRedirect, ProviderRequestOverride, redirected_provider_model_ids,
@@ -34,8 +35,8 @@ use foco_store::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
-        WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
+        NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger,
+        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -637,6 +638,7 @@ fn test_prepared_chat_context(
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        plan_phase_provenance: None,
         agent_definition_snapshot: None,
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
@@ -9724,6 +9726,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             task_id: Some(task_id.clone()),
             attempt_id: Some(attempt_id.clone()),
         },
+        plan_phase_provenance: None,
         agent_definition_snapshot: None,
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
@@ -9882,6 +9885,194 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
 
     drop(database);
     drop(memory_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-derived-effects-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Implement the phase".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.memory_settings.enabled = true;
+    context.memory_settings.extraction_mode = "pending_review".to_string();
+    context.memory_settings.extraction_model_id = Some("extract-model".to_string());
+    context.global_config.spec.auto_enabled = true;
+    let task_id = AgentTaskId::new("agent-task-plan-effects-app").expect("task id");
+    let attempt_id;
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Plan phase chat")
+            .expect("chat insert");
+        database
+            .upsert_message_content(NewMessage {
+                id: "user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "Implement the phase",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user message");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nExisting")
+            .expect("seed spec");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-plan-effects").expect("definition id"),
+            revision: 1,
+            name: "Plan effects".to_string(),
+            description: String::new(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Implement.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        let team_id = AgentTeamId::new("agent-team-plan-effects-app").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-plan-effects-app").expect("instance id");
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-1",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(".foco/agent-worktrees/test"),
+                coordinator_worktree_base_revision: Some("base"),
+                coordinator_worktree_branch: Some("branch"),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .expect("create team");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .create_plan(NewPlan {
+                id: "plan-effects-app",
+                title: "Plan effects",
+                overview: "Wait for integration.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: "plan-effects-app-phase",
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-effects-app-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-effects-app", "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                "plan-effects-app",
+                "plan-effects-app-phase",
+                PlanPhaseAttemptTrigger::Initial,
+                Some("openai-responses"),
+                Some("gpt-5.4"),
+                None,
+            )
+            .expect("begin attempt");
+        attempt_id = attempt.id.clone();
+        database
+            .attach_plan_phase_attempt_run(&attempt.id, "chat-1", &team_id, &task_id)
+            .expect("attach attempt");
+        context.plan_phase_provenance = Some(PlanPhaseRunProvenance {
+            plan_id: attempt.plan_id,
+            phase_id: attempt.phase_id,
+            attempt_id: attempt.id,
+            agent_task_id: task_id.clone(),
+            integration_status: PlanPhaseIntegrationStatus::AwaitingIntegration,
+        });
+    }
+
+    let outcome = ChatAuditOutcome {
+        first_token_at: None,
+        completed_at: utc_timestamp(),
+        first_token_latency_ms: None,
+        total_latency_ms: 1,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: None,
+    };
+    persist_chat_result(
+        &context,
+        &utc_timestamp(),
+        outcome.clone(),
+        &[],
+        Some("Done"),
+        None,
+        &[],
+    )
+    .expect("persist plan phase result");
+    persist_chat_result(
+        &context,
+        &utc_timestamp(),
+        outcome,
+        &[],
+        Some("Done"),
+        None,
+        &[],
+    )
+    .expect("repeat completion");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let pending = database
+        .awaiting_plan_phase_derived_effects()
+        .expect("pending effects");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempt_id, attempt_id);
+    assert_eq!(pending[0].agent_task_id, task_id);
+    assert!(
+        database
+            .workspace_spec_jobs(10)
+            .expect("spec jobs")
+            .is_empty()
+    );
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("memory database");
+    assert!(
+        memory_database
+            .extraction_jobs_for_scope(Some("chat-1"), None, 10)
+            .expect("memory jobs")
+            .is_empty()
+    );
+    drop(memory_database);
+    drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
@@ -10803,6 +10994,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         llm_request_id: "run-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        plan_phase_provenance: None,
         agent_definition_snapshot: None,
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
@@ -11155,6 +11347,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        plan_phase_provenance: None,
         agent_definition_snapshot: None,
         agent_task_input: None,
         agent_unread_messages: Vec::new(),

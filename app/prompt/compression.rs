@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use foco_agent::{ContextPackItem, context_compression_trigger_tokens, estimate_text_tokens};
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
-use foco_store::workspace::{ContextCompressionSnapshotRecord, ToolCallWithResultRecord};
+use foco_store::workspace::{
+    ContextCompressionSnapshotRecord, NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
+};
 use serde_json::{Value, json};
 
 use crate::http::chat::{ContextUsageResponse, ContextUsageSegments};
@@ -1648,14 +1650,54 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    drop(database);
-
     if context.agent_primary_chat_output {
-        queue_memory_extraction_job(context, final_state)?;
-        crate::spec_runtime::queue_workspace_spec_update_job(context, final_state)?;
+        queue_chat_derived_effects(&mut database, context, final_state)?;
     }
 
     Ok(())
+}
+
+fn queue_chat_derived_effects(
+    database: &mut WorkspaceDatabase,
+    context: &PreparedChatContext,
+    final_state: &str,
+) -> Result<(), ApiError> {
+    if final_state != "succeeded" {
+        return Ok(());
+    }
+    if let Some(provenance) = &context.plan_phase_provenance {
+        debug_assert_eq!(
+            provenance.integration_status,
+            PlanPhaseIntegrationStatus::AwaitingIntegration
+        );
+        let context_json = json!({
+            "workspaceId": context.workspace_id,
+            "chatId": context.chat_id,
+            "runId": context.llm_request_id,
+            "userMessageId": context.user_message_id,
+            "assistantMessageId": context.assistant_message_id,
+            "modelId": context.model_id,
+            "providerId": context.provider_id,
+        })
+        .to_string();
+        database
+            .insert_plan_phase_derived_effects(NewPlanPhaseDerivedEffects {
+                attempt_id: &provenance.attempt_id,
+                plan_id: &provenance.plan_id,
+                phase_id: &provenance.phase_id,
+                agent_task_id: &provenance.agent_task_id,
+                chat_id: &context.chat_id,
+                run_id: &context.llm_request_id,
+                user_message_id: &context.user_message_id,
+                assistant_message_id: &context.assistant_message_id,
+                context_json: &context_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        return Ok(());
+    }
+
+    queue_memory_extraction_job(context, final_state)?;
+    crate::spec_runtime::queue_workspace_spec_update_job(context, final_state)
 }
 
 fn queued_chat_run_matches_context(

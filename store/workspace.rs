@@ -43,18 +43,19 @@ pub use workspace_records::{
     NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
     NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
     NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
-    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
-    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
-    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
-    RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
-    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
-    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase,
+    NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection, NewRunEvent,
+    NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
+    NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
+    PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
+    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RewriteChatFromUserMessage,
+    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
+    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -62,13 +63,13 @@ use workspace_schema::{
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    Migration,
+    MIGRATION_033, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 32;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 33;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -263,6 +264,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 32,
         sql: MIGRATION_032,
+    },
+    Migration {
+        version: 33,
+        sql: MIGRATION_033,
     },
 ];
 
@@ -2577,6 +2582,100 @@ impl WorkspaceDatabase {
                     plan_id.trim()
                 ),
             })
+    }
+
+    pub fn plan_phase_attempt_for_agent_task(
+        &self,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<Option<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, plan_id, phase_id, sequence, trigger, status,
+                        provider_id, model_id, thinking_level,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        commit_id, error_message, started_at, completed_at, created_at, updated_at
+                 FROM plan_phase_attempts
+                 WHERE agent_task_id = ?1",
+                params![agent_task_id.as_str()],
+                plan_phase_attempt_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn insert_plan_phase_derived_effects(
+        &mut self,
+        effects: NewPlanPhaseDerivedEffects<'_>,
+    ) -> Result<PlanPhaseDerivedEffectsRecord, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO plan_phase_derived_effects (
+                    attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
+                    user_message_id, assistant_message_id, status, context_json,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'awaiting_integration', ?9, ?10, ?10)
+                 ON CONFLICT(attempt_id) DO NOTHING",
+                params![
+                    effects.attempt_id,
+                    effects.plan_id,
+                    effects.phase_id,
+                    effects.agent_task_id.as_str(),
+                    effects.chat_id,
+                    effects.run_id,
+                    effects.user_message_id,
+                    effects.assistant_message_id,
+                    effects.context_json,
+                    now,
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan_phase_derived_effects(effects.attempt_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase derived effects were not found after insert: {}",
+                    effects.attempt_id
+                ),
+            })
+    }
+
+    pub fn plan_phase_derived_effects(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
+                        user_message_id, assistant_message_id, status, context_json,
+                        released_at, discarded_at, created_at, updated_at
+                 FROM plan_phase_derived_effects
+                 WHERE attempt_id = ?1",
+                params![attempt_id.trim()],
+                plan_phase_derived_effects_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn awaiting_plan_phase_derived_effects(
+        &self,
+    ) -> Result<Vec<PlanPhaseDerivedEffectsRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT attempt_id, plan_id, phase_id, agent_task_id, chat_id, run_id,
+                        user_message_id, assistant_message_id, status, context_json,
+                        released_at, discarded_at, created_at, updated_at
+                 FROM plan_phase_derived_effects
+                 WHERE status = 'awaiting_integration'
+                 ORDER BY created_at ASC, attempt_id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], plan_phase_derived_effects_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn plan_phase_for_agent_task(
@@ -12212,6 +12311,33 @@ fn plan_phase_attempt_from_row(
         completed_at: row.get(15)?,
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
+    })
+}
+
+fn plan_phase_derived_effects_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PlanPhaseDerivedEffectsRecord> {
+    Ok(PlanPhaseDerivedEffectsRecord {
+        attempt_id: row.get(0)?,
+        plan_id: row.get(1)?,
+        phase_id: row.get(2)?,
+        agent_task_id: AgentTaskId::new(row.get::<_, String>(3)?).map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(source),
+            )
+        })?,
+        chat_id: row.get(4)?,
+        run_id: row.get(5)?,
+        user_message_id: row.get(6)?,
+        assistant_message_id: row.get(7)?,
+        status: row.get(8)?,
+        context_json: row.get(9)?,
+        released_at: row.get(10)?,
+        discarded_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 

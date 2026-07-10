@@ -1267,6 +1267,32 @@ CREATE INDEX llm_requests_chat_valid_idx
     WHERE invalidated_at IS NULL;
 "#;
 
+pub(crate) const MIGRATION_033: &str = r#"
+CREATE TABLE plan_phase_derived_effects (
+    attempt_id TEXT PRIMARY KEY NOT NULL REFERENCES plan_phase_attempts(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    phase_id TEXT NOT NULL REFERENCES plan_phases(id) ON DELETE CASCADE,
+    agent_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'awaiting_integration'
+        CHECK (status IN ('awaiting_integration', 'released', 'discarded')),
+    context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+    released_at TEXT,
+    discarded_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX plan_phase_derived_effects_status_idx
+ON plan_phase_derived_effects(status, created_at);
+
+CREATE UNIQUE INDEX plan_phase_derived_effects_task_idx
+ON plan_phase_derived_effects(agent_task_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

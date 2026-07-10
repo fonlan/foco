@@ -25,12 +25,12 @@ use foco_store::{
         NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
-        NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
-        NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-        PlanListFilter, PlanListOrder, PlanPhaseAttemptTrigger, PlanStepPatch,
-        RewriteChatFromUserMessage, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
-        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
+        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPhaseAttemptTrigger,
+        PlanStepPatch, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
+        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
         WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
@@ -1274,6 +1274,112 @@ fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
         failed.phases[0].error_message.as_deref(),
         Some("Plan phase start did not create an implementation chat or Agent task"),
     );
+}
+
+#[test]
+fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let attempt_id;
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .create_plan(NewPlan {
+                id: "plan-derived-effects",
+                title: "Derived effects",
+                overview: "Wait for integration.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: "plan-derived-effects-phase",
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-derived-effects-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-derived-effects", "start")
+            .expect("start plan");
+        let (team_id, instance_id) =
+            create_test_agent_team(&mut database, "chat-derived-effects", "derived-effects");
+        database
+            .upsert_message_content(NewMessage {
+                id: "user-derived-effects",
+                chat_id: "chat-derived-effects",
+                role: "user",
+                content: "Implement",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user message");
+        database
+            .upsert_message_content(NewMessage {
+                id: "assistant-derived-effects",
+                chat_id: "chat-derived-effects",
+                role: "assistant",
+                content: "Done",
+                sequence: 1,
+                metadata_json: None,
+            })
+            .expect("assistant message");
+        let task_id = AgentTaskId::new("agent-task-derived-effects").expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                "plan-derived-effects",
+                "plan-derived-effects-phase",
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        attempt_id = attempt.id.clone();
+        database
+            .attach_plan_phase_attempt_run(&attempt.id, "chat-derived-effects", &team_id, &task_id)
+            .expect("attach run");
+        let input = NewPlanPhaseDerivedEffects {
+            attempt_id: &attempt.id,
+            plan_id: &attempt.plan_id,
+            phase_id: &attempt.phase_id,
+            agent_task_id: &task_id,
+            chat_id: "chat-derived-effects",
+            run_id: task_id.as_str(),
+            user_message_id: "user-derived-effects",
+            assistant_message_id: "assistant-derived-effects",
+            context_json: r#"{"runId":"agent-task-derived-effects"}"#,
+        };
+        let first = database
+            .insert_plan_phase_derived_effects(input.clone())
+            .expect("insert effects");
+        let duplicate = database
+            .insert_plan_phase_derived_effects(input)
+            .expect("duplicate effects");
+        assert_eq!(first, duplicate);
+        assert_eq!(first.status, "awaiting_integration");
+    }
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+    let pending = database
+        .awaiting_plan_phase_derived_effects()
+        .expect("pending effects");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempt_id, attempt_id);
 }
 
 #[test]
