@@ -48,7 +48,6 @@ import {
   ChangeEvent as ReactChangeEvent,
   DragEvent as ReactDragEvent,
   FormEvent,
-  TouchEvent as ReactTouchEvent,
   WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
@@ -163,12 +162,7 @@ import {
   isModelThinkingLevelSupported,
   thinkingLevelOptionsForModel,
 } from "../../shared/thinking-levels";
-import {
-  findVerticalScrollAncestor,
-  forwardVerticalTouchDrag,
-  startVerticalTouchDragForward,
-  type VerticalTouchDragState,
-} from "../../shared/scroll-forwarding";
+import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
 import { FilePickerDialog, type FilePickerSelection } from "../file-picker/FilePickerDialog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
@@ -612,7 +606,6 @@ export function SettingsPanel({
     string[] | null
   >(null);
   const workspaceLogoInputRef = useRef<HTMLInputElement | null>(null);
-  const settingsTableTouchDragRef = useRef<VerticalTouchDragState | null>(null);
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -2811,33 +2804,6 @@ export function SettingsPanel({
         current === operationKey ? null : current,
       );
     }
-  }
-
-  function handleSettingsTableTouchCancel() {
-    settingsTableTouchDragRef.current = null;
-  }
-
-  function handleSettingsTableTouchMove(event: ReactTouchEvent<HTMLDivElement>) {
-    const touch = event.touches[0];
-    if (!touch) {
-      return;
-    }
-    if (
-      forwardVerticalTouchDrag(
-        settingsTableTouchDragRef.current,
-        touch,
-        event.currentTarget,
-      )
-    ) {
-      event.preventDefault();
-    }
-  }
-
-  function handleSettingsTableTouchStart(event: ReactTouchEvent<HTMLDivElement>) {
-    const touch = event.touches[0];
-    settingsTableTouchDragRef.current = touch
-      ? startVerticalTouchDragForward(touch)
-      : null;
   }
 
   function handleSettingsTableWheel(event: ReactWheelEvent<HTMLDivElement>) {
@@ -7472,11 +7438,7 @@ export function SettingsPanel({
                 ) : null}
 
                 <div
-                  className="panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white"
-                  onTouchCancel={handleSettingsTableTouchCancel}
-                  onTouchEnd={handleSettingsTableTouchCancel}
-                  onTouchMove={handleSettingsTableTouchMove}
-                  onTouchStart={handleSettingsTableTouchStart}
+                  className="settings-table-scroll panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white"
                   onWheel={handleSettingsTableWheel}
                 >
                   <table className="min-w-full divide-y divide-stone-200 text-left text-sm">

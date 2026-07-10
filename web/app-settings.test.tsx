@@ -1444,6 +1444,7 @@ describe("app-settings verification surfaces", () => {
     const dreamTableScroller = dreamTable.parentElement;
     const settingsScroller = dreamTable.closest(".settings-shell") as HTMLElement | null;
     expect(dreamTableScroller).toHaveClass("overflow-x-auto");
+    expect(dreamTableScroller).toHaveClass("settings-table-scroll");
     expect(settingsScroller).not.toBeNull();
     if (!dreamTableScroller || !settingsScroller) {
       throw new Error("Expected Dream history to live inside settings scroller");
@@ -1457,15 +1458,16 @@ describe("app-settings verification surfaces", () => {
     fireEvent.wheel(dreamTableScroller, { deltaX: 0, deltaY: 120 });
     expect(settingsScroller.scrollTop).toBe(120);
     settingsScroller.scrollTop = 0;
-    fireEvent.touchStart(dreamTableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
-    fireEvent.touchMove(dreamTableScroller, { touches: [{ clientX: 24, clientY: 90 }] });
-    expect(settingsScroller.scrollTop).toBe(50);
-    fireEvent.touchEnd(dreamTableScroller);
-    settingsScroller.scrollTop = 0;
-    fireEvent.touchStart(dreamTableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
-    fireEvent.touchMove(dreamTableScroller, { touches: [{ clientX: 90, clientY: 110 }] });
+    const verticalTouchMove = new Event("touchmove", {
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(verticalTouchMove, "touches", {
+      value: [{ clientX: 24, clientY: 90 }],
+    });
+    dreamTableScroller.dispatchEvent(verticalTouchMove);
+    expect(verticalTouchMove.defaultPrevented).toBe(false);
     expect(settingsScroller.scrollTop).toBe(0);
-    fireEvent.touchEnd(dreamTableScroller);
     expect(within(dreamTable).getAllByText(workspace.name)).toHaveLength(2);
     expect(within(dreamTable).getAllByRole("button", { name: "View details" })).toHaveLength(2);
     expect(screen.queryByText(memoryDreamJob.summary!)).not.toBeInTheDocument();

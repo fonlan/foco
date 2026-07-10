@@ -296,7 +296,8 @@ summary:focus-visible {
   overscroll-behavior: contain;
 }
 
-.api-stats-audit-table-scroll {
+.api-stats-audit-table-scroll,
+.settings-table-scroll {
   overscroll-behavior-x: contain;
   overscroll-behavior-y: auto;
   touch-action: auto;
