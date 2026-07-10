@@ -7845,8 +7845,11 @@ async fn remote_sidecar_plans_auto_run(
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     Ok(Json(json!({
         "enabled": value.enabled,
+        "desiredEnabled": value.desired_enabled,
         "busy": value.busy,
         "blockedReason": value.blocked_reason,
+        "blockedPlanId": value.blocked_plan_id,
+        "blockedPhaseId": value.blocked_phase_id,
     })))
 }
 
@@ -7866,8 +7869,11 @@ async fn remote_sidecar_plans_auto_run_set(
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     Ok(Json(json!({
         "enabled": value.enabled,
+        "desiredEnabled": value.desired_enabled,
         "busy": value.busy,
         "blockedReason": value.blocked_reason,
+        "blockedPlanId": value.blocked_plan_id,
+        "blockedPhaseId": value.blocked_phase_id,
     })))
 }
 

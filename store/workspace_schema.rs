@@ -1304,6 +1304,20 @@ CREATE INDEX plan_phase_derived_effects_integration_idx
 ON plan_phase_derived_effects(status, integration_confirmed_at, created_at);
 "#;
 
+pub(crate) const MIGRATION_035: &str = r#"
+INSERT INTO workspace_metadata (key, value, updated_at)
+SELECT 'plan_auto_run_desired_enabled', value, updated_at
+FROM workspace_metadata
+WHERE key = 'plan_auto_run_enabled'
+ON CONFLICT(key) DO NOTHING;
+
+INSERT INTO workspace_metadata (key, value, updated_at)
+SELECT 'plan_auto_run_desired_enabled', 'false', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE NOT EXISTS (
+    SELECT 1 FROM workspace_metadata WHERE key = 'plan_auto_run_desired_enabled'
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

@@ -292,9 +292,18 @@ export type PlanResponse = {
 };
 
 export type PlanAutoRunResponse = {
+  /** Backward-compatible effective state: desired and not runtime-blocked. */
   enabled: boolean;
+  desiredEnabled: boolean;
   busy: boolean;
-  blockedReason?: "waiting_for_ready" | "waiting_for_retry" | "cancelled_phase";
+  blockedReason?:
+    | "waiting_for_ready"
+    | "waiting_for_retry"
+    | "cancelled_phase"
+    | "merge_blocked"
+    | "scheduler_error";
+  blockedPlanId?: string;
+  blockedPhaseId?: string;
 };
 
 export type PlanWorktreeAuditItem = {

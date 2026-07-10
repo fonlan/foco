@@ -72,9 +72,13 @@ pub struct AgentInstanceRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanAutoRunStateRecord {
+    /// Backward-compatible effective state: desired and not runtime-blocked.
     pub enabled: bool,
+    pub desired_enabled: bool,
     pub busy: bool,
     pub blocked_reason: Option<String>,
+    pub blocked_plan_id: Option<String>,
+    pub blocked_phase_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -137,6 +137,7 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingPlans,
   isPlanAutoRunBusy,
   isPlanAutoRunEnabled,
+  planAutoRunBlockedReason,
   isPlanAutoRunToggleDisabled,
   loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
@@ -214,6 +215,7 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingPlans: boolean;
   isPlanAutoRunBusy: boolean;
   isPlanAutoRunEnabled: boolean;
+  planAutoRunBlockedReason: string | null;
   isPlanAutoRunToggleDisabled: boolean;
   loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
@@ -326,6 +328,7 @@ const ContextPanel = memo(function ContextPanel({
           <ContextPlanTab
             autoRunBusy={isPlanAutoRunBusy}
             autoRunEnabled={isPlanAutoRunEnabled}
+            autoRunBlockedReason={planAutoRunBlockedReason}
             autoRunToggleDisabled={isPlanAutoRunToggleDisabled}
             error={planError}
             isLoading={isLoadingPlans}
@@ -705,6 +708,7 @@ function ContextTodoGraphTab({
 function ContextPlanTab({
   autoRunBusy,
   autoRunEnabled,
+  autoRunBlockedReason,
   autoRunToggleDisabled,
   error,
   isLoading,
@@ -725,6 +729,7 @@ function ContextPlanTab({
 }: {
   autoRunBusy: boolean;
   autoRunEnabled: boolean;
+  autoRunBlockedReason: string | null;
   autoRunToggleDisabled: boolean;
   error: string | null;
   isLoading: boolean;
@@ -766,6 +771,19 @@ function ContextPlanTab({
     phase: PlanPhase;
   } | null>(null);
   const showAutoRunBusy = autoRunEnabled && autoRunBusy;
+  const autoRunBlockedLabel = autoRunBlockedReason
+    ? t(
+        autoRunBlockedReason === "waiting_for_ready"
+          ? "Auto run waiting for plan readiness"
+          : autoRunBlockedReason === "waiting_for_retry"
+            ? "Auto run paused until phase retry"
+            : autoRunBlockedReason === "cancelled_phase"
+              ? "Auto run paused until cancelled phase retry"
+              : autoRunBlockedReason === "merge_blocked"
+                ? "Auto run paused until merge retry"
+                : "Auto run paused after a scheduler error",
+      )
+    : null;
   const runningPlan = plans.find((plan) => plan.status === "running") ?? null;
   const runningPlanId = runningPlan?.id ?? null;
   const runningPlanArticleRef = useRef<HTMLElement | null>(null);
@@ -955,6 +973,10 @@ function ContextPlanTab({
           <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2 text-xs font-medium text-amber-700">
             <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
             {t("Auto running")}
+          </span>
+        ) : autoRunEnabled && autoRunBlockedLabel ? (
+          <span className="inline-flex min-h-6 shrink-0 items-center rounded-full border border-stone-200 bg-stone-50 px-2 py-1 text-xs font-medium text-stone-600">
+            {autoRunBlockedLabel}
           </span>
         ) : null}
         <button

@@ -799,26 +799,49 @@ fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_can
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
 
-    for (index, status) in ["draft", "ready", "failed", "paused"]
-        .into_iter()
-        .enumerate()
-    {
+    let cases = [
+        (
+            "draft",
+            foco_store::workspace::PlanAutoRunSelection::WaitingForReady {
+                plan_id: "candidate-0".to_string(),
+            },
+        ),
+        (
+            "ready",
+            foco_store::workspace::PlanAutoRunSelection::Candidate(
+                foco_store::workspace::PlanAutoRunCandidateRecord {
+                    plan_id: "candidate-1".to_string(),
+                    action: "start".to_string(),
+                },
+            ),
+        ),
+        (
+            "failed",
+            foco_store::workspace::PlanAutoRunSelection::Candidate(
+                foco_store::workspace::PlanAutoRunCandidateRecord {
+                    plan_id: "candidate-2".to_string(),
+                    action: "start".to_string(),
+                },
+            ),
+        ),
+        (
+            "paused",
+            foco_store::workspace::PlanAutoRunSelection::Candidate(
+                foco_store::workspace::PlanAutoRunCandidateRecord {
+                    plan_id: "candidate-3".to_string(),
+                    action: "resume".to_string(),
+                },
+            ),
+        ),
+    ];
+    for (index, (status, expected)) in cases.into_iter().enumerate() {
         let id = format!("candidate-{index}");
         create_auto_run_test_plan(&mut database, &id, status);
-        let selection = database
-            .next_plan_auto_run_candidate()
-            .expect("candidate selection");
-        let foco_store::workspace::PlanAutoRunSelection::Candidate(candidate) = selection else {
-            panic!("expected candidate for {status}, got {selection:?}");
-        };
-        assert_eq!(candidate.plan_id, id);
         assert_eq!(
-            candidate.action,
-            if status == "paused" {
-                "resume"
-            } else {
-                "start"
-            }
+            database
+                .next_plan_auto_run_candidate()
+                .expect("candidate selection"),
+            expected
         );
         database.delete_plan(&id).expect("delete candidate plan");
     }
@@ -852,13 +875,17 @@ fn plan_auto_run_cancelled_phase_blocks_later_plan_and_is_not_busy() {
         }
     );
     let state = database.plan_auto_run_state().expect("auto-run state");
-    assert!(state.enabled);
+    assert!(state.desired_enabled);
+    assert!(!state.enabled);
     assert!(!state.busy);
+    assert_eq!(state.blocked_reason.as_deref(), Some("cancelled_phase"));
+    assert_eq!(state.blocked_plan_id.as_deref(), Some("blocked"));
+    assert_eq!(state.blocked_phase_id.as_deref(), Some("blocked-phase"));
     assert!(!database.disable_plan_auto_run_if_idle().expect("not idle"));
 }
 
 #[test]
-fn plan_auto_run_idle_disables_persisted_state() {
+fn plan_auto_run_idle_preserves_desired_preference() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
@@ -871,9 +898,12 @@ fn plan_auto_run_idle_disables_persisted_state() {
     assert!(
         database
             .disable_plan_auto_run_if_idle()
-            .expect("disable idle auto-run")
+            .expect("observe idle auto-run")
     );
-    assert!(!database.plan_auto_run_state().expect("state").enabled);
+    let state = database.plan_auto_run_state().expect("state");
+    assert!(state.desired_enabled);
+    assert!(state.enabled);
+    assert!(!state.busy);
 }
 
 #[test]
@@ -895,9 +925,121 @@ fn plan_auto_run_marks_running_plan_busy_without_candidate() {
         database
             .next_plan_auto_run_candidate()
             .expect("candidate query"),
-        foco_store::workspace::PlanAutoRunSelection::Idle
+        foco_store::workspace::PlanAutoRunSelection::Running {
+            plan_id: "running-plan".to_string(),
+            phase_id: Some("running-plan-phase".to_string()),
+        }
     );
     assert!(database.plan_auto_run_state().expect("state").busy);
+}
+
+#[test]
+fn plan_auto_run_legacy_enabled_metadata_migrates_to_desired_preference() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .set_workspace_metadata("plan_auto_run_enabled", "true")
+            .expect("set legacy preference");
+    }
+    let database_path = workspace_database_path(workspace.path());
+    let connection = Connection::open(&database_path).expect("legacy database connection");
+    connection
+        .execute(
+            "DELETE FROM workspace_metadata WHERE key = 'plan_auto_run_desired_enabled'",
+            [],
+        )
+        .expect("remove desired metadata before migration");
+    connection
+        .pragma_update(None, "user_version", 34)
+        .expect("rewind schema version");
+    drop(connection);
+
+    let database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated workspace database");
+    let state = database.plan_auto_run_state().expect("migrated state");
+    assert!(state.desired_enabled);
+}
+
+#[test]
+fn plan_auto_run_desired_and_block_survive_reopen_and_retry_clears_block() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        create_auto_run_test_plan(&mut database, "blocked", "ready");
+        database
+            .set_plan_auto_run_enabled(true)
+            .expect("enable auto-run");
+        database
+            .transition_plan("blocked", "start")
+            .expect("start blocked plan");
+        database
+            .cancel_plan_phase_by_id("blocked", "blocked-phase", "user cancelled phase")
+            .expect("cancel phase");
+        let state = database.plan_auto_run_state().expect("blocked state");
+        assert!(state.desired_enabled);
+        assert!(!state.enabled);
+        assert_eq!(state.blocked_reason.as_deref(), Some("cancelled_phase"));
+    }
+
+    let mut reopened =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopened database");
+    let state = reopened.plan_auto_run_state().expect("reopened state");
+    assert!(state.desired_enabled);
+    assert_eq!(state.blocked_reason.as_deref(), Some("cancelled_phase"));
+
+    reopened
+        .begin_plan_phase_attempt(
+            "blocked",
+            "blocked-phase",
+            foco_store::workspace::PlanPhaseAttemptTrigger::Retry,
+            None,
+            None,
+            None,
+        )
+        .expect("begin retry");
+    let state = reopened.plan_auto_run_state().expect("retry state");
+    assert!(state.desired_enabled);
+    assert!(state.enabled);
+    assert!(state.busy);
+    assert!(state.blocked_reason.is_none());
+}
+
+#[test]
+fn disabling_auto_run_while_blocked_prevents_retry_resume() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "blocked", "ready");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+    database
+        .transition_plan("blocked", "start")
+        .expect("start blocked plan");
+    database
+        .cancel_plan_phase_by_id("blocked", "blocked-phase", "user cancelled phase")
+        .expect("cancel phase");
+    database
+        .set_plan_auto_run_enabled(false)
+        .expect("disable preference");
+    database
+        .begin_plan_phase_attempt(
+            "blocked",
+            "blocked-phase",
+            foco_store::workspace::PlanPhaseAttemptTrigger::Retry,
+            None,
+            None,
+            None,
+        )
+        .expect("begin retry");
+    let state = database.plan_auto_run_state().expect("retry state");
+    assert!(!state.desired_enabled);
+    assert!(!state.enabled);
+    assert!(!state.busy);
+    assert!(state.blocked_reason.is_none());
 }
 
 #[test]
@@ -1174,6 +1316,9 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
         )
         .expect("attach phase");
 
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run preference");
     let completed = database
         .complete_plan_phase_run(&task_id, Some("phase-worktree-commit"))
         .expect("complete phase")
@@ -1189,6 +1334,15 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
         .expect("block merge");
     assert!(blocked.error_message.is_some());
     assert!(blocked.phases[0].error_message.is_some());
+    let blocked_state = database
+        .plan_auto_run_state()
+        .expect("blocked auto-run state");
+    assert!(blocked_state.desired_enabled);
+    assert!(!blocked_state.enabled);
+    assert_eq!(
+        blocked_state.blocked_reason.as_deref(),
+        Some("merge_blocked")
+    );
 
     let merged = database
         .complete_plan_phase_by_id(
@@ -1209,6 +1363,12 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
         Some("shared-merge-commit")
     );
     assert!(merged.phases[0].error_message.is_none());
+    let resumed_state = database
+        .plan_auto_run_state()
+        .expect("resumed auto-run state");
+    assert!(resumed_state.desired_enabled);
+    assert!(resumed_state.enabled);
+    assert!(resumed_state.blocked_reason.is_none());
 }
 
 #[test]

@@ -1316,8 +1316,10 @@ export function App() {
   const planAutoRunState = activeWorkspaceIdForPlanAutoRun
     ? planAutoRunByWorkspace[activeWorkspaceIdForPlanAutoRun] ?? null
     : null;
-  const isPlanAutoRunEnabled = planAutoRunState?.enabled ?? false;
+  const isPlanAutoRunEnabled =
+    planAutoRunState?.desiredEnabled ?? planAutoRunState?.enabled ?? false;
   const isPlanAutoRunBusy = planAutoRunState?.busy ?? false;
+  const planAutoRunBlockedReason = planAutoRunState?.blockedReason ?? null;
   const setPlanAutoRunStateForWorkspace = useCallback(
     (workspaceId: string, autoRun: PlanAutoRunResponse) => {
       if (!workspaceId) {
@@ -11164,6 +11166,7 @@ export function App() {
                 isLoadingPlans={isLoadingActivePlans}
                 isPlanAutoRunBusy={isPlanAutoRunBusy || isPlanAutoRunUpdating || planOperationKey !== null}
                 isPlanAutoRunEnabled={isPlanAutoRunEnabled}
+                planAutoRunBlockedReason={planAutoRunBlockedReason}
                 isPlanAutoRunToggleDisabled={!activeWorkspace?.id}
                 isLoadingTodoGraph={isLoadingTodoGraph}
                 isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}

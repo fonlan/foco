@@ -128,9 +128,14 @@ pub(crate) struct DeletePlanResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PlanAutoRunResponse {
     enabled: bool,
+    desired_enabled: bool,
     busy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_plan_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_phase_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -335,8 +340,11 @@ pub(crate) async fn plan_auto_run(
 
     Ok(Json(PlanAutoRunResponse {
         enabled: auto_run.enabled,
+        desired_enabled: auto_run.desired_enabled,
         busy: auto_run.busy,
         blocked_reason: auto_run.blocked_reason,
+        blocked_plan_id: auto_run.blocked_plan_id,
+        blocked_phase_id: auto_run.blocked_phase_id,
     }))
 }
 
@@ -354,8 +362,11 @@ pub(crate) async fn set_plan_auto_run(
 
     Ok(Json(PlanAutoRunResponse {
         enabled: auto_run.enabled,
+        desired_enabled: auto_run.desired_enabled,
         busy: auto_run.busy,
         blocked_reason: auto_run.blocked_reason,
+        blocked_plan_id: auto_run.blocked_plan_id,
+        blocked_phase_id: auto_run.blocked_phase_id,
     }))
 }
 

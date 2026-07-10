@@ -108,12 +108,14 @@ async fn dispatch_next_plan_auto_run(
 ) -> Result<PlanAutoRunDispatch, ApiError> {
     let selection = {
         let mut database = open_workspace_database(&workspace.path)?;
-        if !database
+        let auto_run = database
             .plan_auto_run_state()
-            .map_err(ApiError::from_workspace_error)?
-            .enabled
-        {
+            .map_err(ApiError::from_workspace_error)?;
+        if !auto_run.desired_enabled {
             return Ok(PlanAutoRunDispatch::Idle);
+        }
+        if !auto_run.enabled {
+            return Ok(PlanAutoRunDispatch::Blocked);
         }
         if database
             .plan_auto_run_has_in_flight()
@@ -134,13 +136,13 @@ async fn dispatch_next_plan_auto_run(
             }
             PlanAutoRunSelection::BlockedByCancelledPhase { plan_id, phase_id } => {
                 database
-                    .set_plan_auto_run_enabled(false)
+                    .block_plan_auto_run("cancelled_phase", Some(plan_id), Some(phase_id))
                     .map_err(ApiError::from_workspace_error)?;
                 tracing::info!(
                     workspace_id = %workspace.id,
                     plan_id,
                     phase_id,
-                    "Plan auto-run stopped at cancelled phase barrier"
+                    "Plan auto-run paused at cancelled phase barrier"
                 );
             }
             PlanAutoRunSelection::WaitingForReady { plan_id } => {
@@ -206,14 +208,18 @@ async fn dispatch_next_plan_auto_run(
                 }
                 Err(mark_error) => {
                     database
-                        .set_plan_auto_run_enabled(false)
+                        .block_plan_auto_run(
+                            "scheduler_error",
+                            Some(candidate.plan_id.as_str()),
+                            None,
+                        )
                         .map_err(ApiError::from_workspace_error)?;
                     tracing::warn!(
                         workspace_id = %workspace.id,
                         plan_id = %candidate.plan_id,
                         error = %error.message,
                         mark_error = %mark_error,
-                        "Plan auto-run disabled after invalid candidate could not be marked failed"
+                        "Plan auto-run paused after invalid candidate could not be marked failed"
                     );
                     Err(error)
                 }
@@ -222,7 +228,7 @@ async fn dispatch_next_plan_auto_run(
         Err(error) => {
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .set_plan_auto_run_enabled(false)
+                .block_plan_auto_run("scheduler_error", Some(candidate.plan_id.as_str()), None)
                 .map_err(ApiError::from_workspace_error)?;
             Err(error)
         }
@@ -355,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_disables_auto_run_at_cancelled_phase_barrier_without_dispatch() {
+    async fn scheduler_preserves_desired_auto_run_at_cancelled_phase_barrier_without_dispatch() {
         let workspace = tempfile::tempdir().expect("workspace");
         let profile = tempfile::tempdir().expect("profile");
         let config = foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
@@ -427,11 +433,13 @@ mod tests {
             foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
                 .expect("database");
         let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(auto_run.desired_enabled);
         assert!(!auto_run.enabled);
         assert!(!auto_run.busy);
+        assert_eq!(auto_run.blocked_reason.as_deref(), Some("cancelled_phase"));
         database
-            .set_plan_auto_run_enabled(true)
-            .expect("re-enable auto-run");
+            .set_plan_auto_run_enabled(false)
+            .expect("disable desired auto-run");
         drop(database);
 
         assert!(
@@ -447,6 +455,7 @@ mod tests {
         let database = foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
             .expect("database");
         let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(!auto_run.desired_enabled);
         assert!(!auto_run.enabled);
         assert!(!auto_run.busy);
         let blocked = database
@@ -508,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_auto_run_candidate_matches_frontend_order() {
+    fn plan_auto_run_candidate_stops_at_running_queue_boundary() {
         let plans = vec![
             plan("running", "running"),
             plan("completed", "completed"),
@@ -516,31 +525,50 @@ mod tests {
             plan("ready", "ready"),
         ];
 
-        let candidate = candidate(choose_plan_auto_run_candidate(&plans));
-        assert_eq!(candidate.plan_id, "paused");
-        assert_eq!(candidate.action, "resume");
-    }
-
-    #[test]
-    fn plan_auto_run_candidate_starts_draft_ready_and_failed() {
-        for status in ["draft", "ready", "failed"] {
-            let candidate = candidate(choose_plan_auto_run_candidate(&[plan(status, status)]));
-            assert_eq!(candidate.plan_id, status);
-            assert_eq!(candidate.action, "start");
-        }
-    }
-
-    #[test]
-    fn plan_auto_run_candidate_ignores_running_and_terminal_plans() {
-        let plans = vec![
-            plan("running", "running"),
-            plan("implemented", "implemented"),
-            plan("completed", "completed"),
-            plan("cancelled", "cancelled"),
-        ];
-
         assert_eq!(
             choose_plan_auto_run_candidate(&plans),
+            PlanAutoRunSelection::Running {
+                plan_id: "running".to_string(),
+                phase_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_auto_run_candidate_waits_for_draft_and_failed_but_starts_ready() {
+        assert_eq!(
+            choose_plan_auto_run_candidate(&[plan("draft", "draft")]),
+            PlanAutoRunSelection::WaitingForReady {
+                plan_id: "draft".to_string(),
+            }
+        );
+        assert_eq!(
+            choose_plan_auto_run_candidate(&[plan("failed", "failed")]),
+            PlanAutoRunSelection::WaitingForRetry {
+                plan_id: "failed".to_string(),
+                phase_id: None,
+            }
+        );
+        let candidate = candidate(choose_plan_auto_run_candidate(&[plan("ready", "ready")]));
+        assert_eq!(candidate.plan_id, "ready");
+        assert_eq!(candidate.action, "start");
+    }
+
+    #[test]
+    fn plan_auto_run_candidate_reports_running_and_ignores_terminal_plans() {
+        assert_eq!(
+            choose_plan_auto_run_candidate(&[plan("running", "running")]),
+            PlanAutoRunSelection::Running {
+                plan_id: "running".to_string(),
+                phase_id: None,
+            }
+        );
+        assert_eq!(
+            choose_plan_auto_run_candidate(&[
+                plan("implemented", "implemented"),
+                plan("completed", "completed"),
+                plan("cancelled", "cancelled"),
+            ]),
             PlanAutoRunSelection::Idle
         );
     }

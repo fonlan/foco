@@ -63,13 +63,13 @@ use workspace_schema::{
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    MIGRATION_033, MIGRATION_034, Migration,
+    MIGRATION_033, MIGRATION_034, MIGRATION_035, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 34;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 35;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -85,6 +85,11 @@ pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
 ];
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
+const PLAN_AUTO_RUN_DESIRED_ENABLED_KEY: &str = "plan_auto_run_desired_enabled";
+const PLAN_AUTO_RUN_LEGACY_ENABLED_KEY: &str = "plan_auto_run_enabled";
+const PLAN_AUTO_RUN_BLOCKED_REASON_KEY: &str = "plan_auto_run_blocked_reason";
+const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
+const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
   AND messages.id NOT IN (
@@ -272,6 +277,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 34,
         sql: MIGRATION_034,
+    },
+    Migration {
+        version: 35,
+        sql: MIGRATION_035,
     },
 ];
 
@@ -748,26 +757,59 @@ impl WorkspaceDatabase {
     }
 
     pub fn plan_auto_run_state(&self) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
-        let enabled = self.workspace_metadata("plan_auto_run_enabled")?.as_deref() == Some("true");
+        let desired_enabled = self
+            .workspace_metadata(PLAN_AUTO_RUN_DESIRED_ENABLED_KEY)?
+            .or_else(|| {
+                self.workspace_metadata(PLAN_AUTO_RUN_LEGACY_ENABLED_KEY)
+                    .ok()
+                    .flatten()
+            })
+            .as_deref()
+            == Some("true");
         let selection = self.next_plan_auto_run_candidate()?;
-        let busy = matches!(
-            selection,
-            PlanAutoRunSelection::Candidate(_) | PlanAutoRunSelection::Running { .. }
-        ) || self.plan_auto_run_has_in_flight()?;
-        let blocked_reason = match selection {
-            PlanAutoRunSelection::WaitingForReady { .. } => Some("waiting_for_ready".to_string()),
-            PlanAutoRunSelection::WaitingForRetry { .. } => Some("waiting_for_retry".to_string()),
-            PlanAutoRunSelection::BlockedByCancelledPhase { .. } => {
-                Some("cancelled_phase".to_string())
-            }
+        let selection_block = match &selection {
+            PlanAutoRunSelection::WaitingForReady { plan_id } => (
+                Some("waiting_for_ready".to_string()),
+                Some(plan_id.clone()),
+                None,
+            ),
+            PlanAutoRunSelection::WaitingForRetry { plan_id, phase_id } => (
+                Some("waiting_for_retry".to_string()),
+                Some(plan_id.clone()),
+                phase_id.clone(),
+            ),
+            PlanAutoRunSelection::BlockedByCancelledPhase { plan_id, phase_id } => (
+                Some("cancelled_phase".to_string()),
+                Some(plan_id.clone()),
+                Some(phase_id.clone()),
+            ),
             PlanAutoRunSelection::Candidate(_)
             | PlanAutoRunSelection::Running { .. }
-            | PlanAutoRunSelection::Idle => None,
+            | PlanAutoRunSelection::Idle => (None, None, None),
         };
+        let persisted_block = (
+            self.workspace_metadata(PLAN_AUTO_RUN_BLOCKED_REASON_KEY)?,
+            self.workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY)?,
+            self.workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY)?,
+        );
+        let (blocked_reason, blocked_plan_id, blocked_phase_id) = if selection_block.0.is_some() {
+            selection_block
+        } else {
+            persisted_block
+        };
+        let enabled = desired_enabled && blocked_reason.is_none();
+        let busy = enabled
+            && (matches!(
+                selection,
+                PlanAutoRunSelection::Candidate(_) | PlanAutoRunSelection::Running { .. }
+            ) || self.plan_auto_run_has_in_flight()?);
         Ok(PlanAutoRunStateRecord {
             enabled,
+            desired_enabled,
             busy,
             blocked_reason,
+            blocked_plan_id,
+            blocked_phase_id,
         })
     }
 
@@ -776,10 +818,61 @@ impl WorkspaceDatabase {
         enabled: bool,
     ) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
         self.set_workspace_metadata(
-            "plan_auto_run_enabled",
+            PLAN_AUTO_RUN_DESIRED_ENABLED_KEY,
+            if enabled { "true" } else { "false" },
+        )?;
+        // Keep the legacy key synchronized for older binaries during a rolling upgrade.
+        self.set_workspace_metadata(
+            PLAN_AUTO_RUN_LEGACY_ENABLED_KEY,
             if enabled { "true" } else { "false" },
         )?;
         self.plan_auto_run_state()
+    }
+
+    pub fn block_plan_auto_run(
+        &mut self,
+        reason: &str,
+        plan_id: Option<&str>,
+        phase_id: Option<&str>,
+    ) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return self.clear_plan_auto_run_block();
+        }
+        self.set_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_REASON_KEY, reason)?;
+        self.set_optional_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY, plan_id)?;
+        self.set_optional_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY, phase_id)?;
+        self.plan_auto_run_state()
+    }
+
+    pub fn clear_plan_auto_run_block(
+        &mut self,
+    ) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
+        self.delete_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_REASON_KEY)?;
+        self.delete_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY)?;
+        self.delete_workspace_metadata(PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY)?;
+        self.plan_auto_run_state()
+    }
+
+    fn set_optional_workspace_metadata(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => self.set_workspace_metadata(key, value),
+            None => self.delete_workspace_metadata(key),
+        }
+    }
+
+    fn delete_workspace_metadata(&mut self, key: &str) -> Result<(), WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM workspace_metadata WHERE key = ?1",
+                params![key],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
     }
 
     pub fn next_plan_auto_run_candidate(
@@ -849,14 +942,10 @@ impl WorkspaceDatabase {
     }
 
     pub fn disable_plan_auto_run_if_idle(&mut self) -> Result<bool, WorkspaceDatabaseError> {
-        if !matches!(
+        Ok(matches!(
             self.next_plan_auto_run_candidate()?,
             PlanAutoRunSelection::Idle
-        ) {
-            return Ok(false);
-        }
-        self.set_workspace_metadata("plan_auto_run_enabled", "false")?;
-        Ok(true)
+        ))
     }
 
     pub fn plan_auto_run_has_in_flight(&self) -> Result<bool, WorkspaceDatabaseError> {
@@ -2119,6 +2208,7 @@ impl WorkspaceDatabase {
                 params![plan_id.trim(), commit_id, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        self.clear_plan_auto_run_block()?;
         self.plan(plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!(
@@ -2324,6 +2414,7 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| self.sqlite_error(source))?;
 
+        self.clear_plan_auto_run_block()?;
         self.plan_phase_attempt(&attempt_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan phase attempt was not found after insert: {attempt_id}"),
@@ -3170,6 +3261,7 @@ impl WorkspaceDatabase {
                     params![phase.plan_id.as_str(), commit_id, now],
                 )
                 .map_err(|source| self.sqlite_error(source))?;
+            self.clear_plan_auto_run_block()?;
             return self.plan(&phase.plan_id).and_then(|plan| {
                 plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                     message: format!(
@@ -3502,11 +3594,27 @@ impl WorkspaceDatabase {
         transaction
             .execute(
                 "INSERT INTO workspace_metadata (key, value, updated_at)
-                 VALUES ('plan_auto_run_enabled', 'false', ?1)
+                 VALUES (?1, 'cancelled_phase', ?2)
                  ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value,
                     updated_at = excluded.updated_at",
-                params![now],
+                params![PLAN_AUTO_RUN_BLOCKED_REASON_KEY, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO workspace_metadata (key, value, updated_at)
+                 VALUES (?1, ?2, ?4), (?3, ?5, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at",
+                params![
+                    PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY,
+                    phase.plan_id.as_str(),
+                    PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY,
+                    now,
+                    phase.id.as_str()
+                ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
         transaction
@@ -3576,7 +3684,11 @@ impl WorkspaceDatabase {
                 params![phase.plan_id.as_str(), error_message, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
-        self.set_workspace_metadata("plan_auto_run_enabled", "false")?;
+        self.block_plan_auto_run(
+            "waiting_for_retry",
+            Some(phase.plan_id.as_str()),
+            Some(phase.id.as_str()),
+        )?;
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after phase failure: {}", phase.plan_id),
@@ -3640,6 +3752,11 @@ impl WorkspaceDatabase {
                 params![phase.plan_id.as_str(), error_message, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        self.block_plan_auto_run(
+            "merge_blocked",
+            Some(phase.plan_id.as_str()),
+            Some(phase.id.as_str()),
+        )?;
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after merge block: {}", phase.plan_id),
