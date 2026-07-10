@@ -12,8 +12,9 @@ use axum::{
 use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
-    ProviderConfigError, ProviderModelRedirect, fetch_provider_model_ids, normalized_base_url,
-    parse_provider_kind, test_provider_connection, validate_model_redirects,
+    NeutralChatRequest, NeutralChatRole, ProviderConfigError, ProviderConnectionConfig,
+    ProviderModelRedirect, fetch_provider_model_ids, normalized_base_url, parse_provider_kind,
+    test_provider_connection, validate_model_redirects,
 };
 use foco_store::{
     config::{
@@ -30,6 +31,9 @@ use foco_store::{
 use crate::*;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
+const MODEL_TEST_MAX_OUTPUT_TOKENS: u32 = 8;
+const MODEL_TEST_REQUEST_KIND: &str = "model availability test";
+const MODEL_TEST_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const REVIEW_AGENT_DEFINITION_ID: &str = "agent-definition-review";
 pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
 pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
@@ -280,6 +284,12 @@ pub(crate) struct ManualSkillsRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TestProviderRequest {
     pub(crate) provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TestModelRequest {
+    pub(crate) model_id: String,
 }
 
 #[derive(Deserialize)]
@@ -643,6 +653,15 @@ pub(crate) struct ProviderTestResponse {
     pub(crate) ok: bool,
     pub(crate) message: String,
     pub(crate) model_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelTestResponse {
+    pub(crate) ok: bool,
+    pub(crate) message: String,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2234,6 +2253,196 @@ pub(crate) async fn test_provider(
         message: format!("Connected; provider returned {model_count} models"),
         model_count,
     }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelTestExecutionOptions {
+    pub(crate) request_kind: &'static str,
+    pub(crate) timeout_ms: u64,
+    pub(crate) retry_count: u32,
+}
+
+pub(crate) fn model_test_execution_options() -> ModelTestExecutionOptions {
+    ModelTestExecutionOptions {
+        request_kind: MODEL_TEST_REQUEST_KIND,
+        timeout_ms: MODEL_TEST_TIMEOUT_MS,
+        retry_count: 0,
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ModelTestProbe {
+    pub(crate) model_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_config: ProviderConnectionConfig,
+    pub(crate) request: NeutralChatRequest,
+}
+
+pub(crate) async fn test_model(
+    State(state): State<AppState>,
+    Json(request): Json<TestModelRequest>,
+) -> Json<ModelTestResponse> {
+    let model_id = request.model_id.trim().to_string();
+    let config = match config_snapshot(&state) {
+        Ok(config) => config,
+        Err(error) => {
+            return Json(model_test_failure(model_id, None, error.message()));
+        }
+    };
+    let probe = match model_test_probe(&config, &model_id) {
+        Ok(probe) => probe,
+        Err(error) => {
+            return Json(model_test_failure(model_id, None, error.message()));
+        }
+    };
+    let workspace = match workspace_by_id(&config, &config.app.active_workspace_id) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return Json(model_test_failure(
+                probe.model_id,
+                Some(probe.provider_id),
+                error.message(),
+            ));
+        }
+    };
+    let workspace_path =
+        match crate::remote_workspace::workspace_audit_path(&state.user_profile_dir, workspace) {
+            Ok(workspace_path) => workspace_path,
+            Err(error) => {
+                return Json(model_test_failure(
+                    probe.model_id,
+                    Some(probe.provider_id),
+                    error.message(),
+                ));
+            }
+        };
+
+    let execution = model_test_execution_options();
+    let result = audited_provider_text_request(
+        &workspace_path,
+        &workspace.id,
+        None,
+        &probe.provider_id,
+        &probe.provider_config,
+        probe.request,
+        execution.request_kind,
+        execution.timeout_ms,
+        execution.retry_count,
+        api_audit_save_details(&config),
+    )
+    .await;
+
+    match result {
+        Ok(_) => Json(ModelTestResponse {
+            ok: true,
+            message: format!(
+                "Model '{}' responded successfully through provider '{}'",
+                probe.model_id, probe.provider_id
+            ),
+            model_id: probe.model_id,
+            provider_id: Some(probe.provider_id),
+        }),
+        Err(error) => Json(model_test_failure(
+            probe.model_id,
+            Some(probe.provider_id),
+            format!("Model availability test failed: {}", error.message()),
+        )),
+    }
+}
+
+pub(crate) fn model_test_probe(
+    config: &GlobalConfig,
+    model_id: &str,
+) -> Result<ModelTestProbe, ApiError> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("modelId must not be empty"));
+    }
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "model '{}' is disabled",
+            model.id
+        )));
+    }
+    if !model_outputs_text(model) {
+        return Err(ApiError::bad_request(format!(
+            "model '{}' does not support text output; availability testing is not supported for non-text models",
+            model.id
+        )));
+    }
+    let provider_id = model
+        .active_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "model '{}' has no active provider selected",
+                model.id
+            ))
+        })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' is not associated with model '{}'",
+            provider_id, model.id
+        )));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "active provider '{}' for model '{}' was not found",
+                provider_id, model.id
+            ))
+        })?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' for model '{}' is disabled",
+            provider.id, model.id
+        )));
+    }
+
+    Ok(ModelTestProbe {
+        model_id: model.id.clone(),
+        provider_id: provider.id.clone(),
+        provider_config: provider_connection_config(provider)?,
+        request: model_test_provider_request(&model.id),
+    })
+}
+
+pub(crate) fn model_test_provider_request(model_id: &str) -> NeutralChatRequest {
+    NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Reply with OK.".to_string(),
+        )],
+        tools: Vec::new(),
+        thinking_level: None,
+        max_output_tokens: Some(MODEL_TEST_MAX_OUTPUT_TOKENS),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    }
+}
+
+fn model_test_failure(
+    model_id: impl Into<String>,
+    provider_id: Option<String>,
+    message: impl Into<String>,
+) -> ModelTestResponse {
+    ModelTestResponse {
+        ok: false,
+        message: message.into(),
+        model_id: model_id.into(),
+        provider_id,
+    }
 }
 
 pub(crate) async fn provider_models(

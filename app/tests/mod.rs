@@ -14,7 +14,9 @@ use foco_agent::{
     AgentRunInput, AgentRunOutcome, AgentRunTask, ToolResource, ToolResourceAccess,
     ToolResourceLock, build_default_system_prompt, context_compression_trigger_tokens,
 };
-use foco_providers::{OPENAI_CHAT_KIND, ProviderModelRedirect, redirected_provider_model_ids};
+use foco_providers::{
+    OPENAI_CHAT_KIND, ProviderModelRedirect, ProviderRequestOverride, redirected_provider_model_ids,
+};
 use foco_store::{
     config::{
         DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME, PromptSettings,
@@ -26,10 +28,10 @@ use foco_store::{
         NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     workspace::{
-        LlmRequestAuditFilters, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphSymbol,
-        NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
-        WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
+        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewCodeGraphFileIndex,
+        NewCodeGraphImport, NewCodeGraphSymbol, NewPromptContextInjection, NewRunEvent,
+        NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewWorkspaceSpecJob,
+        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -49,10 +51,11 @@ use crate::http::{
     settings::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
         DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
-        ManualPromptSettingsRequest, UpdateAgentDefinitionRequest,
+        ManualPromptSettingsRequest, TestModelRequest, UpdateAgentDefinitionRequest,
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
-        default_plan_mode_system_prompt, filter_provider_model_ids,
-        normalize_chat_title_generation_model_id,
+        default_plan_mode_system_prompt, filter_provider_model_ids, model_test_execution_options,
+        model_test_probe, model_test_provider_request, normalize_chat_title_generation_model_id,
+        test_model,
     },
     skill_store::{
         SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
@@ -19654,6 +19657,272 @@ fn managed_agent_worktree_count(workspace_path: &Path) -> usize {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => panic!("read worktree root: {error}"),
     }
+}
+
+fn model_test_config(workspace_dir: PathBuf) -> GlobalConfig {
+    let mut config = prompt_test_config(workspace_dir);
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.api_key = Some("test-key".to_string());
+    config
+}
+
+fn model_test_error(config: &GlobalConfig, model_id: &str) -> String {
+    match model_test_probe(config, model_id) {
+        Ok(_) => panic!("model test probe should be rejected"),
+        Err(error) => error.message().to_string(),
+    }
+}
+
+#[test]
+fn model_test_probe_uses_active_provider_and_builds_minimal_request() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    let expected_redirects = vec![ProviderModelRedirect {
+        from: "upstream-model".to_string(),
+        to: "model".to_string(),
+    }];
+    let expected_overrides = vec![ProviderRequestOverride {
+        target: "header".to_string(),
+        name: "x-model-test".to_string(),
+        value_type: "string".to_string(),
+        value: json!("enabled"),
+    }];
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.base_url = Some("http://127.0.0.1:12345/v1".to_string());
+    provider.model_redirects = expected_redirects.clone();
+    provider.request_overrides = expected_overrides.clone();
+
+    let probe = model_test_probe(&config, "model").expect("valid model test probe");
+    assert_eq!(probe.model_id, "model");
+    assert_eq!(probe.provider_id, "provider");
+    assert_eq!(probe.provider_config.model_redirects, expected_redirects);
+    assert_eq!(probe.provider_config.request_overrides, expected_overrides);
+    assert_eq!(probe.request, model_test_provider_request("model"));
+    assert_eq!(probe.request.model_id, "model");
+    assert_eq!(probe.request.messages.len(), 1);
+    assert_eq!(probe.request.messages[0].role, NeutralChatRole::User);
+    assert_eq!(probe.request.messages[0].content, "Reply with OK.");
+    assert!(probe.request.tools.is_empty());
+    assert_eq!(probe.request.thinking_level, None);
+    assert_eq!(probe.request.max_output_tokens, Some(8));
+
+    let execution = model_test_execution_options();
+    assert_eq!(execution.request_kind, "model availability test");
+    assert_eq!(execution.timeout_ms, 15_000);
+    assert_eq!(execution.retry_count, 0);
+    assert!(MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.contains(&execution.request_kind));
+}
+
+#[test]
+fn model_test_probe_rejects_disabled_and_non_text_models() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.models[0].enabled = false;
+    assert!(model_test_error(&config, "model").contains("model 'model' is disabled"));
+
+    config.models[0].enabled = true;
+    config.models[0].output_modalities = vec!["image".to_string()];
+    let error = model_test_error(&config, "model");
+    assert!(error.contains("does not support text output"));
+    assert!(error.contains("non-text models"));
+}
+
+#[test]
+fn model_test_probe_rejects_missing_invalid_and_disabled_active_provider() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let mut config = model_test_config(workspace.path().to_path_buf());
+
+    config.models[0].active_provider_id = None;
+    assert!(model_test_error(&config, "model").contains("has no active provider selected"));
+
+    config.models[0].active_provider_id = Some("other-provider".to_string());
+    assert!(model_test_error(&config, "model").contains("is not associated with model"));
+
+    config.models[0]
+        .provider_ids
+        .push("missing-provider".to_string());
+    config.models[0].active_provider_id = Some("missing-provider".to_string());
+    assert!(model_test_error(&config, "model").contains("was not found"));
+
+    config.models[0].active_provider_id = Some("provider".to_string());
+    config.providers[0].enabled = false;
+    assert!(model_test_error(&config, "model").contains("is disabled"));
+}
+
+async fn serve_model_test_fixture(
+    status: StatusCode,
+    delay: Duration,
+) -> (
+    String,
+    Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen_for_handler = seen.clone();
+            move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let seen = seen_for_handler.clone();
+                async move {
+                    seen.lock()
+                        .expect("model test request capture")
+                        .push((headers, payload));
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    if !status.is_success() {
+                        return (
+                            status,
+                            Json(json!({ "error": { "message": "fixture rejected request" } })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind model test fixture server");
+    let addr = listener.local_addr().expect("model test fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), seen, task)
+}
+
+async fn run_model_test_handler(
+    workspace_path: PathBuf,
+    base_url: String,
+) -> crate::http::settings::ModelTestResponse {
+    let mut config = model_test_config(workspace_path);
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.base_url = Some(base_url);
+    provider.model_redirects = vec![ProviderModelRedirect {
+        from: "upstream-model".to_string(),
+        to: "model".to_string(),
+    }];
+    provider.request_overrides = vec![ProviderRequestOverride {
+        target: "header".to_string(),
+        name: "x-model-test".to_string(),
+        value_type: "string".to_string(),
+        value: json!("enabled"),
+    }];
+    let profile = tempfile::tempdir().expect("model test profile");
+    let state = test_app_state(config, profile.path().to_path_buf());
+    test_model(
+        State(state),
+        Json(TestModelRequest {
+            model_id: "model".to_string(),
+        }),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn test_model_handler_returns_success_for_upstream_text_response() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let (base_url, seen, server_task) =
+        serve_model_test_fixture(StatusCode::OK, Duration::ZERO).await;
+
+    let response = run_model_test_handler(workspace.path().to_path_buf(), base_url).await;
+    server_task.abort();
+
+    assert!(response.ok);
+    assert_eq!(response.model_id, "model");
+    assert_eq!(response.provider_id.as_deref(), Some("provider"));
+    assert!(response.message.contains("responded successfully"));
+
+    let seen = seen.lock().expect("model test request capture");
+    assert_eq!(seen.len(), 1);
+    let (headers, payload) = &seen[0];
+    assert_eq!(
+        headers
+            .get("x-model-test")
+            .and_then(|value| value.to_str().ok()),
+        Some("enabled")
+    );
+    assert_eq!(
+        payload.get("model").and_then(Value::as_str),
+        Some("upstream-model")
+    );
+    assert_eq!(payload.get("stream").and_then(Value::as_bool), Some(true));
+    assert_eq!(payload.get("max_tokens").and_then(Value::as_u64), Some(8));
+    assert!(payload.get("tools").is_none());
+    assert!(payload.get("reasoning_effort").is_none());
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let audits = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_kind: Some("model availability test"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("model test audit rows");
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].final_state, "succeeded");
+}
+
+#[tokio::test]
+async fn test_model_handler_returns_readable_upstream_failure() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let (base_url, seen, server_task) =
+        serve_model_test_fixture(StatusCode::BAD_GATEWAY, Duration::ZERO).await;
+
+    let response = run_model_test_handler(workspace.path().to_path_buf(), base_url).await;
+    server_task.abort();
+
+    assert!(!response.ok);
+    assert_eq!(response.provider_id.as_deref(), Some("provider"));
+    assert!(response.message.contains("Model availability test failed"));
+    assert!(response.message.contains("502"));
+    assert_eq!(seen.lock().expect("model test request capture").len(), 1);
+}
+
+#[tokio::test]
+async fn run_provider_stream_for_text_returns_readable_timeout() {
+    let (base_url, _seen, server_task) =
+        serve_model_test_fixture(StatusCode::OK, Duration::from_millis(50)).await;
+    let request = model_test_provider_request("model");
+    let provider_config = ProviderConnectionConfig {
+        kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("provider kind"),
+        base_url: Some(base_url),
+        api_key: Some("test-key".to_string()),
+        proxy_url: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+    };
+    let error =
+        match run_provider_stream_for_text(&provider_config, request, "model availability test", 1)
+            .await
+        {
+            Ok(_) => panic!("model test should time out"),
+            Err(error) => error,
+        };
+    server_task.abort();
+    assert_eq!(
+        error.message,
+        "model availability test timed out after 1 ms"
+    );
 }
 
 fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {

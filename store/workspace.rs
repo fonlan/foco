@@ -75,6 +75,7 @@ pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
     "contextCompression",
     "memory extraction",
     "memory retrieval",
+    "model availability test",
     "workspace spec compaction",
     "workspace spec generation",
     "workspace spec update",
