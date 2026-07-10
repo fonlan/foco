@@ -1382,6 +1382,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Detected skills": "已发现技能",
     "skills {count}": "技能 {count}",
     "Enable skill {name}": "启用技能 {name}",
+    "Enable skill location {path}": "启用技能位置 {path}",
     "No detected skills": "暂无已发现技能",
     "Delete skill": "删除技能",
     "Delete skill {name}": "删除技能 {name}",

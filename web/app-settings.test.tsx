@@ -282,6 +282,36 @@ describe("app-settings verification surfaces", () => {
     ]);
   });
 
+  it("toggles a skill location with a location-only request", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const locationPath = "C:\\Users\\fonla\\.agents\\skills";
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    const locationToggle = screen.getByRole("checkbox", {
+      name: `Enable skill location ${locationPath}`,
+    });
+    const locationRow = screen.getByText(locationPath).closest("div");
+    expect(locationToggle).toBeChecked();
+    expect(locationRow).not.toBeNull();
+    expect(within(locationRow as HTMLElement).getByRole("checkbox")).toBe(locationToggle);
+
+    await userEvent.click(locationToggle);
+
+    await waitFor(() => expect(locationToggle).not.toBeChecked());
+    expect(screen.queryByText("Project memory.")).toBeNull();
+    const request = fetchMock.mock.calls.find(([url]) => url === "/api/skills/manual");
+    expect(request).toBeDefined();
+    const body = JSON.parse(String(request?.[1]?.body));
+    expect(body).toEqual({ disabledLocationIds: ["global:agents"] });
+    expect(body).not.toHaveProperty("disabled");
+    expect(body).not.toHaveProperty("enabled");
+    expect(body).not.toHaveProperty("translationModelId");
+  });
+
   it("saves the skill translation model without changing enabled skills", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

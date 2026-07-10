@@ -1889,8 +1889,15 @@ export type McpServerFormState = {
 
 // Skills types
 
+export type SkillLocationSummary = {
+  id: string;
+  path: string;
+  enabled: boolean;
+};
+
 type SkillsSettingsSummary = {
   directories: string[];
+  locations?: SkillLocationSummary[];
   detected: ConfiguredSkillSummary[];
   errors: SkillDiscoveryErrorSummary[];
   translationModelId: string | null;

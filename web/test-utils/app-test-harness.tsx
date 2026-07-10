@@ -410,6 +410,13 @@ export const settings = {
       },
     ],
     directories: ["C:\\Users\\fonla\\.agents\\skills"],
+    locations: [
+      {
+        enabled: true,
+        id: "global:agents",
+        path: "C:\\Users\\fonla\\.agents\\skills",
+      },
+    ],
     errors: [],
     translationModelId: null as string | null,
   },
@@ -2178,6 +2185,7 @@ export const appTestState: {
     skills: {
       detected: ConfiguredSkillSummary[];
       directories: string[];
+      locations?: { id: string; path: string; enabled: boolean }[];
       errors: { path: string; message: string }[];
       translationModelId: string | null;
     };
@@ -2385,21 +2393,40 @@ function savedSkillsSettings(init?: RequestInit) {
     disabled?: string[];
     enabled?: string[];
     translationModelId?: string | null;
+    disabledLocationIds?: string[];
   };
   const enabled = new Set(body.enabled ?? []);
   const disabled = new Set(body.disabled ?? []);
+  const disabledLocationIds = new Set(body.disabledLocationIds ?? []);
+  const hasLocationUpdate = body.disabledLocationIds !== undefined;
 
   appTestState.settingsResponse = {
     ...appTestState.settingsResponse,
     skills: {
       ...appTestState.settingsResponse.skills,
-      detected: appTestState.settingsResponse.skills.detected.map((skill) => ({
-        ...skill,
-        enabled: enabled.has(skill.key)
-          ? true
-          : disabled.has(skill.key)
-            ? false
-            : skill.enabled,
+      detected: appTestState.settingsResponse.skills.detected
+        .filter((skill) =>
+          hasLocationUpdate
+            ? !disabledLocationIds.has(
+              skill.scope === "global"
+                ? "global:agents"
+                : `workspace:${skill.workspaceId}:agents`,
+            )
+            : true,
+        )
+        .map((skill) => ({
+          ...skill,
+          enabled: enabled.has(skill.key)
+            ? true
+            : disabled.has(skill.key)
+              ? false
+              : skill.enabled,
+        })),
+      locations: appTestState.settingsResponse.skills.locations?.map((location) => ({
+        ...location,
+        enabled: hasLocationUpdate
+          ? !disabledLocationIds.has(location.id)
+          : location.enabled,
       })),
       translationModelId:
         body.translationModelId === undefined

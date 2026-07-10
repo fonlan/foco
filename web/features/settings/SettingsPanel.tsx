@@ -136,6 +136,7 @@ import type {
   SettingsWorkspaceSpecJobSummary,
   SettingsWorkspaceSpecJobsResponse,
   SpecSettingsFormState,
+  SkillLocationSummary,
   SystemPromptSummary,
   TerminalShellSummary,
   Translate,
@@ -819,6 +820,13 @@ export function SettingsPanel({
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
   const skills = settings?.skills;
+  const skillLocations: SkillLocationSummary[] =
+    skills?.locations ??
+    (skills?.directories ?? []).map((path) => ({
+      enabled: true,
+      id: path,
+      path,
+    }));
   const currentEnabledSkillIds =
     enabledSkillIds ??
     new Set((skills?.detected ?? []).filter((skill) => skill.enabled).map((skill) => skill.key));
@@ -3930,6 +3938,26 @@ export function SettingsPanel({
     }
   }
 
+  async function saveSkillLocations(nextDisabledLocationIds: string[]) {
+    setIsSavingSkills(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/skills/manual", {
+        body: JSON.stringify({ disabledLocationIds: nextDisabledLocationIds }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncSkillsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSkills(false);
+    }
+  }
+
   async function deleteSkill(skill: ConfiguredSkillSummary) {
     if (!window.confirm(t("Delete skill confirmation"))) {
       return;
@@ -4547,6 +4575,13 @@ export function SettingsPanel({
 
     setEnabledSkillIds(next);
     void saveSkills(next);
+  }
+
+  function toggleSkillLocation(locationId: string, checked: boolean) {
+    const nextDisabledLocationIds = skillLocations
+      .filter((location) => (location.id === locationId ? !checked : !location.enabled))
+      .map((location) => location.id);
+    void saveSkillLocations(nextDisabledLocationIds);
   }
 
   function changeSkillTranslationModel(modelId: string) {
@@ -10859,13 +10894,37 @@ export function SettingsPanel({
                   </h3>
                 </div>
                 <div className="mt-4 grid gap-2">
-                  {skills?.directories.length ? (
-                    skills.directories.map((directory) => (
+                  {skillLocations.length ? (
+                    skillLocations.map((location) => (
                       <div
-                        className="break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
-                        key={directory}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
+                        key={location.id}
                       >
-                        {directory}
+                        <span className="min-w-0 break-all">{location.path}</span>
+                        <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                          <input
+                            aria-label={t("Enable skill location {path}", {
+                              path: location.path,
+                            })}
+                            checked={location.enabled}
+                            className="peer sr-only"
+                            disabled={
+                              isSavingSkills ||
+                              isRefreshingSkills ||
+                              isUpdatingAllSkills ||
+                              updatingSkillKey !== null
+                            }
+                            onChange={(event) =>
+                              toggleSkillLocation(location.id, event.target.checked)
+                            }
+                            title={t("Enable skill location {path}", {
+                              path: location.path,
+                            })}
+                            type="checkbox"
+                          />
+                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                        </label>
                       </div>
                     ))
                   ) : (
