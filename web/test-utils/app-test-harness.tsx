@@ -190,6 +190,7 @@ export const settings = {
     language: "en",
     llmRequestRetryCount: 3,
     maxLlmRequestRetryCount: 10,
+    runtimeToolStateCompressionEnabled: false,
     supportedLanguages: [
       { id: "en", name: "English" },
       { id: "zh-CN", name: "简体中文" },
@@ -2618,6 +2619,10 @@ export function savedGeneralSettings(init?: RequestInit) {
         typeof body.llmRequestRetryCount === "number"
           ? body.llmRequestRetryCount
           : settings.general.llmRequestRetryCount,
+      runtimeToolStateCompressionEnabled:
+        typeof body.runtimeToolStateCompressionEnabled === "boolean"
+          ? body.runtimeToolStateCompressionEnabled
+          : settings.general.runtimeToolStateCompressionEnabled,
       theme:
         body.theme === "dark" || body.theme === "light"
           ? body.theme
@@ -3553,7 +3558,9 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/settings/general") {
-    return jsonResponse(savedGeneralSettings(init));
+    const savedSettings = savedGeneralSettings(init);
+    appTestState.settingsResponse = savedSettings;
+    return jsonResponse(savedSettings);
   }
 
   if (path === "/api/settings/memory") {

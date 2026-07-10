@@ -1526,6 +1526,7 @@ export type GeneralSettingsSummary = {
   language: AppLanguageId;
   llmRequestRetryCount: number;
   maxLlmRequestRetryCount: number;
+  runtimeToolStateCompressionEnabled: boolean;
   supportedLanguages: AppLanguageSummary[];
   supportedThemes: AppThemeSummary[];
   theme: AppThemeId;
@@ -1543,6 +1544,7 @@ export type GeneralFormState = {
   listenPort: string;
   llmRequestRetryCount: string;
   password: string;
+  runtimeToolStateCompressionEnabled: boolean;
   theme: AppThemeId;
 };
 

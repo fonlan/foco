@@ -978,6 +978,8 @@ export function SettingsPanel({
       listenPort: String(data.general.webServer.listenPort),
       llmRequestRetryCount: String(data.general.llmRequestRetryCount),
       password: "",
+      runtimeToolStateCompressionEnabled:
+        data.general.runtimeToolStateCompressionEnabled ?? false,
       theme: data.general.theme,
     });
   }
@@ -2075,6 +2077,8 @@ export function SettingsPanel({
           hookAuditEnabled: generalForm.hookAuditEnabled,
           language: generalForm.language,
           password: password.trim() ? password : null,
+          runtimeToolStateCompressionEnabled:
+            generalForm.runtimeToolStateCompressionEnabled,
           theme: generalForm.theme,
         }),
         headers: { "Content-Type": "application/json" },
@@ -4970,6 +4974,39 @@ export function SettingsPanel({
                         ))}
                     </select>
                   </label>
+                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                      {t("Context management")}
+                    </legend>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-stone-800">
+                          {t("Runtime tool-state compression")}
+                        </p>
+                        <p className="mt-1 max-w-3xl text-xs leading-5 text-stone-500">
+                          {t(
+                            "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost.",
+                          )}
+                        </p>
+                      </div>
+                      <label
+                        aria-label={t("Runtime tool-state compression")}
+                        className="inline-flex size-10 shrink-0 items-center justify-center self-end rounded-lg border border-stone-200 bg-white sm:self-auto"
+                      >
+                        <input
+                          checked={generalForm.runtimeToolStateCompressionEnabled}
+                          className="size-4 accent-teal-700"
+                          onChange={(event) =>
+                            setGeneralForm((current) => ({
+                              ...current,
+                              runtimeToolStateCompressionEnabled: event.target.checked,
+                            }))
+                          }
+                          type="checkbox"
+                        />
+                      </label>
+                    </div>
+                  </fieldset>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                       {t("API request detail retention days")}
@@ -12904,6 +12941,7 @@ function emptyGeneralForm(): GeneralFormState {
     listenPort: "3210",
     llmRequestRetryCount: "3",
     password: "",
+    runtimeToolStateCompressionEnabled: false,
     theme: "light",
   };
 }

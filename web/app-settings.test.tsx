@@ -1120,6 +1120,43 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("saves and reloads runtime tool-state compression from general settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const compressionToggle = await screen.findByRole("checkbox", {
+      name: "Runtime tool-state compression",
+    });
+
+    expect(compressionToggle).not.toBeChecked();
+    expect(
+      screen.getByText(
+        "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost.",
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.click(compressionToggle);
+    await userEvent.click(screen.getByRole("button", { name: "Save general settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining('"runtimeToolStateCompressionEnabled":true'),
+          method: "POST",
+        }),
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Reload general settings" }));
+    expect(
+      await screen.findByRole("checkbox", {
+        name: "Runtime tool-state compression",
+      }),
+    ).toBeChecked();
+  });
+
   it("saves API request audit settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
