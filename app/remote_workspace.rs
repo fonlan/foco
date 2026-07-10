@@ -4758,6 +4758,28 @@ fn remote_optional_string(value: Option<&Value>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn remote_queued_skill_ids(value: Option<&Value>) -> Value {
+    Value::Array(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|skill_id| Value::String(skill_id.to_string()))
+            .collect(),
+    )
+}
+
+fn remote_normalize_queued_run_skill_ids(queued_run: &mut Value) {
+    let Some(object) = queued_run.as_object_mut() else {
+        return;
+    };
+    let skill_ids =
+        remote_queued_skill_ids(object.get("skillIds").or_else(|| object.get("skill_ids")));
+    object.remove("skill_ids");
+    object.insert("skillIds".to_string(), skill_ids);
+}
+
 fn remote_idempotency_key(payload: &Value, fallback: &str) -> String {
     remote_optional_string(payload.get("idempotencyKey")).unwrap_or_else(|| {
         let mut hasher = Sha256::new();
@@ -4793,6 +4815,7 @@ fn remote_chat_queued_run_for_chat(
                 .entry("content".to_string())
                 .or_insert_with(|| Value::String(message.content));
         }
+        remote_normalize_queued_run_skill_ids(&mut queued_run);
         return Ok(Some(queued_run));
     }
     Ok(None)
@@ -4825,6 +4848,8 @@ async fn remote_sidecar_chat_queue(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id = remote_optional_string(payload.get("providerId"));
     let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let skill_ids =
+        remote_queued_skill_ids(payload.get("skillIds").or_else(|| payload.get("skill_ids")));
     let session_mode = remote_optional_string(payload.get("sessionMode"));
     let mut database = sidecar_workspace_database(&state)?;
     let chat_id =
@@ -4902,7 +4927,7 @@ async fn remote_sidecar_chat_queue(
         "modelId": model_id,
         "providerId": provider_id,
         "thinkingLevel": thinking_level,
-        "skillIds": payload.get("skillIds").cloned().unwrap_or_else(|| json!([])),
+        "skillIds": skill_ids,
         "sessionMode": session_mode,
         "content": message,
         "idempotencyKey": idempotency_key,
@@ -7909,6 +7934,7 @@ mod tests {
                 "message": "hello from queue",
                 "modelId": "model-1",
                 "providerId": "provider-1",
+                "skillIds": null,
                 "idempotencyKey": "submit-1",
             })),
         )
@@ -7922,6 +7948,7 @@ mod tests {
             .0;
         assert_eq!(chats["chats"][0]["id"], queued["chatId"]);
         assert_eq!(chats["chats"][0]["queuedRun"]["status"], "queued");
+        assert_eq!(chats["chats"][0]["queuedRun"]["skillIds"], json!([]));
         assert_eq!(
             chats["chats"][0]["queuedRun"]["content"],
             "hello from queue"
@@ -7930,6 +7957,55 @@ mod tests {
             chats["chats"][0]["queuedRun"]["userMessageId"],
             queued["userMessageId"]
         );
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_chats_normalizes_legacy_queued_run_skill_ids() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat_with_metadata("chat-legacy", "Legacy queue", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "legacy-user",
+                chat_id: "chat-legacy",
+                role: "user",
+                content: "legacy queued message",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "legacy-user",
+                            "assistantMessageId": "legacy-assistant",
+                            "modelId": "model-1",
+                            "providerId": "provider-1",
+                            "skill_ids": null,
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert legacy message");
+
+        let chats = remote_sidecar_workspace_chats(State(state), Query(HashMap::new()))
+            .await
+            .expect("workspace chats")
+            .0;
+
+        assert_eq!(chats["chats"][0]["queuedRun"]["skillIds"], json!([]));
+        assert!(chats["chats"][0]["queuedRun"].get("skill_ids").is_none());
+    }
+
+    #[test]
+    fn remote_queued_skill_ids_keeps_only_strings() {
+        assert_eq!(
+            remote_queued_skill_ids(Some(&json!(["skill-a", null, 7, "skill-b"]))),
+            json!(["skill-a", "skill-b"])
+        );
+        assert_eq!(remote_queued_skill_ids(Some(&json!("skill-a"))), json!([]));
     }
 
     #[tokio::test]

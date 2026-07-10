@@ -138,10 +138,11 @@ export function selectedSkillPrefix(
 
 export function messageWithSelectedSkills(
   skills: ConfiguredSkillSummary[],
-  skillIds: string[],
+  skillIds: string[] | null | undefined,
   message: string,
 ) {
-  const links = skillIds
+  const links = (Array.isArray(skillIds) ? skillIds : [])
+    .filter((skillId): skillId is string => typeof skillId === "string")
     .map((skillId) => skills.find((skill) => skill.key === skillId))
     .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill))
     .map((skill) => `[$${skill.name}](${skill.path})`);

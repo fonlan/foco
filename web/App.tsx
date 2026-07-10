@@ -4868,7 +4868,7 @@ export function App() {
             modelId: chat.queuedRun.modelId,
             providerId: chat.queuedRun.providerId,
             thinkingLevel: chat.queuedRun.thinkingLevel ?? "",
-            skillIds: chat.queuedRun.skillIds,
+            skillIds: normalizeStringArray(chat.queuedRun.skillIds),
             localChatKey: chatKey,
             pendingUserMessageId: chat.queuedRun.userMessageId,
             queuedUserMessageId: chat.queuedRun.userMessageId,
@@ -4918,7 +4918,7 @@ export function App() {
         modelId: message.queuedRun?.modelId ?? "",
         providerId: message.queuedRun?.providerId ?? "",
         thinkingLevel: message.queuedRun?.thinkingLevel ?? "",
-        skillIds: message.queuedRun?.skillIds ?? [],
+        skillIds: normalizeStringArray(message.queuedRun?.skillIds),
         localChatKey: chatKey,
         pendingUserMessageId: message.id,
         queuedUserMessageId: message.id,
@@ -15217,6 +15217,12 @@ function normalizeChatMessagesPagination(
   };
 }
 
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
 function normalizeQueuedMessageRunSummary(
   queuedRun: QueuedMessageRunSummary | null | undefined,
 ): QueuedMessageRunSummary | null {
@@ -15250,9 +15256,7 @@ function normalizeQueuedMessageRunSummary(
     modelId,
     providerId: typeof providerId === "string" ? providerId : null,
     thinkingLevel: typeof thinkingLevel === "string" ? thinkingLevel : null,
-    skillIds: Array.isArray(skillIds)
-      ? skillIds.filter((skillId): skillId is string => typeof skillId === "string")
-      : [],
+    skillIds: normalizeStringArray(skillIds),
     assistantMessageId:
       typeof assistantMessageId === "string" ? assistantMessageId : null,
     assistantSequence:

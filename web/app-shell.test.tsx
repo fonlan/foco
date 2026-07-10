@@ -98,6 +98,46 @@ describe("app-shell verification surfaces", () => {
     expect(within(workspaceList).queryByText("Second chat")).not.toBeInTheDocument();
   });
 
+  it("starts a restored queued chat when workspace skillIds is null", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            activeRun: null,
+            codeChangeStats: { additions: 0, deletions: 0 },
+            createdAt: "2026-06-05T13:00:00Z",
+            id: "restored-queued-chat",
+            queuedRun: {
+              assistantMessageId: "restored-assistant",
+              content: "resume queued work",
+              modelId: "gpt-test",
+              providerId: "openai",
+              skillIds: null,
+              status: "queued",
+              thinkingLevel: null,
+              userMessageId: "restored-user",
+            },
+            title: "Restored queued chat",
+            updatedAt: "2026-06-05T13:00:00Z",
+          },
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(
+        vi.mocked(fetch).mock.calls.some(([input]) =>
+          String(input).includes("/api/workspaces/workspace-1/chat/stream"),
+        ),
+      ).toBe(true);
+    });
+    expect(appTestState.activeChatStreamController).not.toBeNull();
+  });
+
   it("refreshes workspaces and renders newly returned chats", async () => {
     renderApp();
 

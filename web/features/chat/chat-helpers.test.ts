@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { translate } from "../../shared/i18n";
-import { toolDisplayName } from "./chat-helpers";
+import { messageWithSelectedSkills, toolDisplayName } from "./chat-helpers";
 
 describe("chat display helpers", () => {
   it("localizes known tool names and memory labels", () => {
@@ -20,5 +20,30 @@ describe("chat display helpers", () => {
     expect(toolDisplayName("read_spec", "zh-CN")).toBe("读取 Spec");
     expect(toolDisplayName("search_query", "zh-CN")).toBe("工具");
     expect(translate("Memories used", {}, "zh-CN")).toBe("使用记忆");
+  });
+
+  it("treats invalid selected skill ids as no skills", () => {
+    const skills = [
+      {
+        canEnable: true,
+        description: "Project memory.",
+        enabled: true,
+        id: "gitmemo",
+        key: "global:gitmemo",
+        name: "gitmemo",
+        path: "/skills/gitmemo/SKILL.md",
+        scope: "global" as const,
+        warnings: [],
+        workspaceId: null,
+        workspaceName: null,
+      },
+    ];
+
+    expect(messageWithSelectedSkills(skills, null, "hello")).toBe("hello");
+    expect(messageWithSelectedSkills(skills, undefined, "hello")).toBe("hello");
+    expect(messageWithSelectedSkills(skills, ["unknown"], "hello")).toBe("hello");
+    expect(messageWithSelectedSkills(skills, ["global:gitmemo"], "hello")).toBe(
+      "[$gitmemo](/skills/gitmemo/SKILL.md) hello",
+    );
   });
 });
