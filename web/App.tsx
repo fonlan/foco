@@ -1287,6 +1287,7 @@ export function App() {
     Record<string, RetryRunRequest[]>
   >({});
   const scheduledWorkspaceRunsRef = useRef<ScheduledWorkspaceRun[]>([]);
+  const failedRestoredQueuedRunKeysRef = useRef<Set<string>>(new Set());
   const pendingGuidanceMessageIdsRef = useRef<Map<string, string>>(new Map());
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => { });
   const hasAppliedInitialBrowserRouteRef = useRef(false);
@@ -3522,10 +3523,20 @@ export function App() {
           ),
         );
       } else {
+        if (nextRun.request.queuedUserMessageId) {
+          failedRestoredQueuedRunKeysRef.current.add(
+            restoredQueuedRunKey(
+              nextRun.workspaceId,
+              nextRun.chatId,
+              nextRun.request.queuedUserMessageId,
+            ),
+          );
+        }
         updateScheduledWorkspaceRuns((current) =>
           current.filter((run) => run.id !== nextRun.id),
         );
       }
+      void refreshWorkspaces();
     })();
   }, [runningChatKeys, scheduledWorkspaceRuns, workspaces]);
 
@@ -4851,8 +4862,14 @@ export function App() {
           }
 
           const chatKey = chatRunKey(workspace.id, chat.id);
+          const restoredRunKey = restoredQueuedRunKey(
+            workspace.id,
+            chat.id,
+            chat.queuedRun.userMessageId,
+          );
           if (
             nextRunChatKeys.has(chatKey) ||
+            failedRestoredQueuedRunKeysRef.current.has(restoredRunKey) ||
             !chat.queuedRun.modelId ||
             !chat.queuedRun.providerId ||
             !chat.queuedRun.content
@@ -4876,7 +4893,7 @@ export function App() {
           };
           const existingRun = currentByChatKey.get(chatKey);
           const scheduledRun: ScheduledWorkspaceRun = existingRun
-            ? { ...existingRun, request: queuedRequest, status: "queued" }
+            ? { ...existingRun, request: queuedRequest }
             : {
               id: chat.id,
               workspaceId: workspace.id,
@@ -13917,6 +13934,14 @@ function formatChatCreatedAt(value: string) {
 
 function chatRunKey(workspaceId: string, chatId: string) {
   return `${workspaceId}:${chatId}`;
+}
+
+function restoredQueuedRunKey(
+  workspaceId: string,
+  chatId: string,
+  userMessageId: string,
+) {
+  return `${workspaceId}\u0000${chatId}\u0000${userMessageId}`;
 }
 
 function parseChatRunKey(chatKey: string) {

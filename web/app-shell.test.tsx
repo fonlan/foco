@@ -138,6 +138,116 @@ describe("app-shell verification surfaces", () => {
     expect(appTestState.activeChatStreamController).not.toBeNull();
   });
 
+  it("does not restart the same restored queued chat after a stream error", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            activeRun: null,
+            codeChangeStats: { additions: 0, deletions: 0 },
+            createdAt: "2026-06-05T13:00:00Z",
+            id: "restored-queued-chat",
+            queuedRun: {
+              assistantMessageId: "restored-assistant",
+              content: "resume queued work",
+              modelId: "gpt-test",
+              providerId: "openai",
+              skillIds: [],
+              status: "queued",
+              thinkingLevel: null,
+              userMessageId: "restored-user",
+            },
+            title: "Restored queued chat",
+            updatedAt: "2026-06-05T13:00:00Z",
+          },
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    renderApp();
+
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await act(async () => {
+      enqueueChatStreamEvent({
+        message: "invalid provider request",
+        type: "error",
+      });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([input]) =>
+            String(input).includes("/api/workspaces/workspace-1/chat/stream"),
+          ),
+      ).toHaveLength(1),
+    );
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    });
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([input]) =>
+          String(input).includes("/api/workspaces/workspace-1/chat/stream"),
+        ),
+    ).toHaveLength(1);
+  });
+
+  it("does not restart a restored queued chat while its first stream is still running", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            activeRun: null,
+            codeChangeStats: { additions: 0, deletions: 0 },
+            createdAt: "2026-06-05T13:00:00Z",
+            id: "restored-queued-chat",
+            queuedRun: {
+              assistantMessageId: "restored-assistant",
+              content: "resume queued work",
+              modelId: "gpt-test",
+              providerId: "openai",
+              skillIds: [],
+              status: "queued",
+              thinkingLevel: null,
+              userMessageId: "restored-user",
+            },
+            title: "Restored queued chat",
+            updatedAt: "2026-06-05T13:00:00Z",
+          },
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    renderApp();
+
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    });
+
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([input]) =>
+          String(input).includes("/api/workspaces/workspace-1/chat/stream"),
+        ),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("refreshes workspaces and renders newly returned chats", async () => {
     renderApp();
 

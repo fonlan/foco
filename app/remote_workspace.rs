@@ -1460,14 +1460,30 @@ fn remote_sidecar_cancel_active_run(
 struct RemoteRunCleanupGuard {
     state: RemoteSidecarState,
     run_id: String,
+    queued_user_message_id: Option<String>,
     disarmed: bool,
 }
 
 impl RemoteRunCleanupGuard {
+    #[cfg(test)]
     fn new(state: RemoteSidecarState, run_id: String) -> Self {
         Self {
             state,
             run_id,
+            queued_user_message_id: None,
+            disarmed: false,
+        }
+    }
+
+    fn for_queued_message(
+        state: RemoteSidecarState,
+        run_id: String,
+        queued_user_message_id: String,
+    ) -> Self {
+        Self {
+            state,
+            run_id,
+            queued_user_message_id: Some(queued_user_message_id),
             disarmed: false,
         }
     }
@@ -1480,6 +1496,12 @@ impl RemoteRunCleanupGuard {
 impl Drop for RemoteRunCleanupGuard {
     fn drop(&mut self) {
         if !self.disarmed {
+            if let Some(queued_user_message_id) = self.queued_user_message_id.as_deref()
+                && let Ok(mut database) =
+                    WorkspaceDatabase::open_or_create(sidecar_workspace_path(&self.state))
+            {
+                let _ = remote_clear_message_queued_run(&mut database, queued_user_message_id);
+            }
             remote_sidecar_cancel_active_run(&self.state, &self.run_id, false, true);
         }
     }
@@ -4800,7 +4822,7 @@ fn remote_chat_queued_run_for_chat(
     chat_id: &str,
 ) -> Result<Option<Value>, foco_store::workspace::WorkspaceDatabaseError> {
     let messages = database.messages_for_chat(chat_id)?;
-    for message in messages.into_iter().rev() {
+    for message in messages {
         if message.role != "user" {
             continue;
         }
@@ -4837,6 +4859,27 @@ fn remote_clear_message_queued_run(
     if object.remove("queuedRun").is_none() {
         return Ok(());
     }
+    database.update_message_metadata(message_id, &metadata.to_string())
+}
+
+fn remote_mark_message_queued_run_started(
+    database: &mut WorkspaceDatabase,
+    message_id: &str,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    let Some(message) = database.message(message_id)? else {
+        return Ok(());
+    };
+    let Ok(mut metadata) = serde_json::from_str::<Value>(&message.metadata_json) else {
+        return Ok(());
+    };
+    let Some(queued_run) = metadata
+        .as_object_mut()
+        .and_then(|object| object.get_mut("queuedRun"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    queued_run.insert("status".to_string(), Value::String("running".to_string()));
     database.update_message_metadata(message_id, &metadata.to_string())
 }
 
@@ -5328,6 +5371,10 @@ fn remote_sidecar_chat_messages_for_request(
     assistant_message_id: &str,
 ) -> Result<Vec<NeutralChatMessage>, foco_store::workspace::WorkspaceDatabaseError> {
     let messages = database.messages_for_chat(chat_id)?;
+    let target_sequence = messages
+        .iter()
+        .find(|message| message.id == assistant_message_id)
+        .map(|message| message.sequence);
     let tool_calls = database.tool_calls_for_chat(chat_id)?;
     let mut tool_calls_by_message = HashMap::<String, Vec<_>>::new();
     for tool_call in tool_calls {
@@ -5342,6 +5389,9 @@ fn remote_sidecar_chat_messages_for_request(
 
     let mut raw_messages = Vec::new();
     for message in messages {
+        if target_sequence.is_some_and(|sequence| message.sequence > sequence) {
+            break;
+        }
         if message.role == "assistant" && message.id == assistant_message_id {
             continue;
         }
@@ -5370,6 +5420,13 @@ fn remote_sidecar_chat_messages_for_request(
                     });
                 }
             }
+        }
+        if message.role == "assistant"
+            && message.content.is_empty()
+            && reasoning.is_none()
+            && assistant_tool_calls.is_empty()
+        {
+            continue;
         }
         raw_messages.push(NeutralChatMessage {
             role: neutral_role_for_message(&message.role),
@@ -5977,7 +6034,7 @@ async fn remote_sidecar_chat_stream(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id =
         remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
-    let database = sidecar_workspace_database(&state)?;
+    let mut database = sidecar_workspace_database(&state)?;
     let chat = database
         .chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
@@ -6004,14 +6061,20 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
-    let initial_provider_request = remote_sidecar_provider_request(
+    let initial_provider_request = match remote_sidecar_provider_request(
         &state,
         &database,
         &chat_id,
         &assistant_message_id,
         &model_id,
         payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
-    )?;
+    ) {
+        Ok(request) => request,
+        Err(response) => {
+            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+            return Err(response);
+        }
+    };
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -6026,7 +6089,21 @@ async fn remote_sidecar_chat_stream(
     let stream_state = state.clone();
     let run_stream = run_stream.clone();
     let stream = async_stream::stream! {
-        let mut cleanup_guard = RemoteRunCleanupGuard::new(stream_state.clone(), run_id.clone());
+        let mut database = database;
+        if let Err(error) = remote_mark_message_queued_run_started(&mut database, &queued_user_message_id) {
+            yield Ok(remote_sidecar_record_run_event(&run_stream, 0, json!({
+                "type": "error",
+                "message": error.to_string(),
+            })));
+            yield Ok(remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" })));
+            remote_sidecar_finish_active_run(&stream_state, &run_id);
+            return;
+        }
+        let mut cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
+            stream_state.clone(),
+            run_id.clone(),
+            queued_user_message_id.clone(),
+        );
         let mut sequence = 0_i64;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -6060,21 +6137,6 @@ async fn remote_sidecar_chat_stream(
                 "modelId": model_id,
                 "request": current_request,
             });
-            let mut database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
-                Ok(database) => database,
-                Err(error) => {
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                        "type": "error",
-                        "message": error.to_string(),
-                    })));
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    return;
-                }
-            };
             let llm_turn = remote_sidecar_run_broker_llm_turn(
                 &stream_state,
                 &run_stream,
@@ -6261,12 +6323,14 @@ async fn remote_sidecar_chat_stream(
                     };
                 }
                 Err(()) => {
+                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
                     break;
                 }
             }
         }
+        let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
         remote_sidecar_finish_active_run(&stream_state, &run_id);
         cleanup_guard.disarm();
     };
@@ -7960,6 +8024,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_workspace_chats_exposes_oldest_queued_run_first() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        for (message, idempotency_key) in [("first", "submit-1"), ("second", "submit-2")] {
+            let _ = remote_sidecar_chat_queue(
+                State(state.clone()),
+                Json(json!({
+                    "chatId": "chat-1",
+                    "message": message,
+                    "modelId": "model-1",
+                    "providerId": "provider-1",
+                    "idempotencyKey": idempotency_key,
+                })),
+            )
+            .await
+            .expect("queue message");
+        }
+
+        let chats = remote_sidecar_workspace_chats(State(state), Query(HashMap::new()))
+            .await
+            .expect("workspace chats")
+            .0;
+
+        assert_eq!(chats["chats"][0]["queuedRun"]["content"], "first");
+    }
+
+    #[tokio::test]
     async fn remote_workspace_chats_normalizes_legacy_queued_run_skill_ids() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
@@ -8158,6 +8249,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_mark_message_queued_run_started_preserves_other_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "parts": [{ "type": "text", "text": "hello" }],
+                        "queuedRun": { "status": "queued" },
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+
+        remote_mark_message_queued_run_started(&mut database, "msg-user-1")
+            .expect("mark queued run started");
+
+        let message = database
+            .message("msg-user-1")
+            .expect("message lookup")
+            .expect("message");
+        let metadata: Value =
+            serde_json::from_str(&message.metadata_json).expect("message metadata");
+        assert_eq!(metadata["queuedRun"]["status"], "running");
+        assert_eq!(metadata["parts"][0]["text"], "hello");
+    }
+
+    #[test]
     fn remote_chat_completion_event_matches_frontend_stream_shape() {
         let event = remote_chat_completion_event(
             "chat-1",
@@ -8313,7 +8441,16 @@ mod tests {
                 role: "user",
                 content: "hello",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
@@ -8350,6 +8487,73 @@ mod tests {
         .expect("handler should return SSE before broker reconnects")
         .expect("SSE response");
         drop(response);
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let message = database
+            .message("msg-user-1")
+            .expect("message lookup")
+            .expect("message");
+        let metadata: Value =
+            serde_json::from_str(&message.metadata_json).expect("message metadata");
+        assert_eq!(metadata["queuedRun"]["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_clears_queue_after_started_stream_is_dropped() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        let (state, _broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let response = remote_sidecar_chat_stream(
+            State(state),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+        let body = response.into_response().into_body();
+        let reader = tokio::spawn(async move { axum::body::to_bytes(body, usize::MAX).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reader.abort();
+        let _ = reader.await;
+        tokio::task::yield_now().await;
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let message = database
+            .message("msg-user-1")
+            .expect("message lookup")
+            .expect("message");
+        let metadata: Value =
+            serde_json::from_str(&message.metadata_json).expect("message metadata");
+        assert!(metadata.get("queuedRun").is_none());
     }
 
     #[tokio::test]
@@ -9148,6 +9352,68 @@ mod tests {
             messages[2].content,
             json!({ "content": "[package]" }).to_string()
         );
+    }
+
+    #[test]
+    fn remote_sidecar_chat_messages_for_request_ignores_empty_placeholders_and_future_messages() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        for message in [
+            NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "first",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-user-2",
+                chat_id: "chat-1",
+                role: "user",
+                content: "second",
+                sequence: 2,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-2",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 3,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-user-3",
+                chat_id: "chat-1",
+                role: "user",
+                content: "future",
+                sequence: 4,
+                metadata_json: Some("{}"),
+            },
+        ] {
+            database.insert_message(message).expect("insert message");
+        }
+
+        let messages =
+            remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
+                .expect("chat messages");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "second");
     }
 
     #[test]
