@@ -957,6 +957,18 @@ function AiRequestDetailDialog({
                   label={t("Status")}
                   value={auditStatusText(request.finalState, t)}
                 />
+                {request.invalidatedAt ? (
+                  <AuditMeta
+                    label={t("Invalidated")}
+                    value={formatAuditDate(request.invalidatedAt, language)}
+                  />
+                ) : null}
+                {request.invalidatedReason ? (
+                  <AuditMeta
+                    label={t("Invalidated reason")}
+                    value={request.invalidatedReason}
+                  />
+                ) : null}
               </div>
               <div className="grid gap-4 xl:grid-cols-2">
                 <AuditJsonBlock

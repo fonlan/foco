@@ -62,9 +62,10 @@ use foco_store::{
         LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, MessageRoleCountRecord,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewPromptContextInjection, NewToolCall, NewToolResult, PromptContextInjectionRecord,
-        TodoGraphRecord, TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord,
-        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, workspace_database_path,
+        RewriteChatFromUserMessage, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
+        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        workspace_database_path,
     },
 };
 use foco_tools::{
@@ -1590,6 +1591,8 @@ struct AiRequestAuditSummary {
     total_latency_ms: Option<i64>,
     status_code: Option<i64>,
     final_state: String,
+    invalidated_at: Option<String>,
+    invalidated_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1616,6 +1619,8 @@ struct AiRequestAuditDetail {
     total_latency_ms: Option<i64>,
     status_code: Option<i64>,
     final_state: String,
+    invalidated_at: Option<String>,
+    invalidated_reason: Option<String>,
     request_body: Option<Value>,
     response_body: Option<Value>,
 }
@@ -1716,6 +1721,8 @@ struct ChatMessageSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     session_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_config: Option<ChatMessageRunConfigSummary>,
     pending_mode: Option<String>,
     queued_run: Option<QueuedMessageRunSummary>,
     tool_calls: Vec<ChatToolCallSummary>,
@@ -1724,6 +1731,17 @@ struct ChatMessageSummary {
     memories_used: Vec<ChatMemoryUsedSummary>,
     extracted_memories: Vec<ChatExtractedMemorySummary>,
     spec_updates: Vec<ChatSpecUpdateSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessageRunConfigSummary {
+    model_id: String,
+    provider_id: Option<String>,
+    thinking_level: Option<String>,
+    selected_skill_ids: Vec<String>,
+    session_mode: Option<String>,
+    team_mode_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -6567,9 +6585,13 @@ impl ApiError {
         error: foco_store::workspace::WorkspaceDatabaseError,
     ) -> Self {
         match error {
+            foco_store::workspace::WorkspaceDatabaseError::ChatRewriteConflict { .. } => {
+                Self::conflict(error.to_string())
+            }
             foco_store::workspace::WorkspaceDatabaseError::AgentDomain { .. }
             | foco_store::workspace::WorkspaceDatabaseError::AgentRuntimeJson { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::InvalidMessageMetadata { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidPlan { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidScheduledTaskData { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
@@ -8119,6 +8141,8 @@ fn ai_request_audit_summary(
         total_latency_ms: row.total_latency_ms,
         status_code: row.status_code,
         final_state: row.final_state,
+        invalidated_at: row.invalidated_at,
+        invalidated_reason: row.invalidated_reason,
     }
 }
 
@@ -8152,6 +8176,8 @@ fn ai_request_audit_detail(
         total_latency_ms: request.total_latency_ms,
         status_code: request.status_code,
         final_state: request.final_state,
+        invalidated_at: request.invalidated_at,
+        invalidated_reason: request.invalidated_reason,
         request_body: parse_optional_json_value(request.request_body_json, "LLM request body")?,
         response_body: parse_optional_json_value(request.response_body_json, "LLM response body")?,
     })
@@ -8880,6 +8906,7 @@ fn queued_user_message_metadata_json(
     thinking_level: Option<&str>,
     skill_ids: &[String],
     session_mode: Option<&str>,
+    team_mode_enabled: bool,
     origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = serde_json::from_str::<Value>(&user_message_metadata_json(attachments)?)
@@ -8892,6 +8919,11 @@ fn queued_user_message_metadata_json(
     if let Some(session_mode) = session_mode {
         metadata_object.insert("sessionMode".to_string(), json!(session_mode));
     }
+    metadata_object.insert("modelId".to_string(), json!(model_id));
+    metadata_object.insert("providerId".to_string(), json!(provider_id));
+    metadata_object.insert("thinkingLevel".to_string(), json!(thinking_level));
+    metadata_object.insert("selectedSkillIds".to_string(), json!(skill_ids));
+    metadata_object.insert("teamModeEnabled".to_string(), json!(team_mode_enabled));
     metadata_object.insert(
         "queuedRun".to_string(),
         json!({
@@ -10458,6 +10490,11 @@ fn chat_message_summaries_for_chat(
         } else {
             None
         };
+        let run_config = if is_user_message {
+            user_message_run_config(&message.metadata_json, queued_run.as_ref())?
+        } else {
+            None
+        };
         let metrics = metrics_by_message.remove(&message.id);
         let extracted_memories = extracted_memories_by_message
             .remove(&message.id)
@@ -10476,6 +10513,7 @@ fn chat_message_summaries_for_chat(
             reasoning,
             status,
             session_mode,
+            run_config,
             pending_mode,
             queued_run,
             tool_calls,
@@ -10843,6 +10881,55 @@ fn user_message_session_mode(
     Ok(string_json_field(&metadata, "sessionMode", "session_mode")
         .map(str::to_string)
         .or_else(|| queued_run.and_then(|queued_run| queued_run.session_mode.clone())))
+}
+
+fn user_message_run_config(
+    metadata_json: &str,
+    queued_run: Option<&QueuedMessageRunSummary>,
+) -> Result<Option<ChatMessageRunConfigSummary>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "user message metadata")?;
+    let model_id = string_json_field(&metadata, "modelId", "model_id")
+        .map(str::to_string)
+        .or_else(|| queued_run.map(|queued_run| queued_run.model_id.clone()));
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    let provider_id = string_json_field(&metadata, "providerId", "provider_id")
+        .map(str::to_string)
+        .or_else(|| queued_run.and_then(|queued_run| queued_run.provider_id.clone()));
+    let thinking_level = string_json_field(&metadata, "thinkingLevel", "thinking_level")
+        .map(str::to_string)
+        .or_else(|| queued_run.and_then(|queued_run| queued_run.thinking_level.clone()));
+    let session_mode = string_json_field(&metadata, "sessionMode", "session_mode")
+        .map(str::to_string)
+        .or_else(|| queued_run.and_then(|queued_run| queued_run.session_mode.clone()));
+    let selected_skill_ids = metadata
+        .get("selectedSkillIds")
+        .or_else(|| metadata.get("selected_skill_ids"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| queued_run.map(|queued_run| queued_run.skill_ids.clone()))
+        .unwrap_or_default();
+    let team_mode_enabled = metadata
+        .get("teamModeEnabled")
+        .or_else(|| metadata.get("team_mode_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(Some(ChatMessageRunConfigSummary {
+        model_id,
+        provider_id,
+        thinking_level,
+        selected_skill_ids,
+        session_mode,
+        team_mode_enabled,
+    }))
 }
 
 #[cfg(test)]

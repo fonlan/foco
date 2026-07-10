@@ -48,25 +48,27 @@ pub use workspace_records::{
     NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
     PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListPage, PlanPatch,
     PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
-    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
-    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RewriteChatFromUserMessage,
+    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
+    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
-    MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, Migration,
+    MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 31;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 32;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -257,6 +259,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 31,
         sql: MEMORY_FACT_ENABLED_MIGRATION_SQL,
+    },
+    Migration {
+        version: 32,
+        sql: MIGRATION_032,
     },
 ];
 
@@ -4384,6 +4390,673 @@ impl WorkspaceDatabase {
         }
     }
 
+    pub fn rewrite_chat_from_user_message(
+        &mut self,
+        rewrite: RewriteChatFromUserMessage<'_>,
+    ) -> Result<RewriteChatFromUserMessageResult, WorkspaceDatabaseError> {
+        validate_json_metadata(rewrite.user_metadata_json, "user message metadata")?;
+        validate_json_metadata(rewrite.chat_queued_run_json, "chat queued run")?;
+        validate_json_metadata(
+            rewrite.assistant_metadata_json,
+            "assistant message metadata",
+        )?;
+        if let Some(input_json) = rewrite.coordinator_task_input_json {
+            validate_agent_json(input_json, "input_json")?;
+        }
+        if rewrite.coordinator_task_id.is_some() != rewrite.coordinator_task_input_json.is_some() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Coordinator task id and input must be provided together".to_string(),
+            });
+        }
+
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let now = now_timestamp();
+        let chat = transaction
+            .query_row(
+                "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+                 FROM chats WHERE id = ?1",
+                params![rewrite.chat_id],
+                chat_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat was not found: {}", rewrite.chat_id),
+            })?;
+        let chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        if chat.archived_at.is_some() {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "archived chats are read-only".to_string(),
+            });
+        }
+        if chat_metadata.get("kind").and_then(Value::as_str)
+            == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND)
+        {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "memory Dream transcript chats are read-only".to_string(),
+            });
+        }
+        if chat_metadata
+            .get(QUEUED_CHAT_METADATA_KEY)
+            .is_some_and(|queued_run| !queued_run.is_null())
+        {
+            return Err(WorkspaceDatabaseError::ChatRewriteConflict {
+                message: "chat already has a queued or running run".to_string(),
+            });
+        }
+
+        let visible_message_sql = format!(
+            "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
+             FROM messages AS messages
+             WHERE messages.id = ?2 AND messages.chat_id = ?1
+             {VISIBLE_MESSAGE_FILTER_SQL}"
+        );
+        let user_message = transaction
+            .query_row(
+                &visible_message_sql,
+                params![rewrite.chat_id, rewrite.user_message_id],
+                message_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!(
+                    "visible message '{}' was not found in chat '{}'",
+                    rewrite.user_message_id, rewrite.chat_id
+                ),
+            })?;
+        if user_message.role != "user" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "only visible user messages can be edited".to_string(),
+            });
+        }
+        if rewrite
+            .expected_content
+            .is_some_and(|expected| expected != user_message.content)
+        {
+            return Err(WorkspaceDatabaseError::ChatRewriteConflict {
+                message: "user message content changed before it could be edited".to_string(),
+            });
+        }
+        let assistant_sequence = user_message.sequence.checked_add(1).ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "assistant message sequence overflowed".to_string(),
+            }
+        })?;
+
+        let agent_team = transaction
+            .query_row(
+                "SELECT id, coordinator_instance_id
+                 FROM agent_teams WHERE chat_id = ?1",
+                params![rewrite.chat_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if rewrite.coordinator_task_id.is_some() && agent_team.is_none() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "chat rewrite requested a Coordinator task without an Agent team"
+                    .to_string(),
+            });
+        }
+        let active_task_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM agent_tasks AS task
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE team.chat_id = ?1 AND task.status IN ('running', 'waiting')",
+                params![rewrite.chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if active_task_count > 0 {
+            return Err(WorkspaceDatabaseError::ChatRewriteConflict {
+                message: format!("chat has {active_task_count} running or waiting Agent task(s)"),
+            });
+        }
+
+        let mut removed_messages_statement = transaction
+            .prepare(
+                "SELECT id, metadata_json
+                 FROM messages
+                 WHERE chat_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let removed_message_rows = removed_messages_statement
+            .query_map(params![rewrite.chat_id, user_message.sequence], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let mut removed_message_ids = Vec::new();
+        let mut invalidated_run_ids = HashSet::new();
+        for row in removed_message_rows {
+            let (message_id, metadata_json) =
+                row.map_err(|source| sqlite_error(&database_path, source))?;
+            if let Ok(metadata) = serde_json::from_str::<Value>(&metadata_json)
+                && let Some(request_ids) = metadata
+                    .get("metrics")
+                    .and_then(|metrics| metrics.get("llmRequestIds"))
+                    .and_then(Value::as_array)
+            {
+                invalidated_run_ids.extend(
+                    request_ids
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+            removed_message_ids.push(message_id);
+        }
+        drop(removed_messages_statement);
+
+        let mut suffix_tasks_statement = transaction
+            .prepare(
+                "SELECT task.id, task.input_json
+                 FROM agent_tasks AS task
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE team.chat_id = ?1",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let suffix_task_rows = suffix_tasks_statement
+            .query_map(params![rewrite.chat_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let removed_message_id_set = removed_message_ids.iter().collect::<HashSet<_>>();
+        let mut suffix_task_ids = HashSet::new();
+        for row in suffix_task_rows {
+            let (task_id, input_json) =
+                row.map_err(|source| sqlite_error(&database_path, source))?;
+            let input = serde_json::from_str::<Value>(&input_json).map_err(|source| {
+                WorkspaceDatabaseError::AgentRuntimeJson {
+                    field: "agent_tasks.input_json",
+                    source,
+                }
+            })?;
+            let queued_user_message_id = input
+                .get("queuedUserMessageId")
+                .or_else(|| input.get("queued_user_message_id"))
+                .and_then(Value::as_str);
+            let visible_assistant_message_id = input
+                .get("visibleAssistantMessageId")
+                .or_else(|| input.get("visible_assistant_message_id"))
+                .and_then(Value::as_str);
+            let visible_assistant_sequence = input
+                .get("visibleAssistantSequence")
+                .or_else(|| input.get("visible_assistant_sequence"))
+                .and_then(Value::as_i64);
+            if queued_user_message_id == Some(rewrite.user_message_id)
+                || queued_user_message_id
+                    .is_some_and(|id| removed_message_id_set.contains(&id.to_string()))
+                || visible_assistant_message_id
+                    .is_some_and(|id| removed_message_id_set.contains(&id.to_string()))
+                || visible_assistant_sequence.is_some_and(|sequence| sequence >= assistant_sequence)
+            {
+                suffix_task_ids.insert(task_id);
+            }
+        }
+        drop(suffix_tasks_statement);
+        invalidated_run_ids.extend(suffix_task_ids.iter().cloned());
+
+        let mut llm_request_statement = transaction
+            .prepare(
+                "SELECT DISTINCT request.id
+                 FROM llm_requests AS request
+                 LEFT JOIN llm_request_events AS event
+                   ON event.llm_request_id = request.id
+                  AND event.event_type = 'start'
+                 WHERE request.chat_id = ?1
+                   AND (
+                       request.id IN (SELECT value FROM json_each(?2))
+                       OR request.agent_task_id IN (SELECT value FROM json_each(?2))
+                       OR CAST(COALESCE(
+                            json_extract(event.normalized_event_json, '$.assistantMessageId'),
+                            json_extract(event.normalized_event_json, '$.assistant_message_id')
+                       ) AS TEXT) IN (SELECT value FROM json_each(?3))
+                   )",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let suffix_task_ids_json = serde_json::to_string(&suffix_task_ids).map_err(|source| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("failed to serialize suffix Agent task ids: {source}"),
+            }
+        })?;
+        let removed_message_ids_json =
+            serde_json::to_string(&removed_message_ids).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("failed to serialize removed message ids: {source}"),
+                }
+            })?;
+        let llm_request_rows = llm_request_statement
+            .query_map(
+                params![
+                    rewrite.chat_id,
+                    suffix_task_ids_json,
+                    removed_message_ids_json
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for row in llm_request_rows {
+            invalidated_run_ids.insert(row.map_err(|source| sqlite_error(&database_path, source))?);
+        }
+        drop(llm_request_statement);
+        let mut invalidated_run_ids = invalidated_run_ids.into_iter().collect::<Vec<_>>();
+        invalidated_run_ids.sort();
+        let invalidated_run_ids_json =
+            serde_json::to_string(&invalidated_run_ids).map_err(|source| {
+                WorkspaceDatabaseError::InvalidAuditData {
+                    message: format!("failed to serialize invalidated run ids: {source}"),
+                }
+            })?;
+
+        let mut invalidated_requests_statement = transaction
+            .prepare(
+                "SELECT id, workspace_id, provider_id, model_id, request_started_at, final_state,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                        total_latency_ms
+                 FROM llm_requests
+                 WHERE invalidated_at IS NULL
+                   AND id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let invalidated_request_rows = invalidated_requests_statement
+            .query_map(params![invalidated_run_ids_json], |row| {
+                Ok(LlmRequestRecord {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    chat_id: None,
+                    request_kind: String::new(),
+                    agent_team_id: None,
+                    agent_instance_id: None,
+                    agent_task_id: None,
+                    agent_attempt_id: None,
+                    provider_id: row.get(2)?,
+                    model_id: row.get(3)?,
+                    request_started_at: row.get(4)?,
+                    first_token_at: None,
+                    completed_at: None,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    cache_read_tokens: row.get(8)?,
+                    cache_write_tokens: row.get(9)?,
+                    reasoning_tokens: None,
+                    cache_ratio: None,
+                    first_token_latency_ms: None,
+                    total_latency_ms: row.get(10)?,
+                    status_code: None,
+                    final_state: row.get(5)?,
+                    request_body_json: None,
+                    response_body_json: None,
+                    invalidated_at: None,
+                    invalidated_reason: None,
+                })
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let invalidated_requests = collect_rows(invalidated_request_rows, &database_path)?;
+        drop(invalidated_requests_statement);
+        for request in &invalidated_requests {
+            apply_llm_request_usage_rollup_delta(
+                &transaction,
+                &database_path,
+                llm_request_usage_rollup_delta(llm_request_record_rollup_source(request), -1),
+            )?;
+        }
+        transaction
+            .execute(
+                "UPDATE llm_requests
+                 SET invalidated_at = ?2, invalidated_reason = ?3
+                 WHERE invalidated_at IS NULL
+                   AND id IN (SELECT value FROM json_each(?1))",
+                params![invalidated_run_ids_json, now, rewrite.invalidated_reason],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let cancelled_agent_task_ids = if let Some((team_id, _)) = agent_team.as_ref() {
+            let mut queued_suffix_task_ids_statement = transaction
+                .prepare(
+                    "SELECT id FROM agent_tasks
+                     WHERE team_id = ?1 AND status = 'queued'
+                       AND id IN (SELECT value FROM json_each(?2))",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let queued_suffix_task_rows = queued_suffix_task_ids_statement
+                .query_map(params![team_id, suffix_task_ids_json], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let mut ids = queued_suffix_task_rows
+                .map(|row| row.map_err(|source| sqlite_error(&database_path, source)))
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(queued_suffix_task_ids_statement);
+            ids.sort();
+            let queued_suffix_task_ids_json = serde_json::to_string(&ids).map_err(|source| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!("failed to serialize queued suffix Agent task ids: {source}"),
+                }
+            })?;
+            let error_json = serde_json::json!({
+                "message": "cancelled because chat history was rewritten",
+                "reason": rewrite.invalidated_reason,
+            })
+            .to_string();
+            let cancelled_rows = transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'cancelled', error_json = ?3, completed_at = ?4, updated_at = ?4
+                     WHERE team_id = ?1 AND status = 'queued'
+                       AND id IN (SELECT value FROM json_each(?2))",
+                    params![team_id, queued_suffix_task_ids_json, error_json, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if cancelled_rows != ids.len() {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "queued Agent tasks changed while chat history was rewritten"
+                        .to_string(),
+                });
+            }
+            ids.into_iter()
+                .map(AgentTaskId::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?
+        } else {
+            Vec::new()
+        };
+
+        let coordinator_context_generation = if let Some((team_id, coordinator_id)) =
+            agent_team.as_ref()
+        {
+            let active_after_cancel: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_tasks
+                     WHERE team_id = ?1 AND status IN ('queued', 'running', 'waiting')",
+                    params![team_id],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if active_after_cancel > 0 {
+                return Err(WorkspaceDatabaseError::ChatRewriteConflict {
+                    message: format!(
+                        "chat has {active_after_cancel} active Agent task(s) that are not part of the rewritten suffix"
+                    ),
+                });
+            }
+            let generation: i64 = transaction
+                .query_row(
+                    "SELECT context_generation FROM agent_instances
+                     WHERE id = ?1 AND team_id = ?2",
+                    params![coordinator_id, team_id],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if generation == i64::MAX {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "Coordinator context generation overflowed".to_string(),
+                });
+            }
+            transaction
+                .execute(
+                    "UPDATE agent_instances
+                     SET context_generation = context_generation + 1,
+                         status = CASE WHEN status IN ('paused', 'failed') THEN 'idle' ELSE status END,
+                         updated_at = ?3
+                     WHERE id = ?1 AND team_id = ?2",
+                    params![coordinator_id, team_id, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            Some(generation + 1)
+        } else {
+            None
+        };
+
+        transaction
+            .execute(
+                "DELETE FROM tool_calls
+                 WHERE chat_id = ?1
+                   AND (
+                       message_id IN (SELECT value FROM json_each(?2))
+                       OR run_id IN (SELECT value FROM json_each(?3))
+                   )",
+                params![
+                    rewrite.chat_id,
+                    removed_message_ids_json,
+                    invalidated_run_ids_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM run_events
+                 WHERE chat_id = ?1
+                   AND run_id IN (SELECT value FROM json_each(?2))",
+                params![rewrite.chat_id, invalidated_run_ids_json],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM prompt_context_injections
+                 WHERE chat_id = ?1 AND kind = 'turn_memory' AND sequence >= ?2",
+                params![rewrite.chat_id, user_message.sequence],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM context_compression_snapshots
+                 WHERE chat_id = ?1
+                   AND (source_message_end_sequence >= ?2 OR sequence >= ?2)",
+                params![rewrite.chat_id, user_message.sequence],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM messages WHERE chat_id = ?1 AND sequence > ?2",
+                params![rewrite.chat_id, user_message.sequence],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE messages
+                 SET content = ?3, metadata_json = ?4
+                 WHERE id = ?1 AND chat_id = ?2 AND role = 'user'",
+                params![
+                    rewrite.user_message_id,
+                    rewrite.chat_id,
+                    rewrite.content,
+                    rewrite.user_metadata_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO messages
+                    (id, chat_id, role, content, sequence, created_at, metadata_json)
+                 VALUES (?1, ?2, 'assistant', '', ?3, ?4, ?5)",
+                params![
+                    rewrite.assistant_message_id,
+                    rewrite.chat_id,
+                    assistant_sequence,
+                    now,
+                    rewrite.assistant_metadata_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut chat_metadata = chat_metadata;
+        chat_metadata.insert(
+            QUEUED_CHAT_METADATA_KEY.to_string(),
+            serde_json::from_str(rewrite.chat_queued_run_json).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat queued run is invalid JSON: {source}"),
+                }
+            })?,
+        );
+        let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE chats SET metadata_json = ?2, updated_at = ?3 WHERE id = ?1",
+                params![rewrite.chat_id, chat_metadata_json, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut skipped_workspace_spec_job_ids = Vec::new();
+        let mut spec_jobs_statement = transaction
+            .prepare(
+                "SELECT id FROM workspace_spec_jobs
+                 WHERE chat_id = ?1 AND status IN ('queued', 'running')
+                   AND run_id IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let spec_job_rows = spec_jobs_statement
+            .query_map(params![rewrite.chat_id, invalidated_run_ids_json], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for row in spec_job_rows {
+            skipped_workspace_spec_job_ids
+                .push(row.map_err(|source| sqlite_error(&database_path, source))?);
+        }
+        drop(spec_jobs_statement);
+        transaction
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = 'skipped', error_message = ?3, completed_at = ?4
+                 WHERE chat_id = ?1 AND status IN ('queued', 'running')
+                   AND run_id IN (SELECT value FROM json_each(?2))",
+                params![
+                    rewrite.chat_id,
+                    invalidated_run_ids_json,
+                    rewrite.invalidated_reason,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut skipped_memory_extraction_job_ids = Vec::new();
+        let mut memory_jobs_statement = transaction
+            .prepare(
+                "SELECT id FROM memory_extraction_jobs
+                 WHERE chat_id = ?1 AND status IN ('queued', 'running')
+                   AND CAST(COALESCE(
+                       json_extract(input_json, '$.runId'),
+                       json_extract(input_json, '$.run_id')
+                   ) AS TEXT) IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let memory_job_rows = memory_jobs_statement
+            .query_map(params![rewrite.chat_id, invalidated_run_ids_json], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for row in memory_job_rows {
+            skipped_memory_extraction_job_ids
+                .push(row.map_err(|source| sqlite_error(&database_path, source))?);
+        }
+        drop(memory_jobs_statement);
+        transaction
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'skipped', error_message = ?3, completed_at = ?4
+                 WHERE chat_id = ?1 AND status IN ('queued', 'running')
+                   AND CAST(COALESCE(
+                       json_extract(input_json, '$.runId'),
+                       json_extract(input_json, '$.run_id')
+                   ) AS TEXT) IN (SELECT value FROM json_each(?2))",
+                params![
+                    rewrite.chat_id,
+                    invalidated_run_ids_json,
+                    rewrite.memory_invalidation_reason,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let agent_task_id = match (
+            agent_team.as_ref(),
+            rewrite.coordinator_task_id,
+            rewrite.coordinator_task_input_json,
+        ) {
+            (Some((team_id, coordinator_id)), Some(task_id), Some(input_json)) => {
+                let task_sequence: i64 = transaction
+                    .query_row(
+                        "SELECT next_task_sequence FROM agent_instances
+                         WHERE id = ?1 AND team_id = ?2",
+                        params![coordinator_id, team_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                transaction
+                    .execute(
+                        "UPDATE agent_instances
+                         SET next_task_sequence = next_task_sequence + 1, updated_at = ?3
+                         WHERE id = ?1 AND team_id = ?2",
+                        params![coordinator_id, team_id, now],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                transaction
+                    .execute(
+                        "INSERT INTO agent_tasks
+                            (id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                             sequence, status, input_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, NULL, NULL, ?4, 'queued', ?5, ?6, ?6)",
+                        params![
+                            task_id.as_str(),
+                            team_id,
+                            coordinator_id,
+                            task_sequence,
+                            input_json,
+                            now
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                Some(task_id.clone())
+            }
+            (None, None, None) | (Some(_), None, None) => None,
+            _ => {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "invalid Coordinator task rewrite state".to_string(),
+                });
+            }
+        };
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let user_message = self.message(rewrite.user_message_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "rewritten user message was not found after commit".to_string(),
+            }
+        })?;
+        let assistant_message = self.message(rewrite.assistant_message_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "new assistant message was not found after commit".to_string(),
+            }
+        })?;
+        let agent_team_id = agent_team.and_then(|(team_id, _)| AgentTeamId::new(team_id).ok());
+
+        Ok(RewriteChatFromUserMessageResult {
+            user_message,
+            assistant_message,
+            removed_message_ids,
+            invalidated_run_ids,
+            cancelled_agent_task_ids,
+            agent_team_id,
+            agent_task_id,
+            coordinator_context_generation,
+            skipped_workspace_spec_job_ids,
+            skipped_memory_extraction_job_ids,
+        })
+    }
+
     pub fn insert_run_event(
         &mut self,
         event: NewRunEvent<'_>,
@@ -5098,30 +5771,32 @@ impl WorkspaceDatabase {
             return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
         }
 
-        apply_llm_request_usage_rollup_delta(
-            &transaction,
-            &database_path,
-            llm_request_usage_rollup_delta(llm_request_record_rollup_source(&old_request), -1),
-        )?;
-        apply_llm_request_usage_rollup_delta(
-            &transaction,
-            &database_path,
-            llm_request_usage_rollup_delta(
-                LlmRequestUsageRollupSource {
-                    workspace_id: old_request.workspace_id.as_deref(),
-                    provider_id: old_request.provider_id.as_str(),
-                    model_id: old_request.model_id.as_str(),
-                    request_started_at: old_request.request_started_at.as_str(),
-                    final_state: outcome.final_state,
-                    input_tokens: outcome.input_tokens,
-                    output_tokens: outcome.output_tokens,
-                    cache_read_tokens: outcome.cache_read_tokens,
-                    cache_write_tokens: outcome.cache_write_tokens,
-                    total_latency_ms: outcome.total_latency_ms,
-                },
-                1,
-            ),
-        )?;
+        if old_request.invalidated_at.is_none() {
+            apply_llm_request_usage_rollup_delta(
+                &transaction,
+                &database_path,
+                llm_request_usage_rollup_delta(llm_request_record_rollup_source(&old_request), -1),
+            )?;
+            apply_llm_request_usage_rollup_delta(
+                &transaction,
+                &database_path,
+                llm_request_usage_rollup_delta(
+                    LlmRequestUsageRollupSource {
+                        workspace_id: old_request.workspace_id.as_deref(),
+                        provider_id: old_request.provider_id.as_str(),
+                        model_id: old_request.model_id.as_str(),
+                        request_started_at: old_request.request_started_at.as_str(),
+                        final_state: outcome.final_state,
+                        input_tokens: outcome.input_tokens,
+                        output_tokens: outcome.output_tokens,
+                        cache_read_tokens: outcome.cache_read_tokens,
+                        cache_write_tokens: outcome.cache_write_tokens,
+                        total_latency_ms: outcome.total_latency_ms,
+                    },
+                    1,
+                ),
+            )?;
+        }
 
         transaction
             .commit()
@@ -5188,7 +5863,7 @@ impl WorkspaceDatabase {
                     first_token_at, completed_at, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
-                    request_body_json, response_body_json
+                    request_body_json, response_body_json, invalidated_at, invalidated_reason
                  FROM llm_requests
                  WHERE id = ?1",
                 params![id],
@@ -5219,11 +5894,62 @@ impl WorkspaceDatabase {
                         final_state: row.get(22)?,
                         request_body_json: row.get(23)?,
                         response_body_json: row.get(24)?,
+                        invalidated_at: row.get(25)?,
+                        invalidated_reason: row.get(26)?,
                     })
                 },
             )
             .optional()
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn invalidate_llm_request(
+        &mut self,
+        id: &str,
+        invalidated_reason: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if invalidated_reason.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAuditData {
+                message: "LLM request invalidation reason must not be empty".to_string(),
+            });
+        }
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(request) = select_llm_request_record(&transaction, id)
+            .map_err(|source| sqlite_error(&database_path, source))?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+        if request.invalidated_at.is_some() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+
+        apply_llm_request_usage_rollup_delta(
+            &transaction,
+            &database_path,
+            llm_request_usage_rollup_delta(llm_request_record_rollup_source(&request), -1),
+        )?;
+        transaction
+            .execute(
+                "UPDATE llm_requests
+                 SET invalidated_at = ?2, invalidated_reason = ?3
+                 WHERE id = ?1 AND invalidated_at IS NULL",
+                params![id, now_timestamp(), invalidated_reason],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     pub fn llm_request_metrics_for_chat(
@@ -5238,6 +5964,7 @@ impl WorkspaceDatabase {
                     total_latency_ms, output_tokens
                  FROM llm_requests
                  WHERE chat_id = ?1
+                   AND invalidated_at IS NULL
                  ORDER BY request_started_at ASC, id ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;
@@ -5265,6 +5992,7 @@ impl WorkspaceDatabase {
             "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
              FROM llm_requests
              WHERE chat_id = ?
+               AND invalidated_at IS NULL
                AND final_state IN ('succeeded', 'completed')
                AND input_tokens IS NOT NULL
                AND output_tokens IS NOT NULL",
@@ -5434,6 +6162,7 @@ impl WorkspaceDatabase {
                  INNER JOIN llm_requests
                     ON llm_requests.id = llm_request_events.llm_request_id
                  WHERE llm_requests.chat_id = ?1
+                   AND llm_requests.invalidated_at IS NULL
                  ORDER BY llm_requests.request_started_at ASC,
                     llm_request_events.sequence ASC",
             )
@@ -5476,6 +6205,7 @@ impl WorkspaceDatabase {
                     AND llm_request_events.event_type = 'start'
                     AND llm_request_events.sequence = 0
                  WHERE llm_requests.chat_id = ?1
+                   AND llm_requests.invalidated_at IS NULL
                  ORDER BY llm_requests.request_started_at ASC,
                     llm_request_events.sequence ASC",
             )
@@ -5508,7 +6238,8 @@ impl WorkspaceDatabase {
                 id, workspace_id, chat_id, request_kind, provider_id, model_id, request_started_at,
                 first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
-                first_token_latency_ms, total_latency_ms, status_code, final_state
+                first_token_latency_ms, total_latency_ms, status_code, final_state,
+                invalidated_at, invalidated_reason
              FROM llm_requests",
         );
         let mut query_params = Vec::new();
@@ -5542,6 +6273,8 @@ impl WorkspaceDatabase {
                     total_latency_ms: row.get(16)?,
                     status_code: row.get(17)?,
                     final_state: row.get(18)?,
+                    invalidated_at: row.get(19)?,
+                    invalidated_reason: row.get(20)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -7744,7 +8477,9 @@ impl WorkspaceDatabase {
                         updated_at, started_at, completed_at
                  FROM agent_tasks
                  WHERE team_id = ?1
-                   AND json_extract(input_json, '$.queuedUserMessageId') = ?2",
+                   AND json_extract(input_json, '$.queuedUserMessageId') = ?2
+                 ORDER BY sequence DESC
+                 LIMIT 1",
                 params![team_id.as_str(), user_message_id],
                 agent_task_from_row,
             )
@@ -11018,6 +11753,9 @@ pub enum WorkspaceDatabaseError {
     InvalidMessageMetadata {
         message: String,
     },
+    ChatRewriteConflict {
+        message: String,
+    },
     InvalidPlan {
         message: String,
     },
@@ -11106,6 +11844,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::InvalidMessageMetadata { message } => {
                 write!(formatter, "invalid message metadata: {message}")
+            }
+            Self::ChatRewriteConflict { message } => {
+                write!(formatter, "chat rewrite conflict: {message}")
             }
             Self::InvalidPlan { message } => {
                 write!(formatter, "invalid plan: {message}")
@@ -11210,6 +11951,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
+            | Self::ChatRewriteConflict { .. }
             | Self::InvalidPlan { .. }
             | Self::InvalidScheduledTaskData { .. }
             | Self::InvalidWorkspaceSpec { .. }
@@ -11228,6 +11970,18 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::WorkspaceNotDirectory { .. } => None,
         }
     }
+}
+
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        sequence: row.get(4)?,
+        created_at: row.get(5)?,
+        metadata_json: row.get(6)?,
+    })
 }
 
 fn plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
@@ -11707,7 +12461,7 @@ fn select_llm_request_record(
                 first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
-                request_body_json, response_body_json
+                request_body_json, response_body_json, invalidated_at, invalidated_reason
              FROM llm_requests
              WHERE id = ?1",
             params![id],
@@ -11743,6 +12497,8 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         final_state: row.get(22)?,
         request_body_json: row.get(23)?,
         response_body_json: row.get(24)?,
+        invalidated_at: row.get(25)?,
+        invalidated_reason: row.get(26)?,
     })
 }
 
@@ -11953,7 +12709,8 @@ fn insert_llm_request_usage_rollup_rebuild_rows(
             COUNT(total_latency_ms),
             COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
          FROM llm_requests
-         WHERE final_state != 'running'",
+         WHERE final_state != 'running'
+           AND invalidated_at IS NULL",
     );
     let mut query_params = Vec::new();
     if let Some(workspace_id) = workspace_id {
@@ -12341,6 +13098,9 @@ fn append_llm_request_audit_where_clause(
     if let Some(value) = filters.started_before {
         push_condition("request_started_at <= ?", value);
     }
+    if filters.valid_only {
+        append_condition(query, &mut has_where, "invalidated_at IS NULL");
+    }
     append_request_kind_exclusion(
         query,
         query_params,
@@ -12513,6 +13273,15 @@ fn run_migrations(
             31 => {
                 !table_exists(&transaction, database_path, "memory_facts")?
                     || table_has_column(&transaction, database_path, "memory_facts", "enabled")?
+            }
+            32 => {
+                !table_exists(&transaction, database_path, "llm_requests")?
+                    || table_has_column(
+                        &transaction,
+                        database_path,
+                        "llm_requests",
+                        "invalidated_at",
+                    )?
             }
             _ => false,
         };

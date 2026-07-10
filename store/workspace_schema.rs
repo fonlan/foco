@@ -1255,6 +1255,18 @@ ALTER TABLE prompt_context_injections
     ADD COLUMN memory_summaries_json TEXT NOT NULL DEFAULT '[]';
 "#;
 
+pub(crate) const MIGRATION_032: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN invalidated_at TEXT;
+
+ALTER TABLE llm_requests
+    ADD COLUMN invalidated_reason TEXT;
+
+CREATE INDEX llm_requests_chat_valid_idx
+    ON llm_requests (chat_id, request_started_at)
+    WHERE invalidated_at IS NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

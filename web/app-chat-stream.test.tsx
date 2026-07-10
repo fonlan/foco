@@ -79,6 +79,85 @@ function activePlan(id: string, title: string) {
 describe("app-chat-stream verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  it("edits a persisted user message, confirms truncation, and starts one replacement stream", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const editButton = await screen.findByRole("button", { name: "Edit message" });
+    await userEvent.click(editButton);
+    const editor = screen.getByRole("textbox", { name: "Edit message" });
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "Please inspect CONTRIBUTING.md.");
+    await userEvent.click(screen.getByRole("button", { name: "Save and regenerate" }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      "Editing this message will remove 1 later messages and regenerate the reply. Continue?",
+    );
+    await waitFor(() => {
+      expect(screen.getByText("Please inspect CONTRIBUTING.md.")).toBeInTheDocument();
+      expect(screen.queryByText("Done.")).not.toBeInTheDocument();
+    });
+    const editRequest = vi.mocked(fetch).mock.calls.find(([input]) =>
+      input.toString().includes("/messages/message-user/edit"),
+    );
+    expect(editRequest).toBeDefined();
+    expect(JSON.parse(String(editRequest?.[1]?.body))).toMatchObject({
+      expectedContent: "Please inspect README.",
+      message: "Please inspect CONTRIBUTING.md.",
+      modelId: "gpt-test",
+      providerId: "openai",
+    });
+    const streamRequests = vi.mocked(fetch).mock.calls.filter(([input]) =>
+      input.toString().includes("/chat/stream"),
+    );
+    expect(streamRequests).toHaveLength(1);
+    expect(JSON.parse(String(streamRequests[0]?.[1]?.body))).toMatchObject({
+      queuedUserMessageId: "message-user",
+    });
+  });
+
+  it("keeps edit mode and restores history when the edit request fails", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      if (input.toString().includes("/messages/message-user/edit")) {
+        return Promise.resolve(jsonResponse({ error: "edit failed" }, { status: 409 }));
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+    const editor = screen.getByRole("textbox", { name: "Edit message" });
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "Edited text");
+    await userEvent.click(screen.getByRole("button", { name: "Save and regenerate" }));
+
+    expect(await screen.findByText("edit failed")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Edit message" })).toHaveValue("Edited text");
+    expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([input]) => input.toString().includes("/chat/stream")),
+    ).toHaveLength(0);
+  });
+
+  it("cancels inline editing without changing the composer or message", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    const composer = screen.getByPlaceholderText(defaultComposerPlaceholder);
+    await userEvent.type(composer, "composer draft");
+    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+    const editor = screen.getByRole("textbox", { name: "Edit message" });
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "discarded edit");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel editing" }));
+
+    expect(screen.queryByRole("textbox", { name: "Edit message" })).not.toBeInTheDocument();
+    expect(screen.getByText("Please inspect README.")).toBeInTheDocument();
+    expect(composer).toHaveValue("composer draft");
+  });
+
   it("collapses selected skill content blocks in user messages", async () => {
     const skillPath =
       "C:\\Users\\fonla\\.agents\\skills\\web-design-guidelines\\SKILL.md";

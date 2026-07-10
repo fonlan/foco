@@ -29,8 +29,8 @@ use chrono::{SecondsFormat, Utc};
 use foco_agent::{build_memory_prompt_section, build_project_spec_prompt_section};
 use foco_mcp::McpRegistry;
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent,
-    NeutralToolCall, NeutralToolDefinition, NeutralUsage, stream_chat,
+    NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
+    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, stream_chat,
 };
 use foco_store::{
     config::{RemoteServerProfile, WorkspaceConfig, WorkspaceLocation},
@@ -40,8 +40,9 @@ use foco_store::{
     },
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewRunEvent, TodoGraphFilter, UpdateLlmRequestOutcome,
-        WorkspaceDatabase, WorkspaceSpecPromptPlan, WorkspaceSpecSettings, workspace_database_path,
+        NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage, TodoGraphFilter,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -853,6 +854,7 @@ struct ControlEnvelope {
 
 #[derive(Clone)]
 struct RemoteActiveRunStream {
+    chat_id: String,
     broker_request_id: Arc<Mutex<Option<String>>>,
     events: Arc<Mutex<Vec<(i64, Value)>>>,
     tx: tokio::sync::broadcast::Sender<(i64, Value)>,
@@ -860,9 +862,10 @@ struct RemoteActiveRunStream {
 }
 
 impl RemoteActiveRunStream {
-    fn new() -> Self {
+    fn new(chat_id: String) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(512);
         Self {
+            chat_id,
             broker_request_id: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(Vec::new())),
             tx,
@@ -1057,6 +1060,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/chats/{chat_id}/messages",
             get(remote_sidecar_chat_messages),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/messages/{message_id}/edit",
+            post(remote_sidecar_edit_chat_user_message),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/statistics",
@@ -1347,13 +1354,30 @@ fn remote_sidecar_remove_active_run(state: &RemoteSidecarState, run_id: &str) {
 fn remote_sidecar_insert_active_run_stream(
     state: &RemoteSidecarState,
     run_id: String,
-    _chat_id: String,
+    chat_id: String,
 ) -> RemoteActiveRunStream {
-    let run_stream = RemoteActiveRunStream::new();
+    let run_stream = RemoteActiveRunStream::new(chat_id);
     if let Ok(mut streams) = state.active_run_streams.lock() {
         streams.insert(run_id, run_stream.clone());
     }
     run_stream
+}
+
+fn remote_sidecar_clear_chat_run_streams(state: &RemoteSidecarState, chat_id: &str) {
+    let run_ids = state
+        .active_run_streams
+        .lock()
+        .map(|streams| {
+            streams
+                .iter()
+                .filter(|(_, run_stream)| run_stream.chat_id == chat_id)
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for run_id in run_ids {
+        remote_sidecar_cancel_active_run(state, &run_id, false, true);
+    }
 }
 
 fn remote_sidecar_active_run_stream(
@@ -4317,6 +4341,96 @@ fn remote_chat_parts(content: &str, reasoning: Option<&str>) -> Vec<Value> {
     parts
 }
 
+fn remote_chat_parts_with_attachments(
+    content: &str,
+    reasoning: Option<&str>,
+    attachments: &[NeutralChatAttachment],
+) -> Vec<Value> {
+    let mut parts = remote_chat_parts(content, reasoning);
+    parts.extend(attachments.iter().cloned().map(|attachment| {
+        let preview_data_url = attachment
+            .content_type
+            .starts_with("image/")
+            .then(|| {
+                attachment.content_base64.as_ref().map(|content_base64| {
+                    format!("data:{};base64,{}", attachment.content_type, content_base64)
+                })
+            })
+            .flatten();
+        json!({
+            "type": "attachment",
+            "attachment": {
+                "id": attachment.id,
+                "name": attachment.name,
+                "contentType": attachment.content_type,
+                "sizeBytes": attachment.size_bytes,
+                "path": attachment.path,
+                "previewDataUrl": preview_data_url,
+            }
+        })
+    }));
+    parts
+}
+
+fn remote_message_attachments(metadata: &Value) -> Vec<NeutralChatAttachment> {
+    metadata
+        .get("attachments")
+        .cloned()
+        .and_then(|attachments| serde_json::from_value(attachments).ok())
+        .unwrap_or_default()
+}
+
+fn remote_message_run_config(metadata: &Value, queued_run: Option<&Value>) -> Option<Value> {
+    let model_id = metadata
+        .get("modelId")
+        .or_else(|| metadata.get("model_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            queued_run
+                .and_then(|run| run.get("modelId").or_else(|| run.get("model_id")))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })?;
+    let provider_id = metadata
+        .get("providerId")
+        .or_else(|| metadata.get("provider_id"))
+        .cloned()
+        .or_else(|| queued_run.and_then(|run| run.get("providerId").cloned()))
+        .unwrap_or(Value::Null);
+    let thinking_level = metadata
+        .get("thinkingLevel")
+        .or_else(|| metadata.get("thinking_level"))
+        .cloned()
+        .or_else(|| queued_run.and_then(|run| run.get("thinkingLevel").cloned()))
+        .unwrap_or(Value::Null);
+    let selected_skill_ids = remote_queued_skill_ids(
+        metadata
+            .get("selectedSkillIds")
+            .or_else(|| metadata.get("selected_skill_ids"))
+            .or_else(|| queued_run.and_then(|run| run.get("skillIds"))),
+    );
+    let session_mode = metadata
+        .get("sessionMode")
+        .or_else(|| metadata.get("session_mode"))
+        .cloned()
+        .or_else(|| queued_run.and_then(|run| run.get("sessionMode").cloned()))
+        .unwrap_or(Value::Null);
+    let team_mode_enabled = metadata
+        .get("teamModeEnabled")
+        .or_else(|| metadata.get("team_mode_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(json!({
+        "modelId": model_id,
+        "providerId": provider_id,
+        "thinkingLevel": thinking_level,
+        "selectedSkillIds": selected_skill_ids,
+        "sessionMode": session_mode,
+        "teamModeEnabled": team_mode_enabled,
+    }))
+}
+
 fn remote_message_summary(
     message: foco_store::workspace::MessageRecord,
     tool_calls: &[foco_store::workspace::ToolCallWithResultRecord],
@@ -4333,10 +4447,17 @@ fn remote_message_summary(
     } else {
         Vec::new()
     };
+    let queued_run = metadata.get("queuedRun").cloned();
+    let run_config = (message.role == "user")
+        .then(|| remote_message_run_config(&metadata, queued_run.as_ref()))
+        .flatten();
+    let attachments = (message.role == "user")
+        .then(|| remote_message_attachments(&metadata))
+        .unwrap_or_default();
     let parts = if message.role == "assistant" {
         remote_message_parts(&message.content, reasoning, &tool_calls)
     } else {
-        remote_chat_parts(&message.content, reasoning)
+        remote_chat_parts_with_attachments(&message.content, reasoning, &attachments)
     };
     json!({
         "id": message.id,
@@ -4345,8 +4466,9 @@ fn remote_message_summary(
         "createdAt": message.created_at,
         "reasoning": reasoning,
         "sessionMode": metadata.get("sessionMode").or_else(|| metadata.get("session_mode")),
+        "runConfig": run_config,
         "pendingMode": metadata.get("pendingMode"),
-        "queuedRun": metadata.get("queuedRun"),
+        "queuedRun": queued_run,
         "toolCalls": tool_calls,
         "parts": parts,
         "metrics": metadata.get("metrics"),
@@ -4495,6 +4617,113 @@ async fn remote_sidecar_chat_messages(
     })))
 }
 
+async fn remote_sidecar_edit_chat_user_message(
+    State(state): State<RemoteSidecarState>,
+    AxumPath((chat_id, message_id)): AxumPath<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    if remote_chat_active_run(&state, &chat_id).is_some() {
+        return Err(ApiError::conflict("chat already has an active remote run").into_response());
+    }
+
+    let message = remote_required_text(payload.get("message"), "message")?;
+    let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
+    let provider_id = remote_optional_string(payload.get("providerId"));
+    let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let selected_skill_ids = remote_queued_skill_ids(
+        payload
+            .get("selectedSkillIds")
+            .or_else(|| payload.get("selected_skill_ids")),
+    );
+    let session_mode = remote_optional_string(payload.get("sessionMode"));
+    let team_mode_enabled = payload
+        .get("teamModeEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expected_content = payload.get("expectedContent").and_then(Value::as_str);
+    let attachments = payload
+        .get("attachments")
+        .cloned()
+        .map(serde_json::from_value::<Vec<NeutralChatAttachment>>)
+        .transpose()
+        .map_err(|source| {
+            ApiError::bad_request(format!("attachments are invalid: {source}")).into_response()
+        })?
+        .unwrap_or_default();
+
+    let mut database = sidecar_workspace_database(&state)?;
+    let current_message = database
+        .message(&message_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("message was not found: {message_id}")).into_response()
+        })?;
+    if current_message.chat_id != chat_id || current_message.role != "user" {
+        return Err(
+            ApiError::bad_request("only user messages in this chat can be edited").into_response(),
+        );
+    }
+    let assistant_sequence = current_message.sequence.checked_add(1).ok_or_else(|| {
+        ApiError::bad_request("assistant message sequence overflowed").into_response()
+    })?;
+    let assistant_message_id = unique_id("msg-assistant");
+    let queued_run = json!({
+        "status": "queued",
+        "userMessageId": message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": assistant_sequence,
+        "modelId": model_id,
+        "providerId": provider_id,
+        "thinkingLevel": thinking_level,
+        "skillIds": selected_skill_ids,
+        "sessionMode": session_mode,
+        "content": message,
+    });
+    let user_metadata = json!({
+        "attachments": attachments,
+        "modelId": model_id,
+        "providerId": provider_id,
+        "thinkingLevel": thinking_level,
+        "selectedSkillIds": selected_skill_ids,
+        "sessionMode": session_mode,
+        "teamModeEnabled": team_mode_enabled,
+        "queuedRun": queued_run,
+    });
+    let rewritten = database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: &chat_id,
+            user_message_id: &message_id,
+            expected_content,
+            content: &message,
+            user_metadata_json: &user_metadata.to_string(),
+            chat_queued_run_json: &queued_run.to_string(),
+            assistant_message_id: &assistant_message_id,
+            assistant_metadata_json: r#"{"streamingState":"streaming"}"#,
+            coordinator_task_id: None,
+            coordinator_task_input_json: None,
+            invalidated_reason: "chat message edited",
+            memory_invalidation_reason: "chat message edited",
+        })
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    remote_sidecar_clear_chat_run_streams(&state, &chat_id);
+
+    Ok(Json(json!({
+        "chatId": chat_id,
+        "userMessageId": message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": assistant_sequence,
+        "content": message,
+        "parts": remote_chat_parts_with_attachments(&message, None, &attachments),
+        "sessionMode": session_mode,
+        "removedMessageIds": rewritten.removed_message_ids,
+        "invalidatedRunIds": rewritten.invalidated_run_ids,
+        "cancelledAgentTaskIds": rewritten.cancelled_agent_task_ids,
+        "skippedWorkspaceSpecJobIds": rewritten.skipped_workspace_spec_job_ids,
+        "skippedMemoryExtractionJobIds": rewritten.skipped_memory_extraction_job_ids,
+        "completedMemoriesPreserved": true,
+    })))
+}
+
 async fn remote_sidecar_chat_statistics(
     State(state): State<RemoteSidecarState>,
     AxumPath(chat_id): AxumPath<String>,
@@ -4533,6 +4762,7 @@ async fn remote_sidecar_chat_statistics(
         .llm_request_audit_count(LlmRequestAuditFilters {
             chat_id: Some(&chat_id),
             exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            valid_only: true,
             ..LlmRequestAuditFilters::default()
         })
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
@@ -4540,6 +4770,7 @@ async fn remote_sidecar_chat_statistics(
         .llm_request_audit_rows(LlmRequestAuditFilters {
             chat_id: Some(&chat_id),
             exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            valid_only: true,
             limit: Some(request_count),
             offset: Some(0),
             ..LlmRequestAuditFilters::default()
@@ -7895,6 +8126,132 @@ mod tests {
             },
             broker_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_edit_chat_user_message_truncates_history_and_survives_reload() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        for (id, role, content, sequence) in [
+            ("user-1", "user", "first", 0),
+            ("assistant-1", "assistant", "first answer", 1),
+            ("user-2", "user", "second", 2),
+            ("assistant-2", "assistant", "second answer", 3),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-1",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("message insert");
+        }
+        drop(database);
+        let stale_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "stale-run".to_string(),
+            "chat-1".to_string(),
+        );
+        stale_stream.record(1, json!({ "type": "textDelta", "delta": "stale" }));
+        remote_sidecar_insert_active_run_stream(
+            &state,
+            "other-run".to_string(),
+            "chat-2".to_string(),
+        );
+
+        let Json(response) = remote_sidecar_edit_chat_user_message(
+            State(state.clone()),
+            AxumPath(("chat-1".to_string(), "user-1".to_string())),
+            Json(json!({
+                "message": "first edited",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+                "selectedSkillIds": ["skill-1"],
+                "attachments": [{
+                    "id": "attachment-1",
+                    "name": "notes.txt",
+                    "contentType": "text/plain",
+                    "sizeBytes": 5,
+                    "contentBase64": "aGVsbG8="
+                }],
+                "expectedContent": "first"
+            })),
+        )
+        .await
+        .expect("edit response");
+        assert_eq!(response["removedMessageIds"].as_array().unwrap().len(), 3);
+        assert_eq!(response["content"], "first edited");
+        assert!(remote_sidecar_active_run_stream(&state, "stale-run").is_none());
+        assert!(remote_sidecar_active_run_stream(&state, "other-run").is_some());
+        assert!(stale_stream.finished.load(Ordering::Relaxed));
+
+        let Json(history) = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath("chat-1".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("reloaded history");
+        assert_eq!(history["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(history["messages"][0]["content"], "first edited");
+        assert_eq!(
+            history["messages"][0]["parts"][1]["attachment"]["name"],
+            "notes.txt"
+        );
+        assert_eq!(history["messages"][0]["runConfig"]["modelId"], "model-1");
+        assert_eq!(history["messages"][1]["content"], "");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_edit_chat_user_message_rejects_active_run_without_mutation() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "original",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("message insert");
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: "run-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            },
+        );
+
+        let response = remote_sidecar_edit_chat_user_message(
+            State(state),
+            AxumPath(("chat-1".to_string(), "user-1".to_string())),
+            Json(json!({
+                "message": "edited",
+                "modelId": "model-1",
+                "expectedContent": "original"
+            })),
+        )
+        .await
+        .expect_err("active run should conflict");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let message = database
+            .message("user-1")
+            .expect("message read")
+            .expect("message");
+        assert_eq!(message.content, "original");
     }
 
     #[test]

@@ -1103,6 +1103,8 @@ export const aiStatistics = {
       chatTitle: "Tool run",
       completedAt: "2026-06-05T10:00:02Z",
       finalState: "succeeded",
+      invalidatedAt: null,
+      invalidatedReason: null,
       firstTokenAt: "2026-06-05T10:00:01Z",
       firstTokenLatencyMs: 1000,
       id: "request-1",
@@ -3947,6 +3949,28 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       id: `terminal-${appTestState.terminalSessionCounter}`,
       name: `Terminal ${appTestState.terminalSessionCounter}`,
       workingDirectory: workspace.path,
+    });
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/messages/message-user/edit") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { message?: string; sessionMode?: string | null })
+        : {};
+    return jsonResponse({
+      assistantMessageId: "message-assistant-edited",
+      assistantSequence: 1,
+      cancelledAgentTaskIds: [],
+      chatId: "chat-1",
+      completedMemoriesPreserved: true,
+      content: body.message ?? "",
+      invalidatedRunIds: ["request-1", "request-2"],
+      parts: [{ text: body.message ?? "", type: "text" }],
+      removedMessageIds: ["message-assistant"],
+      sessionMode: body.sessionMode ?? null,
+      skippedMemoryExtractionJobIds: [],
+      skippedWorkspaceSpecJobIds: [],
+      userMessageId: "message-user",
     });
   }
 

@@ -694,6 +694,36 @@ pub struct MessageRoleCountRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewriteChatFromUserMessage<'a> {
+    pub chat_id: &'a str,
+    pub user_message_id: &'a str,
+    pub expected_content: Option<&'a str>,
+    pub content: &'a str,
+    pub user_metadata_json: &'a str,
+    pub chat_queued_run_json: &'a str,
+    pub assistant_message_id: &'a str,
+    pub assistant_metadata_json: &'a str,
+    pub coordinator_task_id: Option<&'a AgentTaskId>,
+    pub coordinator_task_input_json: Option<&'a str>,
+    pub invalidated_reason: &'a str,
+    pub memory_invalidation_reason: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewriteChatFromUserMessageResult {
+    pub user_message: MessageRecord,
+    pub assistant_message: MessageRecord,
+    pub removed_message_ids: Vec<String>,
+    pub invalidated_run_ids: Vec<String>,
+    pub cancelled_agent_task_ids: Vec<AgentTaskId>,
+    pub agent_team_id: Option<AgentTeamId>,
+    pub agent_task_id: Option<AgentTaskId>,
+    pub coordinator_context_generation: Option<i64>,
+    pub skipped_workspace_spec_job_ids: Vec<String>,
+    pub skipped_memory_extraction_job_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewRunEvent<'a> {
     pub id: &'a str,
     pub chat_id: &'a str,
@@ -837,6 +867,8 @@ pub struct LlmRequestRecord {
     pub final_state: String,
     pub request_body_json: Option<String>,
     pub response_body_json: Option<String>,
+    pub invalidated_at: Option<String>,
+    pub invalidated_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -869,6 +901,7 @@ pub struct LlmRequestAuditFilters<'a> {
     pub final_state: Option<&'a str>,
     pub started_after: Option<&'a str>,
     pub started_before: Option<&'a str>,
+    pub valid_only: bool,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -904,6 +937,8 @@ pub struct LlmRequestAuditRow {
     pub total_latency_ms: Option<i64>,
     pub status_code: Option<i64>,
     pub final_state: String,
+    pub invalidated_at: Option<String>,
+    pub invalidated_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

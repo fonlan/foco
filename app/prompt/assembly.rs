@@ -173,10 +173,25 @@ pub(crate) async fn prepare_prompt_context(
                     .messages_for_chat(chat_id)
                     .map_err(ApiError::from_workspace_error)?;
                 match queued_user_message_id.as_deref() {
-                    Some(queued_user_message_id) => messages
-                        .into_iter()
-                        .filter(|message| message.id != queued_user_message_id)
-                        .collect(),
+                    Some(queued_user_message_id) => {
+                        let queued_assistant_message_id = messages
+                            .iter()
+                            .find(|message| message.id == queued_user_message_id)
+                            .map(|message| {
+                                queued_run_summary_from_message_metadata(&message.metadata_json)
+                            })
+                            .transpose()?
+                            .flatten()
+                            .and_then(|queued_run| queued_run.assistant_message_id);
+                        messages
+                            .into_iter()
+                            .filter(|message| {
+                                message.id != queued_user_message_id
+                                    && queued_assistant_message_id.as_deref()
+                                        != Some(message.id.as_str())
+                            })
+                            .collect()
+                    }
                     None => messages,
                 }
             }

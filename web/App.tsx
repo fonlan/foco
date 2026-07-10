@@ -102,6 +102,7 @@ import type {
   GitDiffLineStats,
   GitDiffResponse,
   GitStatusFileSummary,
+  EditChatUserMessageResponse,
   GitWorktreeSummary,
   HookNotificationSummary,
   InstallRipgrepResponse,
@@ -4110,6 +4111,30 @@ export function App() {
     });
   }
 
+  function handleSelectEditAttachments(
+    onSelected: (attachments: ComposerAttachment[]) => void,
+  ) {
+    const target: FilePickerTarget = activeWorkspace?.id
+      ? { kind: "workspace", workspaceId: activeWorkspace.id }
+      : { kind: "local" };
+    setFilePickerRequest({
+      mode: "file",
+      multiple: true,
+      readFiles: true,
+      target,
+      title: t("Add attachment"),
+      onSelect: (selection) => {
+        const attachments = selection
+          .map((item) => item.file)
+          .filter((file): file is NonNullable<FilePickerSelection["file"]> => Boolean(file))
+          .map(composerAttachmentFromSelectedFile);
+        if (attachments.length) {
+          onSelected(attachments);
+        }
+      },
+    });
+  }
+
   async function handleAddSelectedFileAttachments(files: NonNullable<FilePickerSelection["file"]>[]) {
     if (!files.length) {
       return;
@@ -6956,6 +6981,114 @@ export function App() {
         method: "POST",
       },
     );
+  }
+
+  async function handleEditChatMessage(
+    message: ShellMessage,
+    content: string,
+    editedSkillIds: string[],
+    attachments: ComposerAttachment[],
+  ): Promise<boolean> {
+    const workspaceId = activeWorkspaceIdRef.current;
+    const chatId = activeChatIdRef.current;
+    if (!workspaceId || !chatId || isPendingChatId(chatId) || isSendingMessage) {
+      return false;
+    }
+    const runConfig = message.runConfig;
+    const modelId = runConfig?.modelId ?? selectedModelIdRef.current;
+    const providerId = runConfig?.providerId ?? selectedProviderIdRef.current;
+    if (!modelId || !providerId) {
+      setError(t("This message does not have a reusable model configuration."));
+      return false;
+    }
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const previousMessages = [...(chatMessagesByKeyRef.current[chatKey] ?? [])];
+    setError(null);
+    setIsPreparingChatRun(true);
+    try {
+      const edited = await requestJson<EditChatUserMessageResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(message.id)}/edit`,
+        {
+          body: JSON.stringify({
+            attachments: attachments.map(({ previewDataUrl: _previewDataUrl, ...attachment }) => attachment),
+            expectedContent: message.content,
+            message: content,
+            modelId,
+            providerId,
+            thinkingLevel: runConfig?.thinkingLevel || null,
+            selectedSkillIds: editedSkillIds,
+            sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
+            teamModeEnabled: runConfig?.teamModeEnabled ?? false,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      const targetIndex = previousMessages.findIndex((item) => item.id === message.id);
+      if (targetIndex < 0) {
+        throw new Error(t("Edited message is no longer visible."));
+      }
+      setMessagesForChatKey(chatKey, () => [
+        ...previousMessages.slice(0, targetIndex),
+        {
+          ...message,
+          content: edited.content,
+          parts: edited.parts,
+          runConfig: {
+            modelId,
+            providerId,
+            thinkingLevel: runConfig?.thinkingLevel ?? null,
+            selectedSkillIds: editedSkillIds,
+            sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
+            teamModeEnabled: runConfig?.teamModeEnabled ?? false,
+          },
+        },
+      ]);
+      updateQueuedRunRequestsForChatKey(chatKey, () => []);
+      updateScheduledWorkspaceRuns((current) => current.filter((run) => run.chatKey !== chatKey));
+      setRetryRunRequest(null);
+      setPendingQuestion(null);
+      setQuestionError(null);
+      clearLiveChatStatistics(chatKey);
+      setChatMessagePaginationByKey((current) => ({
+        ...current,
+        [chatKey]: { hasMoreBefore: false, nextBeforeSequence: null },
+      }));
+      contextUsageIdentityByChatKeyRef.current.delete(chatKey);
+      contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
+      setContextUsageByChatKey((current) => {
+        const next = { ...current };
+        delete next[chatKey];
+        return next;
+      });
+      await runChatMessage({
+        attachments,
+        chatId,
+        content: edited.content,
+        modelId,
+        providerId,
+        skillIds: editedSkillIds,
+        sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? undefined,
+        teamModeEnabled: runConfig?.teamModeEnabled ?? false,
+        thinkingLevel: runConfig?.thinkingLevel ?? "",
+        workspaceId,
+        localChatKey: chatKey,
+        pendingUserMessageId: edited.userMessageId,
+        queuedUserMessageId: edited.userMessageId,
+        assistantMessageId: edited.assistantMessageId,
+      });
+      await loadChatMessages(workspaceId, chatId);
+      void loadChatStatistics(workspaceId, chatId);
+      void refreshWorkspaces();
+      refreshActiveAgentTeamSnapshot(workspaceId, chatId);
+      return true;
+    } catch (requestError) {
+      setMessagesForChatKey(chatKey, () => previousMessages);
+      setError(errorMessage(requestError));
+      return false;
+    } finally {
+      setIsPreparingChatRun(false);
+    }
   }
 
   async function handleSendMessage(
@@ -10943,6 +11076,7 @@ export function App() {
                     }
                   }}
                   onDraftMessageChange={setDraftMessage}
+                  onEditMessage={handleEditChatMessage}
                   onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
                   onLoadMoreMessages={() => {
                     if (!activeWorkspaceId || !activeChatId || isPendingChatId(activeChatId)) {
@@ -10951,6 +11085,7 @@ export function App() {
                     return loadOlderChatMessages(activeWorkspaceId, activeChatId);
                   }}
                   onSelectAttachments={handleSelectDraftAttachmentsForChatPanel}
+                  onSelectEditAttachments={handleSelectEditAttachments}
                   onCancelRun={handleCancelRunForChatPanel}
                   onGuideActiveRun={handleGuideActiveRunForChatPanel}
                   onQueueActiveRun={handleQueueActiveRunForChatPanel}
@@ -15253,6 +15388,27 @@ export function normalizeChatMessageSummary(
     rawSessionMode === "plan" ? "plan" : null;
   const status = normalizeChatMessageStatus(fieldValue(message, "status"));
   const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
+  const runConfigValue = fieldValue(message, "runConfig", "run_config");
+  const runConfigRecord = runConfigValue && typeof runConfigValue === "object"
+    ? runConfigValue as Record<string, unknown>
+    : null;
+  const runConfig = runConfigRecord
+    ? {
+      modelId: String(fieldValue(runConfigRecord, "modelId", "model_id") ?? ""),
+      providerId: typeof fieldValue(runConfigRecord, "providerId", "provider_id") === "string"
+        ? String(fieldValue(runConfigRecord, "providerId", "provider_id"))
+        : null,
+      thinkingLevel: typeof fieldValue(runConfigRecord, "thinkingLevel", "thinking_level") === "string"
+        ? String(fieldValue(runConfigRecord, "thinkingLevel", "thinking_level"))
+        : null,
+      selectedSkillIds: Array.isArray(fieldValue(runConfigRecord, "selectedSkillIds", "selected_skill_ids"))
+        ? (fieldValue(runConfigRecord, "selectedSkillIds", "selected_skill_ids") as unknown[])
+          .filter((value): value is string => typeof value === "string")
+        : [],
+      sessionMode: fieldValue(runConfigRecord, "sessionMode", "session_mode") === "plan" ? "plan" as const : null,
+      teamModeEnabled: fieldValue(runConfigRecord, "teamModeEnabled", "team_mode_enabled") === true,
+    }
+    : null;
   const normalizedMessage = {
     ...message,
     extractedMemories,
@@ -15260,6 +15416,7 @@ export function normalizeChatMessageSummary(
     memoriesUsed,
     pendingMode,
     queuedRun,
+    runConfig,
     runBadges: [],
     sessionMode,
     status,

@@ -1490,14 +1490,44 @@ pub(crate) fn persist_chat_result(
         .map_err(ApiError::from_workspace_error)?;
     let final_state = outcome.final_state;
 
+    let current_history_run = context
+        .queued_user_message_id
+        .as_deref()
+        .map(|queued_user_message_id| {
+            queued_chat_run_matches_context(&database, context, queued_user_message_id)
+        })
+        .transpose()?
+        .unwrap_or(true);
+
     if context.captured_llm_requests.is_empty() {
         let run_request =
             CapturedLlmRequest::from_run_context(context, request_started_at, outcome, events);
         persist_llm_request(&mut database, context, &run_request)?;
+        if !current_history_run {
+            database
+                .invalidate_llm_request(&run_request.id, "chat history was rewritten")
+                .map_err(ApiError::from_workspace_error)?;
+        }
     } else {
         for llm_request in &context.captured_llm_requests {
             persist_llm_request(&mut database, context, llm_request)?;
+            if !current_history_run {
+                database
+                    .invalidate_llm_request(&llm_request.id, "chat history was rewritten")
+                    .map_err(ApiError::from_workspace_error)?;
+            }
         }
+    }
+
+    if !current_history_run {
+        tracing::info!(
+            chat_id = %context.chat_id,
+            user_message_id = ?context.queued_user_message_id,
+            assistant_message_id = %context.assistant_message_id,
+            run_id = %context.llm_request_id,
+            "skipping stale chat result after history rewrite"
+        );
+        return Ok(());
     }
 
     let assistant_message_id = if !context.agent_primary_chat_output {
@@ -1619,6 +1649,28 @@ pub(crate) fn persist_chat_result(
     Ok(())
 }
 
+fn queued_chat_run_matches_context(
+    database: &WorkspaceDatabase,
+    context: &PreparedChatContext,
+    queued_user_message_id: &str,
+) -> Result<bool, ApiError> {
+    let Some(chat) = database
+        .chat(&context.chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    let queued_run = queued_run_summary_from_chat_metadata(&chat.metadata_json)?;
+    Ok(queued_run.is_some_and(|queued_run| {
+        queued_run.user_message_id == queued_user_message_id
+            && queued_run.assistant_message_id.as_deref()
+                == Some(context.assistant_message_id.as_str())
+            && queued_run
+                .assistant_sequence
+                .is_none_or(|sequence| sequence == context.assistant_sequence)
+    }))
+}
+
 pub(crate) fn persist_running_llm_request(
     context: &PreparedChatContext,
     request_id: &str,
@@ -1629,6 +1681,11 @@ pub(crate) fn persist_running_llm_request(
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let save_details = api_audit_save_details(&context.global_config);
+    if let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
+        && !queued_chat_run_matches_context(&database, context, queued_user_message_id)?
+    {
+        return Ok(());
+    }
     database
         .insert_llm_request(NewLlmRequest {
             id: request_id,

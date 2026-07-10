@@ -9729,6 +9729,25 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
 }
 
 #[test]
+fn chat_rewrite_errors_map_to_http_validation_and_conflict_statuses() {
+    let conflict = ApiError::from_workspace_error(
+        foco_store::workspace::WorkspaceDatabaseError::ChatRewriteConflict {
+            message: "chat already has a queued or running run".to_string(),
+        },
+    )
+    .into_response();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let invalid = ApiError::from_workspace_error(
+        foco_store::workspace::WorkspaceDatabaseError::InvalidMessageMetadata {
+            message: "only visible user messages can be edited".to_string(),
+        },
+    )
+    .into_response();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
 fn queued_user_message_metadata_writes_top_level_session_mode() {
     let metadata_json = queued_user_message_metadata_json(
         &[],
@@ -9739,12 +9758,15 @@ fn queued_user_message_metadata_writes_top_level_session_mode() {
         None,
         &[],
         Some("plan"),
+        false,
         None,
     )
     .expect("queued user metadata json");
     let metadata = parse_json_value(&metadata_json, "message metadata").expect("metadata json");
 
     assert_eq!(metadata["sessionMode"], "plan");
+    assert_eq!(metadata["selectedSkillIds"], json!([]));
+    assert_eq!(metadata["teamModeEnabled"], false);
     assert_eq!(metadata["queuedRun"]["sessionMode"], "plan");
 }
 
@@ -9854,6 +9876,164 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
 }
 
 #[test]
+fn persist_chat_result_keeps_invalidated_rewrite_history_unchanged() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-stale-chat-result-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat_with_metadata(
+                "chat-1",
+                "Rewritten chat",
+                r#"{"queuedRun":{"status":"running","userMessageId":"user-new","assistantMessageId":"assistant-new","assistantSequence":3,"modelId":"gpt-5.4","content":"New"}}"#,
+            )
+            .expect("chat insert");
+        for (id, role, content, sequence, metadata_json) in [
+            (
+                "user-old",
+                "user",
+                "Old",
+                0,
+                r#"{"queuedRun":{"status":"running","assistantMessageId":"assistant-old","assistantSequence":1,"modelId":"gpt-5.4"}}"#,
+            ),
+            (
+                "assistant-old",
+                "assistant",
+                "",
+                1,
+                r#"{"streamingState":"streaming"}"#,
+            ),
+            (
+                "user-new",
+                "user",
+                "New",
+                2,
+                r#"{"queuedRun":{"status":"running","assistantMessageId":"assistant-new","assistantSequence":3,"modelId":"gpt-5.4"}}"#,
+            ),
+            (
+                "assistant-new",
+                "assistant",
+                "",
+                3,
+                r#"{"streamingState":"streaming"}"#,
+            ),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-1",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some(metadata_json),
+                })
+                .expect("message insert");
+        }
+    }
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Old".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.user_message_id = "user-old".to_string();
+    context.queued_user_message_id = Some("user-old".to_string());
+    context.assistant_message_id = "assistant-old".to_string();
+    context.llm_request_id = "request-old".to_string();
+    context.assistant_sequence = 1;
+    let outcome = ChatAuditOutcome {
+        first_token_at: Some("2026-07-10T10:00:00Z".to_string()),
+        completed_at: "2026-07-10T10:00:01Z".to_string(),
+        first_token_latency_ms: Some(100),
+        total_latency_ms: 1_000,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        reasoning_tokens: None,
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: Some(r#"{"text":"Stale answer"}"#.to_string()),
+    };
+
+    persist_chat_result(
+        &context,
+        "2026-07-10T10:00:00Z",
+        outcome,
+        &[],
+        Some("Stale answer"),
+        None,
+        &[],
+    )
+    .expect("persist stale chat result");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    assert_eq!(
+        database
+            .message("assistant-old")
+            .expect("old assistant read")
+            .expect("old assistant")
+            .content,
+        ""
+    );
+    assert_eq!(
+        database
+            .message("assistant-new")
+            .expect("new assistant read")
+            .expect("new assistant")
+            .content,
+        ""
+    );
+    let chat = database.chat("chat-1").expect("chat read").expect("chat");
+    let queued_run = queued_run_summary_from_chat_metadata(&chat.metadata_json)
+        .expect("queued run parse")
+        .expect("queued run");
+    assert_eq!(queued_run.user_message_id, "user-new");
+    assert_eq!(
+        queued_run.assistant_message_id.as_deref(),
+        Some("assistant-new")
+    );
+    let request = database
+        .llm_request("request-old")
+        .expect("audit request read")
+        .expect("audit request");
+    assert_eq!(request.final_state, "succeeded");
+    assert!(request.invalidated_at.is_some());
+    assert_eq!(
+        request.invalidated_reason.as_deref(),
+        Some("chat history was rewritten")
+    );
+    assert_eq!(
+        database
+            .llm_request_audit_count(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                valid_only: true,
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("valid chat request count"),
+        0
+    );
+    drop(database);
+
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    assert!(
+        memory_database
+            .extraction_jobs_for_scope(Some("chat-1"), None, 10)
+            .expect("memory jobs")
+            .is_empty()
+    );
+    drop(memory_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn chat_summary_clears_stale_pending_run_without_resumable_agent_task() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-stale-chat-queue-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -9940,6 +10120,61 @@ fn chat_message_summaries_clear_stale_pending_message_without_resumable_agent_ta
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn edit_chat_user_message_rejects_active_registry_run_before_prompt_assembly() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-edit-active-run-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-edit-active-run-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let _registration = state
+        .active_chat_runs
+        .register(
+            "run-active".to_string(),
+            workspace_id.clone(),
+            "chat-active".to_string(),
+            "assistant-active".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    let error = match crate::http::chat::edit_chat_user_message(
+        State(state),
+        AxumPath((
+            workspace_id,
+            "chat-active".to_string(),
+            "user-active".to_string(),
+        )),
+        Json(crate::http::chat::EditChatUserMessageRequest {
+            message: "Edited".to_string(),
+            attachments: Vec::new(),
+            model_id: "missing-model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            selected_skill_ids: Vec::new(),
+            session_mode: None,
+            team_mode_enabled: false,
+            expected_content: None,
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("active run must reject edit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 #[tokio::test]
@@ -18221,6 +18456,29 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     .expect("ai statistics detail");
     assert_eq!(detail.request.id, "main-chat-request");
     assert_eq!(detail.request.request_kind, "chat completion");
+    assert!(detail.request.invalidated_at.is_none());
+    assert!(detail.request.invalidated_reason.is_none());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .invalidate_llm_request("main-chat-request", "chat message edited")
+                .expect("invalidate request")
+        );
+    }
+    let Json(invalidated_detail) = crate::http::chat::ai_statistics_detail(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "main-chat-request".to_string())),
+    )
+    .await
+    .expect("invalidated ai statistics detail");
+    assert!(invalidated_detail.request.invalidated_at.is_some());
+    assert_eq!(
+        invalidated_detail.request.invalidated_reason.as_deref(),
+        Some("chat message edited")
+    );
 
     let Json(internal_detail) = crate::http::chat::ai_statistics_detail(
         State(state),

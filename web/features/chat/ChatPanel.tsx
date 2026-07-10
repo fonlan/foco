@@ -11,6 +11,7 @@ import {
   Globe,
   ListChecks,
   LoaderCircle,
+  Pencil,
   Plus,
   RefreshCw,
   Send,
@@ -67,7 +68,7 @@ import type {
 import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
-import { toolDisplayName } from "./chat-helpers";
+import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
 
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
@@ -196,7 +197,9 @@ function ChatPanelComponent({
   onBranchMenuOpen,
   onCancelRun,
   onDraftMessageChange,
+  onEditMessage,
   onGuideActiveRun,
+  onSelectEditAttachments,
   onGuideQueuedMessage,
   onLoadMoreMessages,
   onModelChange,
@@ -256,6 +259,13 @@ function ChatPanelComponent({
   onBranchMenuOpen: () => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
+  onEditMessage: (
+    message: ShellMessage,
+    content: string,
+    selectedSkillIds: string[],
+    attachments: ComposerAttachment[],
+  ) => Promise<boolean>;
+  onSelectEditAttachments: (onSelected: (attachments: ComposerAttachment[]) => void) => void;
   onGuideActiveRun: () => void;
   onGuideQueuedMessage: (messageId: string) => void;
   onLoadMoreMessages: () => Promise<void>;
@@ -307,6 +317,11 @@ function ChatPanelComponent({
   const shouldLockMessageScrollRef = useRef(true);
   const userMessageScrollIntentRef = useRef(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingMessageText, setEditingMessageText] = useState("");
+  const [editingSkillIds, setEditingSkillIds] = useState<string[]>([]);
+  const [editingAttachments, setEditingAttachments] = useState<ComposerAttachment[]>([]);
+  const [isSavingEditedMessage, setIsSavingEditedMessage] = useState(false);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
   const [isResizingComposer, setIsResizingComposer] = useState(false);
   const [isSendButtonTooltipOpen, setIsSendButtonTooltipOpen] = useState(false);
@@ -713,6 +728,59 @@ function ChatPanelComponent({
     }, 1600);
   }, []);
 
+  const beginEditingMessage = useCallback((message: ShellMessage) => {
+    const persistedSkillIds = message.runConfig?.selectedSkillIds;
+    const legacySelectedSkills = persistedSkillIds
+      ? []
+      : selectedSkillPrefix(message.content, true)?.skills ?? [];
+    const legacySkillIds = legacySelectedSkills
+      .map((selectedSkill) => skills.find((skill) =>
+        skill.name === selectedSkill.name || skill.path === selectedSkill.path
+      )?.key)
+      .filter((skillId): skillId is string => Boolean(skillId));
+    setEditingMessageId(message.id);
+    setEditingMessageText(message.content);
+    setEditingSkillIds(persistedSkillIds ?? legacySkillIds);
+    setEditingAttachments([]);
+  }, [skills]);
+
+  const cancelEditingMessage = useCallback(() => {
+    if (isSavingEditedMessage) {
+      return;
+    }
+    setEditingMessageId(null);
+    setEditingMessageText("");
+    setEditingSkillIds([]);
+    setEditingAttachments([]);
+  }, [isSavingEditedMessage]);
+
+  const saveEditedMessage = useCallback(async (message: ShellMessage) => {
+    const trimmed = editingMessageText.trim();
+    if (!trimmed || isSavingEditedMessage) {
+      return;
+    }
+    const messageIndex = messages.findIndex((item) => item.id === message.id);
+    const removedCount = messageIndex < 0 ? 0 : messages.length - messageIndex - 1;
+    if (
+      removedCount > 0 &&
+      !window.confirm(t("Editing this message will remove {count} later messages and regenerate the reply. Continue?", { count: removedCount }))
+    ) {
+      return;
+    }
+    setIsSavingEditedMessage(true);
+    try {
+      const saved = await onEditMessage(message, trimmed, editingSkillIds, editingAttachments);
+      if (saved) {
+        setEditingMessageId(null);
+        setEditingMessageText("");
+        setEditingSkillIds([]);
+        setEditingAttachments([]);
+      }
+    } finally {
+      setIsSavingEditedMessage(false);
+    }
+  }, [editingAttachments, editingMessageText, editingSkillIds, isSavingEditedMessage, messages, onEditMessage, t]);
+
   return (
     <div
       className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden"
@@ -757,15 +825,34 @@ function ChatPanelComponent({
               ) : null}
               {messages.map((message) => (
                 <MessageRow
+                  canEdit={
+                    !readOnly &&
+                    !isSendingMessage &&
+                    !message.pendingMode &&
+                    message.role === "user"
+                  }
+                  editingAttachments={editingAttachments}
+                  editingSkillIds={editingSkillIds}
+                  editingText={editingMessageText}
                   helpers={helpers}
                   isCopied={copiedMessageId === message.id}
+                  isEditing={editingMessageId === message.id}
+                  isSavingEdit={isSavingEditedMessage && editingMessageId === message.id}
                   key={message.id}
                   message={message}
+                  onBeginEdit={beginEditingMessage}
+                  onCancelEdit={cancelEditingMessage}
                   onCopyMessage={handleCopyMessage}
+                  onEditingAttachmentsChange={setEditingAttachments}
+                  onEditingSkillIdsChange={setEditingSkillIds}
+                  onEditingTextChange={setEditingMessageText}
                   onGuideQueuedMessage={onGuideQueuedMessage}
                   onOpenMessageApiRequests={onOpenMessageApiRequests}
+                  onSaveEdit={saveEditedMessage}
+                  onSelectEditAttachments={onSelectEditAttachments}
                   onWithdrawQueuedMessage={onWithdrawQueuedMessage}
                   queuedMessageIds={queuedMessageIds}
+                  skills={skills}
                   workspaceId={workspaceId}
                 />
               ))}
@@ -1087,24 +1174,52 @@ function ChatPanelComponent({
 export const ChatPanel = memo(ChatPanelComponent);
 
 const MessageRow = memo(function MessageRow({
+  canEdit,
+  editingAttachments,
+  editingSkillIds,
+  editingText,
   helpers,
   isCopied,
+  isEditing,
+  isSavingEdit,
   message,
+  onBeginEdit,
+  onCancelEdit,
   onCopyMessage,
+  onEditingAttachmentsChange,
+  onEditingSkillIdsChange,
+  onEditingTextChange,
   onGuideQueuedMessage,
   onOpenMessageApiRequests,
+  onSaveEdit,
+  onSelectEditAttachments,
   onWithdrawQueuedMessage,
   queuedMessageIds,
+  skills,
   workspaceId,
 }: {
+  canEdit: boolean;
+  editingAttachments: ComposerAttachment[];
+  editingSkillIds: string[];
+  editingText: string;
   helpers: ChatPanelHelpers;
   isCopied: boolean;
+  isEditing: boolean;
+  isSavingEdit: boolean;
   message: ShellMessage;
+  onBeginEdit: (message: ShellMessage) => void;
+  onCancelEdit: () => void;
   onCopyMessage: (messageId: string, text: string) => void;
+  onEditingAttachmentsChange: (attachments: ComposerAttachment[]) => void;
+  onEditingSkillIdsChange: (skillIds: string[]) => void;
+  onEditingTextChange: (value: string) => void;
   onGuideQueuedMessage: (messageId: string) => void;
   onOpenMessageApiRequests: (message: ShellMessage) => void;
+  onSaveEdit: (message: ShellMessage) => void;
+  onSelectEditAttachments: (onSelected: (attachments: ComposerAttachment[]) => void) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
   queuedMessageIds: ReadonlySet<string>;
+  skills: ConfiguredSkillSummary[];
   workspaceId: string | null;
 }) {
   const { fallbackMessageParts, formatChatCreatedAt, messageCopyText } = helpers;
@@ -1232,6 +1347,17 @@ const MessageRow = memo(function MessageRow({
                 ) : null}
               </span>
               <span className="message-action-group">
+                {canEdit ? (
+                  <button
+                    aria-label={t("Edit message")}
+                    className="message-action-menu"
+                    onClick={() => onBeginEdit(message)}
+                    title={t("Edit message")}
+                    type="button"
+                  >
+                    <Pencil aria-hidden="true" className="size-3.5" />
+                  </button>
+                ) : null}
                 {canManageQueuedMessage ? (
                   <>
                     <button
@@ -1270,8 +1396,114 @@ const MessageRow = memo(function MessageRow({
                 </button>
               </span>
             </div>
-            {!isUser ? <MemoriesUsedBlock memories={message.memoriesUsed} /> : null}
-            {parts.length ? (
+            {isEditing ? (
+              <div className="space-y-2">
+                {editingSkillIds.length ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {editingSkillIds.map((skillId) => {
+                      const skill = skills.find((item) => item.key === skillId);
+                      return (
+                        <button
+                          className="rounded-full border border-teal-800/20 bg-white/70 px-2 py-0.5 text-xs text-teal-950"
+                          key={skillId}
+                          onClick={() => onEditingSkillIdsChange(editingSkillIds.filter((id) => id !== skillId))}
+                          title={t("Remove skill")}
+                          type="button"
+                        >
+                          {skill?.name ?? skillId} ×
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <select
+                    aria-label={t("Add skill")}
+                    className="rounded-lg border border-stone-300 bg-white/90 px-2 py-1 text-xs"
+                    onChange={(event) => {
+                      const skillId = event.target.value;
+                      if (skillId && !editingSkillIds.includes(skillId)) {
+                        onEditingSkillIdsChange([...editingSkillIds, skillId]);
+                      }
+                      event.target.value = "";
+                    }}
+                    value=""
+                  >
+                    <option value="">{t("Add skill")}</option>
+                    {skills.filter((skill) => !editingSkillIds.includes(skill.key)).map((skill) => (
+                      <option key={skill.key} value={skill.key}>{skill.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    className="rounded-lg border border-stone-300 bg-white/90 px-2 py-1 text-xs"
+                    onClick={() => onSelectEditAttachments((attachments) => onEditingAttachmentsChange([...editingAttachments, ...attachments]))}
+                    type="button"
+                  >
+                    {t("Add attachment")}
+                  </button>
+                </div>
+                {editingAttachments.length ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {editingAttachments.map((attachment) => (
+                      <button
+                        className="rounded-full border border-stone-300 bg-white/70 px-2 py-0.5 text-xs"
+                        key={attachment.id}
+                        onClick={() => onEditingAttachmentsChange(editingAttachments.filter((item) => item.id !== attachment.id))}
+                        title={t("Remove attachment {name}", { name: attachment.name })}
+                        type="button"
+                      >
+                        {attachment.name} ×
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <textarea
+                  aria-label={t("Edit message")}
+                  autoFocus
+                  className="min-h-24 w-full resize-y rounded-xl border border-stone-300 bg-white/90 px-3 py-2 text-sm text-stone-900 outline-none focus:border-teal-700"
+                  disabled={isSavingEdit}
+                  onChange={(event) => onEditingTextChange(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      onCancelEdit();
+                    } else if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      onSaveEdit(message);
+                    }
+                  }}
+                  value={editingText}
+                />
+                <div className="flex justify-end gap-1.5">
+                  <button
+                    aria-label={t("Cancel editing")}
+                    className="message-action-menu"
+                    disabled={isSavingEdit}
+                    onClick={onCancelEdit}
+                    title={t("Cancel editing")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                  <button
+                    aria-label={t("Save and regenerate")}
+                    className="message-action-menu"
+                    disabled={isSavingEdit || !editingText.trim()}
+                    onClick={() => onSaveEdit(message)}
+                    title={t("Save and regenerate")}
+                    type="button"
+                  >
+                    {isSavingEdit ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Send aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {!isEditing && !isUser ? <MemoriesUsedBlock memories={message.memoriesUsed} /> : null}
+            {!isEditing && parts.length ? (
               parts.map((part, partIndex) => (
                 <MessagePartBlock
                   helpers={helpers}
@@ -1289,7 +1521,7 @@ const MessageRow = memo(function MessageRow({
                   workspaceId={workspaceId}
                 />
               ))
-            ) : message.status === "streaming" ? (
+            ) : !isEditing && message.status === "streaming" ? (
               <LoaderCircle
                 aria-hidden="true"
                 className="message-waiting-spinner size-4 animate-spin"

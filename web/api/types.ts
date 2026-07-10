@@ -544,6 +544,15 @@ export type ChatRunBadge =
   | "contextCompressionRuntime"
   | "llmReconnect";
 
+export type ChatMessageRunConfigSummary = {
+  modelId: string;
+  providerId: string | null;
+  thinkingLevel: string | null;
+  selectedSkillIds: string[];
+  sessionMode?: "plan" | null;
+  teamModeEnabled: boolean;
+};
+
 export type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
@@ -552,6 +561,7 @@ export type ChatMessageSummary = {
   reasoning: string | null;
   status?: "error" | "streaming";
   sessionMode?: "plan" | null;
+  runConfig?: ChatMessageRunConfigSummary | null;
   pendingMode?: "guidance" | "queued";
   queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];
@@ -581,6 +591,17 @@ export type QueueChatMessageResponse = {
   sessionMode?: "plan" | null;
   agentTeamId?: string;
   agentTaskId?: string;
+};
+
+export type EditChatUserMessageResponse = {
+  chatId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  assistantSequence: number;
+  content: string;
+  parts: ChatMessagePart[];
+  sessionMode?: "plan" | null;
+  removedMessageIds: string[];
 };
 
 export type ChatMessagesResponse = {
@@ -2096,6 +2117,8 @@ export type AiRequestAuditSummary = {
   totalLatencyMs: number | null;
   statusCode: number | null;
   finalState: string;
+  invalidatedAt: string | null;
+  invalidatedReason: string | null;
 };
 
 export type AiRequestAuditDetail = AiRequestAuditSummary & {
@@ -2221,6 +2244,7 @@ export type ShellMessage = {
   reasoning: string | null;
   status?: "error" | "streaming";
   sessionMode?: "plan" | null;
+  runConfig?: ChatMessageRunConfigSummary | null;
   pendingMode?: "guidance" | "queued";
   queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];

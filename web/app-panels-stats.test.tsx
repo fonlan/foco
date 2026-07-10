@@ -3626,6 +3626,10 @@ describe("app-panels-stats verification surfaces", () => {
     });
     expect(within(dialog).getByText("Request body")).toBeInTheDocument();
     expect(within(dialog).getByText("Response body")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Invalidated")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Invalidated reason"),
+    ).not.toBeInTheDocument();
     const requestBodyBlock = within(dialog)
       .getByText("Request body")
       .closest(".audit-json-block");

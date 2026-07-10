@@ -102,6 +102,45 @@ pub(crate) struct QueueChatMessageResponse {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct EditChatUserMessageRequest {
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ChatAttachmentInput>,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    #[serde(default)]
+    pub(crate) selected_skill_ids: Vec<String>,
+    pub(crate) session_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) team_mode_enabled: bool,
+    pub(crate) expected_content: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditChatUserMessageResponse {
+    pub(crate) chat_id: String,
+    pub(crate) user_message_id: String,
+    pub(crate) assistant_message_id: String,
+    pub(crate) assistant_sequence: i64,
+    pub(crate) content: String,
+    pub(crate) parts: Vec<ChatMessagePart>,
+    pub(crate) session_mode: Option<String>,
+    pub(crate) removed_message_ids: Vec<String>,
+    pub(crate) invalidated_run_ids: Vec<String>,
+    pub(crate) cancelled_agent_task_ids: Vec<foco_agent::AgentTaskId>,
+    pub(crate) skipped_workspace_spec_job_ids: Vec<String>,
+    pub(crate) skipped_memory_extraction_job_ids: Vec<String>,
+    pub(crate) completed_memories_preserved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_team_id: Option<foco_agent::AgentTeamId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_task_id: Option<foco_agent::AgentTaskId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ChatRunStreamQuery {
     after_sequence: Option<i64>,
 }
@@ -506,6 +545,191 @@ pub(crate) async fn queue_chat_message(
     }))
 }
 
+pub(crate) async fn edit_chat_user_message(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id, message_id)): AxumPath<(String, String, String)>,
+    Json(request): Json<EditChatUserMessageRequest>,
+) -> Result<Json<EditChatUserMessageResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    workspace_by_id(&config, &workspace_id)?;
+    if state
+        .active_chat_runs
+        .active_run_for_chat(&workspace_id, &chat_id)?
+        .is_some()
+    {
+        return Err(ApiError::conflict("chat already has an active run"));
+    }
+    let EditChatUserMessageRequest {
+        message,
+        attachments,
+        model_id,
+        provider_id,
+        thinking_level,
+        selected_skill_ids,
+        session_mode,
+        team_mode_enabled,
+        expected_content,
+    } = request;
+    let prompt_context = prepare_prompt_context(
+        &state,
+        &config,
+        &workspace_id,
+        PromptContextRequest {
+            chat_id: Some(chat_id.clone()),
+            queued_user_message_id: None,
+            model_id: model_id.clone(),
+            provider_id: provider_id.clone(),
+            thinking_level: thinking_level.clone(),
+            skill_ids: Some(selected_skill_ids.clone()),
+            session_mode: session_mode.clone(),
+            message: Some(message),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments,
+        },
+        None,
+        PromptAssemblyPurpose::ChatRun,
+    )
+    .await?;
+    validate_provider_request_thinking_level(
+        &config,
+        &state.model_metadata_file,
+        &prompt_context.model_id,
+        prompt_context.provider_request.thinking_level.as_deref(),
+    )?;
+    let content = prompt_context
+        .message
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let assistant_message_id = unique_id("msg-assistant");
+    let mut database = open_workspace_database(&prompt_context.workspace_path)?;
+    let current_message = database
+        .message(&message_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("message was not found: {message_id}")))?;
+    if current_message.chat_id != chat_id || current_message.role != "user" {
+        return Err(ApiError::bad_request(
+            "only user messages in this chat can be edited",
+        ));
+    }
+    let assistant_sequence = current_message
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| ApiError::bad_request("assistant message sequence overflowed"))?;
+    let user_metadata_json = queued_user_message_metadata_json(
+        &prompt_context.attachments,
+        &assistant_message_id,
+        assistant_sequence,
+        &model_id,
+        provider_id.as_deref(),
+        thinking_level.as_deref(),
+        &selected_skill_ids,
+        session_mode.as_deref(),
+        team_mode_enabled,
+        None,
+    )?;
+    let queued_run_json = json!({
+        "status": "queued",
+        "userMessageId": message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": assistant_sequence,
+        "modelId": model_id,
+        "providerId": provider_id,
+        "thinkingLevel": thinking_level,
+        "skillIds": selected_skill_ids,
+        "sessionMode": session_mode,
+        "content": content,
+    })
+    .to_string();
+    let assistant_metadata_json = assistant_message_metadata_json(
+        None,
+        &[],
+        &CodeChangeStats::default(),
+        Some("streaming"),
+        None,
+    )?;
+    let team = database
+        .agent_team_for_chat(&chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let agent_task_id = team
+        .as_ref()
+        .map(|_| {
+            foco_agent::AgentTaskId::new(unique_id("agent-task"))
+                .map_err(|error| ApiError::internal(error.to_string()))
+        })
+        .transpose()?;
+    let task_attachments = prompt_context
+        .attachments
+        .iter()
+        .map(|attachment| ChatAttachmentInput {
+            id: attachment.id.clone(),
+            name: attachment.name.clone(),
+            content_type: attachment.content_type.clone(),
+            content_base64: attachment.content_base64.clone(),
+            path: attachment.path.clone(),
+            size_bytes: attachment.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    let task_input_json = agent_task_id
+        .as_ref()
+        .map(|_| {
+            serde_json::to_string(&CoordinatorTaskInput {
+                queued_user_message_id: message_id.clone(),
+                visible_assistant_message_id: Some(assistant_message_id.clone()),
+                visible_assistant_sequence: Some(assistant_sequence),
+                message: content.to_string(),
+                attachments: task_attachments,
+                skill_ids: selected_skill_ids.clone(),
+                session_mode: session_mode.clone(),
+                collaboration_tools_enabled: team_mode_enabled,
+                defer_until_workspace_idle: false,
+                delegated_input: None,
+                correlation_id: None,
+            })
+            .map_err(|source| {
+                ApiError::internal(format!("failed to serialize Coordinator task: {source}"))
+            })
+        })
+        .transpose()?;
+    let rewritten = database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: &chat_id,
+            user_message_id: &message_id,
+            expected_content: expected_content.as_deref(),
+            content,
+            user_metadata_json: &user_metadata_json,
+            chat_queued_run_json: &queued_run_json,
+            assistant_message_id: &assistant_message_id,
+            assistant_metadata_json: &assistant_metadata_json,
+            coordinator_task_id: agent_task_id.as_ref(),
+            coordinator_task_input_json: task_input_json.as_deref(),
+            invalidated_reason: "chat message edited",
+            memory_invalidation_reason: "chat message edited",
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    if rewritten.agent_task_id.is_some() {
+        state.agent_scheduler.wake()?;
+    }
+
+    Ok(Json(EditChatUserMessageResponse {
+        chat_id,
+        user_message_id: message_id,
+        assistant_message_id,
+        assistant_sequence,
+        content: content.to_string(),
+        parts: user_message_response_parts(content, &prompt_context.attachments),
+        session_mode,
+        removed_message_ids: rewritten.removed_message_ids,
+        invalidated_run_ids: rewritten.invalidated_run_ids,
+        cancelled_agent_task_ids: rewritten.cancelled_agent_task_ids,
+        skipped_workspace_spec_job_ids: rewritten.skipped_workspace_spec_job_ids,
+        skipped_memory_extraction_job_ids: rewritten.skipped_memory_extraction_job_ids,
+        completed_memories_preserved: true,
+        agent_team_id: rewritten.agent_team_id,
+        agent_task_id: rewritten.agent_task_id,
+    }))
+}
+
 pub(crate) async fn queue_chat_message_internal(
     state: &AppState,
     workspace_id: &str,
@@ -624,6 +848,7 @@ pub(crate) async fn queue_chat_message_internal(
         requested_thinking_level.as_deref(),
         &requested_skill_ids,
         requested_session_mode.as_deref(),
+        team_mode_enabled,
         origin_metadata.as_ref(),
     )?;
 
@@ -1753,6 +1978,7 @@ fn load_ai_statistics_response(
             final_state: filters.status.as_deref(),
             started_after: filters.started_after.as_deref(),
             started_before: filters.started_before.as_deref(),
+            valid_only: false,
             limit: Some(page_limit),
             offset: Some(0),
         };
@@ -2249,12 +2475,14 @@ pub(crate) async fn chat_statistics(
         .llm_request_audit_count(LlmRequestAuditFilters {
             chat_id: Some(chat_id),
             exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+            valid_only: true,
             ..LlmRequestAuditFilters::default()
         })
         .and_then(|request_count| {
             database.llm_request_audit_rows(LlmRequestAuditFilters {
                 chat_id: Some(chat_id),
                 exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                valid_only: true,
                 limit: Some(request_count),
                 offset: Some(0),
                 ..LlmRequestAuditFilters::default()

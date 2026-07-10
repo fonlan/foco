@@ -27,15 +27,15 @@ use foco_store::{
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
         NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
         NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-        PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch, ScheduledTaskDueRunClaim,
-        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        prune_workspace_database_backups, workspace_database_path,
+        PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch, RewriteChatFromUserMessage,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -5275,6 +5275,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             final_state: Some("completed"),
             started_after: Some("2026-06-03T09:00:00.000Z"),
             started_before: Some("2026-06-03T10:30:00.000Z"),
+            valid_only: false,
             limit: Some(1),
             offset: None,
         })
@@ -5296,6 +5297,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
                 final_state: Some("completed"),
                 started_after: Some("2026-06-03T09:00:00.000Z"),
                 started_before: Some("2026-06-03T10:30:00.000Z"),
+                valid_only: false,
                 limit: None,
                 offset: None,
             })
@@ -5431,6 +5433,44 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             .llm_request_audit_count(main_chat_filters)
             .expect("main chat audit count"),
         1
+    );
+
+    let valid_main_chat_filters = LlmRequestAuditFilters {
+        valid_only: true,
+        ..main_chat_filters
+    };
+    assert_eq!(
+        database
+            .llm_request_audit_count(valid_main_chat_filters)
+            .expect("valid main chat audit count"),
+        1
+    );
+
+    Connection::open(database.database_path())
+        .expect("open audit database")
+        .execute(
+            "UPDATE llm_requests
+             SET invalidated_at = '2026-07-06T10:01:00Z',
+                 invalidated_reason = 'chat message edited'
+             WHERE id = 'main-chat-request'",
+            [],
+        )
+        .expect("invalidate main chat request");
+    let audit_rows_after_invalidation = database
+        .llm_request_audit_rows(main_chat_filters)
+        .expect("audit rows after invalidation");
+    assert_eq!(audit_rows_after_invalidation.len(), 1);
+    assert_eq!(
+        audit_rows_after_invalidation[0]
+            .invalidated_reason
+            .as_deref(),
+        Some("chat message edited")
+    );
+    assert_eq!(
+        database
+            .llm_request_audit_count(valid_main_chat_filters)
+            .expect("valid main chat audit count after invalidation"),
+        0
     );
 
     let summary = database
@@ -9902,4 +9942,362 @@ fn assert_no_agent_messages_old_references(connection: &Connection) {
             "{table} must not reference agent_messages_old"
         );
     }
+}
+
+#[test]
+fn agent_task_for_queued_user_message_prefers_latest_rewrite_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-rewrite-task", "rewrite-task");
+    let old_task_id = AgentTaskId::new("agent-task-rewrite-old").expect("old task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &old_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"queuedUserMessageId":"user-rewrite","visibleAssistantMessageId":"assistant-old","visibleAssistantSequence":1}"#,
+        })
+        .expect("old task enqueue");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &old_task_id,
+                expected_status: AgentTaskStatus::Queued,
+                transition: AgentTaskTransition::Cancel,
+                result_json: None,
+                error_json: Some(r#"{"message":"rewritten"}"#),
+                interruption_reason: None,
+            })
+            .expect("cancel old task")
+    );
+
+    let new_task_id = AgentTaskId::new("agent-task-rewrite-new").expect("new task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &new_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"queuedUserMessageId":"user-rewrite","visibleAssistantMessageId":"assistant-new","visibleAssistantSequence":1}"#,
+        })
+        .expect("new task enqueue");
+
+    let selected = database
+        .agent_task_for_queued_user_message(&team_id, "user-rewrite")
+        .expect("task lookup")
+        .expect("selected task");
+    assert_eq!(selected.id, new_task_id);
+    assert_eq!(selected.status, AgentTaskStatus::Queued);
+}
+
+#[test]
+fn rewrite_chat_from_user_message_truncates_persisted_history_and_prompt_state() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-rewrite", "Rewrite chat")
+        .expect("chat insert");
+    for (id, role, content, sequence, metadata_json) in [
+        ("user-1", "user", "first", 0, r#"{"modelId":"model-old"}"#),
+        ("assistant-1", "assistant", "first answer", 1, "{}"),
+        ("user-2", "user", "second", 2, "{}"),
+        (
+            "assistant-2",
+            "assistant",
+            "second answer",
+            3,
+            r#"{"metrics":{"llmRequestIds":["run-2"]}}"#,
+        ),
+        ("user-3", "user", "third", 4, "{}"),
+        (
+            "assistant-3",
+            "assistant",
+            "third answer",
+            5,
+            r#"{"metrics":{"llmRequestIds":["run-3"]}}"#,
+        ),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id,
+                chat_id: "chat-rewrite",
+                role,
+                content,
+                sequence,
+                metadata_json: Some(metadata_json),
+            })
+            .expect("message insert");
+    }
+    for (id, sequence) in [
+        ("stable", None),
+        ("turn-before", Some(0)),
+        ("turn-at", Some(2)),
+        ("turn-after", Some(4)),
+    ] {
+        database
+            .insert_prompt_context_injection(NewPromptContextInjection {
+                id,
+                chat_id: "chat-rewrite",
+                kind: if sequence.is_some() {
+                    "turn_memory"
+                } else {
+                    "stable"
+                },
+                sequence,
+                messages_json: "[]",
+                memory_keys_json: "[]",
+                memory_summaries_json: "[]",
+            })
+            .expect("prompt injection insert");
+    }
+    for (id, sequence, source_end) in [
+        ("snapshot-before", 0, 1),
+        ("snapshot-overlap", 1, 2),
+        ("snapshot-after", 4, 4),
+    ] {
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id,
+                chat_id: "chat-rewrite",
+                run_id: id,
+                sequence,
+                summary: id,
+                source_message_start_sequence: 0,
+                source_message_end_sequence: source_end,
+                original_token_count: 10,
+                summary_token_count: 2,
+                metadata_json: None,
+            })
+            .expect("compression snapshot insert");
+    }
+
+    let result = database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: "chat-rewrite",
+            user_message_id: "user-2",
+            expected_content: Some("second"),
+            content: "second edited",
+            user_metadata_json: r#"{"attachments":[{"id":"attachment-1","name":"notes.txt","contentType":"text/plain","sizeBytes":5,"contentBase64":"aGVsbG8="}],"modelId":"model-new","selectedSkillIds":["skill-1"],"queuedRun":{"status":"queued","assistantMessageId":"assistant-edited","assistantSequence":3,"modelId":"model-new","skillIds":["skill-1"]}}"#,
+            chat_queued_run_json: r#"{"status":"queued","userMessageId":"user-2","assistantMessageId":"assistant-edited","assistantSequence":3,"modelId":"model-new","skillIds":["skill-1"],"content":"second edited"}"#,
+            assistant_message_id: "assistant-edited",
+            assistant_metadata_json: r#"{"streamingState":"streaming"}"#,
+            coordinator_task_id: None,
+            coordinator_task_input_json: None,
+            invalidated_reason: "test rewrite",
+            memory_invalidation_reason: "test rewrite",
+        })
+        .expect("rewrite chat");
+
+    assert_eq!(
+        result.removed_message_ids,
+        vec!["assistant-2", "user-3", "assistant-3"]
+    );
+    let messages = database
+        .messages_for_chat("chat-rewrite")
+        .expect("rewritten messages");
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| (
+                message.id.as_str(),
+                message.content.as_str(),
+                message.sequence
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("user-1", "first", 0),
+            ("assistant-1", "first answer", 1),
+            ("user-2", "second edited", 2),
+            ("assistant-edited", "", 3),
+        ]
+    );
+    let edited_metadata: Value =
+        serde_json::from_str(&messages[2].metadata_json).expect("metadata");
+    assert_eq!(edited_metadata["attachments"][0]["name"], "notes.txt");
+    assert_eq!(edited_metadata["selectedSkillIds"][0], "skill-1");
+    let injections = database
+        .prompt_context_injections_for_chat("chat-rewrite")
+        .expect("prompt injections");
+    assert_eq!(
+        injections
+            .iter()
+            .map(|injection| injection.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stable", "turn-before"]
+    );
+    let snapshots = database
+        .context_compression_snapshots_for_chat("chat-rewrite")
+        .expect("compression snapshots");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, "snapshot-before");
+}
+
+#[test]
+fn rewrite_chat_from_user_message_handles_first_and_terminal_user_turns() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+
+    database
+        .insert_chat("chat-first-turn", "First turn")
+        .expect("first chat insert");
+    for (id, role, content, sequence) in [
+        ("first-user-1", "user", "first", 0),
+        ("first-assistant-1", "assistant", "first answer", 1),
+        ("first-user-2", "user", "second", 2),
+        ("first-assistant-2", "assistant", "second answer", 3),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id,
+                chat_id: "chat-first-turn",
+                role,
+                content,
+                sequence,
+                metadata_json: Some("{}"),
+            })
+            .expect("first chat message insert");
+    }
+    let first_result = database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: "chat-first-turn",
+            user_message_id: "first-user-1",
+            expected_content: Some("first"),
+            content: "first edited",
+            user_metadata_json: r#"{"queuedRun":{"status":"queued"}}"#,
+            chat_queued_run_json: r#"{"status":"queued"}"#,
+            assistant_message_id: "first-assistant-new",
+            assistant_metadata_json: r#"{"streamingState":"streaming"}"#,
+            coordinator_task_id: None,
+            coordinator_task_input_json: None,
+            invalidated_reason: "test rewrite",
+            memory_invalidation_reason: "test rewrite",
+        })
+        .expect("rewrite first turn");
+    assert_eq!(
+        first_result.removed_message_ids,
+        vec!["first-assistant-1", "first-user-2", "first-assistant-2"]
+    );
+    assert_eq!(
+        database
+            .messages_for_chat("chat-first-turn")
+            .expect("first chat messages")
+            .into_iter()
+            .map(|message| (message.id, message.content, message.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first-user-1".to_string(), "first edited".to_string(), 0),
+            ("first-assistant-new".to_string(), String::new(), 1),
+        ]
+    );
+
+    database
+        .insert_chat("chat-terminal-turn", "Terminal turn")
+        .expect("terminal chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "terminal-user",
+            chat_id: "chat-terminal-turn",
+            role: "user",
+            content: "terminal",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("terminal user insert");
+    let terminal_result = database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: "chat-terminal-turn",
+            user_message_id: "terminal-user",
+            expected_content: Some("terminal"),
+            content: "terminal edited",
+            user_metadata_json: r#"{"queuedRun":{"status":"queued"}}"#,
+            chat_queued_run_json: r#"{"status":"queued"}"#,
+            assistant_message_id: "terminal-assistant-new",
+            assistant_metadata_json: r#"{"streamingState":"streaming"}"#,
+            coordinator_task_id: None,
+            coordinator_task_input_json: None,
+            invalidated_reason: "test rewrite",
+            memory_invalidation_reason: "test rewrite",
+        })
+        .expect("rewrite terminal turn");
+    assert!(terminal_result.removed_message_ids.is_empty());
+    assert_eq!(
+        database
+            .messages_for_chat("chat-terminal-turn")
+            .expect("terminal chat messages")
+            .into_iter()
+            .map(|message| (message.id, message.content, message.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "terminal-user".to_string(),
+                "terminal edited".to_string(),
+                0,
+            ),
+            ("terminal-assistant-new".to_string(), String::new(), 1),
+        ]
+    );
+}
+
+#[test]
+fn rewrite_chat_from_user_message_rolls_back_when_new_assistant_conflicts() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-rollback", "Rollback")
+        .expect("chat insert");
+    for (id, role, content, sequence) in [
+        ("user-1", "user", "original", 0),
+        ("assistant-1", "assistant", "answer", 1),
+        ("assistant-conflict", "assistant", "existing", 2),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id,
+                chat_id: "chat-rollback",
+                role,
+                content,
+                sequence,
+                metadata_json: Some("{}"),
+            })
+            .expect("message insert");
+    }
+
+    let original_chat = database
+        .chat("chat-rollback")
+        .expect("chat read")
+        .expect("chat");
+    let original_messages = database
+        .messages_for_chat("chat-rollback")
+        .expect("original messages");
+    database
+        .rewrite_chat_from_user_message(RewriteChatFromUserMessage {
+            chat_id: "chat-rollback",
+            user_message_id: "user-1",
+            expected_content: Some("stale original"),
+            content: "edited",
+            user_metadata_json: r#"{"queuedRun":{"status":"queued"}}"#,
+            chat_queued_run_json: r#"{"status":"queued"}"#,
+            assistant_message_id: "assistant-new",
+            assistant_metadata_json: "{}",
+            coordinator_task_id: None,
+            coordinator_task_input_json: None,
+            invalidated_reason: "test rewrite",
+            memory_invalidation_reason: "test rewrite",
+        })
+        .expect_err("expected content conflict should roll back");
+
+    let messages = database
+        .messages_for_chat("chat-rollback")
+        .expect("messages after rollback");
+    assert_eq!(messages, original_messages);
+    let chat = database
+        .chat("chat-rollback")
+        .expect("chat read")
+        .expect("chat");
+    assert_eq!(chat, original_chat);
 }

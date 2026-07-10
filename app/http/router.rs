@@ -511,6 +511,11 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::agents::agent_task_action),
         )
         .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/messages/{message_id}/edit",
+            post(crate::http::chat::edit_chat_user_message)
+                .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chat/queue",
             post(crate::http::chat::queue_chat_message)
                 .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),

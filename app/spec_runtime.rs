@@ -788,6 +788,15 @@ pub(crate) fn apply_workspace_spec_job_output(
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
+    let Some(job) = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if job.status != WorkspaceSpecJobStatus::Running.as_str() {
+        return Ok(());
+    }
     let current = database
         .workspace_spec()
         .map_err(ApiError::from_workspace_error)?
