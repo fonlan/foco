@@ -1028,7 +1028,12 @@ function ContextPlanTab({
                   count + phase.steps.filter((step) => step.status === "completed").length,
                 0,
               );
-              const action = primaryPlanAction(plan.status);
+              const earliestIncompletePhase = earliestIncompletePlanPhase(plan);
+              const cancelledBarrierPhase =
+                earliestIncompletePhase?.status === "cancelled"
+                  ? earliestIncompletePhase
+                  : null;
+              const action = primaryPlanAction(plan);
               const actionKey = action ? `${action}:${plan.id}` : null;
               const mergedCommitId = planMergedIntoSharedWorkspace(plan);
               const canRetryMerge = planNeedsMergeRetry(plan);
@@ -1129,6 +1134,13 @@ function ContextPlanTab({
                     {plan.title}
                   </h3>
                   <p>{plan.overview}</p>
+                  {cancelledBarrierPhase ? (
+                    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                      <span className="font-semibold">{cancelledBarrierPhase.title}</span>
+                      {": "}
+                      {t("Retry the cancelled phase to continue this plan.")}
+                    </div>
+                  ) : null}
                   {plan.errorMessage ? (
                     <div
                       className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700"
@@ -3227,11 +3239,23 @@ function taskStatusClass(status: TaskStatus) {
   return `${base} bg-stone-100 text-stone-600`;
 }
 
-function primaryPlanAction(status: PlanStatus): PlanAction | null {
+function earliestIncompletePlanPhase(plan: Plan) {
+  return plan.phases
+    .filter((phase) => phase.status !== "completed")
+    .sort((left, right) => left.sequence - right.sequence)[0] ?? null;
+}
+
+function primaryPlanAction(plan: Plan): PlanAction | null {
+  const { status } = plan;
   if (status === "implemented" || status === "failed" || status === "cancelled") {
     return "mark_complete";
   }
   if (status === "paused") {
+    // A cancelled earliest incomplete phase is a durable execution barrier. The
+    // phase Retry action is the only UI operation that may resume this plan.
+    if (earliestIncompletePlanPhase(plan)?.status === "cancelled") {
+      return null;
+    }
     return "resume";
   }
   if (status === "ready" || status === "draft") {

@@ -3240,6 +3240,8 @@ impl WorkspaceDatabase {
         &self,
         plan: &'a PlanRecord,
     ) -> Option<&'a PlanPhaseRecord> {
+        // Execution order is a store invariant, not a scheduler convention: a
+        // target phase may start only when every earlier phase is completed.
         plan.phases.iter().find(|phase| phase.status != "completed")
     }
 

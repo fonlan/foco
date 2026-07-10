@@ -790,6 +790,88 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("hides Resume behind Retry when the earliest incomplete phase is cancelled", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-10T12:00:00Z";
+    const cancelledPlan: Plan = {
+      ...planFixture,
+      activePhaseId: null,
+      errorMessage: "user cancelled phase one",
+      id: "plan-cancelled-barrier-ui",
+      pauseRequestedAt: timestamp,
+      status: "paused",
+      title: "Cancelled phase barrier",
+      phases: [
+        {
+          ...planFixture.phases[0],
+          errorMessage: "user cancelled phase one",
+          id: "phase-cancelled-barrier-ui",
+          planId: "plan-cancelled-barrier-ui",
+          status: "cancelled",
+          title: "Cancelled first phase",
+          steps: planFixture.phases[0].steps.map((step) => ({
+            ...step,
+            phaseId: "phase-cancelled-barrier-ui",
+            planId: "plan-cancelled-barrier-ui",
+            status: "cancelled",
+          })),
+        },
+        {
+          ...planFixture.phases[0],
+          id: "phase-later-pending-ui",
+          planId: "plan-cancelled-barrier-ui",
+          sequence: 1,
+          status: "pending",
+          title: "Later pending phase",
+          steps: planFixture.phases[0].steps.map((step) => ({
+            ...step,
+            id: "step-later-pending-ui",
+            phaseId: "phase-later-pending-ui",
+            planId: "plan-cancelled-barrier-ui",
+          })),
+        },
+      ],
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://127.0.0.1").pathname;
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [cancelledPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
+        if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+          return jsonResponse({ busy: false, enabled: false });
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Cancelled phase barrier")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry plan phase" })).toBeInTheDocument();
+    expect(
+      screen.getByText((_, element) =>
+        element?.textContent ===
+        "Cancelled first phase: Retry the cancelled phase to continue this plan.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("user cancelled phase one")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Auto run plansRun every active plan in order",
+      }),
+    ).not.toBeChecked();
+  });
   it.each(["failed", "cancelled"] as const)(
     "retries a %s plan phase through the phase retry endpoint",
     async (phaseStatus) => {

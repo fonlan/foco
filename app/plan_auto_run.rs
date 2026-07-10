@@ -122,6 +122,8 @@ async fn dispatch_next_plan_auto_run(
             return Ok(PlanAutoRunDispatch::Blocked);
         }
         let selection = database
+            // Candidate selection must preserve the same earliest-incomplete
+            // phase boundary enforced by Store start/resume and Retry paths.
             .next_plan_auto_run_candidate()
             .map_err(ApiError::from_workspace_error)?;
         match &selection {

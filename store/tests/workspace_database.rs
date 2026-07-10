@@ -1759,6 +1759,21 @@ fn cancelled_earliest_phase_blocks_resume_without_state_changes() {
     assert_eq!(refreshed.status, "paused");
     assert_eq!(refreshed.phases[0].status, "cancelled");
     assert_eq!(refreshed.phases[1].status, "pending");
+
+    drop(database);
+    let mut reopened =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+    let error = reopened
+        .transition_plan("plan-cancelled-resume-barrier", "resume")
+        .expect_err("persisted cancelled phase must block resume after restart");
+    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+    let reopened_plan = reopened
+        .plan("plan-cancelled-resume-barrier")
+        .expect("reopened plan")
+        .expect("reopened plan");
+    assert_eq!(reopened_plan.status, "paused");
+    assert_eq!(reopened_plan.phases[0].status, "cancelled");
+    assert_eq!(reopened_plan.phases[1].status, "pending");
 }
 
 #[test]
@@ -1904,6 +1919,30 @@ fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
         .expect("plan");
     assert_eq!(plan.phases[0].status, "running");
     assert_eq!(plan.phases[1].status, "completed");
+
+    let completed_retry = database
+        .update_plan_step(
+            "plan-retry-earliest-cancelled",
+            "plan-retry-earliest-cancelled-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete retried earliest phase");
+    assert_eq!(completed_retry.status, "implemented");
+    assert!(completed_retry.active_phase_id.is_none());
+    assert_eq!(completed_retry.phases[0].status, "completed");
+    assert_eq!(completed_retry.phases[1].status, "completed");
+
+    let after_resume = database
+        .transition_plan("plan-retry-earliest-cancelled", "resume")
+        .expect("all-completed abnormal history stays implemented");
+    assert_eq!(after_resume.status, "implemented");
+    assert!(after_resume.active_phase_id.is_none());
+    assert_eq!(after_resume.phases[1].status, "completed");
 }
 
 #[test]
