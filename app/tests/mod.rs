@@ -6936,11 +6936,19 @@ fn workspace_logo_file_ignores_empty_logo_file() {
 }
 
 #[test]
-fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
+fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo_and_thumbnail_caches() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-save-test"));
     let logo_dir = workspace_dir.join(".foco");
     fs::create_dir_all(&logo_dir).expect("logo directory");
     fs::write(logo_dir.join("logo.png"), b"\x89PNG\r\n\x1A\nold").expect("write old logo");
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        fs::write(logo_dir.join(file_name), b"stale").expect("write stale thumbnail cache");
+    }
     let jpeg = &[0xFF, 0xD8, 0xFF, 0xE0, b'l', b'o', b'g', b'o'];
     let kind = workspace_logo_kind(jpeg).expect("jpeg kind");
 
@@ -6948,6 +6956,14 @@ fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
 
     assert!(!logo_dir.join("logo.png").exists());
     assert!(logo_dir.join("logo.jpg").exists());
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        assert!(!logo_dir.join(file_name).exists());
+    }
     let logo = workspace_logo_file(&workspace_dir)
         .expect("logo lookup")
         .expect("saved logo");
@@ -6961,12 +6977,12 @@ fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
 }
 
 #[test]
-fn workspace_logo_thumbnail_generates_png_with_32px_bounds() {
+fn workspace_logo_thumbnail_generates_png_with_160px_bounds_and_ignores_legacy_cache() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-thumb-test"));
     let logo_dir = workspace_dir.join(".foco");
     fs::create_dir_all(&logo_dir).expect("logo directory");
 
-    let source = image::RgbaImage::from_fn(96, 48, |x, y| {
+    let source = image::RgbaImage::from_fn(480, 240, |x, y| {
         image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
     });
     let mut source_png = std::io::Cursor::new(Vec::new());
@@ -6975,6 +6991,16 @@ fn workspace_logo_thumbnail_generates_png_with_32px_bounds() {
         .expect("encode source png");
     let source_png = source_png.into_inner();
     fs::write(logo_dir.join("logo.png"), &source_png).expect("write png logo");
+    fs::write(
+        logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE),
+        b"legacy 32px thumbnail",
+    )
+    .expect("write legacy thumbnail cache");
+    fs::write(
+        logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE),
+        b"legacy version",
+    )
+    .expect("write legacy thumbnail version");
 
     let logo = workspace_logo_file(&workspace_dir)
         .expect("logo lookup")
@@ -6985,14 +7011,50 @@ fn workspace_logo_thumbnail_generates_png_with_32px_bounds() {
     assert!(thumbnail.bytes.len() < source_png.len());
     let decoded = image::load_from_memory_with_format(&thumbnail.bytes, image::ImageFormat::Png)
         .expect("decode thumbnail png");
-    assert!(decoded.width() <= 32);
-    assert!(decoded.height() <= 32);
+    assert!(decoded.width() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
+    assert!(decoded.height() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
+    assert_eq!(
+        decoded.width().max(decoded.height()),
+        WORKSPACE_LOGO_THUMBNAIL_SIZE
+    );
+    assert_eq!((decoded.width(), decoded.height()), (160, 80));
+    assert!(logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE).is_file());
+    assert!(
+        logo_dir
+            .join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE)
+            .is_file()
+    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[test]
-fn clear_workspace_logo_file_removes_logo_candidates() {
+fn workspace_logo_thumbnail_returns_svg_source_without_rasterizing() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-svg-thumb-test"));
+    let logo_dir = workspace_dir.join(".foco");
+    fs::create_dir_all(&logo_dir).expect("logo directory");
+    let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120"><rect width="240" height="120" fill="teal"/></svg>"#;
+    fs::write(logo_dir.join("logo.svg"), source).expect("write svg logo");
+
+    let logo = workspace_logo_file(&workspace_dir)
+        .expect("logo lookup")
+        .expect("saved logo");
+    let thumbnail = workspace_logo_thumbnail_file(&logo).expect("thumbnail");
+
+    assert_eq!(thumbnail.content_type, "image/svg+xml");
+    assert_eq!(thumbnail.bytes, source);
+    assert!(!logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE).exists());
+    assert!(
+        !logo_dir
+            .join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE)
+            .exists()
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn clear_workspace_logo_file_removes_logo_candidates_and_thumbnail_caches() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-clear-test"));
     let logo_dir = workspace_dir.join(".foco");
     fs::create_dir_all(&logo_dir).expect("logo directory");
@@ -7002,11 +7064,27 @@ fn clear_workspace_logo_file_removes_logo_candidates() {
         [0xFF, 0xD8, 0xFF, 0xE0, b'l', b'o', b'g', b'o'],
     )
     .expect("write jpeg logo");
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        fs::write(logo_dir.join(file_name), b"stale").expect("write stale thumbnail cache");
+    }
 
     clear_workspace_logo_file(&workspace_dir).expect("clear logo");
 
     assert!(!logo_dir.join("logo.png").exists());
     assert!(!logo_dir.join("logo.jpg").exists());
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        assert!(!logo_dir.join(file_name).exists());
+    }
     assert!(
         workspace_logo_file(&workspace_dir)
             .expect("logo lookup")

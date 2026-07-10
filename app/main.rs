@@ -336,8 +336,11 @@ const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 // File extensions accepted for persisted workspace logo images.
 const WORKSPACE_LOGO_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "svg"];
-const WORKSPACE_LOGO_THUMBNAIL_FILE: &str = "logo-thumb-32.png";
-const WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE: &str = "logo-thumb-32.version";
+const WORKSPACE_LOGO_THUMBNAIL_SIZE: u32 = 160;
+const WORKSPACE_LOGO_THUMBNAIL_FILE: &str = "logo-thumb-160.png";
+const WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE: &str = "logo-thumb-160.version";
+const LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE: &str = "logo-thumb-32.png";
+const LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE: &str = "logo-thumb-32.version";
 // Prefix used to identify injected AGENTS.md instruction messages.
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 // Prefix used to identify injected user-configured prompt file messages.
@@ -6818,6 +6821,8 @@ fn remove_workspace_logo_files(logo_dir: &Path) -> Result<(), ApiError> {
     for file_name in [
         WORKSPACE_LOGO_THUMBNAIL_FILE,
         WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
     ] {
         let path = logo_dir.join(file_name);
         if path.exists() {
@@ -6993,7 +6998,7 @@ fn generate_workspace_logo_thumbnail_png(bytes: &[u8], path: &Path) -> Result<Ve
 
     let mut png = std::io::Cursor::new(Vec::new());
     image
-        .thumbnail(32, 32)
+        .thumbnail(WORKSPACE_LOGO_THUMBNAIL_SIZE, WORKSPACE_LOGO_THUMBNAIL_SIZE)
         .write_to(&mut png, ImageFormat::Png)
         .map_err(|source| {
             ApiError::internal(format!(
