@@ -175,11 +175,54 @@ struct WorkspaceSpecModelSelection {
 pub(crate) async fn run_workspace_spec_job(
     state: AppState,
     workspace_id: String,
-    job_id: String,
+    _job_id: String,
 ) -> Result<(), ApiError> {
     let config = config_snapshot(&state)?;
     let workspace_path = workspace_by_id(&config, &workspace_id)?.path.clone();
-    run_workspace_spec_jobs(config, workspace_id, workspace_path, job_id).await
+    wake_workspace_spec_runner(config, workspace_id, workspace_path).await
+}
+
+pub(crate) fn wake_workspace_spec_runners_for_startup(state: &AppState) -> Result<(), ApiError> {
+    let config = config_snapshot(state)?;
+    for workspace in &config.workspaces {
+        if !workspace_database_path(&workspace.path).exists() {
+            continue;
+        }
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        if let Some(job) = database
+            .running_workspace_spec_job()
+            .map_err(ApiError::from_workspace_error)?
+        {
+            database
+                .mark_workspace_spec_job_failed(
+                    &job.id,
+                    "workspace spec job was interrupted by process restart",
+                )
+                .map_err(ApiError::from_workspace_error)?;
+            log_workspace_spec_job_status_from_database(&database, &workspace.id, &job.id);
+        }
+        drop(database);
+        spawn_workspace_spec_job(
+            config.clone(),
+            workspace.id.clone(),
+            workspace.path.clone(),
+            "startup-recovery".to_string(),
+        );
+    }
+    Ok(())
+}
+
+async fn wake_workspace_spec_runner(
+    config: GlobalConfig,
+    workspace_id: String,
+    workspace_path: PathBuf,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    recover_stale_running_workspace_spec_job(&mut database, &workspace_id)?;
+    drop(database);
+    run_workspace_spec_jobs(config, workspace_id, workspace_path).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +375,41 @@ fn recover_stale_running_workspace_spec_job(
     Ok(true)
 }
 
+#[cfg(test)]
+pub(crate) fn recover_workspace_spec_queue_for_test(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    if let Some(job) = database
+        .running_workspace_spec_job()
+        .map_err(ApiError::from_workspace_error)?
+        .filter(|job| workspace_spec_running_job_is_stale(job, now))
+    {
+        tracing::warn!(
+            workspace_id = %workspace_id,
+            job_id = %job.id,
+            "stale running workspace spec job recovered in test drain"
+        );
+        database
+            .mark_workspace_spec_job_failed(&job.id, "stale running test recovery")
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    let mut claimed = Vec::new();
+    while let Some(job) = database
+        .claim_next_workspace_spec_job()
+        .map_err(ApiError::from_workspace_error)?
+    {
+        claimed.push(job.id.clone());
+        database
+            .mark_workspace_spec_job_completed(&job.id, None)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(claimed)
+}
+
 pub(crate) fn queue_workspace_spec_update_job(
     context: &PreparedChatContext,
     final_state: &str,
@@ -431,14 +509,12 @@ pub(crate) fn queue_workspace_spec_update_job_with_id(
     let job_id = job.id;
     drop(database);
 
-    if !running_job_exists {
-        spawn_workspace_spec_job(
-            context.global_config.clone(),
-            context.workspace_id.clone(),
-            context.workspace_path.clone(),
-            job_id,
-        );
-    }
+    spawn_workspace_spec_job(
+        context.global_config.clone(),
+        context.workspace_id.clone(),
+        context.workspace_path.clone(),
+        job_id,
+    );
 
     Ok(())
 }
@@ -495,10 +571,6 @@ pub(crate) fn queue_integrated_plan_workspace_spec_update(
             "failed to serialize workspace spec update input: {source}"
         ))
     })?;
-    let running_job_exists = database
-        .running_workspace_spec_job()
-        .map_err(ApiError::from_workspace_error)?
-        .is_some();
     database
         .insert_workspace_spec_job_if_absent(NewWorkspaceSpecJob {
             id: job_id,
@@ -515,7 +587,7 @@ pub(crate) fn queue_integrated_plan_workspace_spec_update(
         })
         .map_err(ApiError::from_workspace_error)?;
     drop(database);
-    if spawn_runner && !running_job_exists {
+    if spawn_runner {
         spawn_workspace_spec_job(
             config.clone(),
             context.workspace_id.clone(),
@@ -530,11 +602,11 @@ fn spawn_workspace_spec_job(
     config: GlobalConfig,
     workspace_id: String,
     workspace_path: PathBuf,
-    job_id: String,
+    wake_job_id: String,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
-            job_id = %job_id,
+            job_id = %wake_job_id,
             workspace_id = %workspace_id,
             "workspace spec update job queued without an active async runtime"
         );
@@ -542,15 +614,12 @@ fn spawn_workspace_spec_job(
     };
     handle.spawn(async move {
         let runtime_workspace_id = workspace_id.clone();
-        let runtime_job_id = job_id.clone();
-        if let Err(error) =
-            run_workspace_spec_jobs(config, workspace_id, workspace_path, job_id).await
-        {
+        if let Err(error) = wake_workspace_spec_runner(config, workspace_id, workspace_path).await {
             tracing::warn!(
                 workspace_id = %runtime_workspace_id,
-                job_id = %runtime_job_id,
+                wake_job_id = %wake_job_id,
                 error = %error.message,
-                "workspace spec background job failed"
+                "workspace spec background runner failed"
             );
         }
     });
@@ -560,44 +629,39 @@ async fn run_workspace_spec_jobs(
     config: GlobalConfig,
     workspace_id: String,
     workspace_path: PathBuf,
-    first_job_id: String,
 ) -> Result<(), ApiError> {
-    let mut next_job_id = Some(first_job_id);
-    while let Some(job_id) = next_job_id {
-        let result =
-            run_workspace_spec_job_inner(&config, &workspace_id, &workspace_path, &job_id).await;
-        if let Err(error) = &result {
+    loop {
+        let Some(job) = claim_next_workspace_spec_job(&workspace_path)? else {
+            return Ok(());
+        };
+        let job_id = job.id.clone();
+        log_workspace_spec_job_status(&workspace_id, &job);
+        if let Err(error) =
+            run_workspace_spec_job_inner(&config, &workspace_id, &workspace_path, job).await
+        {
             mark_workspace_spec_job_failed_at_path(
                 &workspace_path,
                 &workspace_id,
                 &job_id,
                 &error.message,
             );
-            return result;
         }
-
-        next_job_id = queued_workspace_spec_job_id(&workspace_path)?;
     }
-
-    Ok(())
 }
 
 async fn run_workspace_spec_job_inner(
     config: &GlobalConfig,
     workspace_id: &str,
     workspace_path: &std::path::Path,
-    job_id: &str,
+    job: WorkspaceSpecJobRecord,
 ) -> Result<(), ApiError> {
-    let Some(job) = workspace_spec_job_for_run(workspace_path, job_id)? else {
-        return Ok(());
-    };
     if job.trigger_type == WorkspaceSpecTriggerType::ChatCompleted.as_str() {
         return run_workspace_spec_update_job_inner(config, workspace_id, workspace_path, job)
             .await;
     }
 
     let Some(prepared) =
-        prepare_workspace_spec_generation_job(config, workspace_id, workspace_path, job_id)?
+        prepare_workspace_spec_generation_job(config, workspace_id, workspace_path, &job.id)?
     else {
         return Ok(());
     };
@@ -748,10 +812,12 @@ fn prepare_workspace_spec_update_job_input(
     database
         .update_workspace_spec_job_prepared_input(&job.id, base_revision, &input_summary_json)
         .map_err(ApiError::from_workspace_error)?;
-    database
-        .mark_workspace_spec_job_running(&job.id)
-        .map_err(ApiError::from_workspace_error)?;
-    log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
+    if job.status == WorkspaceSpecJobStatus::Queued.as_str() {
+        database
+            .mark_workspace_spec_job_running(&job.id)
+            .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
+    }
 
     Ok(Some((base_revision, input_summary)))
 }
@@ -824,7 +890,9 @@ fn prepare_workspace_spec_generation_job(
         )));
     };
 
-    if job.status != WorkspaceSpecJobStatus::Queued.as_str() {
+    if job.status != WorkspaceSpecJobStatus::Queued.as_str()
+        && job.status != WorkspaceSpecJobStatus::Running.as_str()
+    {
         return Ok(None);
     }
     let spec = database
@@ -848,10 +916,12 @@ fn prepare_workspace_spec_generation_job(
     database
         .update_workspace_spec_job_prepared_input(job_id, base_revision, &input_summary_json)
         .map_err(ApiError::from_workspace_error)?;
-    database
-        .mark_workspace_spec_job_running(job_id)
-        .map_err(ApiError::from_workspace_error)?;
-    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+    if job.status == WorkspaceSpecJobStatus::Queued.as_str() {
+        database
+            .mark_workspace_spec_job_running(job_id)
+            .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+    }
 
     let model = resolve_workspace_spec_model(config, job.model_id.as_deref())?;
     let request = workspace_spec_provider_request(
@@ -1529,36 +1599,14 @@ fn workspace_spec_model_selection(
     })
 }
 
-fn workspace_spec_job_for_run(
+fn claim_next_workspace_spec_job(
     workspace_path: &std::path::Path,
-    job_id: &str,
 ) -> Result<Option<WorkspaceSpecJobRecord>, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    let Some(job) = database
-        .workspace_spec_job(job_id)
-        .map_err(ApiError::from_workspace_error)?
-    else {
-        return Err(ApiError::bad_request(format!(
-            "workspace spec job was not found: {job_id}"
-        )));
-    };
-    if job.status != WorkspaceSpecJobStatus::Queued.as_str() {
-        return Ok(None);
-    }
-
-    Ok(Some(job))
-}
-
-fn queued_workspace_spec_job_id(
-    workspace_path: &std::path::Path,
-) -> Result<Option<String>, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(workspace_path)
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     database
-        .queued_workspace_spec_job()
+        .claim_next_workspace_spec_job()
         .map_err(ApiError::from_workspace_error)
-        .map(|job| job.map(|job| job.id))
 }
 
 fn mark_workspace_spec_job_failed_at_path(

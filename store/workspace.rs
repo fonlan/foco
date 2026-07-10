@@ -1279,6 +1279,89 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn claim_next_workspace_spec_job(
+        &mut self,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let running_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_spec_jobs WHERE status = ?1
+                 )",
+                params![WorkspaceSpecJobStatus::Running.as_str()],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if running_exists {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        }
+
+        let next_job_id = transaction
+            .query_row(
+                "SELECT id
+                 FROM workspace_spec_jobs
+                 WHERE status = ?1
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![WorkspaceSpecJobStatus::Queued.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(next_job_id) = next_job_id else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        };
+
+        let now = now_timestamp();
+        let updated = transaction
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     started_at = ?3,
+                     completed_at = NULL,
+                     error_message = NULL
+                 WHERE id = ?1 AND status = ?4",
+                params![
+                    next_job_id,
+                    WorkspaceSpecJobStatus::Running.as_str(),
+                    now,
+                    WorkspaceSpecJobStatus::Queued.as_str()
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: "workspace spec queue claim lost its selected job".to_string(),
+            });
+        }
+        let job = transaction
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
+                 FROM workspace_spec_jobs
+                 WHERE id = ?1",
+                params![next_job_id],
+                workspace_spec_job_from_row,
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(Some(job))
+    }
+
     pub fn queued_workspace_spec_job(
         &self,
     ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
@@ -1374,16 +1457,36 @@ impl WorkspaceDatabase {
         id: &str,
     ) -> Result<bool, WorkspaceDatabaseError> {
         let now = now_timestamp();
-        self.connection
+        let updated = self
+            .connection
             .execute(
                 "UPDATE workspace_spec_jobs
                  SET status = ?2,
-                     started_at = ?3
-                 WHERE id = ?1",
-                params![id, WorkspaceSpecJobStatus::Running.as_str(), now],
+                     started_at = ?3,
+                     completed_at = NULL,
+                     error_message = NULL
+                 WHERE id = ?1
+                   AND status = ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM workspace_spec_jobs
+                       WHERE status = ?2 AND id != ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM workspace_spec_jobs
+                       WHERE status = ?4
+                         AND (created_at < (SELECT created_at FROM workspace_spec_jobs WHERE id = ?1)
+                              OR (created_at = (SELECT created_at FROM workspace_spec_jobs WHERE id = ?1)
+                                  AND id < ?1))
+                   )",
+                params![
+                    id,
+                    WorkspaceSpecJobStatus::Running.as_str(),
+                    now,
+                    WorkspaceSpecJobStatus::Queued.as_str()
+                ],
             )
-            .map(|updated| updated > 0)
-            .map_err(|source| self.sqlite_error(source))
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(updated == 1)
     }
 
     pub fn mark_workspace_spec_job_completed(

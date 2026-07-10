@@ -113,7 +113,8 @@ use crate::spec_runtime::{
     WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
     prepare_workspace_spec_job, prepare_workspace_spec_update_job, queue_workspace_spec_update_job,
-    workspace_spec_running_job_is_stale, workspace_spec_update_queue_decision,
+    recover_workspace_spec_queue_for_test, workspace_spec_running_job_is_stale,
+    workspace_spec_update_queue_decision,
 };
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
@@ -12934,6 +12935,54 @@ fn workspace_spec_running_job_stale_detection_uses_started_at() {
 
     job.started_at = None;
     assert!(workspace_spec_running_job_is_stale(&job, now));
+}
+
+#[test]
+fn workspace_spec_recovery_fails_stale_running_and_drains_queued_jobs_in_order() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        for id in ["spec-job-a", "spec-job-b", "spec-job-c"] {
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model"),
+                    base_revision: Some(0),
+                    input_summary_json: None,
+                })
+                .expect("spec job");
+        }
+        database
+            .mark_workspace_spec_job_running("spec-job-a")
+            .expect("mark stale running");
+    }
+    let now = chrono::DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
+        .expect("recovery time")
+        .with_timezone(&chrono::Utc);
+    assert_eq!(
+        recover_workspace_spec_queue_for_test(workspace.path(), "workspace-test", now)
+            .expect("recover queue"),
+        vec!["spec-job-b".to_string(), "spec-job-c".to_string()]
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let jobs = database.workspace_spec_jobs(10).expect("spec jobs");
+    assert!(jobs.iter().any(|job| {
+        job.id == "spec-job-a"
+            && job.status == "failed"
+            && job.error_message.as_deref() == Some("stale running test recovery")
+    }));
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == "completed")
+            .map(|job| job.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["spec-job-b", "spec-job-c"])
+    );
 }
 
 #[test]

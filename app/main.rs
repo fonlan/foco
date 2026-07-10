@@ -759,6 +759,8 @@ async fn run_server_until_shutdown(
     let plan_auto_run_scheduler_task =
         plan_auto_run_scheduler.spawn(state.clone(), plan_auto_run_scheduler_wake_rx);
     let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
+    crate::spec_runtime::wake_workspace_spec_runners_for_startup(&state)
+        .map_err(|error| std::io::Error::other(error.message))?;
     let api_audit_cleanup_task = spawn_api_audit_cleanup_scheduler(
         state.clone(),
         Duration::from_secs(API_AUDIT_CLEANUP_STARTUP_DELAY_SECS),

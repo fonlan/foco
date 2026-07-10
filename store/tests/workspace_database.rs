@@ -3133,6 +3133,91 @@ fn workspace_spec_jobs_redact_audit_json_fields() {
 }
 
 #[test]
+fn workspace_spec_job_claim_is_fifo_and_single_owner() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        for id in ["spec-job-a", "spec-job-b", "spec-job-c"] {
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model-1"),
+                    base_revision: Some(1),
+                    input_summary_json: None,
+                })
+                .expect("spec job insert");
+        }
+    }
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let workspace_path = workspace_path.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace_path.as_path()).expect("worker db");
+            barrier.wait();
+            database
+                .claim_next_workspace_spec_job()
+                .expect("claim spec job")
+                .map(|job| job.id)
+        }));
+    }
+    barrier.wait();
+    let claims = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("claim worker"))
+        .collect::<Vec<_>>();
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.as_deref() == Some("spec-job-a"))
+    );
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    assert!(
+        database
+            .claim_next_workspace_spec_job()
+            .expect("second claim")
+            .is_none()
+    );
+    database
+        .mark_workspace_spec_job_failed("spec-job-a", "expected failure")
+        .expect("fail first job");
+    assert_eq!(
+        database
+            .claim_next_workspace_spec_job()
+            .expect("claim second job")
+            .expect("second job")
+            .id,
+        "spec-job-b"
+    );
+    database
+        .mark_workspace_spec_job_completed("spec-job-b", None)
+        .expect("complete second job");
+    drop(database);
+
+    let mut reopened =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen workspace database");
+    assert_eq!(
+        reopened
+            .claim_next_workspace_spec_job()
+            .expect("claim after reopen")
+            .expect("third job")
+            .id,
+        "spec-job-c"
+    );
+}
+
+#[test]
 fn workspace_spec_job_has_retry_reflects_retry_children() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
