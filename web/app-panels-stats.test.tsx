@@ -3071,6 +3071,15 @@ describe("app-panels-stats verification surfaces", () => {
 
     expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
     expect(screen.getByText("Workspace")).toBeInTheDocument();
+    const workspaceLogo = document.querySelector(
+      `.api-overview-panel img[src="${workspace.logoUrl}"]`,
+    );
+    expect(workspaceLogo).toHaveClass("size-20");
+    expect(workspaceLogo).toHaveClass("rounded-2xl");
+    expect(workspaceLogo).toHaveClass("object-cover");
+    expect(workspaceLogo?.parentElement).toHaveClass("overflow-hidden");
+    expect(workspaceLogo?.parentElement).not.toHaveClass("border");
+    expect(workspaceLogo?.parentElement).not.toHaveClass("bg-white");
     expect(aiStatisticsCallUrls()).toHaveLength(0);
   });
 

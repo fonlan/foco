@@ -12176,9 +12176,9 @@ function ApiOverviewPanel({
   return (
     <section className="api-overview-panel grid min-h-[18rem] w-full place-items-center px-4 py-10 text-center">
       <div className="flex max-w-full flex-col items-center gap-4">
-        <span className="inline-flex size-20 items-center justify-center rounded-2xl border border-stone-200 bg-white text-teal-800 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <span className="inline-flex size-20 items-center justify-center overflow-hidden rounded-2xl text-teal-800">
           <WorkspaceIcon
-            className="size-16 rounded-xl object-cover"
+            className="size-20 rounded-2xl object-cover"
             fallbackClassName="size-10"
             isRemote={Boolean(selectedWorkspace?.serverId)}
             logoUrl={selectedWorkspace?.logoUrl}
