@@ -7843,9 +7843,11 @@ async fn remote_sidecar_plans_auto_run(
     let value = database
         .plan_auto_run_state()
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(
-        json!({ "enabled": value.enabled, "busy": value.busy }),
-    ))
+    Ok(Json(json!({
+        "enabled": value.enabled,
+        "busy": value.busy,
+        "blockedReason": value.blocked_reason,
+    })))
 }
 
 async fn remote_sidecar_plans_auto_run_set(
@@ -7862,9 +7864,11 @@ async fn remote_sidecar_plans_auto_run_set(
     let value = database
         .set_plan_auto_run_enabled(enabled)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(
-        json!({ "enabled": value.enabled, "busy": value.busy }),
-    ))
+    Ok(Json(json!({
+        "enabled": value.enabled,
+        "busy": value.busy,
+        "blockedReason": value.blocked_reason,
+    })))
 }
 
 async fn remote_sidecar_plans_order(

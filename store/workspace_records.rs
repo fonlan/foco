@@ -74,6 +74,7 @@ pub struct AgentInstanceRecord {
 pub struct PlanAutoRunStateRecord {
     pub enabled: bool,
     pub busy: bool,
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +86,13 @@ pub struct PlanAutoRunCandidateRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanAutoRunSelection {
     Candidate(PlanAutoRunCandidateRecord),
+    WaitingForReady { plan_id: String },
+    WaitingForRetry {
+        plan_id: String,
+        phase_id: Option<String>,
+    },
     BlockedByCancelledPhase { plan_id: String, phase_id: String },
+    Running { plan_id: String, phase_id: Option<String> },
     Idle,
 }
 

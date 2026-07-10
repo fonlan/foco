@@ -740,11 +740,26 @@ impl WorkspaceDatabase {
 
     pub fn plan_auto_run_state(&self) -> Result<PlanAutoRunStateRecord, WorkspaceDatabaseError> {
         let enabled = self.workspace_metadata("plan_auto_run_enabled")?.as_deref() == Some("true");
+        let selection = self.next_plan_auto_run_candidate()?;
         let busy = matches!(
-            self.next_plan_auto_run_candidate()?,
-            PlanAutoRunSelection::Candidate(_)
+            selection,
+            PlanAutoRunSelection::Candidate(_) | PlanAutoRunSelection::Running { .. }
         ) || self.plan_auto_run_has_in_flight()?;
-        Ok(PlanAutoRunStateRecord { enabled, busy })
+        let blocked_reason = match selection {
+            PlanAutoRunSelection::WaitingForReady { .. } => Some("waiting_for_ready".to_string()),
+            PlanAutoRunSelection::WaitingForRetry { .. } => Some("waiting_for_retry".to_string()),
+            PlanAutoRunSelection::BlockedByCancelledPhase { .. } => {
+                Some("cancelled_phase".to_string())
+            }
+            PlanAutoRunSelection::Candidate(_)
+            | PlanAutoRunSelection::Running { .. }
+            | PlanAutoRunSelection::Idle => None,
+        };
+        Ok(PlanAutoRunStateRecord {
+            enabled,
+            busy,
+            blocked_reason,
+        })
     }
 
     pub fn set_plan_auto_run_enabled(
@@ -761,11 +776,14 @@ impl WorkspaceDatabase {
     pub fn next_plan_auto_run_candidate(
         &self,
     ) -> Result<PlanAutoRunSelection, WorkspaceDatabaseError> {
+        // The first non-terminal plan is the queue boundary. Draft, failed, cancelled-phase,
+        // and running states must stop selection instead of being filtered out in favor of a
+        // later ready plan.
         let plan = self
             .connection
             .query_row(
                 "SELECT id, status FROM plans
-                 WHERE status IN ('draft', 'ready', 'failed', 'paused')
+                 WHERE status IN ('draft', 'ready', 'failed', 'paused', 'running')
                  ORDER BY sort_order ASC, created_at ASC, id ASC
                  LIMIT 1",
                 [],
@@ -776,7 +794,7 @@ impl WorkspaceDatabase {
         let Some((plan_id, status)) = plan else {
             return Ok(PlanAutoRunSelection::Idle);
         };
-        let cancelled_phase_id = self
+        let phase = self
             .connection
             .query_row(
                 "SELECT id, status
@@ -785,18 +803,29 @@ impl WorkspaceDatabase {
                  ORDER BY sequence ASC
                  LIMIT 1",
                 params![plan_id.as_str()],
-                |row| {
-                    let phase_id = row.get::<_, String>(0)?;
-                    let phase_status = row.get::<_, String>(1)?;
-                    Ok((phase_id, phase_status))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .map_err(|source| self.sqlite_error(source))?
-            .and_then(|(phase_id, phase_status)| (phase_status == "cancelled").then_some(phase_id));
-        if let Some(phase_id) = cancelled_phase_id {
-            return Ok(PlanAutoRunSelection::BlockedByCancelledPhase { plan_id, phase_id });
+            .map_err(|source| self.sqlite_error(source))?;
+        let phase_id = phase.as_ref().map(|(phase_id, _)| phase_id.clone());
+        let phase_status = phase.as_ref().map(|(_, status)| status.as_str());
+
+        if phase_status == Some("cancelled") {
+            return Ok(PlanAutoRunSelection::BlockedByCancelledPhase {
+                plan_id,
+                phase_id: phase_id.expect("cancelled phase has an id"),
+            });
         }
+        if status == "draft" {
+            return Ok(PlanAutoRunSelection::WaitingForReady { plan_id });
+        }
+        if status == "failed" || phase_status == Some("failed") {
+            return Ok(PlanAutoRunSelection::WaitingForRetry { plan_id, phase_id });
+        }
+        if status == "running" || matches!(phase_status, Some("running" | "queued")) {
+            return Ok(PlanAutoRunSelection::Running { plan_id, phase_id });
+        }
+
         let action = if status == "paused" {
             "resume"
         } else {

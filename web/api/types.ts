@@ -294,6 +294,7 @@ export type PlanResponse = {
 export type PlanAutoRunResponse = {
   enabled: boolean;
   busy: boolean;
+  blockedReason?: "waiting_for_ready" | "waiting_for_retry" | "cancelled_phase";
 };
 
 export type PlanWorktreeAuditItem = {

@@ -129,6 +129,8 @@ pub(crate) struct DeletePlanResponse {
 pub(crate) struct PlanAutoRunResponse {
     enabled: bool,
     busy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -334,6 +336,7 @@ pub(crate) async fn plan_auto_run(
     Ok(Json(PlanAutoRunResponse {
         enabled: auto_run.enabled,
         busy: auto_run.busy,
+        blocked_reason: auto_run.blocked_reason,
     }))
 }
 
@@ -352,6 +355,7 @@ pub(crate) async fn set_plan_auto_run(
     Ok(Json(PlanAutoRunResponse {
         enabled: auto_run.enabled,
         busy: auto_run.busy,
+        blocked_reason: auto_run.blocked_reason,
     }))
 }
 

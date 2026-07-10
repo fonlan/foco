@@ -143,14 +143,32 @@ async fn dispatch_next_plan_auto_run(
                     "Plan auto-run stopped at cancelled phase barrier"
                 );
             }
-            PlanAutoRunSelection::Candidate(_) => {}
+            PlanAutoRunSelection::WaitingForReady { plan_id } => {
+                tracing::debug!(
+                    workspace_id = %workspace.id,
+                    plan_id,
+                    "Plan auto-run waiting for draft plan to become ready"
+                );
+            }
+            PlanAutoRunSelection::WaitingForRetry { plan_id, phase_id } => {
+                tracing::debug!(
+                    workspace_id = %workspace.id,
+                    plan_id,
+                    phase_id,
+                    "Plan auto-run waiting for explicit failed phase retry"
+                );
+            }
+            PlanAutoRunSelection::Running { .. } | PlanAutoRunSelection::Candidate(_) => {}
         }
         selection
     };
 
     let candidate = match selection {
         PlanAutoRunSelection::Candidate(candidate) => candidate,
-        PlanAutoRunSelection::BlockedByCancelledPhase { .. } => {
+        PlanAutoRunSelection::WaitingForReady { .. }
+        | PlanAutoRunSelection::WaitingForRetry { .. }
+        | PlanAutoRunSelection::BlockedByCancelledPhase { .. }
+        | PlanAutoRunSelection::Running { .. } => {
             return Ok(PlanAutoRunDispatch::Blocked);
         }
         PlanAutoRunSelection::Idle => return Ok(PlanAutoRunDispatch::Idle),
@@ -237,17 +255,35 @@ pub(crate) fn choose_plan_auto_run_candidate(
     let Some(plan) = plans.iter().find(|plan| {
         matches!(
             plan.status.as_str(),
-            "draft" | "ready" | "failed" | "paused"
+            "draft" | "ready" | "failed" | "paused" | "running"
         )
     }) else {
         return PlanAutoRunSelection::Idle;
     };
-    if let Some(phase) = plan.phases.iter().find(|phase| phase.status != "completed")
-        && phase.status == "cancelled"
-    {
+    let phase = plan.phases.iter().find(|phase| phase.status != "completed");
+    let phase_id = phase.map(|phase| phase.id.clone());
+    let phase_status = phase.map(|phase| phase.status.as_str());
+    if phase_status == Some("cancelled") {
         return PlanAutoRunSelection::BlockedByCancelledPhase {
             plan_id: plan.id.clone(),
-            phase_id: phase.id.clone(),
+            phase_id: phase_id.expect("cancelled phase has an id"),
+        };
+    }
+    if plan.status == "draft" {
+        return PlanAutoRunSelection::WaitingForReady {
+            plan_id: plan.id.clone(),
+        };
+    }
+    if plan.status == "failed" || phase_status == Some("failed") {
+        return PlanAutoRunSelection::WaitingForRetry {
+            plan_id: plan.id.clone(),
+            phase_id,
+        };
+    }
+    if plan.status == "running" || matches!(phase_status, Some("running" | "queued")) {
+        return PlanAutoRunSelection::Running {
+            plan_id: plan.id.clone(),
+            phase_id,
         };
     }
     let action = if plan.status == "paused" {
