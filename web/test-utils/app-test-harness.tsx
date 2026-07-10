@@ -2388,6 +2388,86 @@ function saveManualWorkspaceSettings(init?: RequestInit) {
   return appTestState.settingsResponse;
 }
 
+function saveManualProviderSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as {
+    apiProxy?: { enabled: boolean; proxyType: string; url: string };
+    autoSyncModels?: boolean;
+    baseUrl?: string | null;
+    enabled?: boolean;
+    id?: string;
+    kind?: string;
+    modelSyncFilterRegex?: string | null;
+    name?: string;
+  };
+  const currentProvider = appTestState.settingsResponse.providers.find(
+    (provider) => provider.id === body.id,
+  );
+  if (!currentProvider) {
+    const providerKind = appTestState.settingsResponse.providerKinds.find(
+      (kind) => kind.kind === body.kind,
+    );
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      providers: [
+        ...appTestState.settingsResponse.providers,
+        {
+          apiProxy: {
+            enabled: body.apiProxy?.enabled ?? false,
+            proxyType: body.apiProxy?.proxyType ?? "http",
+            supportedTypes: settings.providers[0].apiProxy.supportedTypes,
+            url: body.apiProxy?.url ?? "",
+          },
+          autoSyncModels: body.autoSyncModels ?? false,
+          baseUrl: body.baseUrl ?? providerKind?.defaultBaseUrl ?? "",
+          enabled: body.enabled ?? true,
+          hasApiKey: false,
+          id: body.id ?? "provider",
+          kind: body.kind ?? "openai-chat",
+          kindLabel: providerKind?.label ?? body.kind ?? "OpenAI Chat",
+          modelRedirects: [],
+          modelSyncFilterRegex: body.modelSyncFilterRegex ?? null,
+          name: body.name ?? body.id ?? "Provider",
+          requestOverrides: [],
+          warnings: [],
+        },
+      ],
+    };
+    return appTestState.settingsResponse;
+  }
+
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    providers: appTestState.settingsResponse.providers.map((provider) => {
+      if (provider.id !== body.id) {
+        return provider;
+      }
+
+      return {
+        ...provider,
+        apiProxy: body.apiProxy
+          ? { ...provider.apiProxy, ...body.apiProxy }
+          : provider.apiProxy,
+        autoSyncModels: body.autoSyncModels ?? provider.autoSyncModels,
+        enabled: body.enabled ?? provider.enabled,
+      };
+    }),
+  };
+
+  return appTestState.settingsResponse;
+}
+
+function deleteProviderSettings(init?: RequestInit) {
+  const body = JSON.parse(String(init?.body ?? "{}")) as { id?: string };
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    providers: appTestState.settingsResponse.providers.filter(
+      (provider) => provider.id !== body.id,
+    ),
+  };
+
+  return appTestState.settingsResponse;
+}
+
 function savedSkillsSettings(init?: RequestInit) {
   const body = JSON.parse(String(init?.body ?? "{}")) as {
     disabled?: string[];
@@ -3649,17 +3729,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/providers/manual") {
-    return jsonResponse(savedSettings.provider);
+    return jsonResponse(saveManualProviderSettings(init));
   }
 
   if (path === "/api/providers/delete") {
-    const body = JSON.parse(String(init?.body ?? "{}")) as { id?: string };
-    return jsonResponse({
-      ...appTestState.settingsResponse,
-      providers: appTestState.settingsResponse.providers.filter(
-        (provider) => provider.id !== body.id,
-      ),
-    });
+    return jsonResponse(deleteProviderSettings(init));
   }
 
   if (path === "/api/providers/reveal-api-key") {

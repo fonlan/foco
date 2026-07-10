@@ -2644,6 +2644,11 @@ describe("app-settings verification surfaces", () => {
         requestOverrides: openAiProvider.requestOverrides,
       });
     });
+    await waitFor(() => {
+      expect(
+        screen.getByRole("checkbox", { name: "Enable provider OpenAI" }),
+      ).not.toBeChecked();
+    });
   });
 
   it("keeps provider list operations scoped to the active row", async () => {
@@ -2684,13 +2689,18 @@ describe("app-settings verification surfaces", () => {
     await waitFor(() => expect(openAiToggle).toBeEnabled());
   });
 
-  it("deletes configured providers from the provider list", async () => {
+  it("deletes configured providers and clears their expanded model cache", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Load provider models for OpenAI" }),
+    );
+    expect(await screen.findByText("gpt-4.1")).toBeInTheDocument();
 
     const deleteButton = screen.getByRole("button", { name: "Delete provider OpenAI" });
     expect(deleteButton).toHaveAttribute("title", "Delete provider OpenAI");
@@ -2707,10 +2717,22 @@ describe("app-settings verification surfaces", () => {
     });
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "Delete provider OpenAI" })).toBeNull();
+      expect(screen.queryByText("gpt-4.1")).toBeNull();
     });
+
+    await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
+    changeInput(screen.getByLabelText("Name"), "OpenAI");
+    await userEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    const restoredOpenAiRow = await screen.findByRole("button", {
+      name: "Load provider models for OpenAI",
+    });
+    expect(restoredOpenAiRow).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("gpt-4.1")).toBeNull();
   });
 
   it("keeps provider enable and delete controls out of the edit dialog", async () => {
+    const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
@@ -2721,9 +2743,24 @@ describe("app-settings verification surfaces", () => {
     const providerDialog = screen.getByRole("form", { name: "Provider configuration" });
     expect(within(providerDialog).queryByRole("checkbox", { name: /provider OpenAI/ })).toBeNull();
     expect(within(providerDialog).queryByRole("button", { name: /Delete provider/ })).toBeNull();
-    expect(
-      within(providerDialog).getByRole("button", { name: "Close provider configuration" }),
-    ).toBeInTheDocument();
+    const closeButton = within(providerDialog).getByRole("button", {
+      name: "Close provider configuration",
+    });
+    expect(closeButton).toBeInTheDocument();
+    await userEvent.click(within(providerDialog).getByRole("button", { name: "Save provider" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/providers/manual",
+        expect.objectContaining({ method: "POST" }),
+      );
+      expect(screen.queryByRole("form", { name: "Provider configuration" })).toBeNull();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Close provider configuration" }),
+    );
+    expect(screen.queryByRole("form", { name: "Provider configuration" })).toBeNull();
   });
 
   it("saves provider model redirects from the provider form", async () => {
