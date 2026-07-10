@@ -2839,6 +2839,7 @@ fn migrates_v17_workspace_spec_tables_and_creates_backup() {
     add_workspace_memory_tables(&connection);
     add_workspace_memory_dream_tables(&connection);
     add_memory_reference_tables(&connection);
+    add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -3985,10 +3986,26 @@ fn repository_helpers_round_trip_core_records() {
             .title,
         "Generated title"
     );
+    Connection::open(database.database_path())
+        .expect("open database for deterministic chat ordering")
+        .execute(
+            "UPDATE chats
+             SET created_at = CASE id
+                     WHEN 'chat-1' THEN '2026-06-01T00:00:00.000Z'
+                     ELSE '2026-06-02T00:00:00.000Z'
+                 END,
+                 updated_at = CASE id
+                     WHEN 'chat-1' THEN '2026-06-03T00:00:00.000Z'
+                     ELSE '2026-06-02T00:00:00.000Z'
+                 END
+             WHERE id IN ('chat-1', 'chat-2')",
+            [],
+        )
+        .expect("set deterministic chat ordering");
     let chats = database.chats().expect("chat list");
     assert_eq!(chats.len(), 2);
-    assert_eq!(chats[0].title, "Second chat");
-    assert_eq!(chats[1].title, "Generated title");
+    assert_eq!(chats[0].title, "Generated title");
+    assert_eq!(chats[1].title, "Second chat");
     let dream_chats = database
         .dream_transcript_chats()
         .expect("dream transcript chat list");
@@ -5530,6 +5547,80 @@ fn migrates_v27_llm_request_kind_and_spec_job_chat_id_defaults() {
 }
 
 #[test]
+fn migrates_v21_llm_requests_into_usage_rollups() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+    let connection = Connection::open(&database_path).expect("database rollback to v21");
+    connection
+        .execute_batch(
+            r#"DROP TABLE llm_request_usage_rollups;
+             DROP TABLE plan_phase_attempts;
+             DROP INDEX workspace_spec_jobs_active_retry_idx;
+             ALTER TABLE workspace_spec_jobs DROP COLUMN retry_of_job_id;
+             ALTER TABLE plans DROP COLUMN shared_merge_commit_id;
+             INSERT INTO llm_requests (
+                id, workspace_id, provider_id, model_id, request_started_at,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                total_latency_ms, final_state
+             ) VALUES
+                ('request-1', 'workspace-1', 'openai', 'gpt-old',
+                 '2026-06-03T10:00:00Z', 10, 4, 2, 1, 120, 'completed'),
+                ('request-2', 'workspace-1', 'openai', 'gpt-old',
+                 '2026-06-03T11:00:00Z', 5, 3, NULL, NULL, NULL, 'failed'),
+                ('request-running', 'workspace-1', 'openai', 'gpt-old',
+                 '2026-06-03T12:00:00Z', 100, 100, NULL, NULL, NULL, 'running');
+             PRAGMA user_version = 21;"#,
+        )
+        .expect("v21 llm request fixture");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    let rollups = connection
+        .prepare(
+            "SELECT final_state, request_count, success_count, failed_count,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_write_tokens,
+                    total_tokens, latency_count, latency_sum
+             FROM llm_request_usage_rollups
+             ORDER BY final_state",
+        )
+        .expect("rollup query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .expect("rollup rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect rollups");
+
+    assert_eq!(
+        rollups,
+        vec![
+            ("completed".to_string(), 1, 1, 0, 10, 4, 2, 1, 14, 1, 120),
+            ("failed".to_string(), 1, 0, 1, 5, 3, 0, 0, 8, 0, 0),
+        ]
+    );
+}
+
+#[test]
 fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebuild() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -6382,6 +6473,7 @@ fn migrates_v15_memory_dream_tables() {
         .expect("v15 schema");
     add_workspace_chats_table(&connection);
     add_workspace_memory_tables(&connection);
+    add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -6420,6 +6512,7 @@ fn migrates_v16_memory_references_table() {
         ))
         .expect("v16 schema");
     add_workspace_chats_table(&connection);
+    add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -6505,6 +6598,7 @@ fn migrates_v18_memory_extraction_jobs_allow_skipped_status() {
              PRAGMA user_version = 18;"#
         ))
         .expect("v18 schema");
+    add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
@@ -9433,6 +9527,19 @@ fn add_workspace_memory_tables(connection: &Connection) {
     connection
         .execute_batch(WORKSPACE_MEMORY_SCHEMA_SQL)
         .expect("workspace memory migration fixture schema");
+}
+
+fn add_workspace_agent_plan_reference_tables(connection: &Connection) {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_teams (
+                id TEXT PRIMARY KEY NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY NOT NULL
+             );",
+        )
+        .expect("workspace agent plan reference migration fixture schema");
 }
 
 fn add_workspace_memory_dream_tables(connection: &Connection) {

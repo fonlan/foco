@@ -59,8 +59,8 @@ use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
-    MIGRATION_022, MIGRATION_023, MIGRATION_024, MIGRATION_025, MIGRATION_026, MIGRATION_027,
-    MIGRATION_028, MIGRATION_029, MIGRATION_030, Migration,
+    MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
+    MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
@@ -12524,6 +12524,32 @@ fn run_migrations(
                 source,
             }
         })?;
+        if migration.version == 22
+            && table_has_columns(
+                &transaction,
+                database_path,
+                "llm_requests",
+                &[
+                    "workspace_id",
+                    "request_started_at",
+                    "provider_id",
+                    "model_id",
+                    "final_state",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "total_latency_ms",
+                ],
+            )?
+        {
+            transaction
+                .execute_batch(MIGRATION_022_BACKFILL)
+                .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                    path: database_path.to_path_buf(),
+                    source,
+                })?;
+        }
         transaction
             .pragma_update(None, "user_version", migration.version)
             .map_err(|source| WorkspaceDatabaseError::Sqlite {
@@ -12556,6 +12582,32 @@ fn table_exists(
         .map_err(|source| sqlite_error(database_path, source))?;
     Ok(count > 0)
 }
+
+fn table_has_columns(
+    connection: &Connection,
+    database_path: &Path,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<bool, WorkspaceDatabaseError> {
+    if !table_exists(connection, database_path, table)? {
+        return Ok(false);
+    }
+
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let columns = rows
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(required_columns
+        .iter()
+        .all(|column| columns.contains(*column)))
+}
+
 fn table_has_column(
     connection: &Connection,
     database_path: &Path,

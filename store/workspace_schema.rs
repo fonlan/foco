@@ -1053,7 +1053,9 @@ ON llm_request_usage_rollups (bucket_date);
 
 CREATE INDEX llm_request_usage_rollups_provider_model_idx
 ON llm_request_usage_rollups (provider_id, model_id);
+"#;
 
+pub(crate) const MIGRATION_022_BACKFILL: &str = r#"
 INSERT INTO llm_request_usage_rollups (
     workspace_id, bucket_date, provider_id, model_id, final_state,
     request_count, success_count, failed_count,
