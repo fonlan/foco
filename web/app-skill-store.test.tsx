@@ -197,9 +197,36 @@ describe("skill store app surface", () => {
     const detailPane = await screen.findByRole("region", { name: "Skill details" });
     expect(await within(detailPane).findByRole("heading", { level: 2, name: "HTML PPT" })).toBeInTheDocument();
     expect(within(detailPane).getByText("foco/html-ppt")).toBeInTheDocument();
-    expect(
-      within(await screen.findByRole("region", { name: "Skill list" })).getByText("HTML PPT"),
-    ).toBeInTheDocument();
+    await userEvent.click(within(detailPane).getByRole("button", { name: "Install" }));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) => url === "/api/skill-store/install" && init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    const installCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/skill-store/install" && init?.method === "POST",
+    );
+    const installBody = JSON.parse(String(installCall?.[1]?.body));
+    expect(installBody).toMatchObject({
+      overwrite: false,
+      skillId: "html-ppt",
+      source: "foco/html-ppt",
+      target: "global",
+      files: [
+        {
+          path: "SKILL.md",
+          content:
+            "---\nname: html-ppt\ndescription: Create HTML presentations from notes.\n---\n\n# HTML PPT\n",
+        },
+        {
+          path: "assets/logo.png",
+          content: "iVBORwD/AA==",
+          contentEncoding: "base64",
+        },
+      ],
+    });
   });
 
   it("searches and installs a skill through the backend proxy", async () => {

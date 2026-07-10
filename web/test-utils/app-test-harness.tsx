@@ -3386,6 +3386,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           content:
             "---\nname: html-ppt\ndescription: Create HTML presentations from notes.\n---\n\n# HTML PPT\n",
         },
+        {
+          path: "assets/logo.png",
+          content: "iVBORwD/AA==",
+          contentEncoding: "base64",
+        },
       ],
       id: "html-ppt",
       name: "HTML PPT",

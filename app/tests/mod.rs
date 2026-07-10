@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use std::{collections::BTreeSet, convert::Infallible};
 
 use crate::runtime::agent_run_event_kind;
@@ -62,15 +63,17 @@ use crate::http::{
         test_model,
     },
     skill_store::{
-        SkillStoreBrowseQuery, SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
+        GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES, GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES,
+        GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES, GITHUB_SKILL_ARCHIVE_MAX_FILES, SkillStoreBrowseQuery,
+        SkillStoreBrowseSort, SkillStoreDetailQuery, SkillStoreFile,
         SkillStoreImportPreviewRequest, SkillStoreInstallRequest, SkillStorePageParams,
         SkillStoreSearchQuery, SkillStoreTranslateRequest, SkillStoreUpdateRequest,
-        ensure_skill_files_valid, install_skill_files_to_target_dir,
-        parse_skill_store_import_target, registry_files_from_value, registry_source_from_value,
-        sanitize_skill_file_path, skill_store_browse, skill_store_detail, skill_store_hot,
-        skill_store_import_preview, skill_store_install, skill_store_search, skill_store_translate,
-        skill_store_update, skill_store_update_all, skill_translation_provider_request,
-        validate_skill_slug,
+        ensure_skill_files_valid, extract_github_skill_archive, github_skill_paths_for_root,
+        install_skill_files_to_target_dir, parse_skill_store_import_target,
+        registry_files_from_value, registry_source_from_value, sanitize_skill_file_path,
+        skill_store_browse, skill_store_detail, skill_store_hot, skill_store_import_preview,
+        skill_store_install, skill_store_search, skill_store_translate, skill_store_update,
+        skill_store_update_all, skill_translation_provider_request, validate_skill_slug,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -18945,11 +18948,70 @@ fn skill_store_rejects_unsafe_ids_and_paths() {
 }
 
 #[test]
+fn skill_store_binary_wire_contract_round_trips_and_installs_losslessly() {
+    let binary = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+    let file = SkillStoreFile::from_bytes("assets/logo.png".to_string(), binary.clone());
+    let value = serde_json::to_value(&file).expect("serialize binary skill file");
+    assert_eq!(
+        value.get("contentEncoding").and_then(Value::as_str),
+        Some("base64")
+    );
+    let decoded: SkillStoreFile = serde_json::from_value(value).expect("deserialize binary file");
+    assert_eq!(
+        decoded.decoded_content().expect("decode binary").as_ref(),
+        binary
+    );
+
+    let target_root = env::temp_dir().join(unique_id("foco-skill-store-binary-install-test"));
+    let files = vec![
+        SkillStoreFile::text(
+            "SKILL.md".to_string(),
+            "---\nname: binary-skill\ndescription: Binary assets.\n---\n\n# Binary Skill\n"
+                .to_string(),
+        ),
+        decoded,
+    ];
+    let install_path =
+        install_skill_files_to_target_dir(&target_root, "binary-skill", &files, false)
+            .expect("install binary skill");
+    assert_eq!(
+        fs::read(install_path.join("assets/logo.png")).expect("installed binary file"),
+        binary
+    );
+    fs::remove_dir_all(target_root).expect("remove binary install root");
+}
+
+#[test]
+fn skill_store_rejects_invalid_content_encoding() {
+    let invalid_base64: SkillStoreFile = serde_json::from_value(json!({
+        "path": "assets/logo.png",
+        "content": "%%%",
+        "contentEncoding": "base64"
+    }))
+    .expect("deserialize invalid base64 wire value");
+    let error = invalid_base64
+        .decoded_content()
+        .expect_err("invalid base64 should fail");
+    assert!(error.message().contains("invalid base64"));
+
+    let unsupported: SkillStoreFile = serde_json::from_value(json!({
+        "path": "assets/logo.png",
+        "content": "data",
+        "contentEncoding": "hex"
+    }))
+    .expect("deserialize unsupported wire value");
+    let error = unsupported
+        .decoded_content()
+        .expect_err("unsupported encoding should fail");
+    assert!(error.message().contains("unsupported content encoding"));
+}
+
+#[test]
 fn skill_store_requires_skill_markdown_file() {
-    let files = vec![SkillStoreFile {
-        path: "support/notes.md".to_string(),
-        content: "notes".to_string(),
-    }];
+    let files = vec![SkillStoreFile::text(
+        "support/notes.md".to_string(),
+        "notes".to_string(),
+    )];
 
     let error = ensure_skill_files_valid(&files).expect_err("missing SKILL.md should fail");
 
@@ -19091,6 +19153,386 @@ async fn skill_store_detail_uses_canonical_registry_source_for_display_source() 
     server_task.abort();
 }
 
+#[test]
+fn skill_store_github_tree_enforces_file_count_and_safe_paths() {
+    let too_many = (0..=GITHUB_SKILL_ARCHIVE_MAX_FILES)
+        .map(|index| {
+            json!({
+                "type": "blob",
+                "path": format!("skills/gitmemo/files/{index}.txt")
+            })
+        })
+        .collect::<Vec<_>>();
+    let error = github_skill_paths_for_root(&too_many, "skills/gitmemo")
+        .expect_err("too many tree files must fail before archive download");
+    assert!(error.message().contains("too many files"));
+
+    let unsafe_path = vec![json!({
+        "type": "blob",
+        "path": "skills/gitmemo/../outside.txt"
+    })];
+    let paths = github_skill_paths_for_root(&unsafe_path, "skills/gitmemo")
+        .expect("unsafe skill paths should be excluded from import");
+    assert!(paths.is_empty());
+
+    let hidden_path = vec![
+        json!({ "type": "blob", "path": "skills/gitmemo/SKILL.md" }),
+        json!({ "type": "blob", "path": "skills/gitmemo/.gitignore" }),
+        json!({ "type": "blob", "path": "skills/gitmemo/project/.npmrc" }),
+    ];
+    let paths = github_skill_paths_for_root(&hidden_path, "skills/gitmemo")
+        .expect("hidden repository files should be excluded from import");
+    assert_eq!(paths, ["SKILL.md".to_string()].into_iter().collect());
+}
+
+#[test]
+fn skill_store_github_archive_extracts_selected_root_and_binary_files() {
+    let binary = vec![0x89, b'P', b'N', b'G', 0xff, 0x00];
+    let archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/README.md",
+            b"outside selected root".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/skills/gitmemo/SKILL.md",
+            b"---\nname: gitmemo\ndescription: Project memory.\n---\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/skills/gitmemo/assets/logo.png",
+            binary.clone(),
+            tar::EntryType::Regular,
+        ),
+    ]);
+    let expected = ["SKILL.md".to_string(), "assets/logo.png".to_string()]
+        .into_iter()
+        .collect();
+
+    let files = extract_github_skill_archive(&archive, "skills/gitmemo", &expected)
+        .expect("extract selected skill root");
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].path, "SKILL.md");
+    assert_eq!(files[0].content_encoding, None);
+    assert_eq!(files[1].path, "assets/logo.png");
+    assert_eq!(files[1].content_encoding.as_deref(), Some("base64"));
+    assert_eq!(
+        files[1].decoded_content().expect("decode PNG").as_ref(),
+        binary
+    );
+}
+
+#[test]
+fn skill_store_github_archive_supports_repository_root_skill() {
+    let archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/SKILL.md",
+            b"---\nname: root-skill\ndescription: Root skill.\n---\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/support/notes.md",
+            b"notes".to_vec(),
+            tar::EntryType::Regular,
+        ),
+    ]);
+    let expected = ["SKILL.md".to_string(), "support/notes.md".to_string()]
+        .into_iter()
+        .collect();
+
+    let files = extract_github_skill_archive(&archive, "", &expected)
+        .expect("extract repository root skill");
+
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["SKILL.md", "support/notes.md"]
+    );
+}
+
+#[test]
+fn skill_store_github_archive_rejects_links_and_unexpected_root_files() {
+    let expected = ["SKILL.md".to_string()].into_iter().collect();
+    let link_archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/outside-link",
+            b"README.md".to_vec(),
+            tar::EntryType::Symlink,
+        ),
+        (
+            "random-root/skills/gitmemo/link",
+            b"SKILL.md".to_vec(),
+            tar::EntryType::Symlink,
+        ),
+    ]);
+    let error = extract_github_skill_archive(&link_archive, "skills/gitmemo", &expected)
+        .expect_err("symlink must fail");
+    assert!(
+        error
+            .message()
+            .contains("unsupported link or special entry")
+    );
+
+    let outside_link_archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/outside-link",
+            b"README.md".to_vec(),
+            tar::EntryType::Symlink,
+        ),
+        (
+            "random-root/skills/gitmemo/SKILL.md",
+            b"---\nname: gitmemo\n---\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+    ]);
+    let files = extract_github_skill_archive(&outside_link_archive, "skills/gitmemo", &expected)
+        .expect("link outside selected root should be ignored");
+    assert_eq!(files.len(), 1);
+
+    let unexpected_archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/skills/gitmemo/SKILL.md",
+            b"---\nname: gitmemo\n---\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/skills/gitmemo/unexpected.txt",
+            b"unexpected".to_vec(),
+            tar::EntryType::Regular,
+        ),
+    ]);
+    let error = extract_github_skill_archive(&unexpected_archive, "skills/gitmemo", &expected)
+        .expect_err("unexpected file must fail");
+    assert!(error.message().contains("unexpected file"));
+
+    let hidden_archive = github_skill_archive_fixture(vec![
+        (
+            "random-root/skills/gitmemo/SKILL.md",
+            b"---\nname: gitmemo\n---\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/skills/gitmemo/.gitignore",
+            b"target\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+        (
+            "random-root/skills/gitmemo/project/.npmrc",
+            b"fund=false\n".to_vec(),
+            tar::EntryType::Regular,
+        ),
+    ]);
+    let files = extract_github_skill_archive(&hidden_archive, "skills/gitmemo", &expected)
+        .expect("hidden repository files should be ignored");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "SKILL.md");
+}
+
+#[test]
+fn skill_store_rejects_compressed_archive_over_limit() {
+    let archive = vec![0_u8; GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES + 1];
+    let error = extract_github_skill_archive(&archive, "", &BTreeSet::new())
+        .expect_err("oversized compressed archive must fail");
+
+    assert!(
+        error.message().contains("compressed size limit"),
+        "unexpected error: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn skill_store_github_archive_enforces_file_size_limit() {
+    let archive = github_skill_archive_fixture_with_declared_size(
+        "random-root/skills/gitmemo/large.bin",
+        GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES + 1,
+    );
+    let expected = ["large.bin".to_string()].into_iter().collect();
+
+    let error = extract_github_skill_archive(&archive, "skills/gitmemo", &expected)
+        .expect_err("oversized file must fail before allocation");
+
+    assert!(error.message().contains("per-file size limit"));
+}
+
+#[test]
+fn skill_store_github_archive_enforces_extracted_size_limit() {
+    let full_file_count =
+        (GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES / GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES) as usize;
+    let mut entries = (0..full_file_count)
+        .map(|index| {
+            (
+                format!("random-root/skills/gitmemo/{index:02}.bin"),
+                vec![0; GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES as usize],
+                tar::EntryType::Regular,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.push((
+        "random-root/skills/gitmemo/overflow.bin".to_string(),
+        vec![0],
+        tar::EntryType::Regular,
+    ));
+    let archive = github_skill_archive_fixture_owned(entries.clone());
+    let expected = entries
+        .iter()
+        .map(|(path, _, _)| {
+            path.strip_prefix("random-root/skills/gitmemo/")
+                .expect("fixture skill prefix")
+                .to_string()
+        })
+        .collect();
+
+    let error = extract_github_skill_archive(&archive, "skills/gitmemo", &expected)
+        .expect_err("oversized extracted archive must fail");
+
+    assert!(
+        error.message().contains("extracted size limit"),
+        "unexpected error: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn skill_store_github_archive_enforces_file_count_limit() {
+    let entries = (0..=GITHUB_SKILL_ARCHIVE_MAX_FILES)
+        .map(|index| {
+            (
+                format!("random-root/skills/gitmemo/files/{index}.txt"),
+                Vec::new(),
+                tar::EntryType::Regular,
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = entries
+        .iter()
+        .map(|(path, _, _)| {
+            path.strip_prefix("random-root/skills/gitmemo/")
+                .expect("fixture skill prefix")
+                .to_string()
+        })
+        .collect();
+    let archive = github_skill_archive_fixture_owned(entries);
+
+    let error = extract_github_skill_archive(&archive, "skills/gitmemo", &expected)
+        .expect_err("archive with too many files must fail");
+
+    assert!(
+        error.message().contains("too many files"),
+        "unexpected error: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn skill_store_github_archive_rejects_parent_directory_entry() {
+    let archive = github_skill_archive_fixture_with_raw_path(
+        b"random-root/skills/gitmemo/../outside.txt",
+        b"outside",
+    );
+    let expected = ["SKILL.md".to_string()].into_iter().collect();
+
+    let files = extract_github_skill_archive(&archive, "skills/gitmemo", &expected)
+        .expect_err("archive missing the expected SKILL.md must fail");
+
+    assert!(
+        files.message().contains("unsafe path"),
+        "unexpected error: {}",
+        files.message()
+    );
+}
+
+fn github_skill_archive_fixture(entries: Vec<(&str, Vec<u8>, tar::EntryType)>) -> Vec<u8> {
+    github_skill_archive_fixture_owned(
+        entries
+            .into_iter()
+            .map(|(path, content, entry_type)| (path.to_string(), content, entry_type))
+            .collect(),
+    )
+}
+
+fn github_skill_archive_fixture_owned(entries: Vec<(String, Vec<u8>, tar::EntryType)>) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    {
+        let encoder =
+            flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, content, entry_type) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_mode(0o644);
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, content.as_slice())
+                .expect("append archive fixture entry");
+        }
+        builder.finish().expect("finish archive fixture");
+    }
+    compressed
+}
+
+fn github_skill_archive_fixture_with_raw_path(path: &[u8], content: &[u8]) -> Vec<u8> {
+    assert!(
+        path.len() <= 100,
+        "fixture path must fit the tar name field"
+    );
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(content.len() as u64);
+    header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+    header.set_cksum();
+
+    let mut compressed = Vec::new();
+    {
+        let encoder =
+            flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append(&header, content)
+            .expect("append raw-path archive fixture entry");
+        builder.finish().expect("finish raw-path archive fixture");
+    }
+    compressed
+}
+
+fn github_skill_archive_fixture_with_declared_sizes(entries: &[(String, u64)]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut tar_bytes = Vec::with_capacity(entries.len() * 512 + 1024);
+    for (path, size) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(*size);
+        header.set_path(path).expect("archive fixture path");
+        header.set_cksum();
+        tar_bytes.extend_from_slice(header.as_bytes());
+    }
+    tar_bytes.resize(tar_bytes.len() + 1024, 0);
+
+    let mut compressed = Vec::new();
+    {
+        let mut encoder =
+            flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        encoder
+            .write_all(&tar_bytes)
+            .expect("compress archive fixture");
+        encoder
+            .finish()
+            .expect("finish archive fixture compression");
+    }
+    compressed
+}
+
+fn github_skill_archive_fixture_with_declared_size(path: &str, size: u64) -> Vec<u8> {
+    github_skill_archive_fixture_with_declared_sizes(&[(path.to_string(), size)])
+}
+
 #[tokio::test]
 async fn skill_store_import_preview_fetches_unique_github_skill() {
     let app = axum::Router::new()
@@ -19106,14 +19548,22 @@ async fn skill_store_import_preview_fetches_unique_github_skill() {
             }),
         )
         .route(
-            "/owner/repo/main/skills/gitmemo/SKILL.md",
+            "/repos/owner/repo/tarball/main",
             axum::routing::get(|| async {
-                "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                github_skill_archive_fixture(vec![
+                    (
+                        "random-root/skills/gitmemo/SKILL.md",
+                        b"---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
+                            .to_vec(),
+                        tar::EntryType::Regular,
+                    ),
+                    (
+                        "random-root/skills/gitmemo/support/prompts.md",
+                        b"Remember the useful bits.".to_vec(),
+                        tar::EntryType::Regular,
+                    ),
+                ])
             }),
-        )
-        .route(
-            "/owner/repo/main/skills/gitmemo/support/prompts.md",
-            axum::routing::get(|| async { "Remember the useful bits." }),
         );
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -19149,6 +19599,270 @@ async fn skill_store_import_preview_fetches_unique_github_skill() {
 }
 
 #[tokio::test]
+async fn skill_store_import_preview_large_fixture_uses_single_tarball_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const FILE_COUNT: usize = 6;
+    let total_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let tree_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let tarball_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen_tarball_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let app = axum::Router::new()
+        .route(
+            "/repos/owner/repo/git/trees/main",
+            axum::routing::get({
+                let total_requests = total_requests.clone();
+                let tree_requests = tree_requests.clone();
+                move || {
+                    let total_requests = total_requests.clone();
+                    let tree_requests = tree_requests.clone();
+                    async move {
+                        total_requests.fetch_add(1, Ordering::SeqCst);
+                        tree_requests.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "tree": [
+                                { "type": "blob", "path": "skills/large-fixture/SKILL.md" },
+                                { "type": "blob", "path": "skills/large-fixture/assets/01.png" },
+                                { "type": "blob", "path": "skills/large-fixture/assets/02.woff2" },
+                                { "type": "blob", "path": "skills/large-fixture/project/large.js" },
+                                { "type": "blob", "path": "skills/large-fixture/project/manifest.json" },
+                                { "type": "blob", "path": "skills/large-fixture/references/options.md" }
+                            ]
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/tarball/main",
+            axum::routing::get({
+                let total_requests = total_requests.clone();
+                let tarball_requests = tarball_requests.clone();
+                let seen_tarball_path = seen_tarball_path.clone();
+                move |uri: axum::http::Uri| {
+                    let total_requests = total_requests.clone();
+                    let tarball_requests = tarball_requests.clone();
+                    let seen_tarball_path = seen_tarball_path.clone();
+                    async move {
+                        total_requests.fetch_add(1, Ordering::SeqCst);
+                        tarball_requests.fetch_add(1, Ordering::SeqCst);
+                        *seen_tarball_path.lock().expect("seen tarball path") =
+                            Some(uri.path().to_string());
+                        github_skill_archive_fixture(vec![
+                            (
+                                "random-root/skills/large-fixture/SKILL.md",
+                                b"---\nname: large-fixture\ndescription: Archive fixture.\n---\n\n# Large Fixture\n".to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/skills/large-fixture/assets/01.png",
+                                vec![0x89, b'P', b'N', b'G', 0xff],
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/skills/large-fixture/assets/02.woff2",
+                                vec![b'w', b'O', b'F', b'2', 0xff],
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/skills/large-fixture/project/large.js",
+                                b"export const large = true;".to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/skills/large-fixture/project/manifest.json",
+                                br#"{"name":"fixture"}"#.to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/skills/large-fixture/references/options.md",
+                                b"# Options".to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                        ])
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind large import preview fixture");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _env_guard = skill_store_env_guard(&format!("http://{addr}")).await;
+
+    let Json(response) = skill_store_import_preview(Json(SkillStoreImportPreviewRequest {
+        input: "https://github.com/owner/repo".to_string(),
+    }))
+    .await
+    .expect("unique large fixture should use the archive path");
+    let value = serde_json::to_value(response).expect("serialize large fixture response");
+
+    assert_eq!(
+        value.get("id").and_then(Value::as_str),
+        Some("large-fixture")
+    );
+    assert_eq!(
+        value.get("files").and_then(Value::as_array).map(Vec::len),
+        Some(FILE_COUNT)
+    );
+    assert_eq!(tree_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(tarball_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        total_requests.load(Ordering::SeqCst),
+        2,
+        "multiple skill files must still use exactly one tree request and one archive request"
+    );
+    assert_eq!(
+        seen_tarball_path
+            .lock()
+            .expect("seen tarball path")
+            .as_deref(),
+        Some("/repos/owner/repo/tarball/main")
+    );
+    assert!(
+        value
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| files
+                .iter()
+                .filter(|file| file.get("contentEncoding").is_some())
+                .count()
+                == 2)
+    );
+
+    let preview_files = value
+        .get("files")
+        .cloned()
+        .and_then(|files| serde_json::from_value::<Vec<SkillStoreFile>>(files).ok())
+        .expect("deserialize preview files");
+    let source_bytes = [
+        (
+            "SKILL.md",
+            b"---\nname: large-fixture\ndescription: Archive fixture.\n---\n\n# Large Fixture\n"
+                .as_slice(),
+        ),
+        ("assets/01.png", [0x89, b'P', b'N', b'G', 0xff].as_slice()),
+        ("assets/02.woff2", [b'w', b'O', b'F', b'2', 0xff].as_slice()),
+        ("project/large.js", b"export const large = true;".as_slice()),
+        ("project/manifest.json", br#"{"name":"fixture"}"#.as_slice()),
+        ("references/options.md", b"# Options".as_slice()),
+    ];
+    let target_root = env::temp_dir().join(unique_id("foco-skill-store-preview-install-test"));
+    let install_path =
+        install_skill_files_to_target_dir(&target_root, "large-fixture", &preview_files, false)
+            .expect("install preview files");
+    for (relative_path, expected_bytes) in source_bytes {
+        assert_eq!(
+            fs::read(install_path.join(relative_path)).expect("read installed preview file"),
+            expected_bytes,
+            "installed bytes must match archive bytes for {relative_path}"
+        );
+    }
+    fs::remove_dir_all(target_root).expect("remove preview install root");
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn skill_store_import_preview_falls_back_from_main_to_master() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let main_tree_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let master_tree_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let master_tarball_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route(
+            "/repos/owner/repo/git/trees/main",
+            axum::routing::get({
+                let main_tree_requests = main_tree_requests.clone();
+                move || {
+                    let main_tree_requests = main_tree_requests.clone();
+                    async move {
+                        main_tree_requests.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/git/trees/master",
+            axum::routing::get({
+                let master_tree_requests = master_tree_requests.clone();
+                move || {
+                    let master_tree_requests = master_tree_requests.clone();
+                    async move {
+                        master_tree_requests.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "tree": [
+                                { "type": "blob", "path": "SKILL.md" },
+                                { "type": "blob", "path": "support/notes.md" }
+                            ]
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/tarball/master",
+            axum::routing::get({
+                let master_tarball_requests = master_tarball_requests.clone();
+                move || {
+                    let master_tarball_requests = master_tarball_requests.clone();
+                    async move {
+                        master_tarball_requests.fetch_add(1, Ordering::SeqCst);
+                        github_skill_archive_fixture(vec![
+                            (
+                                "random-root/SKILL.md",
+                                b"---\nname: root-master\ndescription: Master root skill.\n---\n"
+                                    .to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                            (
+                                "random-root/support/notes.md",
+                                b"master branch".to_vec(),
+                                tar::EntryType::Regular,
+                            ),
+                        ])
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind master fallback import preview fixture");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _env_guard = skill_store_env_guard(&format!("http://{addr}")).await;
+
+    let Json(response) = skill_store_import_preview(Json(SkillStoreImportPreviewRequest {
+        input: "https://github.com/owner/repo".to_string(),
+    }))
+    .await
+    .expect("master fallback import preview response");
+    let value = serde_json::to_value(response).expect("serialize master fallback response");
+
+    assert_eq!(value.get("id").and_then(Value::as_str), Some("repo"));
+    assert_eq!(value.get("name").and_then(Value::as_str), Some("repo"));
+    assert!(
+        value
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| files.iter().any(|file| {
+                file.get("path").and_then(Value::as_str) == Some("support/notes.md")
+                    && file.get("content").and_then(Value::as_str) == Some("master branch")
+            }))
+    );
+    assert_eq!(main_tree_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(master_tree_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(master_tarball_requests.load(Ordering::SeqCst), 1);
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn skill_store_import_preview_rejects_ambiguous_github_repo() {
     let app = axum::Router::new().route(
         "/repos/owner/repo/git/trees/main",
@@ -19179,6 +19893,80 @@ async fn skill_store_import_preview_rejects_ambiguous_github_repo() {
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert!(error.message().contains("multiple SKILL.md"));
     server_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "manual network smoke test for the fixed large GitHub skill repository"]
+async fn skill_store_import_preview_real_large_repo_completes_and_installs() {
+    const SOURCE: &str = "chuspeeism/dashiAI-ppt-skill";
+    const PREVIEW_TIMEOUT: Duration = Duration::from_secs(90);
+    const EXPECTED_FILE_COUNT: usize = 350;
+    const EXPECTED_TOTAL_BYTES: usize = 57_984_737;
+
+    let started = Instant::now();
+    let Json(response) = tokio::time::timeout(
+        PREVIEW_TIMEOUT,
+        skill_store_import_preview(Json(SkillStoreImportPreviewRequest {
+            input: format!("https://github.com/{SOURCE}"),
+        })),
+    )
+    .await
+    .expect("real import preview exceeded its outer timeout")
+    .expect("real import preview response");
+    let preview_elapsed = started.elapsed();
+    let value = serde_json::to_value(response).expect("serialize real import preview response");
+    let files: Vec<SkillStoreFile> = serde_json::from_value(
+        value
+            .get("files")
+            .cloned()
+            .expect("real preview files field"),
+    )
+    .expect("deserialize real preview files");
+    let expected_files = files
+        .iter()
+        .map(|file| {
+            file.decoded_content()
+                .map(|content| (file.path.clone(), content.into_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode real preview files before installation");
+    let total_bytes = expected_files
+        .iter()
+        .map(|(_, content)| content.len())
+        .sum::<usize>();
+
+    assert_eq!(value.get("id").and_then(Value::as_str), Some("dashiai-ppt"));
+    assert_eq!(files.len(), EXPECTED_FILE_COUNT);
+    assert_eq!(total_bytes, EXPECTED_TOTAL_BYTES);
+    assert!(files.iter().any(|file| {
+        file.path.ends_with(".png") && file.content_encoding.as_deref() == Some("base64")
+    }));
+
+    let target_root = env::temp_dir().join(unique_id("foco-skill-store-real-preview-install"));
+    let install_path =
+        install_skill_files_to_target_dir(&target_root, "dashiai-ppt", &files, false)
+            .expect("install real preview files");
+    let installed_bytes = expected_files
+        .iter()
+        .map(|(relative_path, expected_content)| {
+            let installed_content = fs::read(install_path.join(relative_path))
+                .expect("read installed real preview file");
+            assert_eq!(
+                &installed_content, expected_content,
+                "installed bytes must match preview bytes for {relative_path}"
+            );
+            installed_content.len()
+        })
+        .sum::<usize>();
+    assert_eq!(installed_bytes, total_bytes);
+    fs::remove_dir_all(target_root).expect("remove real preview install root");
+
+    eprintln!(
+        "real GitHub skill smoke: source={SOURCE}, files={}, bytes={}, preview_elapsed_ms={}",
+        files.len(),
+        total_bytes,
+        preview_elapsed.as_millis()
+    );
 }
 
 #[test]
@@ -19390,15 +20178,14 @@ fn skill_store_install_discovers_written_skill() {
     let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-profile-test"));
     let target_root = profile_dir.join(".agents").join("skills");
     let files = vec![
-        SkillStoreFile {
-            path: "SKILL.md".to_string(),
-            content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
-                .to_string(),
-        },
-        SkillStoreFile {
-            path: "support/prompts.md".to_string(),
-            content: "Search memory before repo work.".to_string(),
-        },
+        SkillStoreFile::text(
+            "SKILL.md".to_string(),
+            "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n".to_string(),
+        ),
+        SkillStoreFile::text(
+            "support/prompts.md".to_string(),
+            "Search memory before repo work.".to_string(),
+        ),
     ];
 
     let install_path = install_skill_files_to_target_dir(&target_root, "gitmemo", &files, false)
@@ -19440,11 +20227,10 @@ async fn skill_store_install_writes_update_metadata_and_settings_store_summary()
             target: SKILL_SCOPE_GLOBAL.to_string(),
             workspace_id: None,
             overwrite: false,
-            files: vec![SkillStoreFile {
-                path: "SKILL.md".to_string(),
-                content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
-                    .to_string(),
-            }],
+            files: vec![SkillStoreFile::text(
+                "SKILL.md".to_string(),
+                "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n".to_string(),
+            )],
         }),
     )
     .await
@@ -19488,11 +20274,10 @@ async fn skill_store_update_rejects_skill_without_store_metadata() {
             target: SKILL_SCOPE_GLOBAL.to_string(),
             workspace_id: None,
             overwrite: false,
-            files: vec![SkillStoreFile {
-                path: "SKILL.md".to_string(),
-                content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
-                    .to_string(),
-            }],
+            files: vec![SkillStoreFile::text(
+                "SKILL.md".to_string(),
+                "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n".to_string(),
+            )],
         }),
     )
     .await
@@ -19542,16 +20327,12 @@ async fn skill_store_update_overwrites_files_and_refreshes_discovery() {
             workspace_id: None,
             overwrite: false,
             files: vec![
-                SkillStoreFile {
-                    path: "SKILL.md".to_string(),
-                    content:
-                        "---\nname: gitmemo\ndescription: Old project memory.\n---\n\n# GitMemo\n"
-                            .to_string(),
-                },
-                SkillStoreFile {
-                    path: "support/prompts.md".to_string(),
-                    content: "old prompt".to_string(),
-                },
+                SkillStoreFile::text(
+                    "SKILL.md".to_string(),
+                    "---\nname: gitmemo\ndescription: Old project memory.\n---\n\n# GitMemo\n"
+                        .to_string(),
+                ),
+                SkillStoreFile::text("support/prompts.md".to_string(), "old prompt".to_string()),
             ],
         }),
     )
@@ -19614,12 +20395,12 @@ async fn skill_store_update_all_keeps_updating_after_single_failure() {
                 target: SKILL_SCOPE_GLOBAL.to_string(),
                 workspace_id: None,
                 overwrite: false,
-                files: vec![SkillStoreFile {
-                    path: "SKILL.md".to_string(),
-                    content: format!(
+                files: vec![SkillStoreFile::text(
+                    "SKILL.md".to_string(),
+                    format!(
                         "---\nname: {skill_id}\ndescription: {description}\n---\n\n# {skill_id}\n"
                     ),
-                }],
+                )],
             }),
         )
         .await
@@ -19693,11 +20474,10 @@ async fn skill_store_update_all_without_store_skills_returns_empty_results() {
     install_skill_files_to_target_dir(
         &profile_dir.join(".agents").join("skills"),
         "gitmemo",
-        &[SkillStoreFile {
-            path: "SKILL.md".to_string(),
-            content: "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n"
-                .to_string(),
-        }],
+        &[SkillStoreFile::text(
+            "SKILL.md".to_string(),
+            "---\nname: gitmemo\ndescription: Project memory.\n---\n\n# GitMemo\n".to_string(),
+        )],
         false,
     )
     .expect("manual skill install");

@@ -1,5 +1,7 @@
 use std::{
+    borrow::Cow,
     env, fs,
+    io::{Cursor, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -7,6 +9,8 @@ use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use flate2::read::GzDecoder;
 use foco_providers::{NeutralChatRequest, NeutralChatRole, NeutralToolDefinition};
 use foco_store::config::{
     GlobalConfig, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
@@ -26,9 +30,13 @@ use crate::{
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
 const DEFAULT_SKILLS_API_BASE_URL: &str = "https://skills-api.deeptoai.com";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
-const DEFAULT_GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILL_STORE_METADATA_FILE_NAME: &str = ".foco-skill-store.json";
+const SKILL_STORE_FILE_ENCODING_BASE64: &str = "base64";
+pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_FILES: usize = 4_096;
 const SKILL_TRANSLATION_TOOL_NAME: &str = "submit_skill_translation";
 const SKILL_TRANSLATION_TIMEOUT_MS: u64 = 120_000;
 const SKILL_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 16_384;
@@ -151,6 +159,58 @@ pub(crate) struct SkillStoreTranslateRequest {
 pub(crate) struct SkillStoreFile {
     pub(crate) path: String,
     pub(crate) content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_encoding: Option<String>,
+}
+
+impl SkillStoreFile {
+    pub(crate) fn text(path: String, content: String) -> Self {
+        Self {
+            path,
+            content,
+            content_encoding: None,
+        }
+    }
+
+    pub(crate) fn from_bytes(path: String, content: Vec<u8>) -> Self {
+        match String::from_utf8(content) {
+            Ok(content) => Self::text(path, content),
+            Err(error) => Self {
+                path,
+                content: BASE64_STANDARD.encode(error.into_bytes()),
+                content_encoding: Some(SKILL_STORE_FILE_ENCODING_BASE64.to_string()),
+            },
+        }
+    }
+
+    pub(crate) fn decoded_content(&self) -> Result<Cow<'_, [u8]>, ApiError> {
+        match self.content_encoding.as_deref() {
+            None => Ok(Cow::Borrowed(self.content.as_bytes())),
+            Some(SKILL_STORE_FILE_ENCODING_BASE64) => BASE64_STANDARD
+                .decode(&self.content)
+                .map(Cow::Owned)
+                .map_err(|source| {
+                    ApiError::bad_request(format!(
+                        "skill file '{}' has invalid base64 content: {source}",
+                        self.path
+                    ))
+                }),
+            Some(encoding) => Err(ApiError::bad_request(format!(
+                "skill file '{}' uses unsupported content encoding '{encoding}'; expected text or base64",
+                self.path
+            ))),
+        }
+    }
+
+    fn text_content(&self) -> Result<&str, ApiError> {
+        if self.content_encoding.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "skill file '{}' must contain text",
+                self.path
+            )));
+        }
+        Ok(&self.content)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -231,14 +291,16 @@ struct SkillStoreClient {
     skills_base_url: String,
     skills_api_base_url: String,
     github_api_base_url: String,
-    github_raw_base_url: String,
     token: Option<String>,
 }
 
 impl SkillStoreClient {
     fn from_env() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .expect("build skill store HTTP client"),
             skills_base_url: env::var("SKILLS_SH_BASE_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -251,10 +313,6 @@ impl SkillStoreClient {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_string()),
-            github_raw_base_url: env::var("SKILLS_STORE_GITHUB_RAW_BASE_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_GITHUB_RAW_BASE_URL.to_string()),
             token: env::var("SKILLS_SH_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -614,59 +672,55 @@ impl SkillStoreClient {
         tree_items: &[Value],
         skill_root: &str,
     ) -> Result<Vec<SkillStoreFile>, ApiError> {
-        let mut paths = tree_items
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("blob"))
-            .filter_map(|item| item.get("path").and_then(Value::as_str))
-            .filter(|path| github_path_is_under_root(*path, skill_root))
-            .map(|path| path.to_string())
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        let mut files = Vec::with_capacity(paths.len());
-        for github_path in paths {
-            let relative = github_path
-                .strip_prefix(skill_root)
-                .unwrap_or(&github_path)
-                .trim_start_matches('/');
-            let clean_path = match sanitize_skill_file_path(if relative.is_empty() {
-                SKILL_FILE_NAME
-            } else {
-                relative
-            }) {
-                Ok(path) => path,
-                Err(error) => {
-                    tracing::debug!(path = github_path, error = %error.message(), "skipping unsupported GitHub skill file");
-                    continue;
-                }
-            };
-            let raw_url = format!(
-                "{}/{}/{}/{}",
-                self.github_raw_base_url.trim_end_matches('/'),
-                source,
-                branch,
-                github_path
-                    .split('/')
-                    .map(url_segment)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-            let content = self
-                .http
-                .get(raw_url)
-                .send()
-                .await
-                .map_err(network_error)?
-                .error_for_status()
-                .map_err(network_error)?
-                .text()
-                .await
-                .map_err(network_error)?;
-            files.push(SkillStoreFile {
-                path: clean_path,
-                content,
-            });
+        let expected_paths = github_skill_paths_for_root(tree_items, skill_root)?;
+        let archive_url = format!(
+            "{}/repos/{}/tarball/{}",
+            self.github_api_base_url.trim_end_matches('/'),
+            source,
+            url_segment(branch)
+        );
+        let mut response = self
+            .http
+            .get(archive_url)
+            .header(reqwest::header::USER_AGENT, "foco-skill-store")
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES as u64)
+        {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive exceeds the compressed size limit of {} bytes",
+                GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES
+            )));
         }
+        let mut archive = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES as u64) as usize,
+        );
+        while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+            let next_len = archive.len().checked_add(chunk.len()).ok_or_else(|| {
+                ApiError::bad_request("GitHub skill archive compressed size overflowed")
+            })?;
+            if next_len > GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES {
+                return Err(ApiError::bad_request(format!(
+                    "GitHub skill archive exceeds the compressed size limit of {} bytes",
+                    GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES
+                )));
+            }
+            archive.extend_from_slice(&chunk);
+        }
+        let skill_root = skill_root.to_string();
+        let files = tokio::task::spawn_blocking(move || {
+            extract_github_skill_archive(&archive, &skill_root, &expected_paths)
+        })
+        .await
+        .map_err(|source| ApiError::internal(format!("GitHub archive task failed: {source}")))??;
         ensure_skill_files_valid(&files)?;
         Ok(files)
     }
@@ -1408,7 +1462,7 @@ fn write_skill_files(root: &Path, files: &[SkillStoreFile]) -> Result<(), ApiErr
                 ))
             })?;
         }
-        fs::write(&path, &file.content).map_err(|source| {
+        fs::write(&path, file.decoded_content()?.as_ref()).map_err(|source| {
             ApiError::internal(format!(
                 "failed to write skill file {}: {}",
                 path.display(),
@@ -1427,7 +1481,9 @@ pub(crate) fn ensure_skill_files_valid(files: &[SkillStoreFile]) -> Result<(), A
     let mut has_skill_md = false;
     for file in files {
         let path = sanitize_skill_file_path(&file.path)?;
+        file.decoded_content()?;
         if path == SKILL_FILE_NAME {
+            file.text_content()?;
             has_skill_md = true;
         }
     }
@@ -1449,7 +1505,7 @@ fn validate_skill_markdown_matches_slug(
         .ok_or_else(|| {
             ApiError::bad_request(format!("skill files must include {SKILL_FILE_NAME}"))
         })?;
-    let parsed = parse_skill_markdown(Path::new(SKILL_FILE_NAME), &skill_file.content)
+    let parsed = parse_skill_markdown(Path::new(SKILL_FILE_NAME), skill_file.text_content()?)
         .map_err(ApiError::bad_request)?;
     if parsed.id != skill_id {
         return Err(ApiError::bad_request(format!(
@@ -1743,7 +1799,8 @@ fn skill_id_from_files(files: &[SkillStoreFile]) -> Option<String> {
     files
         .iter()
         .find(|file| file.path == SKILL_FILE_NAME)
-        .and_then(|file| parse_skill_markdown(Path::new(SKILL_FILE_NAME), &file.content).ok())
+        .and_then(|file| file.text_content().ok())
+        .and_then(|content| parse_skill_markdown(Path::new(SKILL_FILE_NAME), content).ok())
         .map(|parsed| parsed.id)
 }
 
@@ -1790,6 +1847,184 @@ fn find_github_skill_root(tree_items: &[Value], skill_id: &str) -> Result<String
             "GitHub tree did not contain {SKILL_FILE_NAME} for skill '{skill_id}'"
         ))
     })
+}
+
+pub(crate) fn github_skill_paths_for_root(
+    tree_items: &[Value],
+    skill_root: &str,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    let mut paths = std::collections::BTreeSet::new();
+    for github_path in tree_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("blob"))
+        .filter_map(|item| item.get("path").and_then(Value::as_str))
+        .filter(|path| github_path_is_under_root(path, skill_root))
+    {
+        let relative = github_relative_path(github_path, skill_root)?;
+        let Ok(relative) = sanitize_skill_file_path(relative) else {
+            continue;
+        };
+        paths.insert(relative);
+    }
+    if paths.len() > GITHUB_SKILL_ARCHIVE_MAX_FILES {
+        return Err(ApiError::bad_request(format!(
+            "GitHub skill contains too many files ({}; max {})",
+            paths.len(),
+            GITHUB_SKILL_ARCHIVE_MAX_FILES
+        )));
+    }
+    Ok(paths)
+}
+
+fn github_relative_path<'a>(github_path: &'a str, skill_root: &str) -> Result<&'a str, ApiError> {
+    if skill_root.is_empty() {
+        Ok(github_path)
+    } else {
+        github_path
+            .strip_prefix(skill_root)
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "GitHub archive path is outside the selected skill root: {github_path}"
+                ))
+            })
+    }
+}
+
+pub(crate) fn extract_github_skill_archive(
+    archive: &[u8],
+    skill_root: &str,
+    expected_paths: &std::collections::BTreeSet<String>,
+) -> Result<Vec<SkillStoreFile>, ApiError> {
+    if archive.len() > GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "GitHub skill archive exceeds the compressed size limit of {} bytes",
+            GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES
+        )));
+    }
+    let decoder = GzDecoder::new(Cursor::new(archive));
+    let mut tar_archive = tar::Archive::new(decoder);
+    let entries = tar_archive.entries().map_err(|source| {
+        ApiError::bad_request(format!("GitHub skill archive is invalid: {source}"))
+    })?;
+    let mut files = Vec::with_capacity(expected_paths.len());
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut extracted_bytes = 0_u64;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|source| {
+            ApiError::bad_request(format!("GitHub skill archive entry is invalid: {source}"))
+        })?;
+        let path = entry.path().map_err(|source| {
+            ApiError::bad_request(format!("GitHub skill archive path is invalid: {source}"))
+        })?;
+        validate_archive_entry_path(&path)?;
+        let entry_type = entry.header().entry_type();
+        let mut components = path.components();
+        let Some(Component::Normal(_archive_root)) = components.next() else {
+            return Err(ApiError::bad_request(
+                "GitHub skill archive entry is missing its top-level directory",
+            ));
+        };
+        let repository_path = components.as_path();
+        if repository_path.as_os_str().is_empty() {
+            continue;
+        }
+        let repository_path = repository_path
+            .to_str()
+            .ok_or_else(|| ApiError::bad_request("GitHub skill archive path is not valid UTF-8"))?;
+        if !github_path_is_under_root(repository_path, skill_root) {
+            continue;
+        }
+        if !(entry_type.is_file() || entry_type.is_dir()) {
+            return Err(ApiError::bad_request(
+                "GitHub skill archive contains an unsupported link or special entry inside the selected skill root",
+            ));
+        }
+        if entry_type.is_dir() {
+            continue;
+        }
+        let raw_relative = github_relative_path(repository_path, skill_root)?;
+        let Ok(relative) = sanitize_skill_file_path(raw_relative) else {
+            continue;
+        };
+        if !expected_paths.contains(&relative) {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive contained an unexpected file inside the selected skill root: {relative}"
+            )));
+        }
+        if !seen_paths.insert(relative.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive contains a duplicate file: {relative}"
+            )));
+        }
+        if seen_paths.len() > GITHUB_SKILL_ARCHIVE_MAX_FILES {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive contains too many files (max {})",
+                GITHUB_SKILL_ARCHIVE_MAX_FILES
+            )));
+        }
+        let size = entry.header().size().map_err(|source| {
+            ApiError::bad_request(format!(
+                "GitHub skill archive file size is invalid: {source}"
+            ))
+        })?;
+        if size > GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill file '{relative}' exceeds the per-file size limit of {} bytes",
+                GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES
+            )));
+        }
+        extracted_bytes = extracted_bytes.checked_add(size).ok_or_else(|| {
+            ApiError::bad_request("GitHub skill archive extracted size overflowed")
+        })?;
+        if extracted_bytes > GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive exceeds the extracted size limit of {} bytes",
+                GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES
+            )));
+        }
+        let mut content = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut content).map_err(|source| {
+            ApiError::bad_request(format!(
+                "failed to read GitHub skill archive file '{relative}': {source}"
+            ))
+        })?;
+        if content.len() as u64 != size {
+            return Err(ApiError::bad_request(format!(
+                "GitHub skill archive file '{relative}' size did not match its header"
+            )));
+        }
+        files.push(SkillStoreFile::from_bytes(relative, content));
+    }
+
+    let missing = expected_paths.difference(&seen_paths).next().cloned();
+    if let Some(path) = missing {
+        return Err(ApiError::bad_request(format!(
+            "GitHub skill archive did not contain expected file '{path}'"
+        )));
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn validate_archive_entry_path(path: &Path) -> Result<(), ApiError> {
+    if path.is_absolute() {
+        return Err(ApiError::bad_request(
+            "GitHub skill archive contains an absolute path",
+        ));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(part) if !part.is_empty() && part != "." && part != ".." => {}
+            _ => {
+                return Err(ApiError::bad_request(
+                    "GitHub skill archive contains an unsafe path",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn github_path_is_under_root(path: &str, root: &str) -> bool {
@@ -1942,10 +2177,7 @@ fn files_from_registry_candidate(value: &Value) -> Option<Vec<SkillStoreFile>> {
             .iter()
             .filter_map(|(path, content)| {
                 let content = content.as_str()?.to_string();
-                Some(SkillStoreFile {
-                    path: path.clone(),
-                    content,
-                })
+                Some(SkillStoreFile::text(path.clone(), content))
             })
             .collect()
     })
@@ -1957,7 +2189,16 @@ fn files_from_array(files: &[Value]) -> Vec<SkillStoreFile> {
         .filter_map(|file| {
             let path = string_field(file, &["path", "name", "filename"])?;
             let content = raw_string_field(file, &["content", "text", "body"])?;
-            Some(SkillStoreFile { path, content })
+            let content_encoding = file
+                .get("contentEncoding")
+                .or_else(|| file.get("content_encoding"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(SkillStoreFile {
+                path,
+                content,
+                content_encoding,
+            })
         })
         .collect()
 }
