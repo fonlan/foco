@@ -12725,6 +12725,9 @@ fn workspace_spec_update_job_skips_stale_manual_edit() {
         .pop()
         .expect("queued spec job");
     database
+        .mark_workspace_spec_job_running(&job.id)
+        .expect("mark spec job running");
+    database
         .update_workspace_spec_content(1, "# Project Spec\n\nManual edit wins.")
         .expect("manual spec edit");
     drop(database);
