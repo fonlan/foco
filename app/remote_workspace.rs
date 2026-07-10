@@ -8406,6 +8406,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_sidecar_chat_stream_aggregates_tool_followup_metrics() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("write tool fixture");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "read Cargo.toml",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let first_request = loop {
+                let envelope = broker_rx.recv().await.expect("first broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let first_id = first_request.id.expect("first request id");
+            let first_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&first_id)
+                .cloned()
+                .expect("first pending response channel");
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(first_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 4, "outputTokens": 2 },
+                        "toolCalls": [{
+                            "callId": "call-1",
+                            "name": "read_file",
+                            "arguments": {
+                                "path": "Cargo.toml",
+                                "startLine": null,
+                                "endLine": null,
+                                "timeoutMs": null
+                            }
+                        }],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send first response");
+
+            let second_request = loop {
+                let envelope = broker_rx.recv().await.expect("second broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            assert!(
+                second_request.payload["request"]["messages"]
+                    .as_array()
+                    .expect("followup messages")
+                    .iter()
+                    .any(|message| message["role"] == "tool")
+            );
+            let second_id = second_request.id.expect("second request id");
+            let second_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&second_id)
+                .cloned()
+                .expect("second pending response channel");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(second_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "done",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send final text delta");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(second_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 6, "outputTokens": 3 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send final response");
+        });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("tool followup SSE body should finish")
+        .expect("SSE bytes");
+        broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"toolResult\""));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains("\"outputTokens\":5"));
+        assert!(!text.contains("\"totalLatencyMs\":null"));
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant message lookup")
+            .expect("assistant message");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let total_latency_ms = metadata["metrics"]["totalLatencyMs"]
+            .as_i64()
+            .expect("message total latency");
+        assert!(total_latency_ms > 0);
+        assert!(metadata["metrics"]["firstTokenLatencyMs"].is_number());
+        assert_eq!(metadata["metrics"]["outputTokens"], 5);
+
+        let audit = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("audit rows")
+            .into_iter()
+            .next()
+            .expect("audit row");
+        assert_eq!(audit.input_tokens, Some(10));
+        assert_eq!(audit.output_tokens, Some(5));
+        assert_eq!(
+            audit.first_token_latency_ms,
+            metadata["metrics"]["firstTokenLatencyMs"].as_i64()
+        );
+        assert_eq!(audit.total_latency_ms, Some(total_latency_ms));
+    }
+
+    #[tokio::test]
     async fn remote_sidecar_llm_turn_uses_streamed_tool_call_when_response_omits_it() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
