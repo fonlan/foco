@@ -2031,6 +2031,7 @@ impl WorkspaceDatabase {
                     plan.id
                 ),
             })?;
+        self.ensure_plan_phase_predecessors_completed(&plan, phase)?;
         if (!matches!(phase.status.as_str(), "failed" | "cancelled")
             && phase.agent_task_id.is_some())
             || self.phase_has_active_attempt(&phase.id)?
@@ -2546,6 +2547,24 @@ impl WorkspaceDatabase {
         Ok(Some(phase))
     }
 
+    fn ensure_plan_phase_predecessors_completed(
+        &self,
+        plan: &PlanRecord,
+        phase: &PlanPhaseRecord,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        if let Some(predecessor) = plan.phases.iter().find(|candidate| {
+            candidate.sequence < phase.sequence && candidate.status != "completed"
+        }) {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' cannot start while earlier phase '{}' is {}",
+                    phase.id, predecessor.id, predecessor.status
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn plan_phase_for_plan(
         &self,
         plan_id: &str,
@@ -2708,12 +2727,6 @@ impl WorkspaceDatabase {
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
-        self.update_attempt_for_task(
-            agent_task_id,
-            PlanPhaseAttemptStatus::Cancelled,
-            None,
-            Some(error_message),
-        )?;
         self.cancel_plan_phase_record(phase, error_message)
             .map(Some)
     }
@@ -2924,12 +2937,6 @@ impl WorkspaceDatabase {
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
-        self.update_latest_active_attempt_for_phase(
-            plan_id,
-            phase_id,
-            PlanPhaseAttemptStatus::Cancelled,
-            Some(error_message),
-        )?;
         self.cancel_plan_phase_record(phase, error_message)
     }
 
@@ -2951,17 +2958,42 @@ impl WorkspaceDatabase {
             "" => "Plan phase run was cancelled",
             message => message,
         };
-        self.connection
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'cancelled',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('queued', 'running')",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plan_steps
                  SET status = 'cancelled',
                      checked_at = NULL,
                      updated_at = ?3
-                 WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('pending', 'running', 'failed')",
                 params![phase.plan_id.as_str(), phase.id.as_str(), now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plan_phases
                  SET status = 'cancelled',
@@ -2976,20 +3008,34 @@ impl WorkspaceDatabase {
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plans
-                 SET status = 'failed',
+                 SET status = 'paused',
                      active_phase_id = NULL,
+                     pause_requested_at = ?3,
                      error_message = ?2,
-                     completed_at = ?3,
+                     completed_at = NULL,
                      completed_by_user_at = NULL,
                      updated_at = ?3
                  WHERE id = ?1",
                 params![phase.plan_id.as_str(), error_message, now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO workspace_metadata (key, value, updated_at)
+                 VALUES ('plan_auto_run_enabled', 'false', ?1)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at",
+                params![now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!(
@@ -3161,6 +3207,13 @@ impl WorkspaceDatabase {
         self.fail_plan_phase_by_id(plan_id, phase_id, error_message)
     }
 
+    fn earliest_incomplete_plan_phase<'a>(
+        &self,
+        plan: &'a PlanRecord,
+    ) -> Option<&'a PlanPhaseRecord> {
+        plan.phases.iter().find(|phase| phase.status != "completed")
+    }
+
     fn start_next_plan_phase(
         &mut self,
         plan_id: &str,
@@ -3176,19 +3229,7 @@ impl WorkspaceDatabase {
             });
         }
         let now = now_timestamp();
-        let next_phase_id = self
-            .connection
-            .query_row(
-                "SELECT id FROM plan_phases
-                 WHERE plan_id = ?1 AND status IN ('pending', 'running', 'failed')
-                 ORDER BY sequence ASC
-                 LIMIT 1",
-                params![plan.id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|source| self.sqlite_error(source))?;
-        let Some(next_phase_id) = next_phase_id else {
+        let Some(next_phase) = self.earliest_incomplete_plan_phase(&plan) else {
             self.connection
                 .execute(
                     "UPDATE plans
@@ -3208,6 +3249,20 @@ impl WorkspaceDatabase {
                     message: format!("plan was not found after start: {}", plan_id.trim()),
                 });
         };
+        if next_phase.status == "cancelled" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' was cancelled and must be retried explicitly",
+                    next_phase.id
+                ),
+            });
+        }
+        if next_phase.status == "running" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' is already running", next_phase.id),
+            });
+        }
+        let next_phase_id = next_phase.id.clone();
         self.connection
             .execute(
                 "UPDATE plan_steps
@@ -3218,7 +3273,7 @@ impl WorkspaceDatabase {
                    AND phase_id = ?2
                    AND EXISTS (
                        SELECT 1 FROM plan_phases
-                       WHERE plan_id = ?1 AND id = ?2 AND status IN ('failed', 'cancelled')
+                       WHERE plan_id = ?1 AND id = ?2 AND status = 'failed'
                    )",
                 params![plan.id.as_str(), next_phase_id.as_str(), now],
             )
@@ -3227,13 +3282,13 @@ impl WorkspaceDatabase {
             .execute(
                 "UPDATE plan_phases
                  SET status = 'running',
-                     implementation_chat_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE implementation_chat_id END,
-                     agent_team_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE agent_team_id END,
-                     agent_task_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE agent_task_id END,
-                     commit_id = CASE WHEN status IN ('failed', 'cancelled') THEN NULL ELSE commit_id END,
-                     merge_attempt_count = CASE WHEN status IN ('failed', 'cancelled') THEN 0 ELSE merge_attempt_count END,
+                     implementation_chat_id = CASE WHEN status = 'failed' THEN NULL ELSE implementation_chat_id END,
+                     agent_team_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_team_id END,
+                     agent_task_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_task_id END,
+                     commit_id = CASE WHEN status = 'failed' THEN NULL ELSE commit_id END,
+                     merge_attempt_count = CASE WHEN status = 'failed' THEN 0 ELSE merge_attempt_count END,
                      error_message = NULL,
-                     started_at = CASE WHEN status IN ('failed', 'cancelled') THEN ?3 ELSE COALESCE(started_at, ?3) END,
+                     started_at = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(started_at, ?3) END,
                      completed_at = NULL,
                      updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",
@@ -3390,7 +3445,9 @@ impl WorkspaceDatabase {
                     },
                 )
                 .map_err(|source| self.sqlite_error(source))?;
-            let status = if failed > 0 {
+            let status = if phase.status == "cancelled" {
+                "cancelled"
+            } else if failed > 0 {
                 "failed"
             } else if total > 0 && completed == total {
                 "completed"
@@ -3418,6 +3475,7 @@ impl WorkspaceDatabase {
                 message: format!("plan phase count overflowed: {source}"),
             })?;
         let any_failed = phases.iter().any(|phase| phase.status == "failed");
+        let any_cancelled = phases.iter().any(|phase| phase.status == "cancelled");
         let any_running = phases.iter().any(|phase| phase.status == "running");
         let all_completed =
             total_phases > 0 && phases.iter().all(|phase| phase.status == "completed");
@@ -3429,7 +3487,9 @@ impl WorkspaceDatabase {
                 |row| row.get::<_, String>(0),
             )
             .map_err(|source| self.sqlite_error(source))?;
-        let next_status = if any_failed {
+        let next_status = if any_cancelled {
+            "paused"
+        } else if any_failed {
             "failed"
         } else if all_completed {
             "implemented"

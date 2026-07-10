@@ -1574,13 +1574,14 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
         .expect("cancelled plan");
 
     assert!(
-        database
+        !database
             .plan_auto_run_state()
             .expect("auto-run state")
             .enabled
     );
-    assert_eq!(cancelled.status, "failed");
+    assert_eq!(cancelled.status, "paused");
     assert!(cancelled.active_phase_id.is_none());
+    assert!(cancelled.pause_requested_at.is_some());
     assert_eq!(
         cancelled.error_message.as_deref(),
         Some("user cancelled the run")
@@ -1613,6 +1614,229 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
             .is_ok(),
         "cancelled phase can retry"
     );
+}
+
+#[test]
+fn cancelled_earliest_phase_blocks_resume_without_state_changes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-cancelled-resume-barrier",
+            title: "Cancelled resume barrier",
+            overview: "Resume must not skip a cancelled phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-cancelled-resume-barrier-phase-1",
+                    title: "Phase one",
+                    summary: "Cancel me.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-cancelled-resume-barrier-step-1",
+                        title: "Do phase one",
+                        detail: "Cancel before completion.",
+                        acceptance: vec!["cancelled".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-cancelled-resume-barrier-phase-2",
+                    title: "Phase two",
+                    summary: "Must remain pending.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-cancelled-resume-barrier-step-2",
+                        title: "Do phase two",
+                        detail: "Wait for phase one retry.",
+                        acceptance: vec!["not started".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-cancelled-resume-barrier", "start")
+        .expect("start first phase");
+    database
+        .cancel_plan_phase_by_id(
+            "plan-cancelled-resume-barrier",
+            "plan-cancelled-resume-barrier-phase-1",
+            "user cancelled phase one",
+        )
+        .expect("cancel first phase");
+
+    let error = database
+        .transition_plan("plan-cancelled-resume-barrier", "resume")
+        .expect_err("cancelled phase must block resume");
+    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+    let plan = database
+        .plan("plan-cancelled-resume-barrier")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "paused");
+    assert!(plan.active_phase_id.is_none());
+    assert_eq!(plan.phases[0].status, "cancelled");
+    assert_eq!(plan.phases[1].status, "pending");
+
+    let refreshed = database
+        .update_plan_step(
+            "plan-cancelled-resume-barrier",
+            "plan-cancelled-resume-barrier-step-2",
+            PlanStepPatch {
+                title: None,
+                detail: Some("Refresh without clearing the cancellation barrier."),
+                acceptance: None,
+                status: None,
+            },
+        )
+        .expect("refresh plan through step update");
+    assert_eq!(refreshed.status, "paused");
+    assert_eq!(refreshed.phases[0].status, "cancelled");
+    assert_eq!(refreshed.phases[1].status, "pending");
+}
+
+#[test]
+fn retry_rejects_phase_with_incomplete_predecessor_without_creating_attempt() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-retry-order-barrier",
+            title: "Retry order barrier",
+            overview: "Later retries require completed predecessors.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-retry-order-barrier-phase-1",
+                    title: "Phase one",
+                    summary: "Still pending.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-retry-order-barrier-step-1",
+                        title: "Do phase one",
+                        detail: "Must finish first.",
+                        acceptance: vec!["completed".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-retry-order-barrier-phase-2",
+                    title: "Phase two",
+                    summary: "Seeded as failed history.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-retry-order-barrier-step-2",
+                        title: "Do phase two",
+                        detail: "Cannot retry yet.",
+                        acceptance: vec!["blocked".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    let connection = Connection::open(database.database_path()).expect("open database");
+    connection
+        .execute(
+            "UPDATE plan_phases SET status = 'failed', error_message = 'old failure' WHERE id = ?1",
+            params!["plan-retry-order-barrier-phase-2"],
+        )
+        .expect("seed failed later phase");
+    drop(connection);
+
+    let error = database
+        .begin_plan_phase_attempt(
+            "plan-retry-order-barrier",
+            "plan-retry-order-barrier-phase-2",
+            PlanPhaseAttemptTrigger::Retry,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect_err("later phase retry must be rejected");
+    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+    assert!(
+        database
+            .plan_phase_attempts_for_phase("plan-retry-order-barrier-phase-2")
+            .expect("attempts")
+            .is_empty()
+    );
+}
+
+#[test]
+fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-retry-earliest-cancelled",
+            title: "Retry earliest cancelled phase",
+            overview: "Later completed history does not block the earliest phase retry.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-retry-earliest-cancelled-phase-1",
+                    title: "Phase one",
+                    summary: "Cancelled earlier phase.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-retry-earliest-cancelled-step-1",
+                        title: "Retry phase one",
+                        detail: "Run again.",
+                        acceptance: vec!["retried".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-retry-earliest-cancelled-phase-2",
+                    title: "Phase two",
+                    summary: "Already completed in abnormal history.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-retry-earliest-cancelled-step-2",
+                        title: "Completed phase two",
+                        detail: "Do not rerun.",
+                        acceptance: vec!["preserved".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    let connection = Connection::open(database.database_path()).expect("open database");
+    connection
+        .execute_batch(
+            "UPDATE plan_phases
+             SET status = 'cancelled', error_message = 'old cancellation'
+             WHERE id = 'plan-retry-earliest-cancelled-phase-1';
+             UPDATE plan_steps
+             SET status = 'cancelled'
+             WHERE phase_id = 'plan-retry-earliest-cancelled-phase-1';
+             UPDATE plan_phases
+             SET status = 'completed', completed_at = '2026-07-10T00:00:00.000Z'
+             WHERE id = 'plan-retry-earliest-cancelled-phase-2';
+             UPDATE plan_steps
+             SET status = 'completed', checked_at = '2026-07-10T00:00:00.000Z'
+             WHERE phase_id = 'plan-retry-earliest-cancelled-phase-2';
+             UPDATE plans
+             SET status = 'paused', pause_requested_at = '2026-07-10T00:00:00.000Z'
+             WHERE id = 'plan-retry-earliest-cancelled';",
+        )
+        .expect("seed abnormal history");
+    drop(connection);
+
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-retry-earliest-cancelled",
+            "plan-retry-earliest-cancelled-phase-1",
+            PlanPhaseAttemptTrigger::Retry,
+            Some("provider-b"),
+            Some("model-b"),
+            Some("high"),
+        )
+        .expect("retry earliest cancelled phase");
+    assert_eq!(attempt.sequence, 0);
+    assert_eq!(attempt.trigger, "retry");
+    assert_eq!(attempt.provider_id.as_deref(), Some("provider-b"));
+    let plan = database
+        .plan("plan-retry-earliest-cancelled")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.phases[0].status, "running");
+    assert_eq!(plan.phases[1].status, "completed");
 }
 
 #[test]
@@ -1812,7 +2036,12 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
             .plan(&plan_id)
             .expect("repaired plan")
             .expect("repaired plan");
-        assert_eq!(repaired_plan.status, "failed");
+        let expected_plan_status = if suffix == "cancelled" {
+            "paused"
+        } else {
+            "failed"
+        };
+        assert_eq!(repaired_plan.status, expected_plan_status);
         assert_eq!(repaired_plan.phases[0].status, expected_phase_status);
         assert_eq!(
             repaired_plan.phases[0].steps[0].status,
@@ -2072,26 +2301,32 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
             ],
         })
         .expect("create plan");
-    for phase_id in [
-        "plan-attempt-migration-024-completed",
-        "plan-attempt-migration-024-failed",
-        "plan-attempt-migration-024-cancelled",
-    ] {
-        database
-            .begin_plan_phase_attempt(
-                "plan-attempt-migration-024",
-                phase_id,
-                PlanPhaseAttemptTrigger::Initial,
-                Some("provider"),
-                Some("model"),
-                None,
-            )
-            .expect("begin attempt");
-    }
     let database_path = database.database_path().to_path_buf();
     drop(database);
 
     let connection = Connection::open(&database_path).expect("open database");
+    for (sequence, phase_id) in [
+        "plan-attempt-migration-024-completed",
+        "plan-attempt-migration-024-failed",
+        "plan-attempt-migration-024-cancelled",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO plan_phase_attempts (
+                    id, plan_id, phase_id, sequence, trigger, status,
+                    provider_id, model_id, created_at, updated_at
+                 ) VALUES (?1, 'plan-attempt-migration-024', ?2, 0, 'initial', 'queued',
+                    'provider', 'model', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')",
+                params![
+                    format!("plan-phase-attempt-migration-024-seed-{sequence}"),
+                    phase_id
+                ],
+            )
+            .expect("seed active attempt history");
+    }
     connection
         .execute_batch(
             "DROP INDEX IF EXISTS workspace_spec_jobs_active_retry_idx;
