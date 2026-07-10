@@ -1547,6 +1547,77 @@ mod tests {
     }
 
     #[test]
+    fn retry_model_selection_accepts_max_when_model_metadata_declares_it() {
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh", "max"],
+        );
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-a",
+            "model-a",
+            Some("low"),
+        ));
+
+        let selection = plan_retry_model_selection(
+            &config,
+            &metadata_file,
+            &phase,
+            &PlanPhaseRetryRequest {
+                provider_id: Some("provider-b".to_string()),
+                model_id: Some("model-b".to_string()),
+                thinking_level: Some("max".to_string()),
+            },
+        )
+        .expect("max selection");
+
+        assert_eq!(selection.provider_id, "provider-b");
+        assert_eq!(selection.model_id, "model-b");
+        assert_eq!(selection.thinking_level.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn retry_model_selection_rejects_max_when_model_metadata_omits_it() {
+        let mut config = retry_selection_config();
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-a",
+            "model-a",
+            Some("low"),
+        ));
+
+        let error = plan_retry_model_selection(
+            &config,
+            &metadata_file,
+            &phase,
+            &PlanPhaseRetryRequest {
+                provider_id: Some("provider-b".to_string()),
+                model_id: Some("model-b".to_string()),
+                thinking_level: Some("max".to_string()),
+            },
+        )
+        .expect_err("undeclared max should fail");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error
+                .message()
+                .contains("unsupported thinking level 'max' for model 'model-b'")
+        );
+    }
+
+    #[test]
     fn plan_runner_model_selection_uses_default_agent_definition_not_model_order() {
         let mut config = retry_selection_config();
         let (_metadata_dir, metadata_file) = write_retry_selection_metadata(

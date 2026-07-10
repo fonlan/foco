@@ -3007,6 +3007,73 @@ async fn agent_definition_save_rejects_unsupported_thinking_level_for_model() {
 }
 
 #[tokio::test]
+async fn settings_exposes_maximum_thinking_level_label() {
+    let fixture = prompt_state_fixture(|_| {});
+
+    let response = crate::http::settings::settings(State(fixture.state))
+        .await
+        .expect("settings response")
+        .0;
+
+    assert!(
+        response
+            .thinking_levels
+            .iter()
+            .any(|level| level.value == "max" && level.label == "Maximum")
+    );
+}
+
+#[test]
+fn provider_request_thinking_level_accepts_max_only_when_metadata_declares_it() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let metadata_file = profile.path().join("models.dev.json");
+    let metadata_key = foco_store::model_metadata::model_metadata_key("provider", "model");
+    let mut config = prompt_test_config(profile.path().join("workspace"));
+    config.models[0].metadata_key = Some(metadata_key.clone());
+
+    fs::write(
+        &metadata_file,
+        serde_json::to_string(&json!({
+            "sourceUrl": "test",
+            "fetchedAt": "2026-07-10T00:00:00Z",
+            "models": [{
+                "key": metadata_key,
+                "providerId": "provider",
+                "providerName": "Provider",
+                "modelId": "model",
+                "name": "Model",
+                "contextWindow": 20000,
+                "maxOutputTokens": 1000,
+                "pricing": {},
+                "inputModalities": ["text"],
+                "outputModalities": ["text"],
+                "supportedThinkingLevels": ["low", "high", "max"],
+                "supportsTools": false,
+                "supportsCache": false,
+                "reasoning": true,
+                "sourceUrl": "test",
+                "refreshedAt": "2026-07-10T00:00:00Z"
+            }]
+        }))
+        .expect("metadata json"),
+    )
+    .expect("write model metadata");
+
+    validate_provider_request_thinking_level(&config, &metadata_file, "model", Some("max"))
+        .expect("declared max should pass");
+
+    config.models[0].metadata_key = None;
+    let error =
+        validate_provider_request_thinking_level(&config, &metadata_file, "model", Some("max"))
+            .expect_err("max without metadata support should fail");
+    assert!(
+        error
+            .message()
+            .contains("unsupported thinking level 'max' for model 'model'")
+    );
+}
+
+#[tokio::test]
 async fn agent_definitions_api_creates_default_agent_when_empty() {
     let fixture = prompt_state_fixture(|_| {});
     let state = fixture.state.clone();

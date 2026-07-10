@@ -14,6 +14,7 @@ const thinkingLevels: ThinkingLevelSummary[] = [
   { label: "Medium", value: "medium" },
   { label: "High", value: "high" },
   { label: "XHigh", value: "xhigh" },
+  { label: "Maximum", value: "max" },
 ];
 
 function model(overrides: Partial<ConfiguredModelSummary>): ConfiguredModelSummary {
@@ -57,6 +58,34 @@ describe("thinking level helpers", () => {
       { label: "High", value: "high" },
       { label: "XHigh", value: "xhigh" },
     ]);
+  });
+
+  it("shows max only when model metadata declares it", () => {
+    const gpt56 = model({
+      id: "gpt-5.6",
+      supportedThinkingLevels: ["low", "high", "xhigh", "max"],
+      thinkingLevel: "max",
+    });
+
+    expect(thinkingLevelOptionsForModel(gpt56, thinkingLevels)).toEqual([
+      { label: "Low", value: "low" },
+      { label: "High", value: "high" },
+      { label: "XHigh", value: "xhigh" },
+      { label: "Maximum", value: "max" },
+    ]);
+    expect(defaultThinkingLevelForModel(gpt56)).toBe("max");
+    expect(normalizeThinkingLevelForModel(gpt56, "max")).toBe("max");
+
+    const withoutMax = model({
+      supportedThinkingLevels: ["low", "high", "xhigh"],
+      thinkingLevel: "max",
+    });
+    expect(thinkingLevelOptionsForModel(withoutMax, thinkingLevels)).not.toContainEqual({
+      label: "Maximum",
+      value: "max",
+    });
+    expect(defaultThinkingLevelForModel(withoutMax)).toBe("");
+    expect(normalizeThinkingLevelForModel(withoutMax, "max")).toBe("");
   });
 
   it("drops unsupported and empty model levels", () => {

@@ -1448,6 +1448,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Medium: "中",
     High: "高",
     "Extra High": "极高",
+    Maximum: "最高",
     "Listen port must be a positive whole number": "监听端口必须是正整数",
     Unknown: "未知错误",
     "Unknown error": "未知错误",

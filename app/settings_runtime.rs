@@ -247,6 +247,10 @@ pub(crate) async fn settings_response(
                 value: "xhigh",
                 label: "Extra High",
             },
+            ThinkingLevelSummary {
+                value: "max",
+                label: "Maximum",
+            },
         ],
         mcp_transports: vec![
             McpTransportSummary {

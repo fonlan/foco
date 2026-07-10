@@ -60,7 +60,7 @@ pub const SUPPORTED_PLAN_MERGE_AUTOMATION_MODES: &[&str] = &[
     PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
 ];
 pub const SUPPORTED_AGENT_THINKING_LEVELS: &[&str] =
-    &["none", "minimal", "low", "medium", "high", "xhigh"];
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
@@ -4621,6 +4621,16 @@ mod tests {
         let error = serde_json::from_value::<AgentDefinitionSettings>(value)
             .expect_err("missing definition field should fail");
         assert!(error.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn agent_definition_accepts_max_as_known_thinking_level() {
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].model_options.thinking_level = Some("max".to_string());
+
+        config
+            .validate(None)
+            .expect("max should be accepted by general agent config validation");
     }
 
     #[test]

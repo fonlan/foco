@@ -362,13 +362,13 @@ mod tests {
     "id": "openai",
     "name": "OpenAI",
     "models": {
-      "gpt-test": {
-        "id": "gpt-test",
-        "name": "GPT Test",
+      "gpt-5.6": {
+        "id": "gpt-5.6",
+        "name": "GPT 5.6",
         "reasoning": true,
         "reasoning_options": [
-          { "type": "effort", "values": ["none", "minimal", "low", "default", "max", "medium", "minimal"] },
-          { "type": "budget_tokens" },
+          { "type": "effort", "values": ["none", "minimal", "low", "default", "max", "unknown", "medium", "minimal"] },
+          { "type": "budget_tokens", "values": ["max"] },
           { "type": "toggle", "values": ["high"] }
         ],
         "tool_call": true,
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(cache.models.len(), 1);
         let model = &cache.models[0];
 
-        assert_eq!(model.key, "openai/gpt-test");
+        assert_eq!(model.key, "openai/gpt-5.6");
         assert_eq!(model.context_window, Some(128000));
         assert_eq!(model.max_output_tokens, Some(16384));
         assert_eq!(model.pricing.input, Some(1.25));
@@ -397,7 +397,7 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(
             model.supported_thinking_levels,
-            ["none", "minimal", "low", "medium"]
+            ["none", "minimal", "low", "max", "medium"]
         );
         assert_eq!(model.input_modalities, ["text", "image"]);
         assert_eq!(model.output_modalities, ["text"]);
@@ -406,16 +406,16 @@ mod tests {
     }
 
     #[test]
-    fn derives_gpt55_thinking_levels_and_ignores_nulls() {
+    fn derives_gpt56_thinking_levels_and_ignores_nulls() {
         let cache = parse_models_dev_metadata(
             r#"{
   "openai": {
     "id": "openai",
     "name": "OpenAI",
     "models": {
-      "gpt-5.5": {
-        "id": "gpt-5.5",
-        "name": "GPT 5.5",
+      "gpt-5.6": {
+        "id": "gpt-5.6",
+        "name": "GPT 5.6",
         "reasoning_options": [
           { "type": null, "values": ["high"] },
           { "type": "effort", "values": null },
@@ -433,7 +433,7 @@ mod tests {
 
         assert_eq!(
             cache.models[0].supported_thinking_levels,
-            ["none", "low", "medium", "high", "xhigh"]
+            ["none", "low", "medium", "high", "xhigh", "max"]
         );
     }
 
