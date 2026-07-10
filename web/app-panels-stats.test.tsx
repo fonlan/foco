@@ -1,4 +1,10 @@
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -107,15 +113,21 @@ describe("app-panels-stats verification surfaces", () => {
         },
       ],
     };
-    appTestState.workspaceGitBranchesResponses = [branchesResponse, branchesResponse];
-    appTestState.workspaceGitDiffResponsesByWorktreePath[worktreePath] = generatedGitDiff;
+    appTestState.workspaceGitBranchesResponses = [
+      branchesResponse,
+      branchesResponse,
+    ];
+    appTestState.workspaceGitDiffResponsesByWorktreePath[worktreePath] =
+      generatedGitDiff;
 
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
     await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
     expect(
-      await screen.findAllByText("foco/agent-worktrees/agent-instance-coordinator"),
+      await screen.findAllByText(
+        "foco/agent-worktrees/agent-instance-coordinator",
+      ),
     ).not.toHaveLength(0);
     await waitFor(() =>
       expect(
@@ -180,8 +192,12 @@ describe("app-panels-stats verification surfaces", () => {
         },
       ],
     };
-    appTestState.workspaceGitBranchesResponses = [branchesResponse, branchesResponse];
-    appTestState.workspaceGitDiffResponsesByWorktreePath[firstWorktreePath] = generatedGitDiff;
+    appTestState.workspaceGitBranchesResponses = [
+      branchesResponse,
+      branchesResponse,
+    ];
+    appTestState.workspaceGitDiffResponsesByWorktreePath[firstWorktreePath] =
+      generatedGitDiff;
     appTestState.workspaceGitDiffResponsesByWorktreePath[secondWorktreePath] = {
       ...generatedGitDiff,
       diff: [
@@ -213,7 +229,8 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findByText("review.md");
     expect(
       fetchCallUrls().some(
-        (url) => url.pathname === "/api/workspaces/workspace-1/git/branches/switch",
+        (url) =>
+          url.pathname === "/api/workspaces/workspace-1/git/branches/switch",
       ),
     ).toBe(false);
     expect(
@@ -237,19 +254,17 @@ describe("app-panels-stats verification surfaces", () => {
   }
 
   function latestStreamChatId() {
-    const streamCall = vi
-      .mocked(fetch)
-      .mock.calls.findLast(([input]) => {
-        const rawPath =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.toString()
-              : input.url;
-        return new URL(rawPath, "http://localhost").pathname.endsWith(
-          "/chat/stream",
-        );
-      });
+    const streamCall = vi.mocked(fetch).mock.calls.findLast(([input]) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      return new URL(rawPath, "http://localhost").pathname.endsWith(
+        "/chat/stream",
+      );
+    });
     const body = JSON.parse(String(streamCall?.[1]?.body ?? "{}")) as {
       chatId?: string | null;
     };
@@ -264,7 +279,9 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
-    const appRow = await screen.findByRole("button", { name: /web\/App\.tsx M/ });
+    const appRow = await screen.findByRole("button", {
+      name: /web\/App\.tsx M/,
+    });
     const appFileName = within(appRow).getByText("App.tsx");
     const appDirectory = within(appRow).getByText("web");
 
@@ -281,20 +298,32 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await screen.findAllByText("Default");
-    await userEvent.click(screen.getByRole("button", { name: "Close context panel" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Close context panel" }),
+    );
     expect(screen.queryByRole("tab", { name: "ToDo" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Open context panel" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open context panel" }),
+    );
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
-    expect(await screen.findAllByRole("button", { name: /README\.md M/ })).toHaveLength(2);
+    expect(
+      await screen.findAllByRole("button", { name: /README\.md M/ }),
+    ).toHaveLength(2);
     expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getAllByRole("button", { name: /README\.md M/ })[0]);
+    await userEvent.click(
+      screen.getAllByRole("button", { name: /README\.md M/ })[0],
+    );
 
     expect((await screen.findAllByText(/hello world/))[0]).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: /new-note\.txt U/ })).toHaveLength(2);
+    expect(
+      screen.getAllByRole("button", { name: /new-note\.txt U/ }),
+    ).toHaveLength(2);
 
-    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open terminal" }),
+    );
 
     expect(await screen.findByText("connected")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
@@ -310,10 +339,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(within(terminalList).getByText("Terminal 1")).toBeInTheDocument();
     expect(within(terminalList).getByText("Terminal 2")).toBeInTheDocument();
     expect(within(terminalList).getAllByLabelText("connected")).toHaveLength(2);
-    expect(within(terminalList).getAllByText(workspace.path)[0]).toHaveAttribute(
-      "title",
-      workspace.path,
-    );
+    expect(
+      within(terminalList).getAllByText(workspace.path)[0],
+    ).toHaveAttribute("title", workspace.path);
     expect(
       fetchMock.mock.calls.filter(
         ([url]) => url === "/api/workspaces/workspace-1/terminal/session",
@@ -328,10 +356,16 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(
       within(terminalList).getByRole("button", { name: "Close terminal 2" }),
     );
-    expect(within(terminalList).queryByText("Terminal 2")).not.toBeInTheDocument();
-    expect(screen.queryByRole("complementary", { name: "Terminal sessions" })).not.toBeInTheDocument();
+    expect(
+      within(terminalList).queryByText("Terminal 2"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("complementary", { name: "Terminal sessions" }),
+    ).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getAllByRole("button", { name: "Close terminal" })[1]);
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Close terminal" })[1],
+    );
 
     await waitFor(() => {
       expect(screen.queryByText("connected")).not.toBeInTheDocument();
@@ -345,7 +379,8 @@ describe("app-panels-stats verification surfaces", () => {
       acceptance: ["Start queues a team chat."],
       checkedAt: null,
       createdAt: timestamp,
-      detail: "The workspace chat list shows the created implementation session.",
+      detail:
+        "The workspace chat list shows the created implementation session.",
       id: "plan-step-1",
       phaseId: "plan-phase-1",
       planId: "plan-1",
@@ -419,76 +454,82 @@ describe("app-panels-stats verification surfaces", () => {
         workspaceId: "workspace-1",
       },
     );
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces") {
-        return jsonResponse({
-          activeWorkspaceId: workspace.id,
-          workspaces: [
-            {
-              ...workspace,
-              chats: didStartPlan ? [planChat, ...workspace.chats] : workspace.chats,
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              {
+                ...workspace,
+                chats: didStartPlan
+                  ? [planChat, ...workspace.chats]
+                  : workspace.chats,
+              },
+              secondaryWorkspace,
+            ],
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/plans") {
+          const plan = didStartPlan ? runningPlan : readyPlan;
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [plan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/plans/plan-1/action") {
+          didStartPlan = true;
+          return jsonResponse({ plan: runningPlan });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/plan-chat-1/messages") {
+          return jsonResponse({
+            activeRun: {
+              chatId: "plan-chat-1",
+              lastSequence: 0,
+              runId: "agent-task-plan-1",
+              workspaceId: "workspace-1",
             },
-            secondaryWorkspace,
-          ],
-        });
-      }
-
-      if (path === "/api/workspaces/workspace-1/plans") {
-        const plan = didStartPlan ? runningPlan : readyPlan;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [plan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
-
-      if (path === "/api/workspaces/workspace-1/plans/plan-1/action") {
-        didStartPlan = true;
-        return jsonResponse({ plan: runningPlan });
-      }
-
-      if (path === "/api/workspaces/workspace-1/chats/plan-chat-1/messages") {
-        return jsonResponse({
-          activeRun: {
-            chatId: "plan-chat-1",
-            lastSequence: 0,
-            runId: "agent-task-plan-1",
-            workspaceId: "workspace-1",
-          },
-          chat: {
-            id: "plan-chat-1",
-            kind: null,
-            readOnly: false,
-            title: "Plan phase implementation",
-          },
-          messages: [
-            {
-              content: "Plan phase implementation request.",
-              createdAt: timestamp,
-              extractedMemories: [],
-              id: "plan-message-user",
-              memoriesUsed: [],
-              metrics: null,
-              parts: [{ text: "Plan phase implementation request.", type: "text" }],
-              reasoning: null,
-              role: "user",
-              specUpdates: [],
-              toolCalls: [],
+            chat: {
+              id: "plan-chat-1",
+              kind: null,
+              readOnly: false,
+              title: "Plan phase implementation",
             },
-          ],
-          pagination: { hasMoreBefore: false, nextBeforeSequence: null },
-        });
-      }
+            messages: [
+              {
+                content: "Plan phase implementation request.",
+                createdAt: timestamp,
+                extractedMemories: [],
+                id: "plan-message-user",
+                memoriesUsed: [],
+                metrics: null,
+                parts: [
+                  { text: "Plan phase implementation request.", type: "text" },
+                ],
+                reasoning: null,
+                role: "user",
+                specUpdates: [],
+                toolCalls: [],
+              },
+            ],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -572,71 +613,83 @@ describe("app-panels-stats verification surfaces", () => {
       title: "Open implementation chat plan",
       updatedAt: timestamp,
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = new URL(url, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = new URL(url, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces") {
-        return jsonResponse({
-          activeWorkspaceId: workspace.id,
-          workspaces: [
-            { ...workspace, chats: [implementationChat, ...workspace.chats] },
-            secondaryWorkspace,
-          ],
-        });
-      }
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              { ...workspace, chats: [implementationChat, ...workspace.chats] },
+              secondaryWorkspace,
+            ],
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [plan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [plan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chats/plan-chat-open/messages") {
-        return jsonResponse({
-          activeRun: null,
-          chat: {
-            id: "plan-chat-open",
-            kind: null,
-            readOnly: false,
-            title: "Existing implementation chat",
-          },
-          messages: [
-            {
-              content: "Existing implementation transcript.",
-              createdAt: timestamp,
-              extractedMemories: [],
-              id: "plan-open-message-user",
-              memoriesUsed: [],
-              metrics: null,
-              parts: [{ text: "Existing implementation transcript.", type: "text" }],
-              reasoning: null,
-              role: "user",
-              specUpdates: [],
-              toolCalls: [],
+        if (
+          path === "/api/workspaces/workspace-1/chats/plan-chat-open/messages"
+        ) {
+          return jsonResponse({
+            activeRun: null,
+            chat: {
+              id: "plan-chat-open",
+              kind: null,
+              readOnly: false,
+              title: "Existing implementation chat",
             },
-          ],
-          pagination: { hasMoreBefore: false, nextBeforeSequence: null },
-        });
-      }
+            messages: [
+              {
+                content: "Existing implementation transcript.",
+                createdAt: timestamp,
+                extractedMemories: [],
+                id: "plan-open-message-user",
+                memoriesUsed: [],
+                metrics: null,
+                parts: [
+                  { text: "Existing implementation transcript.", type: "text" },
+                ],
+                reasoning: null,
+                role: "user",
+                specUpdates: [],
+                toolCalls: [],
+              },
+            ],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("Open implementation chat plan")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Open implementation chat plan"),
+    ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Open implementation chat" }));
+    await user.click(
+      screen.getByRole("button", { name: "Open implementation chat" }),
+    );
 
-    expect(await screen.findByText("Existing implementation transcript.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Existing implementation transcript."),
+    ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/workspaces/workspace-1/chats/plan-chat-open/messages?limit=100",
       expect.any(Object),
@@ -668,41 +721,48 @@ describe("app-panels-stats verification surfaces", () => {
       title: "Delete me from plan panel",
       updatedAt: timestamp,
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = new URL(url, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = new URL(url, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: deleted ? [] : [plan],
-          totalCount: deleted ? 0 : 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: deleted ? [] : [plan],
+            totalCount: deleted ? 0 : 1,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/plan-delete-ui") {
-        deleted = true;
-        return jsonResponse({ deleted: true });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/plan-delete-ui") {
+          deleted = true;
+          return jsonResponse({ deleted: true });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("Delete me from plan panel")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Delete me from plan panel"),
+    ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Delete plan" }));
     expect(confirmSpy).toHaveBeenCalledWith("Delete plan confirmation");
     expect(
       fetchMock.mock.calls.filter(([input, init]) => {
         const path = new URL(String(input), "http://127.0.0.1").pathname;
-        return path === "/api/workspaces/workspace-1/plans/plan-delete-ui" && init?.method === "DELETE";
+        return (
+          path === "/api/workspaces/workspace-1/plans/plan-delete-ui" &&
+          init?.method === "DELETE"
+        );
       }),
     ).toHaveLength(0);
     expect(screen.getByText("Delete me from plan panel")).toBeInTheDocument();
@@ -713,187 +773,206 @@ describe("app-panels-stats verification surfaces", () => {
       expect(
         fetchMock.mock.calls.filter(([input, init]) => {
           const path = new URL(String(input), "http://127.0.0.1").pathname;
-          return path === "/api/workspaces/workspace-1/plans/plan-delete-ui" && init?.method === "DELETE";
+          return (
+            path === "/api/workspaces/workspace-1/plans/plan-delete-ui" &&
+            init?.method === "DELETE"
+          );
         }),
       ).toHaveLength(1);
     });
     await waitFor(() => {
-      expect(screen.queryByText("Delete me from plan panel")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Delete me from plan panel"),
+      ).not.toBeInTheDocument();
     });
-    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+    expect(
+      screen.getByText("No active plans for this workspace."),
+    ).toBeInTheDocument();
   });
 
-  it.each(["failed", "cancelled"] as const)("retries a %s plan phase through the phase retry endpoint", async (phaseStatus) => {
-    const user = userEvent.setup();
-    const timestamp = "2026-06-28T05:00:00Z";
-    const failedStep = {
-      acceptance: ["Retry uses the phase retry endpoint."],
-      checkedAt: null,
-      createdAt: timestamp,
-      detail: "The Plan runner should see the same task complete after retry.",
-      id: "plan-step-failed",
-      phaseId: "plan-phase-failed",
-      planId: "plan-failed",
-      sequence: 0,
-      status: "failed",
-      title: "Recover failed phase",
-      updatedAt: timestamp,
-    };
-    const failedPhase = {
-      agentTaskId: null,
-      agentTeamId: "agent-team-failed",
-      attempts: [
-        {
-          agentTaskId: "agent-task-failed",
-          agentTeamId: "agent-team-failed",
-          commitId: null,
-          completedAt: timestamp,
-          createdAt: timestamp,
-          errorMessage: "provider rate limited",
-          id: "plan-phase-attempt-failed",
-          implementationChatId: null,
-          modelId: "gpt-test",
-          phaseId: "plan-phase-failed",
-          planId: "plan-failed",
-          providerId: "openai",
-          sequence: 0,
-          startedAt: timestamp,
-          status: phaseStatus,
-          thinkingLevel: null,
-          trigger: "start",
-          updatedAt: timestamp,
+  it.each(["failed", "cancelled"] as const)(
+    "retries a %s plan phase through the phase retry endpoint",
+    async (phaseStatus) => {
+      const user = userEvent.setup();
+      const timestamp = "2026-06-28T05:00:00Z";
+      const failedStep = {
+        acceptance: ["Retry uses the phase retry endpoint."],
+        checkedAt: null,
+        createdAt: timestamp,
+        detail:
+          "The Plan runner should see the same task complete after retry.",
+        id: "plan-step-failed",
+        phaseId: "plan-phase-failed",
+        planId: "plan-failed",
+        sequence: 0,
+        status: "failed",
+        title: "Recover failed phase",
+        updatedAt: timestamp,
+      };
+      const failedPhase = {
+        agentTaskId: null,
+        agentTeamId: "agent-team-failed",
+        attempts: [
+          {
+            agentTaskId: "agent-task-failed",
+            agentTeamId: "agent-team-failed",
+            commitId: null,
+            completedAt: timestamp,
+            createdAt: timestamp,
+            errorMessage: "provider rate limited",
+            id: "plan-phase-attempt-failed",
+            implementationChatId: null,
+            modelId: "gpt-test",
+            phaseId: "plan-phase-failed",
+            planId: "plan-failed",
+            providerId: "openai",
+            sequence: 0,
+            startedAt: timestamp,
+            status: phaseStatus,
+            thinkingLevel: null,
+            trigger: "start",
+            updatedAt: timestamp,
+          },
+        ],
+        commitId: null,
+        completedAt: timestamp,
+        createdAt: timestamp,
+        errorMessage: "provider rate limited",
+        id: "plan-phase-failed",
+        implementationChatId: null,
+        mergeAttemptCount: 0,
+        planId: "plan-failed",
+        sequence: 0,
+        startedAt: timestamp,
+        status: phaseStatus,
+        steps: [failedStep],
+        summary: "The model request failed.",
+        title: "Failed phase",
+        updatedAt: timestamp,
+      };
+      const failedPlan = {
+        activePhaseId: null,
+        completedAt: timestamp,
+        completedByUserAt: null,
+        createdAt: timestamp,
+        errorMessage: "provider rate limited",
+        sharedMergeCommitId: null,
+        id: "plan-failed",
+        overview: "Expose an explicit phase retry control.",
+        pauseRequestedAt: null,
+        phases: [failedPhase],
+        sortOrder: 0,
+        sourceChatId: "chat-1",
+        status: "failed",
+        title: "Retry failed plan phase",
+        updatedAt: timestamp,
+      };
+      const retriedPlan = {
+        ...failedPlan,
+        activePhaseId: "plan-phase-failed",
+        completedAt: null,
+        errorMessage: null,
+        phases: [
+          {
+            ...failedPhase,
+            agentTaskId: "agent-task-retried",
+            implementationChatId: "chat-retried",
+            completedAt: null,
+            errorMessage: null,
+            status: "running",
+          },
+        ],
+        status: "running",
+      };
+      const implementedPlan = {
+        ...retriedPlan,
+        activePhaseId: null,
+        completedAt: timestamp,
+        phases: [
+          {
+            ...retriedPlan.phases[0],
+            completedAt: timestamp,
+            status: "completed",
+            steps: [
+              {
+                ...failedStep,
+                checkedAt: timestamp,
+                status: "completed",
+              },
+            ],
+          },
+        ],
+        status: "implemented",
+      };
+      let didRetry = false;
+      let planRequestCount = 0;
+      const fetchMock = vi.fn(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const path = url.startsWith("http://127.0.0.1")
+            ? new URL(url).pathname
+            : url.split("?")[0];
+
+          if (path === "/api/workspaces/workspace-1/plans") {
+            planRequestCount += 1;
+            return jsonResponse({
+              page: 1,
+              pageSize: 50,
+              plans: [
+                !didRetry
+                  ? failedPlan
+                  : planRequestCount >= 3
+                    ? implementedPlan
+                    : retriedPlan,
+              ],
+              totalCount: 1,
+              totalPages: 1,
+            });
+          }
+
+          if (
+            path ===
+            "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry"
+          ) {
+            didRetry = true;
+            return jsonResponse({ plan: retriedPlan });
+          }
+
+          return mockFetch(input, init);
         },
-      ],
-      commitId: null,
-      completedAt: timestamp,
-      createdAt: timestamp,
-      errorMessage: "provider rate limited",
-      id: "plan-phase-failed",
-      implementationChatId: null,
-      mergeAttemptCount: 0,
-      planId: "plan-failed",
-      sequence: 0,
-      startedAt: timestamp,
-      status: phaseStatus,
-      steps: [failedStep],
-      summary: "The model request failed.",
-      title: "Failed phase",
-      updatedAt: timestamp,
-    };
-    const failedPlan = {
-      activePhaseId: null,
-      completedAt: timestamp,
-      completedByUserAt: null,
-      createdAt: timestamp,
-      errorMessage: "provider rate limited",
-      sharedMergeCommitId: null,
-      id: "plan-failed",
-      overview: "Expose an explicit phase retry control.",
-      pauseRequestedAt: null,
-      phases: [failedPhase],
-      sortOrder: 0,
-      sourceChatId: "chat-1",
-      status: "failed",
-      title: "Retry failed plan phase",
-      updatedAt: timestamp,
-    };
-    const retriedPlan = {
-      ...failedPlan,
-      activePhaseId: "plan-phase-failed",
-      completedAt: null,
-      errorMessage: null,
-      phases: [
-        {
-          ...failedPhase,
-          agentTaskId: "agent-task-retried",
-          implementationChatId: "chat-retried",
-          completedAt: null,
-          errorMessage: null,
-          status: "running",
-        },
-      ],
-      status: "running",
-    };
-    const implementedPlan = {
-      ...retriedPlan,
-      activePhaseId: null,
-      completedAt: timestamp,
-      phases: [
-        {
-          ...retriedPlan.phases[0],
-          completedAt: timestamp,
-          status: "completed",
-          steps: [
-            {
-              ...failedStep,
-              checkedAt: timestamp,
-              status: "completed",
-            },
-          ],
-        },
-      ],
-      status: "implemented",
-    };
-    let didRetry = false;
-    let planRequestCount = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
-
-      if (path === "/api/workspaces/workspace-1/plans") {
-        planRequestCount += 1;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [
-            !didRetry
-              ? failedPlan
-              : planRequestCount >= 3
-                ? implementedPlan
-                : retriedPlan,
-          ],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
-
-      if (path === "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry") {
-        didRetry = true;
-        return jsonResponse({ plan: retriedPlan });
-      }
-
-      return mockFetch(input, init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
-
-    renderApp();
-
-    await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("Retry failed plan phase")).toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "Retry plan phase" }));
-
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry",
-        expect.objectContaining({
-          body: JSON.stringify({}),
-          method: "POST",
-        }),
       );
-    });
-    expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0);
-    await waitFor(
-      () => {
-        expect(screen.getByText("Implemented")).toBeInTheDocument();
-      },
-      { timeout: 5000 },
-    );
-  });
+      vi.stubGlobal("fetch", fetchMock);
+      window.history.replaceState(null, "", "/workspace-1/chat-1");
 
+      renderApp();
+
+      await user.click(await screen.findByRole("tab", { name: "Plan" }));
+      expect(
+        await screen.findByText("Retry failed plan phase"),
+      ).toBeInTheDocument();
+
+      await user.click(
+        screen.getByRole("button", { name: "Retry plan phase" }),
+      );
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry",
+          expect.objectContaining({
+            body: JSON.stringify({}),
+            method: "POST",
+          }),
+        );
+      });
+      expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0);
+      await waitFor(
+        () => {
+          expect(screen.getByText("Implemented")).toBeInTheDocument();
+        },
+        { timeout: 5000 },
+      );
+    },
+  );
 
   it("opens phase retry model override dialog", async () => {
     const user = userEvent.setup();
@@ -964,38 +1043,49 @@ describe("app-panels-stats verification surfaces", () => {
       phases: [{ ...failedPhase, status: "running", errorMessage: null }],
       status: "running",
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [failedPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [failedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry") {
-        return jsonResponse({ plan: retriedPlan });
-      }
+        if (
+          path ===
+          "/api/workspaces/workspace-1/plans/plan-failed/phases/plan-phase-failed/retry"
+        ) {
+          return jsonResponse({ plan: retriedPlan });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    await user.click(screen.getByRole("button", { name: "Retry phase options" }));
-    await user.click(screen.getByRole("menuitem", { name: "Retry with another model..." }));
+    await user.click(
+      screen.getByRole("button", { name: "Retry phase options" }),
+    );
+    await user.click(
+      screen.getByRole("menuitem", { name: "Retry with another model..." }),
+    );
 
-    expect(screen.getByRole("dialog", { name: "Retry with another model" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Retry with another model" }),
+    ).toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("Provider"), "anthropic");
     await user.selectOptions(screen.getByLabelText("Thinking level"), "high");
     await user.click(screen.getByRole("button", { name: "Retry" }));
@@ -1015,26 +1105,27 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
 
-
   it("shows the auto-run checkbox when the plan list is empty", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [],
-          totalCount: 0,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [],
+            totalCount: 0,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1045,8 +1136,12 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       await screen.findByRole("checkbox", { name: /Auto run plans/ }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Run every active plan in order")).toBeInTheDocument();
-    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Run every active plan in order"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("No active plans for this workspace."),
+    ).toBeInTheDocument();
   });
 
   it("scrolls the running plan into view when the Plan tab opens", async () => {
@@ -1074,53 +1169,60 @@ describe("app-panels-stats verification surfaces", () => {
       status: "running" as const,
       title: "Running scroll target",
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [readyPlan, runningPlan],
-          totalCount: 2,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [readyPlan, runningPlan],
+            totalCount: 2,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
-    const rect = (top: number, height: number) => ({
-      bottom: top + height,
-      height,
-      left: 0,
-      right: 320,
-      top,
-      width: 320,
-      x: 0,
-      y: top,
-      toJSON: () => ({}),
-    }) as DOMRect;
-    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return this.classList.contains("context-list-panel") ? 200 : 0;
-    });
-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-      if (this.classList.contains("context-list-panel")) {
-        return rect(0, 200);
-      }
-      if (this.textContent?.includes("Ready scroll decoy")) {
-        return rect(0, 100);
-      }
-      if (this.textContent?.includes("Running scroll target")) {
-        return rect(500, 100);
-      }
-      return rect(0, 0);
-    });
+    const rect = (top: number, height: number) =>
+      ({
+        bottom: top + height,
+        height,
+        left: 0,
+        right: 320,
+        top,
+        width: 320,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return this.classList.contains("context-list-panel") ? 200 : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.classList.contains("context-list-panel")) {
+          return rect(0, 200);
+        }
+        if (this.textContent?.includes("Ready scroll decoy")) {
+          return rect(0, 100);
+        }
+        if (this.textContent?.includes("Running scroll target")) {
+          return rect(500, 100);
+        }
+        return rect(0, 0);
+      },
+    );
 
     renderApp();
 
@@ -1131,7 +1233,9 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(planTab);
 
     const runningTitle = await screen.findByText("Running scroll target");
-    const planListPanel = runningTitle.closest(".context-list-panel") as HTMLElement | null;
+    const planListPanel = runningTitle.closest(
+      ".context-list-panel",
+    ) as HTMLElement | null;
     expect(planListPanel).not.toBeNull();
     await waitFor(() => {
       expect(planListPanel?.scrollTop).toBe(450);
@@ -1148,92 +1252,110 @@ describe("app-panels-stats verification surfaces", () => {
 
   it("toggles the plan worktree audit view back to the plan list", async () => {
     const user = userEvent.setup();
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [],
-          totalCount: 0,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [],
+            totalCount: 0,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/worktrees/audit") {
-        return jsonResponse({
-          items: [
-            {
-              agentInstanceId: "agent-instance-audit",
-              agentTaskId: "agent-task-audit",
-              agentTaskStatus: "completed",
-              baseRevision: "main",
-              branch: "foco/plan-audit",
-              cleanupAllowed: true,
-              commitId: "abcdef1234567890",
-              errorMessage: null,
-              headCommitId: "abcdef1234567890",
-              headCommitShort: "abcdef1",
-              implementationChatId: "chat-audit",
-              phaseId: "phase-audit",
-              phaseStatus: "completed",
-              planId: "plan-audit",
-              planStatus: "implemented",
-              refName: "refs/heads/foco/plan-audit",
-              worktreePath: "C:\\work\\foco\\.worktrees\\plan-audit",
-              worktreeStatus: "kept",
-            },
-          ],
-          recoveryNote: "Recover manually.",
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/worktrees/audit") {
+          return jsonResponse({
+            items: [
+              {
+                agentInstanceId: "agent-instance-audit",
+                agentTaskId: "agent-task-audit",
+                agentTaskStatus: "completed",
+                baseRevision: "main",
+                branch: "foco/plan-audit",
+                cleanupAllowed: true,
+                commitId: "abcdef1234567890",
+                errorMessage: null,
+                headCommitId: "abcdef1234567890",
+                headCommitShort: "abcdef1",
+                implementationChatId: "chat-audit",
+                phaseId: "phase-audit",
+                phaseStatus: "completed",
+                planId: "plan-audit",
+                planStatus: "implemented",
+                refName: "refs/heads/foco/plan-audit",
+                worktreePath: "C:\\work\\foco\\.worktrees\\plan-audit",
+                worktreeStatus: "kept",
+              },
+            ],
+            recoveryNote: "Recover manually.",
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("No active plans for this workspace.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("No active plans for this workspace."),
+    ).toBeInTheDocument();
 
-    const auditButton = screen.getByRole("button", { name: "Audit plan worktrees" });
+    const auditButton = screen.getByRole("button", {
+      name: "Audit plan worktrees",
+    });
     await user.click(auditButton);
 
     expect(await screen.findByText("Legacy worktrees")).toBeInTheDocument();
     expect(screen.getByText("plan-audit / phase-audit")).toBeInTheDocument();
-    expect(screen.queryByText("No active plans for this workspace.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("No active plans for this workspace."),
+    ).not.toBeInTheDocument();
 
     await user.click(auditButton);
 
     await waitFor(() => {
       expect(screen.queryByText("Legacy worktrees")).not.toBeInTheDocument();
     });
-    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+    expect(
+      screen.getByText("No active plans for this workspace."),
+    ).toBeInTheDocument();
   });
 
   it("loads and toggles backend plan auto-run state", async () => {
     const user = userEvent.setup();
     const autoRunRequests: Array<{ enabled?: boolean; method: string }> = [];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
-        const body = init?.body
-          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
-          : {};
-        autoRunRequests.push({ enabled: body.enabled, method: init?.method ?? "GET" });
-        return jsonResponse({ busy: body.enabled ?? false, enabled: body.enabled ?? false });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+          const body = init?.body
+            ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+            : {};
+          autoRunRequests.push({
+            enabled: body.enabled,
+            method: init?.method ?? "GET",
+          });
+          return jsonResponse({
+            busy: body.enabled ?? false,
+            enabled: body.enabled ?? false,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1259,7 +1381,10 @@ describe("app-panels-stats verification surfaces", () => {
     const readyPlan: Plan = {
       ...planFixture,
       activePhaseId: null,
-      phases: planFixture.phases.map((phase) => ({ ...phase, status: "pending" })),
+      phases: planFixture.phases.map((phase) => ({
+        ...phase,
+        status: "pending",
+      })),
       status: "ready",
       title: "Auto-run refresh target",
     };
@@ -1273,38 +1398,45 @@ describe("app-panels-stats verification surfaces", () => {
       status: "running",
     };
     let planRequestCount = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
-        const body = init?.body
-          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
-          : {};
-        return jsonResponse({ busy: body.enabled ?? false, enabled: body.enabled ?? false });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+          const body = init?.body
+            ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+            : {};
+          return jsonResponse({
+            busy: body.enabled ?? false,
+            enabled: body.enabled ?? false,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        planRequestCount += 1;
-        const plan = planRequestCount === 1 ? readyPlan : runningPlan;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [plan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          planRequestCount += 1;
+          const plan = planRequestCount === 1 ? readyPlan : runningPlan;
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [plan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("Auto-run refresh target")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Auto-run refresh target"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Ready")).toBeInTheDocument();
 
     await user.click(screen.getByRole("checkbox", { name: /Auto run plans/ }));
@@ -1312,16 +1444,23 @@ describe("app-panels-stats verification surfaces", () => {
     await waitFor(() => {
       expect(planRequestCount).toBeGreaterThanOrEqual(2);
     });
-    const planArticle = screen.getByText("Auto-run refresh target").closest("article");
+    const planArticle = screen
+      .getByText("Auto-run refresh target")
+      .closest("article");
     if (!planArticle) {
       throw new Error("Expected plan article");
     }
-    expect(within(planArticle).getAllByText("Running").length).toBeGreaterThan(0);
+    expect(within(planArticle).getAllByText("Running").length).toBeGreaterThan(
+      0,
+    );
   });
 
   it("single-flights plan and auto-run polling while auto-run is enabled", async () => {
     const user = userEvent.setup();
-    const intervalCallbacks = new Map<number, { handler: TimerHandler; timeout?: number }>();
+    const intervalCallbacks = new Map<
+      number,
+      { handler: TimerHandler; timeout?: number }
+    >();
     let nextIntervalId = 0;
     let nowMs = 0;
     let holdPlanRequests = false;
@@ -1335,36 +1474,43 @@ describe("app-panels-stats verification surfaces", () => {
         totalCount: 1,
         totalPages: 1,
       });
-    const performanceNowSpy = vi.spyOn(performance, "now").mockImplementation(() => nowMs);
-    const setIntervalSpy = vi.spyOn(window, "setInterval").mockImplementation(
-      ((handler: TimerHandler, timeout?: number) => {
-        nextIntervalId += 1;
-        intervalCallbacks.set(nextIntervalId, { handler, timeout });
-        return nextIntervalId;
-      }) as typeof window.setInterval,
-    );
-    const clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation((id) => {
-      intervalCallbacks.delete(Number(id));
-    });
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    const performanceNowSpy = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => nowMs);
+    const setIntervalSpy = vi.spyOn(window, "setInterval").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      nextIntervalId += 1;
+      intervalCallbacks.set(nextIntervalId, { handler, timeout });
+      return nextIntervalId;
+    }) as typeof window.setInterval);
+    const clearIntervalSpy = vi
+      .spyOn(window, "clearInterval")
+      .mockImplementation((id) => {
+        intervalCallbacks.delete(Number(id));
+      });
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
-        return jsonResponse({ busy: false, enabled: true });
-      }
-
-      if (path === "/api/workspaces/workspace-1/plans") {
-        if (holdPlanRequests) {
-          const response = deferred<Response>();
-          heldPlanResponses.push(response);
-          return response.promise;
+        if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+          return jsonResponse({ busy: false, enabled: true });
         }
-        return plansResponse();
-      }
 
-      return mockFetch(input, init);
-    });
+        if (path === "/api/workspaces/workspace-1/plans") {
+          if (holdPlanRequests) {
+            const response = deferred<Response>();
+            heldPlanResponses.push(response);
+            return response.promise;
+          }
+          return plansResponse();
+        }
+
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1375,14 +1521,18 @@ describe("app-panels-stats verification surfaces", () => {
       expect(await screen.findByText(runningPlan.title)).toBeInTheDocument();
       await waitFor(() => {
         expect(
-          Array.from(intervalCallbacks.values()).filter(({ timeout }) => timeout === 3000),
+          Array.from(intervalCallbacks.values()).filter(
+            ({ timeout }) => timeout === 3000,
+          ),
         ).toHaveLength(1);
       });
 
       fetchMock.mockClear();
       holdPlanRequests = true;
       nowMs = 1000;
-      const poll = Array.from(intervalCallbacks.values()).find((item) => item.timeout === 3000)?.handler;
+      const poll = Array.from(intervalCallbacks.values()).find(
+        (item) => item.timeout === 3000,
+      )?.handler;
       if (typeof poll !== "function") {
         throw new Error("Expected plan polling interval");
       }
@@ -1399,7 +1549,9 @@ describe("app-panels-stats verification surfaces", () => {
 
       expect(heldPlanResponses).toHaveLength(1);
       expect(requestCount("/api/workspaces/workspace-1/plans")).toBe(1);
-      expect(requestCount("/api/workspaces/workspace-1/plans/auto-run")).toBe(1);
+      expect(requestCount("/api/workspaces/workspace-1/plans/auto-run")).toBe(
+        1,
+      );
 
       await act(async () => {
         heldPlanResponses[0].resolve(plansResponse());
@@ -1425,25 +1577,31 @@ describe("app-panels-stats verification surfaces", () => {
       "workspace-1": true,
       "workspace-2": false,
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
-      const match = path.match(/^\/api\/workspaces\/([^/]+)\/plans\/auto-run$/);
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+        const match = path.match(
+          /^\/api\/workspaces\/([^/]+)\/plans\/auto-run$/,
+        );
 
-      if (match) {
-        const workspaceId = decodeURIComponent(match[1] ?? "");
-        if (init?.method === "PUT") {
-          const body = JSON.parse(String(init.body ?? "{}")) as { enabled?: boolean };
-          autoRunEnabledByWorkspace[workspaceId] = body.enabled ?? false;
+        if (match) {
+          const workspaceId = decodeURIComponent(match[1] ?? "");
+          if (init?.method === "PUT") {
+            const body = JSON.parse(String(init.body ?? "{}")) as {
+              enabled?: boolean;
+            };
+            autoRunEnabledByWorkspace[workspaceId] = body.enabled ?? false;
+          }
+          return jsonResponse({
+            busy: false,
+            enabled: autoRunEnabledByWorkspace[workspaceId] ?? false,
+          });
         }
-        return jsonResponse({
-          busy: false,
-          enabled: autoRunEnabledByWorkspace[workspaceId] ?? false,
-        });
-      }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1460,7 +1618,8 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(
       screen.getByRole("button", {
         name: (accessibleName, element) =>
-          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Side project"),
       }),
     );
     await user.click(screen.getByRole("button", { name: /Side note/ }));
@@ -1472,7 +1631,8 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(
       screen.getByRole("button", {
         name: (accessibleName, element) =>
-          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Default"),
       }),
     );
     await user.click(screen.getByRole("tab", { name: /Tool run/ }));
@@ -1550,23 +1710,25 @@ describe("app-panels-stats verification surfaces", () => {
       act(async () => {
         await new Promise((resolve) => window.setTimeout(resolve, 3100));
       });
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        const plan = planStage === 0 ? runningPhase1Plan : runningPhase2Plan;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [plan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          const plan = planStage === 0 ? runningPhase1Plan : runningPhase2Plan;
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [plan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1577,7 +1739,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       await screen.findByRole("checkbox", { name: /Auto run plans/ }),
     ).not.toBeChecked();
-    expect(await screen.findByText("Plan panel polling regression")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Plan panel polling regression"),
+    ).toBeInTheDocument();
     const phase1Section = screen.getByText("Phase 1").closest("section");
     if (!phase1Section) {
       throw new Error("Expected phase 1 section");
@@ -1588,17 +1752,23 @@ describe("app-panels-stats verification surfaces", () => {
     await waitForPlanPoll();
 
     await waitFor(() => {
-      const updatedPhase1Section = screen.getByText("Phase 1").closest("section");
-      const updatedPhase2Section = screen.getByText("Phase 2").closest("section");
+      const updatedPhase1Section = screen
+        .getByText("Phase 1")
+        .closest("section");
+      const updatedPhase2Section = screen
+        .getByText("Phase 2")
+        .closest("section");
       if (!updatedPhase1Section || !updatedPhase2Section) {
         throw new Error("Expected refreshed phase sections");
       }
-      expect(within(updatedPhase1Section).getByText("Completed")).toBeInTheDocument();
-      expect(within(updatedPhase2Section).getByText("Running")).toBeInTheDocument();
+      expect(
+        within(updatedPhase1Section).getByText("Completed"),
+      ).toBeInTheDocument();
+      expect(
+        within(updatedPhase2Section).getByText("Running"),
+      ).toBeInTheDocument();
     });
   });
-
-
 
   it("reorders active plans without frontend auto-running the new first plan", async () => {
     const user = userEvent.setup();
@@ -1631,55 +1801,63 @@ describe("app-panels-stats verification surfaces", () => {
     let plans: Plan[] = [firstPlan, secondPlan];
     const orderRequests: Array<{ planIds: string[] }> = [];
     const autoRunRequests: Array<{ enabled?: boolean; method: string }> = [];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const rawUrl = typeof input === "string" ? input : input.toString();
-      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const path = new URL(rawUrl, "http://127.0.0.1").pathname;
 
-      if (path === "/api/workspaces/workspace-1/plans/auto-run") {
-        const body = init?.body
-          ? (JSON.parse(String(init.body)) as { enabled?: boolean })
-          : {};
-        autoRunRequests.push({ enabled: body.enabled, method: init?.method ?? "GET" });
-        return jsonResponse({ busy: false, enabled: body.enabled ?? false });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/auto-run") {
+          const body = init?.body
+            ? (JSON.parse(String(init.body)) as { enabled?: boolean })
+            : {};
+          autoRunRequests.push({
+            enabled: body.enabled,
+            method: init?.method ?? "GET",
+          });
+          return jsonResponse({ busy: false, enabled: body.enabled ?? false });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/order") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { planIds: string[] };
-        orderRequests.push(body);
-        plans = body.planIds.map((planId, index) => ({
-          ...(plans.find((plan) => plan.id === planId) ?? firstPlan),
-          sortOrder: index,
-        }));
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans,
-          totalCount: plans.length,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans/order") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as {
+            planIds: string[];
+          };
+          orderRequests.push(body);
+          plans = body.planIds.map((planId, index) => ({
+            ...(plans.find((plan) => plan.id === planId) ?? firstPlan),
+            sortOrder: index,
+          }));
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans,
+            totalCount: plans.length,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans,
-          totalCount: plans.length,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans,
+            totalCount: plans.length,
+            totalPages: 1,
+          });
+        }
 
-      const actionMatch = path.match(
-        /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
-      );
-      if (actionMatch) {
-        const planId = decodeURIComponent(actionMatch[1] ?? "");
-        const plan = plans.find((candidate) => candidate.id === planId) ?? secondPlan;
-        return jsonResponse({ plan });
-      }
+        const actionMatch = path.match(
+          /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
+        );
+        if (actionMatch) {
+          const planId = decodeURIComponent(actionMatch[1] ?? "");
+          const plan =
+            plans.find((candidate) => candidate.id === planId) ?? secondPlan;
+          return jsonResponse({ plan });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -1699,7 +1877,9 @@ describe("app-panels-stats verification surfaces", () => {
       getData: vi.fn(() => "plan-2"),
       setData: vi.fn(),
     };
-    const reorderHandles = screen.getAllByRole("button", { name: "Reorder plan" });
+    const reorderHandles = screen.getAllByRole("button", {
+      name: "Reorder plan",
+    });
     const firstArticle = firstTitle.closest("article");
     if (!firstArticle) {
       throw new Error("Expected first plan article");
@@ -1713,17 +1893,23 @@ describe("app-panels-stats verification surfaces", () => {
       expect(orderRequests).toEqual([{ planIds: ["plan-2", "plan-1"] }]);
     });
     await waitFor(() => {
-      expect(screen.getByText("Second queue plan").compareDocumentPosition(
-        screen.getByText("First queue plan"),
-      )).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(
+        screen
+          .getByText("Second queue plan")
+          .compareDocumentPosition(screen.getByText("First queue plan")),
+      ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     });
 
-    await user.click(await screen.findByRole("checkbox", { name: /Auto run plans/ }));
+    await user.click(
+      await screen.findByRole("checkbox", { name: /Auto run plans/ }),
+    );
     await waitFor(() => {
       expect(autoRunRequests).toContainEqual({ enabled: true, method: "PUT" });
     });
     expect(fetchMock).not.toHaveBeenCalledWith(
-      expect.stringMatching(/^\/api\/workspaces\/workspace-1\/plans\/[^/]+\/action$/),
+      expect.stringMatching(
+        /^\/api\/workspaces\/workspace-1\/plans\/[^/]+\/action$/,
+      ),
       expect.anything(),
     );
   });
@@ -1757,29 +1943,33 @@ describe("app-panels-stats verification surfaces", () => {
       updatedAt: "2026-07-02T10:01:00Z",
     };
     let didRetryMerge = false;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [didRetryMerge ? mergedPlan : blockedPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [didRetryMerge ? mergedPlan : blockedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/plan-merge-blocked/action") {
-        didRetryMerge = true;
-        return jsonResponse({ plan: mergedPlan });
-      }
+        if (
+          path === "/api/workspaces/workspace-1/plans/plan-merge-blocked/action"
+        ) {
+          didRetryMerge = true;
+          return jsonResponse({ plan: mergedPlan });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
@@ -1787,7 +1977,9 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await user.click(screen.getByRole("tab", { name: "Plan" }));
 
-    const planCard = (await screen.findByText("Blocked merge plan")).closest("article");
+    const planCard = (await screen.findByText("Blocked merge plan")).closest(
+      "article",
+    );
     expect(planCard).not.toBeNull();
     const retryButton = within(planCard as HTMLElement).getByRole("button", {
       name: "Retry Merge",
@@ -1796,7 +1988,9 @@ describe("app-panels-stats verification surfaces", () => {
       "title",
       "Clean the shared workspace, then retry merge",
     );
-    expect(within(planCard as HTMLElement).getByText(blockedMessage)).toBeInTheDocument();
+    expect(
+      within(planCard as HTMLElement).getByText(blockedMessage),
+    ).toBeInTheDocument();
 
     await user.click(retryButton);
 
@@ -1813,7 +2007,9 @@ describe("app-panels-stats verification surfaces", () => {
       "title",
       "Merged into shared workspace",
     );
-    expect(screen.queryByRole("button", { name: "Retry Merge" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry Merge" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps retry merge action response visible when the refresh returns stale plan data", async () => {
@@ -1824,7 +2020,8 @@ describe("app-panels-stats verification surfaces", () => {
       completedAt: timestamp,
       completedByUserAt: null,
       createdAt: timestamp,
-      errorMessage: "cannot merge Agent worktree while shared workspace has uncommitted changes",
+      errorMessage:
+        "cannot merge Agent worktree while shared workspace has uncommitted changes",
       sharedMergeCommitId: null,
       id: "plan-merge-stale-refresh",
       overview: "Retry should show that merge work has started.",
@@ -1844,36 +2041,43 @@ describe("app-panels-stats verification surfaces", () => {
       updatedAt: "2026-07-04T12:21:00Z",
     };
     let didRetryMerge = false;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [blockedPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [blockedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans/plan-merge-stale-refresh/action") {
-        didRetryMerge = true;
-        return jsonResponse({ plan: runningPlan });
-      }
+        if (
+          path ===
+          "/api/workspaces/workspace-1/plans/plan-merge-stale-refresh/action"
+        ) {
+          didRetryMerge = true;
+          return jsonResponse({ plan: runningPlan });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
 
     await screen.findAllByText("Default");
     await user.click(screen.getByRole("tab", { name: "Plan" }));
-    const retryButton = await screen.findByRole("button", { name: "Retry Merge" });
+    const retryButton = await screen.findByRole("button", {
+      name: "Retry Merge",
+    });
 
     await user.click(retryButton);
 
@@ -1881,7 +2085,9 @@ describe("app-panels-stats verification surfaces", () => {
       expect(didRetryMerge).toBe(true);
       expect(screen.getByText("Running")).toBeInTheDocument();
     });
-    expect(screen.queryByRole("button", { name: "Retry Merge" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry Merge" }),
+    ).not.toBeInTheDocument();
   });
 
   it("marks implemented plans as merged in the plan panel", async () => {
@@ -2056,24 +2262,30 @@ describe("app-panels-stats verification surfaces", () => {
         title: "Ready status colors",
       },
     ];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [implementedPlan, phaseCommitOnlyImplementedPlan, ...statusColorPlans],
-          totalCount: 6,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [
+              implementedPlan,
+              phaseCommitOnlyImplementedPlan,
+              ...statusColorPlans,
+            ],
+            totalCount: 6,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
@@ -2081,7 +2293,9 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Plan" }));
 
-    expect(await screen.findByText("Merged implementation plan")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Merged implementation plan"),
+    ).toBeInTheDocument();
     const mergedCommitBadge = screen.getByText("fedcba9");
     expect(mergedCommitBadge).toHaveAttribute(
       "title",
@@ -2165,13 +2379,19 @@ describe("app-panels-stats verification surfaces", () => {
         ? new URL(url).pathname
         : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/files" && holdNextRequest.files) {
+      if (
+        path === "/api/workspaces/workspace-1/files" &&
+        holdNextRequest.files
+      ) {
         const request = deferred<Response>();
         heldRequests.files.push(request);
         return request.promise;
       }
 
-      if (path === "/api/workspaces/workspace-1/git/diff" && holdNextRequest.diff) {
+      if (
+        path === "/api/workspaces/workspace-1/git/diff" &&
+        holdNextRequest.diff
+      ) {
         const request = deferred<Response>();
         heldRequests.diff.push(request);
         return request.promise;
@@ -2215,10 +2435,14 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
     await screen.findByText("Workspace file tree");
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Refresh files" })).not.toBeDisabled(),
+      expect(
+        screen.getByRole("button", { name: "Refresh files" }),
+      ).not.toBeDisabled(),
     );
     holdNextRequest.files = true;
-    await userEvent.click(screen.getByRole("button", { name: "Refresh files" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh files" }),
+    );
     await waitFor(() => expect(heldRequests.files).toHaveLength(1));
     await expectRefreshIconLoading("Refresh files");
     await act(async () => {
@@ -2228,31 +2452,41 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
     await screen.findByText("Source Control");
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Refresh diff" })).not.toBeDisabled(),
+      expect(
+        screen.getByRole("button", { name: "Refresh diff" }),
+      ).not.toBeDisabled(),
     );
     holdNextRequest.diff = true;
     await userEvent.click(screen.getByRole("button", { name: "Refresh diff" }));
     await waitFor(() => expect(heldRequests.diff).toHaveLength(1));
     await expectRefreshIconLoading("Refresh diff");
     await act(async () => {
-      heldRequests.diff[0]?.resolve(jsonResponse(appTestState.workspaceGitDiffResponse));
+      heldRequests.diff[0]?.resolve(
+        jsonResponse(appTestState.workspaceGitDiffResponse),
+      );
     });
 
     await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
     await screen.findAllByRole("heading", { name: "Project Spec" });
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Reload spec" })).not.toBeDisabled(),
+      expect(
+        screen.getByRole("button", { name: "Reload spec" }),
+      ).not.toBeDisabled(),
     );
     holdNextRequest.spec = true;
     await userEvent.click(screen.getByRole("button", { name: "Reload spec" }));
     await waitFor(() => expect(heldRequests.spec).toHaveLength(1));
     await expectRefreshIconLoading("Reload spec");
     await act(async () => {
-      heldRequests.spec[0]?.resolve(jsonResponse(appTestState.workspaceSpecResponse));
+      heldRequests.spec[0]?.resolve(
+        jsonResponse(appTestState.workspaceSpecResponse),
+      );
     });
 
     await userEvent.click(screen.getByRole("tab", { name: "Agents" }));
-    const agentRefreshButton = await screen.findByRole("button", { name: "Refresh" });
+    const agentRefreshButton = await screen.findByRole("button", {
+      name: "Refresh",
+    });
     await waitFor(() => expect(agentRefreshButton).not.toBeDisabled());
     holdNextRequest.agent = true;
     await userEvent.click(agentRefreshButton);
@@ -2265,12 +2499,15 @@ describe("app-panels-stats verification surfaces", () => {
   it("loads the Project Spec tab in the right panel with markdown preview enabled", async () => {
     await openSpecPanel();
 
-    expect(screen.getByRole("button", { name: "Edit markdown" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    expect(screen.getByRole("heading", { name: "Purpose" })).toBeInTheDocument();
-    expect(screen.getByText("Describe the current workspace.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Edit markdown" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByRole("heading", { name: "Purpose" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Describe the current workspace."),
+    ).toBeInTheDocument();
     expect(screen.queryByLabelText("Project Spec Markdown")).toBeNull();
     expect(screen.getAllByText(/Revision 3/).length).toBeGreaterThan(0);
     expect(screen.getByText(/Latest job: Completed/)).toBeInTheDocument();
@@ -2299,14 +2536,19 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
 
-    expect(await screen.findByRole("heading", { name: "项目 Spec" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "编辑 Markdown" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    expect(screen.getByRole("heading", { name: "Purpose" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "项目 Spec" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "编辑 Markdown" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByRole("heading", { name: "Purpose" }),
+    ).toBeInTheDocument();
     expect(screen.queryByLabelText("项目 Spec Markdown")).toBeNull();
-    expect(screen.queryByRole("checkbox", { name: "启用项目 Spec" })).toBeNull();
+    expect(
+      screen.queryByRole("checkbox", { name: "启用项目 Spec" }),
+    ).toBeNull();
     expect(screen.getByRole("button", { name: "注入新会话" })).toHaveAttribute(
       "aria-pressed",
       "true",
@@ -2324,7 +2566,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("button", { name: "Inject into new chats" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Inject into new chats" }),
+    );
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(
         ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
@@ -2336,7 +2580,9 @@ describe("app-panels-stats verification surfaces", () => {
       });
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Inject into new chats" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Inject into new chats" }),
+    );
     await waitFor(() => {
       const calls = fetchMock.mock.calls.filter(
         ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
@@ -2351,7 +2597,9 @@ describe("app-panels-stats verification surfaces", () => {
   it("saves Project Spec Markdown with the current revision", async () => {
     const fetchMock = vi.mocked(fetch);
     await openSpecPanel();
-    await userEvent.click(screen.getByRole("button", { name: "Edit markdown" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Edit markdown" }),
+    );
     changeInput(
       screen.getByLabelText("Project Spec Markdown"),
       "# Project Spec\n\n## Purpose\n\nUpdated from the right panel.",
@@ -2365,18 +2613,23 @@ describe("app-panels-stats verification surfaces", () => {
       );
       expect(call).toBeDefined();
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({
-        contentMarkdown: "# Project Spec\n\n## Purpose\n\nUpdated from the right panel.",
+        contentMarkdown:
+          "# Project Spec\n\n## Purpose\n\nUpdated from the right panel.",
         expectedRevision: 3,
       });
     });
-    expect((await screen.findAllByText(/Revision 4/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/Revision 4/)).length).toBeGreaterThan(
+      0,
+    );
   });
 
   it("queues Project Spec generation from the right panel", async () => {
     const fetchMock = vi.mocked(fetch);
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("button", { name: "Regenerate spec" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Regenerate spec" }),
+    );
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(
@@ -2385,7 +2638,9 @@ describe("app-panels-stats verification surfaces", () => {
       expect(call).toBeDefined();
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({ modelId: null });
     });
-    expect(await screen.findByText(new RegExp(workspaceSpecQueuedJob.id))).toBeInTheDocument();
+    expect(
+      await screen.findByText(new RegExp(workspaceSpecQueuedJob.id)),
+    ).toBeInTheDocument();
     expect(screen.getByText(/Latest job: Queued/)).toBeInTheDocument();
   });
 
@@ -2393,7 +2648,9 @@ describe("app-panels-stats verification surfaces", () => {
     appTestState.workspaceSpecGenerateCompletes = true;
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("button", { name: "Regenerate spec" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Regenerate spec" }),
+    );
 
     await waitFor(
       () => {
@@ -2406,7 +2663,9 @@ describe("app-panels-stats verification surfaces", () => {
   it("shows Project Spec save conflicts with a reload action", async () => {
     appTestState.workspaceSpecSaveConflict = true;
     await openSpecPanel();
-    await userEvent.click(screen.getByRole("button", { name: "Edit markdown" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Edit markdown" }),
+    );
     changeInput(
       screen.getByLabelText("Project Spec Markdown"),
       "# Project Spec\n\n## Purpose\n\nConflicting edit.",
@@ -2414,11 +2673,17 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(
-      await screen.findByText("workspace spec revision changed; reload and retry"),
+      await screen.findByText(
+        "workspace spec revision changed; reload and retry",
+      ),
     ).toBeInTheDocument();
-    await userEvent.click(screen.getAllByRole("button", { name: "Reload spec" })[1]);
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Reload spec" })[1],
+    );
     await waitFor(() => {
-      expect(screen.getByText("Describe the current workspace.")).toBeInTheDocument();
+      expect(
+        screen.getByText("Describe the current workspace."),
+      ).toBeInTheDocument();
       expect(screen.queryByLabelText("Project Spec Markdown")).toBeNull();
     });
   });
@@ -2430,7 +2695,9 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await screen.findAllByText("Default");
-    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open terminal" }),
+    );
     expect(await screen.findByText("connected")).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.filter(
@@ -2441,21 +2708,27 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(
       screen.getByRole("button", {
         name: (accessibleName, element) =>
-          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Side project"),
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Side project"),
       }),
     );
     await userEvent.click(screen.getByRole("button", { name: /Side note/ }));
-    expect(screen.getByRole("button", { name: "Open terminal" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Open terminal" }),
+    ).toBeInTheDocument();
     expect(closeSpy).not.toHaveBeenCalled();
 
     await userEvent.click(
       screen.getByRole("button", {
         name: (accessibleName, element) =>
-          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Default"),
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Default"),
       }),
     );
     await userEvent.click(screen.getByRole("button", { name: /Tool run/ }));
-    expect(screen.getAllByRole("button", { name: "Close terminal" })).toHaveLength(2);
+    expect(
+      screen.getAllByRole("button", { name: "Close terminal" }),
+    ).toHaveLength(2);
     expect(closeSpy).not.toHaveBeenCalled();
     expect(
       fetchMock.mock.calls.filter(
@@ -2479,22 +2752,26 @@ describe("app-panels-stats verification surfaces", () => {
             : input.url;
 
       if (path === "/api/workspaces") {
-        return Promise.resolve(jsonResponse({
-          activeWorkspaceId: commandWorkspace.id,
-          workspaces: [commandWorkspace, secondaryWorkspace],
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            activeWorkspaceId: commandWorkspace.id,
+            workspaces: [commandWorkspace, secondaryWorkspace],
+          }),
+        );
       }
 
       if (path === "/api/settings") {
-        return Promise.resolve(jsonResponse({
-          ...settings,
-          workspaces: [
-            {
-              ...settings.workspaces[0],
-              commonCommands: commandWorkspace.commonCommands,
-            },
-          ],
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...settings,
+            workspaces: [
+              {
+                ...settings.workspaces[0],
+                commonCommands: commandWorkspace.commonCommands,
+              },
+            ],
+          }),
+        );
       }
 
       return Promise.resolve(mockFetch(input, init));
@@ -2504,7 +2781,9 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await screen.findAllByText("Default");
-    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open terminal" }),
+    );
     expect(await screen.findByText("connected")).toBeInTheDocument();
 
     await userEvent.click(
@@ -2513,7 +2792,10 @@ describe("app-panels-stats verification surfaces", () => {
 
     await waitFor(() => {
       const sentInput = sendSpy.mock.calls
-        .map(([data]) => JSON.parse(String(data)) as { data?: string; type: string })
+        .map(
+          ([data]) =>
+            JSON.parse(String(data)) as { data?: string; type: string },
+        )
         .find(
           (message) =>
             message.type === "input" && message.data?.includes("npm run dev"),
@@ -2529,9 +2811,14 @@ describe("app-panels-stats verification surfaces", () => {
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
-    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "plan",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     await act(async () => {
       await Promise.resolve();
     });
@@ -2548,22 +2835,40 @@ describe("app-panels-stats verification surfaces", () => {
       name: /task-1[\s\S]*Inspect workspace changes/,
     });
     expect(todoTaskButton).toBeInTheDocument();
-    const contextPanel = todoTaskButton.closest(".context-panel") as HTMLElement;
+    const contextPanel = todoTaskButton.closest(
+      ".context-panel",
+    ) as HTMLElement;
     await userEvent.click(todoTaskButton);
-    expect(await screen.findByText("README.md diff is visible")).toBeInTheDocument();
-    expect(within(contextPanel).queryByText(/hello world/)).not.toBeInTheDocument();
+    expect(
+      await screen.findByText("README.md diff is visible"),
+    ).toBeInTheDocument();
+    expect(
+      within(contextPanel).queryByText(/hello world/),
+    ).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
     expect(screen.getByText("Source Control")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: /README\.md M/ })).toHaveLength(2);
-    expect(screen.getAllByRole("button", { name: /new-note\.txt U/ })).toHaveLength(2);
-    expect(screen.getAllByRole("button", { name: /asset\.bin M/ }).length).toBeGreaterThan(0);
-    expect(within(contextPanel).queryByText(/hello world/)).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: /README\.md M/ }),
+    ).toHaveLength(2);
+    expect(
+      screen.getAllByRole("button", { name: /new-note\.txt U/ }),
+    ).toHaveLength(2);
+    expect(
+      screen.getAllByRole("button", { name: /asset\.bin M/ }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      within(contextPanel).queryByText(/hello world/),
+    ).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getAllByRole("button", { name: /README\.md M/ })[0]);
+    await userEvent.click(
+      screen.getAllByRole("button", { name: /README\.md M/ })[0],
+    );
 
-    const inlineDiffLine = (await within(contextPanel).findAllByText(/hello world/))[0];
+    const inlineDiffLine = (
+      await within(contextPanel).findAllByText(/hello world/)
+    )[0];
     expect(inlineDiffLine).toBeInTheDocument();
     const inlineDiffScrollRegion = inlineDiffLine.closest(
       ".panel-scroll",
@@ -2576,7 +2881,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(inlineDiffLine.closest(".overflow-y-auto")).toHaveClass(
       "panel-scroll",
     );
-    expect(within(contextPanel).queryByText("Inspect workspace changes")).not.toBeInTheDocument();
+    expect(
+      within(contextPanel).queryByText("Inspect workspace changes"),
+    ).not.toBeInTheDocument();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -2588,12 +2895,18 @@ describe("app-panels-stats verification surfaces", () => {
 
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
-    await userEvent.click(await screen.findByRole("button", { name: /asset\.bin M/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /asset\.bin M/ }),
+    );
 
     expect(
-      await screen.findByText("Inline diff is unavailable for binary or non-text files."),
+      await screen.findByText(
+        "Inline diff is unavailable for binary or non-text files.",
+      ),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Binary files a/asset.bin and b/asset.bin differ")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Binary files a/asset.bin and b/asset.bin differ"),
+    ).not.toBeInTheDocument();
   });
 
   it("deletes memories from the right panel memory tab", async () => {
@@ -2605,8 +2918,12 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Memory" }));
 
-    const globalItem = (await screen.findByText(activeMemory.fact)).closest("article");
-    const workspaceItem = (await screen.findByText(workspaceMemory.fact)).closest("article");
+    const globalItem = (await screen.findByText(activeMemory.fact)).closest(
+      "article",
+    );
+    const workspaceItem = (
+      await screen.findByText(workspaceMemory.fact)
+    ).closest("article");
     expect(globalItem).not.toBeNull();
     expect(workspaceItem).not.toBeNull();
 
@@ -2664,54 +2981,96 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("Session statistics")).toBeInTheDocument();
     expect(screen.getByText("17.6K")).toBeInTheDocument();
     expect(
-      within(screen.getByText("Memory refs").closest(".context-stat-metric")!)
-        .getByText("3"),
+      within(
+        screen.getByText("Memory refs").closest(".context-stat-metric")!,
+      ).getByText("3"),
     ).toBeInTheDocument();
     expect(
-      within(screen.getByText("New memories").closest(".context-stat-metric")!)
-        .getByText("2"),
+      within(
+        screen.getByText("New memories").closest(".context-stat-metric")!,
+      ).getByText("2"),
     ).toBeInTheDocument();
     expect(screen.getByText("+12 / -3")).toBeInTheDocument();
     expect(
-      within(screen.getByText("Model calls").parentElement!).getByText("gpt-test"),
+      within(screen.getByText("Model calls").parentElement!).getByText(
+        "gpt-test",
+      ),
     ).toBeInTheDocument();
-    const toolsSection = screen.getByText("Tools and compression").parentElement!;
+    const toolsSection = screen.getByText(
+      "Tools and compression",
+    ).parentElement!;
     expect(within(toolsSection).getByText("Read")).toBeInTheDocument();
-    expect(within(toolsSection).queryByText("Rule compression snapshots")).not.toBeInTheDocument();
-    expect(within(toolsSection).queryByText("Compression snapshots")).not.toBeInTheDocument();
+    expect(
+      within(toolsSection).queryByText("Rule compression snapshots"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(toolsSection).queryByText("Compression snapshots"),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("Tool history compression")).toBeInTheDocument();
     expect(
-      within(screen.getByText("Tool history compression").parentElement!)
-        .getByText("2"),
+      within(
+        screen.getByText("Tool history compression").parentElement!,
+      ).getByText("2"),
     ).toBeInTheDocument();
     expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     const contextTimeline = screen.getByLabelText("Context usage timeline");
     expect(within(contextTimeline).getByText("47%")).toBeInTheDocument();
-    expect(within(contextTimeline).queryByText("Snapshot 1")).not.toBeInTheDocument();
-    expect(within(contextTimeline).queryByText("Snapshot 2")).not.toBeInTheDocument();
-    expect(within(contextTimeline).queryByText(/llm \/ ctx-/)).not.toBeInTheDocument();
-    expect(within(contextTimeline).queryByText("Past 80%")).not.toBeInTheDocument();
+    expect(
+      within(contextTimeline).queryByText("Snapshot 1"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(contextTimeline).queryByText("Snapshot 2"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(contextTimeline).queryByText(/llm \/ ctx-/),
+    ).not.toBeInTheDocument();
+    expect(
+      within(contextTimeline).queryByText("Past 80%"),
+    ).not.toBeInTheDocument();
     expect(within(contextTimeline).getAllByText("80%")).not.toHaveLength(0);
     expect(within(contextTimeline).getAllByText("95%")).not.toHaveLength(0);
-    const contextLegend = within(contextTimeline).getByLabelText("Context usage legend");
+    const contextLegend = within(contextTimeline).getByLabelText(
+      "Context usage legend",
+    );
     expect(within(contextLegend).getByText("Prompt/tools")).toBeInTheDocument();
     expect(within(contextLegend).getByText("History")).toBeInTheDocument();
-    expect(within(contextLegend).getByText("Compression snapshot")).toBeInTheDocument();
-    expect(within(contextLegend).queryByText("Reserved output")).not.toBeInTheDocument();
-    expect(within(contextTimeline).getAllByLabelText(/Prompt\/tools:/)).not.toHaveLength(0);
-    expect(within(contextTimeline).getAllByLabelText(/History:/)).not.toHaveLength(0);
-    expect(within(contextTimeline).getAllByLabelText(/Compression snapshot:/)).not.toHaveLength(0);
-    expect(within(contextTimeline).queryByLabelText(/Reserved output:/)).not.toBeInTheDocument();
-    expect(contextTimeline.querySelector(".context-usage-history-stack")).not.toBeInTheDocument();
     expect(
-      fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/context-usage"),
+      within(contextLegend).getByText("Compression snapshot"),
+    ).toBeInTheDocument();
+    expect(
+      within(contextLegend).queryByText("Reserved output"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(contextTimeline).getAllByLabelText(/Prompt\/tools:/),
+    ).not.toHaveLength(0);
+    expect(
+      within(contextTimeline).getAllByLabelText(/History:/),
+    ).not.toHaveLength(0);
+    expect(
+      within(contextTimeline).getAllByLabelText(/Compression snapshot:/),
+    ).not.toHaveLength(0);
+    expect(
+      within(contextTimeline).queryByLabelText(/Reserved output:/),
+    ).not.toBeInTheDocument();
+    expect(
+      contextTimeline.querySelector(".context-usage-history-stack"),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => url === "/api/workspaces/workspace-1/context-usage",
+      ),
     ).toBe(true);
   });
 
   it("renders partial active chat statistics and context usage payloads without crashing", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (input, init) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
       const path = url.startsWith("http") ? new URL(url).pathname : url;
       if (path === "/api/workspaces/workspace-1/chats/chat-1/statistics") {
         return jsonResponse({ workspaceId: workspace.id, chatId: "chat-1" });
@@ -2727,28 +3086,45 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
 
     expect(await screen.findByText("Session statistics")).toBeInTheDocument();
-    expect(within(screen.getByText("Total tokens").closest(".context-stat-metric")!).getByText("0"))
-      .toBeInTheDocument();
+    expect(
+      within(
+        screen.getByText("Total tokens").closest(".context-stat-metric")!,
+      ).getByText("0"),
+    ).toBeInTheDocument();
     expect(screen.getByText("+0 / -0")).toBeInTheDocument();
-    expect(within(screen.getByText("Model calls").parentElement!).getByText("No model calls yet."))
-      .toBeInTheDocument();
-    const toolsSection = screen.getByText("Tools and compression").parentElement!;
-    expect(within(toolsSection).getByText("LLM compression snapshots")).toBeInTheDocument();
-    expect(within(toolsSection).getByText("Tool history compression")).toBeInTheDocument();
-    expect(within(toolsSection).getAllByText("0").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("No context usage yet."))
-      .toBeInTheDocument();
+    expect(
+      within(screen.getByText("Model calls").parentElement!).getByText(
+        "No model calls yet.",
+      ),
+    ).toBeInTheDocument();
+    const toolsSection = screen.getByText(
+      "Tools and compression",
+    ).parentElement!;
+    expect(
+      within(toolsSection).getByText("LLM compression snapshots"),
+    ).toBeInTheDocument();
+    expect(
+      within(toolsSection).getByText("Tool history compression"),
+    ).toBeInTheDocument();
+    expect(
+      within(toolsSection).getAllByText("0").length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("No context usage yet.")).toBeInTheDocument();
   });
-
 
   it("shows context usage only once in the stats context mix", async () => {
     const user = userEvent.setup();
     renderApp();
 
     await user.click(await screen.findByText("Tool run"));
-    await user.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -2765,7 +3141,9 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(await screen.findByRole("tab", { name: "Stats" }));
 
     const contextMix = screen.getByText("Context mix").parentElement!;
-    expect(within(contextMix).queryByText("52,340 / 110,960")).not.toBeInTheDocument();
+    expect(
+      within(contextMix).queryByText("52,340 / 110,960"),
+    ).not.toBeInTheDocument();
     expect(contextMix.querySelector(".context-mini-chart-bars")).not.toBeNull();
     expect(contextMix.querySelector(".context-stats-rows")).toBeNull();
     expect(within(contextMix).getAllByText("History")).toHaveLength(1);
@@ -2792,7 +3170,9 @@ describe("app-panels-stats verification surfaces", () => {
       "edit the file",
     );
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -2812,16 +3192,23 @@ describe("app-panels-stats verification surfaces", () => {
   it("single-flights duplicate active chat statistics refreshes", async () => {
     const user = userEvent.setup();
     let nowMs = 0;
-    const performanceNowSpy = vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+    const performanceNowSpy = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => nowMs);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Stats" }));
     expect(await screen.findByText("Session statistics")).toBeInTheDocument();
     nowMs = 1000;
-    await user.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "save memory");
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "save memory",
+    );
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockClear();
@@ -2853,8 +3240,10 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findByText("Saved.");
     const statisticsRequests = fetchMock.mock.calls.filter(([input]) => {
       const rawUrl = typeof input === "string" ? input : input.toString();
-      return new URL(rawUrl, "http://127.0.0.1").pathname ===
-        "/api/workspaces/workspace-1/chats/chat-1/statistics";
+      return (
+        new URL(rawUrl, "http://127.0.0.1").pathname ===
+        "/api/workspaces/workspace-1/chats/chat-1/statistics"
+      );
     });
     expect(statisticsRequests).toHaveLength(1);
 
@@ -2866,7 +3255,10 @@ describe("app-panels-stats verification surfaces", () => {
 
   it("aborts active streams and chat message loads on app unmount", async () => {
     const user = userEvent.setup();
-    const observedSignals: { loading: AbortSignal | null; stream: AbortSignal | null } = {
+    const observedSignals: {
+      loading: AbortSignal | null;
+      stream: AbortSignal | null;
+    } = {
       loading: null,
       stream: null,
     };
@@ -2881,12 +3273,17 @@ describe("app-panels-stats verification surfaces", () => {
         return new Promise<Response>((_, reject) => {
           const signal = init?.signal;
           if (signal?.aborted) {
-            reject(new DOMException("The operation was aborted.", "AbortError"));
+            reject(
+              new DOMException("The operation was aborted.", "AbortError"),
+            );
             return;
           }
           signal?.addEventListener(
             "abort",
-            () => reject(new DOMException("The operation was aborted.", "AbortError")),
+            () =>
+              reject(
+                new DOMException("The operation was aborted.", "AbortError"),
+              ),
             { once: true },
           );
         });
@@ -2896,7 +3293,10 @@ describe("app-panels-stats verification surfaces", () => {
 
     const { unmount } = renderApp();
     await user.click(await screen.findByText("Tool run"));
-    await user.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await user.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(observedSignals.stream).not.toBeNull());
     await user.click(await screen.findByText("Second chat"));
@@ -2945,41 +3345,48 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
-        return jsonResponse({
-          ...todoGraph,
-          tasks: [
-            ...todoGraph.tasks,
-            {
-              acceptance: [],
-              createdAt: "2026-06-05T10:06:00Z",
-              dependsOn: [],
-              id: "task-2",
-              status: "pending",
-              subtasks: [],
-              summary: "",
-              title: "Wait for next step",
-              updatedAt: "2026-06-05T10:06:00Z",
-            },
-          ],
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
+          return jsonResponse({
+            ...todoGraph,
+            tasks: [
+              ...todoGraph.tasks,
+              {
+                acceptance: [],
+                createdAt: "2026-06-05T10:06:00Z",
+                dependsOn: [],
+                id: "task-2",
+                status: "pending",
+                subtasks: [],
+                summary: "",
+                title: "Wait for next step",
+                updatedAt: "2026-06-05T10:06:00Z",
+              },
+            ],
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
-    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "plan",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     await act(async () => {
       await Promise.resolve();
     });
@@ -2995,10 +3402,21 @@ describe("app-panels-stats verification surfaces", () => {
     const todoGraphHeading = await screen.findByText("ToDo graph");
     const todoPanel = todoGraphHeading.closest(".context-panel") as HTMLElement;
     expect(todoGraphHeading).toBeInTheDocument();
-    expect(within(todoPanel).getByText("Inspect workspace changes")).toBeInTheDocument();
-    expect(within(todoPanel).getByText("running")).toHaveClass("bg-amber-100", "text-amber-800");
-    expect(within(todoPanel).getByText("completed")).toHaveClass("bg-emerald-100", "text-emerald-800");
-    expect(within(todoPanel).getByText("pending")).toHaveClass("bg-stone-100", "text-stone-600");
+    expect(
+      within(todoPanel).getByText("Inspect workspace changes"),
+    ).toBeInTheDocument();
+    expect(within(todoPanel).getByText("running")).toHaveClass(
+      "bg-amber-100",
+      "text-amber-800",
+    );
+    expect(within(todoPanel).getByText("completed")).toHaveClass(
+      "bg-emerald-100",
+      "text-emerald-800",
+    );
+    expect(within(todoPanel).getByText("pending")).toHaveClass(
+      "bg-stone-100",
+      "text-stone-600",
+    );
     expect(within(todoPanel).queryByText("Git diff")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -3029,7 +3447,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     renderApp();
 
-    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Please inspect README."),
+    ).toBeInTheDocument();
     await waitFor(() => expect(todoGraphRequests).toHaveLength(1));
 
     await userEvent.type(
@@ -3037,7 +3457,9 @@ describe("app-panels-stats verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     await act(async () => {
       await Promise.resolve();
     });
@@ -3058,7 +3480,9 @@ describe("app-panels-stats verification surfaces", () => {
       todoGraphRequests[1].resolve(jsonResponse(todoGraph));
     });
 
-    expect(await screen.findByText("Inspect workspace changes")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Inspect workspace changes"),
+    ).toBeInTheDocument();
     expect(screen.queryByText("Failed to fetch")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -3069,7 +3493,9 @@ describe("app-panels-stats verification surfaces", () => {
   it("shows the active workspace identity in the empty chat area", async () => {
     renderApp();
 
-    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: workspace.name }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Workspace")).toBeInTheDocument();
     const workspaceLogo = document.querySelector(
       `.api-overview-panel img[src="${workspace.logoUrl}"]`,
@@ -3086,10 +3512,16 @@ describe("app-panels-stats verification surfaces", () => {
   it("shows AI statistics and request details", async () => {
     renderApp();
 
-    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
-    expect(screen.queryByText("Workspace shell is ready")).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: workspace.name }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Workspace shell is ready"),
+    ).not.toBeInTheDocument();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
 
     expect(await screen.findByText("API details")).toBeInTheDocument();
     await waitFor(() =>
@@ -3099,7 +3531,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("Total tokens")).toBeInTheDocument();
     expect(screen.getByText("Average latency")).toBeInTheDocument();
     expect(screen.getByText("Failed requests")).toBeInTheDocument();
-    expect(await screen.findByText("Requests and tokens trend")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Requests and tokens trend"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Model distribution")).toBeInTheDocument();
     expect(screen.getByText("Channel distribution")).toBeInTheDocument();
     expect(screen.getByText("Channel quality")).toBeInTheDocument();
@@ -3119,18 +3553,24 @@ describe("app-panels-stats verification surfaces", () => {
     );
     const table = screen.getByRole("table");
     const requestTimeCell = table.querySelector("tbody tr td");
-    const requestTimeLines = requestTimeCell?.querySelectorAll("div.space-y-1 > div");
+    const requestTimeLines = requestTimeCell?.querySelectorAll(
+      "div.space-y-1 > div",
+    );
     expect(requestTimeLines).toHaveLength(2);
     expect(requestTimeLines?.[0].textContent).toContain("2026");
     const tableScroller = table.parentElement;
-    const statsScroller = table.closest(".overflow-y-auto") as HTMLElement | null;
+    const statsScroller = table.closest(
+      ".overflow-y-auto",
+    ) as HTMLElement | null;
     expect(tableScroller).toHaveClass("panel-scroll");
     expect(tableScroller).toHaveClass("overflow-x-auto");
     expect(tableScroller).toHaveClass("overflow-y-hidden");
     expect(tableScroller).not.toHaveClass("overflow-auto");
     expect(statsScroller).toHaveClass("panel-scroll");
     if (!tableScroller || !statsScroller) {
-      throw new Error("Expected request audit table to live inside stats scroller");
+      throw new Error(
+        "Expected request audit table to live inside stats scroller",
+      );
     }
     statsScroller.style.overflowY = "auto";
     Object.defineProperties(statsScroller, {
@@ -3138,7 +3578,9 @@ describe("app-panels-stats verification surfaces", () => {
       scrollHeight: { configurable: true, value: 960 },
     });
     statsScroller.scrollTop = 0;
-    fireEvent.touchStart(tableScroller, { touches: [{ clientX: 20, clientY: 140 }] });
+    fireEvent.touchStart(tableScroller, {
+      touches: [{ clientX: 20, clientY: 140 }],
+    });
     const verticalTouchMove = new Event("touchmove", {
       bubbles: true,
       cancelable: true,
@@ -3154,17 +3596,27 @@ describe("app-panels-stats verification surfaces", () => {
       expect(within(table).getByText("OpenAI")).toBeInTheDocument(),
     );
     expect(within(table).getByText("GPT Test")).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "Request audit pagination" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Go to page 2" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("navigation", { name: "Request audit pagination" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Go to page 2" }),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Page size")).toHaveValue(20);
 
     await userEvent.click(screen.getByText("Columns"));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Provider / model" }));
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: "Provider / model" }),
+    );
     expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "View request details" }),
+    );
 
-    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Request details",
+    });
     expect(within(dialog).getByText("Request body")).toBeInTheDocument();
     expect(within(dialog).getByText("Response body")).toBeInTheDocument();
     const requestBodyBlock = within(dialog)
@@ -3181,7 +3633,9 @@ describe("app-panels-stats verification surfaces", () => {
         name: "Collapse all Request body",
       }),
     );
-    expect(within(requestBodyViewer).queryByText('"messages"')).not.toBeInTheDocument();
+    expect(
+      within(requestBodyViewer).queryByText('"messages"'),
+    ).not.toBeInTheDocument();
     await userEvent.click(
       within(requestBodyViewer).getByRole("button", {
         name: "Expand all Request body",
@@ -3212,18 +3666,22 @@ describe("app-panels-stats verification surfaces", () => {
       const path = new URL(rawPath, "http://localhost").pathname;
 
       if (path === "/api/ai-statistics") {
-        return Promise.resolve(jsonResponse({
-          ...aiStatistics,
-          totalCount: 24680,
-          totalPages: 1234,
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            totalCount: 24680,
+            totalPages: 1234,
+          }),
+        );
       }
 
       return Promise.resolve(mockFetch(input, init));
     });
 
     renderApp();
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
 
     const lastPageButton = await screen.findByRole("button", {
       name: "Go to page 1,234",
@@ -3251,20 +3709,24 @@ describe("app-panels-stats verification surfaces", () => {
       const path = new URL(rawPath, "http://localhost").pathname;
 
       if (path === "/api/ai-statistics") {
-        return Promise.resolve(jsonResponse({
-          ...aiStatistics,
-          page: 1,
-          requests,
-          totalCount: requests.length,
-          totalPages: 1,
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            page: 1,
+            requests,
+            totalCount: requests.length,
+            totalPages: 1,
+          }),
+        );
       }
 
       return Promise.resolve(mockFetch(input, init));
     });
 
     renderApp();
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
     const table = await screen.findByRole("table");
 
     expect(within(table).getByText("succeeded")).toHaveClass(
@@ -3285,6 +3747,81 @@ describe("app-panels-stats verification surfaces", () => {
     );
   });
 
+  it("forwards vertical request audit wheel input with a non-passive listener", async () => {
+    const addEventListenerSpy = vi.spyOn(
+      HTMLElement.prototype,
+      "addEventListener",
+    );
+    const removeEventListenerSpy = vi.spyOn(
+      HTMLElement.prototype,
+      "removeEventListener",
+    );
+    window.history.replaceState(null, "", "/stats?page=1");
+
+    const { unmount } = renderApp();
+
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+    const table = await screen.findByRole("table");
+    const tableScroller = table.parentElement;
+    const statsScroller = table.closest(
+      ".overflow-y-auto",
+    ) as HTMLElement | null;
+    if (!tableScroller || !statsScroller) {
+      throw new Error(
+        "Expected request audit table to live inside stats scroller",
+      );
+    }
+
+    const wheelRegistrationIndex = addEventListenerSpy.mock.calls.findIndex(
+      ([type], index) =>
+        type === "wheel" &&
+        addEventListenerSpy.mock.instances[index] === tableScroller,
+    );
+    expect(wheelRegistrationIndex).toBeGreaterThanOrEqual(0);
+    const wheelRegistration =
+      addEventListenerSpy.mock.calls[wheelRegistrationIndex];
+    expect(wheelRegistration[2]).toEqual({ passive: false });
+
+    statsScroller.style.overflowY = "auto";
+    Object.defineProperties(statsScroller, {
+      clientHeight: { configurable: true, value: 360 },
+      scrollHeight: { configurable: true, value: 960 },
+    });
+    statsScroller.scrollTop = 10;
+
+    const verticalWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaMode: WheelEvent.DOM_DELTA_LINE,
+      deltaX: 2,
+      deltaY: 3,
+    });
+    tableScroller.dispatchEvent(verticalWheel);
+    expect(statsScroller.scrollTop).toBe(58);
+    expect(verticalWheel.defaultPrevented).toBe(true);
+
+    const horizontalWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaX: 20,
+      deltaY: 5,
+    });
+    tableScroller.dispatchEvent(horizontalWheel);
+    expect(statsScroller.scrollTop).toBe(58);
+    expect(horizontalWheel.defaultPrevented).toBe(false);
+
+    const wheelListener = wheelRegistration[1];
+    unmount();
+    expect(
+      removeEventListenerSpy.mock.calls.some(
+        ([type, listener], index) =>
+          type === "wheel" &&
+          listener === wheelListener &&
+          removeEventListenerSpy.mock.instances[index] === tableScroller,
+      ),
+    ).toBe(true);
+  });
+
   it("loads API details from the stats URL page", async () => {
     window.history.replaceState(null, "", "/stats?page=2");
 
@@ -3300,10 +3837,9 @@ describe("app-panels-stats verification surfaces", () => {
         ),
       ).toBe(true),
     );
-    expect(screen.getByRole("button", { name: "Go to page 2" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
+    expect(
+      screen.getByRole("button", { name: "Go to page 2" }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("waits to load API details while the page is hidden", async () => {
@@ -3336,7 +3872,9 @@ describe("app-panels-stats verification surfaces", () => {
   it("updates the stats URL when request audit pagination changes", async () => {
     renderApp();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
     expect(await screen.findByText("API details")).toBeInTheDocument();
     await waitFor(() =>
       expect(window.location.pathname + window.location.search).toBe(
@@ -3353,7 +3891,9 @@ describe("app-panels-stats verification surfaces", () => {
     );
     await waitFor(() =>
       expect(
-        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "2"),
+        aiStatisticsCallUrls().some(
+          (url) => url.searchParams.get("page") === "2",
+        ),
       ).toBe(true),
     );
   });
@@ -3366,14 +3906,15 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("API details")).toBeInTheDocument();
     await waitFor(() =>
       expect(
-        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "1"),
+        aiStatisticsCallUrls().some(
+          (url) => url.searchParams.get("page") === "1",
+        ),
       ).toBe(true),
     );
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Go to page 1" })).toHaveAttribute(
-        "aria-current",
-        "page",
-      ),
+      expect(
+        screen.getByRole("button", { name: "Go to page 1" }),
+      ).toHaveAttribute("aria-current", "page"),
     );
 
     await act(async () => {
@@ -3383,13 +3924,14 @@ describe("app-panels-stats verification surfaces", () => {
 
     await waitFor(() =>
       expect(
-        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "3"),
+        aiStatisticsCallUrls().some(
+          (url) => url.searchParams.get("page") === "3",
+        ),
       ).toBe(true),
     );
-    expect(screen.getByRole("button", { name: "Go to page 3" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
+    expect(
+      screen.getByRole("button", { name: "Go to page 3" }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("localizes running status in API request details", async () => {
@@ -3404,35 +3946,41 @@ describe("app-panels-stats verification surfaces", () => {
       const path = new URL(rawPath, "http://localhost").pathname;
 
       if (path === "/api/settings") {
-        return Promise.resolve(jsonResponse({
-          ...settings,
-          general: {
-            ...settings.general,
-            language: "zh-CN",
-          },
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...settings,
+            general: {
+              ...settings.general,
+              language: "zh-CN",
+            },
+          }),
+        );
       }
 
       if (path === "/api/ai-statistics") {
-        return Promise.resolve(jsonResponse({
-          ...aiStatistics,
-          requests: [
-            {
-              ...aiStatistics.requests[0],
-              finalState: "running",
-            },
-          ],
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            requests: [
+              {
+                ...aiStatistics.requests[0],
+                finalState: "running",
+              },
+            ],
+          }),
+        );
       }
 
       if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
-        return Promise.resolve(jsonResponse({
-          ...aiStatisticsDetail,
-          request: {
-            ...aiStatisticsDetail.request,
-            finalState: "running",
-          },
-        }));
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              finalState: "running",
+            },
+          }),
+        );
       }
 
       return Promise.resolve(mockFetch(input, init));
@@ -3440,7 +3988,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     renderApp();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API 详情" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API 详情" }))[0],
+    );
     const table = await screen.findByRole("table");
     expect(within(table).getByText("运行中")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "查看请求详情" }));
@@ -3453,12 +4003,16 @@ describe("app-panels-stats verification surfaces", () => {
   it("loads saved API request audit column settings", async () => {
     const { unmount } = renderApp();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
     const table = await screen.findByRole("table");
     expect(within(table).getByText("OpenAI")).toBeInTheDocument();
 
     await userEvent.click(screen.getByText("Columns"));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Provider / model" }));
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: "Provider / model" }),
+    );
     expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
     await waitFor(() => {
       const savedColumns = JSON.parse(
@@ -3471,13 +4025,16 @@ describe("app-panels-stats verification surfaces", () => {
     window.history.replaceState(null, "", "/");
     renderApp();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
     const reloadedTable = await screen.findByRole("table");
     expect(within(reloadedTable).queryByText("OpenAI")).not.toBeInTheDocument();
     await userEvent.click(screen.getByText("Columns"));
-    expect(screen.getByRole("checkbox", { name: "Provider / model" })).not.toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: "Provider / model" }),
+    ).not.toBeChecked();
   });
-
 
   it("lazy loads workspace file tree children on demand", async () => {
     const fetchMock = vi.mocked(fetch);
@@ -3493,13 +4050,17 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("pages")).toBeInTheDocument();
 
     expect(
-      fetchMock.mock.calls.some((call) => String(call[0]).includes("/files/children")),
+      fetchMock.mock.calls.some((call) =>
+        String(call[0]).includes("/files/children"),
+      ),
     ).toBe(false);
 
     const pagesRow = screen.getByText("pages").closest("div[role='treeitem']");
     expect(pagesRow).not.toBeNull();
     await userEvent.click(
-      within(pagesRow as HTMLElement).getByRole("button", { name: "Expand folder" }),
+      within(pagesRow as HTMLElement).getByRole("button", {
+        name: "Expand folder",
+      }),
     );
 
     await waitFor(() =>
@@ -3520,10 +4081,9 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByText("main.ts"));
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
-    expect(within(tabList).getByRole("tab", { name: /main.ts/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(
+      within(tabList).getByRole("tab", { name: /main.ts/ }),
+    ).toHaveAttribute("aria-selected", "true");
     expect(new URLSearchParams(window.location.search).getAll("file")).toEqual([
       "workspace-1/src%2Fmain.ts",
     ]);
@@ -3535,12 +4095,13 @@ describe("app-panels-stats verification surfaces", () => {
     unmount();
     renderApp();
 
-    const restoredTabList = await screen.findByRole("tablist", { name: "Chat" });
+    const restoredTabList = await screen.findByRole("tablist", {
+      name: "Chat",
+    });
     await waitFor(() =>
-      expect(within(restoredTabList).getByRole("tab", { name: /main.ts/ })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(
+        within(restoredTabList).getByRole("tab", { name: /main.ts/ }),
+      ).toHaveAttribute("aria-selected", "true"),
     );
     await waitFor(() =>
       expect(
@@ -3568,17 +4129,20 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(await screen.findByText("logo.png"));
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
-    expect(within(tabList).getByRole("tab", { name: /logo\.png/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(screen.queryByRole("toolbar", { name: "Editor toolbar" })).not.toBeInTheDocument();
+    expect(
+      within(tabList).getByRole("tab", { name: /logo\.png/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByRole("toolbar", { name: "Editor toolbar" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("img", { name: "logo.png" })).toHaveAttribute(
       "src",
       "/api/workspaces/workspace-1/files/blob?path=assets%2Flogo.png",
     );
     expect(
-      fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/files/content"),
+      fetchMock.mock.calls.some(
+        ([url]) => url === "/api/workspaces/workspace-1/files/content",
+      ),
     ).toBe(false);
   });
 
@@ -3588,13 +4152,19 @@ describe("app-panels-stats verification surfaces", () => {
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
 
-    const componentsRow = screen.getByText("components").closest("div[role='treeitem']");
+    const componentsRow = screen
+      .getByText("components")
+      .closest("div[role='treeitem']");
     expect(componentsRow).not.toBeNull();
     await userEvent.click(
-      within(componentsRow as HTMLElement).getByRole("button", { name: "Expand folder" }),
+      within(componentsRow as HTMLElement).getByRole("button", {
+        name: "Expand folder",
+      }),
     );
 
-    const fileRow = (await screen.findByText("button.tsx")).closest("div[role='treeitem']");
+    const fileRow = (await screen.findByText("button.tsx")).closest(
+      "div[role='treeitem']",
+    );
     expect(fileRow).not.toBeNull();
 
     fireEvent.contextMenu(fileRow as HTMLElement);
@@ -3607,25 +4177,39 @@ describe("app-panels-stats verification surfaces", () => {
       "Copy relative path",
       "Copy absolute path",
     ]) {
-      expect(within(menu).getByRole("menuitem", { name: item })).toBeInTheDocument();
+      expect(
+        within(menu).getByRole("menuitem", { name: item }),
+      ).toBeInTheDocument();
     }
 
-    await userEvent.click(within(menu).getByRole("menuitem", { name: "Copy file name" }));
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("button.tsx");
-
-    fireEvent.contextMenu(fileRow as HTMLElement);
     await userEvent.click(
-      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole("menuitem", {
-        name: "Copy relative path",
-      }),
+      within(menu).getByRole("menuitem", { name: "Copy file name" }),
     );
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("src/components/button.tsx");
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      "button.tsx",
+    );
 
     fireEvent.contextMenu(fileRow as HTMLElement);
     await userEvent.click(
-      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole("menuitem", {
-        name: "Copy absolute path",
-      }),
+      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole(
+        "menuitem",
+        {
+          name: "Copy relative path",
+        },
+      ),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      "src/components/button.tsx",
+    );
+
+    fireEvent.contextMenu(fileRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole(
+        "menuitem",
+        {
+          name: "Copy absolute path",
+        },
+      ),
     );
     expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
       `${workspace.path}\\src\\components\\button.tsx`,
@@ -3644,7 +4228,9 @@ describe("app-panels-stats verification surfaces", () => {
     });
     expect(previewButton).not.toHaveAttribute("aria-pressed");
     expect(previewButton.querySelector(".lucide-eye")).toBeInTheDocument();
-    expect(previewButton.querySelector(".lucide-eye-off")).not.toBeInTheDocument();
+    expect(
+      previewButton.querySelector(".lucide-eye-off"),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();
@@ -3658,9 +4244,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(editButton).toHaveAttribute("aria-pressed", "true");
     expect(editButton.querySelector(".lucide-eye-off")).toBeInTheDocument();
     expect(editButton.querySelector(".lucide-eye")).not.toBeInTheDocument();
-    expect(
-      screen.queryByText(/<\/?div/i),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/<\/?div/i)).not.toBeInTheDocument();
     expect(screen.getByRole("img", { name: "Foco" })).toHaveAttribute(
       "src",
       "/api/workspaces/workspace-1/files/blob?path=foco.svg",
@@ -3696,7 +4280,9 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
     await userEvent.click(await screen.findByText("README.md"));
 
-    const toolbar = await screen.findByRole("toolbar", { name: "Editor toolbar" });
+    const toolbar = await screen.findByRole("toolbar", {
+      name: "Editor toolbar",
+    });
     const toolbarButtons = within(toolbar).getAllByRole("button");
     expect(toolbarButtons[0]).toHaveAccessibleName("Reload file");
 
@@ -3714,5 +4300,4 @@ describe("app-panels-stats verification surfaces", () => {
       ).toHaveLength(contentRequestCount + 1);
     });
   });
-
 });

@@ -25,6 +25,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -102,6 +103,7 @@ export function ApiStatsPanel({
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
+  const auditTableScrollRef = useRef<HTMLDivElement>(null);
   const requests = stats?.requests ?? [];
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const totalCount = stats?.totalCount ?? summary.totalRequests;
@@ -115,7 +117,8 @@ export function ApiStatsPanel({
     ? Math.min(totalCount, pageStart + requests.length - 1)
     : 0;
   const selectedWorkspace =
-    workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
+    workspaces.find((workspace) => workspace.id === filters.workspaceId) ??
+    null;
   const providerLabels = useMemo(
     () =>
       new Map(
@@ -169,7 +172,10 @@ export function ApiStatsPanel({
 
     return [
       {
-        displayXValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
+        displayXValue: formatNullableLatencySeconds(
+          item.averageLatencyMs,
+          language,
+        ),
         displayYValue: formatPercent(item.successRate, language),
         id: item.providerId,
         label: providerLabels.get(item.providerId) ?? item.providerId,
@@ -178,15 +184,16 @@ export function ApiStatsPanel({
       },
     ];
   });
-  const chatOptions = (selectedWorkspace ? [selectedWorkspace] : workspaces)
-    .flatMap((workspace) =>
-      workspace.chats.map((chat) => ({
-        label: selectedWorkspace
-          ? chat.title
-          : `${workspace.name} / ${chat.title}`,
-        value: chat.id,
-      })),
-    );
+  const chatOptions = (
+    selectedWorkspace ? [selectedWorkspace] : workspaces
+  ).flatMap((workspace) =>
+    workspace.chats.map((chat) => ({
+      label: selectedWorkspace
+        ? chat.title
+        : `${workspace.name} / ${chat.title}`,
+      value: chat.id,
+    })),
+  );
   const providerOptions = auditOptions(
     settings?.providers.map((provider) => ({
       label: provider.name,
@@ -204,10 +211,12 @@ export function ApiStatsPanel({
     requests.map((request) => request.modelId),
   );
   const statusOptions = auditOptions(
-    ["succeeded", "failed", "running", "cancelled", "completed"].map((status) => ({
-      label: auditStatusText(status, t),
-      value: status,
-    })),
+    ["succeeded", "failed", "running", "cancelled", "completed"].map(
+      (status) => ({
+        label: auditStatusText(status, t),
+        value: status,
+      }),
+    ),
     requests.map((request) => request.finalState),
     (status) => auditStatusText(status, t),
   );
@@ -290,7 +299,8 @@ export function ApiStatsPanel({
             {formatNullableCompactNumber(request.cacheWriteTokens, language)})
           </div>
           <div className="text-xs text-stone-500">
-            {t("Reasoning")}: {formatNullableCompactNumber(request.reasoningTokens, language)}
+            {t("Reasoning")}:{" "}
+            {formatNullableCompactNumber(request.reasoningTokens, language)}
           </div>
         </div>
       ),
@@ -303,7 +313,10 @@ export function ApiStatsPanel({
       render: (request) => (
         <div className="space-y-1">
           <div className="text-stone-900">
-            {formatNullableLatencySeconds(request.firstTokenLatencyMs, language)}
+            {formatNullableLatencySeconds(
+              request.firstTokenLatencyMs,
+              language,
+            )}
           </div>
           <div className="text-xs text-stone-500">
             {formatNullableLatencySeconds(request.totalLatencyMs, language)}
@@ -386,6 +399,37 @@ export function ApiStatsPanel({
     setAuditPage(routePage);
   }, [routePage, setAuditPage]);
 
+  useEffect(() => {
+    const tableScroller = auditTableScrollRef.current;
+    if (!tableScroller) {
+      return;
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      // Keep desktop trackpad/wheel vertical motion flowing to the page
+      // scroller while horizontal table swipes stay native.
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
+        return;
+      }
+      const deltaUnit =
+        event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? 16
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? tableScroller.clientHeight
+            : 1;
+      const node = findVerticalScrollAncestor(tableScroller.parentElement);
+      if (node) {
+        node.scrollTop += event.deltaY * deltaUnit;
+        event.preventDefault();
+      }
+    };
+
+    tableScroller.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      tableScroller.removeEventListener("wheel", handleWheel);
+    };
+  }, []);
+
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
@@ -401,7 +445,7 @@ export function ApiStatsPanel({
                 </h2>
                 <p className="mt-1 truncate text-xs font-medium text-stone-500">
                   {filters.workspaceId
-                    ? selectedWorkspace?.name ?? filters.workspaceId
+                    ? (selectedWorkspace?.name ?? filters.workspaceId)
                     : t("All workspaces")}
                 </p>
               </div>
@@ -518,7 +562,10 @@ export function ApiStatsPanel({
           <StatsCard
             icon={SlidersHorizontal}
             label={t("Average latency")}
-            value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
+            value={formatNullableLatencySeconds(
+              summary.averageLatencyMs,
+              language,
+            )}
           />
           <StatsCard
             icon={CircleAlert}
@@ -538,7 +585,9 @@ export function ApiStatsPanel({
                 data={trendData}
                 primaryFormatter={(value) => formatNumber(value, language)}
                 primaryLabel={t("Requests")}
-                secondaryFormatter={(value) => formatCompactNumber(value, language)}
+                secondaryFormatter={(value) =>
+                  formatCompactNumber(value, language)
+                }
                 secondaryLabel={t("Tokens")}
                 title={t("Requests and tokens trend")}
               />
@@ -563,7 +612,9 @@ export function ApiStatsPanel({
               <ScatterChartCard
                 data={providerQualityData}
                 title={t("Channel quality")}
-                xFormatter={(value) => formatNullableLatencySeconds(value, language)}
+                xFormatter={(value) =>
+                  formatNullableLatencySeconds(value, language)
+                }
                 xLabel={t("Response time")}
                 yFormatter={(value) => formatPercent(value, language)}
                 yLabel={t("Success rate")}
@@ -620,34 +671,16 @@ export function ApiStatsPanel({
 
           <div
             className="api-stats-audit-table-scroll panel-scroll min-w-0 overflow-x-auto overflow-y-hidden"
-            onWheel={(event) => {
-              // Keep desktop trackpad/wheel vertical motion flowing to the
-              // page scroller while horizontal table swipes stay native.
-              if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
-                return;
-              }
-              const deltaUnit =
-                event.deltaMode === 1
-                  ? 16
-                  : event.deltaMode === 2
-                    ? event.currentTarget.clientHeight
-                    : 1;
-              const node = findVerticalScrollAncestor(
-                event.currentTarget.parentElement,
-              );
-              if (node) {
-                node.scrollTop += event.deltaY * deltaUnit;
-                event.preventDefault();
-              }
-            }}
+            ref={auditTableScrollRef}
           >
             <table className="w-full min-w-max text-left text-sm">
               <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
                 <tr>
                   {visibleColumns.map((column) => (
                     <th
-                      className={`whitespace-nowrap px-4 py-3 ${column.headerClassName ?? ""
-                        }`}
+                      className={`whitespace-nowrap px-4 py-3 ${
+                        column.headerClassName ?? ""
+                      }`}
                       key={column.id}
                     >
                       {column.label}
@@ -658,7 +691,10 @@ export function ApiStatsPanel({
               <tbody className="divide-y divide-stone-100">
                 {requests.length ? (
                   requests.map((request) => (
-                    <tr key={request.id} className="align-top hover:bg-teal-50/40">
+                    <tr
+                      key={request.id}
+                      className="align-top hover:bg-teal-50/40"
+                    >
                       {visibleColumns.map((column) => (
                         <td
                           className={`whitespace-nowrap ${column.cellClassName}`}
@@ -733,10 +769,11 @@ export function ApiStatsPanel({
                       aria-label={t("Go to page {page}", {
                         page: formatNumber(item, language),
                       })}
-                      className={`inline-flex h-9 min-w-9 items-center justify-center rounded-lg border px-2 text-sm font-semibold shadow-sm ${item === currentPage
+                      className={`inline-flex h-9 min-w-9 items-center justify-center rounded-lg border px-2 text-sm font-semibold shadow-sm ${
+                        item === currentPage
                           ? "border-teal-700 bg-teal-700 text-white"
                           : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                        }`}
+                      }`}
                       disabled={isLoading}
                       key={item}
                       onClick={() => goToAuditPage(item)}
@@ -878,14 +915,20 @@ function AiRequestDetailDialog({
           ) : null}
           {isLoading ? (
             <div className="flex items-center gap-2 py-8 text-sm text-stone-500">
-              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              <LoaderCircle
+                aria-hidden="true"
+                className="size-4 animate-spin"
+              />
               {t("Loading...")}
             </div>
           ) : null}
           {request ? (
             <div className="grid gap-4">
               <div className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3 md:grid-cols-2 xl:grid-cols-4">
-                <AuditMeta label={t("Workspace")} value={request.workspaceName} />
+                <AuditMeta
+                  label={t("Workspace")}
+                  value={request.workspaceName}
+                />
                 <AuditMeta
                   label={t("Chat")}
                   value={request.chatTitle ?? request.chatId ?? "n/a"}
@@ -1283,10 +1326,9 @@ function JsonTreeNode({
         collapsedPaths={collapsedPaths}
         closeToken="]"
         depth={depth}
-        entries={value.map((item, index) => [String(index), item] as [
-          string,
-          JsonValue,
-        ])}
+        entries={value.map(
+          (item, index) => [String(index), item] as [string, JsonValue],
+        )}
         isLast={isLast}
         name={name}
         onToggle={onToggle}
@@ -1397,17 +1439,17 @@ function JsonContainerNode({
       {isCollapsed
         ? null
         : entries.map(([entryName, entryValue], index) => (
-          <JsonTreeNode
-            collapsedPaths={collapsedPaths}
-            depth={depth + 1}
-            isLast={index === entries.length - 1}
-            key={jsonChildPath(path, entryName)}
-            name={valueKind === "object" ? entryName : undefined}
-            onToggle={onToggle}
-            path={jsonChildPath(path, entryName)}
-            value={entryValue}
-          />
-        ))}
+            <JsonTreeNode
+              collapsedPaths={collapsedPaths}
+              depth={depth + 1}
+              isLast={index === entries.length - 1}
+              key={jsonChildPath(path, entryName)}
+              name={valueKind === "object" ? entryName : undefined}
+              onToggle={onToggle}
+              path={jsonChildPath(path, entryName)}
+              value={entryValue}
+            />
+          ))}
       {isCollapsed ? null : (
         <JsonLine depth={depth}>
           <JsonTogglePlaceholder />
@@ -1419,13 +1461,7 @@ function JsonContainerNode({
   );
 }
 
-function JsonLine({
-  children,
-  depth,
-}: {
-  children: ReactNode;
-  depth: number;
-}) {
+function JsonLine({ children, depth }: { children: ReactNode; depth: number }) {
   return (
     <span
       className="audit-json-line"
@@ -1495,7 +1531,9 @@ function collectJsonContainerPaths(value: JsonValue | null, path: string) {
       paths.push(path);
     }
     value.forEach((item, index) => {
-      paths.push(...collectJsonContainerPaths(item, jsonChildPath(path, index)));
+      paths.push(
+        ...collectJsonContainerPaths(item, jsonChildPath(path, index)),
+      );
     });
     return paths;
   }
