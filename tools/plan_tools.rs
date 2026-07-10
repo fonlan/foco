@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use foco_store::workspace::{
-    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanRecord, PlanStepPatch,
-    WorkspaceDatabase,
+    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanListOrder, PlanPatch, PlanRecord,
+    PlanStepPatch, WorkspaceDatabase,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -87,8 +87,8 @@ pub(crate) fn get_plans(
     let page_size = request
         .page_size
         .or(request.limit)
-        .unwrap_or(20)
-        .clamp(1, 100);
+        .unwrap_or(10)
+        .clamp(1, 10);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let database = open_plan_database(workspace_path)?;
     let page_record = database.plans(PlanListFilter {
@@ -98,6 +98,7 @@ pub(crate) fn get_plans(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty()),
+        order: PlanListOrder::NewestFirst,
         limit: page_size,
         offset,
     })?;

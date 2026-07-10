@@ -3,8 +3,9 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
 };
 use foco_store::workspace::{
-    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanPatch, PlanPhaseAttemptRecord,
-    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
+    NewPlan, NewPlanPhase, NewPlanStep, PlanListFilter, PlanListOrder, PlanPatch,
+    PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -277,6 +278,7 @@ pub(crate) async fn plans(
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
+            order: PlanListOrder::Manual,
             limit: page_size,
             offset,
         })
@@ -306,6 +308,7 @@ pub(crate) async fn save_plan_order(
         .plans(PlanListFilter {
             view: "active",
             status: None,
+            order: PlanListOrder::Manual,
             limit: DEFAULT_ACTIVE_PLAN_LIMIT,
             offset: 0,
         })

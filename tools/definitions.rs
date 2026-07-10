@@ -750,11 +750,15 @@ fn get_plans_definition() -> ToolDefinition {
                 },
                 "pageSize": {
                     "type": ["integer", "null"],
-                    "description": "Optional page size from 1 to 100. Null defaults to 20."
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Optional page size from 1 to 10. Null defaults to 10."
                 },
                 "limit": {
                     "type": ["integer", "null"],
-                    "description": "Optional alias for pageSize, useful for active view."
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Optional alias for pageSize from 1 to 10, useful for active view. Null defaults to 10."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],

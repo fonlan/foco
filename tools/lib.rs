@@ -1391,6 +1391,28 @@ mod tests {
     }
 
     #[test]
+    fn get_plans_schema_limits_page_size_and_limit_to_ten() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == GET_PLANS_TOOL)
+            .expect("get_plans definition");
+        let properties = definition.input_schema["properties"]
+            .as_object()
+            .expect("get_plans properties");
+
+        for property_name in ["pageSize", "limit"] {
+            let property = &properties[property_name];
+            assert_eq!(property["minimum"], 1);
+            assert_eq!(property["maximum"], 10);
+            let description = property["description"]
+                .as_str()
+                .expect("pagination description");
+            assert!(description.contains("1 to 10"));
+            assert!(description.contains("defaults to 10"));
+        }
+    }
+
+    #[test]
     fn strict_tool_schemas_require_every_property() {
         for tool in builtin_tool_definitions() {
             if tool.strict {
@@ -1615,6 +1637,68 @@ mod tests {
         );
         assert_eq!(completed.output["tasks"][0]["id"], "probe");
         assert_eq!(completed.output["tasks"][0]["subtasks"], json!([]));
+    }
+
+    #[test]
+    fn get_plans_limits_results_to_ten_and_prefers_page_size_over_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..12 {
+            insert_test_plan(workspace.path(), &format!("plan-{index:02}"), None);
+        }
+
+        let default_page = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": null,
+                "pageSize": null,
+                "limit": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!default_page.is_error, "{:?}", default_page.output);
+        assert_eq!(default_page.output["pageSize"], 10);
+        assert_eq!(default_page.output["plans"].as_array().unwrap().len(), 10);
+        assert_eq!(default_page.output["plans"][0]["id"], "plan-11");
+
+        for pagination in [
+            json!({ "pageSize": 100, "limit": null }),
+            json!({ "pageSize": null, "limit": 100 }),
+        ] {
+            let result = execute_builtin_tool(
+                workspace.path(),
+                GET_PLANS_TOOL,
+                json!({
+                    "view": "active",
+                    "status": null,
+                    "page": 1,
+                    "pageSize": pagination["pageSize"],
+                    "limit": pagination["limit"],
+                    "timeoutMs": null
+                }),
+            );
+            assert!(!result.is_error, "{:?}", result.output);
+            assert_eq!(result.output["pageSize"], 10);
+            assert_eq!(result.output["plans"].as_array().unwrap().len(), 10);
+        }
+
+        let page_size_wins = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": 1,
+                "pageSize": 3,
+                "limit": 9,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!page_size_wins.is_error, "{:?}", page_size_wins.output);
+        assert_eq!(page_size_wins.output["pageSize"], 3);
+        assert_eq!(page_size_wins.output["plans"].as_array().unwrap().len(), 3);
     }
 
     #[test]

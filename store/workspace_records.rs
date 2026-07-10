@@ -485,10 +485,18 @@ pub struct PlanPatch<'a> {
     pub error_message: Option<Option<&'a str>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanListOrder {
+    #[default]
+    Manual,
+    NewestFirst,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanListFilter<'a> {
     pub view: &'a str,
     pub status: Option<&'a str>,
+    pub order: PlanListOrder,
     pub limit: i64,
     pub offset: i64,
 }

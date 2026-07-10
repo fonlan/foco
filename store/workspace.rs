@@ -46,15 +46,15 @@ pub use workspace_records::{
     NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanStep,
     NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
     NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListPage, PlanPatch,
-    PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RewriteChatFromUserMessage,
-    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
-    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    PlanAutoRunCandidateRecord, PlanAutoRunStateRecord, PlanListFilter, PlanListOrder,
+    PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch,
+    PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
+    RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
+    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
+    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
+    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -1609,7 +1609,12 @@ impl WorkspaceDatabase {
 
         let mut query = String::from(PLAN_SELECT_BASE_SQL);
         query.push_str(&where_clause);
-        query.push_str(" ORDER BY sort_order ASC, created_at ASC, id ASC LIMIT ? OFFSET ?");
+        query.push_str(match filter.order {
+            PlanListOrder::Manual => {
+                " ORDER BY sort_order ASC, created_at ASC, id ASC LIMIT ? OFFSET ?"
+            }
+            PlanListOrder::NewestFirst => " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        });
         params.push(SqlValue::Integer(filter.limit));
         params.push(SqlValue::Integer(filter.offset));
         let mut statement = self

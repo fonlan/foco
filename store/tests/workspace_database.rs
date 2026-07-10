@@ -27,15 +27,16 @@ use foco_store::{
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
         NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
         NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-        PlanListFilter, PlanPhaseAttemptTrigger, PlanStepPatch, RewriteChatFromUserMessage,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
+        PlanListFilter, PlanListOrder, PlanPhaseAttemptTrigger, PlanStepPatch,
+        RewriteChatFromUserMessage, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
+        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -407,6 +408,7 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
         .plans(PlanListFilter {
             view: "active",
             status: None,
+            order: PlanListOrder::Manual,
             limit: 20,
             offset: 0,
         })
@@ -433,6 +435,7 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
         .plans(PlanListFilter {
             view: "active",
             status: None,
+            order: PlanListOrder::Manual,
             limit: 20,
             offset: 0,
         })
@@ -450,6 +453,7 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
         .plans(PlanListFilter {
             view: "active",
             status: None,
+            order: PlanListOrder::Manual,
             limit: 20,
             offset: 0,
         })
@@ -461,12 +465,80 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
         .plans(PlanListFilter {
             view: "all",
             status: Some("completed"),
+            order: PlanListOrder::Manual,
             limit: 20,
             offset: 0,
         })
         .expect("completed history plans");
     assert_eq!(all_completed.total_count, 1);
     assert_eq!(all_completed.plans[0].status, "completed");
+}
+
+#[test]
+fn plans_newest_first_orders_before_pagination() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    for plan_id in [
+        "plan-oldest",
+        "plan-middle-a",
+        "plan-middle-b",
+        "plan-newest",
+    ] {
+        create_minimal_plan(&mut database, plan_id, "ready");
+    }
+    let connection = Connection::open(database.database_path()).expect("open database");
+    for (plan_id, created_at) in [
+        ("plan-oldest", "2026-01-01T00:00:00.000Z"),
+        ("plan-middle-a", "2026-01-02T00:00:00.000Z"),
+        ("plan-middle-b", "2026-01-02T00:00:00.000Z"),
+        ("plan-newest", "2026-01-03T00:00:00.000Z"),
+    ] {
+        connection
+            .execute(
+                "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+                params![created_at, plan_id],
+            )
+            .expect("set created_at");
+    }
+
+    let first_page = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            order: PlanListOrder::NewestFirst,
+            limit: 2,
+            offset: 0,
+        })
+        .expect("first newest-first page");
+    let second_page = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            order: PlanListOrder::NewestFirst,
+            limit: 2,
+            offset: 2,
+        })
+        .expect("second newest-first page");
+
+    assert_eq!(first_page.total_count, 4);
+    assert_eq!(
+        first_page
+            .plans
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["plan-newest", "plan-middle-b"]
+    );
+    assert_eq!(
+        second_page
+            .plans
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["plan-middle-a", "plan-oldest"]
+    );
 }
 
 #[test]
@@ -503,6 +575,7 @@ fn reorder_active_plans_updates_only_reorderable_slots() {
         .plans(PlanListFilter {
             view: "active",
             status: None,
+            order: PlanListOrder::Manual,
             limit: 20,
             offset: 0,
         })

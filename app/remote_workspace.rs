@@ -7690,6 +7690,7 @@ async fn remote_sidecar_plans_list(
         .plans(foco_store::workspace::PlanListFilter {
             view,
             status,
+            order: foco_store::workspace::PlanListOrder::Manual,
             limit: page_size,
             offset: (page - 1) * page_size,
         })
