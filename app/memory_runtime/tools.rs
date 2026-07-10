@@ -391,7 +391,7 @@ pub(crate) fn collect_memory_search_matches(
         None
     };
     let direct_facts = database
-        .search_active_facts_for_scope(query, chat_filter, None, limit)
+        .search_enabled_active_facts_for_scope(query, chat_filter, None, limit)
         .map_err(ApiError::from_memory_error)?;
     let direct_facts = direct_facts
         .into_iter()
@@ -408,7 +408,7 @@ pub(crate) fn collect_memory_search_matches(
 
     if include_related {
         let related_facts = database
-            .related_active_facts(
+            .related_enabled_active_facts(
                 &direct_ids,
                 MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
                 MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,

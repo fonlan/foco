@@ -119,6 +119,20 @@ fn creates_workspace_foco_database_and_runs_migrations() {
             "{table} table should exist"
         );
     }
+    assert!(column_exists(&connection, "memory_facts", "enabled"));
+    let (enabled_type, enabled_not_null, enabled_default): (String, i64, Option<String>) =
+        connection
+            .query_row(
+                "SELECT type, \"notnull\", dflt_value
+             FROM pragma_table_info('memory_facts')
+             WHERE name = 'enabled'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("memory enabled column definition");
+    assert_eq!(enabled_type, "INTEGER");
+    assert_eq!(enabled_not_null, 1);
+    assert_eq!(enabled_default.as_deref(), Some("1"));
 }
 
 #[test]
@@ -6622,6 +6636,61 @@ fn migrates_v18_memory_extraction_jobs_allow_skipped_status() {
             .status,
         "skipped"
     );
+}
+
+#[test]
+fn migrates_v30_memory_facts_enabled_column_with_existing_rows() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v30 database");
+    connection
+        .execute_batch(&format!(
+            r#"CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z',
+                updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z',
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}'
+             );
+             {WORKSPACE_MEMORY_SCHEMA_SQL}
+             ALTER TABLE memory_facts RENAME TO memory_facts_enabled_fixture;
+             CREATE TABLE memory_facts (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                scope TEXT NOT NULL CHECK (scope IN ('workspace', 'chat')),
+                chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'expired', 'rejected')),
+                kind TEXT NOT NULL CHECK (kind IN ('preference', 'project_fact', 'project_decision', 'procedure', 'constraint', 'episode', 'user_note')),
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+                pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+                is_latest INTEGER NOT NULL DEFAULT 1 CHECK (is_latest IN (0, 1)),
+                expires_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK ((scope = 'chat' AND chat_id IS NOT NULL) OR (scope = 'workspace' AND chat_id IS NULL))
+             );
+             DROP TABLE memory_facts_enabled_fixture;
+             INSERT INTO memory_facts
+                (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                 expires_at, metadata_json, created_at, updated_at)
+             VALUES
+                ('fact-old', 'workspace', NULL, 'active', 'project_fact', 'Old fact', 0.9,
+                 0, 1, NULL, '{{}}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             PRAGMA user_version = 30;"#
+        ))
+        .expect("v30 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let memory = MemoryDatabase::open_workspace_at(&database_path).expect("memory database");
+    assert!(memory.fact("fact-old").unwrap().unwrap().enabled);
 }
 
 #[test]

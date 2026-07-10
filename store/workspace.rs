@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
 use crate::memory::{
-    MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MEMORY_REFERENCES_SCHEMA_SQL,
-    WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
+    MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MEMORY_FACT_ENABLED_MIGRATION_SQL,
+    MEMORY_REFERENCES_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
 };
 #[path = "workspace_records.rs"]
 mod workspace_records;
@@ -66,7 +66,7 @@ use workspace_schema::{
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 30;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 31;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -253,6 +253,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 30,
         sql: MIGRATION_030,
+    },
+    Migration {
+        version: 31,
+        sql: MEMORY_FACT_ENABLED_MIGRATION_SQL,
     },
 ];
 
@@ -12505,6 +12509,10 @@ fn run_migrations(
                         "prompt_context_injections",
                         "memory_summaries_json",
                     )?
+            }
+            31 => {
+                !table_exists(&transaction, database_path, "memory_facts")?
+                    || table_has_column(&transaction, database_path, "memory_facts", "enabled")?
             }
             _ => false,
         };

@@ -251,6 +251,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/memory/status",
             post(crate::http::memory::update_memory_status),
         )
+        .route(
+            "/api/memory/enabled",
+            post(crate::http::memory::update_memory_enabled),
+        )
         .route("/api/memory/edit", post(crate::http::memory::edit_memory))
         .route(
             "/api/memory/forget",

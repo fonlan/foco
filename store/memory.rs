@@ -25,12 +25,12 @@ pub use memory_records::{
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
     GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL,
-    GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_REFERENCES_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
-    WORKSPACE_MEMORY_SCHEMA_SQL,
+    GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_FACT_ENABLED_MIGRATION_SQL, MEMORY_REFERENCES_SCHEMA_SQL,
+    WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
 };
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
-pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 4;
+pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 5;
 
 const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
@@ -48,6 +48,10 @@ const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
         version: 4,
         sql: GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL,
+    },
+    MemoryMigration {
+        version: 5,
+        sql: MEMORY_FACT_ENABLED_MIGRATION_SQL,
     },
 ];
 
@@ -781,6 +785,34 @@ impl MemoryDatabase {
         })
     }
 
+    pub fn set_fact_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<MemoryFactRecord, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let current = self
+            .fact(id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("memory fact was not found: {id}"),
+            })?;
+        if current.enabled == enabled {
+            return Ok(current);
+        }
+
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE memory_facts SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, bool_to_i64(enabled), now],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        self.fact(id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("memory fact was not found after update: {id}"),
+            })
+    }
+
     pub fn delete_fact(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         let database_path = self.database_path.clone();
@@ -932,6 +964,13 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         if edge.relation == MemoryRelationKind::Updates {
+            inherit_update_relation_enabled_state(
+                &transaction,
+                &database_path,
+                edge.source_fact_id,
+                edge.target_fact_id,
+                &now,
+            )?;
             apply_update_relation_effects(&transaction, &database_path, edge.source_fact_id, &now)?;
         }
 
@@ -1765,13 +1804,14 @@ impl MemoryDatabase {
                  GROUP BY fact_id
              )
              SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                    f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                     f.updated_at
              FROM memory_facts f
              LEFT JOIN source_counts sc ON sc.fact_id = f.id
              LEFT JOIN reference_counts rc ON rc.fact_id = f.id
              WHERE ({scope_filter})
                AND f.status IN ('active', 'pending')
+               AND f.enabled = 1
              ORDER BY
                CASE
                  WHEN f.expires_at IS NOT NULL AND f.expires_at <= ?1 THEN 0
@@ -1826,6 +1866,7 @@ impl MemoryDatabase {
              FROM memory_facts
              WHERE ({scope_filter})
                AND status IN ('active', 'pending')
+               AND enabled = 1
                AND (?1 IS NULL OR updated_at > ?1 OR created_at > ?1)"
         );
         let count: i64 = self
@@ -1857,10 +1898,11 @@ impl MemoryDatabase {
                     WHERE e.relation = 'updates'
                  )
                  SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                         f.updated_at
                  FROM memory_facts f
                  JOIN update_chain c ON c.fact_id = f.id
+                 WHERE f.enabled = 1
                  ORDER BY f.created_at DESC, f.id ASC",
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -2030,7 +2072,7 @@ impl MemoryDatabase {
         require_non_empty("id", id)?;
         self.connection
             .query_row(
-                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                         expires_at, metadata_json, created_at, updated_at
                  FROM memory_facts
                  WHERE id = ?1",
@@ -2048,11 +2090,32 @@ impl MemoryDatabase {
         require_non_empty("id", id)?;
         self.connection
             .query_row(
-                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                         expires_at, metadata_json, created_at, updated_at
                  FROM memory_facts
                  WHERE id = ?1
                    AND status = 'active'
+                   AND is_latest = 1",
+                params![id],
+                memory_fact_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
+    fn enabled_active_latest_fact(
+        &self,
+        id: &str,
+    ) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        self.connection
+            .query_row(
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
+                        expires_at, metadata_json, created_at, updated_at
+                 FROM memory_facts
+                 WHERE id = ?1
+                   AND status = 'active'
+                   AND enabled = 1
                    AND is_latest = 1",
                 params![id],
                 memory_fact_from_row,
@@ -2108,7 +2171,7 @@ impl MemoryDatabase {
             .connection
             .prepare(
                 "SELECT DISTINCT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                         f.updated_at
                  FROM memory_facts f
                  JOIN memory_fact_sources fs ON fs.fact_id = f.id
@@ -2154,7 +2217,7 @@ impl MemoryDatabase {
             .connection
             .prepare(
                 "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                         f.updated_at, s.metadata_json
                  FROM memory_facts f
                  JOIN memory_fact_sources fs ON fs.fact_id = f.id
@@ -2164,7 +2227,7 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
             .query_map([], |row| {
-                Ok((memory_fact_from_row(row)?, row.get::<_, String>(13)?))
+                Ok((memory_fact_from_row(row)?, row.get::<_, String>(14)?))
             })
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let mut seen = HashSet::new();
@@ -2200,7 +2263,7 @@ impl MemoryDatabase {
             .connection
             .prepare(
                 "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                         f.updated_at
                  FROM memory_facts f
                  JOIN memory_fact_sources fs ON fs.fact_id = f.id
@@ -2238,7 +2301,7 @@ impl MemoryDatabase {
             .join(", ");
         let sql = format!(
             "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                    f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
                     f.updated_at, s.source_id
              FROM memory_facts f
              JOIN memory_fact_sources fs ON fs.fact_id = f.id
@@ -2256,7 +2319,7 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
             .query_map(params_from_iter(parameters), |row| {
-                Ok((row.get(13)?, memory_fact_from_row(row)?))
+                Ok((row.get(14)?, memory_fact_from_row(row)?))
             })
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
@@ -2284,7 +2347,7 @@ impl MemoryDatabase {
             .connection
             .prepare(
                 "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at, f.updated_at
+                        f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at, f.updated_at
                  FROM memory_fts_index
                  JOIN memory_facts f ON f.id = memory_fts_index.fact_id
                  WHERE memory_fts_index MATCH ?1
@@ -2316,6 +2379,16 @@ impl MemoryDatabase {
         self.search_active_facts_for_scope_page(query, chat_id, kind, limit, 0)
     }
 
+    pub fn search_enabled_active_facts_for_scope(
+        &self,
+        query: &str,
+        chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.search_active_facts_for_scope_page_filtered(query, chat_id, kind, limit, 0, true)
+    }
+
     pub fn search_active_facts_for_scope_page(
         &self,
         query: &str,
@@ -2323,6 +2396,18 @@ impl MemoryDatabase {
         kind: Option<MemoryKind>,
         limit: u32,
         offset: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.search_active_facts_for_scope_page_filtered(query, chat_id, kind, limit, offset, false)
+    }
+
+    fn search_active_facts_for_scope_page_filtered(
+        &self,
+        query: &str,
+        chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
+        limit: u32,
+        offset: u32,
+        enabled_only: bool,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("query", query)?;
         if let Some(chat_id) = chat_id {
@@ -2342,14 +2427,20 @@ impl MemoryDatabase {
             ),
             MemoryDatabaseKind::Workspace => ("f.scope = 'workspace'", None),
         };
+        let enabled_filter_sql = if enabled_only {
+            "AND f.enabled = 1"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
-                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at, f.updated_at
+                    f.pinned, f.enabled, f.is_latest, f.expires_at, f.metadata_json, f.created_at, f.updated_at
              FROM memory_fts_index
              JOIN memory_facts f ON f.id = memory_fts_index.fact_id
              WHERE memory_fts_index MATCH ?1
                AND ({filter_sql})
                AND f.status = 'active'
+               {enabled_filter_sql}
                AND (?4 IS NULL OR f.kind = ?4)
                AND f.is_latest = 1
              ORDER BY
@@ -2429,6 +2520,25 @@ impl MemoryDatabase {
         chat_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.find_active_facts_containing_any_for_scope_filtered(terms, chat_id, limit, false)
+    }
+
+    pub fn find_enabled_active_facts_containing_any_for_scope(
+        &self,
+        terms: &[String],
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.find_active_facts_containing_any_for_scope_filtered(terms, chat_id, limit, true)
+    }
+
+    fn find_active_facts_containing_any_for_scope_filtered(
+        &self,
+        terms: &[String],
+        chat_id: Option<&str>,
+        limit: u32,
+        enabled_only: bool,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -2458,12 +2568,14 @@ impl MemoryDatabase {
             ),
             MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
         };
+        let enabled_filter_sql = if enabled_only { "AND enabled = 1" } else { "" };
         let sql = format!(
-            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                     expires_at, metadata_json, created_at, updated_at
              FROM memory_facts
              WHERE ({filter_sql})
                AND status = ?3
+               {enabled_filter_sql}
                AND is_latest = 1
                AND ({like_filter_sql})
              ORDER BY
@@ -2494,11 +2606,30 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn related_enabled_active_facts(
+        &self,
+        seed_fact_ids: &[String],
+        max_depth: u32,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.related_active_facts_filtered(seed_fact_ids, max_depth, limit, true)
+    }
+
     pub fn related_active_facts(
         &self,
         seed_fact_ids: &[String],
         max_depth: u32,
         limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.related_active_facts_filtered(seed_fact_ids, max_depth, limit, false)
+    }
+
+    fn related_active_facts_filtered(
+        &self,
+        seed_fact_ids: &[String],
+        max_depth: u32,
+        limit: u32,
+        enabled_only: bool,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if limit == 0 {
             return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -2533,7 +2664,12 @@ impl MemoryDatabase {
                         continue;
                     }
                     next_frontier.push(neighbor_id.clone());
-                    if let Some(fact) = self.active_latest_fact(&neighbor_id)? {
+                    let fact = if enabled_only {
+                        self.enabled_active_latest_fact(&neighbor_id)?
+                    } else {
+                        self.active_latest_fact(&neighbor_id)?
+                    };
+                    if let Some(fact) = fact {
                         related.push(fact);
                         if related.len() >= limit as usize {
                             break;
@@ -2558,6 +2694,22 @@ impl MemoryDatabase {
         self.list_facts_for_scope(chat_id, MemoryStatus::Active, None, None, limit)
     }
 
+    pub fn list_enabled_active_facts_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.list_facts_for_scope_page_filtered(
+            chat_id,
+            MemoryStatus::Active,
+            None,
+            None,
+            limit,
+            0,
+            true,
+        )
+    }
+
     pub fn list_facts_for_scope(
         &self,
         chat_id: Option<&str>,
@@ -2577,6 +2729,19 @@ impl MemoryDatabase {
         query: Option<&str>,
         limit: u32,
         offset: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.list_facts_for_scope_page_filtered(chat_id, status, kind, query, limit, offset, false)
+    }
+
+    fn list_facts_for_scope_page_filtered(
+        &self,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        kind: Option<MemoryKind>,
+        query: Option<&str>,
+        limit: u32,
+        offset: u32,
+        enabled_only: bool,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if let Some(chat_id) = chat_id {
             require_non_empty("chat_id", chat_id)?;
@@ -2598,12 +2763,14 @@ impl MemoryDatabase {
             ),
             MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
         };
+        let enabled_filter_sql = if enabled_only { "AND enabled = 1" } else { "" };
         let sql = format!(
-            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                     expires_at, metadata_json, created_at, updated_at
              FROM memory_facts
              WHERE ({filter_sql})
                AND status = ?3
+               {enabled_filter_sql}
                AND (?4 IS NULL OR kind = ?4)
                AND (?5 IS NULL OR lower(fact) LIKE ?5 ESCAPE '\\')
                AND is_latest = 1
@@ -2783,12 +2950,13 @@ impl MemoryDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                         expires_at, metadata_json, created_at, updated_at
                  FROM memory_facts
                  WHERE scope = ?1
                    AND ((?2 IS NULL AND chat_id IS NULL) OR chat_id = ?2)
                    AND status = 'active'
+                   AND enabled = 1
                    AND is_latest = 1
                  ORDER BY pinned DESC, kind ASC, lower(fact) ASC, id ASC
                  LIMIT ?3",
@@ -2849,6 +3017,9 @@ impl MemoryDatabase {
             source_ids: &promoted_source_refs,
             metadata_json: &fact.metadata_json,
         })?;
+        if !fact.enabled {
+            self.set_fact_enabled(promoted_fact_id, false)?;
+        }
 
         self.fact(promoted_fact_id)?
             .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
@@ -2902,6 +3073,9 @@ impl MemoryDatabase {
             source_ids: &promoted_source_refs,
             metadata_json: &fact.metadata_json,
         })?;
+        if !fact.enabled {
+            target.set_fact_enabled(promoted_fact_id, false)?;
+        }
 
         target
             .fact(promoted_fact_id)?
@@ -3089,6 +3263,14 @@ fn run_global_migrations(
         .iter()
         .filter(|migration| migration.version > current_version)
     {
+        if migration.version == 5
+            && table_has_column(&transaction, database_path, "memory_facts", "enabled")?
+        {
+            transaction
+                .pragma_update(None, "user_version", migration.version)
+                .map_err(|source| sqlite_error(database_path, source))?;
+            continue;
+        }
         transaction
             .execute_batch(migration.sql)
             .map_err(|source| sqlite_error(database_path, source))?;
@@ -3102,6 +3284,26 @@ fn run_global_migrations(
         .map_err(|source| sqlite_error(database_path, source))?;
 
     Ok(())
+}
+
+fn table_has_column(
+    connection: &Connection,
+    database_path: &Path,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, MemoryDatabaseError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table_name})"))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    for row in rows {
+        if row.map_err(|source| sqlite_error(database_path, source))? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn schema_version(
@@ -3607,11 +3809,12 @@ fn memory_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFactR
         fact: row.get(5)?,
         confidence: row.get(6)?,
         pinned: row.get::<_, i64>(7)? != 0,
-        is_latest: row.get::<_, i64>(8)? != 0,
-        expires_at: row.get(9)?,
-        metadata_json: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        enabled: row.get::<_, i64>(8)? != 0,
+        is_latest: row.get::<_, i64>(9)? != 0,
+        expires_at: row.get(10)?,
+        metadata_json: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -3734,7 +3937,7 @@ fn fact_by_id(
 ) -> Result<MemoryFactRecord, MemoryDatabaseError> {
     transaction
         .query_row(
-            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
                     expires_at, metadata_json, created_at, updated_at
              FROM memory_facts
              WHERE id = ?1",
@@ -3972,6 +4175,32 @@ fn update_relation_would_cycle(
     Ok(found.is_some())
 }
 
+fn inherit_update_relation_enabled_state(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    source_fact_id: &str,
+    target_fact_id: &str,
+    now: &str,
+) -> Result<(), MemoryDatabaseError> {
+    let target_enabled: i64 = transaction
+        .query_row(
+            "SELECT enabled FROM memory_facts WHERE id = ?1",
+            params![target_fact_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE memory_facts
+             SET enabled = ?2,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![source_fact_id, target_enabled, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(())
+}
+
 fn apply_update_relation_effects(
     transaction: &Transaction<'_>,
     database_path: &Path,
@@ -4198,6 +4427,10 @@ mod tests {
         assert!(memory_table_exists(&connection, "memory_dream_jobs"));
         assert!(memory_table_exists(&connection, "memory_dream_changes"));
         assert!(memory_table_exists(&connection, "memory_references"));
+        assert_eq!(
+            memory_column_definition(&connection, "memory_facts", "enabled"),
+            Some(("INTEGER".to_string(), true, Some("1".to_string())))
+        );
     }
 
     #[test]
@@ -4247,6 +4480,46 @@ mod tests {
         );
         let connection = Connection::open(database.database_path()).expect("open database");
         assert!(memory_table_exists(&connection, "memory_references"));
+    }
+
+    #[test]
+    fn global_database_migrates_existing_facts_as_enabled() {
+        let profile = tempfile::tempdir().expect("profile");
+        let database_path = global_memory_database_path(profile.path());
+        let connection = Connection::open(&database_path).expect("v4 memory database");
+        connection
+            .execute_batch(&format!(
+                "{GLOBAL_MEMORY_SCHEMA_SQL}
+                 {GLOBAL_MEMORY_DREAM_SCHEMA_SQL}
+                 {MEMORY_REFERENCES_SCHEMA_SQL}
+                 {GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL}
+                 INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                     expires_at, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-old', 'global', NULL, 'active', 'preference', 'Use Rust.', 0.9,
+                     0, 1, NULL, '{{}}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 PRAGMA user_version = 4;"
+            ))
+            .expect("v4 memory schema");
+        drop(connection);
+
+        let database = MemoryDatabase::open_or_create_global(profile.path()).expect("migration");
+        let fact = database
+            .fact("fact-old")
+            .expect("fact query")
+            .expect("fact");
+        assert!(fact.enabled);
+        drop(database);
+
+        let reopened = MemoryDatabase::open_or_create_global(profile.path()).expect("reopen");
+        assert!(
+            reopened
+                .fact("fact-old")
+                .expect("fact query")
+                .expect("fact")
+                .enabled
+        );
     }
 
     #[test]
@@ -5712,6 +5985,268 @@ mod tests {
 
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].id, "fact-related");
+    }
+
+    #[test]
+    fn fact_enabled_toggle_is_persistent_and_runtime_queries_exclude_disabled() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut memory =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-enabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test",
+                content: "Runtime enabled fact",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        memory
+            .insert_fact(NewMemoryFact {
+                id: "fact-enabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "Runtime enabled fact",
+                confidence: Some(0.9),
+                pinned: true,
+                source_ids: &["source-enabled"],
+                metadata_json: "{}",
+            })
+            .expect("fact insert");
+
+        memory
+            .insert_fact(NewMemoryFact {
+                id: "fact-related-enabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "Related enabled fact",
+                confidence: Some(0.8),
+                pinned: false,
+                source_ids: &["source-enabled"],
+                metadata_json: "{}",
+            })
+            .expect("related enabled fact insert");
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-related-enabled",
+                source_fact_id: "fact-enabled",
+                target_fact_id: "fact-related-enabled",
+                relation: MemoryRelationKind::Extends,
+                metadata_json: "{}",
+            })
+            .expect("related edge insert");
+        memory
+            .set_fact_enabled("fact-related-enabled", false)
+            .expect("disable related fact");
+
+        assert!(memory.fact("fact-enabled").unwrap().unwrap().enabled);
+        assert!(
+            !memory
+                .set_fact_enabled("fact-enabled", false)
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !memory
+                .set_fact_enabled("fact-enabled", false)
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            memory
+                .list_facts_for_scope(None, MemoryStatus::Active, None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            memory
+                .list_enabled_active_facts_for_scope(None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            memory
+                .search_enabled_active_facts_for_scope("runtime", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            memory
+                .related_enabled_active_facts(&["fact-enabled".to_string()], 1, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            memory
+                .related_active_facts(&["fact-enabled".to_string()], 1, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            memory
+                .refresh_profile_from_active_facts(MemoryScope::Global, None, 10)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            memory
+                .set_fact_enabled("fact-enabled", true)
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            memory
+                .list_enabled_active_facts_for_scope(None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            memory
+                .set_fact_enabled("missing-fact", false)
+                .unwrap_err()
+                .to_string()
+                .contains("was not found")
+        );
+
+        drop(memory);
+        let reopened = MemoryDatabase::open_or_create_global(profile.path()).expect("reopen");
+        assert!(reopened.fact("fact-enabled").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn promote_fact_inherits_disabled_state() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut memory =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-promote-disabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test",
+                content: "Disabled source fact",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        memory
+            .insert_fact(NewMemoryFact {
+                id: "fact-promote-disabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "Disabled source fact",
+                confidence: Some(0.9),
+                pinned: false,
+                source_ids: &["source-promote-disabled"],
+                metadata_json: "{}",
+            })
+            .expect("fact insert");
+        memory
+            .set_fact_enabled("fact-promote-disabled", false)
+            .expect("disable source fact");
+
+        let promoted = memory
+            .promote_fact(
+                "fact-promote-disabled",
+                "fact-promoted-disabled",
+                MemoryScope::Global,
+                None,
+            )
+            .expect("promote fact");
+        assert!(!promoted.enabled);
+    }
+
+    #[test]
+    fn updates_relation_inherits_disabled_state_from_previous_fact() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut memory =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-update-disabled",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test",
+                content: "Disabled update chain",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        for (id, fact) in [
+            ("fact-update-old", "Old disabled fact"),
+            ("fact-update-new", "New replacement fact"),
+        ] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact,
+                    confidence: Some(0.9),
+                    pinned: false,
+                    source_ids: &["source-update-disabled"],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        memory
+            .set_fact_enabled("fact-update-old", false)
+            .expect("disable previous fact");
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-update-disabled",
+                source_fact_id: "fact-update-new",
+                target_fact_id: "fact-update-old",
+                relation: MemoryRelationKind::Updates,
+                metadata_json: "{}",
+            })
+            .expect("updates edge");
+
+        let old = memory.fact("fact-update-old").unwrap().unwrap();
+        let new = memory.fact("fact-update-new").unwrap().unwrap();
+        assert!(!old.enabled);
+        assert_eq!(old.status, MemoryStatus::Superseded.as_str());
+        assert!(!new.enabled);
+        assert!(new.is_latest);
+    }
+
+    fn memory_column_definition(
+        connection: &Connection,
+        table: &str,
+        column: &str,
+    ) -> Option<(String, bool, Option<String>)> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table info statement");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .expect("table info rows");
+        rows.filter_map(Result::ok)
+            .find(|(name, _, _, _)| name == column)
+            .map(|(_, data_type, not_null, default_value)| (data_type, not_null, default_value))
     }
 
     fn memory_table_exists(connection: &Connection, table: &str) -> bool {

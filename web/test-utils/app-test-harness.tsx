@@ -7,6 +7,7 @@ import type {
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
   MemoryDreamJobsResponse,
+  MemoryFactRecord,
   ModelTestResponse,
   Plan,
   QuestionRequestSummary,
@@ -862,6 +863,7 @@ export const activeMemory = {
   chatId: null,
   confidence: null,
   createdAt: "2026-06-09T02:00:00Z",
+  enabled: true,
   expiresAt: null,
   fact: "Stored test preference",
   id: "memory-active-1",
@@ -2211,6 +2213,9 @@ export const appTestState: {
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   memoryDreamJobsResponses: MemoryDreamJobsResponse[];
+  memoriesById: Record<string, MemoryFactRecord>;
+  memoryListAdditional: MemoryFactRecord[];
+  memoryEnabledResponses: Array<Response | Promise<Response>>;
   modelTestResponses: Array<Response | Promise<Response>>;
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
@@ -2237,6 +2242,14 @@ export const appTestState: {
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
   memoryDreamJobsResponses: [],
+  memoriesById: {
+    [activeMemory.id]: { ...activeMemory },
+    [chatMemory.id]: { ...chatMemory },
+    [pendingMemory.id]: { ...pendingMemory },
+    [workspaceMemory.id]: { ...workspaceMemory },
+  },
+  memoryListAdditional: [],
+  memoryEnabledResponses: [],
   modelTestResponses: [],
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
@@ -2652,6 +2665,14 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.memoryDreamJobsResponses = [];
+  appTestState.memoriesById = {
+    [activeMemory.id]: { ...activeMemory },
+    [chatMemory.id]: { ...chatMemory },
+    [pendingMemory.id]: { ...pendingMemory },
+    [workspaceMemory.id]: { ...workspaceMemory },
+  };
+  appTestState.memoryListAdditional = [];
+  appTestState.memoryEnabledResponses = [];
   appTestState.modelTestResponses = [];
   appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
@@ -3606,14 +3627,18 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     const chatId = requestUrl.searchParams.get("chatId");
     const page = Number(requestUrl.searchParams.get("page") ?? "1");
     const pageSize = Number(requestUrl.searchParams.get("pageSize") ?? "20");
-    const memories =
-      status === "pending"
-        ? [pendingMemory]
+    const memories = [
+      ...(status === "pending"
+        ? [appTestState.memoriesById[pendingMemory.id]]
         : scope === "chat"
-          ? [chatMemory]
+          ? [appTestState.memoriesById[chatMemory.id]]
         : scope === "workspace"
-          ? [workspaceMemory]
-          : [activeMemory];
+          ? [appTestState.memoriesById[workspaceMemory.id]]
+          : [appTestState.memoriesById[activeMemory.id]]),
+      ...appTestState.memoryListAdditional.filter(
+        (memory) => memory.scope === scope && memory.status === status,
+      ),
+    ];
     const totalCount =
       (scope === "global" && status !== "pending") || (scope === "chat" && chatId)
         ? 21
@@ -3630,6 +3655,25 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/memory/sources") {
     return jsonResponse({ sources: [memorySource] });
+  }
+
+  if (path === "/api/memory/enabled") {
+    const queuedResponse = appTestState.memoryEnabledResponses.shift();
+    if (queuedResponse) {
+      return await queuedResponse;
+    }
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      enabled?: boolean;
+      factId?: string;
+    };
+    const memory = body.factId ? appTestState.memoriesById[body.factId] : undefined;
+    if (!memory || typeof body.enabled !== "boolean") {
+      return jsonResponse({ message: "memory fact was not found" }, { status: 404 });
+    }
+    const updatedMemory = { ...memory, enabled: body.enabled };
+    appTestState.memoriesById[memory.id] = updatedMemory;
+    return jsonResponse({ memory: updatedMemory });
   }
 
   if (

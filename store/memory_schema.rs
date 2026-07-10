@@ -32,6 +32,7 @@ CREATE TABLE memory_facts (
     fact TEXT NOT NULL CHECK (length(fact) > 0),
     confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
     pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     is_latest INTEGER NOT NULL DEFAULT 1 CHECK (is_latest IN (0, 1)),
     expires_at TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -142,6 +143,11 @@ CREATE INDEX memory_extraction_jobs_chat_idx ON memory_extraction_jobs (chat_id)
 CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);
 "#;
 
+pub const MEMORY_FACT_ENABLED_MIGRATION_SQL: &str = r#"
+ALTER TABLE memory_facts
+ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1));
+"#;
+
 pub const WORKSPACE_MEMORY_DREAM_SCHEMA_SQL: &str = r#"
 CREATE TABLE memory_dream_jobs (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
@@ -236,6 +242,7 @@ CREATE TABLE memory_facts (
     fact TEXT NOT NULL CHECK (length(fact) > 0),
     confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
     pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     is_latest INTEGER NOT NULL DEFAULT 1 CHECK (is_latest IN (0, 1)),
     expires_at TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',

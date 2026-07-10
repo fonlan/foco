@@ -1696,6 +1696,88 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("toggles memory enabled state per row without changing pin or list membership", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    const disableLabel = `Disable memory ${activeMemory.fact}`;
+    const enableLabel = `Enable memory ${activeMemory.fact}`;
+    const disableSwitch = await screen.findByRole("switch", { name: disableLabel });
+    expect(disableSwitch).toBeChecked();
+    expect(activeMemory.pinned).toBe(true);
+
+    await userEvent.click(disableSwitch);
+
+    await waitFor(() => {
+      const enabledCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/enabled",
+      );
+      expect(enabledCall).toBeDefined();
+      expect(JSON.parse(String(enabledCall?.[1]?.body))).toEqual({
+        chatId: null,
+        enabled: false,
+        factId: activeMemory.id,
+        scope: "global",
+        workspaceId: null,
+      });
+    });
+
+    const enableSwitch = await screen.findByRole("switch", { name: enableLabel });
+    expect(enableSwitch).not.toBeChecked();
+    expect(screen.getAllByText(activeMemory.fact).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Edit memory" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete memory" })).toBeEnabled();
+
+    await userEvent.click(enableSwitch);
+    expect(await screen.findByRole("switch", { name: disableLabel })).toBeChecked();
+    expect(appTestState.memoriesById[activeMemory.id].pinned).toBe(true);
+  });
+
+  it("keeps only the target memory toggle pending and preserves state on failure", async () => {
+    const secondMemory = {
+      ...activeMemory,
+      fact: "Another active memory",
+      id: "memory-active-2",
+      pinned: false,
+    };
+    appTestState.memoriesById[secondMemory.id] = secondMemory;
+    appTestState.memoryListAdditional = [secondMemory];
+    const pendingResponse = deferred<Response>();
+    appTestState.memoryEnabledResponses.push(pendingResponse.promise);
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    const activeDisableLabel = `Disable memory ${activeMemory.fact}`;
+    const activeSwitch = await screen.findByRole("switch", { name: activeDisableLabel });
+    await userEvent.click(activeSwitch);
+
+    await waitFor(() => expect(activeSwitch).toBeDisabled());
+    const secondSwitch = await screen.findByRole("switch", {
+      name: `Disable memory ${secondMemory.fact}`,
+    });
+    expect(secondSwitch).toBeEnabled();
+    expect(secondSwitch).toBeChecked();
+
+    pendingResponse.resolve(jsonResponse({ error: "toggle failed" }, { status: 500 }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/memory/enabled")).toHaveLength(1);
+      expect(screen.getByText("toggle failed")).toBeInTheDocument();
+    });
+
+    const restoredSwitch = screen.getByRole("switch", { name: activeDisableLabel });
+    expect(restoredSwitch).toBeChecked();
+    expect(restoredSwitch).toBeEnabled();
+  });
+
   it("filters, clears, and promotes workspace memories", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const fetchMock = vi.mocked(fetch);

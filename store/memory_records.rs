@@ -186,6 +186,7 @@ pub struct MemoryFactRecord {
     pub fact: String,
     pub confidence: Option<f64>,
     pub pinned: bool,
+    pub enabled: bool,
     pub is_latest: bool,
     pub expires_at: Option<String>,
     pub metadata_json: String,

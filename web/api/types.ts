@@ -1670,6 +1670,7 @@ export type MemoryFactRecord = {
   fact: string;
   confidence: number | null;
   pinned: boolean;
+  enabled: boolean;
   isLatest: boolean;
   expiresAt: string | null;
   metadataJson: string;

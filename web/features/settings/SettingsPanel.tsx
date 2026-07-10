@@ -577,6 +577,9 @@ export function SettingsPanel({
   const [isLoadingMemoryDreamChanges, setIsLoadingMemoryDreamChanges] =
     useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
+  const [pendingMemoryEnabledIds, setPendingMemoryEnabledIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [memoryDreamRunKey, setMemoryDreamRunKey] = useState<string | null>(null);
   const [isClearingPassword, setIsClearingPassword] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
@@ -3003,6 +3006,43 @@ export function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsSavingMemory(false);
+    }
+  }
+
+  async function updateMemoryEnabled(memory: MemoryFactRecord, enabled: boolean) {
+    if (pendingMemoryEnabledIds.has(memory.id)) {
+      return;
+    }
+
+    setPendingMemoryEnabledIds((current) => new Set(current).add(memory.id));
+    setError(null);
+
+    try {
+      const response = await requestJson<MemoryMutationResponse>("/api/memory/enabled", {
+        body: JSON.stringify({
+          chatId: memory.scope === "chat" ? memory.chatId : null,
+          enabled,
+          factId: memory.id,
+          scope: memory.scope,
+          workspaceId: memory.scope === "global" ? null : memoryFilter.workspaceId,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      if (!response.memory) {
+        throw new Error(t("Memory enabled update returned no memory."));
+      }
+      setMemories((current) =>
+        current.map((item) => (item.id === response.memory?.id ? response.memory : item)),
+      );
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setPendingMemoryEnabledIds((current) => {
+        const next = new Set(current);
+        next.delete(memory.id);
+        return next;
+      });
     }
   }
 
@@ -6687,6 +6727,12 @@ export function SettingsPanel({
                               </div>
                               <div>
                                 <span className="font-semibold text-stone-700">
+                                  {t("Enabled")}:{" "}
+                                </span>
+                                {selectedMemory.enabled ? t("Yes") : t("No")}
+                              </div>
+                              <div>
+                                <span className="font-semibold text-stone-700">
                                   {t("Memory scope")}:{" "}
                                 </span>
                                 {memoryScopeLabel(selectedMemory.scope, t)}
@@ -7935,7 +7981,13 @@ export function SettingsPanel({
                       {t("No memories")}
                     </div>
                   ) : (
-                    memories.map((memory) => (
+                    memories.map((memory) => {
+                      const isMemoryEnabledPending = pendingMemoryEnabledIds.has(memory.id);
+                      const memoryEnabledToggleLabel = memory.enabled
+                        ? t("Disable memory {fact}", { fact: memory.fact })
+                        : t("Enable memory {fact}", { fact: memory.fact });
+
+                      return (
                       <div
                         className={`grid gap-3 rounded-xl border px-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto] ${selectedMemoryId === memory.id
                             ? "border-teal-200 bg-teal-50/80"
@@ -7971,6 +8023,27 @@ export function SettingsPanel({
                           </div>
                         </button>
                         <div className="flex items-start justify-end gap-2">
+                          <label
+                            className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
+                            title={memoryEnabledToggleLabel}
+                          >
+                            <input
+                              aria-label={memoryEnabledToggleLabel}
+                              checked={memory.enabled}
+                              className="peer sr-only"
+                              disabled={
+                                isMemoryEnabledPending || isLoadingMemories || isSavingMemory
+                              }
+                              onChange={(event) =>
+                                void updateMemoryEnabled(memory, event.target.checked)
+                              }
+                              role="switch"
+                              title={memoryEnabledToggleLabel}
+                              type="checkbox"
+                            />
+                            <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                          </label>
                           {memory.scope !== "global" ? (
                             <button
                               aria-label={t("Promote one level")}
@@ -8006,7 +8079,8 @@ export function SettingsPanel({
                           </button>
                         </div>
                       </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-3 text-sm">

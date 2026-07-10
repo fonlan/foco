@@ -67,6 +67,16 @@ pub(crate) struct MemoryStatusRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEnabledRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    fact_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct EditMemoryRequest {
     scope: String,
     workspace_id: Option<String>,
@@ -723,6 +733,54 @@ pub(crate) async fn update_memory_status(
     }
 
     Ok(Json(MemoryMutationResponse { memory }))
+}
+
+pub(crate) async fn update_memory_enabled(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryEnabledRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let chat_id = normalized_optional_text(request.chat_id);
+    if scope == MemoryScope::Chat && chat_id.is_none() {
+        return Err(ApiError::bad_request(
+            "chat memory enabled updates require chatId",
+        ));
+    }
+    if scope != MemoryScope::Chat && chat_id.is_some() {
+        return Err(ApiError::bad_request(
+            "chatId is only valid for chat memory enabled updates",
+        ));
+    }
+
+    let fact_id = normalized_required_text("factId", &request.fact_id)?;
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+    let current = database
+        .fact(&fact_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::from_status_message(
+                StatusCode::NOT_FOUND,
+                format!("memory fact was not found: {fact_id}"),
+            )
+        })?;
+    let current_scope = MemoryScope::parse(&current.scope).map_err(ApiError::from_memory_error)?;
+    if current_scope != scope || current.chat_id.as_deref() != chat_id.as_deref() {
+        return Err(ApiError::from_status_message(
+            StatusCode::NOT_FOUND,
+            format!("memory fact was not found: {fact_id}"),
+        ));
+    }
+
+    let memory = database
+        .set_fact_enabled(&fact_id, request.enabled)
+        .map_err(ApiError::from_memory_error)?;
+    refresh_memory_profile(&mut database, scope, chat_id.as_deref())?;
+
+    Ok(Json(MemoryMutationResponse {
+        memory: Some(memory),
+    }))
 }
 
 pub(crate) async fn edit_memory(

@@ -3225,7 +3225,7 @@ async fn broker_memory_global_search(
             return;
         }
     };
-    let results = match memory_db.search_active_facts_for_scope(query, None, None, limit) {
+    let results = match memory_db.search_enabled_active_facts_for_scope(query, None, None, limit) {
         Ok(r) => r,
         Err(e) => {
             let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;

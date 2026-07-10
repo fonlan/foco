@@ -469,7 +469,9 @@ pub(crate) fn memory_extraction_existing_memory_candidates(
                     None,
                     MEMORY_EXTRACTION_EXISTING_FACT_LIMIT,
                 )
-                .map_err(ApiError::from_memory_error)?,
+                .map_err(ApiError::from_memory_error)?
+                .into_iter()
+                .filter(|fact| fact.enabled),
         );
         candidates.extend(
             global_memory
@@ -480,7 +482,9 @@ pub(crate) fn memory_extraction_existing_memory_candidates(
                     None,
                     MEMORY_EXTRACTION_EXISTING_FACT_LIMIT,
                 )
-                .map_err(ApiError::from_memory_error)?,
+                .map_err(ApiError::from_memory_error)?
+                .into_iter()
+                .filter(|fact| fact.enabled),
         );
     }
 

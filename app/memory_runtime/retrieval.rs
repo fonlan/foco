@@ -325,20 +325,30 @@ fn relevant_memory_facts_fts(
     };
 
     let workspace_facts = workspace_memory
-        .search_active_facts_for_scope(&search.fts_query, chat_id, None, MEMORY_CONTEXT_FACT_LIMIT)
+        .search_enabled_active_facts_for_scope(
+            &search.fts_query,
+            chat_id,
+            None,
+            MEMORY_CONTEXT_FACT_LIMIT,
+        )
         .map_err(ApiError::from_memory_error)?;
     let global_facts = global_memory
-        .search_active_facts_for_scope(&search.fts_query, None, None, MEMORY_CONTEXT_FACT_LIMIT)
+        .search_enabled_active_facts_for_scope(
+            &search.fts_query,
+            None,
+            None,
+            MEMORY_CONTEXT_FACT_LIMIT,
+        )
         .map_err(ApiError::from_memory_error)?;
     let workspace_containing_facts = workspace_memory
-        .find_active_facts_containing_any_for_scope(
+        .find_enabled_active_facts_containing_any_for_scope(
             &search.contains_terms,
             chat_id,
             MEMORY_CONTEXT_FACT_LIMIT,
         )
         .map_err(ApiError::from_memory_error)?;
     let global_containing_facts = global_memory
-        .find_active_facts_containing_any_for_scope(
+        .find_enabled_active_facts_containing_any_for_scope(
             &search.contains_terms,
             None,
             MEMORY_CONTEXT_FACT_LIMIT,
@@ -441,7 +451,7 @@ pub(crate) fn llm_memory_retrieval_candidates(
 
     if let Some(search) = query_text.and_then(memory_prompt_search) {
         let workspace_facts = workspace_memory
-            .search_active_facts_for_scope(
+            .search_enabled_active_facts_for_scope(
                 &search.fts_query,
                 chat_id,
                 None,
@@ -449,7 +459,7 @@ pub(crate) fn llm_memory_retrieval_candidates(
             )
             .map_err(ApiError::from_memory_error)?;
         let workspace_containing_facts = workspace_memory
-            .find_active_facts_containing_any_for_scope(
+            .find_enabled_active_facts_containing_any_for_scope(
                 &search.contains_terms,
                 chat_id,
                 MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
@@ -467,7 +477,7 @@ pub(crate) fn llm_memory_retrieval_candidates(
         );
 
         let global_facts = global_memory
-            .search_active_facts_for_scope(
+            .search_enabled_active_facts_for_scope(
                 &search.fts_query,
                 None,
                 None,
@@ -475,7 +485,7 @@ pub(crate) fn llm_memory_retrieval_candidates(
             )
             .map_err(ApiError::from_memory_error)?;
         let global_containing_facts = global_memory
-            .find_active_facts_containing_any_for_scope(
+            .find_enabled_active_facts_containing_any_for_scope(
                 &search.contains_terms,
                 None,
                 MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
@@ -494,12 +504,12 @@ pub(crate) fn llm_memory_retrieval_candidates(
     }
 
     let workspace_facts = workspace_memory
-        .list_active_facts_for_scope(chat_id, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
+        .list_enabled_active_facts_for_scope(chat_id, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
         .map_err(ApiError::from_memory_error)?;
     push_llm_memory_candidates(workspace_facts, &mut seen, &mut candidates, limit);
 
     let global_facts = global_memory
-        .list_active_facts_for_scope(None, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
+        .list_enabled_active_facts_for_scope(None, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
         .map_err(ApiError::from_memory_error)?;
     push_llm_memory_candidates(global_facts, &mut seen, &mut candidates, limit);
 
@@ -540,7 +550,7 @@ fn finish_relevant_memory_facts(
     let related_rank_start = facts.len();
     facts.extend(
         workspace_memory
-            .related_active_facts(
+            .related_enabled_active_facts(
                 &workspace_seed_ids,
                 MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
                 MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,
@@ -557,7 +567,7 @@ fn finish_relevant_memory_facts(
     let global_related_rank_start = facts.len();
     facts.extend(
         global_memory
-            .related_active_facts(
+            .related_enabled_active_facts(
                 &global_seed_ids,
                 MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
                 MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,

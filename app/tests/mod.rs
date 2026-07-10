@@ -24,8 +24,10 @@ use foco_store::{
     },
     memory::{
         MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
-        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryStatus, NewMemoryDreamJob,
-        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryReferenceStatus,
+        MemoryReferenceType, MemoryStatus, NewMemoryDreamJob, NewMemoryEdge,
+        NewMemoryExtractionJob, NewMemoryFact, NewMemoryReference, NewMemorySource,
+        UpdateMemoryFact,
     },
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewCodeGraphFileIndex,
@@ -13353,6 +13355,7 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
         fact: "Prefer concise replies.".to_string(),
         confidence: Some(0.9),
         pinned: false,
+        enabled: true,
         is_latest: true,
         expires_at: None,
         metadata_json: "{}".to_string(),
@@ -13480,6 +13483,19 @@ fn memory_extraction_existing_candidates_include_active_and_pending_memories() {
         false,
     );
 
+    insert_test_memory_fact(
+        &mut global_memory,
+        "global-disabled-source",
+        "global-disabled",
+        MemoryScope::Global,
+        None,
+        "Global disabled memory.",
+        false,
+    );
+    global_memory
+        .set_fact_enabled("global-disabled", false)
+        .expect("disable global candidate");
+
     let candidates =
         memory_extraction_existing_memory_candidates(&global_memory, &workspace_memory, "chat-1")
             .expect("existing memory candidates");
@@ -13491,6 +13507,7 @@ fn memory_extraction_existing_candidates_include_active_and_pending_memories() {
     assert!(facts.contains("Workspace active memory."));
     assert!(facts.contains("Chat pending memory."));
     assert!(facts.contains("Global active memory."));
+    assert!(!facts.contains("Global disabled memory."));
 
     drop(global_memory);
     drop(workspace_memory);
@@ -20549,6 +20566,431 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         output_modalities: vec!["text".to_string()],
     });
     config
+}
+
+#[tokio::test]
+async fn memory_enabled_http_preserves_management_state_and_refreshes_profiles() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut global = MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+            .expect("global memory database");
+        insert_test_memory_fact(
+            &mut global,
+            "global-source-enabled-http",
+            "global-fact-enabled-http",
+            MemoryScope::Global,
+            None,
+            "Global enabled HTTP memory",
+            true,
+        );
+        global
+            .refresh_profile_from_active_facts(MemoryScope::Global, None, 10)
+            .expect("global profile refresh");
+    }
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-enabled-http", "Memory enabled HTTP")
+            .expect("chat insert");
+        drop(workspace_database);
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut workspace,
+            "workspace-source-enabled-http",
+            "workspace-fact-enabled-http",
+            MemoryScope::Workspace,
+            None,
+            "Workspace enabled HTTP memory",
+            false,
+        );
+        insert_test_memory_fact(
+            &mut workspace,
+            "chat-source-enabled-http",
+            "chat-fact-enabled-http",
+            MemoryScope::Chat,
+            Some("chat-enabled-http"),
+            "Chat enabled HTTP memory",
+            false,
+        );
+        workspace
+            .insert_edge(NewMemoryEdge {
+                id: "workspace-edge-enabled-http",
+                source_fact_id: "workspace-fact-enabled-http",
+                target_fact_id: "chat-fact-enabled-http",
+                relation: foco_store::memory::MemoryRelationKind::Extends,
+                metadata_json: "{}",
+            })
+            .expect("memory edge insert");
+        workspace
+            .replace_fact_references(
+                "workspace-fact-enabled-http",
+                &[NewMemoryReference {
+                    id: "workspace-reference-enabled-http",
+                    fact_id: "workspace-fact-enabled-http",
+                    reference_type: MemoryReferenceType::FilePath,
+                    value: "README.md",
+                    normalized_value: "README.md",
+                    status: MemoryReferenceStatus::Valid,
+                    metadata_json: "{}",
+                    checked_at: None,
+                }],
+            )
+            .expect("memory reference insert");
+        workspace
+            .refresh_profile_from_active_facts(MemoryScope::Workspace, None, 10)
+            .expect("workspace profile refresh");
+        workspace
+            .refresh_profile_from_active_facts(MemoryScope::Chat, Some("chat-enabled-http"), 10)
+            .expect("chat profile refresh");
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind memory enabled app server");
+    let app_addr = listener.local_addr().expect("memory enabled app address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{app_addr}");
+
+    let global_response = client
+        .post(format!("{base}/api/memory/enabled"))
+        .json(&json!({
+            "scope": "global",
+            "factId": "global-fact-enabled-http",
+            "enabled": false
+        }))
+        .send()
+        .await
+        .expect("disable global memory");
+    assert_eq!(global_response.status(), StatusCode::OK);
+    let global_body = global_response
+        .json::<Value>()
+        .await
+        .expect("global enabled response");
+    assert_eq!(global_body["memory"]["id"], "global-fact-enabled-http");
+    assert_eq!(global_body["memory"]["scope"], "global");
+    assert_eq!(global_body["memory"]["enabled"], false);
+
+    let global_list = client
+        .get(format!(
+            "{base}/api/memory?scope=global&status=active&page=1&pageSize=1&query=Global%20enabled"
+        ))
+        .send()
+        .await
+        .expect("global memory list")
+        .json::<Value>()
+        .await
+        .expect("global memory list response");
+    assert_eq!(global_list["totalCount"], 1);
+    assert_eq!(global_list["totalPages"], 1);
+    assert_eq!(global_list["memories"][0]["enabled"], false);
+
+    for enabled in [false, true, false] {
+        let response = client
+            .post(format!("{base}/api/memory/enabled"))
+            .json(&json!({
+                "scope": "workspace",
+                "workspaceId": workspace_id,
+                "factId": "workspace-fact-enabled-http",
+                "enabled": enabled
+            }))
+            .send()
+            .await
+            .expect("toggle workspace memory");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .json::<Value>()
+                .await
+                .expect("workspace enabled response")["memory"]["enabled"],
+            enabled
+        );
+    }
+
+    let workspace_list = client
+        .get(format!(
+            "{base}/api/memory?scope=workspace&workspaceId={workspace_id}&status=active&page=1&pageSize=1&query=Workspace%20enabled"
+        ))
+        .send()
+        .await
+        .expect("workspace memory list")
+        .json::<Value>()
+        .await
+        .expect("workspace memory list response");
+    assert_eq!(workspace_list["totalCount"], 1);
+    assert_eq!(workspace_list["totalPages"], 1);
+    assert_eq!(workspace_list["memories"][0]["enabled"], false);
+
+    let chat_response = client
+        .post(format!("{base}/api/memory/enabled"))
+        .json(&json!({
+            "scope": "chat",
+            "workspaceId": workspace_id,
+            "chatId": "chat-enabled-http",
+            "factId": "chat-fact-enabled-http",
+            "enabled": false
+        }))
+        .send()
+        .await
+        .expect("disable chat memory");
+    assert_eq!(chat_response.status(), StatusCode::OK);
+
+    let edit_response = client
+        .post(format!("{base}/api/memory/edit"))
+        .json(&json!({
+            "scope": "workspace",
+            "workspaceId": workspace_id,
+            "memoryId": "workspace-fact-enabled-http",
+            "fact": "Workspace memory remains editable while disabled"
+        }))
+        .send()
+        .await
+        .expect("edit disabled workspace memory");
+    assert_eq!(edit_response.status(), StatusCode::OK);
+    assert_eq!(
+        edit_response
+            .json::<Value>()
+            .await
+            .expect("edit disabled memory response")["memory"]["enabled"],
+        false
+    );
+
+    {
+        let global = MemoryDatabase::open_or_create_global_at(
+            profile.path().join(".foco").join("memory.sqlite"),
+        )
+        .expect("reopen global memory database");
+        let fact = global
+            .fact("global-fact-enabled-http")
+            .expect("global fact query")
+            .expect("global fact");
+        assert_eq!(fact.status, "active");
+        assert!(fact.pinned);
+        assert!(
+            global
+                .profile("memory-profile:global")
+                .expect("global profile query")
+                .is_none()
+        );
+        assert_eq!(
+            global
+                .sources_for_fact("global-fact-enabled-http")
+                .expect("global sources")
+                .len(),
+            1
+        );
+    }
+    {
+        let workspace = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("reopen workspace memory database");
+        let fact = workspace
+            .fact("workspace-fact-enabled-http")
+            .expect("workspace fact query")
+            .expect("workspace fact");
+        assert_eq!(fact.status, "active");
+        assert!(!fact.enabled);
+        assert_eq!(
+            fact.fact,
+            "Workspace memory remains editable while disabled"
+        );
+        assert!(
+            workspace
+                .profile("memory-profile:workspace")
+                .expect("workspace profile query")
+                .is_none()
+        );
+        assert!(
+            workspace
+                .profile("memory-profile:chat:chat-enabled-http")
+                .expect("chat profile query")
+                .is_none()
+        );
+        assert_eq!(
+            workspace
+                .sources_for_fact("workspace-fact-enabled-http")
+                .expect("workspace sources")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .edges_for_fact_ids(&["workspace-fact-enabled-http".to_string()], 10)
+                .expect("workspace edges")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .references_for_fact_ids(&["workspace-fact-enabled-http".to_string()], 10)
+                .expect("workspace references")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .count_facts_for_scope(None, MemoryStatus::Active, None, None)
+                .expect("workspace fact count"),
+            1
+        );
+    }
+
+    let reenable_global = client
+        .post(format!("{base}/api/memory/enabled"))
+        .json(&json!({
+            "scope": "global",
+            "factId": "global-fact-enabled-http",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("reenable global memory");
+    assert_eq!(reenable_global.status(), StatusCode::OK);
+    let reenable_workspace = client
+        .post(format!("{base}/api/memory/enabled"))
+        .json(&json!({
+            "scope": "workspace",
+            "workspaceId": workspace_id,
+            "factId": "workspace-fact-enabled-http",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("reenable workspace memory");
+    assert_eq!(reenable_workspace.status(), StatusCode::OK);
+
+    {
+        let global = MemoryDatabase::open_or_create_global_at(
+            profile.path().join(".foco").join("memory.sqlite"),
+        )
+        .expect("reopen reenabled global memory database");
+        assert!(
+            global
+                .profile("memory-profile:global")
+                .expect("reenabled global profile query")
+                .expect("reenabled global profile")
+                .profile_text
+                .contains("Global enabled HTTP memory")
+        );
+    }
+    {
+        let workspace = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("reopen reenabled workspace memory database");
+        assert!(
+            workspace
+                .profile("memory-profile:workspace")
+                .expect("reenabled workspace profile query")
+                .expect("reenabled workspace profile")
+                .profile_text
+                .contains("Workspace memory remains editable while disabled")
+        );
+    }
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn memory_enabled_http_validates_scope_location_and_missing_fact() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    {
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut workspace,
+            "workspace-validation-source",
+            "workspace-validation-fact",
+            MemoryScope::Workspace,
+            None,
+            "Workspace validation memory",
+            false,
+        );
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind memory enabled validation server");
+    let app_addr = listener
+        .local_addr()
+        .expect("memory enabled validation address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{app_addr}/api/memory/enabled");
+
+    for (payload, expected_status) in [
+        (
+            json!({ "scope": "invalid", "factId": "missing", "enabled": false }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "scope": "workspace", "factId": "missing", "enabled": false }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({
+                "scope": "workspace",
+                "workspaceId": "missing-workspace",
+                "factId": "missing",
+                "enabled": false
+            }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({
+                "scope": "chat",
+                "workspaceId": workspace_id,
+                "factId": "missing",
+                "enabled": false
+            }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({
+                "scope": "chat",
+                "workspaceId": workspace_id,
+                "chatId": "wrong-chat",
+                "factId": "workspace-validation-fact",
+                "enabled": false
+            }),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({
+                "scope": "global",
+                "factId": "missing",
+                "enabled": false
+            }),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = client
+            .post(&endpoint)
+            .json(&payload)
+            .send()
+            .await
+            .expect("memory enabled validation request");
+        assert_eq!(response.status(), expected_status, "payload: {payload}");
+    }
+
+    app_task.abort();
 }
 
 fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {

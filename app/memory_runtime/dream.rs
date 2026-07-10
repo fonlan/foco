@@ -4037,6 +4037,47 @@ mod tests {
     }
 
     #[test]
+    fn dream_candidates_exclude_disabled_facts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_fact(
+            &mut database,
+            "fact-dream-disabled",
+            MemoryScope::Workspace,
+            None,
+            MemoryStatus::Active,
+            MemoryKind::ProjectFact,
+            "Disabled facts must not enter Dream.",
+            Some(0.95),
+        );
+        database
+            .set_fact_enabled("fact-dream-disabled", false)
+            .expect("disable fact");
+
+        assert!(
+            database
+                .dream_candidate_facts(MemoryDreamScope::Workspace, Some("workspace-1"), 10)
+                .expect("candidates")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .dream_updated_fact_count_since(
+                    MemoryDreamScope::Workspace,
+                    Some("workspace-1"),
+                    None,
+                )
+                .expect("updated fact count"),
+            0
+        );
+    }
+
+    #[test]
     fn deterministic_dream_rejects_stale_low_confidence_pending_facts() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let workspace_dir = temp_dir.path().join("workspace");
@@ -4845,6 +4886,7 @@ mod tests {
             fact: "Prefer compact replies.".to_string(),
             confidence: Some(0.9),
             pinned: false,
+            enabled: true,
             is_latest: true,
             expires_at: None,
             metadata_json: "{}".to_string(),
