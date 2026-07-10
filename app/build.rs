@@ -19,9 +19,15 @@ fn main() {
 fn build_macos_tray_icon() -> Result<(), Box<dyn std::error::Error>> {
     const TRAY_ICON_SIZE: u32 = 18;
     const TRAY_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect x="118" y="105" width="260" height="94" rx="47" fill="#fff" />
-  <rect x="118" y="105" width="94" height="302" rx="47" fill="#fff" />
-  <circle cx="269" cy="292" r="73" fill="#fff" />
+  <defs>
+    <mask id="tray-icon-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" rx="112" fill="#fff" />
+      <rect x="118" y="105" width="260" height="94" rx="47" fill="#000" />
+      <rect x="118" y="105" width="94" height="302" rx="47" fill="#000" />
+      <circle cx="269" cy="292" r="73" fill="#000" />
+    </mask>
+  </defs>
+  <rect width="512" height="512" fill="#fff" mask="url(#tray-icon-mask)" />
 </svg>"##;
 
     let output_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
