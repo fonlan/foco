@@ -457,10 +457,10 @@ function WorkspaceFilesTab({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-sky-50 text-sky-800">
-            <Files aria-hidden="true" className="size-5" />
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-xl bg-sky-50 text-sky-800">
+            <Files aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{t("Files")}</h2>
@@ -2032,7 +2032,7 @@ function ContextSpecTab({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
-      <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
             <ScrollText aria-hidden="true" className="size-4" />
@@ -2737,7 +2737,7 @@ function SourceControlPanel({
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
-      <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
             <GitCompare aria-hidden="true" className="size-4" />
