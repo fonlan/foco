@@ -1097,6 +1097,17 @@ export type ConfiguredModelSummary = {
   warnings: string[];
 };
 
+export type ModelTestResponse = {
+  ok: boolean;
+  message: string;
+  modelId: string;
+  providerId: string | null;
+};
+
+export type ModelTestState = {
+  testing: boolean;
+};
+
 export type ModelMetadataResponse = {
   sourceUrl: string | null;
   fetchedAt: string | null;

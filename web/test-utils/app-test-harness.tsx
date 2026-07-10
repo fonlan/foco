@@ -7,6 +7,7 @@ import type {
   ConfiguredWorkspaceSummary,
   GitBranchesResponse,
   MemoryDreamJobsResponse,
+  ModelTestResponse,
   Plan,
   QuestionRequestSummary,
   SettingsWorkspaceSpecJobSummary,
@@ -2195,6 +2196,7 @@ export const appTestState: {
   workspaceResponseWorkspaces: unknown[];
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   memoryDreamJobsResponses: MemoryDreamJobsResponse[];
+  modelTestResponses: Array<Response | Promise<Response>>;
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
   lastManualWorkspaceRequest: Partial<ConfiguredWorkspaceSummary> | null;
@@ -2220,6 +2222,7 @@ export const appTestState: {
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatSearchResponseWorkspaces: null,
   memoryDreamJobsResponses: [],
+  modelTestResponses: [],
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
   lastManualWorkspaceRequest: null,
@@ -2535,6 +2538,7 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.memoryDreamJobsResponses = [];
+  appTestState.modelTestResponses = [];
   appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
   appTestState.lastManualWorkspaceRequest = null;
@@ -3111,6 +3115,22 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings") {
     return jsonResponse(appTestState.settingsResponse);
+  }
+
+  if (path === "/api/models/test") {
+    const response = appTestState.modelTestResponses.shift();
+    if (response) {
+      return response;
+    }
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as { modelId?: string };
+    const modelId = body.modelId ?? "gpt-test";
+    return jsonResponse({
+      message: `Model '${modelId}' responded successfully through provider 'openai'`,
+      modelId,
+      ok: true,
+      providerId: "openai",
+    } satisfies ModelTestResponse);
   }
 
   if (path === "/api/update/status") {

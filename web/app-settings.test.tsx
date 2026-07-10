@@ -2,7 +2,11 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ConfiguredSkillSummary, MemoryDreamJobSummary } from "./api/types";
+import type {
+  ConfiguredModelSummary,
+  ConfiguredSkillSummary,
+  MemoryDreamJobSummary,
+} from "./api/types";
 import {
   activeMemory,
   agentDefinitions,
@@ -111,6 +115,95 @@ describe("app-settings verification surfaces", () => {
     expect(githubLink).toHaveAttribute("href", "https://github.com/fonlan/foco");
     expect(githubLink).toHaveAttribute("target", "_blank");
     expect(githubLink).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("tests configured models with per-row loading and toast feedback", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const pendingResponse = deferred<Response>();
+    const secondModel: ConfiguredModelSummary = {
+      ...appTestState.settingsResponse.configuredModels[0]!,
+      activeProviderId: "anthropic",
+      displayName: "Claude Test",
+      id: "claude-test",
+      providerIds: ["anthropic"],
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [...appTestState.settingsResponse.configuredModels, secondModel],
+    };
+    appTestState.modelTestResponses.push(
+      pendingResponse.promise,
+      jsonResponse({
+        message: "Image output models cannot be tested with a text request",
+        modelId: "gpt-test",
+        ok: false,
+        providerId: "openai",
+      }),
+    );
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+
+    const testButton = screen.getByRole("button", { name: "Test model GPT Test" });
+    const secondTestButton = screen.getByRole("button", { name: "Test model Claude Test" });
+    expect(testButton).toHaveAttribute("title", "Test model");
+    expect(testButton).toBeEnabled();
+    expect(secondTestButton).toBeEnabled();
+
+    await userEvent.click(testButton);
+    expect(testButton).toBeDisabled();
+    expect(secondTestButton).toBeEnabled();
+    expect(testButton.querySelector(".animate-spin")).not.toBeNull();
+
+    await userEvent.click(testButton);
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/models/test")).toHaveLength(1);
+
+    pendingResponse.resolve(
+      jsonResponse({
+        message: "Model responded successfully",
+        modelId: "gpt-test",
+        ok: true,
+        providerId: "openai",
+      }),
+    );
+
+    const successToast = await screen.findByRole("status");
+    expect(successToast).toHaveTextContent("Model test succeeded for GPT Test: Model responded successfully");
+    await waitFor(() => expect(testButton).toBeEnabled());
+    expect(testButton.querySelector(".animate-spin")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/models/test",
+      expect.objectContaining({
+        body: JSON.stringify({ modelId: "gpt-test" }),
+        method: "POST",
+      }),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss model test result" }));
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await userEvent.click(testButton);
+    const errorToast = await screen.findByRole("alert");
+    expect(errorToast).toHaveTextContent(
+      "Model test failed for GPT Test: Image output models cannot be tested with a text request",
+    );
+    await waitFor(() => expect(testButton).toBeEnabled());
+  });
+
+  it("shows a model test error toast when the request fails", async () => {
+    appTestState.modelTestResponses.push(jsonResponse({ error: "Provider request failed" }, { status: 502 }));
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Test model GPT Test" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Model test failed for GPT Test: Provider request failed",
+    );
   });
 
   it("checks and installs updates from the About settings page", async () => {

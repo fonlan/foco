@@ -28,6 +28,7 @@ import {
   Play,
   PlugZap,
   Plus,
+  RadioTower,
   Redo2,
   RefreshCw,
   ScrollText,
@@ -108,6 +109,8 @@ import type {
   ModelFormState,
   ModelMetadataRecord,
   ModelMetadataResponse,
+  ModelTestResponse,
+  ModelTestState,
   Plan,
   PlanResponse,
   PlansResponse,
@@ -173,6 +176,11 @@ import {
   sameStringList,
   workspaceNameFromPath,
 } from "../workspaces/workspace-helpers";
+
+type ModelTestToast = {
+  kind: "error" | "success";
+  message: string;
+};
 
 type ProviderModelListState = {
   message: string | null;
@@ -598,6 +606,9 @@ export function SettingsPanel({
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
+  const [modelTests, setModelTests] = useState<Record<string, ModelTestState>>({});
+  const [modelTestToast, setModelTestToast] = useState<ModelTestToast | null>(null);
+  const modelTestsInFlightRef = useRef<Set<string>>(new Set());
   const [expandedProviderIds, setExpandedProviderIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -610,6 +621,15 @@ export function SettingsPanel({
   const [isGeneralPasswordVisible, setIsGeneralPasswordVisible] = useState(false);
   const [isProviderApiKeyVisible, setIsProviderApiKeyVisible] = useState(false);
   const [isEditingGeneralPassword, setIsEditingGeneralPassword] = useState(false);
+
+  useEffect(() => {
+    if (!modelTestToast) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => setModelTestToast(null), 6000);
+    return () => window.clearTimeout(timeoutId);
+  }, [modelTestToast]);
 
   const selectedMetadata = useMemo(
     () =>
@@ -4318,6 +4338,52 @@ export function SettingsPanel({
     }
   }
 
+  async function testModel(model: ConfiguredModelSummary) {
+    if (modelTestsInFlightRef.current.has(model.id)) {
+      return;
+    }
+
+    modelTestsInFlightRef.current.add(model.id);
+    setModelTests((current) => ({
+      ...current,
+      [model.id]: { testing: true },
+    }));
+    setModelTestToast(null);
+
+    try {
+      const data = await requestJson<ModelTestResponse>("/api/models/test", {
+        body: JSON.stringify({ modelId: model.id }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const modelName = model.displayName || data.modelId || model.id;
+      const resultMessageKey = data.ok
+        ? "Model test succeeded for {name}: {message}"
+        : "Model test failed for {name}: {message}";
+      setModelTestToast({
+        kind: data.ok ? "success" : "error",
+        message: t(resultMessageKey, {
+          message: data.message,
+          name: modelName,
+        }),
+      });
+    } catch (requestError) {
+      setModelTestToast({
+        kind: "error",
+        message: t("Model test failed for {name}: {message}", {
+          message: errorMessage(requestError),
+          name: model.displayName || model.id,
+        }),
+      });
+    } finally {
+      modelTestsInFlightRef.current.delete(model.id);
+      setModelTests((current) => ({
+        ...current,
+        [model.id]: { testing: false },
+      }));
+    }
+  }
+
   async function loadProviderModels(providerId: string) {
     if (loadingProviderModelIdsRef.current.has(providerId)) {
       return;
@@ -4495,6 +4561,33 @@ export function SettingsPanel({
 
   return (
     <div className="settings-shell panel-scroll min-h-0 flex-1 overflow-y-auto">
+      {modelTestToast ? (
+        <div
+          aria-live={modelTestToast.kind === "success" ? "polite" : "assertive"}
+          className={modelTestToast.kind === "success" ? "app-status-toast" : "app-error-toast"}
+          role={modelTestToast.kind === "success" ? "status" : "alert"}
+        >
+          {modelTestToast.kind === "success" ? (
+            <CheckCircle2 aria-hidden="true" className="app-status-toast-icon" />
+          ) : (
+            <CircleAlert aria-hidden="true" className="app-error-toast-icon" />
+          )}
+          <div className="app-error-toast-message">{modelTestToast.message}</div>
+          <button
+            aria-label={t("Dismiss model test result")}
+            className={
+              modelTestToast.kind === "success"
+                ? "app-status-toast-close"
+                : "app-error-toast-close"
+            }
+            onClick={() => setModelTestToast(null)}
+            title={t("Close")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+      ) : null}
       <div className="settings-layout grid">
         <aside className="settings-section-nav-card flex min-h-0 flex-col border-stone-200 bg-white p-2">
           <div className="settings-sidebar-header workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
@@ -10917,6 +11010,22 @@ export function SettingsPanel({
                             <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
                             <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                           </label>
+                          <button
+                            aria-label={t("Test model {name}", {
+                              name: model.displayName,
+                            })}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                            disabled={modelTests[model.id]?.testing === true}
+                            onClick={() => void testModel(model)}
+                            title={t("Test model")}
+                            type="button"
+                          >
+                            {modelTests[model.id]?.testing ? (
+                              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                            ) : (
+                              <RadioTower aria-hidden="true" className="size-4" />
+                            )}
+                          </button>
                           <button
                             aria-label={t("Edit model {name}", {
                               name: model.displayName,
