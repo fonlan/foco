@@ -6886,9 +6886,6 @@ export function App() {
     if (chatKey) {
       rememberPlanModeForChatKey(chatKey, value);
     }
-    if (value) {
-      setIsTeamModeEnabled(false);
-    }
   }
 
   function activeRunForRequest(request: RetryRunRequest): ActiveRunInfo | null {

@@ -824,16 +824,20 @@ describe("app agents verification surfaces", () => {
     await waitFor(() => expect(snapshotCallCount()).toBeGreaterThan(callsAfterStart));
   });
 
-  it("queues the first message with Team tools enabled by default from the composer", async () => {
+  it("restores enabled Team mode after leaving Plan mode", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    const teamToggle = await screen.findByRole("button", { name: "Plan mode" });
-    expect(teamToggle).toHaveAttribute("aria-pressed", "false");
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
 
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
-      "handle this",
+      "handle this after planning",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -842,9 +846,10 @@ describe("app agents verification surfaces", () => {
         ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
       );
       expect(queueCall).toBeDefined();
-      const [, init] = queueCall!;
-      expect(JSON.parse(init?.body as string)).toMatchObject({
-        message: "handle this",
+      const body = JSON.parse(queueCall![1]?.body as string);
+      expect(body).toMatchObject({
+        message: "handle this after planning",
+        sessionMode: null,
         teamModeEnabled: true,
       });
     });
@@ -905,7 +910,7 @@ describe("app agents verification surfaces", () => {
     );
   });
 
-  it("uses the configured Team mode default for a new composer", async () => {
+  it("keeps disabled Team mode after leaving Plan mode", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -927,11 +932,16 @@ describe("app agents verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    await screen.findByRole("button", { name: "Plan mode" });
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
 
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
-      "use the default",
+      "stay without team tools",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -940,8 +950,10 @@ describe("app agents verification surfaces", () => {
         ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
       );
       expect(queueCall).toBeDefined();
-      expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
-        message: "use the default",
+      const body = JSON.parse(queueCall![1]?.body as string);
+      expect(body).toMatchObject({
+        message: "stay without team tools",
+        sessionMode: null,
         teamModeEnabled: false,
       });
     });
