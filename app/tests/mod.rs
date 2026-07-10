@@ -6991,49 +6991,36 @@ fn workspace_logo_thumbnail_generates_png_with_160px_bounds_without_writing_cach
         .expect("encode source png");
     let source_png = source_png.into_inner();
     fs::write(logo_dir.join("logo.png"), &source_png).expect("write png logo");
-    fs::write(
-        logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE),
-        b"legacy 32px thumbnail",
-    )
-    .expect("write legacy thumbnail cache");
-    fs::write(
-        logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE),
-        b"legacy version",
-    )
-    .expect("write legacy thumbnail version");
 
     let logo = workspace_logo_file(&workspace_dir)
         .expect("logo lookup")
         .expect("saved logo");
-    let thumbnail = workspace_logo_thumbnail_file(&logo).expect("thumbnail");
+    let first_thumbnail = workspace_logo_thumbnail_file(&logo).expect("first thumbnail");
+    let second_thumbnail = workspace_logo_thumbnail_file(&logo).expect("second thumbnail");
 
-    assert_eq!(thumbnail.content_type, "image/png");
-    assert!(thumbnail.bytes.len() < source_png.len());
-    let decoded = image::load_from_memory_with_format(&thumbnail.bytes, image::ImageFormat::Png)
-        .expect("decode thumbnail png");
-    assert!(decoded.width() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
-    assert!(decoded.height() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
-    assert_eq!(
-        decoded.width().max(decoded.height()),
-        WORKSPACE_LOGO_THUMBNAIL_SIZE
-    );
-    assert_eq!((decoded.width(), decoded.height()), (160, 80));
+    assert_eq!(first_thumbnail.content_type, "image/png");
+    assert_eq!(second_thumbnail.content_type, "image/png");
+    assert_eq!(first_thumbnail.bytes, second_thumbnail.bytes);
+    assert!(first_thumbnail.bytes.len() < source_png.len());
+    for thumbnail_bytes in [&first_thumbnail.bytes, &second_thumbnail.bytes] {
+        let decoded = image::load_from_memory_with_format(thumbnail_bytes, image::ImageFormat::Png)
+            .expect("decode thumbnail png");
+        assert!(decoded.width() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
+        assert!(decoded.height() <= WORKSPACE_LOGO_THUMBNAIL_SIZE);
+        assert_eq!(
+            decoded.width().max(decoded.height()),
+            WORKSPACE_LOGO_THUMBNAIL_SIZE
+        );
+        assert_eq!((decoded.width(), decoded.height()), (160, 80));
+    }
     for file_name in [
         WORKSPACE_LOGO_THUMBNAIL_FILE,
         WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
     ] {
         assert!(!logo_dir.join(file_name).exists());
     }
-    assert_eq!(
-        fs::read(logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE))
-            .expect("read legacy thumbnail cache"),
-        b"legacy 32px thumbnail"
-    );
-    assert_eq!(
-        fs::read(logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE))
-            .expect("read legacy thumbnail version"),
-        b"legacy version"
-    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -7045,7 +7032,7 @@ async fn workspace_logo_thumbnail_uses_long_lived_private_http_cache() {
     let logo_dir = workspace_dir.join(".foco");
     fs::create_dir_all(&logo_dir).expect("logo directory");
 
-    let source = image::RgbaImage::from_pixel(32, 16, image::Rgba([24, 48, 96, 255]));
+    let source = image::RgbaImage::from_pixel(320, 160, image::Rgba([24, 48, 96, 255]));
     let mut source_png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(source)
         .write_to(&mut source_png, image::ImageFormat::Png)
@@ -7075,6 +7062,20 @@ async fn workspace_logo_thumbnail_uses_long_lived_private_http_cache() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("thumbnail body");
+    let decoded = image::load_from_memory_with_format(&body, image::ImageFormat::Png)
+        .expect("decode thumbnail response");
+    assert_eq!((decoded.width(), decoded.height()), (160, 80));
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        assert!(!logo_dir.join(file_name).exists());
+    }
 }
 
 #[test]
@@ -7092,12 +7093,14 @@ fn workspace_logo_thumbnail_returns_svg_source_without_rasterizing() {
 
     assert_eq!(thumbnail.content_type, "image/svg+xml");
     assert_eq!(thumbnail.bytes, source);
-    assert!(!logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE).exists());
-    assert!(
-        !logo_dir
-            .join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE)
-            .exists()
-    );
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE,
+        LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        assert!(!logo_dir.join(file_name).exists());
+    }
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
