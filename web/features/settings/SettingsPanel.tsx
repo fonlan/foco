@@ -590,6 +590,10 @@ export function SettingsPanel({
   const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
     useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
+  const [providerOperationIds, setProviderOperationIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const providerOperationIdsRef = useRef<Set<string>>(new Set());
   const [isRevealingProviderApiKey, setIsRevealingProviderApiKey] = useState(false);
   const [isRefreshingProviderModels, setIsRefreshingProviderModels] =
     useState(false);
@@ -3827,11 +3831,74 @@ export function SettingsPanel({
     }
   }
 
-  async function deleteProvider(providerId: string) {
-    setIsSavingProvider(true);
+  function startProviderOperation(providerId: string) {
+    if (providerOperationIdsRef.current.has(providerId)) {
+      return false;
+    }
+
+    providerOperationIdsRef.current.add(providerId);
+    setProviderOperationIds(new Set(providerOperationIdsRef.current));
+    return true;
+  }
+
+  function finishProviderOperation(providerId: string) {
+    providerOperationIdsRef.current.delete(providerId);
+    setProviderOperationIds(new Set(providerOperationIdsRef.current));
+  }
+
+  async function toggleConfiguredProviderEnabled(
+    provider: ConfiguredProviderSummary,
+    enabled: boolean,
+  ) {
+    if (!startProviderOperation(provider.id)) {
+      return;
+    }
+
     setError(null);
-    setIsProviderApiKeyVisible(false);
-    setIsRevealingProviderApiKey(false);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/providers/manual", {
+        body: JSON.stringify({
+          apiKey: null,
+          apiProxy: {
+            enabled: provider.apiProxy.enabled,
+            proxyType: provider.apiProxy.proxyType,
+            url: provider.apiProxy.url,
+          },
+          baseUrl: provider.baseUrl,
+          clearApiKey: false,
+          enabled,
+          id: provider.id,
+          kind: provider.kind,
+          autoSyncModels: provider.autoSyncModels,
+          modelSyncFilterRegex: provider.modelSyncFilterRegex,
+          modelRedirects: provider.modelRedirects.map((redirect) => ({
+            from: redirect.from,
+            to: redirect.to,
+          })),
+          name: provider.name,
+          requestOverrides: provider.requestOverrides.map((overrideRule) => ({
+            ...overrideRule,
+          })),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      finishProviderOperation(provider.id);
+    }
+  }
+
+  async function deleteProvider(providerId: string) {
+    if (!startProviderOperation(providerId)) {
+      return;
+    }
+
+    setError(null);
 
     try {
       const data = await requestJson<SettingsResponse>("/api/providers/delete", {
@@ -3851,11 +3918,6 @@ export function SettingsPanel({
         delete next[providerId];
         return next;
       });
-      setProviderForm({
-        ...emptyProviderForm(),
-        kind: defaultProviderKind(data.providerKinds),
-      });
-      closeProviderDialog();
       setForm((current) => ({
         ...current,
         activeProviderId:
@@ -3867,7 +3929,7 @@ export function SettingsPanel({
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
-      setIsSavingProvider(false);
+      finishProviderOperation(providerId);
     }
   }
 
@@ -9660,34 +9722,6 @@ export function SettingsPanel({
                         ) : null}
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        <label className="relative inline-flex cursor-pointer items-center">
-                          <input
-                            aria-label={t("Enable provider")}
-                            checked={providerForm.enabled}
-                            className="peer sr-only"
-                            onChange={(event) =>
-                              setProviderForm((current) => ({
-                                ...current,
-                                enabled: event.target.checked,
-                              }))
-                            }
-                            type="checkbox"
-                          />
-                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
-                        </label>
-                        {providerForm.id ? (
-                          <button
-                            aria-label={t("Delete provider")}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
-                            disabled={isSavingProvider}
-                            onClick={() => void deleteProvider(providerForm.id)}
-                            title={t("Delete provider")}
-                            type="button"
-                          >
-                            <Trash2 aria-hidden="true" className="size-4" />
-                          </button>
-                        ) : null}
                         <button
                           aria-label={t("Close provider configuration")}
                           className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
@@ -10223,6 +10257,13 @@ export function SettingsPanel({
                       const test = providerTests[provider.id];
                       const modelList = providerModelLists[provider.id];
                       const isExpanded = expandedProviderIds.has(provider.id);
+                      const isProviderOperationPending = providerOperationIds.has(provider.id);
+                      const providerToggleLabel = provider.enabled
+                        ? t("Disable provider {name}", { name: provider.name })
+                        : t("Enable provider {name}", { name: provider.name });
+                      const providerDeleteLabel = t("Delete provider {name}", {
+                        name: provider.name,
+                      });
 
                       return (
                         <div className="px-4 py-3" key={provider.id}>
@@ -10303,12 +10344,34 @@ export function SettingsPanel({
                                 ) : null}
                               </div>
                             </button>
-                            <div className="flex flex-wrap gap-2">
+                            <div className="flex flex-wrap items-center justify-end gap-2 md:self-start">
+                              <label
+                                className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
+                                title={providerToggleLabel}
+                              >
+                                <input
+                                  aria-label={providerToggleLabel}
+                                  checked={provider.enabled}
+                                  className="peer sr-only"
+                                  disabled={isProviderOperationPending}
+                                  onChange={(event) =>
+                                    void toggleConfiguredProviderEnabled(
+                                      provider,
+                                      event.target.checked,
+                                    )
+                                  }
+                                  title={providerToggleLabel}
+                                  type="checkbox"
+                                />
+                                <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                                <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                              </label>
                               <button
                                 aria-label={t("Edit provider {name}", {
                                   name: provider.name,
                                 })}
-                                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                                disabled={isProviderOperationPending}
                                 onClick={() => editConfiguredProvider(provider)}
                                 title={t("Edit provider")}
                                 type="button"
@@ -10320,7 +10383,7 @@ export function SettingsPanel({
                                   name: provider.name,
                                 })}
                                 className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                                disabled={test?.status === "testing"}
+                                disabled={isProviderOperationPending || test?.status === "testing"}
                                 onClick={() => void testProvider(provider.id)}
                                 title={t("Test provider")}
                                 type="button"
@@ -10332,6 +10395,23 @@ export function SettingsPanel({
                                   />
                                 ) : (
                                   <PlugZap aria-hidden="true" className="size-4" />
+                                )}
+                              </button>
+                              <button
+                                aria-label={providerDeleteLabel}
+                                className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                disabled={isProviderOperationPending}
+                                onClick={() => void deleteProvider(provider.id)}
+                                title={providerDeleteLabel}
+                                type="button"
+                              >
+                                {isProviderOperationPending ? (
+                                  <LoaderCircle
+                                    aria-hidden="true"
+                                    className="size-4 animate-spin"
+                                  />
+                                ) : (
+                                  <Trash2 aria-hidden="true" className="size-4" />
                                 )}
                               </button>
                             </div>

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ConfiguredModelSummary,
+  ConfiguredProviderSummary,
   ConfiguredSkillSummary,
   MemoryDreamJobSummary,
 } from "./api/types";
@@ -2546,6 +2547,183 @@ describe("app-settings verification surfaces", () => {
         method: "POST",
       }),
     );
+  });
+
+  it("localizes provider list actions", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" as const },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings" ? jsonResponse(zhSettings) : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "设置" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "设置" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "供应商" }));
+
+    expect(screen.getByRole("checkbox", { name: "停用供应商 OpenAI" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除供应商 OpenAI" })).toBeInTheDocument();
+  });
+
+  it("toggles configured providers from the provider list without dropping settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const openAiProvider = {
+      ...settings.providers[0],
+      apiProxy: {
+        ...settings.providers[0].apiProxy,
+        enabled: true,
+        proxyType: "socks",
+        url: "127.0.0.1:7891",
+      },
+      modelRedirects: [{ from: "upstream-model", to: "local-model" }],
+      requestOverrides: [
+        {
+          target: "body" as const,
+          name: "text.verbosity",
+          valueType: "string" as const,
+          value: "low",
+        },
+      ],
+    };
+    appTestState.settingsResponse = {
+      ...settings,
+      providers: [
+        openAiProvider as ConfiguredProviderSummary &
+          (typeof appTestState.settingsResponse.providers)[number],
+        settings.providers[1],
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+
+    const toggle = screen.getByRole("checkbox", {
+      name: "Disable provider OpenAI",
+    });
+    expect(toggle).toHaveAttribute("title", "Disable provider OpenAI");
+    expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/providers/manual" &&
+          JSON.parse(String(init?.body ?? "{}")).id === "openai" &&
+          JSON.parse(String(init?.body ?? "{}")).enabled === false,
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        apiKey: null,
+        apiProxy: {
+          enabled: openAiProvider.apiProxy.enabled,
+          proxyType: openAiProvider.apiProxy.proxyType,
+          url: openAiProvider.apiProxy.url,
+        },
+        baseUrl: openAiProvider.baseUrl,
+        clearApiKey: false,
+        enabled: false,
+        id: openAiProvider.id,
+        kind: openAiProvider.kind,
+        autoSyncModels: openAiProvider.autoSyncModels,
+        modelSyncFilterRegex: openAiProvider.modelSyncFilterRegex,
+        modelRedirects: openAiProvider.modelRedirects,
+        name: openAiProvider.name,
+        requestOverrides: openAiProvider.requestOverrides,
+      });
+    });
+  });
+
+  it("keeps provider list operations scoped to the active row", async () => {
+    const pendingResponse = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/providers/manual") {
+        return pendingResponse.promise;
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+
+    const openAiToggle = screen.getByRole("checkbox", { name: "Disable provider OpenAI" });
+    const anthropicToggle = screen.getByRole("checkbox", {
+      name: "Disable provider Anthropic",
+    });
+    const openAiDelete = screen.getByRole("button", { name: "Delete provider OpenAI" });
+    const anthropicDelete = screen.getByRole("button", {
+      name: "Delete provider Anthropic",
+    });
+
+    fireEvent.click(openAiToggle);
+    fireEvent.click(openAiToggle);
+
+    await waitFor(() => expect(openAiToggle).toBeDisabled());
+    expect(openAiDelete).toBeDisabled();
+    expect(anthropicToggle).toBeEnabled();
+    expect(anthropicDelete).toBeEnabled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/providers/manual")).toHaveLength(1);
+
+    pendingResponse.resolve(jsonResponse(settings));
+    await waitFor(() => expect(openAiToggle).toBeEnabled());
+  });
+
+  it("deletes configured providers from the provider list", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+
+    const deleteButton = screen.getByRole("button", { name: "Delete provider OpenAI" });
+    expect(deleteButton).toHaveAttribute("title", "Delete provider OpenAI");
+    await userEvent.click(deleteButton);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/providers/delete",
+        expect.objectContaining({
+          body: JSON.stringify({ id: "openai" }),
+          method: "POST",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Delete provider OpenAI" })).toBeNull();
+    });
+  });
+
+  it("keeps provider enable and delete controls out of the edit dialog", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+
+    const providerDialog = screen.getByRole("form", { name: "Provider configuration" });
+    expect(within(providerDialog).queryByRole("checkbox", { name: /provider OpenAI/ })).toBeNull();
+    expect(within(providerDialog).queryByRole("button", { name: /Delete provider/ })).toBeNull();
+    expect(
+      within(providerDialog).getByRole("button", { name: "Close provider configuration" }),
+    ).toBeInTheDocument();
   });
 
   it("saves provider model redirects from the provider form", async () => {

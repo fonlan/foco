@@ -3652,6 +3652,16 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(savedSettings.provider);
   }
 
+  if (path === "/api/providers/delete") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { id?: string };
+    return jsonResponse({
+      ...appTestState.settingsResponse,
+      providers: appTestState.settingsResponse.providers.filter(
+        (provider) => provider.id !== body.id,
+      ),
+    });
+  }
+
   if (path === "/api/providers/reveal-api-key") {
     return jsonResponse({ apiKey: "sk-saved" });
   }
