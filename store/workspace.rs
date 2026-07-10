@@ -661,6 +661,7 @@ impl WorkspaceDatabase {
         let database_existed = database_path.exists();
         let mut connection = open_connection(&database_path)?;
         run_migrations(&mut connection, &database_path, database_existed)?;
+        enable_write_ahead_logging(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -12411,18 +12412,18 @@ fn open_connection(database_path: &Path) -> Result<Connection, WorkspaceDatabase
         })?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|source| WorkspaceDatabaseError::Sqlite {
-            path: database_path.to_path_buf(),
-            source,
-        })?;
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(|source| WorkspaceDatabaseError::Sqlite {
-            path: database_path.to_path_buf(),
-            source,
-        })?;
+        .map_err(|source| sqlite_error(database_path, source))?;
 
     Ok(connection)
+}
+
+fn enable_write_ahead_logging(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|source| sqlite_error(database_path, source))
 }
 
 fn run_migrations(

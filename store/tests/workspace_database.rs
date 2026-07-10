@@ -55,6 +55,11 @@ fn creates_workspace_foco_database_and_runs_migrations() {
     );
 
     let connection = Connection::open(database.database_path()).expect("open database");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode");
+    assert_eq!(journal_mode, "wal");
+
     for table in [
         "workspace_metadata",
         "chats",
