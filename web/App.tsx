@@ -1435,6 +1435,13 @@ export function App() {
   const liveChatStatistics = activeChatKey
     ? liveChatStatisticsByKey[activeChatKey] ?? null
     : null;
+  const latestProviderUsage =
+    activeChatKey !== null && runningChatKeys.has(activeChatKey)
+      ? liveChatStatistics?.usage ?? null
+      : null;
+  const displayedContextUsage = contextUsage
+    ? contextUsageWithLatestProviderUsage(contextUsage, latestProviderUsage)
+    : null;
   // ponytail: stats only tracks message shape here; add text hashes if live stats need per-token updates.
   const chatStatisticsMessageFingerprint = useMemo(
     () =>
@@ -10915,7 +10922,7 @@ export function App() {
                   draftMessage={draftMessage}
                   draftUnsupportedAttachmentMessage={unsupportedDraftAttachmentMessage}
                   gitBranches={gitBranches}
-                  contextUsage={contextUsage}
+                  contextUsage={displayedContextUsage}
                   isLoadingSettings={isLoadingSettings}
                   isLoadingBranches={isLoadingBranches}
                   isLoadingContextUsage={isLoadingContextUsage}
@@ -11003,7 +11010,7 @@ export function App() {
                 chatStatistics={displayedChatStatistics}
                 chatStatisticsError={chatStatisticsError}
                 contextMemories={contextMemories}
-                contextUsage={contextUsage}
+                contextUsage={displayedContextUsage}
                 deletingContextMemoryId={deletingContextMemoryId}
                 contextMemoryError={contextMemoryError}
                 diffError={diffError}
@@ -13600,6 +13607,53 @@ function withLiveChatStatistics(
     totalTokens: base.totalTokens + totalTokens,
     userMessageCount,
   };
+}
+
+function contextUsageWithLatestProviderUsage(
+  usage: ContextUsageResponse,
+  latestProviderUsage: ChatUsage | null,
+): ContextUsageResponse {
+  const inputTokens = latestProviderUsage?.inputTokens;
+  if (typeof inputTokens !== "number" || inputTokens < 0 || usage.contextWindow <= 0) {
+    return usage;
+  }
+
+  const segments = contextUsageSegmentsForProviderInput(usage, inputTokens);
+  return {
+    ...usage,
+    compressionSnapshotTokens: segments.compressionSnapshot,
+    historyTokens: segments.history,
+    segments,
+    systemPromptTokens: segments.systemPrompt,
+    toolSchemaTokens: segments.toolSchema,
+    totalUsedContextTokens: inputTokens,
+    usagePercent: Math.ceil((inputTokens * 100) / usage.contextWindow),
+  };
+}
+
+function contextUsageSegmentsForProviderInput(
+  usage: ContextUsageResponse,
+  inputTokens: number,
+) {
+  const segments = { ...usage.segments };
+  const estimatedTokens =
+    segments.systemPrompt +
+    segments.toolSchema +
+    segments.compressionSnapshot +
+    segments.history;
+  let tokensToRemove = Math.max(0, estimatedTokens - inputTokens);
+  for (const key of ["history", "compressionSnapshot", "toolSchema", "systemPrompt"] as const) {
+    if (tokensToRemove <= 0) {
+      break;
+    }
+    const removedTokens = Math.min(segments[key], tokensToRemove);
+    segments[key] -= removedTokens;
+    tokensToRemove -= removedTokens;
+  }
+  if (inputTokens > estimatedTokens) {
+    segments.history += inputTokens - estimatedTokens;
+  }
+  return segments;
 }
 
 function emptyChatStatistics(

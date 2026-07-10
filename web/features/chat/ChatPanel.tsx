@@ -1329,16 +1329,22 @@ function ContextUsageCircle({
   const { t } = useI18n();
   const percent = usage?.usagePercent ?? 0;
   const clampedPercent = Math.min(Math.max(percent, 0), 100);
-  const toneClass = usage?.willCompressOnNextSend
+  const toneClass = usage?.hasLlmCompressionPlan
     ? "context-usage-circle-critical"
     : usage && percent >= usage.compressionTriggerPercent
       ? "context-usage-circle-warn"
       : "context-usage-circle-normal";
-  const title = t("Context usage {percent}%", { percent });
+  const ariaLabel = t("Context usage {percent}%", { percent });
+  const title = usage
+    ? t("Context usage {percent}% (assembled {assembledPercent}%)", {
+        assembledPercent: usage.assembledUsagePercent,
+        percent,
+      })
+    : ariaLabel;
 
   return (
     <div
-      aria-label={title}
+      aria-label={ariaLabel}
       className={`context-usage-circle ${toneClass} ${isLoading ? "context-usage-circle-loading" : ""
         } ${className}`}
       role="status"

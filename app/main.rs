@@ -2268,6 +2268,7 @@ enum PromptContextSourceBucket {
     RuntimeToolStateSnapshot,
 }
 
+#[derive(Clone)]
 struct ContextMessageGroup {
     message_indices: Vec<usize>,
     estimated_tokens: u64,

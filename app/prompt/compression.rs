@@ -240,7 +240,11 @@ async fn ensure_llm_context_compression(
     events: &mut Vec<ContextCompressionEventDetail>,
     mode: LlmContextCompressionMode,
 ) -> Result<bool, ApiError> {
-    let covered_group_indices = llm_context_compression_group_indices(message_groups, mode);
+    let covered_group_indices = llm_context_compression_group_indices(
+        message_groups,
+        context.context_budget.available_message_tokens,
+        mode,
+    );
     if covered_group_indices.is_empty() {
         return Ok(false);
     }
@@ -396,6 +400,7 @@ async fn ensure_llm_context_compression(
 
 pub(crate) fn llm_context_compression_group_indices(
     groups: &[ContextMessageGroup],
+    available_message_tokens: u64,
     mode: LlmContextCompressionMode,
 ) -> Vec<usize> {
     let compressible_indices = groups
@@ -417,22 +422,31 @@ pub(crate) fn llm_context_compression_group_indices(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if matches!(mode, LlmContextCompressionMode::Normal)
-        && compressible_indices.len() <= CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES
-    {
-        return Vec::new();
+    if matches!(mode, LlmContextCompressionMode::RequiredOverflow) {
+        return compressible_indices;
     }
 
-    let covered_count = match mode {
-        LlmContextCompressionMode::Normal => {
-            compressible_indices.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES
-        }
-        LlmContextCompressionMode::RequiredOverflow => compressible_indices.len(),
-    };
-    compressible_indices
-        .into_iter()
-        .take(covered_count)
-        .collect()
+    let normally_covered_count = compressible_indices
+        .len()
+        .saturating_sub(CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES);
+    let mut covered_indices = compressible_indices
+        .iter()
+        .copied()
+        .take(normally_covered_count)
+        .collect::<Vec<_>>();
+
+    let pack_items = pack_items_from_message_groups(groups);
+    if let Ok(packed) = pack_context(&pack_items, available_message_tokens) {
+        let selected_indices = packed.selected_indices.into_iter().collect::<HashSet<_>>();
+        covered_indices.extend(
+            compressible_indices
+                .into_iter()
+                .skip(normally_covered_count)
+                .filter(|index| !selected_indices.contains(index)),
+        );
+    }
+
+    covered_indices
 }
 
 async fn llm_context_compression_summary(
@@ -2151,32 +2165,59 @@ pub(crate) fn context_usage_response(
     let available_message_tokens = context.context_budget.available_message_tokens;
     let context_window = context.context_budget.context_window;
     let max_output_tokens = context.context_budget.max_output_tokens;
-    let segments = context_usage_segments(&context.context_budget, &message_groups);
-    let total_used_context_tokens = context_usage_segments_total(&segments);
+    let assembled_segments = context_usage_segments(&context.context_budget, &message_groups);
+    let assembled_total_used_context_tokens = context_usage_segments_total(&assembled_segments);
     let token_breakdown = context_token_breakdown(&message_groups);
-    let packed_message_tokens = if token_breakdown.required_tokens > available_message_tokens {
-        assembled_message_tokens
-    } else {
-        pack_neutral_messages(
-            context.provider_request.messages.clone(),
-            &context.message_source_sequences,
-            &context.message_context_sources,
-            &context.context_budget,
-            context.active_tool_start_index,
-        )?
-        .iter()
-        .map(neutral_message_estimated_tokens)
-        .sum::<u64>()
-    };
+    let (packed_message_tokens, packed_groups) =
+        if token_breakdown.required_tokens > available_message_tokens {
+            (assembled_message_tokens, message_groups.clone())
+        } else {
+            let pack_items = pack_items_from_message_groups(&message_groups);
+            let packed = pack_context(&pack_items, available_message_tokens)
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            let packed_message_tokens = packed.used_message_tokens;
+            let packed_groups = packed
+                .selected_indices
+                .into_iter()
+                .map(|index| message_groups[index].clone())
+                .collect::<Vec<_>>();
+            (packed_message_tokens, packed_groups)
+        };
     let used_message_tokens = packed_message_tokens;
     let compression_trigger_tokens = context_window_compression_trigger_tokens(context_window);
+    let compression_trigger_percent = percentage_ceil(compression_trigger_tokens, context_window);
+    let llm_compression_trigger_tokens = llm_context_compression_trigger_tokens(context_window);
+    let llm_compression_trigger_percent =
+        percentage_ceil(llm_compression_trigger_tokens, context_window);
+    let normal_llm_compression_plan = assembled_total_used_context_tokens
+        >= llm_compression_trigger_tokens
+        && !llm_context_compression_group_indices(
+            &message_groups,
+            available_message_tokens,
+            LlmContextCompressionMode::Normal,
+        )
+        .is_empty();
+    let required_overflow_llm_compression_plan = token_breakdown.required_tokens
+        > available_message_tokens
+        && !llm_context_compression_group_indices(
+            &message_groups,
+            available_message_tokens,
+            LlmContextCompressionMode::RequiredOverflow,
+        )
+        .is_empty();
+    let has_llm_compression_plan =
+        normal_llm_compression_plan || required_overflow_llm_compression_plan;
+    let segments = context_usage_segments(&context.context_budget, &packed_groups);
+    let total_used_context_tokens = context_usage_segments_total(&segments);
     let usage_percent = percentage_ceil(total_used_context_tokens, context_window);
-    let compression_trigger_percent = 80;
-    let will_compress_on_next_send = total_used_context_tokens >= compression_trigger_tokens;
+    let assembled_usage_percent =
+        percentage_ceil(assembled_total_used_context_tokens, context_window);
+    let will_compress_on_next_send = has_llm_compression_plan;
 
     Ok(ContextUsageResponse {
         used_message_tokens,
         assembled_message_tokens,
+        assembled_usage_percent,
         post_compression_message_tokens: assembled_message_tokens,
         packed_message_tokens,
         available_message_tokens,
@@ -2192,6 +2233,9 @@ pub(crate) fn context_usage_response(
         usage_percent,
         compression_trigger_tokens,
         compression_trigger_percent,
+        llm_compression_trigger_tokens,
+        llm_compression_trigger_percent,
+        has_llm_compression_plan,
         will_compress_on_next_send,
         segments,
         token_breakdown,

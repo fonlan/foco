@@ -349,8 +349,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 55%" }),
+    ).toHaveTextContent("55%");
     const usageCallsAfterUsage = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
@@ -947,8 +947,8 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 55%" }),
+    ).toHaveTextContent("55%");
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
@@ -974,8 +974,8 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("tab", { name: /Tool run/ }));
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 55%" }),
+    ).toHaveTextContent("55%");
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
@@ -4148,8 +4148,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 55%" }),
+    ).toHaveTextContent("55%");
     const usageCalls = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&

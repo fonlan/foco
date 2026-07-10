@@ -1675,11 +1675,16 @@ export const planFixture: Plan = {
 
 export const contextUsage = {
   availableMessageTokens: 110960,
+  assembledMessageTokens: 52340,
+  assembledUsagePercent: 47,
   compressionSnapshotTokens: 2340,
   compressionTriggerPercent: 80,
   compressionTriggerTokens: 102400,
   contextWindow: 128000,
   historyTokens: 32000,
+  hasLlmCompressionPlan: false,
+  llmCompressionTriggerPercent: 95,
+  llmCompressionTriggerTokens: 121600,
   maxOutputTokens: 20000,
   memoryBudgetTokens: 15360,
   memoryContextTokens: 120,
@@ -1691,6 +1696,8 @@ export const contextUsage = {
     toolSchema: 9800,
   },
   systemPromptTokens: 4200,
+  packedMessageTokens: 52340,
+  postCompressionMessageTokens: 52340,
   tokenBreakdown: {
     bySource: [
       {

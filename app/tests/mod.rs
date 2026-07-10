@@ -4596,16 +4596,145 @@ fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
         .expect("context groups");
 
     assert_eq!(
-        llm_context_compression_group_indices(&message_groups, LlmContextCompressionMode::Normal),
+        llm_context_compression_group_indices(
+            &message_groups,
+            u64::MAX,
+            LlmContextCompressionMode::Normal,
+        ),
         vec![1]
     );
     assert_eq!(
         llm_context_compression_group_indices(
             &message_groups,
+            u64::MAX,
             LlmContextCompressionMode::RequiredOverflow
         ),
         vec![1, 2, 3]
     );
+}
+
+#[test]
+fn llm_context_compression_group_indices_include_recent_group_that_pack_would_drop() {
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "small history".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "large history".repeat(1_000)),
+        neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+    ];
+    let sequences = vec![None, Some(0), Some(1), Some(2)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 0 },
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::CurrentUser { sequence: 2 },
+    ];
+    let message_groups = context_message_groups(&messages, &sequences, &sources, messages.len())
+        .expect("context groups");
+    let large_group_tokens = message_groups[2].estimated_tokens;
+
+    assert_eq!(
+        llm_context_compression_group_indices(
+            &message_groups,
+            large_group_tokens.saturating_sub(1),
+            LlmContextCompressionMode::Normal,
+        ),
+        vec![2]
+    );
+}
+
+#[tokio::test]
+async fn ensure_context_compression_tries_llm_when_recent_large_group_would_be_dropped() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-large-recent-group-llm-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "small history".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "large history".repeat(1_000)),
+        neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+    ];
+    let sequences = vec![None, Some(0), Some(1), Some(2)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 0 },
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::CurrentUser { sequence: 2 },
+    ];
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 300);
+    context.provider_config.api_key = None;
+    context.active_tool_start_index = context.provider_request.messages.len();
+    assert!(prepared_context_total_used_tokens(&context) >= 950);
+
+    let error = ensure_context_compression(&mut context)
+        .await
+        .expect_err("large recent group should enter the LLM compression branch");
+
+    assert!(error.message().contains("API key"));
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-large-group-usage-preview-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "small history".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "large history".repeat(1_000)),
+        neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+    ];
+    let sequences = vec![None, Some(0), Some(1), Some(2)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 0 },
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::CurrentUser { sequence: 2 },
+    ];
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 300);
+    context.active_tool_start_index = context.provider_request.messages.len();
+    let context_window = context.context_budget.context_window;
+    let preview = PreparedPromptContext {
+        workspace_id: context.workspace_id,
+        workspace_path: context.workspace_path,
+        model_id: context.model_id,
+        provider_id: context.provider_id,
+        provider_config: context.provider_config,
+        provider_request: context.provider_request,
+        context_budget: context.context_budget,
+        memory_context_tokens: 0,
+        memory_budget_tokens: 0,
+        memories_used: Vec::new(),
+        compression_snapshots: context.compression_snapshots,
+        message_source_sequences: context.message_source_sequences,
+        message_context_sources: context.message_context_sources,
+        active_tool_start_index: context.active_tool_start_index,
+        session_mode: None,
+        chat_id: Some(context.chat_id),
+        is_new_chat: false,
+        raw_message: None,
+        message: None,
+        attachments: Vec::new(),
+        next_message_sequence: 3,
+        pending_context_injections: Vec::new(),
+        pending_memory_retrieval: None,
+        pending_spec_snapshot: None,
+    };
+    let usage = context_usage_response(&preview).expect("context usage response");
+
+    assert!(usage.assembled_usage_percent > 100);
+    assert!(usage.usage_percent < usage.assembled_usage_percent);
+    assert!(
+        usage.usage_percent
+            < usage
+                .assembled_message_tokens
+                .saturating_mul(100)
+                .div_ceil(context_window)
+    );
+    assert!(usage.has_llm_compression_plan);
+    assert!(usage.will_compress_on_next_send);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[tokio::test]
@@ -4698,12 +4827,17 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
     .expect("context groups");
     assert!(context_token_breakdown(&message_groups).required_tokens > 8);
     assert!(
-        llm_context_compression_group_indices(&message_groups, LlmContextCompressionMode::Normal)
-            .is_empty()
+        llm_context_compression_group_indices(
+            &message_groups,
+            context.context_budget.available_message_tokens,
+            LlmContextCompressionMode::Normal,
+        )
+        .is_empty()
     );
     assert_eq!(
         llm_context_compression_group_indices(
             &message_groups,
+            context.context_budget.available_message_tokens,
             LlmContextCompressionMode::RequiredOverflow
         ),
         vec![2, 3]
@@ -17613,13 +17747,6 @@ async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
             skill_ids: None,
             assistant_draft: None,
             assistant_draft_reasoning: None,
-            _latest_response_usage: Some(foco_providers::NeutralUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                reasoning_tokens: None,
-            }),
         }),
     )
     .await
@@ -17632,8 +17759,12 @@ async fn context_usage_preview_uses_assembled_prompt_budget_not_latest_usage() {
         context_compression_trigger_tokens(usage.context_window)
     );
     assert_eq!(usage.compression_trigger_percent, 80);
-    assert!(usage.total_used_context_tokens >= usage.compression_trigger_tokens);
-    assert!(usage.will_compress_on_next_send);
+    assert_eq!(usage.llm_compression_trigger_percent, 95);
+    assert!(usage.assembled_usage_percent >= usage.compression_trigger_percent);
+    assert_eq!(
+        usage.will_compress_on_next_send,
+        usage.has_llm_compression_plan
+    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
@@ -18195,6 +18326,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         context_compression_trigger_tokens(prompt_context.context_budget.context_window)
     );
     assert_eq!(usage.compression_trigger_percent, 80);
+    assert_eq!(usage.llm_compression_trigger_percent, 95);
     assert_eq!(
         usage.context_window,
         prompt_context.context_budget.context_window
@@ -18216,6 +18348,15 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         usage.usage_percent,
         usage
             .total_used_context_tokens
+            .saturating_mul(100)
+            .div_ceil(usage.context_window)
+    );
+    assert_eq!(
+        usage.assembled_usage_percent,
+        usage
+            .system_prompt_tokens
+            .saturating_add(usage.tool_schema_tokens)
+            .saturating_add(usage.assembled_message_tokens)
             .saturating_mul(100)
             .div_ceil(usage.context_window)
     );

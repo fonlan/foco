@@ -862,6 +862,7 @@ type ContextSourceTokenBreakdown = {
 export type ContextUsageResponse = {
   usedMessageTokens: number;
   assembledMessageTokens: number;
+  assembledUsagePercent: number;
   postCompressionMessageTokens: number;
   packedMessageTokens: number;
   availableMessageTokens: number;
@@ -877,6 +878,9 @@ export type ContextUsageResponse = {
   usagePercent: number;
   compressionTriggerTokens: number;
   compressionTriggerPercent: number;
+  llmCompressionTriggerTokens: number;
+  llmCompressionTriggerPercent: number;
+  hasLlmCompressionPlan: boolean;
   willCompressOnNextSend: boolean;
   segments: ContextUsageSegments;
   tokenBreakdown: ContextTokenBreakdown;

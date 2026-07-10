@@ -43,7 +43,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "memory.rejected": "Rejected",
     Current: "Current",
     Snapshot: "Snapshot",
-    "Past 80%": "Past 80%",
+    "Past {percent}%": "Past {percent}%",
     "Prompt/tools": "Prompt/tools",
     "Compression snapshot": "Compression snapshot",
     "Runtime tool-state snapshots": "Tool history compression",
@@ -489,6 +489,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Send: "发送",
     "Context usage": "上下文使用量",
     "Context usage {percent}%": "上下文使用量 {percent}%",
+    "Context usage {percent}% (assembled {assembledPercent}%)":
+      "上下文使用量 {percent}%（未裁剪组装量 {assembledPercent}%）",
     "Context compression may run on the next send":
       "下次发送可能会触发上下文压缩",
     "LLM request failed and reconnected": "大模型请求失败并已重连",
@@ -573,7 +575,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Context usage legend": "上下文用量图例",
     Current: "当前",
     Snapshot: "快照",
-    "Past 80%": "已超过 80%",
+    "Past {percent}%": "已超过 {percent}%",
     "Prompt/tools": "提示词/工具",
     "Compression snapshot": "压缩快照",
     "Compression snapshots": "压缩快照",

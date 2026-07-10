@@ -141,8 +141,6 @@ pub(crate) struct ContextUsageRequest {
     pub(crate) skill_ids: Option<Vec<String>>,
     pub(crate) assistant_draft: Option<String>,
     pub(crate) assistant_draft_reasoning: Option<String>,
-    #[serde(default, rename = "latestResponseUsage")]
-    pub(crate) _latest_response_usage: Option<NeutralUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -172,6 +170,7 @@ pub(crate) struct ChatAttachmentPart {
 pub(crate) struct ContextUsageResponse {
     pub(crate) used_message_tokens: u64,
     pub(crate) assembled_message_tokens: u64,
+    pub(crate) assembled_usage_percent: u64,
     pub(crate) post_compression_message_tokens: u64,
     pub(crate) packed_message_tokens: u64,
     pub(crate) available_message_tokens: u64,
@@ -187,6 +186,9 @@ pub(crate) struct ContextUsageResponse {
     pub(crate) usage_percent: u64,
     pub(crate) compression_trigger_tokens: u64,
     pub(crate) compression_trigger_percent: u64,
+    pub(crate) llm_compression_trigger_tokens: u64,
+    pub(crate) llm_compression_trigger_percent: u64,
+    pub(crate) has_llm_compression_plan: bool,
     pub(crate) will_compress_on_next_send: bool,
     pub(crate) segments: ContextUsageSegments,
     pub(crate) token_breakdown: ContextTokenBreakdown,

@@ -3140,6 +3140,13 @@ describe("app-panels-stats verification surfaces", () => {
 
     await user.click(await screen.findByRole("tab", { name: "Stats" }));
 
+    const contextTimeline = screen.getByLabelText("Context usage timeline");
+    expect(within(contextTimeline).getByText("55%")).toBeInTheDocument();
+    expect(
+      contextTimeline.querySelector<HTMLElement>(".context-usage-bar-track"),
+    ).toHaveAttribute("title", "70,000 / 128,000");
+    expect(within(contextTimeline).getByText("70,000")).toBeInTheDocument();
+
     const contextMix = screen.getByText("Context mix").parentElement!;
     expect(
       within(contextMix).queryByText("52,340 / 110,960"),
