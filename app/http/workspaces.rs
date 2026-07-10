@@ -1051,7 +1051,10 @@ pub(crate) async fn workspace_logo_thumbnail(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, thumbnail.content_type)
-        .header(header::CACHE_CONTROL, "private, max-age=60")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
         .body(Body::from(thumbnail.bytes))
         .expect("workspace logo thumbnail response is valid"))
 }

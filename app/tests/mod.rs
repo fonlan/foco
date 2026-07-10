@@ -76,7 +76,7 @@ use crate::http::{
         workspace_spec_jobs,
     },
     terminal::create_terminal_session,
-    workspaces::{WorkspacePathRequest, add_workspace},
+    workspaces::{WorkspacePathRequest, add_workspace, workspace_logo_thumbnail},
 };
 use crate::memory_runtime::scheduler::{
     dispatch_auto_memory_dreams_at, memory_dream_interval_due, reconcile_memory_dream_runs,
@@ -6977,7 +6977,7 @@ fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo_and_thu
 }
 
 #[test]
-fn workspace_logo_thumbnail_generates_png_with_160px_bounds_and_ignores_legacy_cache() {
+fn workspace_logo_thumbnail_generates_png_with_160px_bounds_without_writing_cache_files() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-thumb-test"));
     let logo_dir = workspace_dir.join(".foco");
     fs::create_dir_all(&logo_dir).expect("logo directory");
@@ -7018,14 +7018,63 @@ fn workspace_logo_thumbnail_generates_png_with_160px_bounds_and_ignores_legacy_c
         WORKSPACE_LOGO_THUMBNAIL_SIZE
     );
     assert_eq!((decoded.width(), decoded.height()), (160, 80));
-    assert!(logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE).is_file());
-    assert!(
-        logo_dir
-            .join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE)
-            .is_file()
+    for file_name in [
+        WORKSPACE_LOGO_THUMBNAIL_FILE,
+        WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE,
+    ] {
+        assert!(!logo_dir.join(file_name).exists());
+    }
+    assert_eq!(
+        fs::read(logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_FILE))
+            .expect("read legacy thumbnail cache"),
+        b"legacy 32px thumbnail"
+    );
+    assert_eq!(
+        fs::read(logo_dir.join(LEGACY_WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE))
+            .expect("read legacy thumbnail version"),
+        b"legacy version"
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn workspace_logo_thumbnail_uses_long_lived_private_http_cache() {
+    let profile = tempfile::tempdir().expect("profile tempdir");
+    let workspace_dir = profile.path().join("workspace");
+    let logo_dir = workspace_dir.join(".foco");
+    fs::create_dir_all(&logo_dir).expect("logo directory");
+
+    let source = image::RgbaImage::from_pixel(32, 16, image::Rgba([24, 48, 96, 255]));
+    let mut source_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(source)
+        .write_to(&mut source_png, image::ImageFormat::Png)
+        .expect("encode source png");
+    fs::write(logo_dir.join("logo.png"), source_png.into_inner()).expect("write png logo");
+
+    let config = GlobalConfig::first_run(workspace_dir);
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let response =
+        workspace_logo_thumbnail(State(state), AxumPath(DEFAULT_WORKSPACE_ID.to_string()))
+            .await
+            .expect("thumbnail response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, max-age=31536000, immutable")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
 }
 
 #[test]

@@ -6873,7 +6873,7 @@ struct WorkspaceLogoThumbnail {
 fn workspace_logo_thumbnail_file(
     logo: &WorkspaceLogoFile,
 ) -> Result<WorkspaceLogoThumbnail, ApiError> {
-    let (bytes, metadata) = read_workspace_logo_file(&logo.path)?;
+    let (bytes, _) = read_workspace_logo_file(&logo.path)?;
     let kind = workspace_logo_kind(&bytes)?;
     if kind != logo.kind {
         return Err(ApiError::bad_request(format!(
@@ -6890,90 +6890,9 @@ fn workspace_logo_thumbnail_file(
         });
     }
 
-    if let Some(thumbnail) = read_workspace_logo_thumbnail_cache(logo)? {
-        return Ok(WorkspaceLogoThumbnail {
-            bytes: thumbnail,
-            content_type: "image/png",
-        });
-    }
-
-    let thumbnail = generate_workspace_logo_thumbnail_png(&bytes, &logo.path)?;
-    write_workspace_logo_thumbnail_cache(logo, &thumbnail, &metadata)?;
     Ok(WorkspaceLogoThumbnail {
-        bytes: thumbnail,
+        bytes: generate_workspace_logo_thumbnail_png(&bytes, &logo.path)?,
         content_type: "image/png",
-    })
-}
-
-fn workspace_logo_thumbnail_cache_paths(
-    logo: &WorkspaceLogoFile,
-) -> Result<(PathBuf, PathBuf), ApiError> {
-    let Some(logo_dir) = logo.path.parent() else {
-        return Err(ApiError::internal(format!(
-            "workspace logo has no parent directory: {}",
-            logo.path.display()
-        )));
-    };
-
-    Ok((
-        logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_FILE),
-        logo_dir.join(WORKSPACE_LOGO_THUMBNAIL_VERSION_FILE),
-    ))
-}
-
-fn read_workspace_logo_thumbnail_cache(
-    logo: &WorkspaceLogoFile,
-) -> Result<Option<Vec<u8>>, ApiError> {
-    let (thumbnail_path, version_path) = workspace_logo_thumbnail_cache_paths(logo)?;
-    if !thumbnail_path.exists() || !version_path.exists() {
-        return Ok(None);
-    }
-    if !thumbnail_path.is_file() {
-        return Err(ApiError::bad_request(format!(
-            "workspace logo thumbnail path must be a file: {}",
-            thumbnail_path.display()
-        )));
-    }
-
-    let cached_version = fs::read_to_string(&version_path).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to read workspace logo thumbnail version {}: {}",
-            version_path.display(),
-            source
-        ))
-    })?;
-    if cached_version != logo.version {
-        return Ok(None);
-    }
-
-    fs::read(&thumbnail_path).map(Some).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to read workspace logo thumbnail {}: {}",
-            thumbnail_path.display(),
-            source
-        ))
-    })
-}
-
-fn write_workspace_logo_thumbnail_cache(
-    logo: &WorkspaceLogoFile,
-    thumbnail: &[u8],
-    metadata: &fs::Metadata,
-) -> Result<(), ApiError> {
-    let (thumbnail_path, version_path) = workspace_logo_thumbnail_cache_paths(logo)?;
-    fs::write(&thumbnail_path, thumbnail).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to write workspace logo thumbnail {}: {}",
-            thumbnail_path.display(),
-            source
-        ))
-    })?;
-    fs::write(&version_path, workspace_logo_version(metadata)).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to write workspace logo thumbnail version {}: {}",
-            version_path.display(),
-            source
-        ))
     })
 }
 
