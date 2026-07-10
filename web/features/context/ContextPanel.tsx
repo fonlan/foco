@@ -139,6 +139,7 @@ const ContextPanel = memo(function ContextPanel({
   isPlanAutoRunEnabled,
   planAutoRunBlockedReason,
   isPlanAutoRunToggleDisabled,
+  runtimeToolStateCompressionEnabled,
   loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
   isLoadingTodoGraph,
@@ -217,6 +218,7 @@ const ContextPanel = memo(function ContextPanel({
   isPlanAutoRunEnabled: boolean;
   planAutoRunBlockedReason: string | null;
   isPlanAutoRunToggleDisabled: boolean;
+  runtimeToolStateCompressionEnabled: boolean;
   loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
@@ -425,6 +427,7 @@ const ContextPanel = memo(function ContextPanel({
             contextUsage={contextUsage}
             error={chatStatisticsError}
             isLoading={isLoadingChatStatistics}
+            runtimeToolStateCompressionEnabled={runtimeToolStateCompressionEnabled}
             statistics={chatStatistics}
           />
         ) : null}
@@ -2242,11 +2245,13 @@ function ContextStatsTab({
   contextUsage,
   error,
   isLoading,
+  runtimeToolStateCompressionEnabled,
   statistics,
 }: {
   contextUsage: ContextUsageResponse | null;
   error: string | null;
   isLoading: boolean;
+  runtimeToolStateCompressionEnabled: boolean;
   statistics: ChatStatisticsResponse | null;
 }) {
   const { language, t } = useI18n();
@@ -2388,13 +2393,17 @@ function ContextStatsTab({
               label: t("LLM compression snapshots"),
               value: formatNumber(statistics.compression.llmSnapshotCount, language),
             },
-            {
-              label: t("Runtime tool-state snapshots"),
-              value: formatNumber(
-                statistics.compression.runtimeToolStateSnapshotCount,
-                language,
-              ),
-            },
+            ...(runtimeToolStateCompressionEnabled
+              ? [
+                  {
+                    label: t("Runtime tool-state snapshots"),
+                    value: formatNumber(
+                      statistics.compression.runtimeToolStateSnapshotCount,
+                      language,
+                    ),
+                  },
+                ]
+              : []),
             {
               label: t("Tokens saved"),
               value: formatNumber(statistics.compression.savedTokenCount, language),

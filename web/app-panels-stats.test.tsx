@@ -3088,12 +3088,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(toolsSection).queryByText("Compression snapshots"),
     ).not.toBeInTheDocument();
-    expect(screen.getByText("Tool history compression")).toBeInTheDocument();
     expect(
-      within(
-        screen.getByText("Tool history compression").parentElement!,
-      ).getByText("2"),
-    ).toBeInTheDocument();
+      within(toolsSection).queryByText("Tool history compression"),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("52,340 / 110,960")).not.toBeInTheDocument();
     const contextTimeline = screen.getByLabelText("Context usage timeline");
     expect(within(contextTimeline).getByText("47%")).toBeInTheDocument();
@@ -3144,6 +3141,27 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBe(true);
   });
 
+  it("shows tool history compression when runtime tool-state compression is enabled", async () => {
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      general: {
+        ...appTestState.settingsResponse.general,
+        runtimeToolStateCompressionEnabled: true,
+      },
+    };
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
+
+    const toolHistoryCompression = await screen.findByText(
+      "Tool history compression",
+    );
+    expect(
+      within(toolHistoryCompression.parentElement!).getByText("2"),
+    ).toBeInTheDocument();
+  });
+
   it("renders partial active chat statistics and context usage payloads without crashing", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (input, init) => {
@@ -3186,8 +3204,8 @@ describe("app-panels-stats verification surfaces", () => {
       within(toolsSection).getByText("LLM compression snapshots"),
     ).toBeInTheDocument();
     expect(
-      within(toolsSection).getByText("Tool history compression"),
-    ).toBeInTheDocument();
+      within(toolsSection).queryByText("Tool history compression"),
+    ).not.toBeInTheDocument();
     expect(
       within(toolsSection).getAllByText("0").length,
     ).toBeGreaterThanOrEqual(2);

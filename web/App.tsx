@@ -11168,6 +11168,9 @@ export function App() {
                 isPlanAutoRunEnabled={isPlanAutoRunEnabled}
                 planAutoRunBlockedReason={planAutoRunBlockedReason}
                 isPlanAutoRunToggleDisabled={!activeWorkspace?.id}
+                runtimeToolStateCompressionEnabled={
+                  settings?.general.runtimeToolStateCompressionEnabled ?? false
+                }
                 isLoadingTodoGraph={isLoadingTodoGraph}
                 isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}
                 isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
