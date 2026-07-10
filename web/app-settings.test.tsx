@@ -655,6 +655,87 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("polls Spec job history until a retried job completes", async () => {
+    appTestState.settingsSpecJobsResponse = [appTestState.settingsSpecJobsResponse[0]];
+    const fetchMock = vi.mocked(fetch);
+    let specPoll: (() => void) | null = null;
+    const originalSetInterval = window.setInterval.bind(window);
+    const pollIntervalId = 7400 as unknown as ReturnType<typeof window.setInterval>;
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+    vi.spyOn(window, "setInterval").mockImplementation(((
+      ...args: Parameters<typeof window.setInterval>
+    ) => {
+      const [handler, timeout] = args;
+      if (timeout === 3000 && typeof handler === "function") {
+        specPoll = () => handler();
+        return pollIntervalId;
+      }
+      return (originalSetInterval as (...intervalArgs: unknown[]) => unknown)(
+        ...args,
+      ) as ReturnType<typeof window.setInterval>;
+    }) as typeof window.setInterval);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Retry Spec job" }),
+    );
+
+    expect(await within(specHistorySection).findByText("Queued")).toBeInTheDocument();
+    await waitFor(() => expect(specPoll).not.toBeNull());
+    const activeJob = appTestState.settingsSpecJobsResponse.find(
+      (item) => item.job.status === "queued" || item.job.status === "running",
+    );
+    expect(activeJob).toBeDefined();
+    appTestState.settingsSpecJobsResponse = activeJob
+      ? appTestState.settingsSpecJobsResponse.map((item) =>
+        item.job.id === activeJob.job.id
+          ? {
+            ...item,
+            job: {
+              ...item.job,
+              completedAt: "2026-06-11T03:13:00Z",
+              output: { contentBytes: 640, revision: 5 },
+              startedAt: "2026-06-11T03:12:10Z",
+              status: "completed",
+            },
+          }
+          : item,
+      )
+      : appTestState.settingsSpecJobsResponse;
+
+    const poll = specPoll as (() => void) | null;
+    if (!poll) {
+      throw new Error("Expected Spec job history polling interval to be registered");
+    }
+    await act(async () => {
+      poll();
+    });
+
+    await waitFor(() => {
+      expect(within(specHistorySection).queryByText("Queued")).not.toBeInTheDocument();
+      expect(within(specHistorySection).getAllByText("No Spec jobs")).not.toHaveLength(0);
+      expect(clearIntervalSpy).toHaveBeenCalledWith(pollIntervalId);
+    });
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const value = String(input);
+        return (
+          value.startsWith("/api/settings/spec/jobs?") &&
+          value.includes("page=1") &&
+          value.includes("pageSize=20") &&
+          value.includes("retryableOnly=true")
+        );
+      }),
+    ).toBe(true);
+  });
+
   it("hides Spec retry buttons for failed jobs that already have retry jobs", async () => {
     const failedJob = appTestState.settingsSpecJobsResponse[0];
     appTestState.settingsSpecJobsResponse = [

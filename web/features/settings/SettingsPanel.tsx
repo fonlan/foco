@@ -343,6 +343,8 @@ const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 
 const MEMORY_DREAM_POLL_INTERVAL_MS = 3000;
 
+const SPEC_JOBS_POLL_INTERVAL_MS = 3000;
+
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
 type SkillStoreUpdateResponse = {
@@ -747,6 +749,9 @@ export function SettingsPanel({
   const specJobsPageEnd = specJobs.length
     ? Math.min(specJobsTotalCount, specJobsPageStart + specJobs.length - 1)
     : 0;
+  const hasActiveSpecJobs = specJobs.some(
+    (item) => item.job.status === "queued" || item.job.status === "running",
+  );
   const planHistoryPaginationItems = auditPaginationItems(
     planHistoryPage,
     planHistoryTotalPages,
@@ -1421,6 +1426,18 @@ export function SettingsPanel({
       void loadSpecJobs();
     }
   }, [activeSection, loadSpecJobs]);
+
+  useEffect(() => {
+    if (activeSection !== "spec" || !hasActiveSpecJobs) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadSpecJobs();
+    }, SPEC_JOBS_POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [activeSection, hasActiveSpecJobs, loadSpecJobs]);
 
   useEffect(() => {
     if (activeSection === "plan") {
@@ -2257,7 +2274,6 @@ export function SettingsPanel({
         `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs/${encodeURIComponent(jobId)}/retry`,
         { method: "POST" },
       );
-      // ponytail: no auto polling yet; entering the page and Refresh cover the first version.
       await loadSpecJobs();
     } catch (requestError) {
       setError(errorMessage(requestError));
