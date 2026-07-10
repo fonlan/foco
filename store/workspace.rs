@@ -2097,18 +2097,22 @@ impl WorkspaceDatabase {
             .map(str::trim)
             .unwrap_or(current.overview.as_str())
             .to_string();
-        let status = match patch.status {
-            Some("completed") => {
+        if let Some(status) = patch.status {
+            validate_plan_status(status)?;
+            if status == "completed" {
                 return Err(WorkspaceDatabaseError::InvalidPlan {
                     message: "use mark_complete to complete a plan".to_string(),
                 });
             }
-            Some(status) => {
-                validate_plan_status(status)?;
-                status.to_string()
+            if status != current.status {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: format!(
+                        "plan status cannot be changed from '{}' to '{}' with update_plan; use a plan action or state-machine reconciliation",
+                        current.status, status
+                    ),
+                });
             }
-            None => current.status,
-        };
+        }
         let error_message = match patch.error_message {
             Some(Some(message)) => Some(message.trim().to_string()),
             Some(None) => None,
@@ -2120,18 +2124,71 @@ impl WorkspaceDatabase {
                 "UPDATE plans
                  SET title = ?2,
                      overview = ?3,
-                     status = ?4,
-                     error_message = ?5,
-                     updated_at = ?6,
-                     completed_at = CASE WHEN ?4 = 'implemented' THEN COALESCE(completed_at, ?6) ELSE completed_at END,
-                     completed_by_user_at = CASE WHEN ?4 = 'completed' THEN COALESCE(completed_by_user_at, ?6) ELSE completed_by_user_at END
+                     error_message = ?4,
+                     updated_at = ?5
                  WHERE id = ?1",
-                params![plan_id.trim(), title, overview, status, error_message, now],
+                params![plan_id.trim(), title, overview, error_message, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
         self.plan(plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan was not found after update: {}", plan_id.trim()),
+            })
+    }
+
+    pub fn mark_plan_invalid(
+        &mut self,
+        plan_id: &str,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(
+            plan.status.as_str(),
+            "implemented" | "completed" | "cancelled"
+        ) {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{}' cannot be marked invalid while {}",
+                    plan.id, plan.status
+                ),
+            });
+        }
+        if plan.phases.iter().any(|phase| {
+            phase
+                .attempts
+                .iter()
+                .any(|attempt| matches!(attempt.status.as_str(), "queued" | "running"))
+        }) {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{}' cannot be marked invalid while a phase attempt is active",
+                    plan.id
+                ),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     pause_requested_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan.id, error_message.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan was not found after invalid reconciliation: {}",
+                    plan_id.trim()
+                ),
             })
     }
 

@@ -27,16 +27,16 @@ use foco_store::{
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
         NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPhaseAttemptTrigger,
-        PlanStepPatch, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
-        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        prune_workspace_database_backups, workspace_database_path,
+        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
+        PlanPhaseAttemptTrigger, PlanStepPatch, RewriteChatFromUserMessage,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -638,6 +638,139 @@ fn create_minimal_plan(database: &mut WorkspaceDatabase, id: &str, status: &str)
             }],
         })
         .expect("create minimal plan");
+}
+
+#[test]
+fn update_plan_cannot_bypass_execution_state_machine() {
+    for phase_status in ["pending", "running", "failed", "cancelled"] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let plan_id = format!("plan-update-guard-{phase_status}");
+        create_minimal_plan(&mut database, &plan_id, "ready");
+        let connection = Connection::open(database.database_path()).expect("open fixture database");
+        connection
+            .execute(
+                "UPDATE plan_phases SET status = ?2 WHERE plan_id = ?1",
+                params![plan_id, phase_status],
+            )
+            .expect("set phase fixture status");
+
+        let error = database
+            .update_plan(
+                &plan_id,
+                PlanPatch {
+                    title: None,
+                    overview: None,
+                    status: Some("implemented"),
+                    error_message: None,
+                },
+            )
+            .expect_err("generic update must not set implemented");
+        assert!(
+            error.to_string().contains("cannot be changed"),
+            "unexpected error for {phase_status}: {error}"
+        );
+        assert_eq!(
+            database
+                .plan(&plan_id)
+                .expect("plan lookup")
+                .expect("plan")
+                .status,
+            "ready"
+        );
+    }
+}
+
+#[test]
+fn update_plan_only_edits_metadata_and_normal_state_machine_still_completes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    create_minimal_plan(&mut database, "plan-update-metadata", "ready");
+
+    let updated = database
+        .update_plan(
+            "plan-update-metadata",
+            PlanPatch {
+                title: Some("Updated title"),
+                overview: Some("Updated overview"),
+                status: Some("ready"),
+                error_message: Some(Some("visible note")),
+            },
+        )
+        .expect("metadata update");
+    assert_eq!(updated.status, "ready");
+    assert_eq!(updated.title, "Updated title");
+    assert_eq!(updated.error_message.as_deref(), Some("visible note"));
+
+    database
+        .transition_plan("plan-update-metadata", "start")
+        .expect("start plan");
+    let implemented = database
+        .update_plan_step(
+            "plan-update-metadata",
+            "plan-update-metadata-step",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete through state machine");
+    assert_eq!(implemented.status, "implemented");
+    let completed = database
+        .transition_plan("plan-update-metadata", "mark_complete")
+        .expect("mark complete");
+    assert_eq!(completed.status, "completed");
+}
+
+#[test]
+fn mark_plan_invalid_is_narrow_and_rejects_active_or_terminal_plans() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    create_minimal_plan(&mut database, "plan-invalid-reconcile", "ready");
+    let failed = database
+        .mark_plan_invalid("plan-invalid-reconcile", "invalid scheduler candidate")
+        .expect("reconcile invalid plan");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        failed.error_message.as_deref(),
+        Some("invalid scheduler candidate")
+    );
+
+    create_minimal_plan(&mut database, "plan-invalid-active", "ready");
+    database
+        .transition_plan("plan-invalid-active", "start")
+        .expect("start active plan");
+    database
+        .begin_plan_phase_attempt(
+            "plan-invalid-active",
+            "plan-invalid-active-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+        )
+        .expect("begin active attempt");
+    let active_error = database
+        .mark_plan_invalid("plan-invalid-active", "must not bypass active attempt")
+        .expect_err("active attempt must block invalid reconciliation");
+    assert!(active_error.to_string().contains("attempt is active"));
+
+    let connection = Connection::open(database.database_path()).expect("open fixture database");
+    connection
+        .execute(
+            "UPDATE plans SET status = 'implemented' WHERE id = 'plan-invalid-reconcile'",
+            [],
+        )
+        .expect("create historical terminal fixture");
+    let terminal_error = database
+        .mark_plan_invalid("plan-invalid-reconcile", "must not rewrite terminal plan")
+        .expect_err("terminal plan must be preserved");
+    assert!(terminal_error.to_string().contains("while implemented"));
 }
 
 #[test]

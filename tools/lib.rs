@@ -1702,6 +1702,38 @@ mod tests {
     }
 
     #[test]
+    fn generic_update_plan_tool_cannot_set_execution_status() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        insert_test_plan(workspace.path(), "plan-tool-status-guard", None);
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_PLAN_TOOL,
+            json!({
+                "planId": "plan-tool-status-guard",
+                "title": null,
+                "overview": null,
+                "status": "implemented",
+                "errorMessage": null,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error);
+        assert_error_contains(&result, "cannot be changed");
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        assert_eq!(
+            database
+                .plan("plan-tool-status-guard")
+                .expect("plan lookup")
+                .expect("plan")
+                .status,
+            "ready"
+        );
+    }
+
+    #[test]
     fn plan_mode_rejects_plan_status_mutations_but_allows_content_updates() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut database =

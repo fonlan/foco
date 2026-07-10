@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use foco_store::{
     config::WorkspaceConfig,
-    workspace::{PlanAutoRunSelection, PlanAutoRunStateRecord, PlanPatch},
+    workspace::{PlanAutoRunSelection, PlanAutoRunStateRecord},
 };
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
@@ -188,21 +188,13 @@ async fn dispatch_next_plan_auto_run(
         Err(error) if error.message.starts_with("invalid plan:") => {
             let mut database = open_workspace_database(&workspace.path)?;
             let error_message = format!("Plan auto-run skipped invalid item: {}", error.message);
-            match database.update_plan(
-                &candidate.plan_id,
-                PlanPatch {
-                    title: None,
-                    overview: None,
-                    status: Some("failed"),
-                    error_message: Some(Some(&error_message)),
-                },
-            ) {
+            match database.mark_plan_invalid(&candidate.plan_id, &error_message) {
                 Ok(_) => {
                     tracing::warn!(
                         workspace_id = %workspace.id,
                         plan_id = %candidate.plan_id,
                         error = %error.message,
-                        "Plan auto-run marked invalid candidate failed"
+                        "Plan auto-run reconciled invalid candidate as failed"
                     );
                     Ok(PlanAutoRunDispatch::Blocked)
                 }
@@ -219,7 +211,7 @@ async fn dispatch_next_plan_auto_run(
                         plan_id = %candidate.plan_id,
                         error = %error.message,
                         mark_error = %mark_error,
-                        "Plan auto-run paused after invalid candidate could not be marked failed"
+                        "Plan auto-run paused after invalid candidate could not be reconciled"
                     );
                     Err(error)
                 }
