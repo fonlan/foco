@@ -11027,6 +11027,95 @@ async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
     remove_dir_if_exists(&profile_dir);
 }
 
+#[tokio::test]
+async fn worker_chat_context_does_not_replace_parent_queued_run() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worker-queued-run-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-worker-queued-run-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat_with_metadata(
+                "chat-worker-queued-run",
+                "Worker queued run isolation",
+                r#"{"queuedRun":{"status":"running","userMessageId":"parent-user","assistantMessageId":"parent-assistant","assistantSequence":1,"modelId":"model"}}"#,
+            )
+            .expect("chat insert");
+    }
+
+    let context = prepare_chat_context_for_output(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: Some("parent-task:worker-task".to_string()),
+            run_id_override: Some("worker-task".to_string()),
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: Some("chat-worker-queued-run".to_string()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Review the parent task".to_string(),
+            attachments: Vec::new(),
+        },
+        false,
+    )
+    .await
+    .expect("worker chat context");
+
+    persist_running_llm_request(
+        &context,
+        "worker-request",
+        "2026-07-11T05:00:00Z",
+        "{}",
+        &[],
+    )
+    .expect("worker audit start");
+    persist_chat_result(
+        &context,
+        "2026-07-11T05:00:00Z",
+        test_chat_outcome("succeeded"),
+        &[],
+        Some("Review complete"),
+        None,
+        &[],
+    )
+    .expect("worker result persistence");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let chat = database
+        .chat("chat-worker-queued-run")
+        .expect("chat read")
+        .expect("chat");
+    let metadata =
+        parse_json_value(&chat.metadata_json, "chat metadata").expect("chat metadata json");
+    assert_eq!(metadata["queuedRun"]["userMessageId"], "parent-user");
+    assert_eq!(
+        metadata["queuedRun"]["assistantMessageId"],
+        "parent-assistant"
+    );
+    assert!(
+        database
+            .llm_request("worker-request")
+            .expect("worker audit read")
+            .is_some()
+    );
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
 #[test]
 fn persist_chat_result_writes_each_captured_llm_request() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-multi-audit-request-test"));

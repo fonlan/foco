@@ -1501,14 +1501,18 @@ pub(crate) fn persist_chat_result(
         .map_err(ApiError::from_workspace_error)?;
     let final_state = outcome.final_state;
 
-    let current_history_run = context
-        .queued_user_message_id
-        .as_deref()
-        .map(|queued_user_message_id| {
-            queued_chat_run_matches_context(&database, context, queued_user_message_id)
-        })
-        .transpose()?
-        .unwrap_or(true);
+    let current_history_run = if context.agent_primary_chat_output {
+        context
+            .queued_user_message_id
+            .as_deref()
+            .map(|queued_user_message_id| {
+                queued_chat_run_matches_context(&database, context, queued_user_message_id)
+            })
+            .transpose()?
+            .unwrap_or(true)
+    } else {
+        true
+    };
 
     if context.captured_llm_requests.is_empty() {
         let run_request =
@@ -1644,7 +1648,9 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    if let Some(queued_user_message_id) = &context.queued_user_message_id {
+    if context.agent_primary_chat_output
+        && let Some(queued_user_message_id) = &context.queued_user_message_id
+    {
         database
             .clear_chat_queued_run(&context.chat_id, queued_user_message_id)
             .map_err(ApiError::from_workspace_error)?;
@@ -1734,7 +1740,8 @@ pub(crate) fn persist_running_llm_request(
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let save_details = api_audit_save_details(&context.global_config);
-    if let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
+    if context.agent_primary_chat_output
+        && let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
         && !queued_chat_run_matches_context(&database, context, queued_user_message_id)?
     {
         return Err(ApiError::conflict(

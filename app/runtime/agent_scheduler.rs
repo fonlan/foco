@@ -539,7 +539,8 @@ async fn run_coordinator_task_inner(
 
     let config = config_snapshot(state)?;
     validate_agent_snapshot_for_workspace(&config, workspace, &instance.definition_snapshot)?;
-    let mut chat_context = prepare_chat_context(
+    let agent_primary_chat_output = instance.role == AgentRole::Coordinator;
+    let mut chat_context = prepare_chat_context_for_output(
         state,
         &config,
         &workspace.id,
@@ -557,6 +558,7 @@ async fn run_coordinator_task_inner(
             message: task_input.message.clone(),
             attachments: task_input.attachments.clone(),
         },
+        agent_primary_chat_output,
     )
     .await?;
     chat_context.tool_workspace_path = match instance.execution_workspace_mode {
@@ -602,7 +604,6 @@ async fn run_coordinator_task_inner(
         &collaboration_permissions,
         &config.agent_definitions,
     )?;
-    chat_context.agent_primary_chat_output = instance.role == AgentRole::Coordinator;
     chat_context.agent_unread_messages = agent_unread_messages;
     if chat_context.pending_memory_retrieval.is_none() {
         chat_context.provider_request.prompt_cache_key = Some(prompt_cache_key(

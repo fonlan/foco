@@ -4320,6 +4320,16 @@ async fn prepare_chat_context(
     workspace_id: &str,
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
+    prepare_chat_context_for_output(state, config, workspace_id, request, true).await
+}
+
+async fn prepare_chat_context_for_output(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace_id: &str,
+    request: ChatStreamRequest,
+    agent_primary_chat_output: bool,
+) -> Result<PreparedChatContext, ApiError> {
     let queued_user_message_id = request
         .queued_user_message_id
         .as_deref()
@@ -4520,14 +4530,16 @@ async fn prepare_chat_context(
                 metadata_json: Some(&user_metadata_json),
             })
             .map_err(ApiError::from_workspace_error)?;
-        database
-            .mark_chat_queued_run_started(
-                &chat_id,
-                &user_message_id,
-                &assistant_message_id,
-                assistant_sequence,
-            )
-            .map_err(ApiError::from_workspace_error)?;
+        if agent_primary_chat_output {
+            database
+                .mark_chat_queued_run_started(
+                    &chat_id,
+                    &user_message_id,
+                    &assistant_message_id,
+                    assistant_sequence,
+                )
+                .map_err(ApiError::from_workspace_error)?;
+        }
     } else {
         database
             .insert_message(NewMessage {
@@ -4600,7 +4612,7 @@ async fn prepare_chat_context(
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
         agent_tool_context: None,
-        agent_primary_chat_output: true,
+        agent_primary_chat_output,
         session_mode: prompt_context.session_mode,
         session_upload_paths: None,
         provider_config: prompt_context.provider_config,
