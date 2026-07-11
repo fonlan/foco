@@ -683,7 +683,6 @@ fn test_prepared_chat_context(
         memory_settings: MemorySettings::default(),
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
-        request_body_json: "{}".to_string(),
         captured_llm_requests: Vec::new(),
         compression_snapshots: Vec::new(),
         message_source_sequences,
@@ -808,45 +807,6 @@ fn prompt_cache_key_includes_agent_layers_and_resolved_memory() {
     )
     .expect("memory cache key");
     assert_ne!(base_key, memory_key);
-}
-
-#[test]
-fn serialized_provider_request_promotes_leading_system_messages_to_instructions() {
-    let request = NeutralChatRequest {
-        model_id: "gpt-5.4".to_string(),
-        messages: vec![
-            neutral_text_message(NeutralChatRole::System, "base".to_string()),
-            neutral_text_message(NeutralChatRole::System, "workspace prompt".to_string()),
-            neutral_text_message(NeutralChatRole::Developer, "skills".to_string()),
-            neutral_text_message(NeutralChatRole::User, "go".to_string()),
-        ],
-        tools: Vec::new(),
-        thinking_level: None,
-        max_output_tokens: Some(16),
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-    };
-
-    let request_json: Value =
-        serde_json::from_str(&serialize_provider_request(&request).expect("request json"))
-            .expect("serialized request is json");
-    assert_eq!(
-        request_json.get("instructions").and_then(Value::as_str),
-        Some("base\n\nworkspace prompt")
-    );
-    let messages = request_json
-        .get("messages")
-        .and_then(Value::as_array)
-        .expect("messages array");
-    assert_eq!(messages.len(), 2);
-    assert_eq!(
-        messages[0].get("role").and_then(Value::as_str),
-        Some("developer")
-    );
-    assert_eq!(
-        messages[1].get("role").and_then(Value::as_str),
-        Some("user")
-    );
 }
 
 #[tokio::test]
@@ -8387,12 +8347,10 @@ Only load this when matched.
             .content
             .contains("Only load this when matched")
     );
-    assert!(scheduler_context.request_body_json.contains("## Skills"));
-    assert!(
-        scheduler_context
-            .request_body_json
-            .contains("- Name: \\\"queuedmemo\\\";")
-    );
+    let scheduler_request_json =
+        serde_json::to_string(&scheduler_context.provider_request).expect("scheduler request json");
+    assert!(scheduler_request_json.contains("## Skills"));
+    assert!(scheduler_request_json.contains("- Name: \\\"queuedmemo\\\";"));
 
     drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -8500,22 +8458,18 @@ Only load this when matched.
     .expect("scheduler chat context");
 
     assert!(scheduler_context.pending_memory_retrieval.is_some());
-    assert!(scheduler_context.request_body_json.contains("## Skills"));
-    assert!(
-        scheduler_context
-            .request_body_json
-            .contains("- Name: \\\"deferredmemo\\\";")
-    );
+    let scheduler_request_json =
+        serde_json::to_string(&scheduler_context.provider_request).expect("scheduler request json");
+    assert!(scheduler_request_json.contains("## Skills"));
+    assert!(scheduler_request_json.contains("- Name: \\\"deferredmemo\\\";"));
     assert_eq!(
-        scheduler_context
-            .request_body_json
+        scheduler_request_json
             .matches("## Extra Prompt Context")
             .count(),
         1
     );
     assert_eq!(
-        scheduler_context
-            .request_body_json
+        scheduler_request_json
             .matches(EXTRA_PROMPT_MESSAGE_PREFIX)
             .count(),
         1
@@ -9784,7 +9738,6 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
-        request_body_json: "{}".to_string(),
         captured_llm_requests: Vec::new(),
         compression_snapshots: Vec::new(),
         message_source_sequences: vec![Some(0)],
@@ -9833,8 +9786,14 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         memories_used: Vec::new(),
     });
 
-    persist_running_llm_request(&context, "request-1", "2026-06-06T09:00:00Z", "{}", &[])
-        .expect("persist running LLM request");
+    persist_running_llm_request(
+        &context,
+        "request-1",
+        "2026-06-06T09:00:00Z",
+        Some("{}"),
+        &[],
+    )
+    .expect("persist running LLM request");
     persist_chat_result(
         &context,
         "2026-06-06T09:00:00Z",
@@ -10311,9 +10270,14 @@ fn persist_running_llm_request_rejects_replaced_queued_run() {
     context.queued_user_message_id = Some("user-old".to_string());
     context.assistant_message_id = "assistant-old".to_string();
 
-    let error =
-        persist_running_llm_request(&context, "request-old", "2026-07-10T10:00:00Z", "{}", &[])
-            .expect_err("replaced queued run must reject audit start");
+    let error = persist_running_llm_request(
+        &context,
+        "request-old",
+        "2026-07-10T10:00:00Z",
+        Some("{}"),
+        &[],
+    )
+    .expect_err("replaced queued run must reject audit start");
 
     assert_eq!(
         error.message,
@@ -11076,7 +11040,7 @@ async fn worker_chat_context_does_not_replace_parent_queued_run() {
         &context,
         "worker-request",
         "2026-07-11T05:00:00Z",
-        "{}",
+        Some("{}"),
         &[],
     )
     .expect("worker audit start");
@@ -11200,7 +11164,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
-        request_body_json: "{}".to_string(),
+
         captured_llm_requests: vec![
             captured_test_llm_request("request-1", "assistant-1", 10, 1_000),
             captured_test_llm_request("request-2", "assistant-1", 20, 1_500),
@@ -11415,10 +11379,11 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
             response_body_json: Some("{}".to_string()),
         },
     });
+    let capture = ProviderAuditCapture::new(&workspace_dir, "llm-cancelled", false);
     context.capture_cancelled_llm_request(
+        &capture,
         "llm-cancelled",
         "2026-06-06T09:00:00Z",
-        r#"{"model":"gpt-5.4"}"#,
         &turn_events,
         Instant::now(),
         "chat run cancelled",
@@ -11553,7 +11518,6 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
-        request_body_json: "{}".to_string(),
         captured_llm_requests: Vec::new(),
         compression_snapshots: Vec::new(),
         message_source_sequences: vec![Some(0)],
@@ -15972,8 +15936,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
     .expect("chat context");
 
     assert!(context.pending_memory_retrieval.is_some());
-    serde_json::from_str::<Value>(&context.request_body_json)
-        .expect("deferred request body is valid JSON");
+    serde_json::to_value(&context.provider_request).expect("deferred request is valid JSON");
     let error = context
         .resolve_pending_memory(&config)
         .await
@@ -15993,8 +15956,8 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         context.provider_request.prompt_cache_retention.as_deref(),
         Some(PROMPT_CACHE_RETENTION_24H)
     );
-    let final_request_json: Value =
-        serde_json::from_str(&context.request_body_json).expect("final request body is valid JSON");
+    let final_request_json =
+        serde_json::to_value(&context.provider_request).expect("final request is valid JSON");
     assert!(
         !final_request_json
             .to_string()
@@ -18231,9 +18194,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
     resolve_prompt_context_memory(&mut context, &state.memory_database_file, &config)
         .await
         .expect("resolve memory");
-    let request_json: Value =
-        serde_json::from_str(&serialize_provider_request(&context.provider_request).unwrap())
-            .expect("request json");
+    let request_json = serde_json::to_value(&context.provider_request).expect("request json");
     let request_text = request_json.to_string();
 
     assert!(request_text.contains("Foco retrieved memory context"));
@@ -22078,6 +22039,265 @@ async fn run_model_test_handler(
     .0
 }
 
+async fn serve_main_chat_wire_fixture() -> (
+    String,
+    Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen_for_handler = seen.clone();
+            move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let seen = seen_for_handler.clone();
+                async move {
+                    seen.lock()
+                        .expect("main chat request capture")
+                        .push((headers, payload));
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        concat!(
+                            "data: {\"id\":\"chat-fixture\",\"raw_chunk_secret\":\"chunk-only-secret\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Main chat wire OK\"}}]}\n\n",
+                            "data: {\"id\":\"chat-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat fixture server");
+    let addr = listener.local_addr().expect("main chat fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), seen, task)
+}
+
+#[tokio::test]
+async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, seen, server_task) = serve_main_chat_wire_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.base_url = Some(base_url);
+    provider.model_redirects = vec![ProviderModelRedirect {
+        from: "upstream-model".to_string(),
+        to: "model".to_string(),
+    }];
+    provider.request_overrides = vec![
+        ProviderRequestOverride {
+            target: "header".to_string(),
+            name: "x-main-chat-fixture".to_string(),
+            value_type: "string".to_string(),
+            value: json!("enabled"),
+        },
+        ProviderRequestOverride {
+            target: "body".to_string(),
+            name: "foco_fixture".to_string(),
+            value_type: "string".to_string(),
+            value: json!("main-chat-finalized"),
+        },
+    ];
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Verify real provider wire persistence".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare main chat context");
+    let chat_id = context.chat_id.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_id = None;
+    let mut completed_text = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::Start { .. } => {}
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_id = Some(id),
+            ChatSseEvent::Complete { text, .. } => completed_text = Some(text),
+            ChatSseEvent::Error { message } => panic!("main chat failed: {message}"),
+            _ => {}
+        }
+    }
+    server_task.abort();
+    assert_eq!(completed_text.as_deref(), Some("Main chat wire OK"));
+    let llm_request_id = llm_request_id.expect("main chat LLM request id");
+
+    let seen = seen.lock().expect("main chat request capture");
+    assert_eq!(seen.len(), 1);
+    let (raw_headers, raw_body) = &seen[0];
+    assert_eq!(
+        raw_headers
+            .get("x-main-chat-fixture")
+            .and_then(|value| value.to_str().ok()),
+        Some("enabled")
+    );
+    assert_eq!(raw_body["model"], "upstream-model");
+    assert_eq!(raw_body["foco_fixture"], "main-chat-finalized");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let request = database
+        .llm_request(&llm_request_id)
+        .expect("read main chat audit")
+        .expect("main chat audit exists");
+    assert_eq!(request.chat_id.as_deref(), Some(chat_id.as_str()));
+    let request_body: Value = serde_json::from_str(
+        request
+            .request_body_json
+            .as_deref()
+            .expect("main chat provider request dump"),
+    )
+    .expect("parse main chat provider request dump");
+    assert_eq!(request_body["format"], "provider_request_v1");
+    assert_eq!(request_body["method"], "POST");
+    assert_eq!(
+        serde_json::from_str::<Value>(request_body["body"].as_str().expect("wire body"))
+            .expect("wire body JSON"),
+        *raw_body
+    );
+    assert!(
+        request_body["headers"]["authorization"]
+            .as_str()
+            .is_some_and(|value| value == "[REDACTED]")
+    );
+    let response_body: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("main chat final response dump"),
+    )
+    .expect("parse main chat final response dump");
+    assert_eq!(response_body["format"], "provider_final_response_v1");
+    assert_eq!(response_body["state"], "succeeded");
+    assert_eq!(response_body["text"], "Main chat wire OK");
+    assert!(!response_body.to_string().contains("chunk-only-secret"));
+    drop(database);
+
+    let Json(detail) = crate::http::chat::ai_statistics_detail(
+        State(state),
+        AxumPath((workspace_id, llm_request_id)),
+    )
+    .await
+    .expect("AI statistics detail");
+    assert_eq!(detail.request.request_detail_status, "captured");
+    assert_eq!(detail.request.response_detail_status, "captured");
+    assert_eq!(
+        detail
+            .request
+            .request_body
+            .as_ref()
+            .and_then(|value| value["format"].as_str()),
+        Some("provider_request_v1")
+    );
+    assert_eq!(
+        detail
+            .request
+            .response_body
+            .as_ref()
+            .and_then(|value| value["format"].as_str()),
+        Some("provider_final_response_v1")
+    );
+}
+
+#[tokio::test]
+async fn main_chat_details_disabled_send_once_without_request_or_response_dump() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, seen, server_task) = serve_main_chat_wire_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = false;
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Verify detail capture can be disabled".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare detail-disabled main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_id = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_id = Some(id),
+            ChatSseEvent::Error { message } => panic!("detail-disabled chat failed: {message}"),
+            _ => {}
+        }
+    }
+    server_task.abort();
+    assert_eq!(
+        seen.lock().expect("detail-disabled request capture").len(),
+        1
+    );
+    let request = WorkspaceDatabase::open_or_create(workspace.path())
+        .expect("workspace database")
+        .llm_request(&llm_request_id.expect("detail-disabled LLM request id"))
+        .expect("read detail-disabled audit")
+        .expect("detail-disabled audit exists");
+    assert_eq!(request.final_state, "succeeded");
+    assert!(request.request_body_json.is_none());
+    assert!(request.response_body_json.is_none());
+}
+
 #[tokio::test]
 async fn test_model_handler_returns_success_for_upstream_text_response() {
     let workspace = tempfile::tempdir().expect("workspace directory");
@@ -22119,6 +22339,50 @@ async fn test_model_handler_returns_success_for_upstream_text_response() {
         .expect("model test audit rows");
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].final_state, "succeeded");
+    let request = database
+        .llm_request(&audits[0].id)
+        .expect("read model test audit")
+        .expect("model test audit exists");
+    let request_body: Value = serde_json::from_str(
+        request
+            .request_body_json
+            .as_deref()
+            .expect("model test request wire dump"),
+    )
+    .expect("parse model test request wire dump");
+    assert_eq!(
+        request_body.get("format").and_then(Value::as_str),
+        Some("provider_request_v1")
+    );
+    assert_eq!(
+        request_body.get("method").and_then(Value::as_str),
+        Some("POST")
+    );
+    assert!(
+        request_body
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.ends_with("/v1/chat/completions"))
+    );
+    let response_body: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("model test final response dump"),
+    )
+    .expect("parse model test final response dump");
+    assert_eq!(
+        response_body.get("format").and_then(Value::as_str),
+        Some("provider_final_response_v1")
+    );
+    assert_eq!(
+        response_body.get("state").and_then(Value::as_str),
+        Some("succeeded")
+    );
+    assert_eq!(
+        response_body.get("text").and_then(Value::as_str),
+        Some("OK")
+    );
 }
 
 #[tokio::test]
@@ -22135,6 +22399,51 @@ async fn test_model_handler_returns_readable_upstream_failure() {
     assert!(response.message.contains("Model availability test failed"));
     assert!(response.message.contains("502"));
     assert_eq!(seen.lock().expect("model test request capture").len(), 1);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let audits = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_kind: Some("model availability test"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("model test failure audit rows");
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].final_state, "failed");
+    assert_eq!(audits[0].status_code, Some(502));
+    let request = database
+        .llm_request(&audits[0].id)
+        .expect("read failed model test audit")
+        .expect("failed model test audit exists");
+    let request_body: Value = serde_json::from_str(
+        request
+            .request_body_json
+            .as_deref()
+            .expect("failed model test request wire dump"),
+    )
+    .expect("parse failed model test request wire dump");
+    assert_eq!(
+        request_body.get("format").and_then(Value::as_str),
+        Some("provider_request_v1")
+    );
+    let response_body: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("failed model test final response dump"),
+    )
+    .expect("parse failed model test final response dump");
+    assert_eq!(
+        response_body.get("format").and_then(Value::as_str),
+        Some("provider_final_response_v1")
+    );
+    assert_eq!(
+        response_body.get("state").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        response_body.get("statusCode").and_then(Value::as_u64),
+        Some(502)
+    );
 }
 
 #[tokio::test]
@@ -22150,13 +22459,19 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
         request_overrides: Vec::new(),
         model_redirects: Vec::new(),
     };
-    let error =
-        match run_provider_stream_for_text(&provider_config, request, "model availability test", 1)
-            .await
-        {
-            Ok(_) => panic!("model test should time out"),
-            Err(error) => error,
-        };
+    let capture = ProviderAuditCapture::new(Path::new("."), "llm-model-test", false);
+    let error = match run_provider_stream_for_text(
+        &provider_config,
+        request,
+        "model availability test",
+        1,
+        &capture,
+    )
+    .await
+    {
+        Ok(_) => panic!("model test should time out"),
+        Err(error) => error,
+    };
     server_task.abort();
     assert_eq!(
         error.message,
@@ -23234,6 +23549,42 @@ struct PromptStateFixture {
     _profile: tempfile::TempDir,
     _workspace_dir: PathBuf,
     state: AppState,
+}
+
+#[test]
+fn audit_detail_statuses_distinguish_wire_running_malformed_and_partial() {
+    let wire_request = json!({ "format": "provider_request_v1", "version": 1 });
+    assert_eq!(
+        audit_request_detail_status("running", Some("wire"), Some(&wire_request)),
+        "captured"
+    );
+    assert_eq!(
+        audit_request_detail_status("running", None, None),
+        "pending"
+    );
+    let malformed = parse_audit_detail_value(Some("not-json"));
+    assert_eq!(
+        audit_request_detail_status("failed", Some("not-json"), malformed.as_ref()),
+        "malformed"
+    );
+    assert_eq!(
+        audit_request_detail_status("failed", None, None),
+        "unavailable"
+    );
+
+    let partial_response = json!({
+        "format": "provider_final_response_v1",
+        "state": "failed",
+        "partial": true,
+    });
+    assert_eq!(
+        audit_response_detail_status("failed", Some("wire"), Some(&partial_response)),
+        "partial"
+    );
+    assert_eq!(
+        audit_response_detail_status("running", None, None),
+        "pending"
+    );
 }
 
 fn prompt_state_fixture(configure: impl FnOnce(&mut GlobalConfig)) -> PromptStateFixture {

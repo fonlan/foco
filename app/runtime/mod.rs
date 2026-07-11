@@ -4,6 +4,7 @@ mod chat_run;
 mod code_graph;
 mod image_tools;
 mod native_tools;
+mod provider_audit;
 mod questions;
 mod sidecar_config;
 mod subscriptions;
@@ -43,6 +44,7 @@ pub(crate) use native_tools::{
     RipgrepStatus, RipgrepToolSummary, detect_ripgrep, download_and_install_ripgrep,
     ripgrep_tool_summary,
 };
+pub(crate) use provider_audit::ProviderAuditCapture;
 pub(crate) use questions::{
     AskQuestionInput, QuestionAnswer, QuestionAnswerResponse, QuestionItem, QuestionItemAnswer,
     QuestionOption, QuestionRegistry, QuestionRequest,

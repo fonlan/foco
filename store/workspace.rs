@@ -6461,6 +6461,27 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn update_llm_request_body(
+        &mut self,
+        id: &str,
+        request_body_json: Option<&str>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let request_body_json = redact_optional_audit_json(request_body_json, "request_body_json")?;
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE llm_requests SET request_body_json = ?2 WHERE id = ?1",
+                params![id, request_body_json],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
+        }
+
+        Ok(())
+    }
+
     pub fn update_llm_request_outcome(
         &mut self,
         id: &str,

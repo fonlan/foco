@@ -33,6 +33,17 @@ The fork adds an optional read-only prepared-request observer at the final genai
 
 The patch must not serialize the adapter request a second time or send a duplicate request. Foco's provider layer owns redaction and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes.
 
+## End-to-end acceptance in Foco
+
+Foco's completion gate is not the fork test alone. The repository keeps two layers of real HTTP regressions:
+
+- `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters` starts local servers for OpenAI Chat, OpenAI Responses, Anthropic, and Gemini. It compares the observer dump with the request actually received by the server, verifies provider-specific final mappings (model redirect, system/instructions, tools, thinking, prompt-cache-related options and supported overrides), checks credential redaction, and rejects duplicate sends.
+- `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire` runs the production main-chat stream against a local provider, then verifies the same final request body travels through the observer into SQLite and the AI statistics detail handler as `provider_request_v1`; the final aggregate is returned as `provider_final_response_v1` without chunk-only fields. The companion detail-disabled test verifies one send with no request/response detail.
+
+These tests are the hard regression against a UI-only or import-only integration. When the fork, genai baseline, adapter code, audit lifecycle, SQLite schema, or statistics detail API changes, rerun both provider tests and the focused app tests before claiming wire capture is complete.
+
+Adapter behavior must be asserted from the actual finalized request rather than assumed to be uniform. In the current genai baseline, OpenAI adapters merge supported arbitrary `extra_body` values, while Anthropic and Gemini expose their provider-specific thinking mapping but do not preserve an arbitrary extra-body key. The dump must reflect those real adapter semantics; tests must not manufacture fields that were not sent.
+
 ## Upgrade procedure
 
 When upgrading genai:

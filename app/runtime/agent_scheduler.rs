@@ -618,7 +618,6 @@ async fn run_coordinator_task_inner(
         chat_context.provider_request.prompt_cache_retention =
             Some(PROMPT_CACHE_RETENTION_24H.to_string());
     }
-    chat_context.request_body_json = serialize_provider_request(&chat_context.provider_request)?;
     consume_agent_messages(&workspace.path, &consumed_agent_message_ids)?;
     chat_context.agent_associations = AgentRunAssociations {
         team_id: Some(task.team_id.clone()),

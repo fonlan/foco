@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use foco_agent::{ContextPackItem, context_compression_trigger_tokens, estimate_text_tokens};
-use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
+use foco_providers::{
+    NeutralChatMessage, NeutralChatRole, NeutralToolCall, stream_chat_with_capture_observer,
+};
 use foco_store::workspace::{
     ContextCompressionSnapshotRecord, NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
 };
@@ -475,7 +477,6 @@ async fn llm_context_compression_summary(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     };
-    let request_body_json = serialize_provider_request(&request)?;
     let request_id = unique_id("llm");
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();
@@ -494,39 +495,158 @@ async fn llm_context_compression_summary(
         })
         .to_string(),
     }];
-
-    let mut stream = timeout(
+    persist_running_llm_request_for_kind(
+        context,
+        &request_id,
+        &request_started_at,
+        "contextCompression",
+        None,
+        &events,
+    )?;
+    let capture = ProviderAuditCapture::new(
+        &context.workspace_path,
+        request_id.clone(),
+        api_audit_save_details(&context.global_config),
+    );
+    let observer = capture.observer();
+    let capture_details = observer.is_some();
+    let mut stream = match timeout(
         Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
-        stream_chat(&context.provider_config, request),
+        stream_chat_with_capture_observer(
+            &context.provider_config,
+            request,
+            capture_details,
+            observer,
+        ),
     )
     .await
-    .map_err(|_| {
-        ApiError::internal(format!(
-            "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
-        ))
-    })?
-    .map_err(|source| ApiError::internal(source.to_string()))?;
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(source)) => {
+            capture.persist_request_failure(&source)?;
+            let message = source.to_string();
+            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+            let response_body_json =
+                capture.failed_response_json(message.clone(), source.status_code(), false)?;
+            context.captured_llm_requests.push(CapturedLlmRequest {
+                id: request_id,
+                request_kind: "contextCompression",
+                request_started_at,
+                request_body_json,
+                events,
+                outcome: ChatAuditOutcome {
+                    response_body_json,
+                    ..failed_provider_audit_outcome(
+                        started_at,
+                        &message,
+                        source.status_code().map(i64::from),
+                    )
+                },
+            });
+            return Err(ApiError::internal(message));
+        }
+        Err(_) => {
+            let message = format!(
+                "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
+            );
+            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+            let response_body_json = capture.failed_response_json(message.clone(), None, false)?;
+            context.captured_llm_requests.push(CapturedLlmRequest {
+                id: request_id,
+                request_kind: "contextCompression",
+                request_started_at,
+                request_body_json,
+                events,
+                outcome: ChatAuditOutcome {
+                    response_body_json,
+                    ..failed_provider_audit_outcome(started_at, &message, None)
+                },
+            });
+            return Err(ApiError::internal(message));
+        }
+    };
     let mut output_text = String::new();
     let mut final_usage = None;
     let mut first_token_at = None;
     let mut first_token_latency_ms = None;
-    let mut response_body_json = None;
 
     loop {
-        let Some(event_result) = timeout(
+        let event_result = match timeout(
             Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
             stream.next_event(),
         )
         .await
-        .map_err(|_| {
-            ApiError::internal(format!(
-                "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
-            ))
-        })?
-        else {
-            break;
+        {
+            Ok(event_result) => event_result,
+            Err(_) => {
+                let message = format!(
+                    "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
+                );
+                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+                let response_body_json =
+                    capture.failed_response_json(message.clone(), None, true)?;
+                context.captured_llm_requests.push(CapturedLlmRequest {
+                    id: request_id,
+                    request_kind: "contextCompression",
+                    request_started_at,
+                    request_body_json,
+                    events,
+                    outcome: ChatAuditOutcome {
+                        response_body_json,
+                        ..failed_provider_audit_outcome(started_at, &message, None)
+                    },
+                });
+                return Err(ApiError::internal(message));
+            }
         };
-        let event = event_result.map_err(|source| ApiError::internal(source.to_string()))?;
+        let Some(event_result) = event_result else {
+            let message = "context compression summary stream ended without a completion event";
+            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+            let response_body_json = capture.failed_response_json(message, None, true)?;
+            context.captured_llm_requests.push(CapturedLlmRequest {
+                id: request_id,
+                request_kind: "contextCompression",
+                request_started_at,
+                request_body_json,
+                events,
+                outcome: ChatAuditOutcome {
+                    response_body_json,
+                    ..failed_provider_audit_outcome(started_at, message, None)
+                },
+            });
+            return Err(ApiError::internal(message));
+        };
+        let event = match event_result {
+            Ok(event) => event,
+            Err(source) => {
+                let message = source.to_string();
+                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+                let response_body_json =
+                    capture
+                        .response_json(stream.final_response_dump())?
+                        .or(capture.failed_response_json(
+                            message.clone(),
+                            source.status_code(),
+                            true,
+                        )?);
+                context.captured_llm_requests.push(CapturedLlmRequest {
+                    id: request_id,
+                    request_kind: "contextCompression",
+                    request_started_at,
+                    request_body_json,
+                    events,
+                    outcome: ChatAuditOutcome {
+                        response_body_json,
+                        ..failed_provider_audit_outcome(
+                            started_at,
+                            &message,
+                            source.status_code().map(i64::from),
+                        )
+                    },
+                });
+                return Err(ApiError::internal(message));
+            }
+        };
         events.push(captured_provider_event(&event));
 
         match event {
@@ -543,51 +663,77 @@ async fn llm_context_compression_summary(
                 final_usage = Some(usage);
             }
             NeutralChatStreamEvent::ToolCall { tool_call } => {
-                return Err(ApiError::internal(format!(
+                let message = format!(
                     "context compression summary called unsupported tool '{}'",
                     tool_call.name
-                )));
+                );
+                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+                let response_body_json =
+                    capture.failed_response_json(message.clone(), None, true)?;
+                context.captured_llm_requests.push(CapturedLlmRequest {
+                    id: request_id,
+                    request_kind: "contextCompression",
+                    request_started_at,
+                    request_body_json,
+                    events,
+                    outcome: ChatAuditOutcome {
+                        response_body_json,
+                        ..failed_provider_audit_outcome(started_at, &message, None)
+                    },
+                });
+                return Err(ApiError::internal(message));
             }
-            NeutralChatStreamEvent::Complete {
-                text,
-                usage,
-                stop_reason,
-                response_id,
-                ..
-            } => {
+            NeutralChatStreamEvent::Complete { text, usage, .. } => {
                 if !text.trim().is_empty() {
                     output_text.push_str(&text);
                 }
                 if let Some(usage) = usage {
                     final_usage = Some(usage);
                 }
-                response_body_json = Some(
-                    json!({
-                        "requestKind": "contextCompression",
-                        "kind": CONTEXT_COMPRESSION_KIND_LLM,
-                        "text": output_text,
-                        "usage": final_usage,
-                        "stopReason": stop_reason,
-                        "responseId": response_id,
-                    })
-                    .to_string(),
-                );
                 break;
             }
             NeutralChatStreamEvent::Error { message } => {
-                return Err(ApiError::internal(format!(
-                    "context compression summary stream error: {message}"
-                )));
+                let message = format!("context compression summary stream error: {message}");
+                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+                let response_body_json = capture
+                    .response_json(stream.final_response_dump())?
+                    .or(capture.failed_response_json(message.clone(), None, true)?);
+                context.captured_llm_requests.push(CapturedLlmRequest {
+                    id: request_id,
+                    request_kind: "contextCompression",
+                    request_started_at,
+                    request_body_json,
+                    events,
+                    outcome: ChatAuditOutcome {
+                        response_body_json,
+                        ..failed_provider_audit_outcome(started_at, &message, None)
+                    },
+                });
+                return Err(ApiError::internal(message));
             }
         }
     }
 
     let summary = output_text.trim().to_string();
     if summary.is_empty() {
-        return Err(ApiError::internal(
-            "context compression summary returned empty text",
-        ));
+        let message = "context compression summary returned empty text";
+        let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+        let response_body_json = capture.failed_response_json(message, None, false)?;
+        context.captured_llm_requests.push(CapturedLlmRequest {
+            id: request_id,
+            request_kind: "contextCompression",
+            request_started_at,
+            request_body_json,
+            events,
+            outcome: ChatAuditOutcome {
+                response_body_json,
+                ..failed_provider_audit_outcome(started_at, message, None)
+            },
+        });
+        return Err(ApiError::internal(message));
     }
+    let request_body_json = capture.captured_request_json()?.unwrap_or_default();
+    let response_body_json = capture.response_json(stream.final_response_dump())?;
     context.captured_llm_requests.push(CapturedLlmRequest {
         id: request_id,
         request_kind: "contextCompression",
@@ -1434,50 +1580,6 @@ fn next_context_snapshot_sequence(
     Ok(next)
 }
 
-pub(crate) fn serialize_provider_request(request: &NeutralChatRequest) -> Result<String, ApiError> {
-    let mut value = serde_json::to_value(request).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to serialize provider-neutral chat request: {source}"
-        ))
-    })?;
-    // ponytail: audit JSON mirrors genai's leading-system-to-instructions step;
-    // use genai/WebRequestData if this ever needs to be an exact provider payload.
-    promote_leading_system_messages_to_instructions(&mut value);
-    serde_json::to_string(&value).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to serialize provider-neutral chat request: {source}"
-        ))
-    })
-}
-
-fn promote_leading_system_messages_to_instructions(value: &mut Value) {
-    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let leading_system_count = messages
-        .iter()
-        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-        .count();
-    if leading_system_count == 0 {
-        return;
-    }
-
-    let instructions = messages
-        .iter()
-        .take(leading_system_count)
-        .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if instructions.is_empty() {
-        return;
-    }
-
-    messages.drain(0..leading_system_count);
-    if let Some(object) = value.as_object_mut() {
-        object.insert("instructions".to_string(), Value::String(instructions));
-    }
-}
-
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
     match role {
         NeutralChatRole::System => "system",
@@ -1734,7 +1836,25 @@ pub(crate) fn persist_running_llm_request(
     context: &PreparedChatContext,
     request_id: &str,
     request_started_at: &str,
-    request_body_json: &str,
+    request_body_json: Option<&str>,
+    events: &[CapturedAuditEvent],
+) -> Result<(), ApiError> {
+    persist_running_llm_request_for_kind(
+        context,
+        request_id,
+        request_started_at,
+        "chat completion",
+        request_body_json,
+        events,
+    )
+}
+
+fn persist_running_llm_request_for_kind(
+    context: &PreparedChatContext,
+    request_id: &str,
+    request_started_at: &str,
+    request_kind: &str,
+    request_body_json: Option<&str>,
     events: &[CapturedAuditEvent],
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
@@ -1752,8 +1872,12 @@ pub(crate) fn persist_running_llm_request(
         .insert_llm_request(NewLlmRequest {
             id: request_id,
             workspace_id: &context.workspace_id,
-            chat_id: Some(&context.chat_id),
-            request_kind: "chat completion",
+            chat_id: database
+                .chat(&context.chat_id)
+                .map_err(ApiError::from_workspace_error)?
+                .is_some()
+                .then_some(context.chat_id.as_str()),
+            request_kind,
             agent_team_id: context.agent_associations.team_id.as_ref(),
             agent_instance_id: context.agent_associations.instance_id.as_ref(),
             agent_task_id: context.agent_associations.task_id.as_ref(),
@@ -1772,7 +1896,8 @@ pub(crate) fn persist_running_llm_request(
             total_latency_ms: None,
             status_code: None,
             final_state: "running",
-            request_body_json: api_audit_detail_json(request_body_json, save_details),
+            request_body_json: request_body_json
+                .and_then(|value| api_audit_detail_json(value, save_details)),
             response_body_json: None,
         })
         .map_err(ApiError::from_workspace_error)?;
@@ -1848,7 +1973,9 @@ fn persist_llm_request(
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,
                 final_state: request.outcome.final_state,
-                request_body_json: api_audit_detail_json(&request.request_body_json, save_details),
+                request_body_json: (!request.request_body_json.is_empty())
+                    .then(|| request.request_body_json.as_str())
+                    .and_then(|value| api_audit_detail_json(value, save_details)),
                 response_body_json: request
                     .outcome
                     .response_body_json

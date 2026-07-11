@@ -9,7 +9,8 @@ use std::{
 use foco_mcp::{McpRegistry, encode_mcp_tool_name};
 use foco_providers::{
     NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStream,
-    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig, stream_chat,
+    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig,
+    stream_chat_with_capture_observer,
 };
 use foco_store::{
     config::{
@@ -25,7 +26,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
-use crate::api_audit_detail_json;
+use crate::{api_audit_detail_json, runtime::ProviderAuditCapture};
 
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const HOOK_OUTPUT_PREVIEW_CHARS: usize = 4000;
@@ -808,18 +809,18 @@ impl AuditedPromptHookStream {
         first_token_at: Option<String>,
         first_token_latency_ms: Option<i64>,
         usage: Option<NeutralUsage>,
-        output: &str,
+        _output: &str,
     ) -> Result<(), String> {
         let mut database =
             WorkspaceDatabase::open_or_create(&self.workspace_path).map_err(|source| {
                 format!("failed to open workspace database for prompt hook audit: {source}")
             })?;
-        let response_body_json = json!({
-            "requestKind": "prompt hook",
-            "text": output,
-            "usage": usage,
-        })
-        .to_string();
+        let response_body_json = self
+            .stream
+            .final_response_dump()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|source| format!("failed to serialize prompt hook response dump: {source}"))?;
         database
             .update_llm_request_outcome(
                 &self.request_id,
@@ -835,10 +836,9 @@ impl AuditedPromptHookStream {
                     total_latency_ms: Some(elapsed_millis(self.started_at)),
                     status_code: Some(200),
                     final_state: "succeeded",
-                    response_body_json: api_audit_detail_json(
-                        &response_body_json,
-                        self.save_details,
-                    ),
+                    response_body_json: response_body_json
+                        .as_deref()
+                        .and_then(|value| api_audit_detail_json(value, self.save_details)),
                 },
             )
             .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
@@ -848,12 +848,19 @@ impl AuditedPromptHookStream {
     }
 
     fn fail(&self, message: &str) -> Result<(), String> {
+        let response_body_json = self
+            .stream
+            .interrupted_final_response_dump(message)
+            .map(|dump| serde_json::to_string(&dump))
+            .transpose()
+            .map_err(|source| format!("failed to serialize prompt hook failure dump: {source}"))?;
         fail_prompt_hook_audit(
             &self.workspace_path,
             &self.request_id,
             self.started_at,
             None,
             message,
+            response_body_json.as_deref(),
             self.save_details,
         )
     }
@@ -899,8 +906,6 @@ async fn audited_prompt_hook_stream(
         .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
     let request_id = format!("llm-hook-{}", uuid_suffix());
     let request_started_at = utc_timestamp();
-    let request_body_json = serde_json::to_string(&hook_request)
-        .map_err(|source| format!("failed to serialize prompt hook provider request: {source}"))?;
     let mut database =
         WorkspaceDatabase::open_or_create(request.workspace_path).map_err(|source| {
             format!("failed to open workspace database for prompt hook audit: {source}")
@@ -929,10 +934,7 @@ async fn audited_prompt_hook_stream(
             total_latency_ms: None,
             status_code: None,
             final_state: "running",
-            request_body_json: api_audit_detail_json(
-                &request_body_json,
-                request.api_audit_save_details,
-            ),
+            request_body_json: None,
             response_body_json: None,
         })
         .map_err(|source| format!("failed to insert prompt hook LLM audit: {source}"))?;
@@ -958,10 +960,20 @@ async fn audited_prompt_hook_stream(
         .map_err(|source| format!("failed to insert prompt hook LLM audit event: {source}"))?;
     drop(database);
 
+    let capture = ProviderAuditCapture::new(
+        request.workspace_path,
+        request_id.clone(),
+        request.api_audit_save_details,
+    );
     let started_at = std::time::Instant::now();
     match timeout(
         Duration::from_millis(timeout_ms),
-        stream_chat(provider_config, hook_request),
+        stream_chat_with_capture_observer(
+            provider_config,
+            hook_request,
+            request.api_audit_save_details,
+            capture.observer(),
+        ),
     )
     .await
     {
@@ -974,24 +986,42 @@ async fn audited_prompt_hook_stream(
             save_details: request.api_audit_save_details,
         }),
         Ok(Err(source)) => {
+            capture.persist_request_failure(&source).map_err(|error| {
+                format!(
+                    "failed to persist prompt hook request dump: {}",
+                    error.message
+                )
+            })?;
+            let response_body_json = capture
+                .failed_response_json(
+                    format!("prompt hook provider call failed: {source}"),
+                    source.status_code(),
+                    false,
+                )
+                .map_err(|error| error.message)?;
             fail_prompt_hook_audit(
                 request.workspace_path,
                 &request_id,
                 started_at,
                 source.status_code().map(i64::from),
                 &format!("prompt hook provider call failed: {source}"),
+                response_body_json.as_deref(),
                 request.api_audit_save_details,
             )?;
             Err(format!("prompt hook provider call failed: {source}"))
         }
         Err(_) => {
             let message = format!("prompt hook timed out after {timeout_ms} ms");
+            let response_body_json = capture
+                .failed_response_json(message.clone(), None, false)
+                .map_err(|error| error.message)?;
             fail_prompt_hook_audit(
                 request.workspace_path,
                 &request_id,
                 started_at,
                 None,
                 &message,
+                response_body_json.as_deref(),
                 request.api_audit_save_details,
             )?;
             Err(message)
@@ -1034,12 +1064,20 @@ fn fail_prompt_hook_audit(
     started_at: std::time::Instant,
     status_code: Option<i64>,
     message: &str,
+    response_body_json: Option<&str>,
     save_details: bool,
 ) -> Result<(), String> {
     let mut database = WorkspaceDatabase::open_or_create(workspace_path).map_err(|source| {
         format!("failed to open workspace database for prompt hook audit: {source}")
     })?;
-    let response_body_json = json!({ "error": message }).to_string();
+    let fallback_response_body_json = foco_providers::ProviderFinalResponseDump::failed(
+        message,
+        status_code.and_then(|code| u16::try_from(code).ok()),
+        false,
+    );
+    let fallback_response_body_json = serde_json::to_string(&fallback_response_body_json)
+        .map_err(|source| format!("failed to serialize prompt hook failure dump: {source}"))?;
+    let response_body_json = response_body_json.unwrap_or(&fallback_response_body_json);
     database
         .update_llm_request_outcome(
             request_id,
@@ -1055,7 +1093,7 @@ fn fail_prompt_hook_audit(
                 total_latency_ms: Some(elapsed_millis(started_at)),
                 status_code: status_code.filter(|code| *code > 0),
                 final_state: "failed",
-                response_body_json: api_audit_detail_json(&response_body_json, save_details),
+                response_body_json: api_audit_detail_json(response_body_json, save_details),
             },
         )
         .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;

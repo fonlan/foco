@@ -5201,6 +5201,28 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(request.provider_id, "openai");
     assert_eq!(request.input_tokens, Some(3));
     assert_eq!(request.final_state, "completed");
+    database
+        .update_llm_request_body(
+            "request-1",
+            Some(
+                r#"{"format":"provider_request_v1","headers":{"authorization":"Bearer secret"},"body":"actual"}"#,
+            ),
+        )
+        .expect("llm request body update");
+    let request = database
+        .llm_request("request-1")
+        .expect("updated llm request read")
+        .expect("updated llm request");
+    let request_body: serde_json::Value = serde_json::from_str(
+        request
+            .request_body_json
+            .as_deref()
+            .expect("updated request body"),
+    )
+    .expect("updated request body json");
+    assert_eq!(request_body["format"], "provider_request_v1");
+    assert_eq!(request_body["headers"]["authorization"], "[REDACTED]");
+    assert_eq!(request_body["body"], "actual");
     let metrics = database
         .llm_request_metrics_for_chat("chat-1")
         .expect("chat request metrics");

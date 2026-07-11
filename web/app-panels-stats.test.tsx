@@ -4170,7 +4170,9 @@ describe("app-panels-stats verification surfaces", () => {
                   ...aiStatisticsDetail.request,
                   finalState: "succeeded",
                   requestBody: null,
+                  requestDetailStatus: "unavailable",
                   responseBody: null,
+                  responseDetailStatus: "unavailable",
                 };
         return Promise.resolve(jsonResponse({ ...aiStatisticsDetail, request }));
       }
@@ -4208,7 +4210,7 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(
-      within(dialog).getByText("Request detail is pending or was pruned."),
+      within(dialog).getByText("Request detail was not captured or was pruned."),
     ).toBeInTheDocument();
     expect(
       within(dialog).getByText("Final response detail is unavailable or was pruned."),

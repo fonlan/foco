@@ -29,10 +29,9 @@ use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefiniti
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
-    ProviderFinalResponseDump, ProviderRequestDumpObserver, ProviderRequestOverride,
-    ProviderWireRequestDump, normalized_proxy_url, parse_provider_kind, stream_chat,
-    stream_chat_with_capture, stream_chat_with_capture_observer,
+    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestFailure,
+    ProviderRequestOverride, normalized_proxy_url, parse_provider_kind,
+    stream_chat_with_capture_observer,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -130,7 +129,7 @@ use crate::prompt::{
     ensure_context_compression, environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
     persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
-    serialize_provider_request, system_prompt_summaries, tool_prompt_infos,
+    system_prompt_summaries, tool_prompt_infos,
 };
 #[cfg(all(test, windows))]
 pub(crate) use crate::runtime::find_system_ripgrep;
@@ -141,14 +140,14 @@ use crate::runtime::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, ActiveChatRunRegistration, ActiveChatRunRegistry,
     ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, AgentToolContext,
     ChatRunCancellation, CodeGraphIndexState, CoordinatorTaskInput, GuidanceMessage,
-    QuestionAnswer, QuestionAnswerResponse, QuestionRegistry, QuestionRequest,
-    ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, RepeatedToolCallDetector,
-    RipgrepStatus, RipgrepToolSummary, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-    chat_run_subscription_stream, detect_ripgrep, execute_tool_calls_parallel,
-    image_model_available, insert_agent_event, is_agent_tool_name, pending_tool_calls,
-    recently_active_code_graph_workspaces, ripgrep_tool_summary, run_chat_context_in_background,
-    spawn_api_audit_cleanup_scheduler, spawn_code_graph_index_initialization,
-    validate_agent_snapshot_for_workspace,
+    ProviderAuditCapture, QuestionAnswer, QuestionAnswerResponse, QuestionRegistry,
+    QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
+    RepeatedToolCallDetector, RipgrepStatus, RipgrepToolSummary, ToolOutputDeltaEvent,
+    ToolResourceLockRegistry, chat_run_subscription_stream, detect_ripgrep,
+    execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
+    pending_tool_calls, recently_active_code_graph_workspaces, ripgrep_tool_summary,
+    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
+    spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
@@ -201,6 +200,8 @@ pub(crate) use skills::{
     preserve_disabled_skill_keys_for_hidden_locations, refresh_derived_enabled_skills,
     skill_is_disabled, skill_is_required_disabled, skill_search_roots,
 };
+#[cfg(test)]
+mod provider_audit_source_guard;
 #[cfg(test)]
 mod tests;
 
@@ -1625,6 +1626,8 @@ struct AiRequestAuditDetail {
     final_state: String,
     invalidated_at: Option<String>,
     invalidated_reason: Option<String>,
+    request_detail_status: &'static str,
+    response_detail_status: &'static str,
     request_body: Option<Value>,
     response_body: Option<Value>,
 }
@@ -2093,7 +2096,6 @@ struct PreparedChatContext {
     memory_settings: MemorySettings,
     memories_used: Vec<ChatMemoryUsedSummary>,
     memory_target_status: MemoryStatus,
-    request_body_json: String,
     captured_llm_requests: Vec<CapturedLlmRequest>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
@@ -2468,7 +2470,7 @@ impl CapturedLlmRequest {
             id: context.llm_request_id.clone(),
             request_kind: "chat completion",
             request_started_at: request_started_at.to_string(),
-            request_body_json: context.request_body_json.clone(),
+            request_body_json: String::new(),
             events: events.to_vec(),
             outcome,
         }
@@ -2515,11 +2517,7 @@ fn persist_completed_llm_request(
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,
                 final_state: request.outcome.final_state,
-                response_body_json: request
-                    .outcome
-                    .response_body_json
-                    .as_deref()
-                    .and_then(|value| api_audit_detail_json(value, save_details)),
+                response_body_json: request.outcome.response_body_json.as_deref(),
             },
         )
         .map_err(ApiError::from_workspace_error)?;
@@ -2553,41 +2551,68 @@ fn persist_completed_llm_request(
 impl PreparedChatContext {
     fn capture_cancelled_llm_request(
         &mut self,
+        capture: &ProviderAuditCapture,
         request_id: &str,
         request_started_at: &str,
-        request_body_json: &str,
         events: &[CapturedAuditEvent],
         started_at: Instant,
         message: &str,
     ) {
-        self.captured_llm_requests
-            .push(CapturedLlmRequest::cancelled(
-                request_id,
-                request_started_at,
-                request_body_json,
-                events,
-                started_at,
-                message,
-            ));
+        let request_body_json = capture
+            .captured_request_json()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let response_body_json = capture
+            .failed_response_json(message, None, true)
+            .ok()
+            .flatten();
+        let mut request = CapturedLlmRequest::cancelled(
+            request_id,
+            request_started_at,
+            &request_body_json,
+            events,
+            started_at,
+            message,
+        );
+        request.outcome.response_body_json = response_body_json;
+        self.captured_llm_requests.push(request);
     }
 
     fn capture_failed_llm_request(
         &mut self,
+        capture: &ProviderAuditCapture,
         request_id: String,
         request_started_at: String,
-        request_body_json: String,
         events: Vec<CapturedAuditEvent>,
         started_at: Instant,
         message: &str,
         status_code: Option<i64>,
+        partial: bool,
     ) {
+        let request_body_json = capture
+            .captured_request_json()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let response_body_json = capture
+            .failed_response_json(
+                message,
+                status_code.and_then(|value| u16::try_from(value).ok()),
+                partial,
+            )
+            .ok()
+            .flatten();
         self.captured_llm_requests.push(CapturedLlmRequest {
             id: request_id,
             request_kind: "chat completion",
             request_started_at,
             request_body_json,
             events,
-            outcome: failed_provider_audit_outcome(started_at, message, status_code),
+            outcome: ChatAuditOutcome {
+                response_body_json,
+                ..failed_provider_audit_outcome(started_at, message, status_code)
+            },
         });
     }
 
@@ -2879,44 +2904,11 @@ impl PreparedChatContext {
                             })
                             .to_string(),
                         }];
-                        let turn_request_body_json;
-                        match serialize_provider_request(&turn_request) {
-                            Ok(request_body_json) => {
-                                self.request_body_json = request_body_json;
-                                turn_request_body_json = self.request_body_json.clone();
-                            }
-                            Err(error) => {
-                                let message = error.message;
-                                let event = ChatSseEvent::Error {
-                                    message: message.clone(),
-                                };
-                                events.push(captured_event(&event));
-                                let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                    let event = ChatSseEvent::Error {
-                                        message: persist_error.message,
-                                    };
-                                    yield event;
-                                } else {
-                                    yield event;
-                                }
-
-                                return;
-                            }
-                        }
                         if let Err(error) = persist_running_llm_request(
                             &self,
                             &turn_llm_request_id,
                             &turn_request_started_at,
-                            &turn_request_body_json,
+                            None,
                             &turn_events,
                         ) {
                             yield ChatSseEvent::Error {
@@ -2930,14 +2922,19 @@ impl PreparedChatContext {
                         };
                         events.push(captured_event(&attempt_start_event));
                         yield attempt_start_event;
+                        let turn_capture = ProviderAuditCapture::new(
+                            &self.workspace_path,
+                            turn_llm_request_id.clone(),
+                            api_audit_save_details(&self.global_config),
+                        );
                         let mut provider_stream = match tokio::select! {
                             changed = app_shutdown_rx.changed() => {
                                 if changed.is_err() || *app_shutdown_rx.borrow() {
                                     cancellation.cancel();
                                     self.capture_cancelled_llm_request(
+                                        &turn_capture,
                                         &turn_llm_request_id,
                                         &turn_request_started_at,
-                                        &turn_request_body_json,
                                         &turn_events,
                                         turn_started_at,
                                         SHUTDOWN_MESSAGE,
@@ -2963,9 +2960,9 @@ impl PreparedChatContext {
                             changed = run_cancellation_rx.changed() => {
                                 if changed.is_err() || *run_cancellation_rx.borrow() {
                                     self.capture_cancelled_llm_request(
+                                        &turn_capture,
                                         &turn_llm_request_id,
                                         &turn_request_started_at,
-                                        &turn_request_body_json,
                                         &turn_events,
                                         turn_started_at,
                                         "chat run cancelled",
@@ -2991,27 +2988,42 @@ impl PreparedChatContext {
                             }
                             provider_stream = timeout(
                                 Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
-                                stream_chat(&self.provider_config, turn_request),
+                                stream_chat_with_capture_observer(
+                                    &self.provider_config,
+                                    turn_request,
+                                    api_audit_save_details(&self.global_config),
+                                    turn_capture.observer(),
+                                ),
                             ) => provider_stream
-                                .unwrap_or_else(|_| Err(provider_stream_idle_timeout_error())),
+                                .unwrap_or_else(|_| Err(ProviderRequestFailure {
+                                    error: provider_stream_idle_timeout_error(),
+                                    request_dump: None,
+                                })),
                         } {
                             Ok(provider_stream) => provider_stream,
                             Err(error) => {
-                                let status_code = provider_status_code(&error);
+                                if let Err(persist_error) = turn_capture.persist_request_failure(&error) {
+                                    yield ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    return;
+                                }
+                                let status_code = error.status_code().map(i64::from);
                                 let message = error.to_string();
                                 if should_retry_provider_stream_error(
-                                    &error,
+                                    &error.error,
                                     turn_retry_count,
                                     self.global_config.app.llm_request_retry_count,
                                 ) {
                                     self.capture_failed_llm_request(
+                                        &turn_capture,
                                         turn_llm_request_id,
                                         turn_request_started_at,
-                                        turn_request_body_json,
                                         turn_events,
                                         turn_started_at,
                                         &message,
                                         status_code,
+                                        true,
                                     );
                                     turn_retry_count = turn_retry_count.saturating_add(1);
                                     assistant_text = attempt_assistant_text;
@@ -3049,14 +3061,16 @@ impl PreparedChatContext {
                                     status_code,
                                 )
                                 .await;
-                                self.captured_llm_requests.push(CapturedLlmRequest {
-                                    id: turn_llm_request_id,
-                                    request_kind: "chat completion",
-                                    request_started_at: turn_request_started_at,
-                                    request_body_json: turn_request_body_json,
-                                    events: turn_events,
-                                    outcome: outcome.clone(),
-                                });
+                                self.capture_failed_llm_request(
+                                    &turn_capture,
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    status_code,
+                                    false,
+                                );
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
@@ -3082,10 +3096,10 @@ impl PreparedChatContext {
                                     if changed.is_err() || *app_shutdown_rx.borrow() {
                                         cancellation.cancel();
                                         self.capture_cancelled_llm_request(
+                                            &turn_capture,
                                             &turn_llm_request_id,
                                             &turn_request_started_at,
-                                            &turn_request_body_json,
-                                            &turn_events,
+                                                &turn_events,
                                             turn_started_at,
                                             SHUTDOWN_MESSAGE,
                                         );
@@ -3110,10 +3124,10 @@ impl PreparedChatContext {
                                 changed = run_cancellation_rx.changed() => {
                                     if changed.is_err() || *run_cancellation_rx.borrow() {
                                         self.capture_cancelled_llm_request(
+                                            &turn_capture,
                                             &turn_llm_request_id,
                                             &turn_request_started_at,
-                                            &turn_request_body_json,
-                                            &turn_events,
+                                                &turn_events,
                                             turn_started_at,
                                             "chat run cancelled",
                                         );
@@ -3155,13 +3169,14 @@ impl PreparedChatContext {
                                         self.global_config.app.llm_request_retry_count,
                                     ) {
                                         self.capture_failed_llm_request(
+                                            &turn_capture,
                                             turn_llm_request_id,
                                             turn_request_started_at,
-                                            turn_request_body_json,
                                             turn_events,
                                             turn_started_at,
                                             &message,
                                             status_code,
+                                            true,
                                         );
                                         turn_retry_count = turn_retry_count.saturating_add(1);
                                         assistant_text = attempt_assistant_text;
@@ -3199,13 +3214,36 @@ impl PreparedChatContext {
                                         status_code,
                                     )
                                     .await;
+                                    let response_body_json = match turn_capture
+                                        .response_json(provider_stream.final_response_dump())
+                                    {
+                                        Ok(response_body_json) => response_body_json,
+                                        Err(error) => {
+                                            yield ChatSseEvent::Error {
+                                                message: error.message,
+                                            };
+                                            return;
+                                        }
+                                    };
+                                    let captured_request_json = match turn_capture.captured_request_json() {
+                                        Ok(request_body_json) => request_body_json.unwrap_or_default(),
+                                        Err(error) => {
+                                            yield ChatSseEvent::Error {
+                                                message: error.message,
+                                            };
+                                            return;
+                                        }
+                                    };
                                     self.captured_llm_requests.push(CapturedLlmRequest {
                                         id: turn_llm_request_id,
                                         request_kind: "chat completion",
                                         request_started_at: turn_request_started_at,
-                                        request_body_json: turn_request_body_json,
+                                        request_body_json: captured_request_json,
                                         events: turn_events,
-                                        outcome: outcome.clone(),
+                                        outcome: ChatAuditOutcome {
+                                            response_body_json,
+                                            ..outcome.clone()
+                                        },
                                     });
 
                                     if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
@@ -3302,13 +3340,14 @@ impl PreparedChatContext {
                                         let message = "provider completed without streaming assistant text deltas".to_string();
                                         if turn_retry_count < self.global_config.app.llm_request_retry_count {
                                             self.capture_failed_llm_request(
+                                                &turn_capture,
                                                 turn_llm_request_id,
                                                 turn_request_started_at,
-                                                turn_request_body_json,
                                                 turn_events,
                                                 turn_started_at,
                                                 &message,
                                                 None,
+                                        true,
                                             );
                                             turn_retry_count = turn_retry_count.saturating_add(1);
                                             assistant_text = attempt_assistant_text;
@@ -3339,21 +3378,23 @@ impl PreparedChatContext {
                                         };
                                         events.push(captured_event(&event));
                                         let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-                                        self.captured_llm_requests.push(CapturedLlmRequest {
-                                            id: turn_llm_request_id,
-                                            request_kind: "chat completion",
-                                            request_started_at: turn_request_started_at,
-                                            request_body_json: turn_request_body_json,
-                                            events: turn_events,
-                                            outcome: outcome.clone(),
-                                        });
+                                            &self,
+                                            started_at,
+                                            &mut events,
+                                            &message,
+                                            None,
+                                        )
+                                        .await;
+                                        self.capture_failed_llm_request(
+                                            &turn_capture,
+                                            turn_llm_request_id,
+                                            turn_request_started_at,
+                                            turn_events,
+                                            turn_started_at,
+                                            &message,
+                                            None,
+                                            false,
+                                        );
 
                                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                             let event = ChatSseEvent::Error {
@@ -3371,13 +3412,14 @@ impl PreparedChatContext {
                                         let message = "provider completed without assistant text or tool calls".to_string();
                                         if turn_retry_count < self.global_config.app.llm_request_retry_count {
                                             self.capture_failed_llm_request(
+                                                &turn_capture,
                                                 turn_llm_request_id,
                                                 turn_request_started_at,
-                                                turn_request_body_json,
                                                 turn_events,
                                                 turn_started_at,
                                                 &message,
                                                 None,
+                                        true,
                                             );
                                             turn_retry_count = turn_retry_count.saturating_add(1);
                                             assistant_text = attempt_assistant_text;
@@ -3415,14 +3457,16 @@ impl PreparedChatContext {
                                     None,
                                 )
                                 .await;
-                                        self.captured_llm_requests.push(CapturedLlmRequest {
-                                            id: turn_llm_request_id,
-                                            request_kind: "chat completion",
-                                            request_started_at: turn_request_started_at,
-                                            request_body_json: turn_request_body_json,
-                                            events: turn_events,
-                                            outcome: outcome.clone(),
-                                        });
+                                        self.capture_failed_llm_request(
+                                            &turn_capture,
+                                            turn_llm_request_id,
+                                            turn_request_started_at,
+                                            turn_events,
+                                            turn_started_at,
+                                            &message,
+                                            None,
+                                            false,
+                                        );
 
                                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                             let event = ChatSseEvent::Error {
@@ -3457,11 +3501,31 @@ impl PreparedChatContext {
                                         final_usage = Some(total_usage.clone());
                                     }
                                     let turn_total_latency_ms = elapsed_millis(turn_started_at);
+                                    let response_body_json = match turn_capture
+                                        .response_json(provider_stream.final_response_dump())
+                                    {
+                                        Ok(response_body_json) => response_body_json,
+                                        Err(error) => {
+                                            yield ChatSseEvent::Error {
+                                                message: error.message,
+                                            };
+                                            return;
+                                        }
+                                    };
+                                    let request_body_json = match turn_capture.captured_request_json() {
+                                        Ok(request_body_json) => request_body_json.unwrap_or_default(),
+                                        Err(error) => {
+                                            yield ChatSseEvent::Error {
+                                                message: error.message,
+                                            };
+                                            return;
+                                        }
+                                    };
                                     let completed_turn_request = CapturedLlmRequest {
                                         id: turn_llm_request_id.clone(),
                                         request_kind: "chat completion",
                                         request_started_at: turn_request_started_at.clone(),
-                                        request_body_json: turn_request_body_json.clone(),
+                                        request_body_json,
                                         events: turn_events.clone(),
                                         outcome: ChatAuditOutcome {
                                             first_token_at: turn_first_token_at.clone(),
@@ -3481,15 +3545,7 @@ impl PreparedChatContext {
                                                 .and_then(|usage| usage.reasoning_tokens),
                                             status_code: Some(200),
                                             final_state: "succeeded",
-                                            response_body_json: Some(json!({
-                                                "turnIndex": turn_index,
-                                                "text": text.clone(),
-                                                "reasoning": reasoning.clone(),
-                                                "toolCalls": tool_calls.clone(),
-                                                "usage": usage.clone(),
-                                                "stopReason": stop_reason.clone(),
-                                                "responseId": response_id.clone(),
-                                            }).to_string()),
+                                            response_body_json,
                                         },
                                     };
                                     if let Err(error) = persist_completed_llm_request(&self, &completed_turn_request) {
@@ -4170,13 +4226,14 @@ impl PreparedChatContext {
                                 NeutralChatStreamEvent::Error { message } => {
                                     if turn_retry_count < self.global_config.app.llm_request_retry_count {
                                         self.capture_failed_llm_request(
+                                            &turn_capture,
                                             turn_llm_request_id,
                                             turn_request_started_at,
-                                            turn_request_body_json,
                                             turn_events,
                                             turn_started_at,
                                             &message,
                                             None,
+                                        true,
                                         );
                                         turn_retry_count = turn_retry_count.saturating_add(1);
                                         assistant_text = attempt_assistant_text;
@@ -4214,14 +4271,16 @@ impl PreparedChatContext {
                                     None,
                                 )
                                 .await;
-                                    self.captured_llm_requests.push(CapturedLlmRequest {
-                                        id: turn_llm_request_id,
-                                        request_kind: "chat completion",
-                                        request_started_at: turn_request_started_at,
-                                        request_body_json: turn_request_body_json,
-                                        events: turn_events,
-                                        outcome: outcome.clone(),
-                                    });
+                                    self.capture_failed_llm_request(
+                                        &turn_capture,
+                                        turn_llm_request_id,
+                                        turn_request_started_at,
+                                        turn_events,
+                                        turn_started_at,
+                                        &message,
+                                        None,
+                                        true,
+                                    );
 
                                     if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                         let event = ChatSseEvent::Error {
@@ -4246,13 +4305,14 @@ impl PreparedChatContext {
                         let message = "provider stream ended without a completion event".to_string();
                         if turn_retry_count < self.global_config.app.llm_request_retry_count {
                             self.capture_failed_llm_request(
+                                &turn_capture,
                                 turn_llm_request_id,
                                 turn_request_started_at,
-                                turn_request_body_json,
                                 turn_events,
                                 turn_started_at,
                                 &message,
                                 None,
+                                        true,
                             );
                             turn_retry_count = turn_retry_count.saturating_add(1);
                             assistant_text = attempt_assistant_text;
@@ -4290,14 +4350,16 @@ impl PreparedChatContext {
                                     None,
                                 )
                                 .await;
-                        self.captured_llm_requests.push(CapturedLlmRequest {
-                            id: turn_llm_request_id,
-                            request_kind: "chat completion",
-                            request_started_at: turn_request_started_at,
-                            request_body_json: turn_request_body_json,
-                            events: turn_events,
-                            outcome: outcome.clone(),
-                        });
+                        self.capture_failed_llm_request(
+                            &turn_capture,
+                            turn_llm_request_id,
+                            turn_request_started_at,
+                            turn_events,
+                            turn_started_at,
+                            &message,
+                            None,
+                            true,
+                        );
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                             let event = ChatSseEvent::Error {
@@ -4562,14 +4624,7 @@ async fn prepare_chat_context_for_output(
     let pending_memory_retrieval = prompt_context.pending_memory_retrieval;
     let memory_resolution_deferred = pending_memory_retrieval.is_some();
     let mut provider_request = prompt_context.provider_request;
-    // When memory retrieval is deferred, the prompt cache key is finalized
-    // after the memory messages have been spliced into the prompt (in the
-    // background stream, after the `start` event). The initial request body is
-    // still serialized without a cache key so cancellation or memory-resolution
-    // failures never write invalid JSON into the LLM audit table.
-    let request_body_json = if memory_resolution_deferred {
-        serialize_provider_request(&provider_request)?
-    } else {
+    if !memory_resolution_deferred {
         provider_request.prompt_cache_key = Some(prompt_cache_key(
             &prompt_context.workspace_id,
             &chat_id,
@@ -4580,8 +4635,7 @@ async fn prepare_chat_context_for_output(
             &prompt_context.message_context_sources,
         )?);
         provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
-        serialize_provider_request(&provider_request)?
-    };
+    }
     let code_change_baseline =
         session_code_change_baseline_for_workspace(&prompt_context.workspace_path);
     if let SessionCodeChangeBaselineState::Unavailable { reason } = &code_change_baseline {
@@ -4628,7 +4682,6 @@ async fn prepare_chat_context_for_output(
         memory_settings: config.memory.clone(),
         memories_used: prompt_context.memories_used,
         memory_target_status: memory_target_status_for_prompt(raw_message),
-        request_body_json,
         captured_llm_requests: Vec::new(),
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
@@ -4760,7 +4813,6 @@ impl PreparedChatContext {
             &self.message_context_sources,
         )?);
         self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
-        self.request_body_json = serialize_provider_request(&self.provider_request)?;
 
         Ok(())
     }
@@ -4818,7 +4870,6 @@ impl PreparedChatContext {
             &self.message_context_sources,
         )?);
         self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
-        self.request_body_json = serialize_provider_request(&self.provider_request)?;
 
         Ok(())
     }
@@ -4983,8 +5034,6 @@ pub(crate) async fn audited_provider_text_request(
     retry_count: u32,
     save_details: bool,
 ) -> Result<String, ApiError> {
-    let request_body_json = serialize_provider_request(&request)?;
-
     for attempt_index in 0..=retry_count {
         let request_id = unique_id("llm");
         let request_started_at = utc_timestamp();
@@ -5015,7 +5064,7 @@ pub(crate) async fn audited_provider_text_request(
                 total_latency_ms: None,
                 status_code: None,
                 final_state: "running",
-                request_body_json: api_audit_detail_json(&request_body_json, save_details),
+                request_body_json: None,
                 response_body_json: None,
             })
             .map_err(ApiError::from_workspace_error)?;
@@ -5041,11 +5090,13 @@ pub(crate) async fn audited_provider_text_request(
             .map_err(ApiError::from_workspace_error)?;
         drop(database);
 
+        let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
         let result = run_provider_stream_for_text(
             provider_config,
             request.clone(),
             request_kind,
             timeout_ms,
+            &capture,
         )
         .await;
         let completed_at = utc_timestamp();
@@ -5082,10 +5133,7 @@ pub(crate) async fn audited_provider_text_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: Some(200),
                             final_state: "succeeded",
-                            response_body_json: api_audit_detail_json(
-                                &response_body_json,
-                                save_details,
-                            ),
+                            response_body_json: response_body_json.as_deref(),
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
@@ -5099,7 +5147,6 @@ pub(crate) async fn audited_provider_text_request(
                 return Ok(text);
             }
             Err(error) => {
-                let error_body_json = json!({ "error": &error.message }).to_string();
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -5115,10 +5162,7 @@ pub(crate) async fn audited_provider_text_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: error.status_code,
                             final_state: "failed",
-                            response_body_json: api_audit_detail_json(
-                                &error_body_json,
-                                save_details,
-                            ),
+                            response_body_json: error.response_body_json.as_deref(),
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
@@ -5148,8 +5192,6 @@ pub(crate) async fn audited_provider_tool_request(
     retry_count: u32,
     save_details: bool,
 ) -> Result<Value, ApiError> {
-    let request_body_json = serialize_provider_request(&request)?;
-
     for attempt_index in 0..=retry_count {
         let request_id = unique_id("llm");
         let request_started_at = utc_timestamp();
@@ -5180,7 +5222,7 @@ pub(crate) async fn audited_provider_tool_request(
                 total_latency_ms: None,
                 status_code: None,
                 final_state: "running",
-                request_body_json: api_audit_detail_json(&request_body_json, save_details),
+                request_body_json: None,
                 response_body_json: None,
             })
             .map_err(ApiError::from_workspace_error)?;
@@ -5206,6 +5248,7 @@ pub(crate) async fn audited_provider_tool_request(
             .map_err(ApiError::from_workspace_error)?;
         drop(database);
 
+        let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
         let result = run_provider_stream_for_tool(
             provider_config,
             request.clone(),
@@ -5213,6 +5256,7 @@ pub(crate) async fn audited_provider_tool_request(
             expected_tool_name,
             tool_label,
             timeout_ms,
+            &capture,
         )
         .await;
         let completed_at = utc_timestamp();
@@ -5249,10 +5293,7 @@ pub(crate) async fn audited_provider_tool_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: Some(200),
                             final_state: "succeeded",
-                            response_body_json: api_audit_detail_json(
-                                &response_body_json,
-                                save_details,
-                            ),
+                            response_body_json: response_body_json.as_deref(),
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
@@ -5266,7 +5307,6 @@ pub(crate) async fn audited_provider_tool_request(
                 return Ok(tool_arguments);
             }
             Err(error) => {
-                let error_body_json = json!({ "error": &error.message }).to_string();
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -5282,10 +5322,7 @@ pub(crate) async fn audited_provider_tool_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: error.status_code,
                             final_state: "failed",
-                            response_body_json: api_audit_detail_json(
-                                &error_body_json,
-                                save_details,
-                            ),
+                            response_body_json: error.response_body_json.as_deref(),
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
@@ -5307,7 +5344,7 @@ struct AuditedTextStreamOutcome {
     usage: Option<NeutralUsage>,
     first_token_at: Option<String>,
     first_token_latency_ms: Option<i64>,
-    response_body_json: String,
+    response_body_json: Option<String>,
 }
 
 struct AuditedToolStreamOutcome {
@@ -5316,12 +5353,13 @@ struct AuditedToolStreamOutcome {
     usage: Option<NeutralUsage>,
     first_token_at: Option<String>,
     first_token_latency_ms: Option<i64>,
-    response_body_json: String,
+    response_body_json: Option<String>,
 }
 
 struct AuditedProviderError {
     message: String,
     status_code: Option<i64>,
+    response_body_json: Option<String>,
 }
 
 impl AuditedProviderError {
@@ -5329,7 +5367,44 @@ impl AuditedProviderError {
         Self {
             message: message.into(),
             status_code,
+            response_body_json: None,
         }
+    }
+
+    fn with_response_body_json(mut self, response_body_json: Option<String>) -> Self {
+        self.response_body_json = response_body_json;
+        self
+    }
+
+    fn with_stream_final_response(
+        self,
+        capture: &ProviderAuditCapture,
+        stream: &foco_providers::NeutralChatStream,
+    ) -> Self {
+        if self.response_body_json.is_some() {
+            return self;
+        }
+        self.with_response_body_json(
+            capture
+                .response_json(stream.final_response_dump())
+                .unwrap_or(None),
+        )
+    }
+
+    fn with_interrupted_stream_response(
+        self,
+        capture: &ProviderAuditCapture,
+        stream: &foco_providers::NeutralChatStream,
+        message: &str,
+    ) -> Self {
+        if self.response_body_json.is_some() {
+            return self;
+        }
+        self.with_response_body_json(
+            capture
+                .response_json(stream.interrupted_final_response_dump(message).as_ref())
+                .unwrap_or(None),
+        )
     }
 }
 
@@ -5338,37 +5413,46 @@ async fn run_provider_stream_for_text(
     request: NeutralChatRequest,
     request_kind: &str,
     timeout_ms: u64,
+    capture: &ProviderAuditCapture,
 ) -> Result<AuditedTextStreamOutcome, AuditedProviderError> {
     let started_at = Instant::now();
+    let observer = capture.observer();
+    let capture_details = observer.is_some();
     let mut stream = timeout(
         Duration::from_millis(timeout_ms),
-        stream_chat(provider_config, request),
+        stream_chat_with_capture_observer(provider_config, request, capture_details, observer),
     )
     .await
     .map_err(|_| {
-        AuditedProviderError::new(
-            format!("{request_kind} timed out after {timeout_ms} ms"),
-            None,
+        let message = format!("{request_kind} timed out after {timeout_ms} ms");
+        AuditedProviderError::new(message.clone(), None).with_response_body_json(
+            capture
+                .failed_response_json(message, None, false)
+                .unwrap_or(None),
         )
     })?
     .map_err(|source| {
-        AuditedProviderError::new(source.to_string(), provider_status_code(&source))
+        let _ = capture.persist_request_failure(&source);
+        AuditedProviderError::new(source.to_string(), source.status_code().map(i64::from))
+            .with_response_body_json(
+                capture
+                    .failed_response_json(source.to_string(), source.status_code(), false)
+                    .unwrap_or(None),
+            )
     })?;
     let mut output_text = String::new();
     let mut events = Vec::new();
     let mut final_usage = None;
     let mut first_token_at = None;
     let mut first_token_latency_ms = None;
-    let mut completion_json = None;
 
     loop {
         let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
             .await
             .map_err(|_| {
-                AuditedProviderError::new(
-                    format!("{request_kind} timed out after {timeout_ms} ms"),
-                    None,
-                )
+                let message = format!("{request_kind} timed out after {timeout_ms} ms");
+                AuditedProviderError::new(message.clone(), None)
+                    .with_interrupted_stream_response(capture, &stream, &message)
             })?
         else {
             break;
@@ -5378,6 +5462,7 @@ async fn run_provider_stream_for_text(
                 format!("{request_kind} stream failed: {source}"),
                 provider_status_code(&source),
             )
+            .with_stream_final_response(capture, &stream)
         })?;
         events.push(event.clone());
 
@@ -5401,6 +5486,14 @@ async fn run_provider_stream_for_text(
                         tool_call.name
                     ),
                     None,
+                )
+                .with_interrupted_stream_response(
+                    capture,
+                    &stream,
+                    &format!(
+                        "{request_kind} called unsupported tool '{}'",
+                        tool_call.name
+                    ),
                 ));
             }
             NeutralChatStreamEvent::Complete {
@@ -5418,7 +5511,8 @@ async fn run_provider_stream_for_text(
                             tool_call.name
                         ),
                         None,
-                    ));
+                    )
+                    .with_stream_final_response(capture, &stream));
                 }
                 if output_text.is_empty() && !text.is_empty() {
                     output_text.push_str(&text);
@@ -5426,32 +5520,23 @@ async fn run_provider_stream_for_text(
                 if let Some(usage) = usage {
                     final_usage = Some(usage);
                 }
-                completion_json = Some(
-                    json!({
-                        "requestKind": request_kind,
-                        "text": output_text,
-                        "usage": final_usage,
-                        "stopReason": stop_reason,
-                        "responseId": response_id,
-                    })
-                    .to_string(),
-                );
+                let _ = (stop_reason, response_id);
                 break;
             }
             NeutralChatStreamEvent::Error { message } => {
                 return Err(AuditedProviderError::new(
                     format!("{request_kind} stream error: {message}"),
                     None,
-                ));
+                )
+                .with_stream_final_response(capture, &stream));
             }
         }
     }
 
     if output_text.trim().is_empty() {
-        return Err(AuditedProviderError::new(
-            format!("{request_kind} returned empty text"),
-            None,
-        ));
+        let message = format!("{request_kind} returned empty text");
+        return Err(AuditedProviderError::new(message.clone(), None)
+            .with_interrupted_stream_response(capture, &stream, &message));
     }
 
     Ok(AuditedTextStreamOutcome {
@@ -5460,8 +5545,9 @@ async fn run_provider_stream_for_text(
         usage: final_usage,
         first_token_at,
         first_token_latency_ms,
-        response_body_json: completion_json
-            .unwrap_or_else(|| json!({ "requestKind": request_kind }).to_string()),
+        response_body_json: capture
+            .response_json(stream.final_response_dump())
+            .unwrap_or(None),
     })
 }
 
@@ -5472,21 +5558,32 @@ async fn run_provider_stream_for_tool(
     expected_tool_name: &str,
     tool_label: &str,
     timeout_ms: u64,
+    capture: &ProviderAuditCapture,
 ) -> Result<AuditedToolStreamOutcome, AuditedProviderError> {
     let started_at = Instant::now();
+    let observer = capture.observer();
+    let capture_details = observer.is_some();
     let mut stream = timeout(
         Duration::from_millis(timeout_ms),
-        stream_chat(provider_config, request),
+        stream_chat_with_capture_observer(provider_config, request, capture_details, observer),
     )
     .await
     .map_err(|_| {
-        AuditedProviderError::new(
-            format!("{request_kind} timed out after {timeout_ms} ms"),
-            None,
+        let message = format!("{request_kind} timed out after {timeout_ms} ms");
+        AuditedProviderError::new(message.clone(), None).with_response_body_json(
+            capture
+                .failed_response_json(message, None, false)
+                .unwrap_or(None),
         )
     })?
     .map_err(|source| {
-        AuditedProviderError::new(source.to_string(), provider_status_code(&source))
+        let _ = capture.persist_request_failure(&source);
+        AuditedProviderError::new(source.to_string(), source.status_code().map(i64::from))
+            .with_response_body_json(
+                capture
+                    .failed_response_json(source.to_string(), source.status_code(), false)
+                    .unwrap_or(None),
+            )
     })?;
     let mut output_text = String::new();
     let mut tool_arguments = None;
@@ -5494,16 +5591,14 @@ async fn run_provider_stream_for_tool(
     let mut final_usage = None;
     let mut first_token_at = None;
     let mut first_token_latency_ms = None;
-    let mut completion_json = None;
 
     loop {
         let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
             .await
             .map_err(|_| {
-                AuditedProviderError::new(
-                    format!("{request_kind} timed out after {timeout_ms} ms"),
-                    None,
-                )
+                let message = format!("{request_kind} timed out after {timeout_ms} ms");
+                AuditedProviderError::new(message.clone(), None)
+                    .with_interrupted_stream_response(capture, &stream, &message)
             })?
         else {
             break;
@@ -5513,6 +5608,7 @@ async fn run_provider_stream_for_tool(
                 format!("{request_kind} stream failed: {source}"),
                 provider_status_code(&source),
             )
+            .with_stream_final_response(capture, &stream)
         })?;
         events.push(event.clone());
 
@@ -5532,13 +5628,12 @@ async fn run_provider_stream_for_tool(
             NeutralChatStreamEvent::ToolCall { tool_call } => {
                 capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                 if tool_call.name != expected_tool_name {
-                    return Err(AuditedProviderError::new(
-                        format!(
-                            "{request_kind} called unsupported tool '{}'",
-                            tool_call.name
-                        ),
-                        None,
-                    ));
+                    let message = format!(
+                        "{request_kind} called unsupported tool '{}'",
+                        tool_call.name
+                    );
+                    return Err(AuditedProviderError::new(message.clone(), None)
+                        .with_interrupted_stream_response(capture, &stream, &message));
                 }
                 tool_arguments = Some(tool_call.arguments);
             }
@@ -5559,7 +5654,8 @@ async fn run_provider_stream_for_tool(
                                     tool_call.name
                                 ),
                                 None,
-                            ));
+                            )
+                            .with_stream_final_response(capture, &stream));
                         }
                         tool_arguments = Some(tool_call.arguments);
                     }
@@ -5570,37 +5666,30 @@ async fn run_provider_stream_for_tool(
                 if let Some(usage) = usage {
                     final_usage = Some(usage);
                 }
-                completion_json = Some(
-                    json!({
-                        "requestKind": request_kind,
-                        "text": output_text,
-                        "usage": final_usage,
-                        "stopReason": stop_reason,
-                        "responseId": response_id,
-                    })
-                    .to_string(),
-                );
+                let _ = (stop_reason, response_id);
                 break;
             }
             NeutralChatStreamEvent::Error { message } => {
                 return Err(AuditedProviderError::new(
                     format!("{request_kind} stream error: {message}"),
                     None,
-                ));
+                )
+                .with_stream_final_response(capture, &stream));
             }
         }
     }
 
     let tool_arguments = tool_arguments.ok_or_else(|| {
         let text = output_text.trim();
-        if text.is_empty() {
+        let error = if text.is_empty() {
             AuditedProviderError::new(format!("{request_kind} did not call {tool_label}"), None)
         } else {
             AuditedProviderError::new(
                 format!("{request_kind} returned text instead of {tool_label}: {text}"),
                 None,
             )
-        }
+        };
+        error.with_stream_final_response(capture, &stream)
     })?;
 
     Ok(AuditedToolStreamOutcome {
@@ -5609,8 +5698,9 @@ async fn run_provider_stream_for_tool(
         usage: final_usage,
         first_token_at,
         first_token_latency_ms,
-        response_body_json: completion_json
-            .unwrap_or_else(|| json!({ "requestKind": request_kind }).to_string()),
+        response_body_json: capture
+            .response_json(stream.final_response_dump())
+            .unwrap_or(None),
     })
 }
 
@@ -8198,6 +8288,18 @@ fn ai_request_audit_detail(
     workspace: &WorkspaceConfig,
     chat_titles: &HashMap<String, String>,
 ) -> Result<AiRequestAuditDetail, ApiError> {
+    let request_detail = parse_audit_detail_value(request.request_body_json.as_deref());
+    let response_detail = parse_audit_detail_value(request.response_body_json.as_deref());
+    let request_detail_status = audit_request_detail_status(
+        &request.final_state,
+        request.request_body_json.as_deref(),
+        request_detail.as_ref(),
+    );
+    let response_detail_status = audit_response_detail_status(
+        &request.final_state,
+        request.response_body_json.as_deref(),
+        response_detail.as_ref(),
+    );
     Ok(AiRequestAuditDetail {
         id: request.id,
         workspace_id: workspace.id.clone(),
@@ -8225,8 +8327,10 @@ fn ai_request_audit_detail(
         final_state: request.final_state,
         invalidated_at: request.invalidated_at,
         invalidated_reason: request.invalidated_reason,
-        request_body: parse_optional_json_value(request.request_body_json, "LLM request body")?,
-        response_body: parse_optional_json_value(request.response_body_json, "LLM response body")?,
+        request_detail_status,
+        response_detail_status,
+        request_body: request_detail,
+        response_body: response_detail,
     })
 }
 
@@ -11351,6 +11455,68 @@ fn chat_tool_call_summary(
         completed_at: record.completed_at,
         live_output: None,
     })
+}
+
+fn parse_audit_detail_value(value: Option<&str>) -> Option<Value> {
+    value.map(|value| {
+        serde_json::from_str(value).unwrap_or_else(|_| {
+            json!({
+                "format": "legacy_text_v1",
+                "text": value,
+            })
+        })
+    })
+}
+
+fn audit_request_detail_status(
+    final_state: &str,
+    raw: Option<&str>,
+    parsed: Option<&Value>,
+) -> &'static str {
+    match (raw, parsed) {
+        (Some(_), Some(Value::Object(value)))
+            if value.get("format").and_then(Value::as_str) == Some("provider_request_v1") =>
+        {
+            "captured"
+        }
+        (Some(_), Some(Value::Object(value)))
+            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
+        {
+            "malformed"
+        }
+        (Some(_), _) => "legacy",
+        (None, _) if final_state == "running" => "pending",
+        (None, _) => "unavailable",
+    }
+}
+
+fn audit_response_detail_status(
+    final_state: &str,
+    raw: Option<&str>,
+    parsed: Option<&Value>,
+) -> &'static str {
+    match (raw, parsed) {
+        (Some(_), Some(Value::Object(value)))
+            if value.get("format").and_then(Value::as_str)
+                == Some("provider_final_response_v1") =>
+        {
+            match value.get("state").and_then(Value::as_str) {
+                Some("failed") if value.get("partial").and_then(Value::as_bool) == Some(true) => {
+                    "partial"
+                }
+                Some("failed") => "failed",
+                _ => "captured",
+            }
+        }
+        (Some(_), Some(Value::Object(value)))
+            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
+        {
+            "malformed"
+        }
+        (Some(_), _) => "legacy",
+        (None, _) if final_state == "running" => "pending",
+        (None, _) => "unavailable",
+    }
 }
 
 fn parse_json_value(value: &str, field: &str) -> Result<Value, ApiError> {

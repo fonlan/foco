@@ -42,7 +42,11 @@ pub struct ProviderWireRequestDump {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "state")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "state"
+)]
 pub enum ProviderFinalResponseDump {
     Succeeded {
         format: String,
@@ -1560,7 +1564,10 @@ fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
         .body()
         .and_then(|body| body.as_bytes())
         .map(|bytes| match std::str::from_utf8(bytes) {
-            Ok(body) => (Some(body.to_string()), Some("utf8".to_string())),
+            Ok(body) => (
+                Some(redact_json_body_credentials(body)),
+                Some("utf8".to_string()),
+            ),
             Err(_) => (
                 Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
                 Some("base64".to_string()),
@@ -1587,24 +1594,81 @@ fn redact_url_credentials(url: &reqwest::Url) -> String {
     if redacted.password().is_some() {
         let _ = redacted.set_password(Some(REDACTED_HEADER_VALUE));
     }
+    if redacted.query().is_some() {
+        let query = redacted
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if is_sensitive_query_name(&name) {
+                    REDACTED_HEADER_VALUE.to_string()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect::<Vec<_>>();
+        redacted.query_pairs_mut().clear().extend_pairs(query);
+    }
     redacted.to_string()
 }
 
-fn is_sensitive_header_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    normalized == "authorization"
-        || normalized == "proxy-authorization"
+fn redact_json_body_credentials(body: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    redact_json_credentials(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
+}
+
+fn redact_json_credentials(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if is_sensitive_credential_name(name) {
+                    *value = Value::String(REDACTED_HEADER_VALUE.to_string());
+                } else {
+                    redact_json_credentials(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_json_credentials(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_sensitive_query_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|character| *character != '-' && *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized == "key" || normalized.contains("apikey") || normalized.contains("accesskey")
+}
+
+fn is_sensitive_credential_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|character| *character != '-' && *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized == "key"
+        || normalized == "authorization"
+        || normalized == "proxyauthorization"
         || normalized == "cookie"
-        || normalized == "set-cookie"
-        || normalized == "x-api-key"
-        || normalized == "api-key"
-        || normalized == "x-goog-api-key"
-        || normalized == "x-auth-token"
+        || normalized == "setcookie"
+        || normalized == "password"
+        || normalized.contains("apikey")
         || normalized.contains("signature")
         || normalized.contains("credential")
         || normalized.contains("secret")
-        || normalized.ends_with("-token")
-        || normalized.ends_with("_token")
+        || normalized.ends_with("token")
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    is_sensitive_credential_name(name)
 }
 fn normalize_stream_event(
     event: ChatStreamEvent,
@@ -1928,56 +1992,242 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        time::{Duration, timeout},
     };
 
-    async fn spawn_openai_sse_fixture(
+    #[derive(Debug)]
+    struct RawHttpRequest {
+        method: String,
+        target: String,
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    fn parse_raw_http_request(bytes: Vec<u8>) -> RawHttpRequest {
+        let header_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("raw HTTP header terminator");
+        let head = String::from_utf8(bytes[..header_end].to_vec()).expect("raw HTTP headers");
+        let mut lines = head.lines();
+        let request_line = lines.next().expect("HTTP request line");
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().expect("HTTP method").to_string();
+        let target = request_parts.next().expect("HTTP target").to_string();
+        let headers = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect();
+        let body = String::from_utf8(bytes[header_end..].to_vec()).expect("raw HTTP body");
+        RawHttpRequest {
+            method,
+            target,
+            headers,
+            body,
+        }
+    }
+
+    async fn read_raw_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let read = socket
+                .read(&mut buffer)
+                .await
+                .expect("read fixture request");
+            assert!(read > 0, "fixture client closed before headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or_default();
+        while request.len() < header_end + content_length {
+            let read = socket.read(&mut buffer).await.expect("read fixture body");
+            assert!(read > 0, "fixture client closed before body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request.truncate(header_end + content_length);
+        request
+    }
+
+    async fn spawn_raw_http_fixture(
+        status: &'static str,
+        content_type: &'static str,
         response_body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture");
         let address = listener.local_addr().expect("fixture address");
         let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept fixture request");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end = loop {
-                let read = socket
-                    .read(&mut buffer)
+            let mut requests = Vec::new();
+            loop {
+                let accepted = if requests.is_empty() {
+                    Some(listener.accept().await.expect("accept fixture request"))
+                } else {
+                    timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .ok()
+                        .map(|result| result.expect("accept repeated fixture request"))
+                };
+                let Some((mut socket, _)) = accepted else {
+                    break;
+                };
+                requests.push(read_raw_http_request(&mut socket).await);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
                     .await
-                    .expect("read fixture request");
-                assert!(read > 0, "fixture client closed before headers");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("content length"))
-                })
-                .unwrap_or_default();
-            while request.len() < header_end + content_length {
-                let read = socket.read(&mut buffer).await.expect("read fixture body");
-                assert!(read > 0, "fixture client closed before body");
-                request.extend_from_slice(&buffer[..read]);
+                    .expect("write fixture response");
             }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write fixture response");
-            request
+            requests
         });
-        (format!("http://{address}/v1/"), task)
+        (format!("http://{address}/"), task)
+    }
+
+    async fn assert_adapter_captures_finalized_request_once(
+        kind_name: &str,
+        model_id: &str,
+        expected_target_fragment: &str,
+        response_body: &'static str,
+    ) -> (ProviderWireRequestDump, RawHttpRequest) {
+        let (base_url, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response_body).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(kind_name).expect("provider kind"),
+            base_url: Some(base_url),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "x-fixture-header".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("fixture-header-value".to_string()),
+                },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_BODY.to_string(),
+                    name: "foco_fixture".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("finalized-body-override".to_string()),
+                },
+            ],
+            model_redirects: vec![ProviderModelRedirect {
+                from: format!("upstream-{model_id}"),
+                to: model_id.to_string(),
+            }],
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "adapter system"),
+            neutral_text_message(NeutralChatRole::User, "adapter user"),
+        ]);
+        request.model_id = model_id.to_string();
+        request.thinking_level = Some("low".to_string());
+        request.prompt_cache_key = Some("fixture-cache-key".to_string());
+        request.prompt_cache_retention = Some("24h".to_string());
+        request.tools.push(NeutralToolDefinition {
+            name: "fixture_tool".to_string(),
+            description: "fixture tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open adapter fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("adapter wire request dump")
+            .clone();
+        while stream.next_event().await.is_some() {}
+
+        let requests = fixture.await.expect("adapter fixture task");
+        assert_eq!(
+            requests.len(),
+            1,
+            "capture must not duplicate provider sends"
+        );
+        let raw = parse_raw_http_request(requests.into_iter().next().expect("raw request"));
+        assert_eq!(dump.method, raw.method);
+        assert!(
+            raw.target.contains(expected_target_fragment),
+            "{}",
+            raw.target
+        );
+        assert!(dump.url.ends_with(&raw.target));
+        assert_eq!(dump.body.as_deref(), Some(raw.body.as_str()));
+        assert_eq!(dump.body_encoding.as_deref(), Some("utf8"));
+        assert_eq!(
+            dump.headers.get("x-fixture-header").map(String::as_str),
+            Some("fixture-header-value")
+        );
+        let raw_secret_header = raw
+            .headers
+            .iter()
+            .find(|(_, value)| value.contains("fixture-api-key"))
+            .map(|(name, _)| name)
+            .expect("provider authentication header");
+        assert_eq!(
+            dump.headers.get(raw_secret_header).map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        let body: Value = serde_json::from_str(&raw.body).expect("adapter request JSON");
+        match kind_name {
+            OPENAI_CHAT_KIND | OPENAI_RESPONSES_KIND => {
+                assert_eq!(
+                    body.get("foco_fixture").and_then(Value::as_str),
+                    Some("finalized-body-override"),
+                    "adapter {kind_name} did not preserve extra_body: {}",
+                    raw.body
+                );
+            }
+            ANTHROPIC_KIND => {
+                assert_eq!(body["thinking"]["type"], "enabled");
+                assert_eq!(body["thinking"]["budget_tokens"], 1024);
+            }
+            GEMINI_KIND => {
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+                    true
+                );
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    1000
+                );
+            }
+            _ => unreachable!("fixture covers primary adapters only"),
+        }
+        if kind_name != GEMINI_KIND {
+            assert!(raw.body.contains(&format!("upstream-{model_id}")));
+        } else {
+            assert!(raw.target.contains(&format!("upstream-{model_id}")));
+        }
+        assert!(raw.body.contains("adapter system"));
+        assert!(raw.body.contains("fixture_tool"));
+        let final_response = stream
+            .final_response_dump()
+            .expect("adapter final response dump");
+        assert!(
+            !serde_json::to_string(final_response)
+                .expect("adapter final response JSON")
+                .contains("chunk-only-secret")
+        );
+        (dump, raw)
     }
 
     fn openai_responses_kind() -> ProviderKind {
@@ -2837,6 +3087,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wire_dump_redacts_credentials_without_mutating_prompt_text() {
+        let mut request = Request::new(
+            reqwest::Method::POST,
+            reqwest::Url::parse(
+                "https://user:password@example.test/v1/chat?key=query-secret&topic=api-key-is-a-prompt",
+            )
+            .expect("url"),
+        );
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer header-secret"),
+        );
+        request.headers_mut().insert(
+            reqwest::header::HeaderName::from_static("x-provider-signature"),
+            reqwest::header::HeaderValue::from_static("signature-secret"),
+        );
+        *request.body_mut() = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "api_key": "body-secret",
+                "nested": { "accessToken": "nested-secret" },
+                "prompt": "Keep api_key and token words in ordinary prompt text",
+            }))
+            .expect("body")
+            .into(),
+        );
+
+        let dump = provider_wire_request_dump(&request);
+        assert!(dump.url.contains("%5BREDACTED%5D:%5BREDACTED%5D@"));
+        assert!(dump.url.contains("key=%5BREDACTED%5D"));
+        assert!(dump.url.contains("topic=api-key-is-a-prompt"));
+        assert_eq!(
+            dump.headers.get("authorization").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            dump.headers.get("x-provider-signature").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        let body: Value = serde_json::from_str(dump.body.as_deref().expect("body")).expect("json");
+        assert_eq!(body["api_key"], REDACTED_HEADER_VALUE);
+        assert_eq!(body["nested"]["accessToken"], REDACTED_HEADER_VALUE);
+        assert_eq!(
+            body["prompt"],
+            "Keep api_key and token words in ordinary prompt text"
+        );
+        assert_eq!(dump.body_encoding.as_deref(), Some("utf8"));
+    }
+
+    #[test]
+    fn wire_dump_preserves_empty_and_binary_body_semantics() {
+        let empty = Request::new(
+            reqwest::Method::GET,
+            reqwest::Url::parse("https://example.test/").expect("url"),
+        );
+        let empty_dump = provider_wire_request_dump(&empty);
+        assert_eq!(empty_dump.body, None);
+        assert_eq!(empty_dump.body_encoding, None);
+
+        let mut binary = Request::new(
+            reqwest::Method::POST,
+            reqwest::Url::parse("https://example.test/").expect("url"),
+        );
+        *binary.body_mut() = Some(vec![0xff, 0x00, 0x80].into());
+        let binary_dump = provider_wire_request_dump(&binary);
+        assert_eq!(binary_dump.body.as_deref(), Some("/wCA"));
+        assert_eq!(binary_dump.body_encoding.as_deref(), Some("base64"));
+    }
+
+    #[tokio::test]
+    async fn captures_finalized_requests_for_four_primary_adapters() {
+        let openai_chat = concat!(
+            "data: {\"raw_chunk_secret\":\"chunk-only-secret\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"chat ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_adapter_captures_finalized_request_once(
+            OPENAI_CHAT_KIND,
+            "fixture-chat-model",
+            "/chat/completions",
+            openai_chat,
+        )
+        .await;
+
+        let openai_responses = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"responses ok\",\"chunk_secret\":\"chunk-only-secret\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-fixture\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"responses ok\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
+        );
+        assert_adapter_captures_finalized_request_once(
+            OPENAI_RESPONSES_KIND,
+            "fixture-responses-model",
+            "/responses",
+            openai_responses,
+        )
+        .await;
+
+        let anthropic = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-fixture\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fixture\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic ok\"},\"chunk_secret\":\"chunk-only-secret\"}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        assert_adapter_captures_finalized_request_once(
+            ANTHROPIC_KIND,
+            "fixture-anthropic-model",
+            "/messages",
+            anthropic,
+        )
+        .await;
+
+        let gemini = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"gemini ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5},\"chunk_secret\":\"chunk-only-secret\"}\n\n"
+        );
+        assert_adapter_captures_finalized_request_once(
+            GEMINI_KIND,
+            "fixture-gemini-model",
+            ":streamGenerateContent",
+            gemini,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn captures_final_wire_request_and_only_final_response() {
         const CHUNK_SENTINEL: &str = "chunk-only-secret";
@@ -2845,7 +3219,9 @@ mod tests {
             "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
             "data: [DONE]\n\n"
         );
-        let (base_url, fixture) = spawn_openai_sse_fixture(response).await;
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let base_url = format!("{fixture_root}v1/");
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
             base_url: Some(base_url),
@@ -2915,8 +3291,10 @@ mod tests {
             } if text == "final text" && stop_reason == "stop"
         ));
 
-        let raw_request = fixture.await.expect("fixture task");
-        let raw_request = String::from_utf8(raw_request).expect("raw HTTP request UTF-8");
+        let raw_requests = fixture.await.expect("fixture task");
+        assert_eq!(raw_requests.len(), 1);
+        let raw_request = String::from_utf8(raw_requests.into_iter().next().expect("raw request"))
+            .expect("raw HTTP request UTF-8");
         assert!(raw_request.contains("authorization: Bearer fixture-api-key"));
         assert!(raw_request.contains(body));
     }
@@ -2927,7 +3305,9 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let (base_url, fixture) = spawn_openai_sse_fixture(response).await;
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let base_url = format!("{fixture_root}v1/");
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
             base_url: Some(base_url),
@@ -2947,6 +3327,7 @@ mod tests {
         assert!(stream.wire_request_dump().is_none());
         while stream.next_event().await.is_some() {}
         assert!(stream.final_response_dump().is_none());
-        fixture.await.expect("fixture task");
+        let raw_requests = fixture.await.expect("fixture task");
+        assert_eq!(raw_requests.len(), 1);
     }
 }

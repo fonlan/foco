@@ -31,6 +31,7 @@ import {
 } from "react";
 
 import type {
+  AiRequestAuditDetail,
   AiRequestAuditSummary,
   AiRequestDetailResponse,
   AiStatisticsSummary,
@@ -975,12 +976,23 @@ function AiRequestDetailDialog({
               <div className="grid gap-4 xl:grid-cols-2">
                 <ProviderRequestDetail
                   copied={copiedKey === "request"}
+                  detailStatus={
+                    request.requestDetailStatus ??
+                    (request.requestBody === null ? "pending" : "legacy")
+                  }
                   onCopy={(text) => onCopy("request", text)}
                   requestBody={request.requestBody}
                 />
                 <ProviderResponseDetail
                   copied={copiedKey === "response"}
-                  finalState={request.finalState}
+                  detailStatus={
+                    request.responseDetailStatus ??
+                    (request.responseBody === null
+                      ? request.finalState === "running"
+                        ? "pending"
+                        : "unavailable"
+                      : "legacy")
+                  }
                   onCopy={(text) => onCopy("response", text)}
                   responseBody={request.responseBody}
                 />
@@ -995,10 +1007,12 @@ function AiRequestDetailDialog({
 
 function ProviderRequestDetail({
   copied,
+  detailStatus,
   onCopy,
   requestBody,
 }: {
   copied: boolean;
+  detailStatus: NonNullable<AiRequestAuditDetail["requestDetailStatus"]>;
   onCopy: (text: string) => void;
   requestBody: JsonValue | ProviderWireRequestDump | null;
 }) {
@@ -1007,11 +1021,15 @@ function ProviderRequestDetail({
     return (
       <AuditDetailCard
         notice={
-          requestBody === null
+          detailStatus === "pending"
             ? t("Request detail is pending or was pruned.")
-            : t(
-                "Legacy normalized record. Request is not the actual provider payload.",
-              )
+            : detailStatus === "unavailable"
+              ? t("Request detail was not captured or was pruned.")
+              : detailStatus === "malformed"
+                ? t("Stored request detail is malformed legacy text.")
+                : t(
+                    "Legacy normalized record. Request is not the actual provider payload.",
+                  )
         }
         noticeTone={requestBody === null ? "neutral" : "warning"}
         title={t("Request body")}
@@ -1051,26 +1069,28 @@ function ProviderRequestDetail({
 
 function ProviderResponseDetail({
   copied,
-  finalState,
+  detailStatus,
   onCopy,
   responseBody,
 }: {
   copied: boolean;
-  finalState: string;
+  detailStatus: NonNullable<AiRequestAuditDetail["responseDetailStatus"]>;
   onCopy: (text: string) => void;
   responseBody: JsonValue | ProviderFinalResponseDump | null;
 }) {
   const { t } = useI18n();
   if (!isProviderFinalResponseDump(responseBody)) {
-    const pruned = responseBody === null && finalState !== "running";
+    const unavailable = detailStatus === "unavailable";
     return (
       <AuditDetailCard
         notice={
           responseBody === null
-            ? pruned
+            ? unavailable
               ? t("Final response detail is unavailable or was pruned.")
               : t("Waiting for the final provider response...")
-            : t("Legacy normalized response record.")
+            : detailStatus === "malformed"
+              ? t("Stored response detail is malformed legacy text.")
+              : t("Legacy normalized response record.")
         }
         noticeTone={responseBody === null ? "neutral" : "warning"}
         title={t("Response body")}

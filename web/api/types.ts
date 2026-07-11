@@ -2165,6 +2165,24 @@ export type ProviderFinalResponseDump =
     };
 
 export type AiRequestAuditDetail = AiRequestAuditSummary & {
+  requestDetailStatus?:
+    | "captured"
+    | "failed"
+    | "legacy"
+    | "legacy_text"
+    | "malformed"
+    | "partial"
+    | "pending"
+    | "unavailable";
+  responseDetailStatus?:
+    | "captured"
+    | "failed"
+    | "legacy"
+    | "legacy_text"
+    | "malformed"
+    | "partial"
+    | "pending"
+    | "unavailable";
   requestBody: JsonValue | ProviderWireRequestDump | null;
   responseBody: JsonValue | ProviderFinalResponseDump | null;
 };
