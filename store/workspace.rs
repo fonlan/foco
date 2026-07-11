@@ -14067,6 +14067,17 @@ fn run_migrations(
                         "invalidated_at",
                     )?
             }
+            33 => table_exists(&transaction, database_path, "plan_phase_derived_effects")?,
+            34 => {
+                !table_exists(&transaction, database_path, "plan_phase_derived_effects")?
+                    || table_has_columns(
+                        &transaction,
+                        database_path,
+                        "plan_phase_derived_effects",
+                        &["integration_confirmed_at", "terminal_reason"],
+                    )?
+            }
+            35 => !table_exists(&transaction, database_path, "workspace_metadata")?,
             _ => false,
         };
         if skip_migration {
