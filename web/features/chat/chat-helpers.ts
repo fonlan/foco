@@ -45,6 +45,14 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   image_gen: { en: "ImageGen", "zh-CN": "生图" },
   memory_search: { en: "Memory Search", "zh-CN": "搜索记忆" },
   memory_write: { en: "Memory Write", "zh-CN": "写入记忆" },
+  "mcp__context7__query-docs": {
+    en: "Query Documentation",
+    "zh-CN": "查询文档",
+  },
+  "mcp__context7__resolve-library-id": {
+    en: "Resolve Library ID",
+    "zh-CN": "解析库 ID",
+  },
   read_file: { en: "Read", "zh-CN": "读取" },
   read_spec: { en: "Read Spec", "zh-CN": "读取 Spec" },
   run_command: { en: "Run", "zh-CN": "运行" },
@@ -59,12 +67,12 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
 };
 
 export function toolDisplayName(toolName: string, language: AppLanguageId) {
-  if (toolName.startsWith("mcp__")) {
-    return language === "zh-CN" ? "MCP工具" : "MCP Tool";
-  }
   const known = TOOL_DISPLAY_NAMES[toolName];
   if (known) {
     return known[language];
+  }
+  if (toolName.startsWith("mcp__")) {
+    return toolName;
   }
   if (language === "zh-CN") {
     return "工具";

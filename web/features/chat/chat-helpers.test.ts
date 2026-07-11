@@ -18,6 +18,17 @@ describe("chat display helpers", () => {
     expect(toolDisplayName("graph_explore", "zh-CN")).toBe("代码探索");
     expect(toolDisplayName("memory_search", "zh-CN")).toBe("搜索记忆");
     expect(toolDisplayName("read_spec", "zh-CN")).toBe("读取 Spec");
+    expect(toolDisplayName("mcp__context7__query-docs", "en")).toBe(
+      "Query Documentation",
+    );
+    expect(toolDisplayName("mcp__context7__query-docs", "zh-CN")).toBe("查询文档");
+    expect(toolDisplayName("mcp__custom__unmapped-tool", "en")).toBe(
+      "mcp__custom__unmapped-tool",
+    );
+    expect(toolDisplayName("mcp__custom__unmapped-tool", "zh-CN")).toBe(
+      "mcp__custom__unmapped-tool",
+    );
+    expect(toolDisplayName("search_query", "en")).toBe("Search Query");
     expect(toolDisplayName("search_query", "zh-CN")).toBe("工具");
     expect(translate("Memories used", {}, "zh-CN")).toBe("使用记忆");
   });
