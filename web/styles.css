@@ -3719,7 +3719,8 @@ summary:focus-visible {
   border-color: var(--foco-border);
 }
 
-.app-root .divide-stone-100 > :not([hidden]) ~ :not([hidden]) {
+.app-root :where(.divide-stone-100 > :not(:last-child)),
+.app-root :where(.divide-stone-200 > :not(:last-child)) {
   border-color: var(--foco-border);
 }
 
