@@ -1,5 +1,5 @@
 import { ArrowLeft, Bot, ListChecks, LoaderCircle, RefreshCw, User } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   AgentTranscriptItemView,
@@ -24,6 +24,7 @@ type AgentTranscriptWirePart = ChatMessagePart | {
 
 const AGENT_TRANSCRIPT_PAGE_SIZE = 25;
 const noSelectedSkillPrefix = () => null;
+type AgentTranscriptLoadMode = "append" | "hard" | "refresh" | "soft";
 
 function normalizeAgentTranscriptPart(
   part: AgentTranscriptWirePart,
@@ -75,49 +76,107 @@ export function AgentTranscriptPanel({
   const [hasMore, setHasMore] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+  const activeTranscriptRequestRef = useRef<AbortController | null>(null);
+  const transcriptRequestGenerationRef = useRef(0);
+  const hasTranscriptBaselineRef = useRef(false);
+  const snapshotRef = useRef(snapshot);
+  const lastHandledSnapshotRef = useRef<AgentTeamSnapshotResponse | null>(null);
+  const instanceExists = instance !== null;
+
+  snapshotRef.current = snapshot;
+
+  const cancelActiveTranscriptRequest = useCallback(() => {
+    activeTranscriptRequestRef.current?.abort();
+    activeTranscriptRequestRef.current = null;
+    transcriptRequestGenerationRef.current += 1;
+  }, []);
 
   const loadTranscript = useCallback(
-    async (nextPage: number, mode: "replace" | "append") => {
-      setIsTranscriptLoading(true);
-      setTranscriptError(null);
+    async (nextPage: number, mode: AgentTranscriptLoadMode) => {
+      activeTranscriptRequestRef.current?.abort();
+      const controller = new AbortController();
+      const requestGeneration = transcriptRequestGenerationRef.current + 1;
+      transcriptRequestGenerationRef.current = requestGeneration;
+      activeTranscriptRequestRef.current = controller;
+      const isSoft = mode === "soft";
+
+      setIsTranscriptLoading(!isSoft);
+      if (!isSoft) {
+        setTranscriptError(null);
+      }
       try {
         const data = await requestJson<AgentTranscriptResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/agent-team/instances/${encodeURIComponent(instanceId)}/transcript?page=${nextPage}&pageSize=${AGENT_TRANSCRIPT_PAGE_SIZE}`,
+          { signal: controller.signal },
         );
+        if (transcriptRequestGenerationRef.current !== requestGeneration) {
+          return;
+        }
         setItems((current) =>
           mode === "append" ? [...current, ...data.items] : data.items,
         );
         setPage(data.page);
         setHasMore(data.hasMore);
+        hasTranscriptBaselineRef.current = true;
+        setTranscriptError(null);
       } catch (err) {
-        setTranscriptError(errorMessage(err));
-        if (mode === "replace") {
-          setItems([]);
-          setPage(1);
-          setHasMore(false);
+        if (
+          controller.signal.aborted ||
+          transcriptRequestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
+        if (!isSoft) {
+          setTranscriptError(errorMessage(err));
         }
       } finally {
-        setIsTranscriptLoading(false);
+        if (transcriptRequestGenerationRef.current === requestGeneration) {
+          activeTranscriptRequestRef.current = null;
+          setIsTranscriptLoading(false);
+        }
       }
     },
     [instanceId, workspaceId],
   );
 
   useEffect(() => {
+    cancelActiveTranscriptRequest();
+    setIsTranscriptLoading(false);
     setItems([]);
     setPage(1);
     setHasMore(false);
-    if (instance) {
-      void loadTranscript(1, "replace");
+    setTranscriptError(null);
+    hasTranscriptBaselineRef.current = false;
+    lastHandledSnapshotRef.current = snapshotRef.current;
+    if (instanceExists) {
+      void loadTranscript(1, "hard");
     }
-  }, [instance, loadTranscript]);
+  }, [cancelActiveTranscriptRequest, instanceExists, instanceId, loadTranscript, workspaceId]);
+
+  useEffect(() => {
+    if (lastHandledSnapshotRef.current === snapshot) {
+      return;
+    }
+
+    lastHandledSnapshotRef.current = snapshot;
+    if (instanceExists) {
+      void loadTranscript(1, hasTranscriptBaselineRef.current ? "soft" : "hard");
+    }
+  }, [instanceExists, loadTranscript, snapshot]);
+
+  useEffect(
+    () => () => {
+      cancelActiveTranscriptRequest();
+    },
+    [cancelActiveTranscriptRequest],
+  );
 
   const refreshTranscript = useCallback(async () => {
     await onRefresh();
-    if (instance) {
-      await loadTranscript(1, "replace");
+    if (instanceExists) {
+      await loadTranscript(1, "refresh");
     }
-  }, [instance, loadTranscript, onRefresh]);
+  }, [instanceExists, loadTranscript, onRefresh]);
 
   const loadMoreTranscript = useCallback(async () => {
     if (!isTranscriptLoading && hasMore) {

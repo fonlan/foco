@@ -1105,6 +1105,7 @@ export function App() {
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
   const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
   const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
+  const agentTeamSnapshotChatKeyRef = useRef<string | null>(null);
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
@@ -2132,12 +2133,21 @@ export function App() {
   }, []);
 
   const loadAgentTeamSnapshot = useCallback(
-    async (workspaceId: string, chatId: string) => {
+    async (
+      workspaceId: string,
+      chatId: string,
+      options?: { silent?: boolean },
+    ) => {
       const requestedChatKey = chatRunKey(workspaceId, chatId);
       const isCurrentAgentTeamRequest = () =>
         activeChatKeyRef.current === requestedChatKey;
+      const silent =
+        options?.silent ??
+        (agentTeamSnapshotChatKeyRef.current === requestedChatKey);
 
-      setIsLoadingAgentTeam(true);
+      if (!silent) {
+        setIsLoadingAgentTeam(true);
+      }
       setAgentTeamError(null);
 
       try {
@@ -2145,20 +2155,24 @@ export function App() {
           `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/agent-team`,
         );
         if (isCurrentAgentTeamRequest()) {
+          agentTeamSnapshotChatKeyRef.current = requestedChatKey;
           setAgentTeamSnapshot(data);
         }
         return data;
       } catch (requestError) {
         const message = errorMessage(requestError);
         if (isCurrentAgentTeamRequest()) {
-          setAgentTeamSnapshot(null);
+          if (!silent) {
+            agentTeamSnapshotChatKeyRef.current = null;
+            setAgentTeamSnapshot(null);
+          }
           if (!message.includes("has no Agent team")) {
             setAgentTeamError(message);
           }
         }
         return null;
       } finally {
-        if (isCurrentAgentTeamRequest()) {
+        if (!silent && isCurrentAgentTeamRequest()) {
           setIsLoadingAgentTeam(false);
         }
       }
@@ -2176,7 +2190,7 @@ export function App() {
         setContextPanelTab("agents");
         setIsContextPanelOpen(true);
       }
-      void loadAgentTeamSnapshot(event.workspaceId, event.chatId);
+      void loadAgentTeamSnapshot(event.workspaceId, event.chatId, { silent: true });
     },
     [loadAgentTeamSnapshot],
   );
@@ -2187,7 +2201,7 @@ export function App() {
         return;
       }
 
-      void loadAgentTeamSnapshot(workspaceId, chatId);
+      void loadAgentTeamSnapshot(workspaceId, chatId, { silent: true });
     },
     [loadAgentTeamSnapshot],
   );
@@ -2208,6 +2222,7 @@ export function App() {
       !activeChatId ||
       isPendingChatId(activeChatId)
     ) {
+      agentTeamSnapshotChatKeyRef.current = null;
       setAgentTeamSnapshot(null);
       setAgentTeamError(null);
       return;
@@ -2254,23 +2269,36 @@ export function App() {
     if (
       !canUseApp ||
       !visibleAgentSnapshotTarget ||
-      !visibleAgentSnapshotHasRunningTask ||
-      isLoadingAgentTeam
+      !visibleAgentSnapshotHasRunningTask
     ) {
       return;
     }
 
-    const refreshTimer = window.setTimeout(() => {
-      void loadAgentTeamSnapshot(
-        visibleAgentSnapshotTarget.workspaceId,
-        visibleAgentSnapshotTarget.chatId,
-      );
-    }, AGENT_TEAM_RUNNING_REFRESH_MS);
+    let cancelled = false;
+    let refreshTimer: number | null = null;
+    const scheduleRefresh = () => {
+      refreshTimer = window.setTimeout(() => {
+        void loadAgentTeamSnapshot(
+          visibleAgentSnapshotTarget.workspaceId,
+          visibleAgentSnapshotTarget.chatId,
+          { silent: true },
+        ).finally(() => {
+          if (!cancelled) {
+            scheduleRefresh();
+          }
+        });
+      }, AGENT_TEAM_RUNNING_REFRESH_MS);
+    };
 
-    return () => window.clearTimeout(refreshTimer);
+    scheduleRefresh();
+    return () => {
+      cancelled = true;
+      if (refreshTimer !== null) {
+        window.clearTimeout(refreshTimer);
+      }
+    };
   }, [
     canUseApp,
-    isLoadingAgentTeam,
     loadAgentTeamSnapshot,
     visibleAgentSnapshotHasRunningTask,
     visibleAgentSnapshotTarget,
@@ -10099,7 +10127,7 @@ export function App() {
   const providersForChatPanel = settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
   const refreshAgentPanelForContextPanel = useStableCallback(async () => {
     if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
-      await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
+      await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, { silent: false });
     }
   });
   const openAgentInstanceTabForContextPanel = useStableCallback(openAgentInstanceTab);
@@ -11035,6 +11063,7 @@ export function App() {
                       await loadAgentTeamSnapshot(
                         activeAgentTab.workspaceId,
                         activeAgentTab.chatId,
+                        { silent: false },
                       );
                     }}
                     snapshot={agentTeamSnapshot}

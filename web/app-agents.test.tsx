@@ -1,4 +1,4 @@
-import { act, screen, waitFor, waitForElementToBeRemoved, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -659,7 +659,6 @@ describe("app agents verification surfaces", () => {
         },
       ],
     };
-    let snapshot = firstSnapshot;
     const firstTranscriptResponse: AgentTranscriptResponse = {
       ...agentTranscriptResponse,
       items: [
@@ -702,7 +701,11 @@ describe("app agents verification surfaces", () => {
         },
       ],
     };
-    let transcriptResponse = firstTranscriptResponse;
+    const snapshotRefreshGate = deferred<void>();
+    const transcriptRefreshGate = deferred<void>();
+    let deferRefreshes = false;
+    let snapshotRequestCount = 0;
+    let transcriptRequestCount = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -711,10 +714,20 @@ describe("app agents verification surfaces", () => {
           ? new URL(url).pathname
           : url.split("?")[0];
         if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
-          return jsonResponse(snapshot);
+          snapshotRequestCount += 1;
+          if (deferRefreshes) {
+            await snapshotRefreshGate.promise;
+            return jsonResponse(secondSnapshot);
+          }
+          return jsonResponse(firstSnapshot);
         }
         if (path.endsWith("/agent-instance-worker/transcript")) {
-          return jsonResponse(transcriptResponse);
+          transcriptRequestCount += 1;
+          if (deferRefreshes) {
+            await transcriptRefreshGate.promise;
+            return jsonResponse(secondTranscriptResponse);
+          }
+          return jsonResponse(firstTranscriptResponse);
         }
         return mockFetch(input, init);
       }),
@@ -735,8 +748,9 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
 
-    transcriptResponse = secondTranscriptResponse;
-    snapshot = secondSnapshot;
+    const snapshotRequestsBeforeRefresh = snapshotRequestCount;
+    const transcriptRequestsBeforeRefresh = transcriptRequestCount;
+    deferRefreshes = true;
     await act(async () => {
       enqueueChatStreamEvent({
         chatId: "chat-1",
@@ -749,9 +763,33 @@ describe("app agents verification surfaces", () => {
       });
     });
 
-    await waitForElementToBeRemoved(() => screen.queryByText("Inspection complete."), {
-      timeout: 2500,
-    }).catch(() => undefined);
+    await waitFor(() =>
+      expect(snapshotRequestCount).toBeGreaterThan(snapshotRequestsBeforeRefresh),
+    );
+    const transcriptPanel = screen
+      .getByText("Checking workspace state.")
+      .closest(".chat-panel");
+    expect(transcriptPanel).not.toBeNull();
+    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    ).toBeEnabled();
+    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+
+    await act(async () => {
+      snapshotRefreshGate.resolve();
+    });
+    await waitFor(() =>
+      expect(transcriptRequestCount).toBeGreaterThan(transcriptRequestsBeforeRefresh),
+    );
+    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+
+    await act(async () => {
+      transcriptRefreshGate.resolve();
+    });
     await waitFor(
       () => expect(screen.getByText("Still inspecting.")).toBeInTheDocument(),
       { timeout: 2500 },
