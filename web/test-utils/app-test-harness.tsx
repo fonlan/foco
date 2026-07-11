@@ -2227,6 +2227,8 @@ export const appTestState: {
     workspaces: ConfiguredWorkspaceSummary[];
   };
   workspaceSpecResponse: typeof workspaceSpec;
+  workspaceSpecResponsesByWorkspaceId: Record<string, typeof workspaceSpec>;
+  workspaceSpecSettingsResponses: Array<Response | Promise<Response>>;
   settingsSpecJobsResponse: SettingsWorkspaceSpecJobSummary[];
   agentTeamSnapshotResponse: typeof agentTeamSnapshot;
   workspaceSpecSaveConflict: boolean;
@@ -2256,6 +2258,10 @@ export const appTestState: {
   scheduledTasksResponse: scheduledTasks,
   settingsResponse: settings,
   workspaceSpecResponse: clonedWorkspaceSpec(),
+  workspaceSpecResponsesByWorkspaceId: {
+    [workspace.id]: clonedWorkspaceSpec(),
+  },
+  workspaceSpecSettingsResponses: [],
   settingsSpecJobsResponse: clonedSettingsSpecJobs(),
   agentTeamSnapshotResponse: agentTeamSnapshot,
   workspaceSpecSaveConflict: false,
@@ -2281,6 +2287,38 @@ export const appTestState: {
   lastWorkspaceOrderRequest: null,
   lastManualWorkspaceRequest: null,
 };
+
+function workspaceSpecResponseForWorkspace(workspaceId: string) {
+  if (workspaceId === workspace.id) {
+    return appTestState.workspaceSpecResponse;
+  }
+
+  const existing = appTestState.workspaceSpecResponsesByWorkspaceId[workspaceId];
+  if (existing) {
+    return existing;
+  }
+
+  const created = clonedWorkspaceSpec();
+  appTestState.workspaceSpecResponsesByWorkspaceId = {
+    ...appTestState.workspaceSpecResponsesByWorkspaceId,
+    [workspaceId]: created,
+  };
+  return created;
+}
+
+function setWorkspaceSpecResponseForWorkspace(
+  workspaceId: string,
+  response: typeof workspaceSpec,
+) {
+  if (workspaceId === workspace.id) {
+    appTestState.workspaceSpecResponse = response;
+  }
+  appTestState.workspaceSpecResponsesByWorkspaceId = {
+    ...appTestState.workspaceSpecResponsesByWorkspaceId,
+    [workspaceId]: response,
+  };
+}
+
 function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspaceSummary {
   const workspaceSummary = item as ConfiguredWorkspaceSummary & { chats?: unknown[] };
 
@@ -2683,6 +2721,10 @@ export function resetAppTestEnvironment() {
   appTestState.scheduledTasksResponse = scheduledTasks;
   appTestState.settingsResponse = settings;
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
+  appTestState.workspaceSpecResponsesByWorkspaceId = {
+    [workspace.id]: clonedWorkspaceSpec(),
+  };
+  appTestState.workspaceSpecSettingsResponses = [];
   appTestState.settingsSpecJobsResponse = clonedSettingsSpecJobs();
   appTestState.agentTeamSnapshotResponse = agentTeamSnapshot;
   appTestState.workspaceSpecSaveConflict = false;
@@ -3524,30 +3566,46 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         contentMarkdown: string;
         expectedRevision: number;
       };
-      appTestState.workspaceSpecResponse = {
+      setWorkspaceSpecResponseForWorkspace(workspace.id, {
         ...appTestState.workspaceSpecResponse,
         contentMarkdown: body.contentMarkdown,
         latestJob: appTestState.workspaceSpecResponse.latestJob,
         revision: body.expectedRevision + 1,
         updatedAt: "2026-06-11T03:10:00Z",
-      };
+      });
     }
     return jsonResponse(appTestState.workspaceSpecResponse);
   }
 
-  if (path.match(/^\/api\/workspaces\/[^/]+\/spec\/settings$/)) {
-    const body = JSON.parse(String(init?.body ?? "{}")) as {
+  const workspaceSpecMatch = path.match(/^\/api\/workspaces\/([^/]+)\/spec$/);
+  if (workspaceSpecMatch) {
+    const workspaceId = decodeURIComponent(workspaceSpecMatch[1] ?? "");
+    return jsonResponse(workspaceSpecResponseForWorkspace(workspaceId));
+  }
+
+  const workspaceSpecSettingsMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/spec\/settings$/,
+  );
+  if (workspaceSpecSettingsMatch && init?.method === "PUT") {
+    const queuedResponse = appTestState.workspaceSpecSettingsResponses.shift();
+    if (queuedResponse) {
+      return await queuedResponse;
+    }
+
+    const workspaceId = decodeURIComponent(workspaceSpecSettingsMatch[1] ?? "");
+    const body = JSON.parse(String(init.body ?? "{}")) as {
       enabled: boolean;
       injectEnabled: boolean;
     };
-    appTestState.workspaceSpecResponse = {
-      ...appTestState.workspaceSpecResponse,
+    const response = {
+      ...workspaceSpecResponseForWorkspace(workspaceId),
       settings: {
         enabled: body.enabled,
         injectEnabled: body.injectEnabled,
       },
     };
-    return jsonResponse(appTestState.workspaceSpecResponse);
+    setWorkspaceSpecResponseForWorkspace(workspaceId, response);
+    return jsonResponse(response);
   }
 
   if (path === "/api/workspaces/workspace-1/spec/generate") {

@@ -1894,6 +1894,7 @@ export function SettingsPanel({
   }
 
   async function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
+    setError(null);
     setWorkspaceForm({
       commonCommands: workspace.commonCommands.map((command) => ({ ...command })),
       id: workspace.id,
@@ -3352,9 +3353,10 @@ export function SettingsPanel({
     setError(null);
 
     try {
+      const workspaceId = workspaceForm.id;
       const data = await requestJson<SettingsResponse>("/api/workspaces/manual", {
         body: JSON.stringify({
-          id: workspaceForm.id,
+          id: workspaceId,
           name: workspaceForm.name,
           path: workspaceForm.serverId ? (workspaceForm.remotePath ?? workspaceForm.path) : workspaceForm.path,
           serverId: workspaceForm.serverId ?? null,
@@ -3370,15 +3372,20 @@ export function SettingsPanel({
       onSettingsChange(data);
       await onWorkspacesChange();
       if (editingWorkspace && isWorkspaceSpecSettingsLoaded) {
-        try {
-          await saveWorkspaceSpecSettingsRequest(
-            workspaceForm.id,
-            workspaceForm.specEnabled,
-            workspaceForm.specEnabled ? workspaceForm.specInjectEnabled : false,
-          );
-        } catch (specError) {
-          setError(errorMessage(specError));
-        }
+        const savedSpec = await saveWorkspaceSpecSettingsRequest(
+          workspaceId,
+          workspaceForm.specEnabled,
+          workspaceForm.specEnabled ? workspaceForm.specInjectEnabled : false,
+        );
+        setWorkspaceForm((current) =>
+          current.id === workspaceId
+            ? {
+                ...current,
+                specEnabled: savedSpec.settings.enabled,
+                specInjectEnabled: savedSpec.settings.injectEnabled,
+              }
+            : current,
+        );
       }
       setIsWorkspaceDialogOpen(false);
     } catch (requestError) {
@@ -4852,7 +4859,7 @@ export function SettingsPanel({
             </div>
           </section>
 
-          {error ? (
+          {error && !isWorkspaceDialogOpen ? (
             <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
               {error}
             </div>
@@ -8323,6 +8330,14 @@ export function SettingsPanel({
                         <X aria-hidden="true" className="size-4" />
                       </button>
                     </div>
+                    {error ? (
+                      <div
+                        className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                        role="alert"
+                      >
+                        {error}
+                      </div>
+                    ) : null}
                     <div className="space-y-3">
                       <TextField
                         label={t("Workspace name")}
@@ -8569,6 +8584,7 @@ export function SettingsPanel({
                         disabled={
                           isSavingWorkspace ||
                           isLoadingWorkspaceSpecSettings ||
+                          !isWorkspaceSpecSettingsLoaded ||
                           !workspaceForm.name.trim() ||
                           !workspaceForm.path.trim()
                         }

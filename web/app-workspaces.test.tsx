@@ -30,25 +30,73 @@ import {
 } from "./test-utils/app-test-harness";
 type WorkspaceFixture = {
   commonCommands: typeof workspace.commonCommands;
+  connectionStatus?: string;
+  displayPath?: string;
   id: string;
+  lastRemoteError?: string | null;
   logoUrl: string | null;
   name: string;
   path: string;
   pinned: boolean;
+  remotePath?: string | null;
+  serverId?: string | null;
+  serverName?: string | null;
   terminalShell: string;
 };
 
 function configuredWorkspace(item: WorkspaceFixture, isDefault = false) {
   return {
     commonCommands: item.commonCommands,
+    connectionStatus: item.connectionStatus,
+    displayPath: item.displayPath,
     id: item.id,
     isDefault,
+    lastRemoteError: item.lastRemoteError,
     logoUrl: item.logoUrl,
     name: item.name,
     path: item.path,
     pinned: item.pinned,
+    remotePath: item.remotePath,
+    serverId: item.serverId,
+    serverName: item.serverName,
     terminalShell: item.terminalShell,
   };
+}
+
+function remoteWorkspaceFixture() {
+  return {
+    ...secondaryWorkspace,
+    chats: [],
+    connectionStatus: "ready",
+    displayPath: "dev-box:/home/fonla/repos/remote-project",
+    id: "workspace-remote",
+    lastRemoteError: null,
+    name: "Remote project",
+    path: "dev-box:/home/fonla/repos/remote-project",
+    remotePath: "/home/fonla/repos/remote-project",
+    serverId: "server-1",
+    serverName: "dev-box",
+  };
+}
+
+function configureRemoteWorkspaceSpec() {
+  const remoteWorkspace = remoteWorkspaceFixture();
+  appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    workspaces: [
+      configuredWorkspace(workspace, true),
+      configuredWorkspace(remoteWorkspace),
+    ],
+  };
+  appTestState.workspaceSpecResponsesByWorkspaceId = {
+    ...appTestState.workspaceSpecResponsesByWorkspaceId,
+    [remoteWorkspace.id]: {
+      ...workspaceSpec,
+      settings: { enabled: false, injectEnabled: false },
+    },
+  };
+  return remoteWorkspace;
 }
 
 function workspaceButton(name: string) {
@@ -1028,6 +1076,111 @@ describe("app-workspaces verification surfaces", () => {
         injectEnabled: false,
       });
     });
+  });
+
+  it("persists remote workspace Project Spec enablement after reopening settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const remoteWorkspace = configureRemoteWorkspaceSpec();
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Remote project" }),
+    );
+
+    const specCheckbox = await screen.findByRole("checkbox", {
+      name: "Enable Project Spec",
+    });
+    await waitFor(() => expect(specCheckbox).toBeEnabled());
+    expect(specCheckbox).not.toBeChecked();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          url === `/api/workspaces/${remoteWorkspace.id}/spec` && !init?.method,
+      ),
+    ).toBe(true);
+
+    await userEvent.click(specCheckbox);
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("form", { name: "Workspace configuration" }),
+      ).not.toBeInTheDocument();
+    });
+
+    const manualSaveIndex = fetchMock.mock.calls.findIndex(
+      ([url, init]) => url === "/api/workspaces/manual" && init?.method === "POST",
+    );
+    const specSaveIndex = fetchMock.mock.calls.findIndex(
+      ([url, init]) =>
+        url === `/api/workspaces/${remoteWorkspace.id}/spec/settings` &&
+        init?.method === "PUT",
+    );
+    expect(manualSaveIndex).toBeGreaterThanOrEqual(0);
+    expect(specSaveIndex).toBeGreaterThan(manualSaveIndex);
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[manualSaveIndex]?.[1]?.body)),
+    ).toEqual(
+      expect.objectContaining({
+        id: remoteWorkspace.id,
+        path: remoteWorkspace.remotePath,
+        remotePath: remoteWorkspace.remotePath,
+        serverId: remoteWorkspace.serverId,
+      }),
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Remote project" }),
+    );
+    const reopenedSpecCheckbox = await screen.findByRole("checkbox", {
+      name: "Enable Project Spec",
+    });
+    await waitFor(() => expect(reopenedSpecCheckbox).toBeEnabled());
+    expect(reopenedSpecCheckbox).toBeChecked();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          url === `/api/workspaces/${remoteWorkspace.id}/spec` && !init?.method,
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("keeps remote workspace settings open when Project Spec saving fails", async () => {
+    configureRemoteWorkspaceSpec();
+    appTestState.workspaceSpecSettingsResponses.push(
+      jsonResponse({ error: "Remote Project Spec settings could not be saved" }, { status: 502 }),
+    );
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Remote project" }),
+    );
+
+    const specCheckbox = await screen.findByRole("checkbox", {
+      name: "Enable Project Spec",
+    });
+    await waitFor(() => expect(specCheckbox).toBeEnabled());
+    await userEvent.click(specCheckbox);
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    const workspaceForm = await screen.findByRole("form", {
+      name: "Workspace configuration",
+    });
+    expect(
+      await within(workspaceForm).findByRole("alert"),
+    ).toHaveTextContent("Remote Project Spec settings could not be saved");
+    expect(
+      within(workspaceForm).getByRole("checkbox", { name: "Enable Project Spec" }),
+    ).toBeChecked();
+    await waitFor(() =>
+      expect(
+        within(workspaceForm).getByRole("button", { name: "Save workspace" }),
+      ).toBeEnabled(),
+    );
   });
 
 });
