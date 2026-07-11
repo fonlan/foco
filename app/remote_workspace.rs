@@ -2953,11 +2953,16 @@ fn insert_broker_llm_audit_start(
     context: &BrokerLlmAuditContext,
     provider_id: &str,
     model_id: &str,
+    thinking_level: Option<&str>,
     request_started_at: &str,
 ) {
-    if let Err(error) =
-        insert_broker_llm_audit_start_inner(context, provider_id, model_id, request_started_at)
-    {
+    if let Err(error) = insert_broker_llm_audit_start_inner(
+        context,
+        provider_id,
+        model_id,
+        thinking_level,
+        request_started_at,
+    ) {
         tracing::warn!(
             request_id = %context.request_id,
             workspace_id = %context.workspace_id,
@@ -2971,6 +2976,7 @@ fn insert_broker_llm_audit_start_inner(
     context: &BrokerLlmAuditContext,
     provider_id: &str,
     model_id: &str,
+    thinking_level: Option<&str>,
     request_started_at: &str,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.audit_path)?;
@@ -2994,6 +3000,7 @@ fn insert_broker_llm_audit_start_inner(
         agent_attempt_id: None,
         provider_id,
         model_id,
+        thinking_level,
         request_started_at,
         first_token_at: None,
         completed_at: None,
@@ -3175,7 +3182,13 @@ async fn broker_llm_stream(
     let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_started_instant = Instant::now();
     if let Some(context) = audit_context.as_ref() {
-        insert_broker_llm_audit_start(context, provider_id, model_id, &request_started_at);
+        insert_broker_llm_audit_start(
+            context,
+            provider_id,
+            model_id,
+            request.thinking_level.as_deref(),
+            &request_started_at,
+        );
     }
     let save_details = api_audit_save_details(&config);
     let audit_capture = audit_context.as_ref().map(|context| {
@@ -5885,6 +5898,7 @@ fn persist_sidecar_llm_audit(
             agent_attempt_id: None,
             provider_id,
             model_id,
+            thinking_level: None,
             request_started_at: &run_metrics.request_started_at,
             first_token_at: run_metrics.first_token_at.as_deref(),
             completed_at: Some(completed_at),
@@ -10751,7 +10765,7 @@ mod tests {
             request_id: "remote-run-1".to_string(),
         };
         let started_at = "2026-07-08T00:00:00Z";
-        insert_broker_llm_audit_start(&context, "provider-1", "model-1", started_at);
+        insert_broker_llm_audit_start(&context, "provider-1", "model-1", None, started_at);
         let capture = ProviderAuditCapture::new(workspace.path(), "remote-run-1", true);
         let request_body_json = capture
             .request_json(Some(&foco_providers::ProviderWireRequestDump {

@@ -53,6 +53,7 @@ export const AI_STATS_COLUMN_IDS = [
   "requestTime",
   "session",
   "providerModel",
+  "thinkingLevel",
   "input",
   "output",
   "duration",

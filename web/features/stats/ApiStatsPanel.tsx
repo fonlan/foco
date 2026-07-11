@@ -274,6 +274,20 @@ export function ApiStatsPanel({
       ),
     },
     {
+      cellClassName: "px-4 py-3 text-stone-700",
+      id: "thinkingLevel",
+      label: t("Thinking level"),
+      render: (request) => (
+        <span className="font-medium text-stone-800">
+          {thinkingLevelLabel(
+            request.thinkingLevel,
+            settings?.thinkingLevels ?? [],
+            t,
+          )}
+        </span>
+      ),
+    },
+    {
       cellClassName: "px-4 py-3 text-right font-mono",
       headerClassName: "text-right",
       id: "input",
@@ -1892,6 +1906,18 @@ function formatNullableLatencySeconds(
   return `${new Intl.NumberFormat(language, {
     maximumFractionDigits: 2,
   }).format(value / 1000)} s`;
+}
+
+function thinkingLevelLabel(
+  value: string | null | undefined,
+  thinkingLevels: SettingsResponse["thinkingLevels"],
+  t: Translate,
+) {
+  if (!value) {
+    return t("Model default");
+  }
+  const label = thinkingLevels.find((level) => level.value === value)?.label;
+  return label ? t(label) : value;
 }
 
 function formatLatencySeconds(value: number, language: AppLanguageId = "en") {

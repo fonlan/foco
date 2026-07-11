@@ -94,6 +94,7 @@ CREATE TABLE llm_requests (
     cache_read_tokens INTEGER CHECK (cache_read_tokens IS NULL OR cache_read_tokens >= 0),
     cache_write_tokens INTEGER CHECK (cache_write_tokens IS NULL OR cache_write_tokens >= 0),
     reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+    thinking_level TEXT CHECK (thinking_level IS NULL OR length(thinking_level) > 0),
     first_token_latency_ms INTEGER CHECK (first_token_latency_ms IS NULL OR first_token_latency_ms >= 0),
     total_latency_ms INTEGER CHECK (total_latency_ms IS NULL OR total_latency_ms >= 0),
     status_code INTEGER,
@@ -1316,6 +1317,11 @@ SELECT 'plan_auto_run_desired_enabled', 'false', strftime('%Y-%m-%dT%H:%M:%fZ', 
 WHERE NOT EXISTS (
     SELECT 1 FROM workspace_metadata WHERE key = 'plan_auto_run_desired_enabled'
 );
+"#;
+
+pub(crate) const MIGRATION_036: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN thinking_level TEXT CHECK (thinking_level IS NULL OR length(thinking_level) > 0);
 "#;
 
 #[cfg(test)]

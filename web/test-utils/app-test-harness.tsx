@@ -1117,6 +1117,7 @@ export const aiStatistics = {
       requestKind: "chat completion",
       requestStartedAt: "2026-06-05T10:00:00Z",
       statusCode: 200,
+      thinkingLevel: "high",
       totalLatencyMs: 2000,
       workspaceId: "workspace-1",
       workspaceName: "Default",

@@ -2116,6 +2116,7 @@ export type AiRequestAuditSummary = {
   requestKind: string;
   providerId: string;
   modelId: string;
+  thinkingLevel: string | null;
   requestStartedAt: string;
   firstTokenAt: string | null;
   completedAt: string | null;

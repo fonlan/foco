@@ -42,6 +42,7 @@ export function writeAiStatsVisibleColumnIds(
 const AI_STATS_COMBINED_COLUMN_IDS = new Set<AiStatsColumnId>([
   "session",
   "providerModel",
+  "thinkingLevel",
   "input",
   "output",
   "duration",

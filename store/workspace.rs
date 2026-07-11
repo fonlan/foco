@@ -63,13 +63,13 @@ use workspace_schema::{
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    MIGRATION_033, MIGRATION_034, MIGRATION_035, Migration,
+    MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 35;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 36;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -281,6 +281,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 35,
         sql: MIGRATION_035,
+    },
+    Migration {
+        version: 36,
+        sql: MIGRATION_036,
     },
 ];
 
@@ -5433,6 +5437,7 @@ impl WorkspaceDatabase {
                     agent_attempt_id: None,
                     provider_id: row.get(2)?,
                     model_id: row.get(3)?,
+                    thinking_level: None,
                     request_started_at: row.get(4)?,
                     first_token_at: None,
                     completed_at: None,
@@ -6381,6 +6386,7 @@ impl WorkspaceDatabase {
         validate_llm_agent_references(&self.connection, &self.database_path, &request)?;
 
         let cache_ratio = calculate_cache_ratio(request.input_tokens, request.cache_read_tokens)?;
+        let thinking_level = normalized_optional_text(request.thinking_level);
         let request_body_json =
             redact_optional_audit_json(request.request_body_json, "request_body_json")?;
         let response_body_json =
@@ -6396,14 +6402,14 @@ impl WorkspaceDatabase {
                 "INSERT INTO llm_requests
                     (
                         id, workspace_id, chat_id, request_kind, agent_team_id, agent_instance_id,
-                        agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
-                        first_token_at, completed_at, input_tokens, output_tokens,
+                        agent_task_id, agent_attempt_id, provider_id, model_id, thinking_level,
+                        request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                         first_token_latency_ms, total_latency_ms, status_code, final_state,
                         request_body_json, response_body_json
                     )
                  VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     request.id,
                     request.workspace_id,
@@ -6415,6 +6421,7 @@ impl WorkspaceDatabase {
                     request.agent_attempt_id.map(AgentAttemptId::as_str),
                     request.provider_id,
                     request.model_id,
+                    thinking_level,
                     request.request_started_at,
                     request.first_token_at,
                     request.completed_at,
@@ -6635,8 +6642,8 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT
                     id, workspace_id, chat_id, request_kind, agent_team_id, agent_instance_id,
-                    agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
-                    first_token_at, completed_at, input_tokens, output_tokens,
+                    agent_task_id, agent_attempt_id, provider_id, model_id, thinking_level,
+                    request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
                     request_body_json, response_body_json, invalidated_at, invalidated_reason
@@ -6655,23 +6662,24 @@ impl WorkspaceDatabase {
                         agent_attempt_id: optional_agent_id_from_row(row, 7)?,
                         provider_id: row.get(8)?,
                         model_id: row.get(9)?,
-                        request_started_at: row.get(10)?,
-                        first_token_at: row.get(11)?,
-                        completed_at: row.get(12)?,
-                        input_tokens: row.get(13)?,
-                        output_tokens: row.get(14)?,
-                        cache_read_tokens: row.get(15)?,
-                        cache_write_tokens: row.get(16)?,
-                        reasoning_tokens: row.get(17)?,
-                        cache_ratio: row.get(18)?,
-                        first_token_latency_ms: row.get(19)?,
-                        total_latency_ms: row.get(20)?,
-                        status_code: row.get(21)?,
-                        final_state: row.get(22)?,
-                        request_body_json: row.get(23)?,
-                        response_body_json: row.get(24)?,
-                        invalidated_at: row.get(25)?,
-                        invalidated_reason: row.get(26)?,
+                        thinking_level: row.get(10)?,
+                        request_started_at: row.get(11)?,
+                        first_token_at: row.get(12)?,
+                        completed_at: row.get(13)?,
+                        input_tokens: row.get(14)?,
+                        output_tokens: row.get(15)?,
+                        cache_read_tokens: row.get(16)?,
+                        cache_write_tokens: row.get(17)?,
+                        reasoning_tokens: row.get(18)?,
+                        cache_ratio: row.get(19)?,
+                        first_token_latency_ms: row.get(20)?,
+                        total_latency_ms: row.get(21)?,
+                        status_code: row.get(22)?,
+                        final_state: row.get(23)?,
+                        request_body_json: row.get(24)?,
+                        response_body_json: row.get(25)?,
+                        invalidated_at: row.get(26)?,
+                        invalidated_reason: row.get(27)?,
                     })
                 },
             )
@@ -7011,8 +7019,8 @@ impl WorkspaceDatabase {
         let offset = filters.offset.unwrap_or(0).max(0);
         let mut query = String::from(
             "SELECT
-                id, workspace_id, chat_id, request_kind, provider_id, model_id, request_started_at,
-                first_token_at, completed_at, input_tokens, output_tokens,
+                id, workspace_id, chat_id, request_kind, provider_id, model_id, thinking_level,
+                request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
                 invalidated_at, invalidated_reason
@@ -7036,21 +7044,22 @@ impl WorkspaceDatabase {
                     request_kind: row.get(3)?,
                     provider_id: row.get(4)?,
                     model_id: row.get(5)?,
-                    request_started_at: row.get(6)?,
-                    first_token_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                    input_tokens: row.get(9)?,
-                    output_tokens: row.get(10)?,
-                    cache_read_tokens: row.get(11)?,
-                    cache_write_tokens: row.get(12)?,
-                    reasoning_tokens: row.get(13)?,
-                    cache_ratio: row.get(14)?,
-                    first_token_latency_ms: row.get(15)?,
-                    total_latency_ms: row.get(16)?,
-                    status_code: row.get(17)?,
-                    final_state: row.get(18)?,
-                    invalidated_at: row.get(19)?,
-                    invalidated_reason: row.get(20)?,
+                    thinking_level: row.get(6)?,
+                    request_started_at: row.get(7)?,
+                    first_token_at: row.get(8)?,
+                    completed_at: row.get(9)?,
+                    input_tokens: row.get(10)?,
+                    output_tokens: row.get(11)?,
+                    cache_read_tokens: row.get(12)?,
+                    cache_write_tokens: row.get(13)?,
+                    reasoning_tokens: row.get(14)?,
+                    cache_ratio: row.get(15)?,
+                    first_token_latency_ms: row.get(16)?,
+                    total_latency_ms: row.get(17)?,
+                    status_code: row.get(18)?,
+                    final_state: row.get(19)?,
+                    invalidated_at: row.get(20)?,
+                    invalidated_reason: row.get(21)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -13262,8 +13271,8 @@ fn select_llm_request_record(
         .query_row(
             "SELECT
                 id, workspace_id, chat_id, request_kind, agent_team_id, agent_instance_id,
-                agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
-                first_token_at, completed_at, input_tokens, output_tokens,
+                agent_task_id, agent_attempt_id, provider_id, model_id, thinking_level,
+                request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
                 request_body_json, response_body_json, invalidated_at, invalidated_reason
@@ -13287,23 +13296,24 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         agent_attempt_id: optional_agent_id_from_row(row, 7)?,
         provider_id: row.get(8)?,
         model_id: row.get(9)?,
-        request_started_at: row.get(10)?,
-        first_token_at: row.get(11)?,
-        completed_at: row.get(12)?,
-        input_tokens: row.get(13)?,
-        output_tokens: row.get(14)?,
-        cache_read_tokens: row.get(15)?,
-        cache_write_tokens: row.get(16)?,
-        reasoning_tokens: row.get(17)?,
-        cache_ratio: row.get(18)?,
-        first_token_latency_ms: row.get(19)?,
-        total_latency_ms: row.get(20)?,
-        status_code: row.get(21)?,
-        final_state: row.get(22)?,
-        request_body_json: row.get(23)?,
-        response_body_json: row.get(24)?,
-        invalidated_at: row.get(25)?,
-        invalidated_reason: row.get(26)?,
+        thinking_level: row.get(10)?,
+        request_started_at: row.get(11)?,
+        first_token_at: row.get(12)?,
+        completed_at: row.get(13)?,
+        input_tokens: row.get(14)?,
+        output_tokens: row.get(15)?,
+        cache_read_tokens: row.get(16)?,
+        cache_write_tokens: row.get(17)?,
+        reasoning_tokens: row.get(18)?,
+        cache_ratio: row.get(19)?,
+        first_token_latency_ms: row.get(20)?,
+        total_latency_ms: row.get(21)?,
+        status_code: row.get(22)?,
+        final_state: row.get(23)?,
+        request_body_json: row.get(24)?,
+        response_body_json: row.get(25)?,
+        invalidated_at: row.get(26)?,
+        invalidated_reason: row.get(27)?,
     })
 }
 
@@ -14099,6 +14109,15 @@ fn run_migrations(
                     )?
             }
             35 => !table_exists(&transaction, database_path, "workspace_metadata")?,
+            36 => {
+                !table_exists(&transaction, database_path, "llm_requests")?
+                    || table_has_column(
+                        &transaction,
+                        database_path,
+                        "llm_requests",
+                        "thinking_level",
+                    )?
+            }
             _ => false,
         };
         if skip_migration {

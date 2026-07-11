@@ -922,6 +922,7 @@ async fn audited_prompt_hook_stream(
             agent_attempt_id: None,
             provider_id,
             model_id: &hook_request.model_id,
+            thinking_level: None,
             request_started_at: &request_started_at,
             first_token_at: None,
             completed_at: None,
