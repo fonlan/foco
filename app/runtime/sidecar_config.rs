@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ApiError;
 use crate::skills::{
-    SelectedSkillPromptEntry, SkillPromptEntry, discover_skills, parse_skill_file,
-    selected_skill_prompt_entry, skill_is_disabled, skill_is_required_disabled,
+    SkillPromptEntry, discover_skills, parse_skill_file, skill_is_disabled,
+    skill_is_required_disabled,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -39,6 +39,8 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) disabled_skill_keys: Vec<String>,
     #[serde(default)]
     pub(crate) disabled_skill_location_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) required_disabled_skill_keys: Vec<String>,
     #[serde(default)]
     pub(crate) selected_skills: Vec<SidecarRuntimeSkillContent>,
 }
@@ -71,10 +73,6 @@ impl SidecarRuntimeSkillContent {
             path: self.path.clone(),
         }
     }
-
-    pub(crate) fn selected_prompt_entry(&self) -> SelectedSkillPromptEntry {
-        selected_skill_prompt_entry(self.prompt_entry(), self.content_markdown.clone())
-    }
 }
 
 pub(crate) fn build_sidecar_runtime_config_bundle(
@@ -82,6 +80,8 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
     config: &GlobalConfig,
     config_generation: u64,
 ) -> Result<SidecarRuntimeConfigBundle, ApiError> {
+    let (global_skills, required_disabled_skill_keys) =
+        global_skill_content(user_profile_dir, config)?;
     let payload = SidecarRuntimeConfigPayload {
         agent_definitions: config.agent_definitions.clone(),
         prompts: config.prompts.clone(),
@@ -91,9 +91,10 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         memory: config.memory.clone(),
         spec: config.spec.clone(),
         plan: config.plan.clone(),
-        global_skills: global_skill_content(user_profile_dir, config)?,
+        global_skills,
         disabled_skill_keys: config.skills.disabled.clone(),
         disabled_skill_location_ids: config.skills.disabled_locations.clone(),
+        required_disabled_skill_keys,
         selected_skills: Vec::new(),
     };
     let payload_json = serde_json::to_vec(&payload).map_err(|source| {
@@ -123,7 +124,7 @@ fn sidecar_mcp_config(config: &McpConfig) -> McpConfig {
 fn global_skill_content(
     user_profile_dir: &Path,
     config: &GlobalConfig,
-) -> Result<Vec<SidecarRuntimeSkillContent>, ApiError> {
+) -> Result<(Vec<SidecarRuntimeSkillContent>, Vec<String>), ApiError> {
     let disabled_ids = config
         .skills
         .disabled
@@ -136,8 +137,14 @@ fn global_skill_content(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let required_disabled_skill_keys = discovery
+        .required_disabled
+        .iter()
+        .filter(|key| key.starts_with("global:"))
+        .cloned()
+        .collect::<Vec<_>>();
 
-    discovery
+    let global_skills = discovery
         .skills
         .iter()
         .filter(|skill| {
@@ -164,7 +171,9 @@ fn global_skill_content(
                 content_markdown: parsed.markdown,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok((global_skills, required_disabled_skill_keys))
 }
 
 #[cfg(test)]
@@ -277,6 +286,10 @@ mod tests {
             bundle.payload.disabled_skill_location_ids,
             config.skills.disabled_locations
         );
+        assert_eq!(
+            bundle.payload.required_disabled_skill_keys,
+            vec!["global:broken".to_string()]
+        );
         assert!(bundle.payload.selected_skills.is_empty());
     }
 
@@ -345,6 +358,7 @@ mod tests {
         payload.remove("globalSkills");
         payload.remove("disabledSkillKeys");
         payload.remove("disabledSkillLocationIds");
+        payload.remove("requiredDisabledSkillKeys");
         payload.insert(
             "selectedSkills".to_string(),
             serde_json::json!([{
@@ -362,6 +376,7 @@ mod tests {
         assert!(parsed.payload.global_skills.is_empty());
         assert!(parsed.payload.disabled_skill_keys.is_empty());
         assert!(parsed.payload.disabled_skill_location_ids.is_empty());
+        assert!(parsed.payload.required_disabled_skill_keys.is_empty());
         assert_eq!(parsed.payload.selected_skills[0].description, "");
         assert_eq!(parsed.payload.selected_skills[0].scope, SKILL_SCOPE_GLOBAL);
     }
