@@ -4712,7 +4712,7 @@ export function SettingsPanel({
         </div>
       ) : null}
       <div className="settings-layout grid">
-        <aside className="settings-section-nav-card flex min-h-0 flex-col border-stone-200 bg-white p-2">
+        <aside className="settings-section-nav-card flex min-h-0 flex-col border-stone-200 p-2">
           <div className="settings-sidebar-header workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
             <div className="min-w-0">
               <span className="workspace-sidebar-title">{t("Settings")}</span>

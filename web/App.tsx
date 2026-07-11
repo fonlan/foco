@@ -10303,7 +10303,7 @@ export function App() {
 
   return (
     <I18nContext.Provider value={{ language, t }}>
-      <main className="app-root foco-workbench text-stone-950">
+      <main className="app-root foco-workbench">
         {error ? (
           <section
             aria-live="assertive"

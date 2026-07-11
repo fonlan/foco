@@ -3685,7 +3685,8 @@ body,
 
 /* Foco visual hierarchy refresh: colors/elevation only, layout unchanged. */
 html,
-body {
+body,
+.app-root {
   color: var(--foco-text);
 }
 
@@ -3746,17 +3747,25 @@ summary:focus-visible {
   background-color: var(--foco-panel);
 }
 
+/* Include .app-root itself: main uses text-stone-950 and children inherit. */
+.app-root.text-stone-950,
+.app-root.text-stone-900,
+.app-root.text-stone-800,
 .app-root .text-stone-950,
 .app-root .text-stone-900,
 .app-root .text-stone-800 {
   color: var(--foco-text);
 }
 
+.app-root.text-stone-700,
+.app-root.text-stone-600,
 .app-root .text-stone-700,
 .app-root .text-stone-600 {
   color: var(--foco-text-muted);
 }
 
+.app-root.text-stone-500,
+.app-root.text-stone-400,
 .app-root .text-stone-500,
 .app-root .text-stone-400 {
   color: var(--foco-text-faint);
@@ -3940,6 +3949,13 @@ summary:focus-visible {
 .settings-section-nav-card {
   border-right: 1px solid var(--foco-border);
   background: var(--foco-sidebar-gradient), var(--foco-sidebar);
+}
+
+/* Beat .app-root .bg-white (0,2,0) so settings rail keeps theme surface. */
+.app-root .settings-section-nav-card.bg-white,
+.app-root .settings-section-nav-card {
+  background: var(--foco-sidebar-gradient), var(--foco-sidebar);
+  background-color: var(--foco-sidebar);
 }
 
 .workspace-sidebar-header,
@@ -4445,15 +4461,30 @@ summary:focus-visible {
   color: var(--foco-text-muted);
 }
 
+.app-root .settings-section-nav > button:not([aria-current="page"]) {
+  color: var(--foco-text-muted);
+}
+
 .settings-section-nav > button:hover {
   background: var(--foco-panel-soft);
   color: var(--foco-text);
 }
 
+.app-root .settings-section-nav > button:not([aria-current="page"]):hover {
+  background: var(--foco-panel-soft);
+  color: var(--foco-text);
+}
+
 .settings-section-nav > button[aria-current="page"] {
-  background: var(--foco-primary);
+  background: var(--foco-accent);
   color: #ffffff;
-  box-shadow: 0 12px 28px rgba(17, 32, 51, 0.18);
+  box-shadow: var(--foco-shadow-accent);
+}
+
+.app-root .settings-section-nav > button[aria-current="page"] {
+  background: var(--foco-accent);
+  color: #ffffff;
+  box-shadow: var(--foco-shadow-accent);
 }
 
 .app-root :is(input, select, textarea):not(.message-composer-textarea):not(
