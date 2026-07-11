@@ -191,11 +191,13 @@ pub(crate) use settings_runtime::{
     workspace_response_from_config,
 };
 #[cfg(test)]
+pub(crate) use skills::discover_skills_in_all_locations;
+#[cfg(test)]
 pub(crate) use skills::parse_skill_markdown;
 pub(crate) use skills::{
     SkillDiscoveryErrorSummary, deletable_skill_directory_for_path, discover_skills,
-    discover_skills_in_all_locations, enabled_skill_frontmatter_messages,
-    merge_disabled_skill_keys, merge_manual_disabled_skill_keys, message_with_selected_skills,
+    enabled_skill_frontmatter_messages, merge_disabled_skill_keys,
+    merge_manual_disabled_skill_keys, message_with_selected_skills,
     normalize_manual_disabled_skill_ids, parse_skill_file,
     preserve_disabled_skill_keys_for_hidden_locations, refresh_derived_enabled_skills,
     skill_is_disabled, skill_is_required_disabled, skill_search_roots,
@@ -360,6 +362,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 // Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
+#[cfg(any(windows, all(target_os = "macos", not(debug_assertions)), test))]
 pub(crate) const UPDATED_RESTART_COMMAND: &str = "--updated-restart";
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
@@ -2353,6 +2356,7 @@ struct ContextCompressionEventDetail {
 #[derive(Clone, Debug)]
 struct ContextCompressionResult {
     active_tool_start_index: usize,
+    #[allow(dead_code)]
     runtime_tool_state_compressed: bool,
     events: Vec<ContextCompressionEventDetail>,
 }
@@ -2563,7 +2567,9 @@ impl PreparedChatContext {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let response_body_json = capture
+        // Prefer versioned wire response when details capture is enabled; keep the
+        // compact cancelled payload when details are off so the cancel reason is retained.
+        let wire_response_body_json = capture
             .failed_response_json(message, None, true)
             .ok()
             .flatten();
@@ -2575,7 +2581,9 @@ impl PreparedChatContext {
             started_at,
             message,
         );
-        request.outcome.response_body_json = response_body_json;
+        if let Some(response_body_json) = wire_response_body_json {
+            request.outcome.response_body_json = Some(response_body_json);
+        }
         self.captured_llm_requests.push(request);
     }
 

@@ -1336,13 +1336,13 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
     expect(
-      within(guidedAnswerRow as HTMLElement).getByText(/Noop/),
+      within(guidedAnswerRow as HTMLElement).getByText(/noop/),
     ).toBeInTheDocument();
     expect(
       within(guidedAnswerRow as HTMLElement).queryByText(/running/i),
     ).not.toBeInTheDocument();
     expect(
-      within(initialAnswerRow as HTMLElement).queryByText(/Noop/),
+      within(initialAnswerRow as HTMLElement).queryByText(/noop/),
     ).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1376,7 +1376,7 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const toolName = await screen.findByText("Pre Guidance Tool");
+    const toolName = await screen.findByText("pre_guidance_tool");
     const interruptedAssistantRow = toolName.closest(".message-row") as HTMLElement | null;
     expect(interruptedAssistantRow).not.toBeNull();
     expect(

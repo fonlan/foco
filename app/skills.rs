@@ -346,6 +346,7 @@ pub(crate) fn discover_skills(user_profile_dir: &Path, config: &GlobalConfig) ->
     )
 }
 
+#[cfg(test)]
 pub(crate) fn discover_skills_in_all_locations(
     user_profile_dir: &Path,
     workspaces: &[WorkspaceConfig],

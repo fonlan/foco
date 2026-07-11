@@ -1207,7 +1207,7 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
 
     const runCommandSummary = (await screen.findByLabelText("Run (run_command)")).closest("summary");
-    const unknownSummary = (await screen.findByLabelText("Mystery Tool (mystery_tool)")).closest("summary");
+    const unknownSummary = (await screen.findByLabelText("mystery_tool (mystery_tool)")).closest("summary");
 
     expect(runCommandSummary?.querySelector("svg.lucide-terminal")).toBeInTheDocument();
     expect(unknownSummary?.querySelector("svg.lucide-wrench")).toBeInTheDocument();
