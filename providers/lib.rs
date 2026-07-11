@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use futures_util::StreamExt;
 use genai::{
@@ -11,11 +15,76 @@ use genai::{
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
-use reqwest::StatusCode;
+use reqwest::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub const PROVIDER_WIRE_REQUEST_DUMP_VERSION: u32 = 1;
+pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
+const REDACTED_HEADER_VALUE: &str = "[REDACTED]";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWireRequestDump {
+    pub version: u32,
+    pub method: String,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ProviderFinalResponseDump {
+    Succeeded {
+        version: u32,
+        text: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<NeutralToolCall>,
+        usage: Option<NeutralUsage>,
+        stop_reason: Option<String>,
+        response_id: Option<String>,
+    },
+    Failed {
+        version: u32,
+        partial: bool,
+        error: String,
+        status_code: Option<u16>,
+    },
+}
+
+impl ProviderFinalResponseDump {
+    fn succeeded(
+        text: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<NeutralToolCall>,
+        usage: Option<NeutralUsage>,
+        stop_reason: Option<String>,
+        response_id: Option<String>,
+    ) -> Self {
+        Self::Succeeded {
+            version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            text,
+            reasoning,
+            tool_calls,
+            usage,
+            stop_reason,
+            response_id,
+        }
+    }
+
+    pub fn failed(error: impl Into<String>, status_code: Option<u16>, partial: bool) -> Self {
+        Self::Failed {
+            version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            partial,
+            error: error.into(),
+            status_code,
+        }
+    }
+}
+
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
 pub const GEMINI_KIND: &str = "gemini";
 pub const ANTHROPIC_KIND: &str = "anthropic";
@@ -718,23 +787,116 @@ pub struct NeutralUsage {
     pub reasoning_tokens: Option<i64>,
 }
 
+#[derive(Debug)]
+pub struct ProviderRequestFailure {
+    pub error: ProviderConfigError,
+    pub request_dump: Option<ProviderWireRequestDump>,
+}
+
+impl ProviderRequestFailure {
+    pub fn status_code(&self) -> Option<u16> {
+        self.error.status_code()
+    }
+}
+
+impl fmt::Display for ProviderRequestFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ProviderRequestFailure {}
+
 pub struct NeutralChatStream {
     stream: genai::chat::ChatStream,
     error_context: ProviderErrorContext,
+    wire_request_dump: Option<ProviderWireRequestDump>,
+    saw_response_event: bool,
+    final_response_dump: Option<ProviderFinalResponseDump>,
 }
 
 impl NeutralChatStream {
+    pub fn wire_request_dump(&self) -> Option<&ProviderWireRequestDump> {
+        self.wire_request_dump.as_ref()
+    }
+
+    pub fn final_response_dump(&self) -> Option<&ProviderFinalResponseDump> {
+        self.final_response_dump.as_ref()
+    }
+
+    pub fn interrupted_final_response_dump(
+        &self,
+        message: impl Into<String>,
+    ) -> Option<ProviderFinalResponseDump> {
+        self.wire_request_dump
+            .as_ref()
+            .map(|_| ProviderFinalResponseDump::failed(message, None, self.saw_response_event))
+    }
+
     pub async fn next_event(
         &mut self,
     ) -> Option<Result<NeutralChatStreamEvent, ProviderConfigError>> {
         let event = self.stream.next().await?;
-        Some(match event {
+        let normalized = match event {
             Ok(event) => normalize_stream_event(event),
             Err(source) => Err(ProviderConfigError::from_genai_error_with_context(
                 source,
                 &self.error_context,
             )),
-        })
+        };
+
+        match &normalized {
+            Ok(
+                NeutralChatStreamEvent::Start
+                | NeutralChatStreamEvent::TextDelta { .. }
+                | NeutralChatStreamEvent::ReasoningDelta { .. }
+                | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
+                | NeutralChatStreamEvent::ToolCall { .. }
+                | NeutralChatStreamEvent::Usage { .. },
+            ) => {
+                self.saw_response_event = true;
+            }
+            Ok(NeutralChatStreamEvent::Complete {
+                text,
+                reasoning,
+                tool_calls,
+                usage,
+                stop_reason,
+                response_id,
+            }) => {
+                self.saw_response_event = true;
+                if self.wire_request_dump.is_some() {
+                    self.final_response_dump = Some(ProviderFinalResponseDump::succeeded(
+                        text.clone(),
+                        reasoning.clone(),
+                        tool_calls.clone(),
+                        usage.clone(),
+                        stop_reason.clone(),
+                        response_id.clone(),
+                    ));
+                }
+            }
+            Ok(NeutralChatStreamEvent::Error { message }) => {
+                if self.wire_request_dump.is_some() {
+                    self.final_response_dump = Some(ProviderFinalResponseDump::failed(
+                        message.clone(),
+                        None,
+                        self.saw_response_event,
+                    ));
+                }
+            }
+            Err(error) => {
+                if self.wire_request_dump.is_some() {
+                    self.final_response_dump = Some(ProviderFinalResponseDump::failed(
+                        error.to_string(),
+                        error.status_code(),
+                        self.saw_response_event,
+                    ));
+                }
+            }
+        }
+
+        Some(normalized)
     }
 }
 
@@ -742,23 +904,68 @@ pub async fn stream_chat(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
 ) -> Result<NeutralChatStream, ProviderConfigError> {
-    let client = config.genai_client()?;
-    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())?;
-    let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
-    let error_context =
-        config.provider_error_context("opening provider stream", upstream_model_id)?;
-    let options = genai_chat_options(config, &request)?;
-    let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
-    let response = client
-        .exec_chat_stream(model, chat_request, Some(&options))
+    stream_chat_with_capture(config, request, false)
         .await
-        .map_err(|source| {
-            ProviderConfigError::from_genai_error_with_context(source, &error_context)
+        .map_err(|failure| failure.error)
+}
+
+pub async fn stream_chat_with_capture(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    capture_details: bool,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    let client = config
+        .genai_client()
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
         })?;
+    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let error_context = config
+        .provider_error_context("opening provider stream", upstream_model_id)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let options = genai_chat_options(config, &request).map_err(|error| ProviderRequestFailure {
+        error,
+        request_dump: None,
+    })?;
+    let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
+    let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
+    let observer = captured_request.as_ref().map(|captured_request| {
+        let captured_request = Arc::clone(captured_request);
+        Arc::new(move |request: &Request| {
+            let dump = provider_wire_request_dump(request);
+            if let Ok(mut slot) = captured_request.lock() {
+                *slot = Some(dump);
+            }
+        }) as genai::PreparedRequestObserver
+    });
+    let response = client
+        .exec_chat_stream_observed(model, chat_request, Some(&options), observer)
+        .await
+        .map_err(|source| ProviderRequestFailure {
+            error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
+            request_dump: take_captured_request_dump(&captured_request),
+        })?;
+    let wire_request_dump = take_captured_request_dump(&captured_request);
 
     Ok(NeutralChatStream {
         stream: response.stream,
         error_context: error_context.with_phase("reading provider stream"),
+        wire_request_dump,
+        saw_response_event: false,
+        final_response_dump: None,
     })
 }
 
@@ -1296,6 +1503,72 @@ fn insert_nested_body_override(
     ))
 }
 
+fn take_captured_request_dump(
+    captured_request: &Option<Arc<Mutex<Option<ProviderWireRequestDump>>>>,
+) -> Option<ProviderWireRequestDump> {
+    captured_request
+        .as_ref()
+        .and_then(|captured_request| captured_request.lock().ok()?.take())
+}
+
+fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str().to_string();
+            let value = if is_sensitive_header_name(&name) {
+                REDACTED_HEADER_VALUE.to_string()
+            } else {
+                value
+                    .to_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|_| "[NON_UTF8]".to_string())
+            };
+            (name, value)
+        })
+        .collect();
+    let body = request
+        .body()
+        .and_then(|body| body.as_bytes())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+
+    ProviderWireRequestDump {
+        version: PROVIDER_WIRE_REQUEST_DUMP_VERSION,
+        method: request.method().as_str().to_string(),
+        url: redact_url_credentials(request.url()),
+        headers,
+        body,
+    }
+}
+
+fn redact_url_credentials(url: &reqwest::Url) -> String {
+    let mut redacted = url.clone();
+    if !redacted.username().is_empty() {
+        let _ = redacted.set_username(REDACTED_HEADER_VALUE);
+    }
+    if redacted.password().is_some() {
+        let _ = redacted.set_password(Some(REDACTED_HEADER_VALUE));
+    }
+    redacted.to_string()
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized == "authorization"
+        || normalized == "proxy-authorization"
+        || normalized == "cookie"
+        || normalized == "set-cookie"
+        || normalized == "x-api-key"
+        || normalized == "api-key"
+        || normalized == "x-goog-api-key"
+        || normalized == "x-auth-token"
+        || normalized.contains("signature")
+        || normalized.contains("credential")
+        || normalized.contains("secret")
+        || normalized.ends_with("-token")
+        || normalized.ends_with("_token")
+}
 fn normalize_stream_event(
     event: ChatStreamEvent,
 ) -> Result<NeutralChatStreamEvent, ProviderConfigError> {
@@ -1615,6 +1888,60 @@ fn webc_error_status_code(source: &genai::webc::Error) -> Option<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn spawn_openai_sse_fixture(
+        response_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept fixture request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read fixture request");
+                assert!(read > 0, "fixture client closed before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .unwrap_or_default();
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).await.expect("read fixture body");
+                assert!(read > 0, "fixture client closed before body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write fixture response");
+            request
+        });
+        (format!("http://{address}/v1/"), task)
+    }
 
     fn openai_responses_kind() -> ProviderKind {
         parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind")
@@ -2456,7 +2783,6 @@ mod tests {
             prompt_cache_key: Some("foco:workspace:chat".to_string()),
             prompt_cache_retention: Some("1h".to_string()),
         };
-
         let config = ProviderConnectionConfig {
             kind: openai_responses_kind(),
             base_url: None,
@@ -2467,11 +2793,123 @@ mod tests {
         };
         let error =
             genai_chat_options(&config, &request).expect_err("unsupported retention should fail");
-
         assert!(
             error
                 .to_string()
                 .contains("unsupported prompt cache retention")
         );
+    }
+
+    #[tokio::test]
+    async fn captures_final_wire_request_and_only_final_response() {
+        const CHUNK_SENTINEL: &str = "chunk-only-secret";
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"raw_chunk_secret\":\"chunk-only-secret\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final text\"}}]}\n\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, fixture) = spawn_openai_sse_fixture(response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(base_url),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "x-fixture-header".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("fixture-header-value".to_string()),
+                },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_BODY.to_string(),
+                    name: "text.verbosity".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("low".to_string()),
+                },
+            ],
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "wire system"),
+            neutral_text_message(NeutralChatRole::User, "wire user"),
+        ]);
+        request.tools.push(NeutralToolDefinition {
+            name: "fixture_tool".to_string(),
+            description: "fixture tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .clone();
+        assert_eq!(dump.method, "POST");
+        assert!(dump.url.ends_with("/v1/chat/completions"));
+        assert_eq!(
+            dump.headers.get("authorization").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            dump.headers.get("x-fixture-header").map(String::as_str),
+            Some("fixture-header-value")
+        );
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body_json["messages"][0]["role"], "system");
+        assert_eq!(body_json["messages"][0]["content"], "wire system");
+        assert_eq!(body_json["tools"][0]["function"]["name"], "fixture_tool");
+        assert_eq!(body_json["text"]["verbosity"], "low");
+
+        while stream.next_event().await.is_some() {}
+        let final_dump = stream.final_response_dump().expect("final response dump");
+        let final_json = serde_json::to_string(final_dump).expect("final response JSON");
+        assert!(!final_json.contains(CHUNK_SENTINEL));
+        assert!(matches!(
+            final_dump,
+            ProviderFinalResponseDump::Succeeded {
+                text,
+                stop_reason: Some(stop_reason),
+                ..
+            } if text == "final text" && stop_reason == "stop"
+        ));
+
+        let raw_request = fixture.await.expect("fixture task");
+        let raw_request = String::from_utf8(raw_request).expect("raw HTTP request UTF-8");
+        assert!(raw_request.contains("authorization: Bearer fixture-api-key"));
+        assert!(raw_request.contains(body));
+    }
+
+    #[tokio::test]
+    async fn capture_disabled_keeps_request_and_response_details_empty() {
+        let response = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, fixture) = spawn_openai_sse_fixture(response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(base_url),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "capture disabled",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, false)
+            .await
+            .expect("open fixture stream");
+        assert!(stream.wire_request_dump().is_none());
+        while stream.next_event().await.is_some() {}
+        assert!(stream.final_response_dump().is_none());
+        fixture.await.expect("fixture task");
     }
 }
