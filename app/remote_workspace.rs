@@ -74,6 +74,10 @@ use crate::{
     hooks::HookRuntime,
     http::{
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
+        spec::{
+            SaveWorkspaceSpecRequest, WorkspaceSpecResponse, WorkspaceSpecSettingsRequest,
+            workspace_spec_response,
+        },
         terminal::TerminalSessionResponse,
     },
     markdown_code_block, neutral_text_message, neutral_tool_definition,
@@ -4575,8 +4579,9 @@ pub(crate) async fn ensure_remote_workspace_connected(
     state: &AppState,
     workspace_id: &str,
 ) -> Result<(), ApiError> {
-    if sidecar_proxy_target(state, workspace_id)?.is_some() {
-        return Ok(());
+    match sidecar_proxy_target(state, workspace_id)? {
+        SidecarProxyTarget::Local | SidecarProxyTarget::Connected { .. } => return Ok(()),
+        SidecarProxyTarget::Disconnected => {}
     }
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
@@ -4587,19 +4592,34 @@ pub(crate) async fn ensure_remote_workspace_connected(
         .remote_workspace_manager
         .connect_workspace(state.clone(), &server_id, workspace_id)
         .await?;
-    Ok(())
+    match sidecar_proxy_target(state, workspace_id)? {
+        SidecarProxyTarget::Connected { .. } => Ok(()),
+        SidecarProxyTarget::Disconnected => Err(ApiError::bad_gateway(format!(
+            "remote workspace sidecar is not connected after connect: {workspace_id}"
+        ))),
+        SidecarProxyTarget::Local => Err(ApiError::internal(format!(
+            "workspace became local while connecting remote sidecar: {workspace_id}"
+        ))),
+    }
 }
 
-/// Return the local tunnel base URL and bearer token for a remote workspace's
-/// sidecar session, or None if the workspace is local or its sidecar is not connected.
+pub(crate) enum SidecarProxyTarget {
+    Local,
+    Disconnected,
+    Connected { base: String, token: String },
+}
+
+/// Classify a workspace as local, remote but disconnected, or connected to a
+/// sidecar tunnel. Keeping the disconnected state distinct prevents remote
+/// workspace requests from falling through to local workspace handlers.
 pub(crate) fn sidecar_proxy_target(
     state: &AppState,
     workspace_id: &str,
-) -> Result<Option<(String, String)>, ApiError> {
+) -> Result<SidecarProxyTarget, ApiError> {
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
     let WorkspaceLocation::Ssh { server_id, .. } = &workspace.location else {
-        return Ok(None);
+        return Ok(SidecarProxyTarget::Local);
     };
     let sessions = state
         .remote_workspace_manager
@@ -4608,12 +4628,12 @@ pub(crate) fn sidecar_proxy_target(
         .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
     let key = session_key(server_id, workspace_id);
     if let Some(session) = sessions.get(&key) {
-        Ok(Some((
-            format!("http://127.0.0.1:{}/", session.local_port),
-            session.token.clone(),
-        )))
+        Ok(SidecarProxyTarget::Connected {
+            base: format!("http://127.0.0.1:{}/", session.local_port),
+            token: session.token.clone(),
+        })
     } else {
-        Ok(None)
+        Ok(SidecarProxyTarget::Disconnected)
     }
 }
 
@@ -4624,10 +4644,13 @@ pub(crate) async fn proxy_sidecar_json_request(
     suffix: &str,
     payload: Option<Value>,
 ) -> Result<Value, ApiError> {
-    let Some((base, token)) = sidecar_proxy_target(state, workspace_id)? else {
-        return Err(ApiError::conflict(format!(
-            "remote workspace sidecar is not connected: {workspace_id}"
-        )));
+    let (base, token) = match sidecar_proxy_target(state, workspace_id)? {
+        SidecarProxyTarget::Connected { base, token } => (base, token),
+        SidecarProxyTarget::Local | SidecarProxyTarget::Disconnected => {
+            return Err(ApiError::conflict(format!(
+                "remote workspace sidecar is not connected: {workspace_id}"
+            )));
+        }
     };
     let url = format!(
         "{}/api/remote/workspace/{}",
@@ -8414,56 +8437,46 @@ async fn remote_sidecar_terminal_ws(
 
 async fn remote_sidecar_spec_get(
     State(state): State<RemoteSidecarState>,
-) -> Result<Json<Value>, axum::response::Response> {
+) -> Result<Json<WorkspaceSpecResponse>, axum::response::Response> {
     let database =
         foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(remote_sidecar_spec_response(&database)?))
+    Ok(Json(
+        workspace_spec_response(&database).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_spec_settings(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, axum::response::Response> {
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let inject_enabled = payload
-        .get("injectEnabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    Json(request): Json<WorkspaceSpecSettingsRequest>,
+) -> Result<Json<WorkspaceSpecResponse>, axum::response::Response> {
     let mut database =
         foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     database
-        .upsert_workspace_spec_settings(enabled, inject_enabled)
+        .upsert_workspace_spec_settings(request.enabled, request.inject_enabled)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(remote_sidecar_spec_response(&database)?))
+    Ok(Json(
+        workspace_spec_response(&database).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_spec_put(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, axum::response::Response> {
-    let expected_revision = payload
-        .get("expectedRevision")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ApiError::bad_request("expectedRevision is required").into_response())?;
-    let content_markdown = payload
-        .get("contentMarkdown")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("contentMarkdown is required").into_response())?;
+    Json(request): Json<SaveWorkspaceSpecRequest>,
+) -> Result<Json<WorkspaceSpecResponse>, axum::response::Response> {
     let mut database =
         foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     database
-        .update_workspace_spec_content(expected_revision, content_markdown)
+        .update_workspace_spec_content(request.expected_revision, &request.content_markdown)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
         .ok_or_else(|| {
             ApiError::conflict("workspace spec revision changed; reload and retry").into_response()
         })?;
-    Ok(Json(remote_sidecar_spec_response(&database)?))
+    Ok(Json(
+        workspace_spec_response(&database).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_spec_generate(
@@ -8549,41 +8562,6 @@ async fn remote_sidecar_spec_jobs_retry(
                 .into_response()
         })?;
     Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
-}
-
-fn remote_sidecar_spec_response(
-    database: &foco_store::workspace::WorkspaceDatabase,
-) -> Result<Value, axum::response::Response> {
-    let spec = database
-        .workspace_spec()
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let latest_job = database
-        .workspace_spec_jobs(1)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-        .into_iter()
-        .next()
-        .map(remote_sidecar_spec_job_json)
-        .transpose()?;
-    let (enabled, inject_enabled, content_markdown, revision, generated_at, updated_at) = match spec
-    {
-        Some(spec) => (
-            spec.enabled,
-            spec.inject_enabled,
-            spec.content_markdown,
-            spec.revision,
-            spec.generated_at,
-            Some(spec.updated_at),
-        ),
-        None => (false, false, String::new(), 0, None, None),
-    };
-    Ok(json!({
-        "settings": { "enabled": enabled, "injectEnabled": inject_enabled },
-        "contentMarkdown": content_markdown,
-        "revision": revision,
-        "generatedAt": generated_at,
-        "updatedAt": updated_at,
-        "latestJob": latest_job,
-    }))
 }
 
 fn remote_sidecar_spec_job_json(
@@ -9605,6 +9583,191 @@ mod tests {
         assert_eq!(session.working_directory, workspace_path);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_spec_settings_persist_only_in_sidecar_database() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let local_workspace = profile.path().join("local-workspace");
+        let local_decoy = profile.path().join("remote-local-decoy");
+        let remote_workspace = tempfile::tempdir().expect("remote workspace tempdir");
+        fs::create_dir_all(&local_workspace).expect("local workspace directory");
+        fs::create_dir_all(&local_decoy).expect("local decoy directory");
+        fs::create_dir_all(profile.path().join(".foco")).expect("profile config directory");
+
+        let (sidecar_state, _) =
+            test_sidecar_state(remote_workspace.path().display().to_string(), 0);
+        let sidecar_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind spec sidecar server");
+        let sidecar_address = sidecar_listener.local_addr().expect("sidecar address");
+        let sidecar_app = Router::new()
+            .route(
+                "/api/remote/workspace/spec",
+                get(remote_sidecar_spec_get).put(remote_sidecar_spec_put),
+            )
+            .route(
+                "/api/remote/workspace/spec/settings",
+                put(remote_sidecar_spec_settings),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sidecar_state.clone(),
+                sidecar_bearer_auth,
+            ))
+            .with_state(sidecar_state);
+        let sidecar_task = tokio::spawn(async move {
+            axum::serve(sidecar_listener, sidecar_app)
+                .await
+                .expect("serve spec sidecar routes");
+        });
+
+        let mut config = foco_store::config::GlobalConfig::first_run(local_workspace);
+        config
+            .remote_servers
+            .push(foco_store::config::RemoteServerProfile {
+                id: "srv".to_string(),
+                name: "Server".to_string(),
+                host_alias: "server".to_string(),
+                ..foco_store::config::RemoteServerProfile::default()
+            });
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: local_decoy.clone(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "srv".to_string(),
+                remote_path: remote_workspace.path().display().to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        });
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        assert!(matches!(
+            sidecar_proxy_target(&state, "remote").expect("remote proxy target classification"),
+            SidecarProxyTarget::Disconnected
+        ));
+        state.remote_workspace_manager.insert_fake_session_for_test(
+            "srv",
+            "remote",
+            &remote_workspace.path().display().to_string(),
+            sidecar_address.port(),
+            "token",
+        );
+        assert!(matches!(
+            sidecar_proxy_target(&state, "remote").expect("connected proxy target"),
+            SidecarProxyTarget::Connected { .. }
+        ));
+
+        let app_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind app spec proxy server");
+        let app_address = app_listener.local_addr().expect("app address");
+        let app_task = tokio::spawn(async move {
+            axum::serve(app_listener, crate::http::router::app_router(state))
+                .await
+                .expect("serve app spec proxy routes");
+        });
+        let client = reqwest::Client::new();
+        let spec_url = format!("http://{app_address}/api/workspaces/remote/spec");
+        let settings_url = format!("{spec_url}/settings");
+
+        let initial = client
+            .get(&spec_url)
+            .send()
+            .await
+            .expect("initial remote spec get");
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial: Value = initial.json().await.expect("initial spec json");
+        assert_eq!(initial["settings"]["enabled"], false);
+        assert_eq!(initial["settings"]["injectEnabled"], false);
+
+        for invalid_payload in [
+            json!({ "enabled": true }),
+            json!({ "enabled": true, "injectEnabled": "yes" }),
+        ] {
+            let response = client
+                .put(&settings_url)
+                .json(&invalid_payload)
+                .send()
+                .await
+                .expect("invalid remote spec settings request");
+            assert!(
+                response.status().is_client_error(),
+                "payload: {invalid_payload}"
+            );
+        }
+        let invalid_database =
+            WorkspaceDatabase::open_or_create(remote_workspace.path()).expect("open remote db");
+        assert!(
+            invalid_database
+                .workspace_spec()
+                .expect("read spec after invalid payloads")
+                .is_none(),
+            "invalid settings payloads must not create a defaulted spec row"
+        );
+        drop(invalid_database);
+
+        let saved = client
+            .put(&settings_url)
+            .json(&json!({ "enabled": true, "injectEnabled": true }))
+            .send()
+            .await
+            .expect("save remote spec settings");
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved: Value = saved.json().await.expect("saved spec json");
+        assert_eq!(saved["settings"]["enabled"], true);
+        assert_eq!(saved["settings"]["injectEnabled"], true);
+
+        let reloaded = client
+            .get(&spec_url)
+            .send()
+            .await
+            .expect("reload remote spec");
+        assert_eq!(reloaded.status(), StatusCode::OK);
+        let reloaded: Value = reloaded.json().await.expect("reloaded spec json");
+        assert_eq!(reloaded["settings"], saved["settings"]);
+
+        let remote_database =
+            WorkspaceDatabase::open_or_create(remote_workspace.path()).expect("reopen remote db");
+        let remote_spec = remote_database
+            .workspace_spec()
+            .expect("read remote spec")
+            .expect("persisted remote spec");
+        assert!(remote_spec.enabled);
+        assert!(remote_spec.inject_enabled);
+        drop(remote_database);
+
+        let local_database =
+            WorkspaceDatabase::open_or_create(&local_decoy).expect("open local decoy db");
+        assert!(
+            local_database
+                .workspace_spec()
+                .expect("read local decoy spec")
+                .is_none(),
+            "remote spec settings must not fall back to the main process workspace database"
+        );
+        drop(local_database);
+
+        sidecar_task.abort();
+        let _ = sidecar_task.await;
+        let unavailable = client
+            .put(&settings_url)
+            .json(&json!({ "enabled": false, "injectEnabled": false }))
+            .send()
+            .await
+            .expect("remote spec request with unavailable sidecar");
+        assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
+        let local_database =
+            WorkspaceDatabase::open_or_create(&local_decoy).expect("reopen local decoy db");
+        assert!(
+            local_database
+                .workspace_spec()
+                .expect("re-read local decoy spec")
+                .is_none()
+        );
+
+        app_task.abort();
     }
 
     fn write_remote_test_skill(

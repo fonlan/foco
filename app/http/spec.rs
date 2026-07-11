@@ -20,15 +20,15 @@ const MAX_SPEC_JOB_LIMIT: i64 = 100;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkspaceSpecSettingsRequest {
-    enabled: bool,
-    inject_enabled: bool,
+    pub(crate) enabled: bool,
+    pub(crate) inject_enabled: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SaveWorkspaceSpecRequest {
-    expected_revision: u64,
-    content_markdown: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) content_markdown: String,
 }
 
 #[derive(Deserialize)]
@@ -437,7 +437,7 @@ fn workspace_spec_jobs_for_workspace(
     Ok((jobs, total_count))
 }
 
-fn workspace_spec_response(
+pub(crate) fn workspace_spec_response(
     database: &WorkspaceDatabase,
 ) -> Result<WorkspaceSpecResponse, ApiError> {
     let spec = database

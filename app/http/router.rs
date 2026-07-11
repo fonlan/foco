@@ -658,15 +658,25 @@ async fn remote_workspace_proxy_middleware(
     };
     let suffix = suffix.to_string();
 
-    // Check if this workspace is remote and has an active sidecar session.
     if let Err(error) =
         crate::remote_workspace::ensure_remote_workspace_connected(&state, &workspace_id).await
     {
         return error.into_response();
     }
+
+    // Local workspaces fall through. Remote workspaces must have a connected
+    // sidecar target; a disconnected or invalid target is never allowed to
+    // reach the local workspace handler.
     let (base, token) = match crate::remote_workspace::sidecar_proxy_target(&state, &workspace_id) {
-        Ok(Some(target)) => target,
-        _ => return next.run(request).await,
+        Ok(crate::remote_workspace::SidecarProxyTarget::Connected { base, token }) => (base, token),
+        Ok(crate::remote_workspace::SidecarProxyTarget::Local) => return next.run(request).await,
+        Ok(crate::remote_workspace::SidecarProxyTarget::Disconnected) => {
+            return crate::ApiError::bad_gateway(format!(
+                "remote workspace sidecar is not connected: {workspace_id}"
+            ))
+            .into_response();
+        }
+        Err(error) => return error.into_response(),
     };
 
     // Build the proxied URL - map /api/workspaces/{id}/foo to /api/remote/workspace/foo
