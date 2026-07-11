@@ -1025,6 +1025,7 @@ pub enum ToolConflictError {
     },
     ResourceConflict {
         resource: ToolResource,
+        display_path: Option<String>,
         first_call_id: String,
         first_access: ToolResourceAccess,
         second_call_id: String,
@@ -1457,6 +1458,7 @@ pub fn plan_tool_execution(
             requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name),
             locks,
             file_write_kind: file_write_kind(&tool_call.name),
+            file_display_path: file_display_path(tool_call),
         });
     }
 
@@ -1664,6 +1666,7 @@ struct AnalyzedToolCall {
     requires_sequential_execution: bool,
     locks: Vec<ToolResourceLock>,
     file_write_kind: Option<FileWriteKind>,
+    file_display_path: Option<String>,
 }
 
 fn push_parallel_group_before_matching_edit_file(
@@ -1733,6 +1736,11 @@ fn reject_conflicting_parallel_tool_calls(
                 && second_lock.access == ToolResourceAccess::Write
             {
                 if let ToolResource::File(path) = &first_lock.resource {
+                    let display_path = first_analysis
+                        .file_display_path
+                        .as_ref()
+                        .unwrap_or(path)
+                        .clone();
                     if first_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
                         && second_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
                     {
@@ -1752,12 +1760,12 @@ fn reject_conflicting_parallel_tool_calls(
                                 Some(FileWriteKind::LineRangeOrFull),
                                 Some(FileWriteKind::ReplaceExact),
                             ) => ToolConflictError::MixedFileWriteMethods {
-                                path: path.clone(),
+                                path: display_path,
                                 first_call_id: first_call.id.clone(),
                                 second_call_id: second_call.id.clone(),
                             },
                             _ => ToolConflictError::SameFileWrite {
-                                path: path.clone(),
+                                path: display_path,
                                 first_call_id: first_call.id.clone(),
                                 second_call_id: second_call.id.clone(),
                             },
@@ -1768,6 +1776,10 @@ fn reject_conflicting_parallel_tool_calls(
 
             return Err(ToolConflictError::ResourceConflict {
                 resource: first_lock.resource.clone(),
+                display_path: match &first_lock.resource {
+                    ToolResource::File(_) => first_analysis.file_display_path.clone(),
+                    _ => None,
+                },
                 first_call_id: first_call.id.clone(),
                 first_access: first_lock.access,
                 second_call_id: second_call.id.clone(),
@@ -1807,11 +1819,26 @@ fn required_path(tool_call: &PendingToolCall) -> Result<String, ToolConflictErro
         .arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(normalize_workspace_path)
+        .map(normalize_workspace_path_key)
         .ok_or_else(|| ToolConflictError::MissingPath {
             tool_name: tool_call.name.clone(),
             call_id: tool_call.id.clone(),
         })
+}
+
+fn file_display_path(tool_call: &PendingToolCall) -> Option<String> {
+    if !matches!(
+        tool_call.name.as_str(),
+        READ_FILE_TOOL_NAME | WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME
+    ) {
+        return None;
+    }
+
+    tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(normalize_workspace_path_display)
 }
 
 fn memory_scope_key(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
@@ -1858,14 +1885,17 @@ fn accesses_conflict(first: ToolResourceAccess, second: ToolResourceAccess) -> b
     )
 }
 
-fn normalize_workspace_path(path: &str) -> String {
+fn normalize_workspace_path_key(path: &str) -> String {
+    normalize_workspace_path_display(path).to_ascii_lowercase()
+}
+
+fn normalize_workspace_path_display(path: &str) -> String {
     path.trim()
         .replace('\\', "/")
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/")
-        .to_ascii_lowercase()
 }
 
 pub fn context_compression_trigger_tokens(available_tokens: u64) -> u64 {
@@ -1934,14 +1964,24 @@ impl fmt::Display for ToolConflictError {
             ),
             Self::ResourceConflict {
                 resource,
+                display_path,
                 first_call_id,
                 first_access,
                 second_call_id,
                 second_access,
-            } => write!(
-                formatter,
-                "tool resource conflict for {resource} between tool call '{first_call_id}' ({first_access}) and '{second_call_id}' ({second_access})"
-            ),
+            } => {
+                if let (ToolResource::File(_), Some(path)) = (resource, display_path) {
+                    write!(
+                        formatter,
+                        "tool resource conflict for file '{path}' between tool call '{first_call_id}' ({first_access}) and '{second_call_id}' ({second_access})"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "tool resource conflict for {resource} between tool call '{first_call_id}' ({first_access}) and '{second_call_id}' ({second_access})"
+                    )
+                }
+            }
         }
     }
 }
@@ -2090,7 +2130,7 @@ mod tests {
     fn mutation_and_unknown_tools_take_workspace_mutation_lease_when_they_touch_workspace_files() {
         let write_locks = tool_resource_locks(&test_tool_call(
             WRITE_FILE_TOOL_NAME,
-            json!({ "path": "src/lib.rs" }),
+            json!({ "path": ".\\web\\features\\skill-store\\SkillStorePage.tsx" }),
         ))
         .expect("write locks");
         assert!(write_locks.iter().any(|lock| {
@@ -2098,7 +2138,8 @@ mod tests {
                 && lock.access == ToolResourceAccess::Exclusive
         }));
         assert!(write_locks.iter().any(|lock| {
-            lock.resource == ToolResource::File("src/lib.rs".to_string())
+            lock.resource
+                == ToolResource::File("web/features/skill-store/skillstorepage.tsx".to_string())
                 && lock.access == ToolResourceAccess::Write
         }));
 
@@ -2824,12 +2865,16 @@ mod tests {
             PendingToolCall {
                 id: "call-a".to_string(),
                 name: WRITE_FILE_TOOL_NAME.to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
+                arguments: json!({
+                    "path": "web/features/skill-store/SkillStorePage.tsx"
+                }),
             },
             PendingToolCall {
                 id: "call-c".to_string(),
                 name: EDIT_FILE_TOOL_NAME.to_string(),
-                arguments: json!({ "path": ".\\src\\main.rs" }),
+                arguments: json!({
+                    "path": ".\\WEB\\features\\skill-store\\skillstorepage.tsx"
+                }),
             },
         ];
 
@@ -2838,11 +2883,46 @@ mod tests {
         assert_eq!(
             error,
             ToolConflictError::MixedFileWriteMethods {
-                path: "src/main.rs".to_string(),
+                path: "web/features/skill-store/SkillStorePage.tsx".to_string(),
                 first_call_id: "call-a".to_string(),
                 second_call_id: "call-c".to_string(),
             }
         );
+        assert!(error.to_string().contains("SkillStorePage.tsx"));
+        assert!(!error.to_string().contains("skillstorepage.tsx"));
+    }
+
+    #[test]
+    fn rejects_multiple_write_files_for_same_file_with_display_path_casing() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "path": ".\\web\\features\\skill-store\\SkillStorePage.tsx"
+                }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "path": "WEB/features/skill-store/skillstorepage.tsx"
+                }),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::SameFileWrite {
+                path: "web/features/skill-store/SkillStorePage.tsx".to_string(),
+                first_call_id: "call-a".to_string(),
+                second_call_id: "call-b".to_string(),
+            }
+        );
+        assert!(error.to_string().contains("SkillStorePage.tsx"));
+        assert!(!error.to_string().contains("skillstorepage.tsx"));
     }
 
     #[test]
@@ -3022,6 +3102,7 @@ mod tests {
             error,
             ToolConflictError::ResourceConflict {
                 resource: ToolResource::ProjectSpec,
+                display_path: None,
                 first_call_id: "call-read".to_string(),
                 first_access: ToolResourceAccess::Read,
                 second_call_id: "call-update".to_string(),
@@ -3051,6 +3132,7 @@ mod tests {
             error,
             ToolConflictError::ResourceConflict {
                 resource: ToolResource::ProjectSpec,
+                display_path: None,
                 first_call_id: "call-update-a".to_string(),
                 first_access: ToolResourceAccess::Write,
                 second_call_id: "call-update-b".to_string(),
@@ -3065,12 +3147,16 @@ mod tests {
             PendingToolCall {
                 id: "call-a".to_string(),
                 name: READ_FILE_TOOL_NAME.to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
+                arguments: json!({
+                    "path": ".\\web\\features\\skill-store\\SkillStorePage.tsx"
+                }),
             },
             PendingToolCall {
                 id: "call-b".to_string(),
                 name: EDIT_FILE_TOOL_NAME.to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
+                arguments: json!({
+                    "path": "WEB/features/skill-store/skillstorepage.tsx"
+                }),
             },
         ];
 
@@ -3079,13 +3165,18 @@ mod tests {
         assert_eq!(
             error,
             ToolConflictError::ResourceConflict {
-                resource: ToolResource::File("src/main.rs".to_string()),
+                resource: ToolResource::File(
+                    "web/features/skill-store/skillstorepage.tsx".to_string()
+                ),
+                display_path: Some("web/features/skill-store/SkillStorePage.tsx".to_string()),
                 first_call_id: "call-a".to_string(),
                 first_access: ToolResourceAccess::Read,
                 second_call_id: "call-b".to_string(),
                 second_access: ToolResourceAccess::Write,
             }
         );
+        assert!(error.to_string().contains("SkillStorePage.tsx"));
+        assert!(!error.to_string().contains("skillstorepage.tsx"));
     }
 
     #[test]
@@ -3180,6 +3271,7 @@ mod tests {
             error,
             ToolConflictError::ResourceConflict {
                 resource: ToolResource::WorkspaceFiles,
+                display_path: None,
                 first_call_id: "call-a".to_string(),
                 first_access: ToolResourceAccess::Read,
                 second_call_id: "call-b".to_string(),
