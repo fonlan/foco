@@ -26,7 +26,10 @@ use axum::{
     routing::{any, get, patch, post, put},
 };
 use chrono::{SecondsFormat, Utc};
-use foco_agent::{build_memory_prompt_section, build_project_spec_prompt_section};
+use foco_agent::{
+    ContextBudget, build_memory_prompt_section, build_project_spec_prompt_section,
+    calculate_context_budget,
+};
 use foco_mcp::McpRegistry;
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
@@ -65,7 +68,9 @@ use tungstenite::client::IntoClientRequest;
 use std::os::windows::process::CommandExt;
 
 use crate::{
-    ApiError, AppResult, AppState, MAX_AGENT_TOOL_ROUNDS, api_audit_save_details, config_snapshot,
+    ApiError, AppResult, AppState, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
+    api_audit_save_details, append_pending_tool_state_messages, config_snapshot,
+    estimate_tool_schema_tokens,
     hooks::HookRuntime,
     http::{
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
@@ -74,7 +79,8 @@ use crate::{
     markdown_code_block, neutral_text_message, neutral_tool_definition,
     prompt::{
         active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-        configured_extra_prompt_message, environment_context_message,
+        compress_all_runtime_tool_state_messages, compress_runtime_tool_state_messages_if_needed,
+        configured_extra_prompt_message, environment_context_message, pack_neutral_messages,
     },
     runtime::{
         ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
@@ -115,14 +121,19 @@ struct RemoteSidecarToolLoopGuard {
 
 impl RemoteSidecarToolLoopGuard {
     fn check_before_execution(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
-        self.tool_rounds = self.tool_rounds.saturating_add(1);
-        if self.tool_rounds > MAX_AGENT_TOOL_ROUNDS {
-            return Err(format!(
-                "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds and remote runtime tool-state recovery is not yet available"
-            ));
-        }
-
         self.repeated_tool_call_detector.check(tool_calls)
+    }
+
+    fn reached_round_cap(&self, max_tool_rounds: usize) -> bool {
+        self.tool_rounds >= max_tool_rounds
+    }
+
+    fn record_executed_round(&mut self) {
+        self.tool_rounds = self.tool_rounds.saturating_add(1);
+    }
+
+    fn reset_after_compression(&mut self) {
+        self.tool_rounds = 0;
     }
 
     fn check_after_execution(
@@ -133,16 +144,230 @@ impl RemoteSidecarToolLoopGuard {
     }
 }
 
-fn remote_sidecar_append_runtime_guard_message(
-    messages: &mut Vec<NeutralChatMessage>,
-    action: ReadOnlyToolProgressAction,
-) {
-    if let ReadOnlyToolProgressAction::Warn(message) = action {
-        messages.push(neutral_text_message(
-            NeutralChatRole::System,
-            format!("## Runtime Guard\n\n{}", message.trim()),
-        ));
+struct RemoteSidecarRuntimeToolState {
+    message_source_sequences: Vec<Option<i64>>,
+    message_context_sources: Vec<PromptContextSource>,
+    active_tool_start_index: usize,
+    next_runtime_tool_batch_index: usize,
+    runtime_tool_state_compression_count: usize,
+    context_budget: ContextBudget,
+    compression_enabled: bool,
+}
+
+impl RemoteSidecarRuntimeToolState {
+    fn for_request(
+        state: &RemoteSidecarState,
+        request: &NeutralChatRequest,
+    ) -> Result<Self, ApiError> {
+        let bundle = state
+            .runtime_config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone());
+        let compression_enabled = bundle
+            .as_ref()
+            .is_some_and(|bundle| bundle.payload.app.runtime_tool_state_compression_enabled);
+        let context_budget = bundle
+            .as_ref()
+            .and_then(|bundle| {
+                bundle
+                    .payload
+                    .models
+                    .iter()
+                    .find(|model| model.id == request.model_id)
+            })
+            .and_then(|model| model.limits.as_ref())
+            .map(|limits| {
+                calculate_context_budget(
+                    limits.context_window,
+                    limits.max_output_tokens,
+                    0,
+                    estimate_tool_schema_tokens(&request.tools),
+                )
+                .map_err(|source| ApiError::bad_request(source.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(ContextBudget {
+                context_window: u64::MAX,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: u64::MAX,
+            });
+        let message_context_sources = remote_sidecar_initial_context_sources(&request.messages);
+
+        Ok(Self {
+            message_source_sequences: vec![None; request.messages.len()],
+            message_context_sources,
+            active_tool_start_index: request.messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget,
+            compression_enabled,
+        })
     }
+
+    fn append_runtime_tool_batch(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        batch_messages: Vec<NeutralChatMessage>,
+    ) {
+        let batch_index = self.next_runtime_tool_batch_index;
+        self.next_runtime_tool_batch_index = self.next_runtime_tool_batch_index.saturating_add(1);
+        for message in batch_messages {
+            messages.push(message);
+            self.message_source_sequences.push(None);
+            self.message_context_sources
+                .push(PromptContextSource::RuntimeToolState { batch_index });
+        }
+    }
+
+    fn append_runtime_guard_message(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        action: ReadOnlyToolProgressAction,
+    ) {
+        if let ReadOnlyToolProgressAction::Warn(message) = action {
+            messages.push(neutral_text_message(
+                NeutralChatRole::System,
+                format!("## Runtime Guard\n\n{}", message.trim()),
+            ));
+            self.message_source_sequences.push(None);
+            self.message_context_sources
+                .push(PromptContextSource::RuntimeGuard);
+        }
+    }
+
+    fn compress_if_needed(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        force: bool,
+    ) -> Result<bool, ApiError> {
+        compress_runtime_tool_state_messages_if_needed(
+            messages,
+            &mut self.message_source_sequences,
+            &mut self.message_context_sources,
+            &mut self.active_tool_start_index,
+            &mut self.runtime_tool_state_compression_count,
+            &self.context_budget,
+            self.compression_enabled,
+            force,
+        )
+    }
+
+    fn recover_after_round_cap(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        tool_calls: Vec<NeutralToolCall>,
+        assistant_text: String,
+        assistant_reasoning: Option<String>,
+    ) -> Result<bool, ApiError> {
+        append_pending_tool_state_messages(
+            messages,
+            &mut self.message_source_sequences,
+            &mut self.message_context_sources,
+            &mut self.next_runtime_tool_batch_index,
+            tool_calls,
+            assistant_text,
+            assistant_reasoning,
+        );
+        compress_all_runtime_tool_state_messages(
+            messages,
+            &mut self.message_source_sequences,
+            &mut self.message_context_sources,
+            &mut self.active_tool_start_index,
+        )
+    }
+
+    fn packed_messages_for_request(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+    ) -> Result<Vec<NeutralChatMessage>, ApiError> {
+        self.compress_if_needed(messages, false)?;
+        match pack_neutral_messages(
+            messages.clone(),
+            &self.message_source_sequences,
+            &self.message_context_sources,
+            &self.context_budget,
+            self.active_tool_start_index,
+        ) {
+            Ok(messages) => Ok(messages),
+            Err(first_error) => {
+                if self.compress_if_needed(messages, true)? {
+                    return pack_neutral_messages(
+                        messages.clone(),
+                        &self.message_source_sequences,
+                        &self.message_context_sources,
+                        &self.context_budget,
+                        self.active_tool_start_index,
+                    )
+                    .map_err(remote_sidecar_context_overflow_error);
+                }
+                Err(remote_sidecar_context_overflow_error(first_error))
+            }
+        }
+    }
+}
+
+fn remote_sidecar_initial_context_sources(
+    messages: &[NeutralChatMessage],
+) -> Vec<PromptContextSource> {
+    let current_user_index = messages
+        .iter()
+        .rposition(|message| message.role == NeutralChatRole::User);
+    let mut next_sequence = 0_i64;
+    let mut active_tool_sequence = None;
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if message.role == NeutralChatRole::System {
+                active_tool_sequence = None;
+                return PromptContextSource::ReservedPrompt;
+            }
+            if Some(index) == current_user_index {
+                let sequence = next_sequence;
+                next_sequence = next_sequence.saturating_add(1);
+                active_tool_sequence = None;
+                return PromptContextSource::CurrentUser { sequence };
+            }
+            if message.role == NeutralChatRole::Tool {
+                let sequence = active_tool_sequence.unwrap_or_else(|| {
+                    let sequence = next_sequence;
+                    next_sequence = next_sequence.saturating_add(1);
+                    active_tool_sequence = Some(sequence);
+                    sequence
+                });
+                return PromptContextSource::StoredMessage { sequence };
+            }
+
+            let sequence = next_sequence;
+            next_sequence = next_sequence.saturating_add(1);
+            active_tool_sequence = (message.role == NeutralChatRole::Assistant
+                && !message.tool_calls.is_empty())
+            .then_some(sequence);
+            PromptContextSource::StoredMessage { sequence }
+        })
+        .collect()
+}
+
+fn remote_sidecar_current_turn_output(accumulated: &str, turn_start: usize) -> String {
+    accumulated[turn_start..].to_string()
+}
+
+fn remote_sidecar_tool_round_cap_error(max_tool_rounds: usize) -> String {
+    format!(
+        "agent run exceeded {max_tool_rounds} tool continuation rounds and had no runtime tool state to compress"
+    )
+}
+
+fn remote_sidecar_context_overflow_error(source: ApiError) -> ApiError {
+    ApiError::bad_request(format!(
+        "remote sidecar context exceeds the model input budget after runtime tool-state compression and request packing; LLM context compression is not available in the sidecar: {}",
+        source.message
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -6304,6 +6529,38 @@ fn remote_sidecar_record_tool_result(
     Ok(())
 }
 
+fn remote_sidecar_close_unexecuted_tool_calls(
+    database: &mut WorkspaceDatabase,
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+    reason: &str,
+) -> Vec<Value> {
+    let allowed_tools = remote_sidecar_executable_tool_names();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    tool_calls
+        .iter()
+        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+        .map(|tool_call| {
+            let output = json!({
+                "error": reason,
+                "skipped": true,
+            });
+            let _ = remote_sidecar_record_tool_result(
+                database, tool_call, &output, true, &timestamp, &timestamp,
+            );
+            json!({
+                "type": "toolResult",
+                "assistantMessageId": assistant_message_id,
+                "toolCallId": tool_call.call_id,
+                "output": output,
+                "isError": true,
+                "startedAt": timestamp,
+                "completedAt": timestamp,
+            })
+        })
+        .collect()
+}
+
 async fn remote_sidecar_execute_tool_call(
     state: &RemoteSidecarState,
     tool_call: NeutralToolCall,
@@ -6825,6 +7082,14 @@ async fn remote_sidecar_chat_stream(
             return Err(response);
         }
     };
+    let initial_runtime_tool_state =
+        match RemoteSidecarRuntimeToolState::for_request(&state, &initial_provider_request) {
+            Ok(runtime_tool_state) => runtime_tool_state,
+            Err(error) => {
+                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                return Err(error.into_response());
+            }
+        };
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -6859,6 +7124,7 @@ async fn remote_sidecar_chat_stream(
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut current_request = initial_provider_request;
+        let mut runtime_tool_state = initial_runtime_tool_state;
         let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "start",
@@ -6876,6 +7142,44 @@ async fn remote_sidecar_chat_stream(
         let mut last_yielded_sequence = sequence;
 
         loop {
+            // The sidecar intentionally stops short of LLM-generated snapshot compression. It
+            // shares deterministic runtime tool-state compression with local chat, then packs a
+            // request clone so optional history cannot grow without bound before broker dispatch.
+            let packed_messages = match runtime_tool_state
+                .packed_messages_for_request(&mut current_request.messages)
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    let message = error.message;
+                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let total_latency_ms = run_metrics.total_latency_ms();
+                    let _ = persist_sidecar_llm_audit(
+                        &mut database,
+                        &stream_state.workspace_id,
+                        &chat_id,
+                        &run_id,
+                        &provider_id,
+                        &model_id,
+                        &run_metrics,
+                        &completed_at,
+                        total_latency_ms,
+                        "failed",
+                        json!({ "error": { "message": message } }),
+                    );
+                    sequence += 1;
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
+                        "type": "error",
+                        "message": message,
+                    })));
+                    sequence += 1;
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
+            };
+            let mut broker_request = current_request.clone();
+            broker_request.messages = packed_messages;
             let broker_request_id = unique_id("broker-request");
             run_stream.set_broker_request_id(broker_request_id.clone());
             let broker_payload = json!({
@@ -6885,8 +7189,10 @@ async fn remote_sidecar_chat_stream(
                 "runId": run_id,
                 "providerId": provider_id,
                 "modelId": model_id,
-                "request": current_request,
+                "request": broker_request,
             });
+            let turn_text_start = text.len();
+            let turn_reasoning_start = reasoning.len();
             let llm_turn = remote_sidecar_run_broker_llm_turn(
                 &stream_state,
                 &run_stream,
@@ -6912,6 +7218,9 @@ async fn remote_sidecar_chat_stream(
                     break;
                 }
             }
+            let turn_text = remote_sidecar_current_turn_output(&text, turn_text_start);
+            let turn_reasoning =
+                remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
             match llm_turn {
                 Ok(None) => {
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
@@ -6952,18 +7261,83 @@ async fn remote_sidecar_chat_stream(
                         cleanup_guard.disarm();
                         break;
                     }
+                    if tool_loop_guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS) {
+                        let recovery = runtime_tool_state.recover_after_round_cap(
+                            &mut current_request.messages,
+                            tool_calls.clone(),
+                            turn_text,
+                            (!turn_reasoning.is_empty()).then_some(turn_reasoning),
+                        );
+                        let (recovered, message) = match recovery {
+                            Ok(true) => (
+                                true,
+                                format!(
+                                    "tool call was not executed because runtime tool state was compressed after reaching {MAX_AGENT_TOOL_ROUNDS} continuation rounds"
+                                ),
+                            ),
+                            Ok(false) => (
+                                false,
+                                remote_sidecar_tool_round_cap_error(MAX_AGENT_TOOL_ROUNDS),
+                            ),
+                            Err(error) => (false, error.message),
+                        };
+                        for event in remote_sidecar_close_unexecuted_tool_calls(
+                            &mut database,
+                            &assistant_message_id,
+                            &tool_calls,
+                            &message,
+                        ) {
+                            sequence += 1;
+                            yield Ok(remote_sidecar_record_run_event(
+                                &run_stream,
+                                sequence,
+                                event,
+                            ));
+                            last_yielded_sequence = sequence;
+                        }
+                        if recovered {
+                            tool_loop_guard.reset_after_compression();
+                            continue;
+                        }
+                        let completed_at =
+                            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        let total_latency_ms = run_metrics.total_latency_ms();
+                        let _ = persist_sidecar_llm_audit(
+                            &mut database,
+                            &stream_state.workspace_id,
+                            &chat_id,
+                            &run_id,
+                            &provider_id,
+                            &model_id,
+                            &run_metrics,
+                            &completed_at,
+                            total_latency_ms,
+                            "failed",
+                            json!({ "error": { "message": message } }),
+                        );
+                        sequence += 1;
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
+                            "type": "error",
+                            "message": message,
+                        })));
+                        sequence += 1;
+                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        cleanup_guard.disarm();
+                        break;
+                    }
                     let allowed_tools = remote_sidecar_executable_tool_names();
 
                     let mut next_messages = current_request.messages.clone();
-                    next_messages.push(NeutralChatMessage {
+                    let mut batch_messages = vec![NeutralChatMessage {
                         role: NeutralChatRole::Assistant,
-                        content: text.clone(),
+                        content: turn_text,
                         attachments: Vec::new(),
-                        reasoning: (!reasoning.is_empty()).then_some(reasoning.clone()),
+                        reasoning: (!turn_reasoning.is_empty()).then_some(turn_reasoning),
                         tool_calls: tool_calls.clone(),
                         tool_call_id: None,
                         tool_name: None,
-                    });
+                    }];
 
                     let runnable_tool_calls = tool_calls
                         .iter()
@@ -7003,7 +7377,7 @@ async fn remote_sidecar_chat_stream(
                                 "startedAt": started_at,
                                 "completedAt": completed_at,
                             }));
-                            next_messages.push(NeutralChatMessage {
+                            batch_messages.push(NeutralChatMessage {
                                 role: NeutralChatRole::Tool,
                                 content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
                                 attachments: Vec::new(),
@@ -7039,7 +7413,7 @@ async fn remote_sidecar_chat_stream(
                             "startedAt": started_at,
                             "completedAt": completed_at,
                         }));
-                        next_messages.push(NeutralChatMessage {
+                        batch_messages.push(NeutralChatMessage {
                             role: NeutralChatRole::Tool,
                             content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
                             attachments: Vec::new(),
@@ -7049,7 +7423,10 @@ async fn remote_sidecar_chat_stream(
                             tool_name: Some(tool_call.name.clone()),
                         });
                     }
-                    remote_sidecar_append_runtime_guard_message(
+                    runtime_tool_state
+                        .append_runtime_tool_batch(&mut next_messages, batch_messages);
+                    tool_loop_guard.record_executed_round();
+                    runtime_tool_state.append_runtime_guard_message(
                         &mut next_messages,
                         tool_loop_guard.check_after_execution(&tool_calls),
                     );
@@ -8731,6 +9108,68 @@ mod tests {
             thought_signatures: None,
         }
     }
+    fn test_remote_runtime_tool_state(
+        messages: &[NeutralChatMessage],
+        context_window: u64,
+        available_message_tokens: u64,
+        compression_enabled: bool,
+    ) -> RemoteSidecarRuntimeToolState {
+        RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![None; messages.len()],
+            message_context_sources: remote_sidecar_initial_context_sources(messages),
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens,
+            },
+            compression_enabled,
+        }
+    }
+
+    fn test_remote_tool_batch(batch_index: usize, output_chars: usize) -> Vec<NeutralChatMessage> {
+        let tool_call = test_remote_tool_call(
+            format!("call-{batch_index}"),
+            format!("file-{batch_index}.rs"),
+        );
+        vec![
+            NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: format!("turn-{batch_index}"),
+                attachments: Vec::new(),
+                reasoning: Some(format!("reasoning-{batch_index}")),
+                tool_calls: vec![tool_call.clone()],
+                tool_call_id: None,
+                tool_name: None,
+            },
+            NeutralChatMessage {
+                role: NeutralChatRole::Tool,
+                content: "x".repeat(output_chars),
+                attachments: Vec::new(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call.call_id),
+                tool_name: Some(tool_call.name),
+            },
+        ]
+    }
+
+    #[test]
+    fn remote_sidecar_followup_uses_only_current_turn_output() {
+        let mut text = "first turn".to_string();
+        let turn_start = text.len();
+        text.push_str("第二轮");
+
+        assert_eq!(
+            remote_sidecar_current_turn_output(&text, turn_start),
+            "第二轮"
+        );
+    }
 
     #[test]
     fn remote_sidecar_tool_loop_uses_shared_round_limit_and_allows_ninth_batch() {
@@ -8740,16 +9179,19 @@ mod tests {
             let tool_call =
                 test_remote_tool_call(format!("call-{round}"), format!("file-{round}.rs"));
             assert!(guard.check_before_execution(&[tool_call]).is_ok());
+            assert!(!guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS));
+            guard.record_executed_round();
             if round == 9 {
                 assert_eq!(guard.tool_rounds, 9);
             }
         }
 
-        let error = guard
-            .check_before_execution(&[test_remote_tool_call("overflow", "overflow.rs")])
-            .expect_err("round after shared cap should fail");
-        assert!(error.contains(&MAX_AGENT_TOOL_ROUNDS.to_string()));
-        assert!(error.contains("remote runtime tool-state recovery"));
+        assert!(guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS));
+        assert!(
+            guard
+                .check_before_execution(&[test_remote_tool_call("overflow", "overflow.rs")])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -8783,6 +9225,8 @@ mod tests {
     fn remote_sidecar_tool_loop_injects_read_only_progress_warning_and_continues() {
         let mut guard = RemoteSidecarToolLoopGuard::default();
         let mut messages = Vec::new();
+        let mut runtime_tool_state =
+            test_remote_runtime_tool_state(&messages, 10_000, 10_000, true);
 
         for round in 1..=crate::READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD {
             let tool_calls = [test_remote_tool_call(
@@ -8790,7 +9234,8 @@ mod tests {
                 format!("file-{round}.rs"),
             )];
             assert!(guard.check_before_execution(&tool_calls).is_ok());
-            remote_sidecar_append_runtime_guard_message(
+            guard.record_executed_round();
+            runtime_tool_state.append_runtime_guard_message(
                 &mut messages,
                 guard.check_after_execution(&tool_calls),
             );
@@ -8808,13 +9253,207 @@ mod tests {
 
         let next_tool_calls = [test_remote_tool_call("call-next", "next.rs")];
         assert!(guard.check_before_execution(&next_tool_calls).is_ok());
-        remote_sidecar_append_runtime_guard_message(
+        guard.record_executed_round();
+        runtime_tool_state.append_runtime_guard_message(
             &mut messages,
             guard.check_after_execution(&next_tool_calls),
         );
         assert_eq!(messages.len(), 1);
     }
 
+    #[test]
+    fn remote_sidecar_runtime_tool_state_compression_preserves_recent_two_batches() {
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "inspect the workspace".to_string(),
+        )];
+        let mut runtime_tool_state =
+            test_remote_runtime_tool_state(&messages, 10_000, 10_000, true);
+        for batch_index in 0..4 {
+            runtime_tool_state.append_runtime_tool_batch(
+                &mut messages,
+                test_remote_tool_batch(batch_index, 10_000),
+            );
+        }
+
+        let packed = runtime_tool_state
+            .packed_messages_for_request(&mut messages)
+            .expect("remote runtime compression and packing");
+
+        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 1);
+        assert_eq!(
+            runtime_tool_state
+                .message_context_sources
+                .iter()
+                .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == NeutralChatRole::Tool)
+                .count(),
+            crate::CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES
+        );
+        assert!(packed.iter().any(|message| {
+            message
+                .content
+                .contains("Runtime tool-state compression snapshot")
+        }));
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.tool_call_id.as_deref() == Some("call-2") })
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.tool_call_id.as_deref() == Some("call-3") })
+        );
+        assert!(!messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("call-0")
+                || message.tool_call_id.as_deref() == Some("call-1")
+        }));
+    }
+
+    #[test]
+    fn remote_sidecar_required_overflow_forces_compression_when_setting_is_disabled() {
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "inspect the workspace".to_string(),
+        )];
+        let mut runtime_tool_state =
+            test_remote_runtime_tool_state(&messages, 100_000, 2_500, false);
+        for batch_index in 0..4 {
+            runtime_tool_state.append_runtime_tool_batch(
+                &mut messages,
+                test_remote_tool_batch(batch_index, 4_000),
+            );
+        }
+
+        assert!(
+            !runtime_tool_state
+                .compress_if_needed(&mut messages, false)
+                .expect("disabled normal compression")
+        );
+        runtime_tool_state
+            .packed_messages_for_request(&mut messages)
+            .expect("required overflow should force runtime compression");
+        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 1);
+    }
+
+    #[test]
+    fn remote_sidecar_round_cap_recovers_once_and_fails_without_new_tool_state() {
+        const TEST_MAX_TOOL_ROUNDS: usize = 2;
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "inspect the workspace".to_string(),
+        )];
+        let mut runtime_tool_state =
+            test_remote_runtime_tool_state(&messages, 10_000, 10_000, true);
+        runtime_tool_state
+            .append_runtime_tool_batch(&mut messages, test_remote_tool_batch(0, 1_000));
+        let mut guard = RemoteSidecarToolLoopGuard::default();
+        guard.record_executed_round();
+        guard.record_executed_round();
+        assert!(guard.reached_round_cap(TEST_MAX_TOOL_ROUNDS));
+
+        assert!(
+            runtime_tool_state
+                .recover_after_round_cap(
+                    &mut messages,
+                    vec![test_remote_tool_call("pending", "pending.rs")],
+                    "need another file".to_string(),
+                    Some("checking evidence".to_string()),
+                )
+                .expect("round cap recovery")
+        );
+        guard.reset_after_compression();
+        assert_eq!(guard.tool_rounds, 0);
+        assert!(messages.iter().all(|message| message.tool_calls.is_empty()));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.role != NeutralChatRole::Tool)
+        );
+
+        assert!(
+            !runtime_tool_state
+                .recover_after_round_cap(&mut messages, Vec::new(), String::new(), None)
+                .expect("no live runtime state remains")
+        );
+        assert_eq!(
+            remote_sidecar_tool_round_cap_error(TEST_MAX_TOOL_ROUNDS),
+            "agent run exceeded 2 tool continuation rounds and had no runtime tool state to compress"
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_round_cap_recovery_closes_skipped_pending_tool_calls() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant insert");
+        let tool_call = test_remote_tool_call("pending", "pending.rs");
+        remote_sidecar_record_pending_tool_calls(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "assistant-1",
+            std::slice::from_ref(&tool_call),
+        )
+        .expect("pending tool call");
+
+        let events = remote_sidecar_close_unexecuted_tool_calls(
+            &mut database,
+            "assistant-1",
+            std::slice::from_ref(&tool_call),
+            "compressed at round cap",
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "toolResult");
+        assert_eq!(events[0]["isError"], true);
+        let tool_calls = database
+            .tool_calls_for_message("assistant-1")
+            .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].status, "error");
+    }
+
+    #[test]
+    fn remote_sidecar_required_overflow_fails_before_broker_without_llm_compression() {
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "required current turn ".repeat(2_000),
+        )];
+        let mut runtime_tool_state = test_remote_runtime_tool_state(&messages, 1_000, 16, false);
+
+        let error = runtime_tool_state
+            .packed_messages_for_request(&mut messages)
+            .expect_err("oversized required context must not reach the broker");
+
+        assert!(
+            error
+                .message
+                .contains("LLM context compression is not available")
+        );
+        assert!(
+            error
+                .message
+                .contains("after runtime tool-state compression and request packing")
+        );
+    }
     #[tokio::test]
     async fn remote_sidecar_terminal_session_accepts_empty_post_and_persists_contract() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");

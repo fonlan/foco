@@ -12,12 +12,14 @@ pub(crate) use compression::{
     llm_context_compression_trigger_tokens,
 };
 pub(crate) use compression::{
-    active_compression_snapshots, compression_snapshot_message, context_usage_response,
-    context_usage_segments_total, context_window_compression_trigger_tokens,
-    ensure_context_compression, interleaved_tool_state_messages,
-    neutral_assistant_tool_call_message, neutral_message_estimated_tokens,
-    neutral_tool_call_from_record, pack_neutral_messages, persist_chat_result,
-    persist_running_llm_request, recover_after_tool_round_cap, snapshot_covered_sequences,
+    active_compression_snapshots, compress_all_runtime_tool_state_messages,
+    compress_runtime_tool_state_messages_if_needed, compression_snapshot_message,
+    context_usage_response, context_usage_segments_total,
+    context_window_compression_trigger_tokens, ensure_context_compression,
+    interleaved_tool_state_messages, neutral_assistant_tool_call_message,
+    neutral_message_estimated_tokens, neutral_tool_call_from_record, pack_neutral_messages,
+    persist_chat_result, persist_running_llm_request, recover_after_tool_round_cap,
+    snapshot_covered_sequences,
 };
 pub(crate) use environment::environment_context_message;
 #[cfg(all(not(windows), not(target_os = "macos")))]

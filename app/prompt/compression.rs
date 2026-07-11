@@ -861,32 +861,48 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
     context: &mut PreparedChatContext,
     force: bool,
 ) -> Result<bool, ApiError> {
-    if !force
-        && !context
+    compress_runtime_tool_state_messages_if_needed(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &mut context.active_tool_start_index,
+        &mut context.runtime_tool_state_compression_count,
+        &context.context_budget,
+        context
             .global_config
             .app
-            .runtime_tool_state_compression_enabled
-    {
+            .runtime_tool_state_compression_enabled,
+        force,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_runtime_tool_state_messages_if_needed(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    active_tool_start_index: &mut usize,
+    runtime_tool_state_compression_count: &mut usize,
+    context_budget: &foco_agent::ContextBudget,
+    compression_enabled: bool,
+    force: bool,
+) -> Result<bool, ApiError> {
+    if !force && !compression_enabled {
         return Ok(false);
     }
 
-    validate_prompt_context_lengths(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &context.message_context_sources,
-    )?;
+    validate_prompt_context_lengths(messages, message_source_sequences, message_context_sources)?;
 
-    if context.runtime_tool_state_compression_count
-        >= CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS
+    if *runtime_tool_state_compression_count >= CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS
     {
         return Ok(false);
     }
 
     let message_groups = context_message_groups(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &context.message_context_sources,
-        context.active_tool_start_index,
+        messages,
+        message_source_sequences,
+        message_context_sources,
+        *active_tool_start_index,
     )?;
     let runtime_tool_groups = message_groups
         .iter()
@@ -902,13 +918,13 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
         return Ok(false);
     }
 
-    let segments = context_usage_segments(&context.context_budget, &message_groups);
+    let segments = context_usage_segments(context_budget, &message_groups);
     let total_used_context_tokens = context_usage_segments_total(&segments);
     let breakdown = context_token_breakdown(&message_groups);
     let should_compress = force
         || total_used_context_tokens
-            >= context_window_compression_trigger_tokens(context.context_budget.context_window)
-        || breakdown.required_tokens > context.context_budget.available_message_tokens;
+            >= context_window_compression_trigger_tokens(context_budget.context_window)
+        || breakdown.required_tokens > context_budget.available_message_tokens;
     if !should_compress {
         return Ok(false);
     }
@@ -926,42 +942,31 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
     let covered_message_indices = message_group_indices(&message_groups, &covered_group_indices)?;
     let original_tokens = covered_message_indices
         .iter()
-        .map(|index| neutral_message_estimated_tokens(&context.provider_request.messages[*index]))
+        .map(|index| neutral_message_estimated_tokens(&messages[*index]))
         .sum::<u64>();
     if original_tokens == 0 {
         return Ok(false);
     }
 
-    let summary = runtime_tool_state_summary(
-        &context.provider_request.messages,
-        &covered_message_indices,
-        true,
-    )?;
+    let summary = runtime_tool_state_summary(messages, &covered_message_indices, true)?;
     let summary_tokens = estimate_text_tokens(&summary);
     if summary_tokens >= original_tokens {
         return Ok(false);
     }
 
     let snapshot = neutral_text_message(NeutralChatRole::User, summary);
-    context.provider_request.messages = replace_covered_messages_with_snapshot(
-        &context.provider_request.messages,
-        &covered_message_indices,
-        snapshot,
-    );
-    context.message_source_sequences = replace_covered_sequences_with_snapshot(
-        &context.message_source_sequences,
-        &covered_message_indices,
-    );
-    context.message_context_sources = replace_covered_sources_with_snapshot(
-        &context.message_context_sources,
+    *messages =
+        replace_covered_messages_with_snapshot(messages, &covered_message_indices, snapshot);
+    *message_source_sequences =
+        replace_covered_sequences_with_snapshot(message_source_sequences, &covered_message_indices);
+    *message_context_sources = replace_covered_sources_with_snapshot(
+        message_context_sources,
         &covered_message_indices,
         PromptContextSource::RuntimeToolStateSnapshot,
     );
-    context.active_tool_start_index = compressed_active_tool_start_index(
-        context.active_tool_start_index,
-        &covered_message_indices,
-    );
-    context.runtime_tool_state_compression_count += 1;
+    *active_tool_start_index =
+        compressed_active_tool_start_index(*active_tool_start_index, &covered_message_indices);
+    *runtime_tool_state_compression_count += 1;
 
     Ok(true)
 }
@@ -969,14 +974,30 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
 pub(crate) fn compress_all_runtime_tool_state(
     context: &mut PreparedChatContext,
 ) -> Result<bool, ApiError> {
-    validate_prompt_context_lengths(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &context.message_context_sources,
-    )?;
+    compress_all_runtime_tool_state_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &mut context.active_tool_start_index,
+    )
+}
 
-    let covered_message_indices = context
-        .message_context_sources
+pub(crate) fn compress_all_runtime_tool_state_messages(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    active_tool_start_index: &mut usize,
+) -> Result<bool, ApiError> {
+    validate_prompt_context_lengths(messages, message_source_sequences, message_context_sources)?;
+
+    if !message_context_sources
+        .iter()
+        .any(|source| matches!(source, PromptContextSource::RuntimeToolState { .. }))
+    {
+        return Ok(false);
+    }
+
+    let covered_message_indices = message_context_sources
         .iter()
         .enumerate()
         .filter_map(|(index, source)| {
@@ -988,34 +1009,20 @@ pub(crate) fn compress_all_runtime_tool_state(
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    if covered_message_indices.is_empty() {
-        return Ok(false);
-    }
 
-    let summary = runtime_tool_state_summary(
-        &context.provider_request.messages,
-        &covered_message_indices,
-        false,
-    )?;
+    let summary = runtime_tool_state_summary(messages, &covered_message_indices, false)?;
     let snapshot = neutral_text_message(NeutralChatRole::User, summary);
-    context.provider_request.messages = replace_covered_messages_with_snapshot(
-        &context.provider_request.messages,
-        &covered_message_indices,
-        snapshot,
-    );
-    context.message_source_sequences = replace_covered_sequences_with_snapshot(
-        &context.message_source_sequences,
-        &covered_message_indices,
-    );
-    context.message_context_sources = replace_covered_sources_with_snapshot(
-        &context.message_context_sources,
+    *messages =
+        replace_covered_messages_with_snapshot(messages, &covered_message_indices, snapshot);
+    *message_source_sequences =
+        replace_covered_sequences_with_snapshot(message_source_sequences, &covered_message_indices);
+    *message_context_sources = replace_covered_sources_with_snapshot(
+        message_context_sources,
         &covered_message_indices,
         PromptContextSource::RuntimeToolStateSnapshot,
     );
-    context.active_tool_start_index = compressed_active_tool_start_index(
-        context.active_tool_start_index,
-        &covered_message_indices,
-    );
+    *active_tool_start_index =
+        compressed_active_tool_start_index(*active_tool_start_index, &covered_message_indices);
 
     Ok(true)
 }
