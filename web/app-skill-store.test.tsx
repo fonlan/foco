@@ -209,24 +209,13 @@ describe("skill store app surface", () => {
       ([url, init]) => url === "/api/skill-store/install" && init?.method === "POST",
     );
     const installBody = JSON.parse(String(installCall?.[1]?.body));
-    expect(installBody).toMatchObject({
+    expect(installBody).toEqual({
       overwrite: false,
       skillId: "html-ppt",
       source: "foco/html-ppt",
       target: "global",
-      files: [
-        {
-          path: "SKILL.md",
-          content:
-            "---\nname: html-ppt\ndescription: Create HTML presentations from notes.\n---\n\n# HTML PPT\n",
-        },
-        {
-          path: "assets/logo.png",
-          content: "iVBORwD/AA==",
-          contentEncoding: "base64",
-        },
-      ],
     });
+    expect(installBody.files).toBeUndefined();
   });
 
   it("searches and installs a skill through the backend proxy", async () => {

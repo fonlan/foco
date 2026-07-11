@@ -398,7 +398,6 @@ export function SkillStorePage({
             source: detail.source ?? selectedSkill?.source ?? undefined,
             target: installTarget,
             workspaceId: installTarget === "workspace" ? workspaceId : undefined,
-            files: importedDetail === detail ? detail.files : undefined,
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
