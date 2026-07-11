@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use base64::Engine;
 use futures_util::StreamExt;
 use genai::{
     Client, Headers, WebConfig,
@@ -21,24 +22,30 @@ use serde_json::{Map, Value};
 
 pub const PROVIDER_WIRE_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
+pub const PROVIDER_WIRE_REQUEST_DUMP_FORMAT: &str = "provider_request_v1";
+pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v1";
 const REDACTED_HEADER_VALUE: &str = "[REDACTED]";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderWireRequestDump {
+    pub format: String,
     pub version: u32,
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_encoding: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum ProviderFinalResponseDump {
     Succeeded {
+        format: String,
         version: u32,
         text: String,
         reasoning: Option<String>,
@@ -48,6 +55,7 @@ pub enum ProviderFinalResponseDump {
         response_id: Option<String>,
     },
     Failed {
+        format: String,
         version: u32,
         partial: bool,
         error: String,
@@ -65,6 +73,7 @@ impl ProviderFinalResponseDump {
         response_id: Option<String>,
     ) -> Self {
         Self::Succeeded {
+            format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
             version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
             text,
             reasoning,
@@ -77,6 +86,7 @@ impl ProviderFinalResponseDump {
 
     pub fn failed(error: impl Into<String>, status_code: Option<u16>, partial: bool) -> Self {
         Self::Failed {
+            format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
             version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
             partial,
             error: error.into(),
@@ -900,6 +910,8 @@ impl NeutralChatStream {
     }
 }
 
+pub type ProviderRequestDumpObserver = Arc<dyn Fn(&ProviderWireRequestDump) + Send + Sync>;
+
 pub async fn stream_chat(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
@@ -913,6 +925,15 @@ pub async fn stream_chat_with_capture(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
     capture_details: bool,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    stream_chat_with_capture_observer(config, request, capture_details, None).await
+}
+
+pub async fn stream_chat_with_capture_observer(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    capture_details: bool,
+    request_observer: Option<ProviderRequestDumpObserver>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
     let client = config
         .genai_client()
@@ -942,15 +963,22 @@ pub async fn stream_chat_with_capture(
     })?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
-    let observer = captured_request.as_ref().map(|captured_request| {
-        let captured_request = Arc::clone(captured_request);
-        Arc::new(move |request: &Request| {
+    let observer = if capture_details || request_observer.is_some() {
+        let captured_request = captured_request.clone();
+        Some(Arc::new(move |request: &Request| {
             let dump = provider_wire_request_dump(request);
-            if let Ok(mut slot) = captured_request.lock() {
+            if let Some(request_observer) = request_observer.as_ref() {
+                request_observer(&dump);
+            }
+            if let Some(captured_request) = captured_request.as_ref()
+                && let Ok(mut slot) = captured_request.lock()
+            {
                 *slot = Some(dump);
             }
-        }) as genai::PreparedRequestObserver
-    });
+        }) as genai::PreparedRequestObserver)
+    } else {
+        None
+    };
     let response = client
         .exec_chat_stream_observed(model, chat_request, Some(&options), observer)
         .await
@@ -1528,17 +1556,26 @@ fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
             (name, value)
         })
         .collect();
-    let body = request
+    let (body, body_encoding) = request
         .body()
         .and_then(|body| body.as_bytes())
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        .map(|bytes| match std::str::from_utf8(bytes) {
+            Ok(body) => (Some(body.to_string()), Some("utf8".to_string())),
+            Err(_) => (
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                Some("base64".to_string()),
+            ),
+        })
+        .unwrap_or((None, None));
 
     ProviderWireRequestDump {
+        format: PROVIDER_WIRE_REQUEST_DUMP_FORMAT.to_string(),
         version: PROVIDER_WIRE_REQUEST_DUMP_VERSION,
         method: request.method().as_str().to_string(),
         url: redact_url_credentials(request.url()),
         headers,
         body,
+        body_encoding,
     }
 }
 

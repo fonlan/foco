@@ -29,8 +29,10 @@ use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefiniti
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestOverride,
-    normalized_proxy_url, parse_provider_kind, stream_chat,
+    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
+    ProviderFinalResponseDump, ProviderRequestDumpObserver, ProviderRequestOverride,
+    ProviderWireRequestDump, normalized_proxy_url, parse_provider_kind, stream_chat,
+    stream_chat_with_capture, stream_chat_with_capture_observer,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;

@@ -8,6 +8,7 @@ version.workspace = true
 path = "lib.rs"
 
 [dependencies]
+base64.workspace = true
 futures-util.workspace = true
 genai.workspace = true
 reqwest.workspace = true
