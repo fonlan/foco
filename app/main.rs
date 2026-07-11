@@ -3309,26 +3309,11 @@ impl PreparedChatContext {
                                     capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                                     capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                                 }
-                                NeutralChatStreamEvent::ToolCall { tool_call } => {
+                                NeutralChatStreamEvent::ToolCall { tool_call: _ } => {
                                     capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                                     capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                    if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
-                                        let event = ChatSseEvent::ToolCall {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            reasoning_duration_ms: if reasoning_duration_ms.is_none()
-                                                && let Some(started_at) = reasoning_started_at.take()
-                                            {
-                                                reasoning_duration_ms = Some(elapsed_millis(started_at));
-                                                reasoning_duration_ms
-                                            } else {
-                                                reasoning_duration_ms
-                                            },
-                                            tool_call: pending_tool_call_summary(&tool_call),
-                                        };
-                                        let captured = captured_event(&event);
-                                        events.push(captured.clone());
-                                        yield event;
-                                    }
+                                    // ponytail: provider ToolCallChunk may carry partial arguments
+                                    // (e.g. `"{\""`); only emit/persist from Complete with full args.
                                 }
                                 NeutralChatStreamEvent::Usage { usage } => {
                                     let event = ChatSseEvent::Usage { usage };
@@ -5655,17 +5640,9 @@ async fn run_provider_stream_for_tool(
                 capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                 output_text.push_str(&delta);
             }
-            NeutralChatStreamEvent::ToolCall { tool_call } => {
+            NeutralChatStreamEvent::ToolCall { tool_call: _ } => {
                 capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                if tool_call.name != expected_tool_name {
-                    let message = format!(
-                        "{request_kind} called unsupported tool '{}'",
-                        tool_call.name
-                    );
-                    return Err(AuditedProviderError::new(message.clone(), None)
-                        .with_interrupted_stream_response(capture, &stream, &message));
-                }
-                tool_arguments = Some(tool_call.arguments);
+                // ponytail: ignore partial ToolCallChunk; Complete carries full name/args.
             }
             NeutralChatStreamEvent::Complete {
                 tool_calls,
@@ -5675,20 +5652,18 @@ async fn run_provider_stream_for_tool(
                 response_id,
                 ..
             } => {
-                if tool_arguments.is_none() {
-                    for tool_call in tool_calls {
-                        if tool_call.name != expected_tool_name {
-                            return Err(AuditedProviderError::new(
-                                format!(
-                                    "{request_kind} completed with unsupported tool '{}'",
-                                    tool_call.name
-                                ),
-                                None,
-                            )
-                            .with_stream_final_response(capture, &stream));
-                        }
-                        tool_arguments = Some(tool_call.arguments);
+                for tool_call in tool_calls {
+                    if tool_call.name != expected_tool_name {
+                        return Err(AuditedProviderError::new(
+                            format!(
+                                "{request_kind} completed with unsupported tool '{}'",
+                                tool_call.name
+                            ),
+                            None,
+                        )
+                        .with_stream_final_response(capture, &stream));
                     }
+                    tool_arguments = Some(tool_call.arguments);
                 }
                 if !text.trim().is_empty() {
                     output_text.push_str(&text);

@@ -11643,6 +11643,145 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
 }
 
 #[test]
+fn persist_chat_result_accepts_complete_input_after_partial_stream_stub() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-partial-tool-input-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Partial tool input chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "Run git status.",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user message insert");
+    }
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    // Simulate a full-args ToolCall event after Complete (stream partials are no longer emitted).
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::ToolCall {
+                assistant_message_id: "assistant-1".to_string(),
+                reasoning_duration_ms: None,
+                tool_call: ChatToolCallSummary {
+                    id: "call-partial".to_string(),
+                    name: "run_command".to_string(),
+                    status: "running".to_string(),
+                    input: json!({ "command": "git", "args": ["status", "--short"] }),
+                    output: None,
+                    is_error: false,
+                    started_at: None,
+                    completed_at: None,
+                    live_output: None,
+                },
+            },
+        )
+        .expect("complete tool call event");
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::ToolResult {
+                assistant_message_id: "assistant-1".to_string(),
+                tool_call_id: "call-partial".to_string(),
+                output: json!({ "stdout": " M README.md", "success": true }),
+                is_error: false,
+                started_at: "2026-07-11T15:00:00Z".to_string(),
+                completed_at: "2026-07-11T15:00:01Z".to_string(),
+            },
+        )
+        .expect("tool result event");
+
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        1_000,
+    );
+    context.chat_id = "chat-1".to_string();
+    context.assistant_message_id = "assistant-1".to_string();
+    context.assistant_sequence = 1;
+    context.llm_request_id = "run-1".to_string();
+    context.agent_primary_chat_output = true;
+
+    let tool_calls = vec![ExecutedToolCall {
+        id: "call-partial".to_string(),
+        name: "run_command".to_string(),
+        input: json!({ "command": "git", "args": ["status", "--short"] }),
+        output: json!({ "stdout": " M README.md", "success": true }),
+        is_error: false,
+        started_at: "2026-07-11T15:00:00Z".to_string(),
+        completed_at: "2026-07-11T15:00:01Z".to_string(),
+    }];
+    let outcome = ChatAuditOutcome {
+        first_token_at: Some("2026-07-11T15:00:00Z".to_string()),
+        completed_at: "2026-07-11T15:00:02Z".to_string(),
+        first_token_latency_ms: Some(1),
+        total_latency_ms: 2,
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: Some(r#"{"text":"done"}"#.to_string()),
+    };
+
+    persist_chat_result(
+        &context,
+        "2026-07-11T15:00:00Z",
+        outcome,
+        &[],
+        Some("done"),
+        None,
+        &tool_calls,
+    )
+    .expect("finalize with matching complete tool input must succeed");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace reopen");
+    let records = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "call-partial");
+    assert_eq!(records[0].status, "completed");
+    let input: Value = serde_json::from_str(&records[0].input_json).expect("input json");
+    assert_eq!(input["command"], "git");
+    assert_eq!(input["args"], json!(["status", "--short"]));
+    assert!(records[0].result.is_some());
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn active_chat_run_subscription_replays_cached_events_after_sequence() {
     let registry = ActiveChatRunRegistry::default();
     let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();

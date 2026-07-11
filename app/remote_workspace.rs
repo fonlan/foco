@@ -6470,6 +6470,7 @@ fn merge_remote_tool_calls(
 ) -> Vec<NeutralToolCall> {
     let mut merged = BTreeMap::<String, NeutralToolCall>::new();
     for tool_call in existing.iter().chain(incoming.iter()) {
+        // Later chunks/Complete win so partial stream arguments are replaced by full args.
         merged.insert(tool_call.call_id.clone(), tool_call.clone());
     }
     merged.into_values().collect()
@@ -6814,32 +6815,12 @@ async fn remote_sidecar_run_broker_llm_turn(
                         continue;
                     };
                     run_metrics.capture_first_output();
+                    // ponytail: stream toolCall chunks may have partial arguments; only merge
+                    // in memory and persist/emit after the broker response with full args.
                     collected_tool_calls = merge_remote_tool_calls(
                         &collected_tool_calls,
                         std::slice::from_ref(&tool_call),
                     );
-                    let pending_payload = json!({
-                        "type": "toolCall",
-                        "assistantMessageId": assistant_message_id,
-                        "toolCall": {
-                            "id": tool_call.call_id.clone(),
-                            "name": tool_call.name.clone(),
-                            "status": "running",
-                            "input": tool_call.arguments.clone(),
-                            "output": Value::Null,
-                            "isError": false,
-                        },
-                    });
-                    remote_sidecar_record_pending_tool_calls(
-                        database,
-                        chat_id,
-                        run_id,
-                        assistant_message_id,
-                        std::slice::from_ref(&tool_call),
-                    )
-                    .map_err(|_| ())?;
-                    *sequence += 1;
-                    run_stream.record(*sequence, pending_payload);
                 }
                 remote_sidecar_set_active_run(
                     state,
@@ -6871,8 +6852,12 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
                     .unwrap_or_default();
-                let tool_calls =
-                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls);
+                // Prefer Complete toolCalls when present; stream chunks may still be partial.
+                let tool_calls = if response_tool_calls.is_empty() {
+                    Vec::new()
+                } else {
+                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
+                };
                 if !tool_calls.is_empty() {
                     run_metrics.capture_first_output();
                 }
@@ -8776,8 +8761,12 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
                     .unwrap_or_default();
-                let tool_calls =
-                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls);
+                // Prefer Complete toolCalls when present; stream chunks may still be partial.
+                let tool_calls = if response_tool_calls.is_empty() {
+                    Vec::new()
+                } else {
+                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
+                };
                 let submit = tool_calls
                     .into_iter()
                     .find(|tool_call| tool_call.name == "submit_workspace_spec")
@@ -11765,6 +11754,26 @@ mod tests {
             messages[2].content,
             json!({ "content": "[package]" }).to_string()
         );
+    }
+
+    #[test]
+    fn merge_remote_tool_calls_prefers_later_complete_arguments() {
+        let partial = NeutralToolCall {
+            call_id: "call-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: Value::String("{\"".to_string()),
+            thought_signatures: None,
+        };
+        let complete = NeutralToolCall {
+            call_id: "call-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "git", "args": ["status", "--short"] }),
+            thought_signatures: None,
+        };
+        let merged = merge_remote_tool_calls(&[partial], &[complete.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].call_id, complete.call_id);
+        assert_eq!(merged[0].arguments, complete.arguments);
     }
 
     #[test]
