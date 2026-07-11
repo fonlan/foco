@@ -22122,7 +22122,71 @@ async fn serve_main_chat_wire_fixture() -> (
     (format!("http://{addr}/v1"), seen, task)
 }
 
-async fn serve_main_chat_tool_conflict_fixture() -> (
+#[derive(Clone, Copy)]
+enum MainChatToolConflictFixture {
+    SameFileWrites,
+    MixedFileMethodsWithRead,
+    ProjectSpecWrites,
+}
+
+impl MainChatToolConflictFixture {
+    fn first_response(self) -> &'static str {
+        match self {
+            Self::SameFileWrites => concat!(
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-write-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"first\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-write-2\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"second\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Self::MixedFileMethodsWithRead => concat!(
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-write\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"replaced\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-read\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call-edit\",\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"oldStr\\\":\\\"original\\\",\\\"newStr\\\":\\\"edited\\\",\\\"replaceAll\\\":false}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":12}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            Self::ProjectSpecWrites => concat!(
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-spec-1\",\"type\":\"function\",\"function\":{\"name\":\"update_spec\",\"arguments\":\"{\\\"contentMarkdown\\\":\\\"# First\\\",\\\"expectedRevision\\\":0}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-spec-2\",\"type\":\"function\",\"function\":{\"name\":\"update_spec\",\"arguments\":\"{\\\"contentMarkdown\\\":\\\"# Second\\\",\\\"expectedRevision\\\":0}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        }
+    }
+
+    fn expected_call_ids(self) -> &'static [&'static str] {
+        match self {
+            Self::SameFileWrites => &["call-write-1", "call-write-2"],
+            Self::MixedFileMethodsWithRead => &["call-write", "call-read", "call-edit"],
+            Self::ProjectSpecWrites => &["call-spec-1", "call-spec-2"],
+        }
+    }
+
+    fn expected_conflict_text(self) -> &'static str {
+        match self {
+            Self::SameFileWrites | Self::MixedFileMethodsWithRead => "ConflictCase.txt",
+            Self::ProjectSpecWrites => "project spec",
+        }
+    }
+
+    fn user_message(self) -> &'static str {
+        match self {
+            Self::SameFileWrites => "Trigger and recover from a same-file write conflict",
+            Self::MixedFileMethodsWithRead => {
+                "Trigger and recover from a write/edit conflict with an intervening read"
+            }
+            Self::ProjectSpecWrites => "Trigger and recover from a project spec write conflict",
+        }
+    }
+
+    fn uses_file(self) -> bool {
+        matches!(self, Self::SameFileWrites | Self::MixedFileMethodsWithRead)
+    }
+}
+
+async fn serve_main_chat_tool_conflict_fixture(
+    fixture: MainChatToolConflictFixture,
+) -> (
     String,
     Arc<Mutex<Vec<(HeaderMap, Value)>>>,
     tokio::task::JoinHandle<()>,
@@ -22141,12 +22205,7 @@ async fn serve_main_chat_tool_conflict_fixture() -> (
                         requests.len()
                     };
                     let body = if request_count == 1 {
-                        concat!(
-                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-write-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"first\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
-                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-write-2\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"second\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
-                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n",
-                            "data: [DONE]\n\n"
-                        )
+                        fixture.first_response()
                     } else {
                         concat!(
                             "data: {\"id\":\"chat-recovered\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered after conflict\"}}]}\n\n",
@@ -22172,13 +22231,14 @@ async fn serve_main_chat_tool_conflict_fixture() -> (
     (format!("http://{addr}/v1"), seen, task)
 }
 
-#[tokio::test]
-async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
+async fn assert_main_chat_tool_conflict_recovers(fixture: MainChatToolConflictFixture) {
     let workspace = tempfile::tempdir().expect("workspace directory");
     let profile = tempfile::tempdir().expect("profile directory");
-    fs::write(workspace.path().join("ConflictCase.txt"), "original")
-        .expect("write conflict fixture file");
-    let (base_url, seen, server_task) = serve_main_chat_tool_conflict_fixture().await;
+    if fixture.uses_file() {
+        fs::write(workspace.path().join("ConflictCase.txt"), "original")
+            .expect("write conflict fixture file");
+    }
+    let (base_url, seen, server_task) = serve_main_chat_tool_conflict_fixture(fixture).await;
     let mut config = model_test_config(workspace.path().to_path_buf());
     config.app.llm_request_retry_count = 0;
     let workspace_id = config.workspaces[0].id.clone();
@@ -22204,7 +22264,7 @@ async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
             thinking_level: None,
             skill_ids: None,
             session_mode: None,
-            message: "Trigger and recover from a same-file write conflict".to_string(),
+            message: fixture.user_message().to_string(),
             attachments: Vec::new(),
         },
     )
@@ -22234,23 +22294,23 @@ async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
     }
     server_task.abort();
 
+    let expected_call_ids = fixture
+        .expected_call_ids()
+        .iter()
+        .map(|call_id| (*call_id).to_string())
+        .collect::<Vec<_>>();
     assert_eq!(completed_text.as_deref(), Some("Recovered after conflict"));
-    assert_eq!(tool_call_ids, vec!["call-write-1", "call-write-2"]);
-    assert_eq!(tool_results.len(), 2);
+    assert_eq!(tool_call_ids, expected_call_ids);
+    assert_eq!(tool_results.len(), fixture.expected_call_ids().len());
     assert!(tool_results.iter().all(|(_, _, is_error)| *is_error));
     for (tool_call_id, output, _) in &tool_results {
         let message = output["error"]
             .as_str()
             .expect("tool conflict error output");
         assert!(message.contains(tool_call_id));
-        assert!(message.contains("ConflictCase.txt"));
+        assert!(message.contains(fixture.expected_conflict_text()));
         assert!(message.contains("No tool calls in this batch were executed"));
     }
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("ConflictCase.txt"))
-            .expect("read conflict fixture file"),
-        "original"
-    );
 
     let seen = seen.lock().expect("tool conflict request capture");
     assert_eq!(seen.len(), 2);
@@ -22263,18 +22323,28 @@ async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
         .iter()
         .filter(|message| message["role"] == "tool")
         .collect::<Vec<_>>();
-    assert_eq!(tool_messages.len(), 2);
-    let follow_up_json = seen[1].1.to_string();
-    assert!(follow_up_json.contains("call-write-1"));
-    assert!(follow_up_json.contains("call-write-2"));
-    assert!(follow_up_json.contains("ConflictCase.txt"));
+    assert_eq!(tool_messages.len(), fixture.expected_call_ids().len());
+    for call_id in fixture.expected_call_ids() {
+        let tool_message = tool_messages
+            .iter()
+            .find(|message| message["tool_call_id"] == *call_id)
+            .unwrap_or_else(|| panic!("missing follow-up tool message for {call_id}"));
+        let content = tool_message["content"]
+            .as_str()
+            .expect("follow-up tool error content");
+        assert!(content.contains("No tool calls in this batch were executed"));
+        assert!(content.contains(fixture.expected_conflict_text()));
+    }
     drop(seen);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
     let persisted_tool_calls = database
         .tool_calls_for_chat(&chat_id)
         .expect("persisted tool calls");
-    assert_eq!(persisted_tool_calls.len(), 2);
+    assert_eq!(
+        persisted_tool_calls.len(),
+        fixture.expected_call_ids().len()
+    );
     assert!(
         persisted_tool_calls
             .iter()
@@ -22286,6 +22356,37 @@ async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
             .as_ref()
             .is_some_and(|result| result.is_error)
     }));
+
+    if fixture.uses_file() {
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("ConflictCase.txt"))
+                .expect("read conflict fixture file"),
+            "original"
+        );
+    } else {
+        assert!(
+            database
+                .workspace_spec()
+                .expect("read workspace spec after rejected batch")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn main_chat_same_file_writes_return_tool_errors_and_continue_next_turn() {
+    assert_main_chat_tool_conflict_recovers(MainChatToolConflictFixture::SameFileWrites).await;
+}
+
+#[tokio::test]
+async fn main_chat_write_read_edit_conflict_rejects_every_call_and_continues_next_turn() {
+    assert_main_chat_tool_conflict_recovers(MainChatToolConflictFixture::MixedFileMethodsWithRead)
+        .await;
+}
+
+#[tokio::test]
+async fn main_chat_project_spec_write_conflict_returns_tool_errors_and_continues_next_turn() {
+    assert_main_chat_tool_conflict_recovers(MainChatToolConflictFixture::ProjectSpecWrites).await;
 }
 
 #[tokio::test]
