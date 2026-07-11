@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ApiError;
 use crate::skills::{
-    discover_skills_in_all_locations, parse_skill_file, skill_is_disabled,
-    skill_is_required_disabled,
+    SelectedSkillPromptEntry, SkillPromptEntry, discover_skills, parse_skill_file,
+    selected_skill_prompt_entry, skill_is_disabled, skill_is_required_disabled,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -33,6 +33,13 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) memory: MemorySettings,
     pub(crate) spec: SpecSettings,
     pub(crate) plan: PlanSettings,
+    #[serde(default)]
+    pub(crate) global_skills: Vec<SidecarRuntimeSkillContent>,
+    #[serde(default)]
+    pub(crate) disabled_skill_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) disabled_skill_location_ids: Vec<String>,
+    #[serde(default)]
     pub(crate) selected_skills: Vec<SidecarRuntimeSkillContent>,
 }
 
@@ -42,15 +49,37 @@ pub(crate) struct SidecarRuntimeSkillContent {
     pub(crate) key: String,
     pub(crate) id: String,
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: String,
     pub(crate) path: String,
+    #[serde(default = "default_global_skill_scope")]
+    pub(crate) scope: String,
     pub(crate) content_markdown: String,
+}
+
+fn default_global_skill_scope() -> String {
+    SKILL_SCOPE_GLOBAL.to_string()
+}
+
+impl SidecarRuntimeSkillContent {
+    pub(crate) fn prompt_entry(&self) -> SkillPromptEntry {
+        SkillPromptEntry {
+            key: self.key.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            scope: self.scope.clone(),
+            path: self.path.clone(),
+        }
+    }
+
+    pub(crate) fn selected_prompt_entry(&self) -> SelectedSkillPromptEntry {
+        selected_skill_prompt_entry(self.prompt_entry(), self.content_markdown.clone())
+    }
 }
 
 pub(crate) fn build_sidecar_runtime_config_bundle(
     user_profile_dir: &Path,
     config: &GlobalConfig,
-    workspace_id: &str,
-    requested_skill_keys: Option<&[String]>,
     config_generation: u64,
 ) -> Result<SidecarRuntimeConfigBundle, ApiError> {
     let payload = SidecarRuntimeConfigPayload {
@@ -62,12 +91,10 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         memory: config.memory.clone(),
         spec: config.spec.clone(),
         plan: config.plan.clone(),
-        selected_skills: selected_skill_content(
-            user_profile_dir,
-            config,
-            workspace_id,
-            requested_skill_keys,
-        )?,
+        global_skills: global_skill_content(user_profile_dir, config)?,
+        disabled_skill_keys: config.skills.disabled.clone(),
+        disabled_skill_location_ids: config.skills.disabled_locations.clone(),
+        selected_skills: Vec::new(),
     };
     let payload_json = serde_json::to_vec(&payload).map_err(|source| {
         ApiError::internal(format!("sidecar config serialization failed: {source}"))
@@ -93,11 +120,9 @@ fn sidecar_mcp_config(config: &McpConfig) -> McpConfig {
     config
 }
 
-fn selected_skill_content(
+fn global_skill_content(
     user_profile_dir: &Path,
     config: &GlobalConfig,
-    workspace_id: &str,
-    requested_skill_keys: Option<&[String]>,
 ) -> Result<Vec<SidecarRuntimeSkillContent>, ApiError> {
     let disabled_ids = config
         .skills
@@ -105,56 +130,62 @@ fn selected_skill_content(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let discovery = discover_skills_in_all_locations(user_profile_dir, &config.workspaces);
+    let discovery = discover_skills(user_profile_dir, config);
     let required_disabled_ids = discovery
         .required_disabled
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let requested = requested_skill_keys
-        .filter(|keys| !keys.is_empty())
-        .map(|keys| keys.iter().map(String::as_str).collect::<HashSet<_>>());
-    let Some(requested) = requested else {
-        return Ok(Vec::new());
-    };
 
-    let mut selected = Vec::new();
-    for skill in discovery.skills.iter().filter(|skill| {
-        skill_applies_to_workspace(skill, workspace_id)
-            && !skill_is_disabled(skill, &disabled_ids)
-            && !skill_is_required_disabled(skill, &required_disabled_ids)
-            && (requested.contains(skill.key.as_str()) || requested.contains(skill.id.as_str()))
-    }) {
-        let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
-        if parsed.id != skill.id {
-            return Err(ApiError::bad_request(format!(
-                "selected skill '{}' file now declares skill id '{}'",
-                skill.key, parsed.id
-            )));
-        }
-        selected.push(SidecarRuntimeSkillContent {
-            key: skill.key.clone(),
-            id: skill.id.clone(),
-            name: parsed.name,
-            path: skill.path.display().to_string(),
-            content_markdown: parsed.markdown,
-        });
-    }
+    discovery
+        .skills
+        .iter()
+        .filter(|skill| {
+            skill.scope == SKILL_SCOPE_GLOBAL
+                && !skill_is_disabled(skill, &disabled_ids)
+                && !skill_is_required_disabled(skill, &required_disabled_ids)
+        })
+        .map(|skill| {
+            let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
+            if parsed.id != skill.id {
+                return Err(ApiError::bad_request(format!(
+                    "global skill '{}' file now declares skill id '{}'",
+                    skill.key, parsed.id
+                )));
+            }
 
-    Ok(selected)
-}
-
-fn skill_applies_to_workspace(
-    skill: &foco_store::config::SkillSettings,
-    _workspace_id: &str,
-) -> bool {
-    skill.scope == SKILL_SCOPE_GLOBAL
+            Ok(SidecarRuntimeSkillContent {
+                key: skill.key.clone(),
+                id: skill.id.clone(),
+                name: parsed.name,
+                description: skill.description.clone(),
+                path: skill.path.display().to_string(),
+                scope: skill.scope.clone(),
+                content_markdown: parsed.markdown,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
-    use foco_store::config::{DEFAULT_WORKSPACE_ID, ProviderSettings};
+    use foco_store::config::ProviderSettings;
+    use serde_json::Value;
+
+    fn write_skill(root: &Path, id: &str, description: &str, instructions: &str) {
+        let skill_dir = root.join(id);
+        fs::create_dir_all(&skill_dir).expect("skill directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {id}\ndescription: {description}\n---\n\n# {id}\n\n{instructions}\n"
+            ),
+        )
+        .expect("skill file");
+    }
 
     #[test]
     fn sidecar_runtime_bundle_omits_provider_api_keys_and_has_stable_hash() {
@@ -175,19 +206,163 @@ mod tests {
             api_proxy: Default::default(),
         });
 
-        let bundle = build_sidecar_runtime_config_bundle(
-            profile.path(),
-            &config,
-            DEFAULT_WORKSPACE_ID,
-            None,
-            7,
-        )
-        .expect("bundle");
+        let bundle =
+            build_sidecar_runtime_config_bundle(profile.path(), &config, 7).expect("bundle");
         let json = serde_json::to_string(&bundle).expect("bundle json");
 
         assert_eq!(bundle.config_generation, 7);
         assert!(bundle.hash.starts_with("sha256:"));
         assert!(!json.contains("secret-key"));
         assert!(!json.contains("providers"));
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_syncs_only_enabled_global_skills_and_disabled_filters() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_root = profile.path().join(".agents").join("skills");
+        let workspace_root = workspace.path().join(".agents").join("skills");
+        write_skill(
+            &global_root,
+            "enabled",
+            "Enabled skill.",
+            "Enabled instructions.",
+        );
+        write_skill(
+            &global_root,
+            "disabled",
+            "Disabled skill.",
+            "Disabled instructions.",
+        );
+        write_skill(
+            &workspace_root,
+            "workspace-only",
+            "Workspace skill.",
+            "Workspace instructions.",
+        );
+        let broken_dir = global_root.join("broken");
+        fs::create_dir_all(&broken_dir).expect("broken skill directory");
+        fs::write(
+            broken_dir.join("SKILL.md"),
+            "---\nname: broken\ndescription:\n---\n\n# Broken\n",
+        )
+        .expect("broken skill file");
+
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.skills.disabled = vec!["global:disabled".to_string(), "legacy-id".to_string()];
+        config.skills.disabled_locations =
+            vec![format!("workspace:{}:claude", config.workspaces[0].id)];
+
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+
+        assert_eq!(
+            bundle.payload.global_skills,
+            vec![SidecarRuntimeSkillContent {
+                key: "global:enabled".to_string(),
+                id: "enabled".to_string(),
+                name: "enabled".to_string(),
+                description: "Enabled skill.".to_string(),
+                path: global_root
+                    .join("enabled")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string(),
+                scope: SKILL_SCOPE_GLOBAL.to_string(),
+                content_markdown: "---\nname: enabled\ndescription: Enabled skill.\n---\n\n# enabled\n\nEnabled instructions.\n".to_string(),
+            }]
+        );
+        assert_eq!(bundle.payload.disabled_skill_keys, config.skills.disabled);
+        assert_eq!(
+            bundle.payload.disabled_skill_location_ids,
+            config.skills.disabled_locations
+        );
+        assert!(bundle.payload.selected_skills.is_empty());
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_excludes_skills_in_disabled_global_location() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        write_skill(
+            &profile.path().join(".agents").join("skills"),
+            "hidden",
+            "Hidden skill.",
+            "Hidden instructions.",
+        );
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.skills.disabled_locations = vec!["global:agents".to_string()];
+
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+
+        assert!(bundle.payload.global_skills.is_empty());
+        assert_eq!(
+            bundle.payload.disabled_skill_location_ids,
+            vec!["global:agents".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_hash_changes_when_global_skill_content_changes() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_root = profile.path().join(".agents").join("skills");
+        write_skill(
+            &global_root,
+            "changing",
+            "Changing skill.",
+            "First instructions.",
+        );
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let before = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("bundle before change");
+        write_skill(
+            &global_root,
+            "changing",
+            "Changing skill.",
+            "Second instructions.",
+        );
+
+        let after = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
+            .expect("bundle after change");
+
+        assert_ne!(before.hash, after.hash);
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_deserializes_legacy_skill_payload_defaults() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        let mut value = serde_json::to_value(bundle).expect("bundle value");
+        let payload = value
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .expect("payload object");
+        payload.remove("globalSkills");
+        payload.remove("disabledSkillKeys");
+        payload.remove("disabledSkillLocationIds");
+        payload.insert(
+            "selectedSkills".to_string(),
+            serde_json::json!([{
+                "key": "global:legacy",
+                "id": "legacy",
+                "name": "Legacy",
+                "path": "/legacy/SKILL.md",
+                "contentMarkdown": "# Legacy"
+            }]),
+        );
+
+        let parsed = serde_json::from_value::<SidecarRuntimeConfigBundle>(value)
+            .expect("legacy bundle parse");
+
+        assert!(parsed.payload.global_skills.is_empty());
+        assert!(parsed.payload.disabled_skill_keys.is_empty());
+        assert!(parsed.payload.disabled_skill_location_ids.is_empty());
+        assert_eq!(parsed.payload.selected_skills[0].description, "");
+        assert_eq!(parsed.payload.selected_skills[0].scope, SKILL_SCOPE_GLOBAL);
     }
 }

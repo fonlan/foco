@@ -78,7 +78,9 @@ use crate::{
         ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
         execute_tool, execute_web_tool,
     },
-    save_config, unique_id, workspace_by_id,
+    save_config,
+    skills::format_selected_skills_message,
+    unique_id, workspace_by_id,
 };
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
@@ -430,8 +432,6 @@ impl RemoteWorkspaceManager {
         let bundle = build_sidecar_runtime_config_bundle(
             &state.user_profile_dir,
             &config,
-            workspace_id,
-            None,
             Utc::now().timestamp_millis().max(0) as u64,
         )?;
         let active_runs = Arc::new(Mutex::new(Vec::new()));
@@ -5672,7 +5672,7 @@ fn remote_sidecar_provider_request(
     model_id: &str,
     thinking_level: Value,
 ) -> Result<NeutralChatRequest, axum::response::Response> {
-    let raw_messages =
+    let mut raw_messages =
         remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
             .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
 
@@ -5705,6 +5705,8 @@ fn remote_sidecar_provider_request(
         });
     };
 
+    apply_sidecar_selected_skills(&bundle, &mut raw_messages);
+
     let workspace_path = Path::new(&state.workspace_path);
     let mut messages = Vec::with_capacity(raw_messages.len() + 8);
     messages.push(neutral_text_message(
@@ -5721,9 +5723,6 @@ fn remote_sidecar_provider_request(
             NeutralChatRole::System,
             build_memory_prompt_section(),
         ));
-    }
-    for message in sidecar_selected_skill_messages(&bundle) {
-        messages.push(message);
     }
     if let Some(message) = configured_extra_prompt_message(&payload.prompts) {
         messages.push(message);
@@ -5756,28 +5755,28 @@ fn remote_sidecar_provider_request(
     })
 }
 
-fn sidecar_selected_skill_messages(bundle: &SidecarRuntimeConfigBundle) -> Vec<NeutralChatMessage> {
+fn apply_sidecar_selected_skills(
+    bundle: &SidecarRuntimeConfigBundle,
+    messages: &mut [NeutralChatMessage],
+) {
     if bundle.payload.selected_skills.is_empty() {
-        return Vec::new();
+        return;
     }
     let entries = bundle
         .payload
         .selected_skills
         .iter()
-        .map(|skill| {
-            format!(
-                "## Skill: {}\n\nPath: `{}`\n\n{}",
-                skill.name,
-                skill.path,
-                skill.content_markdown.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    vec![neutral_text_message(
-        NeutralChatRole::Developer,
-        format!("## Selected Skills\n\n{entries}"),
-    )]
+        .map(|skill| skill.selected_prompt_entry())
+        .collect::<Vec<_>>();
+    let Some(user_message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == NeutralChatRole::User)
+    else {
+        return;
+    };
+
+    user_message.content = format_selected_skills_message(&entries, &user_message.content);
 }
 
 fn remote_sidecar_chat_messages_for_request(
@@ -10115,6 +10114,37 @@ mod tests {
     }
 
     #[test]
+    fn apply_sidecar_selected_skills_uses_shared_user_message_format() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let config = foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        let mut value = serde_json::to_value(bundle).expect("runtime bundle value");
+        value["payload"]["selectedSkills"] = json!([{
+            "key": "global:demo",
+            "id": "demo",
+            "name": "Demo",
+            "path": "/global/demo/SKILL.md",
+            "contentMarkdown": "# Demo\n\nDo it.\n"
+        }]);
+        let bundle = serde_json::from_value::<SidecarRuntimeConfigBundle>(value)
+            .expect("legacy runtime bundle");
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "hello".to_string(),
+        )];
+
+        apply_sidecar_selected_skills(&bundle, &mut messages);
+
+        assert_eq!(
+            messages[0].content,
+            "# Selected Skills\n\n```json\n[\n  {\n    \"name\": \"Demo\",\n    \"path\": \"/global/demo/SKILL.md\"\n  }\n]\n```\n\n## Skill 1: Demo\n\nPath: `/global/demo/SKILL.md`\n\n### Instructions\n\n# Demo\n\nDo it.\n\n## End Selected Skills\n\nhello"
+        );
+        assert_eq!(messages[0].role, NeutralChatRole::User);
+    }
+
+    #[test]
     fn remote_sidecar_provider_request_includes_synced_system_prompt() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
@@ -10171,9 +10201,8 @@ mod tests {
             input_modalities: Vec::new(),
             output_modalities: Vec::new(),
         });
-        let bundle =
-            build_sidecar_runtime_config_bundle(workspace.path(), &config, "workspace", None, 1)
-                .expect("runtime bundle");
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);
 
         let request = remote_sidecar_provider_request(

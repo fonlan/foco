@@ -43,10 +43,78 @@ pub(crate) struct ParsedSkillFile {
     pub(crate) markdown: String,
 }
 
-struct SelectedSkillPrompt {
-    name: String,
-    path: String,
-    markdown: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillPromptEntry {
+    pub(crate) key: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) scope: String,
+    pub(crate) path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedSkillPromptEntry {
+    pub(crate) prompt: SkillPromptEntry,
+    pub(crate) content_markdown: String,
+}
+
+pub(crate) fn skill_prompt_entry_from_settings(skill: &SkillSettings) -> SkillPromptEntry {
+    SkillPromptEntry {
+        key: skill.key.clone(),
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        scope: skill_scope_prompt_label(skill),
+        path: skill.path.display().to_string(),
+    }
+}
+
+pub(crate) fn selected_skill_prompt_entry(
+    prompt: SkillPromptEntry,
+    content_markdown: impl Into<String>,
+) -> SelectedSkillPromptEntry {
+    SelectedSkillPromptEntry {
+        prompt,
+        content_markdown: content_markdown.into().trim().to_string(),
+    }
+}
+
+pub(crate) fn format_selected_skills_message(
+    entries: &[SelectedSkillPromptEntry],
+    message: &str,
+) -> String {
+    let metadata = serde_json::to_string_pretty(
+        &entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "name": entry.prompt.name,
+                    "path": entry.prompt.path,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("selected skill metadata is always JSON serializable");
+    let instructions = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            format!(
+                "## Skill {}: {}\n\nPath: `{}`\n\n### Instructions\n\n{}",
+                index + 1,
+                entry.prompt.name,
+                entry.prompt.path,
+                entry.content_markdown
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "# Selected Skills\n\n{}\n\n{}\n\n## End Selected Skills\n\n{}",
+        markdown_code_block("json", &metadata),
+        instructions,
+        message,
+    )
 }
 
 pub(crate) fn message_with_selected_skills(
@@ -109,50 +177,17 @@ pub(crate) fn message_with_selected_skills(
             )));
         }
 
-        entries.push(selected_skill_entry(&skill.path, parsed));
+        let prompt = SkillPromptEntry {
+            key: skill.key.clone(),
+            name: parsed.name,
+            description: parsed.description,
+            scope: skill_scope_prompt_label(skill),
+            path: skill.path.display().to_string(),
+        };
+        entries.push(selected_skill_prompt_entry(prompt, parsed.markdown));
     }
 
-    let metadata = serde_json::to_string_pretty(
-        &entries
-            .iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "name": entry.name,
-                    "path": entry.path,
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .expect("selected skill metadata is always JSON serializable");
-    let instructions = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            format!(
-                "## Skill {}: {}\n\nPath: `{}`\n\n### Instructions\n\n{}",
-                index + 1,
-                entry.name,
-                entry.path,
-                entry.markdown
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    Ok(format!(
-        "# Selected Skills\n\n{}\n\n{}\n\n## End Selected Skills\n\n{}",
-        markdown_code_block("json", &metadata),
-        instructions,
-        message,
-    ))
-}
-
-fn selected_skill_entry(path: &Path, skill: ParsedSkillFile) -> SelectedSkillPrompt {
-    SelectedSkillPrompt {
-        name: skill.name,
-        path: path.display().to_string(),
-        markdown: skill.markdown.trim().to_string(),
-    }
+    Ok(format_selected_skills_message(&entries, message))
 }
 
 fn normalize_skill_keys(values: Vec<String>) -> Result<Vec<String>, ApiError> {
@@ -891,6 +926,27 @@ fn validate_skill_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn available_skills_routing_message(
+    entries: &[SkillPromptEntry],
+) -> Option<NeutralChatMessage> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let entries = entries
+        .iter()
+        .map(skill_frontmatter_entry)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(neutral_text_message(
+        NeutralChatRole::Developer,
+        format!(
+            "## Skills\n\nA skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used in this session. Each entry includes a name, description, skill key, scope, and source locator. Treat this list as a routing table for the current user turn. Foco currently exposes filesystem-backed skills; `file` locators are paths on the host filesystem.\n\n### Available Skills\n\n{}\n\n### How to Use Skills\n\n- Discovery: The list above is the skills available in this session (name + description + skill key + scope + source locator). Empty selected `skillIds` or empty Agent task skill ids mean no skill was explicitly preselected for the task; they do not mean the available-skill list is empty. `file` entries live on the host filesystem and must be opened with `read_file` when the skill is selected. Workspace skill paths are usually workspace-relative in practice; global skill paths are usually absolute paths outside the workspace and `read_file` will request explicit user authorization before reading them.\n- Trigger rules: Before starting task work, compare the user's latest request with the available skill names and descriptions. If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list, its `SKILL.md` file can't be read, or the user denies external read access for a global skill, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1. After deciding to use a skill, the main agent must read its `SKILL.md` completely with `read_file` before taking task actions. If a read is truncated or line-ranged, continue until the full file is loaded.\n  2. When `SKILL.md` references another resource, resolve relative paths against that skill's directory and read only the resources required for the current task.\n  3. If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the relevant files. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent.\n  4. Prefer running or patching provided scripts, templates, or assets from the skill directory instead of retyping large code blocks or recreating assets.\n  5. Reuse provided assets or templates from the skill source whenever they fit the task.\n- Coordination and sequencing: If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them. Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.\n- Context hygiene: Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets. Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked. When variants exist, pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly, state the issue, pick the next-best approach, and continue.",
+            entries
+        ),
+    ))
+}
+
 pub(crate) fn enabled_skill_frontmatter_messages(
     user_profile_dir: &Path,
     config: &GlobalConfig,
@@ -917,33 +973,23 @@ pub(crate) fn enabled_skill_frontmatter_messages(
                 && !skill_is_disabled(skill, &disabled_ids)
                 && !skill_is_required_disabled(skill, &required_disabled_ids)
         })
-        .map(skill_frontmatter_entry)
+        .map(skill_prompt_entry_from_settings)
         .collect::<Vec<_>>();
 
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    Ok(vec![neutral_text_message(
-        NeutralChatRole::Developer,
-        format!(
-            "## Skills\n\nA skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used in this session. Each entry includes a name, description, skill key, scope, and source locator. Treat this list as a routing table for the current user turn. Foco currently exposes filesystem-backed skills; `file` locators are paths on the host filesystem.\n\n### Available Skills\n\n{}\n\n### How to Use Skills\n\n- Discovery: The list above is the skills available in this session (name + description + skill key + scope + source locator). Empty selected `skillIds` or empty Agent task skill ids mean no skill was explicitly preselected for the task; they do not mean the available-skill list is empty. `file` entries live on the host filesystem and must be opened with `read_file` when the skill is selected. Workspace skill paths are usually workspace-relative in practice; global skill paths are usually absolute paths outside the workspace and `read_file` will request explicit user authorization before reading them.\n- Trigger rules: Before starting task work, compare the user's latest request with the available skill names and descriptions. If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list, its `SKILL.md` file can't be read, or the user denies external read access for a global skill, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1. After deciding to use a skill, the main agent must read its `SKILL.md` completely with `read_file` before taking task actions. If a read is truncated or line-ranged, continue until the full file is loaded.\n  2. When `SKILL.md` references another resource, resolve relative paths against that skill's directory and read only the resources required for the current task.\n  3. If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the relevant files. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent.\n  4. Prefer running or patching provided scripts, templates, or assets from the skill directory instead of retyping large code blocks or recreating assets.\n  5. Reuse provided assets or templates from the skill source whenever they fit the task.\n- Coordination and sequencing: If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them. Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.\n- Context hygiene: Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets. Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked. When variants exist, pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly, state the issue, pick the next-best approach, and continue.",
-            entries.join("\n")
-        ),
-    )])
+    Ok(available_skills_routing_message(&entries)
+        .into_iter()
+        .collect())
 }
 
-fn skill_frontmatter_entry(skill: &SkillSettings) -> String {
+fn skill_frontmatter_entry(skill: &SkillPromptEntry) -> String {
     format!(
         "- Name: {}; description: {}; key: {}; scope: {}; file: {}",
         serde_json::to_string(&skill.name).expect("skill name is always JSON serializable"),
         serde_json::to_string(&skill.description)
             .expect("skill description is always JSON serializable"),
         serde_json::to_string(&skill.key).expect("skill key is always JSON serializable"),
-        serde_json::to_string(&skill_scope_prompt_label(skill))
-            .expect("skill scope is always JSON serializable"),
-        serde_json::to_string(&skill.path.display().to_string())
-            .expect("skill path is always JSON serializable")
+        serde_json::to_string(&skill.scope).expect("skill scope is always JSON serializable"),
+        serde_json::to_string(&skill.path).expect("skill path is always JSON serializable")
     )
 }
 
