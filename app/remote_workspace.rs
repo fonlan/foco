@@ -9172,6 +9172,38 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_runtime_state_reads_compression_and_budget_from_synced_bundle() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut config = remote_test_config(workspace.path());
+        config.app.runtime_tool_state_compression_enabled = true;
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 7)
+            .expect("sidecar runtime bundle");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        *state.runtime_config.lock().expect("runtime config lock") = Some(bundle);
+        let request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "inspect the workspace".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let runtime_tool_state =
+            RemoteSidecarRuntimeToolState::for_request(&state, &request).expect("runtime state");
+
+        assert!(runtime_tool_state.compression_enabled);
+        assert_eq!(runtime_tool_state.context_budget.context_window, 128_000);
+        assert_eq!(runtime_tool_state.context_budget.max_output_tokens, 4_096);
+        assert!(runtime_tool_state.context_budget.available_message_tokens < 128_000);
+    }
+
+    #[test]
     fn remote_sidecar_tool_loop_uses_shared_round_limit_and_allows_ninth_batch() {
         let mut guard = RemoteSidecarToolLoopGuard::default();
 
@@ -9315,6 +9347,62 @@ mod tests {
             message.tool_call_id.as_deref() == Some("call-0")
                 || message.tool_call_id.as_deref() == Some("call-1")
         }));
+    }
+
+    #[test]
+    fn remote_sidecar_disabled_setting_skips_eighty_percent_compression() {
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "inspect the workspace".to_string(),
+        )];
+        let mut runtime_tool_state = test_remote_runtime_tool_state(&messages, 2_000, 3_000, false);
+        for batch_index in 0..4 {
+            runtime_tool_state.append_runtime_tool_batch(
+                &mut messages,
+                test_remote_tool_batch(batch_index, 2_000),
+            );
+        }
+        let message_groups = crate::prompt::context_message_groups(
+            &messages,
+            &runtime_tool_state.message_source_sequences,
+            &runtime_tool_state.message_context_sources,
+            runtime_tool_state.active_tool_start_index,
+        )
+        .expect("remote context groups");
+        let total_used_tokens =
+            crate::prompt::context_usage_segments_total(&crate::prompt::context_usage_segments(
+                &runtime_tool_state.context_budget,
+                &message_groups,
+            ));
+        assert!(
+            total_used_tokens
+                >= crate::context_window_compression_trigger_tokens(
+                    runtime_tool_state.context_budget.context_window,
+                )
+        );
+        assert!(
+            crate::prompt::context_token_breakdown(&message_groups).required_tokens
+                <= runtime_tool_state.context_budget.available_message_tokens
+        );
+
+        let packed = runtime_tool_state
+            .packed_messages_for_request(&mut messages)
+            .expect("disabled compression should still pack without force");
+
+        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 0);
+        assert!(
+            runtime_tool_state
+                .message_context_sources
+                .iter()
+                .all(|source| !matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+        );
+        assert_eq!(
+            packed
+                .iter()
+                .filter(|message| message.role == NeutralChatRole::Tool)
+                .count(),
+            4
+        );
     }
 
     #[test]
