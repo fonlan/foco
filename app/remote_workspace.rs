@@ -67,7 +67,10 @@ use std::os::windows::process::CommandExt;
 use crate::{
     ApiError, AppResult, AppState, api_audit_save_details, config_snapshot,
     hooks::HookRuntime,
-    http::remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
+    http::{
+        remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
+        terminal::TerminalSessionResponse,
+    },
     markdown_code_block, neutral_text_message, neutral_tool_definition,
     prompt::{
         active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
@@ -7935,11 +7938,10 @@ async fn remote_sidecar_git_branch_create(
 
 async fn remote_sidecar_terminal_session(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
+) -> Result<Json<TerminalSessionResponse>, axum::response::Response> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let _shell = payload.get("shell").map(String::as_str).unwrap_or("bash");
     let ws_path = sidecar_workspace_path(&state);
+    let working_directory = ws_path.display().to_string();
     let session_id = format!(
         "remote-term-{}-{}",
         SystemTime::now()
@@ -7953,14 +7955,15 @@ async fn remote_sidecar_terminal_session(
     db.upsert_terminal_session(foco_store::workspace::NewTerminalSession {
         id: &session_id,
         name: "Remote Terminal",
-        working_directory: &ws_path.display().to_string(),
+        working_directory: &working_directory,
         metadata_json: None,
     })
     .map_err(|e| ApiError::internal(e.to_string()).into_response())?;
-    Ok(Json(serde_json::json!({
-        "sessionId": session_id,
-        "workingDirectory": ws_path.display().to_string(),
-    })))
+    Ok(Json(TerminalSessionResponse {
+        id: session_id,
+        name: "Remote Terminal".to_string(),
+        working_directory,
+    }))
 }
 
 async fn remote_sidecar_terminal_ws(
@@ -8676,6 +8679,71 @@ mod tests {
             },
             broker_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_terminal_session_accepts_empty_post_and_persists_contract() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_path = workspace.path().display().to_string();
+        let (state, _) = test_sidecar_state(workspace_path.clone(), 0);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal test server");
+        let address = listener.local_addr().expect("terminal test address");
+        let app = Router::new()
+            .route(
+                "/api/remote/workspace/terminal/session",
+                post(remote_sidecar_terminal_session),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve terminal test route");
+        });
+
+        let client = reqwest::Client::new();
+        let request = client
+            .post(format!(
+                "http://{address}/api/remote/workspace/terminal/session"
+            ))
+            .build()
+            .expect("build empty terminal request");
+        assert!(request.body().is_none());
+        assert!(request.headers().get(header::CONTENT_TYPE).is_none());
+        let response = client
+            .execute(request)
+            .await
+            .expect("send empty terminal request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = response.json().await.expect("terminal response json");
+
+        let object = payload.as_object().expect("terminal response object");
+        assert_eq!(object.len(), 3);
+        assert!(!object.contains_key("sessionId"));
+        let session_id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("terminal response id");
+        assert_eq!(
+            object.get("name").and_then(Value::as_str),
+            Some("Remote Terminal")
+        );
+        assert_eq!(
+            object.get("workingDirectory").and_then(Value::as_str),
+            Some(workspace_path.as_str())
+        );
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let session = database
+            .terminal_session(session_id)
+            .expect("terminal session query")
+            .expect("persisted terminal session");
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.name, "Remote Terminal");
+        assert_eq!(session.working_directory, workspace_path);
+
+        server.abort();
     }
 
     fn write_remote_test_skill(
