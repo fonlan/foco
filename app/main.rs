@@ -21,7 +21,7 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
-    AgentTaskId, build_available_tools_prompt, build_memory_prompt_section,
+    AgentTaskId, ToolConflictError, build_available_tools_prompt, build_memory_prompt_section,
     build_project_spec_prompt_section, calculate_context_budget, estimate_json_tokens,
     estimate_text_tokens, pack_context, plan_tool_execution,
 };
@@ -3851,36 +3851,6 @@ impl PreparedChatContext {
                                         return;
                                     }
 
-                                    let pending_tool_calls = pending_tool_calls(&tool_calls);
-                                    let execution_plan = match plan_tool_execution(&pending_tool_calls) {
-                                        Ok(plan) => plan,
-                                        Err(error) => {
-                                        let message = error.to_string();
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                                            let event = ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                            yield event;
-                                        } else {
-                                            yield event;
-                                        }
-
-                                        return;
-                                        }
-                                    };
                                     if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
                                         let event = ChatSseEvent::Error {
                                             message: message.clone(),
@@ -3907,10 +3877,56 @@ impl PreparedChatContext {
                                         return;
                                     }
 
+                                    let pending_tool_calls = pending_tool_calls(&tool_calls);
+                                    let execution_plan = match plan_tool_execution(&pending_tool_calls) {
+                                        Ok(plan) => Ok(plan),
+                                        Err(error) => match rejected_tool_batch_results(
+                                            &tool_calls,
+                                            &error,
+                                        ) {
+                                            Some(tool_results) => Err(tool_results),
+                                            None => {
+                                                let message = error.to_string();
+                                                let event = ChatSseEvent::Error {
+                                                    message: message.clone(),
+                                                };
+                                                events.push(captured_event(&event));
+                                                let outcome = failed_chat_audit_outcome(
+                                                    &self,
+                                                    started_at,
+                                                    &mut events,
+                                                    &message,
+                                                    None,
+                                                )
+                                                .await;
+
+                                                if let Err(persist_error) = persist_chat_result(
+                                                    &self,
+                                                    &request_started_at,
+                                                    outcome,
+                                                    &events,
+                                                    None,
+                                                    None,
+                                                    &executed_tool_calls,
+                                                ) {
+                                                    yield ChatSseEvent::Error {
+                                                        message: persist_error.message,
+                                                    };
+                                                } else {
+                                                    yield event;
+                                                }
+
+                                                return;
+                                            }
+                                        },
+                                    };
+
                                     for tool_call in &tool_calls {
                                         capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                                         capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                        seen_tool_call_ids.insert(tool_call.call_id.clone());
+                                        if !seen_tool_call_ids.insert(tool_call.call_id.clone()) {
+                                            continue;
+                                        }
                                         let event = ChatSseEvent::ToolCall {
                                             assistant_message_id: self.assistant_message_id.clone(),
                                             reasoning_duration_ms: if reasoning_duration_ms.is_none()
@@ -3927,7 +3943,9 @@ impl PreparedChatContext {
                                         yield event;
                                     }
 
-                                    let next_tool_results = match {
+                                    let next_executed_tool_calls = match execution_plan {
+                                        Ok(execution_plan) => {
+                                            let next_tool_results = match {
                                         let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
                                         let (tool_output_delta_tx, mut tool_output_delta_rx) =
                                             mpsc::unbounded_channel();
@@ -4124,6 +4142,10 @@ impl PreparedChatContext {
                                         &mut self.message_context_sources,
                                         &batch_hook_summary.additional_context,
                                     );
+                                            next_executed_tool_calls
+                                        }
+                                        Err(rejected_tool_calls) => rejected_tool_calls,
+                                    };
                                     for executed_tool_call in &next_executed_tool_calls {
                                         let result_event = ChatSseEvent::ToolResult {
                                             assistant_message_id: self.assistant_message_id.clone(),
@@ -8658,6 +8680,43 @@ fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary
         completed_at: None,
         live_output: None,
     }
+}
+
+fn rejected_tool_batch_results(
+    tool_calls: &[NeutralToolCall],
+    error: &ToolConflictError,
+) -> Option<Vec<ExecutedToolCall>> {
+    match error {
+        ToolConflictError::SameFileWrite { .. }
+        | ToolConflictError::MixedFileWriteMethods { .. }
+        | ToolConflictError::ResourceConflict { .. } => {}
+        ToolConflictError::MissingPath { .. } | ToolConflictError::MissingScope { .. } => {
+            return None;
+        }
+    }
+
+    let conflict = error.to_string();
+    let timestamp = utc_timestamp();
+    Some(
+        tool_calls
+            .iter()
+            .map(|tool_call| {
+                let message = format!(
+                    "Tool call '{}' ('{}') was not executed because the entire tool batch was rejected: {conflict}. No tool calls in this batch were executed. Retry with a non-conflicting batch. For same-file changes, use one write_file call or send ordered edit_file operations in separate tool-call rounds; do not mix write_file and edit_file for the same file. Do not repeat the unchanged batch.",
+                    tool_call.call_id, tool_call.name
+                );
+                ExecutedToolCall {
+                    id: tool_call.call_id.clone(),
+                    name: tool_call.name.clone(),
+                    input: tool_call.arguments.clone(),
+                    output: json!({ "error": message }),
+                    is_error: true,
+                    started_at: timestamp.clone(),
+                    completed_at: timestamp.clone(),
+                }
+            })
+            .collect(),
+    )
 }
 
 fn executed_tool_call_summary(tool_call: &ExecutedToolCall) -> ChatToolCallSummary {

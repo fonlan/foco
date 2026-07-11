@@ -1727,6 +1727,49 @@ fn repeated_tool_call_detector_resets_when_arguments_change() {
 }
 
 #[test]
+fn rejected_tool_batch_results_pair_every_call_and_preserve_conflict_path_case() {
+    let tool_calls = vec![
+        test_neutral_tool_call(
+            "call-write-1",
+            "write_file",
+            json!({ "path": "ConflictCase.txt", "content": "first" }),
+        ),
+        test_neutral_tool_call(
+            "call-write-2",
+            "write_file",
+            json!({ "path": "ConflictCase.txt", "content": "second" }),
+        ),
+    ];
+    let error = ToolConflictError::SameFileWrite {
+        path: "ConflictCase.txt".to_string(),
+        first_call_id: "call-write-1".to_string(),
+        second_call_id: "call-write-2".to_string(),
+    };
+
+    let results = rejected_tool_batch_results(&tool_calls, &error)
+        .expect("same-file write conflict should reject the batch with tool results");
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.id.as_str(), result.name.as_str(), result.is_error))
+            .collect::<Vec<_>>(),
+        vec![
+            ("call-write-1", "write_file", true),
+            ("call-write-2", "write_file", true),
+        ]
+    );
+    for result in results {
+        let message = result.output["error"].as_str().expect("tool error message");
+        assert!(message.contains("ConflictCase.txt"));
+        assert!(message.contains("call-write-1"));
+        assert!(message.contains("call-write-2"));
+        assert!(message.contains("No tool calls in this batch were executed"));
+        assert!(message.contains("do not mix write_file and edit_file"));
+    }
+}
+
+#[test]
 fn read_only_tool_progress_detector_warns_once_and_continues_varied_exploration() {
     let mut detector = ReadOnlyToolProgressDetector::default();
 
@@ -22077,6 +22120,172 @@ async fn serve_main_chat_wire_fixture() -> (
     });
 
     (format!("http://{addr}/v1"), seen, task)
+}
+
+async fn serve_main_chat_tool_conflict_fixture() -> (
+    String,
+    Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen_for_handler = seen.clone();
+            move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let seen = seen_for_handler.clone();
+                async move {
+                    let request_count = {
+                        let mut requests = seen.lock().expect("tool conflict request capture");
+                        requests.push((headers, payload));
+                        requests.len()
+                    };
+                    let body = if request_count == 1 {
+                        concat!(
+                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-write-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"first\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-write-2\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"ConflictCase.txt\\\",\\\"content\\\":\\\"second\\\",\\\"startLine\\\":null,\\\"endLine\\\":null}\"}}]}}]}\n\n",
+                            "data: {\"id\":\"chat-conflict\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"chat-recovered\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered after conflict\"}}]}\n\n",
+                            "data: {\"id\":\"chat-recovered\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                    };
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind tool conflict fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("tool conflict fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), seen, task)
+}
+
+#[tokio::test]
+async fn main_chat_tool_conflict_returns_tool_errors_and_continues_next_turn() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    fs::write(workspace.path().join("ConflictCase.txt"), "original")
+        .expect("write conflict fixture file");
+    let (base_url, seen, server_task) = serve_main_chat_tool_conflict_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Trigger and recover from a same-file write conflict".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare tool conflict chat context");
+    let chat_id = context.chat_id.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut tool_call_ids = Vec::new();
+    let mut tool_results = Vec::new();
+    let mut completed_text = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::ToolCall { tool_call, .. } => tool_call_ids.push(tool_call.id),
+            ChatSseEvent::ToolResult {
+                tool_call_id,
+                output,
+                is_error,
+                ..
+            } => tool_results.push((tool_call_id, output, is_error)),
+            ChatSseEvent::Complete { text, .. } => completed_text = Some(text),
+            ChatSseEvent::Error { message } => panic!("tool conflict chat failed: {message}"),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert_eq!(completed_text.as_deref(), Some("Recovered after conflict"));
+    assert_eq!(tool_call_ids, vec!["call-write-1", "call-write-2"]);
+    assert_eq!(tool_results.len(), 2);
+    assert!(tool_results.iter().all(|(_, _, is_error)| *is_error));
+    for (tool_call_id, output, _) in &tool_results {
+        let message = output["error"]
+            .as_str()
+            .expect("tool conflict error output");
+        assert!(message.contains(tool_call_id));
+        assert!(message.contains("ConflictCase.txt"));
+        assert!(message.contains("No tool calls in this batch were executed"));
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("ConflictCase.txt"))
+            .expect("read conflict fixture file"),
+        "original"
+    );
+
+    let seen = seen.lock().expect("tool conflict request capture");
+    assert_eq!(seen.len(), 2);
+    let follow_up_messages = seen[1]
+        .1
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("follow-up provider messages");
+    let tool_messages = follow_up_messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 2);
+    let follow_up_json = seen[1].1.to_string();
+    assert!(follow_up_json.contains("call-write-1"));
+    assert!(follow_up_json.contains("call-write-2"));
+    assert!(follow_up_json.contains("ConflictCase.txt"));
+    drop(seen);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let persisted_tool_calls = database
+        .tool_calls_for_chat(&chat_id)
+        .expect("persisted tool calls");
+    assert_eq!(persisted_tool_calls.len(), 2);
+    assert!(
+        persisted_tool_calls
+            .iter()
+            .all(|tool_call| tool_call.status == "error")
+    );
+    assert!(persisted_tool_calls.iter().all(|tool_call| {
+        tool_call
+            .result
+            .as_ref()
+            .is_some_and(|result| result.is_error)
+    }));
 }
 
 #[tokio::test]

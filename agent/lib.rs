@@ -1100,6 +1100,7 @@ You are a deeply pragmatic, effective software engineer. You take engineering qu
 - Built-in file tools use workspace-relative paths. Use "." for the workspace root.
 - Command execution tools run a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string unless you explicitly invoke the detected shell.
 - Parallelize independent tool calls whenever the current model/tool interface supports multiple calls in one turn. Foco executes compatible tool calls concurrently, but conflicting writes to the same resource must not be batched.
+- A hard tool-batch conflict rejects the entire batch and returns an error result for every call; no call in that batch is executed. Retry in a later tool-call round with a non-conflicting batch. For the same file, use one write_file call or sequential edit_file rounds, and never batch write_file with edit_file.
 
 ## Foco Context
 
@@ -2675,6 +2676,8 @@ mod tests {
         assert!(prompt.contains("Prefer code graph tools before text search"));
         assert!(prompt.contains("Treat MCP tools in the available-tool list as first-class tools"));
         assert!(prompt.contains("When skill front matter is injected"));
+        assert!(prompt.contains("A hard tool-batch conflict rejects the entire batch"));
+        assert!(prompt.contains("never batch write_file with edit_file"));
         assert!(!prompt.contains("<system_prompt>"));
         assert!(!prompt.contains("<identity>"));
         assert!(!prompt.contains("Available tools:"));
