@@ -65,7 +65,7 @@ use tungstenite::client::IntoClientRequest;
 use std::os::windows::process::CommandExt;
 
 use crate::{
-    ApiError, AppResult, AppState, api_audit_save_details, config_snapshot,
+    ApiError, AppResult, AppState, MAX_AGENT_TOOL_ROUNDS, api_audit_save_details, config_snapshot,
     hooks::HookRuntime,
     http::{
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
@@ -77,9 +77,10 @@ use crate::{
         configured_extra_prompt_message, environment_context_message,
     },
     runtime::{
-        ProviderAuditCapture, QuestionRegistry, SidecarRuntimeConfigBundle, ToolOutputDeltaEvent,
-        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
-        execute_tool, execute_web_tool,
+        ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
+        ReadOnlyToolProgressDetector, RepeatedToolCallDetector, SidecarRuntimeConfigBundle,
+        ToolOutputDeltaEvent, ToolResourceLockRegistry, build_sidecar_runtime_config_bundle,
+        execute_image_tool, execute_tool, execute_web_tool,
     },
     save_config,
     skills::{
@@ -102,9 +103,47 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const REMOTE_SIDECAR_MAX_TOOL_ROUNDS: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Default)]
+struct RemoteSidecarToolLoopGuard {
+    tool_rounds: usize,
+    repeated_tool_call_detector: RepeatedToolCallDetector,
+    read_only_tool_progress_detector: ReadOnlyToolProgressDetector,
+}
+
+impl RemoteSidecarToolLoopGuard {
+    fn check_before_execution(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
+        self.tool_rounds = self.tool_rounds.saturating_add(1);
+        if self.tool_rounds > MAX_AGENT_TOOL_ROUNDS {
+            return Err(format!(
+                "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds and remote runtime tool-state recovery is not yet available"
+            ));
+        }
+
+        self.repeated_tool_call_detector.check(tool_calls)
+    }
+
+    fn check_after_execution(
+        &mut self,
+        tool_calls: &[NeutralToolCall],
+    ) -> ReadOnlyToolProgressAction {
+        self.read_only_tool_progress_detector.check(tool_calls)
+    }
+}
+
+fn remote_sidecar_append_runtime_guard_message(
+    messages: &mut Vec<NeutralChatMessage>,
+    action: ReadOnlyToolProgressAction,
+) {
+    if let ReadOnlyToolProgressAction::Warn(message) = action {
+        messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            format!("## Runtime Guard\n\n{}", message.trim()),
+        ));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -6820,7 +6859,7 @@ async fn remote_sidecar_chat_stream(
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut current_request = initial_provider_request;
-        let mut tool_rounds = 0_usize;
+        let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "start",
             "chatId": chat_id,
@@ -6885,12 +6924,7 @@ async fn remote_sidecar_chat_stream(
                         cleanup_guard.disarm();
                         break;
                     }
-                    let allowed_tools = remote_sidecar_executable_tool_names();
-                    tool_rounds += 1;
-                    if tool_rounds > REMOTE_SIDECAR_MAX_TOOL_ROUNDS {
-                        let message = format!(
-                            "remote tool round limit reached after {REMOTE_SIDECAR_MAX_TOOL_ROUNDS} rounds"
-                        );
+                    if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
                         let completed_at =
                             Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                         let total_latency_ms = run_metrics.total_latency_ms();
@@ -6918,6 +6952,7 @@ async fn remote_sidecar_chat_stream(
                         cleanup_guard.disarm();
                         break;
                     }
+                    let allowed_tools = remote_sidecar_executable_tool_names();
 
                     let mut next_messages = current_request.messages.clone();
                     next_messages.push(NeutralChatMessage {
@@ -7014,6 +7049,10 @@ async fn remote_sidecar_chat_stream(
                             tool_name: Some(tool_call.name.clone()),
                         });
                     }
+                    remote_sidecar_append_runtime_guard_message(
+                        &mut next_messages,
+                        tool_loop_guard.check_after_execution(&tool_calls),
+                    );
 
                     for event in followup_sse_events {
                         sequence += 1;
@@ -8679,6 +8718,101 @@ mod tests {
             },
             broker_rx,
         )
+    }
+
+    fn test_remote_tool_call(
+        call_id: impl Into<String>,
+        path: impl Into<String>,
+    ) -> NeutralToolCall {
+        NeutralToolCall {
+            call_id: call_id.into(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": path.into() }),
+            thought_signatures: None,
+        }
+    }
+
+    #[test]
+    fn remote_sidecar_tool_loop_uses_shared_round_limit_and_allows_ninth_batch() {
+        let mut guard = RemoteSidecarToolLoopGuard::default();
+
+        for round in 1..=MAX_AGENT_TOOL_ROUNDS {
+            let tool_call =
+                test_remote_tool_call(format!("call-{round}"), format!("file-{round}.rs"));
+            assert!(guard.check_before_execution(&[tool_call]).is_ok());
+            if round == 9 {
+                assert_eq!(guard.tool_rounds, 9);
+            }
+        }
+
+        let error = guard
+            .check_before_execution(&[test_remote_tool_call("overflow", "overflow.rs")])
+            .expect_err("round after shared cap should fail");
+        assert!(error.contains(&MAX_AGENT_TOOL_ROUNDS.to_string()));
+        assert!(error.contains("remote runtime tool-state recovery"));
+    }
+
+    #[test]
+    fn remote_sidecar_tool_loop_rejects_third_identical_batch() {
+        let mut guard = RemoteSidecarToolLoopGuard::default();
+
+        for index in 1..crate::MAX_REPEATED_TOOL_CALL_BATCHES {
+            assert!(
+                guard
+                    .check_before_execution(&[test_remote_tool_call(
+                        format!("call-{index}"),
+                        "same.rs",
+                    )])
+                    .is_ok()
+            );
+        }
+
+        let error = guard
+            .check_before_execution(&[test_remote_tool_call("call-3", "same.rs")])
+            .expect_err("third repeated batch should fail");
+        assert_eq!(
+            error,
+            format!(
+                "agent run repeated the same tool call batch {} times (read_file); possible tool-call loop",
+                crate::MAX_REPEATED_TOOL_CALL_BATCHES
+            )
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_tool_loop_injects_read_only_progress_warning_and_continues() {
+        let mut guard = RemoteSidecarToolLoopGuard::default();
+        let mut messages = Vec::new();
+
+        for round in 1..=crate::READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD {
+            let tool_calls = [test_remote_tool_call(
+                format!("call-{round}"),
+                format!("file-{round}.rs"),
+            )];
+            assert!(guard.check_before_execution(&tool_calls).is_ok());
+            remote_sidecar_append_runtime_guard_message(
+                &mut messages,
+                guard.check_after_execution(&tool_calls),
+            );
+        }
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, NeutralChatRole::System);
+        assert!(messages[0].content.contains("## Runtime Guard"));
+        assert!(
+            messages[0]
+                .content
+                .contains("consecutive read-only exploration tool batches")
+        );
+        assert!(guard.tool_rounds < MAX_AGENT_TOOL_ROUNDS);
+
+        let next_tool_calls = [test_remote_tool_call("call-next", "next.rs")];
+        assert!(guard.check_before_execution(&next_tool_calls).is_ok());
+        remote_sidecar_append_runtime_guard_message(
+            &mut messages,
+            guard.check_after_execution(&next_tool_calls),
+        );
+        assert_eq!(messages.len(), 1);
     }
 
     #[tokio::test]

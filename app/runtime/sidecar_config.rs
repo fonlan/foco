@@ -22,9 +22,18 @@ pub(crate) struct SidecarRuntimeConfigBundle {
     pub(crate) payload: SidecarRuntimeConfigPayload,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarRuntimeAppSettings {
+    #[serde(default)]
+    pub(crate) runtime_tool_state_compression_enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SidecarRuntimeConfigPayload {
+    #[serde(default)]
+    pub(crate) app: SidecarRuntimeAppSettings,
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) prompts: PromptSettings,
     pub(crate) models: Vec<ModelSettings>,
@@ -83,6 +92,11 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
     let (global_skills, required_disabled_skill_keys) =
         global_skill_content(user_profile_dir, config)?;
     let payload = SidecarRuntimeConfigPayload {
+        app: SidecarRuntimeAppSettings {
+            runtime_tool_state_compression_enabled: config
+                .app
+                .runtime_tool_state_compression_enabled,
+        },
         agent_definitions: config.agent_definitions.clone(),
         prompts: config.prompts.clone(),
         models: config.models.clone(),
@@ -226,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_runtime_bundle_syncs_runtime_tool_state_compression_setting() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+
+        let disabled = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("disabled runtime bundle");
+        assert!(!disabled.payload.app.runtime_tool_state_compression_enabled);
+
+        config.app.runtime_tool_state_compression_enabled = true;
+        let enabled = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
+            .expect("enabled runtime bundle");
+        let enabled_json = serde_json::to_value(&enabled).expect("enabled bundle json");
+
+        assert!(enabled.payload.app.runtime_tool_state_compression_enabled);
+        assert_eq!(
+            enabled_json["payload"]["app"]["runtimeToolStateCompressionEnabled"],
+            Value::Bool(true)
+        );
+        assert_ne!(disabled.hash, enabled.hash);
+    }
+
+    #[test]
     fn sidecar_runtime_bundle_syncs_only_enabled_global_skills_and_disabled_filters() {
         let profile = tempfile::tempdir().expect("profile");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -355,6 +392,7 @@ mod tests {
             .get_mut("payload")
             .and_then(Value::as_object_mut)
             .expect("payload object");
+        payload.remove("app");
         payload.remove("globalSkills");
         payload.remove("disabledSkillKeys");
         payload.remove("disabledSkillLocationIds");
@@ -373,6 +411,7 @@ mod tests {
         let parsed = serde_json::from_value::<SidecarRuntimeConfigBundle>(value)
             .expect("legacy bundle parse");
 
+        assert!(!parsed.payload.app.runtime_tool_state_compression_enabled);
         assert!(parsed.payload.global_skills.is_empty());
         assert!(parsed.payload.disabled_skill_keys.is_empty());
         assert!(parsed.payload.disabled_skill_location_ids.is_empty());
