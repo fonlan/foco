@@ -2870,16 +2870,36 @@ export function App() {
           if (!job) {
             continue;
           }
+          setWorkspaceSpec((current) =>
+            current ? { ...current, latestJob: job } : current,
+          );
           if (job.status === "queued" || job.status === "running") {
             continue;
           }
           if (job.status === "completed" && activeWorkspaceIdRef.current === workspaceId) {
             await loadWorkspaceSpec(workspaceId);
+          } else if (
+            (job.status === "failed" || job.status === "skipped") &&
+            activeWorkspaceIdRef.current === workspaceId
+          ) {
+            setWorkspaceSpecError(
+              job.errorMessage?.trim() ||
+                (job.status === "skipped"
+                  ? "Workspace spec generation was skipped"
+                  : "Workspace spec generation failed"),
+            );
           }
           return;
         }
-      } catch {
-        return;
+        if (activeWorkspaceIdRef.current === workspaceId) {
+          setWorkspaceSpecError(
+            "Workspace spec generation is still running; reload later to check progress.",
+          );
+        }
+      } catch (requestError) {
+        if (activeWorkspaceIdRef.current === workspaceId) {
+          setWorkspaceSpecError(errorMessage(requestError));
+        }
       }
     },
     [loadWorkspaceSpec],

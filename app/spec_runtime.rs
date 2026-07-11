@@ -172,6 +172,18 @@ struct WorkspaceSpecModelSelection {
     max_output_tokens: u32,
 }
 
+/// Remote sidecar only needs provider/model ids for brokered LLM calls; secrets stay local.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRemoteWorkspaceSpecJob {
+    pub(crate) job_id: String,
+    pub(crate) chat_id: Option<String>,
+    pub(crate) base_revision: u64,
+    pub(crate) provider_id: String,
+    pub(crate) model_id: String,
+    pub(crate) request: NeutralChatRequest,
+    pub(crate) workspace_path: PathBuf,
+}
+
 pub(crate) async fn run_workspace_spec_job(
     state: AppState,
     workspace_id: String,
@@ -722,7 +734,7 @@ async fn run_workspace_spec_update_job_inner(
     let request = workspace_spec_update_provider_request(
         &model.model_id,
         &config.app.language,
-        &config.spec,
+        config.spec.update_system_prompt.as_deref(),
         model.max_output_tokens,
         &input_summary,
     )?;
@@ -873,6 +885,84 @@ pub(crate) fn prepare_workspace_spec_job(
     prepare_workspace_spec_generation_job(config, workspace_id, &workspace.path, job_id)
 }
 
+/// Prepare a manual generation job for remote sidecar execution.
+/// Uses models/spec prompts from the synced runtime config; LLM runs via broker.
+pub(crate) fn prepare_remote_workspace_spec_generation_job(
+    workspace_id: &str,
+    workspace_path: &std::path::Path,
+    job_id: &str,
+    models: &[ModelSettings],
+    generation_model_id: Option<&str>,
+    generation_system_prompt: Option<&str>,
+    app_language: &str,
+) -> Result<Option<PreparedRemoteWorkspaceSpecJob>, ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(job) = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Err(ApiError::bad_request(format!(
+            "workspace spec job was not found: {job_id}"
+        )));
+    };
+
+    if job.status != WorkspaceSpecJobStatus::Queued.as_str()
+        && job.status != WorkspaceSpecJobStatus::Running.as_str()
+    {
+        return Ok(None);
+    }
+    let spec = database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(spec) = spec.filter(|spec| spec.enabled) else {
+        database
+            .mark_workspace_spec_job_skipped(job_id, "workspace_spec_disabled")
+            .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+        return Ok(None);
+    };
+    let base_revision = spec.revision;
+    let input_summary =
+        collect_workspace_spec_input_without_memory(workspace_id, workspace_path, base_revision)?;
+    let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize workspace spec input: {source}"
+        ))
+    })?;
+    database
+        .update_workspace_spec_job_prepared_input(job_id, base_revision, &input_summary_json)
+        .map_err(ApiError::from_workspace_error)?;
+    if job.status == WorkspaceSpecJobStatus::Queued.as_str() {
+        database
+            .mark_workspace_spec_job_running(job_id)
+            .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+    }
+
+    let model = resolve_workspace_spec_model_from_models(
+        models,
+        job.model_id.as_deref().or(generation_model_id),
+    )?;
+    let request = workspace_spec_provider_request(
+        &model.model_id,
+        app_language,
+        generation_system_prompt,
+        model.max_output_tokens,
+        &input_summary,
+    )?;
+
+    Ok(Some(PreparedRemoteWorkspaceSpecJob {
+        job_id: job.id,
+        chat_id: job.chat_id,
+        base_revision,
+        provider_id: model.provider_id,
+        model_id: model.model_id,
+        request,
+        workspace_path: workspace_path.to_path_buf(),
+    }))
+}
+
 fn prepare_workspace_spec_generation_job(
     config: &GlobalConfig,
     workspace_id: &str,
@@ -927,7 +1017,7 @@ fn prepare_workspace_spec_generation_job(
     let request = workspace_spec_provider_request(
         &model.model_id,
         &config.app.language,
-        &config.spec,
+        config.spec.generation_system_prompt.as_deref(),
         model.max_output_tokens,
         &input_summary,
     )?;
@@ -1172,6 +1262,17 @@ fn collect_workspace_spec_input(
     workspace_path: &std::path::Path,
     base_revision: u64,
 ) -> Result<WorkspaceSpecGenerationInput, ApiError> {
+    let mut input =
+        collect_workspace_spec_input_without_memory(workspace_id, workspace_path, base_revision)?;
+    input.memory_profiles = workspace_memory_profiles(config, workspace_path)?;
+    Ok(input)
+}
+
+fn collect_workspace_spec_input_without_memory(
+    workspace_id: &str,
+    workspace_path: &std::path::Path,
+    base_revision: u64,
+) -> Result<WorkspaceSpecGenerationInput, ApiError> {
     let database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let context = database
@@ -1202,7 +1303,7 @@ fn collect_workspace_spec_input(
             files,
             symbols,
         },
-        memory_profiles: workspace_memory_profiles(config, workspace_path)?,
+        memory_profiles: Vec::new(),
         source_files: root_source_files(workspace_path),
     })
 }
@@ -1309,7 +1410,7 @@ fn root_source_files(workspace_path: &std::path::Path) -> Vec<WorkspaceSpecSourc
 fn workspace_spec_provider_request(
     model_id: &str,
     app_language: &str,
-    spec_settings: &SpecSettings,
+    generation_system_prompt: Option<&str>,
     max_output_tokens: u32,
     input_summary: &WorkspaceSpecGenerationInput,
 ) -> Result<NeutralChatRequest, ApiError> {
@@ -1319,7 +1420,7 @@ fn workspace_spec_provider_request(
         ))
     })?;
     let system_prompt = workspace_spec_system_prompt(
-        spec_settings.generation_system_prompt.as_deref(),
+        generation_system_prompt,
         default_workspace_spec_generation_system_prompt(),
         app_language,
     );
@@ -1344,7 +1445,7 @@ fn workspace_spec_provider_request(
 fn workspace_spec_update_provider_request(
     model_id: &str,
     app_language: &str,
-    spec_settings: &SpecSettings,
+    update_system_prompt: Option<&str>,
     max_output_tokens: u32,
     input_summary: &WorkspaceSpecUpdateInput,
 ) -> Result<NeutralChatRequest, ApiError> {
@@ -1354,7 +1455,7 @@ fn workspace_spec_update_provider_request(
         ))
     })?;
     let system_prompt = workspace_spec_system_prompt(
-        spec_settings.update_system_prompt.as_deref(),
+        update_system_prompt,
         default_workspace_spec_update_system_prompt(),
         app_language,
     );
@@ -1467,7 +1568,7 @@ fn workspace_spec_language_name(app_language: &str) -> &'static str {
     }
 }
 
-fn parse_workspace_spec_output(value: Value) -> Result<String, ApiError> {
+pub(crate) fn parse_workspace_spec_output(value: Value) -> Result<String, ApiError> {
     let output: WorkspaceSpecToolOutput = serde_json::from_value(value).map_err(|source| {
         ApiError::bad_request(format!(
             "malformed workspace spec generation JSON: {source}"
@@ -1480,6 +1581,31 @@ fn parse_workspace_spec_output(value: Value) -> Result<String, ApiError> {
         ));
     }
     Ok(content)
+}
+
+pub(crate) fn mark_workspace_spec_job_failed(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    job_id: &str,
+    error_message: &str,
+) {
+    mark_workspace_spec_job_failed_at_path(workspace_path, workspace_id, job_id, error_message);
+}
+
+pub(crate) fn claim_next_workspace_spec_job_for_path(
+    workspace_path: &std::path::Path,
+) -> Result<Option<WorkspaceSpecJobRecord>, ApiError> {
+    claim_next_workspace_spec_job(workspace_path)
+}
+
+pub(crate) fn recover_stale_running_workspace_spec_job_for_path(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    recover_stale_running_workspace_spec_job(&mut database, workspace_id)?;
+    Ok(())
 }
 
 fn parse_workspace_spec_update_output(value: Value) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
@@ -1508,9 +1634,28 @@ fn resolve_workspace_spec_model(
     config: &GlobalConfig,
     requested_model_id: Option<&str>,
 ) -> Result<WorkspaceSpecModelSelection, ApiError> {
+    let model_id = match requested_model_id.and_then(non_empty_trimmed) {
+        Some(model_id) => model_id.to_string(),
+        None => only_configured_generation_model(&config.models)?.id.clone(),
+    };
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "workspace spec generation model was not found: {model_id}"
+            ))
+        })?;
+    workspace_spec_model_selection(config, model)
+}
+
+fn resolve_workspace_spec_model_from_models(
+    models: &[ModelSettings],
+    requested_model_id: Option<&str>,
+) -> Result<RemoteWorkspaceSpecModelSelection, ApiError> {
     let model = match requested_model_id.and_then(non_empty_trimmed) {
-        Some(model_id) => config
-            .models
+        Some(model_id) => models
             .iter()
             .find(|model| model.id == model_id)
             .ok_or_else(|| {
@@ -1518,14 +1663,13 @@ fn resolve_workspace_spec_model(
                     "workspace spec generation model was not found: {model_id}"
                 ))
             })?,
-        None => only_configured_generation_model(config)?,
+        None => only_configured_generation_model(models)?,
     };
-    workspace_spec_model_selection(config, model)
+    remote_workspace_spec_model_selection(model)
 }
 
-fn only_configured_generation_model(config: &GlobalConfig) -> Result<&ModelSettings, ApiError> {
-    let candidates = config
-        .models
+fn only_configured_generation_model(models: &[ModelSettings]) -> Result<&ModelSettings, ApiError> {
+    let candidates = models
         .iter()
         .filter(|model| model.enabled && model.active_provider_id.is_some())
         .collect::<Vec<_>>();
@@ -1538,10 +1682,16 @@ fn only_configured_generation_model(config: &GlobalConfig) -> Result<&ModelSetti
     ))
 }
 
-fn workspace_spec_model_selection(
-    config: &GlobalConfig,
+#[derive(Debug)]
+struct RemoteWorkspaceSpecModelSelection {
+    model_id: String,
+    provider_id: String,
+    max_output_tokens: u32,
+}
+
+fn remote_workspace_spec_model_selection(
     model: &ModelSettings,
-) -> Result<WorkspaceSpecModelSelection, ApiError> {
+) -> Result<RemoteWorkspaceSpecModelSelection, ApiError> {
     if !model.enabled {
         return Err(ApiError::bad_request(format!(
             "workspace spec generation model '{}' is disabled",
@@ -1566,22 +1716,6 @@ fn workspace_spec_model_selection(
             provider_id, model.id
         )));
     }
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "workspace spec generation provider '{}' was not found",
-                provider_id
-            ))
-        })?;
-    if !provider.enabled {
-        return Err(ApiError::bad_request(format!(
-            "workspace spec generation provider '{}' is disabled",
-            provider.id
-        )));
-    }
     let max_output_tokens = u32::try_from(limits.max_output_tokens)
         .map_err(|_| {
             ApiError::bad_request(format!(
@@ -1591,11 +1725,40 @@ fn workspace_spec_model_selection(
         })?
         .min(WORKSPACE_SPEC_MAX_OUTPUT_TOKENS);
 
-    Ok(WorkspaceSpecModelSelection {
+    Ok(RemoteWorkspaceSpecModelSelection {
         model_id: model.id.clone(),
-        provider_id: provider.id.clone(),
-        provider_config: provider_connection_config(provider)?,
+        provider_id: provider_id.to_string(),
         max_output_tokens,
+    })
+}
+
+fn workspace_spec_model_selection(
+    config: &GlobalConfig,
+    model: &ModelSettings,
+) -> Result<WorkspaceSpecModelSelection, ApiError> {
+    let remote = remote_workspace_spec_model_selection(model)?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == remote.provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "workspace spec generation provider '{}' was not found",
+                remote.provider_id
+            ))
+        })?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "workspace spec generation provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    Ok(WorkspaceSpecModelSelection {
+        model_id: remote.model_id,
+        provider_id: remote.provider_id,
+        provider_config: provider_connection_config(provider)?,
+        max_output_tokens: remote.max_output_tokens,
     })
 }
 
@@ -1784,9 +1947,14 @@ mod tests {
             current_spec_markdown: "# Project Spec\n\nExisting spec.".to_string(),
         };
 
-        let request =
-            workspace_spec_update_provider_request("model", "zh-CN", &settings, 1_024, &input)
-                .expect("workspace spec update request");
+        let request = workspace_spec_update_provider_request(
+            "model",
+            "zh-CN",
+            settings.update_system_prompt.as_deref(),
+            1_024,
+            &input,
+        )
+        .expect("workspace spec update request");
         let system_prompt = &request.messages[0].content;
 
         assert!(system_prompt.contains("Custom update prompt."));

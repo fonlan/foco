@@ -45,7 +45,8 @@ use foco_store::{
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
         NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage, TodoGraphFilter,
-        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceSpecJobRecord,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
         workspace_database_path,
     },
 };
@@ -98,6 +99,12 @@ use crate::{
         discover_workspace_skills_for_path, format_selected_skills_message, parse_skill_file,
         parse_skill_markdown, selected_skill_prompt_entry, skill_is_disabled,
         skill_is_required_disabled, skill_prompt_entry_from_settings,
+    },
+    spec_runtime::{
+        apply_workspace_spec_job_output, claim_next_workspace_spec_job_for_path,
+        log_workspace_spec_job_status, mark_workspace_spec_job_failed, parse_workspace_spec_output,
+        prepare_remote_workspace_spec_generation_job,
+        recover_stale_running_workspace_spec_job_for_path,
     },
     unique_id, workspace_by_id,
 };
@@ -8520,6 +8527,8 @@ async fn remote_sidecar_spec_generate(
             input_summary_json: Some(&input_summary.to_string()),
         })
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    drop(database);
+    wake_remote_sidecar_spec_runner(&state);
     Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
 }
 
@@ -8561,6 +8570,8 @@ async fn remote_sidecar_spec_jobs_retry(
             ApiError::bad_request(format!("workspace spec job cannot be retried: {job_id}"))
                 .into_response()
         })?;
+    drop(database);
+    wake_remote_sidecar_spec_runner(&state);
     Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
 }
 
@@ -8596,6 +8607,211 @@ fn remote_sidecar_spec_job_json(
         "completedAt": job.completed_at,
         "hasRetry": job.has_retry,
     }))
+}
+
+fn wake_remote_sidecar_spec_runner(state: &RemoteSidecarState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_remote_sidecar_spec_jobs(state).await {
+            tracing::warn!(
+                error = %error.message(),
+                "remote sidecar workspace spec runner failed"
+            );
+        }
+    });
+}
+
+async fn run_remote_sidecar_spec_jobs(state: RemoteSidecarState) -> Result<(), ApiError> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    recover_stale_running_workspace_spec_job_for_path(&workspace_path, &state.workspace_id)?;
+    loop {
+        let Some(job) = claim_next_workspace_spec_job_for_path(&workspace_path)? else {
+            return Ok(());
+        };
+        let job_id = job.id.clone();
+        log_workspace_spec_job_status(&state.workspace_id, &job);
+        if let Err(error) = run_remote_sidecar_spec_job(&state, job).await {
+            mark_workspace_spec_job_failed(
+                &workspace_path,
+                &state.workspace_id,
+                &job_id,
+                error.message(),
+            );
+        }
+    }
+}
+
+async fn run_remote_sidecar_spec_job(
+    state: &RemoteSidecarState,
+    job: WorkspaceSpecJobRecord,
+) -> Result<(), ApiError> {
+    if job.trigger_type != WorkspaceSpecTriggerType::ManualInitial.as_str()
+        && job.trigger_type != WorkspaceSpecTriggerType::ManualRefresh.as_str()
+    {
+        return Err(ApiError::bad_request(format!(
+            "remote sidecar does not execute workspace spec trigger '{}'",
+            job.trigger_type
+        )));
+    }
+
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone())
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "remote sidecar runtime config is unavailable; wait for runtime config sync",
+            )
+        })?;
+    let payload = &bundle.payload;
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let Some(prepared) = prepare_remote_workspace_spec_generation_job(
+        &state.workspace_id,
+        &workspace_path,
+        &job.id,
+        &payload.models,
+        payload.spec.generation_model_id.as_deref(),
+        payload.spec.generation_system_prompt.as_deref(),
+        &payload.app.language,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let content_markdown = remote_sidecar_broker_workspace_spec_tool_request(
+        state,
+        &prepared.provider_id,
+        &prepared.model_id,
+        prepared.request,
+        prepared.chat_id.as_deref(),
+        payload.spec.llm_timeout_ms,
+    )
+    .await?;
+    // ponytail: remote skips LLM compaction for oversized specs; fail loudly instead of
+    // silently truncating. Upgrade path: reuse local compaction via a second broker turn.
+    if content_markdown.len() > foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "workspace spec generation exceeded {} bytes ({} bytes). Shorten the project or regenerate later.",
+            foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+            content_markdown.len()
+        )));
+    }
+    apply_workspace_spec_job_output(
+        &prepared.workspace_path,
+        &prepared.job_id,
+        prepared.base_revision,
+        &content_markdown,
+    )?;
+    if let Ok(database) = WorkspaceDatabase::open_or_create(&prepared.workspace_path) {
+        if let Ok(Some(job)) = database.workspace_spec_job(&prepared.job_id) {
+            log_workspace_spec_job_status(&state.workspace_id, &job);
+        }
+    }
+    Ok(())
+}
+
+async fn remote_sidecar_broker_workspace_spec_tool_request(
+    state: &RemoteSidecarState,
+    provider_id: &str,
+    model_id: &str,
+    request: NeutralChatRequest,
+    chat_id: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String, ApiError> {
+    let broker_request_id = unique_id("broker-spec");
+    let broker_payload = json!({
+        "workspaceId": state.workspace_id,
+        "chatId": chat_id,
+        "requestId": broker_request_id,
+        "providerId": provider_id,
+        "modelId": model_id,
+        "request": request,
+    });
+    let mut broker_rx =
+        remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload)
+            .await
+            .map_err(api_error_from_response)?;
+
+    let timeout_duration = Duration::from_millis(timeout_ms.max(1_000));
+    let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
+    loop {
+        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                return Err(ApiError::bad_gateway(
+                    "remote broker closed before workspace spec generation completed",
+                ));
+            }
+            Err(_) => {
+                return Err(ApiError::bad_gateway(
+                    "remote broker timed out while generating workspace spec",
+                ));
+            }
+        };
+        match envelope.message_type.as_str() {
+            "stream" => {
+                let kind = envelope
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind == "toolCall" {
+                    if let Some(tool_value) = envelope.payload.get("toolCall") {
+                        if let Ok(tool_call) =
+                            serde_json::from_value::<NeutralToolCall>(tool_value.clone())
+                        {
+                            collected_tool_calls = merge_remote_tool_calls(
+                                &collected_tool_calls,
+                                std::slice::from_ref(&tool_call),
+                            );
+                        }
+                    }
+                }
+            }
+            "response" => {
+                let response_tool_calls = envelope
+                    .payload
+                    .get("toolCalls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
+                    .unwrap_or_default();
+                let tool_calls =
+                    merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls);
+                let submit = tool_calls
+                    .into_iter()
+                    .find(|tool_call| tool_call.name == "submit_workspace_spec")
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "workspace spec generation completed without submit_workspace_spec tool call",
+                        )
+                    })?;
+                return parse_workspace_spec_output(submit.arguments);
+            }
+            "error" => {
+                let message = envelope
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote broker unavailable");
+                return Err(ApiError::bad_gateway(message.to_string()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn api_error_from_response(response: axum::response::Response) -> ApiError {
+    let status = response.status();
+    let message = format!(
+        "remote broker request failed with status {}",
+        status.as_u16()
+    );
+    if status.as_u16() >= 500 {
+        ApiError::bad_gateway(message)
+    } else {
+        ApiError::bad_request(message)
+    }
 }
 
 async fn remote_sidecar_plans_list(
@@ -9768,6 +9984,98 @@ mod tests {
         );
 
         app_task.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_spec_generate_executes_job_via_broker() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let mut config = remote_test_config(workspace.path());
+        config.spec.generation_model_id = Some("model-1".to_string());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = loop {
+                match broker_rx.recv().await {
+                    Ok(envelope) if envelope.message_type == "request" => break envelope,
+                    Ok(_) => continue,
+                    Err(_) => panic!("broker channel closed"),
+                }
+            };
+            assert_eq!(request.method.as_deref(), Some("llm.stream"));
+            let request_id = request.id.expect("broker request id");
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id.clone()),
+                method: None,
+                payload: json!({
+                    "toolCalls": [{
+                        "callId": "tool-1",
+                        "name": "submit_workspace_spec",
+                        "arguments": {
+                            "contentMarkdown": "# Project Spec\n\n## Purpose\n\nRemote generated.\n"
+                        }
+                    }],
+                    "usage": null,
+                    "llmRequestId": request_id.clone(),
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let tx = broker_pending
+                .lock()
+                .await
+                .remove(&request_id)
+                .expect("pending broker receiver");
+            tx.send(response).expect("send broker response");
+        });
+
+        let response = remote_sidecar_spec_generate(State(state.clone()), Json(json!({})))
+            .await
+            .expect("generate response");
+        let job_id = response.0["job"]["id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+
+        let mut completed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+            let job = database
+                .workspace_spec_job(&job_id)
+                .expect("read job")
+                .expect("job exists");
+            if job.status == "completed" {
+                completed = true;
+                let spec = database
+                    .workspace_spec()
+                    .expect("read spec")
+                    .expect("spec row");
+                assert!(spec.content_markdown.contains("Remote generated."));
+                break;
+            }
+            if matches!(job.status.as_str(), "failed" | "skipped") {
+                panic!("job ended as {}: {:?}", job.status, job.error_message);
+            }
+        }
+        assert!(
+            completed,
+            "remote sidecar should complete the queued spec job"
+        );
+        broker_task.await.expect("broker task");
     }
 
     fn write_remote_test_skill(

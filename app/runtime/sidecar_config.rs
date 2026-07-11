@@ -27,6 +27,12 @@ pub(crate) struct SidecarRuntimeConfigBundle {
 pub(crate) struct SidecarRuntimeAppSettings {
     #[serde(default)]
     pub(crate) runtime_tool_state_compression_enabled: bool,
+    #[serde(default = "default_sidecar_app_language")]
+    pub(crate) language: String,
+}
+
+fn default_sidecar_app_language() -> String {
+    "en".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -96,6 +102,7 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
             runtime_tool_state_compression_enabled: config
                 .app
                 .runtime_tool_state_compression_enabled,
+            language: config.app.language.clone(),
         },
         agent_definitions: config.agent_definitions.clone(),
         prompts: config.prompts.clone(),
@@ -260,6 +267,24 @@ mod tests {
             Value::Bool(true)
         );
         assert_ne!(disabled.hash, enabled.hash);
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_syncs_app_language() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.app.language = "zh-CN".to_string();
+
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        let json = serde_json::to_value(&bundle).expect("bundle json");
+
+        assert_eq!(bundle.payload.app.language, "zh-CN");
+        assert_eq!(
+            json["payload"]["app"]["language"],
+            Value::String("zh-CN".into())
+        );
     }
 
     #[test]
