@@ -28,8 +28,8 @@ describe("chat display helpers", () => {
     expect(toolDisplayName("mcp__custom__unmapped-tool", "zh-CN")).toBe(
       "mcp__custom__unmapped-tool",
     );
-    expect(toolDisplayName("search_query", "en")).toBe("Search Query");
-    expect(toolDisplayName("search_query", "zh-CN")).toBe("工具");
+    expect(toolDisplayName("search_query", "en")).toBe("search_query");
+    expect(toolDisplayName("search_query", "zh-CN")).toBe("search_query");
     expect(translate("Memories used", {}, "zh-CN")).toBe("使用记忆");
   });
 

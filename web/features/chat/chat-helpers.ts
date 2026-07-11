@@ -68,20 +68,7 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
 
 export function toolDisplayName(toolName: string, language: AppLanguageId) {
   const known = TOOL_DISPLAY_NAMES[toolName];
-  if (known) {
-    return known[language];
-  }
-  if (toolName.startsWith("mcp__")) {
-    return toolName;
-  }
-  if (language === "zh-CN") {
-    return "工具";
-  }
-  return toolName
-    .split(/[\s_-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ") || "Tool";
+  return known ? known[language] : toolName;
 }
 
 export function isSkillAvailableForWorkspace(
