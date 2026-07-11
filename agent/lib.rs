@@ -1488,7 +1488,7 @@ pub fn plan_tool_execution(
                 call_indices: vec![index],
             });
         } else {
-            push_parallel_group_before_matching_edit_file(
+            push_parallel_group_before_orderable_workspace_file_conflict(
                 &mut groups,
                 &mut pending_parallel_indices,
                 &analyzed_calls,
@@ -1669,38 +1669,63 @@ struct AnalyzedToolCall {
     file_display_path: Option<String>,
 }
 
-fn push_parallel_group_before_matching_edit_file(
+fn push_parallel_group_before_orderable_workspace_file_conflict(
     groups: &mut Vec<ToolExecutionGroup>,
     indices: &mut Vec<usize>,
     analyzed_calls: &[AnalyzedToolCall],
     current_call: &AnalyzedToolCall,
 ) {
-    if current_call.file_write_kind != Some(FileWriteKind::ReplaceExact) {
-        return;
-    }
-
     if indices.iter().any(|index| {
-        let pending_call = &analyzed_calls[*index];
-        pending_call.file_write_kind == Some(FileWriteKind::ReplaceExact)
-            && pending_call.locks.iter().any(|pending_lock| {
-                current_call
-                    .locks
-                    .iter()
-                    .any(|lock| edit_file_locks_overlap(pending_lock, lock))
-            })
+        analyzed_calls_have_orderable_workspace_file_conflict(&analyzed_calls[*index], current_call)
     }) {
         push_parallel_group(groups, indices);
     }
 }
 
-fn edit_file_locks_overlap(first: &ToolResourceLock, second: &ToolResourceLock) -> bool {
-    first.access == ToolResourceAccess::Write
-        && second.access == ToolResourceAccess::Write
-        && matches!(
-            (&first.resource, &second.resource),
-            (ToolResource::File(_), ToolResource::File(_))
-        )
-        && resources_overlap(&first.resource, &second.resource)
+fn analyzed_calls_have_orderable_workspace_file_conflict(
+    first: &AnalyzedToolCall,
+    second: &AnalyzedToolCall,
+) -> bool {
+    first.locks.iter().any(|first_lock| {
+        second.locks.iter().any(|second_lock| {
+            is_orderable_workspace_file_conflict(first_lock, first, second_lock, second)
+        })
+    })
+}
+
+fn is_orderable_workspace_file_conflict(
+    first_lock: &ToolResourceLock,
+    first_analysis: &AnalyzedToolCall,
+    second_lock: &ToolResourceLock,
+    second_analysis: &AnalyzedToolCall,
+) -> bool {
+    if !tool_resource_locks_conflict(first_lock, second_lock)
+        || !is_workspace_file_resource(&first_lock.resource)
+        || !is_workspace_file_resource(&second_lock.resource)
+    {
+        return false;
+    }
+
+    if matches!(
+        (first_lock.access, second_lock.access),
+        (ToolResourceAccess::Read, ToolResourceAccess::Write)
+            | (ToolResourceAccess::Write, ToolResourceAccess::Read)
+    ) {
+        return true;
+    }
+
+    matches!(
+        (&first_lock.resource, &second_lock.resource),
+        (ToolResource::File(_), ToolResource::File(_))
+    ) && first_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+        && second_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+}
+
+fn is_workspace_file_resource(resource: &ToolResource) -> bool {
+    matches!(
+        resource,
+        ToolResource::WorkspaceFiles | ToolResource::File(_)
+    )
 }
 
 fn push_parallel_group(groups: &mut Vec<ToolExecutionGroup>, indices: &mut Vec<usize>) {
@@ -1772,6 +1797,15 @@ fn reject_conflicting_parallel_tool_calls(
                         },
                     );
                 }
+            }
+
+            if is_orderable_workspace_file_conflict(
+                first_lock,
+                first_analysis,
+                second_lock,
+                second_analysis,
+            ) {
+                continue;
             }
 
             return Err(ToolConflictError::ResourceConflict {
@@ -2860,11 +2894,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_same_file_write_file_and_edit_file_inside_one_turn() {
+    fn rejects_same_file_write_file_and_edit_file_even_with_read_between_them() {
         let calls = vec![
             PendingToolCall {
                 id: "call-a".to_string(),
                 name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "path": "web/features/skill-store/SkillStorePage.tsx"
+                }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
                 arguments: json!({
                     "path": "web/features/skill-store/SkillStorePage.tsx"
                 }),
@@ -3142,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_same_turn_file_read_write_conflicts() {
+    fn plans_same_file_read_then_edit_as_ordered_groups() {
         let calls = vec![
             PendingToolCall {
                 id: "call-a".to_string(),
@@ -3160,23 +3201,138 @@ mod tests {
             },
         ];
 
-        let error = plan_tool_execution(&calls).expect_err("conflict");
+        let plan = plan_tool_execution(&calls).expect("plan");
 
         assert_eq!(
-            error,
-            ToolConflictError::ResourceConflict {
-                resource: ToolResource::File(
-                    "web/features/skill-store/skillstorepage.tsx".to_string()
-                ),
-                display_path: Some("web/features/skill-store/SkillStorePage.tsx".to_string()),
-                first_call_id: "call-a".to_string(),
-                first_access: ToolResourceAccess::Read,
-                second_call_id: "call-b".to_string(),
-                second_access: ToolResourceAccess::Write,
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ]
             }
         );
-        assert!(error.to_string().contains("SkillStorePage.tsx"));
-        assert!(!error.to_string().contains("skillstorepage.tsx"));
+    }
+
+    #[test]
+    fn plans_same_file_write_then_read_as_ordered_groups() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-write".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-read".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": ".\\SRC\\main.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn plans_same_file_read_write_read_as_three_ordered_groups() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-read-before".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-unrelated-before".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/lib.rs" }),
+            },
+            PendingToolCall {
+                id: "call-write".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-read-after".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-unrelated-after".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/other.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0, 1],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![2],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![3, 4],
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn plans_independent_file_read_and_write_in_one_parallel_group() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-read".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/a.rs" }),
+            },
+            PendingToolCall {
+                id: "call-write".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/b.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1],
+                }]
+            }
+        );
     }
 
     #[test]
@@ -3251,31 +3407,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workspace_read_with_parallel_file_write() {
+    fn plans_file_write_before_workspace_read_as_ordered_groups() {
         let calls = vec![
             PendingToolCall {
-                id: "call-a".to_string(),
+                id: "call-write".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-search".to_string(),
+                name: SEARCH_TEXT_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "needle", "path": "." }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn plans_workspace_reads_before_file_write_as_ordered_groups() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-search".to_string(),
                 name: SEARCH_TEXT_TOOL_NAME.to_string(),
                 arguments: json!({ "query": "needle", "path": "." }),
             },
             PendingToolCall {
-                id: "call-b".to_string(),
+                id: "call-find".to_string(),
+                name: FIND_FILES_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "." }),
+            },
+            PendingToolCall {
+                id: "call-graph".to_string(),
+                name: GRAPH_EXPLORE_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "plan_tool_execution" }),
+            },
+            PendingToolCall {
+                id: "call-write".to_string(),
                 name: WRITE_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": "src/main.rs" }),
             },
         ];
 
-        let error = plan_tool_execution(&calls).expect_err("conflict");
+        let plan = plan_tool_execution(&calls).expect("plan");
 
         assert_eq!(
-            error,
-            ToolConflictError::ResourceConflict {
-                resource: ToolResource::WorkspaceFiles,
-                display_path: None,
-                first_call_id: "call-a".to_string(),
-                first_access: ToolResourceAccess::Read,
-                second_call_id: "call-b".to_string(),
-                second_access: ToolResourceAccess::Write,
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0, 1, 2],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![3],
+                    },
+                ]
             }
         );
     }
