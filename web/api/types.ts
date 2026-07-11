@@ -2133,9 +2133,40 @@ export type AiRequestAuditSummary = {
   invalidatedReason: string | null;
 };
 
+export type ProviderWireRequestDump = {
+  body?: string;
+  bodyEncoding?: string;
+  format: "provider_request_v1";
+  headers: Record<string, string>;
+  method: string;
+  url: string;
+  version: number;
+};
+
+export type ProviderFinalResponseDump =
+  | {
+      format: "provider_final_response_v1";
+      reasoning: string | null;
+      responseId: string | null;
+      state: "succeeded";
+      stopReason: string | null;
+      text: string;
+      toolCalls: JsonValue[];
+      usage: JsonValue | null;
+      version: number;
+    }
+  | {
+      error: string;
+      format: "provider_final_response_v1";
+      partial: boolean;
+      state: "failed";
+      statusCode: number | null;
+      version: number;
+    };
+
 export type AiRequestAuditDetail = AiRequestAuditSummary & {
-  requestBody: JsonValue | null;
-  responseBody: JsonValue | null;
+  requestBody: JsonValue | ProviderWireRequestDump | null;
+  responseBody: JsonValue | ProviderFinalResponseDump | null;
 };
 
 type AiStatisticsTrendPoint = {

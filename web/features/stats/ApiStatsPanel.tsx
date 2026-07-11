@@ -37,6 +37,8 @@ import type {
   AiStatsFilterState,
   AppLanguageId,
   JsonValue,
+  ProviderFinalResponseDump,
+  ProviderWireRequestDump,
   SettingsResponse,
   Translate,
   WorkspaceSummary,
@@ -971,21 +973,16 @@ function AiRequestDetailDialog({
                 ) : null}
               </div>
               <div className="grid gap-4 xl:grid-cols-2">
-                <AuditJsonBlock
+                <ProviderRequestDetail
                   copied={copiedKey === "request"}
-                  label={t("Request body")}
-                  onCopy={() =>
-                    onCopy("request", auditJsonText(request.requestBody))
-                  }
-                  value={request.requestBody}
+                  onCopy={(text) => onCopy("request", text)}
+                  requestBody={request.requestBody}
                 />
-                <AuditJsonBlock
+                <ProviderResponseDetail
                   copied={copiedKey === "response"}
-                  label={t("Response body")}
-                  onCopy={() =>
-                    onCopy("response", auditJsonText(request.responseBody))
-                  }
-                  value={request.responseBody}
+                  finalState={request.finalState}
+                  onCopy={(text) => onCopy("response", text)}
+                  responseBody={request.responseBody}
                 />
               </div>
             </div>
@@ -994,6 +991,258 @@ function AiRequestDetailDialog({
       </section>
     </div>
   );
+}
+
+function ProviderRequestDetail({
+  copied,
+  onCopy,
+  requestBody,
+}: {
+  copied: boolean;
+  onCopy: (text: string) => void;
+  requestBody: JsonValue | ProviderWireRequestDump | null;
+}) {
+  const { t } = useI18n();
+  if (!isProviderWireRequestDump(requestBody)) {
+    return (
+      <AuditDetailCard
+        notice={
+          requestBody === null
+            ? t("Request detail is pending or was pruned.")
+            : t(
+                "Legacy normalized record. Request is not the actual provider payload.",
+              )
+        }
+        noticeTone={requestBody === null ? "neutral" : "warning"}
+        title={t("Request body")}
+      >
+        <AuditJsonBlock
+          copied={copied}
+          label={t("Request body")}
+          onCopy={() => onCopy(auditJsonText(requestBody))}
+          value={requestBody}
+        />
+      </AuditDetailCard>
+    );
+  }
+
+  const bodyValue = parseProviderBody(requestBody.body);
+  return (
+    <AuditDetailCard title={t("Actual provider request")}>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <AuditMeta label={t("HTTP method")} value={requestBody.method} />
+        <AuditMeta label={t("Provider URL")} value={requestBody.url} />
+      </div>
+      <AuditJsonBlock
+        copied={false}
+        label={t("Redacted headers")}
+        onCopy={() => onCopy(auditJsonText(requestBody.headers))}
+        value={requestBody.headers}
+      />
+      <AuditJsonBlock
+        copied={copied}
+        label={t("Request body")}
+        onCopy={() => onCopy(requestBody.body ?? "")}
+        value={bodyValue}
+      />
+    </AuditDetailCard>
+  );
+}
+
+function ProviderResponseDetail({
+  copied,
+  finalState,
+  onCopy,
+  responseBody,
+}: {
+  copied: boolean;
+  finalState: string;
+  onCopy: (text: string) => void;
+  responseBody: JsonValue | ProviderFinalResponseDump | null;
+}) {
+  const { t } = useI18n();
+  if (!isProviderFinalResponseDump(responseBody)) {
+    const pruned = responseBody === null && finalState !== "running";
+    return (
+      <AuditDetailCard
+        notice={
+          responseBody === null
+            ? pruned
+              ? t("Final response detail is unavailable or was pruned.")
+              : t("Waiting for the final provider response...")
+            : t("Legacy normalized response record.")
+        }
+        noticeTone={responseBody === null ? "neutral" : "warning"}
+        title={t("Response body")}
+      >
+        <AuditJsonBlock
+          copied={copied}
+          label={t("Response body")}
+          onCopy={() => onCopy(auditJsonText(responseBody))}
+          value={responseBody}
+        />
+      </AuditDetailCard>
+    );
+  }
+
+  if (responseBody.state === "failed") {
+    return (
+      <AuditDetailCard
+        notice={
+          responseBody.partial
+            ? t("The stream ended before a complete response was received.")
+            : t("The provider request failed.")
+        }
+        noticeTone="error"
+        title={t("Final provider response")}
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <AuditMeta label={t("State")} value={t("Failed")} />
+          <AuditMeta
+            label={t("HTTP status")}
+            value={responseBody.statusCode?.toString() ?? "n/a"}
+          />
+        </div>
+        <AuditTextBlock
+          copied={copied}
+          label={t("Final error")}
+          onCopy={() => onCopy(responseBody.error)}
+          value={responseBody.error}
+        />
+      </AuditDetailCard>
+    );
+  }
+
+  return (
+    <AuditDetailCard title={t("Final provider response")}>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <AuditMeta
+          label={t("Stop reason")}
+          value={responseBody.stopReason ?? "n/a"}
+        />
+        <AuditMeta
+          label={t("Response ID")}
+          value={responseBody.responseId ?? "n/a"}
+        />
+      </div>
+      <AuditTextBlock
+        copied={copied}
+        label={t("Final text")}
+        onCopy={() => onCopy(responseBody.text)}
+        value={responseBody.text}
+      />
+      {responseBody.reasoning ? (
+        <AuditTextBlock
+          copied={false}
+          label={t("Final reasoning")}
+          onCopy={() => onCopy(responseBody.reasoning ?? "")}
+          value={responseBody.reasoning}
+        />
+      ) : null}
+      <AuditJsonBlock
+        copied={false}
+        label={t("Tool calls")}
+        onCopy={() => onCopy(auditJsonText(responseBody.toolCalls))}
+        value={responseBody.toolCalls}
+      />
+      <AuditJsonBlock
+        copied={false}
+        label={t("Usage")}
+        onCopy={() => onCopy(auditJsonText(responseBody.usage))}
+        value={responseBody.usage}
+      />
+    </AuditDetailCard>
+  );
+}
+
+function AuditDetailCard({
+  children,
+  notice,
+  noticeTone = "neutral",
+  title,
+}: {
+  children: ReactNode;
+  notice?: string;
+  noticeTone?: "error" | "neutral" | "warning";
+  title: string;
+}) {
+  const noticeClass =
+    noticeTone === "error"
+      ? "border-rose-200 bg-rose-50 text-rose-700"
+      : noticeTone === "warning"
+        ? "border-amber-200 bg-amber-50 text-amber-800"
+        : "border-stone-200 bg-stone-50 text-stone-600";
+  return (
+    <section className="grid min-w-0 content-start gap-3 rounded-xl border border-stone-200 bg-white p-3">
+      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+      {notice ? (
+        <div className={`rounded-lg border px-3 py-2 text-xs ${noticeClass}`}>
+          {notice}
+        </div>
+      ) : null}
+      {children}
+    </section>
+  );
+}
+
+function AuditTextBlock({
+  copied,
+  label,
+  onCopy,
+  value,
+}: {
+  copied: boolean;
+  label: string;
+  onCopy: () => void;
+  value: string;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="audit-json-block min-w-0 rounded-xl border border-stone-200 bg-stone-950 text-stone-100 shadow-sm">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-800 px-3 py-2">
+        <span className="text-xs font-semibold text-stone-300">{label}</span>
+        <button
+          aria-label={t("Copy {{label}}", { label })}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-stone-300 hover:bg-stone-800 hover:text-white"
+          onClick={onCopy}
+          type="button"
+        >
+          <Copy aria-hidden="true" className="size-3.5" />
+          {copied ? t("Copied") : t("Copy")}
+        </button>
+      </div>
+      <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words px-3 py-3 text-xs leading-5">
+        {value || t("No content")}
+      </pre>
+    </div>
+  );
+}
+
+function isProviderWireRequestDump(
+  value: JsonValue | ProviderWireRequestDump | null,
+): value is ProviderWireRequestDump {
+  return isJsonObject(value) && value.format === "provider_request_v1";
+}
+
+function isProviderFinalResponseDump(
+  value: JsonValue | ProviderFinalResponseDump | null,
+): value is ProviderFinalResponseDump {
+  return isJsonObject(value) && value.format === "provider_final_response_v1";
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseProviderBody(body: string | undefined): JsonValue | null {
+  if (!body) {
+    return null;
+  }
+  try {
+    return JSON.parse(body) as JsonValue;
+  } catch {
+    return body;
+  }
 }
 
 function AuditMeta({ label, value }: { label: string; value: string }) {

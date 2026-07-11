@@ -3724,8 +3724,20 @@ describe("app-panels-stats verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", {
       name: "Request details",
     });
-    expect(within(dialog).getByText("Request body")).toBeInTheDocument();
-    expect(within(dialog).getByText("Response body")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Actual provider request"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Final provider response"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("POST")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("https://api.example.test/v1/responses"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText('"authorization"')).toBeInTheDocument();
+    expect(within(dialog).getByText('"[REDACTED]"')).toBeInTheDocument();
+    expect(within(dialog).getByText("Done.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Finished reasoning.")).toBeInTheDocument();
     expect(within(dialog).queryByText("Invalidated")).not.toBeInTheDocument();
     expect(
       within(dialog).queryByText("Invalidated reason"),
@@ -3736,7 +3748,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(requestBodyBlock).not.toBeNull();
     const requestBodyViewer = requestBodyBlock as HTMLElement;
     expect(requestBodyViewer).toHaveClass("audit-json-block");
-    expect(within(requestBodyViewer).getByText('"messages"')).toHaveClass(
+    expect(within(requestBodyViewer).getByText('"input"')).toHaveClass(
       "audit-json-token-key",
     );
     await userEvent.click(
@@ -3744,15 +3756,13 @@ describe("app-panels-stats verification surfaces", () => {
         name: "Collapse all Request body",
       }),
     );
-    expect(
-      within(requestBodyViewer).queryByText('"messages"'),
-    ).not.toBeInTheDocument();
+    expect(within(requestBodyViewer).queryByText('"input"')).not.toBeInTheDocument();
     await userEvent.click(
       within(requestBodyViewer).getByRole("button", {
         name: "Expand all Request body",
       }),
     );
-    expect(within(requestBodyViewer).getByText('"messages"')).toHaveClass(
+    expect(within(requestBodyViewer).getByText('"input"')).toHaveClass(
       "audit-json-token-key",
     );
     expect(within(dialog).queryByText("Stream events")).not.toBeInTheDocument();
@@ -4044,8 +4054,9 @@ describe("app-panels-stats verification surfaces", () => {
     ).toHaveAttribute("aria-current", "page");
   });
 
-  it("localizes running status in API request details", async () => {
+  it("polls running API request details every second until the final response arrives", async () => {
     const fetchMock = vi.mocked(fetch);
+    let detailCalls = 0;
     fetchMock.mockImplementation((input, init) => {
       const rawPath =
         typeof input === "string"
@@ -4082,12 +4093,15 @@ describe("app-panels-stats verification surfaces", () => {
       }
 
       if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        detailCalls += 1;
+        const isFinal = detailCalls >= 2;
         return Promise.resolve(
           jsonResponse({
             ...aiStatisticsDetail,
             request: {
               ...aiStatisticsDetail.request,
-              finalState: "running",
+              finalState: isFinal ? "succeeded" : "running",
+              responseBody: isFinal ? aiStatisticsDetail.request.responseBody : null,
             },
           }),
         );
@@ -4108,6 +4122,97 @@ describe("app-panels-stats verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", { name: "请求详情" });
     expect(within(dialog).getByText("状态")).toBeInTheDocument();
     expect(within(dialog).getByText("运行中")).toBeInTheDocument();
+    expect(within(dialog).getByText("正在等待供应商最终响应……")).toBeInTheDocument();
+    await waitFor(
+      () => {
+        expect(detailCalls).toBeGreaterThanOrEqual(2);
+        expect(within(dialog).getByText("供应商最终响应")).toBeInTheDocument();
+        expect(within(dialog).getByText("Done.")).toBeInTheDocument();
+      },
+      { timeout: 2500 },
+    );
+  });
+
+  it("distinguishes legacy, failed partial, and pruned API request details", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let detailMode: "failed" | "legacy" | "pruned" = "legacy";
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        const request =
+          detailMode === "legacy"
+            ? {
+                ...aiStatisticsDetail.request,
+                requestBody: { messages: [{ content: "legacy" }] },
+                responseBody: { text: "legacy response" },
+              }
+            : detailMode === "failed"
+              ? {
+                  ...aiStatisticsDetail.request,
+                  finalState: "failed",
+                  responseBody: {
+                    error: "connection reset",
+                    format: "provider_final_response_v1",
+                    partial: true,
+                    state: "failed",
+                    statusCode: 502,
+                    version: 1,
+                  },
+                }
+              : {
+                  ...aiStatisticsDetail.request,
+                  finalState: "succeeded",
+                  requestBody: null,
+                  responseBody: null,
+                };
+        return Promise.resolve(jsonResponse({ ...aiStatisticsDetail, request }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+    let dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(
+      within(dialog).getByText(
+        "Legacy normalized record. Request is not the actual provider payload.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Legacy normalized response record.")).toBeInTheDocument();
+
+    fireEvent.click(dialog.parentElement as HTMLElement);
+    detailMode = "failed";
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+    dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(
+      within(dialog).getByText(
+        "The stream ended before a complete response was received.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("connection reset")).toBeInTheDocument();
+    expect(within(dialog).getByText("502")).toBeInTheDocument();
+
+    fireEvent.click(dialog.parentElement as HTMLElement);
+    detailMode = "pruned";
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+    dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(
+      within(dialog).getByText("Request detail is pending or was pruned."),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Final response detail is unavailable or was pruned."),
+    ).toBeInTheDocument();
   });
 
   it("loads saved API request audit column settings", async () => {

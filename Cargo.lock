@@ -908,6 +908,7 @@ dependencies = [
 name = "foco-providers"
 version = "0.1.26"
 dependencies = [
+ "base64",
  "futures-util",
  "genai",
  "reqwest",

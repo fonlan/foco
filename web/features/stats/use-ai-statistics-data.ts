@@ -9,6 +9,7 @@ import type {
 } from "../../api/types";
 
 const AI_STATS_POLL_INTERVAL_MS = 5000;
+const AI_REQUEST_DETAIL_POLL_INTERVAL_MS = 1000;
 
 export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
   return {
@@ -44,6 +45,7 @@ export function useAiStatisticsData(
   const filtersRef = useRef(filters);
   const statsRef = useRef<AiStatisticsResponse | null>(null);
   const isStatsRequestInFlightRef = useRef(false);
+  const isDetailRequestInFlightRef = useRef(false);
   const shouldReloadStatsAfterCurrentRequestRef = useRef(false);
   const copiedTimerRef = useRef<number | null>(null);
 
@@ -52,6 +54,10 @@ export function useAiStatisticsData(
 
   const loadRequestDetail = useCallback(
     async (request: AiRequestAuditSummary, showLoading: boolean) => {
+      if (isDetailRequestInFlightRef.current) {
+        return;
+      }
+      isDetailRequestInFlightRef.current = true;
       setDetailError(null);
       if (showLoading) {
         setDetail(null);
@@ -65,10 +71,16 @@ export function useAiStatisticsData(
             request.workspaceId,
           )}/ai-statistics/${encodeURIComponent(request.id)}`,
         );
-        setDetail(data);
+        if (selectedRequestRef.current?.id === request.id) {
+          setDetail(data);
+          selectedRequestRef.current = data.request;
+        }
       } catch (requestError) {
-        setDetailError(errorMessage(requestError));
+        if (selectedRequestRef.current?.id === request.id) {
+          setDetailError(errorMessage(requestError));
+        }
       } finally {
+        isDetailRequestInFlightRef.current = false;
         if (showLoading) {
           setIsLoadingDetail(false);
         }
@@ -168,6 +180,23 @@ export function useAiStatisticsData(
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [loadStats]);
+
+  useEffect(() => {
+    const selectedRequest = selectedRequestRef.current;
+    if (!selectedRequest || detail?.request.finalState !== "running") {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      const current = selectedRequestRef.current;
+      if (!current || !isAiStatsDocumentVisible()) {
+        return;
+      }
+      void loadRequestDetail(current, false);
+    }, AI_REQUEST_DETAIL_POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [detail?.request.finalState, loadRequestDetail]);
 
   useEffect(() => {
     return () => {

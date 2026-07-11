@@ -1184,8 +1184,31 @@ export const aiStatisticsDetail = {
   ],
   request: {
     ...aiStatistics.requests[0],
-    requestBody: { messages: [{ content: "Hello", role: "user" }] },
-    responseBody: { text: "Done." },
+    requestBody: {
+      body: JSON.stringify({
+        input: [{ content: "Hello", role: "user" }],
+        model: "gpt-test",
+      }),
+      format: "provider_request_v1",
+      headers: {
+        authorization: "[REDACTED]",
+        "content-type": "application/json",
+      },
+      method: "POST",
+      url: "https://api.example.test/v1/responses",
+      version: 1,
+    },
+    responseBody: {
+      format: "provider_final_response_v1",
+      reasoning: "Finished reasoning.",
+      responseId: "resp-test",
+      state: "succeeded",
+      stopReason: "stop",
+      text: "Done.",
+      toolCalls: [],
+      usage: { inputTokens: 3, outputTokens: 2 },
+      version: 1,
+    },
   },
 };
 
