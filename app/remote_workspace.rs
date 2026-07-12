@@ -12802,6 +12802,122 @@ mod tests {
     }
 
     #[test]
+    fn finish_broker_llm_audit_persists_cancelled_compact_and_captured_responses() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let cases = [
+            ("cancel-compact", None, None, false, false),
+            (
+                "cancel-versioned",
+                Some(foco_providers::ProviderFinalResponseDump::failed(
+                    "broker request cancelled",
+                    None,
+                    false,
+                )),
+                Some(false),
+                true,
+                false,
+            ),
+            (
+                "cancel-partial",
+                Some(foco_providers::ProviderFinalResponseDump::failed(
+                    "broker request cancelled",
+                    None,
+                    true,
+                )),
+                Some(true),
+                true,
+                true,
+            ),
+        ];
+
+        for (request_id, captured_dump, expected_partial, capture_details, has_first_token) in cases
+        {
+            let context = BrokerLlmAuditContext {
+                audit_path: workspace.path().to_path_buf(),
+                workspace_id: "remote-ws".to_string(),
+                chat_id: Some("chat-1".to_string()),
+                chat_title: Some("Remote chat".to_string()),
+                request_id: request_id.to_string(),
+                request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
+            };
+            insert_broker_llm_audit_start(
+                &context,
+                "provider-1",
+                "model-1",
+                None,
+                "2026-07-12T00:00:00Z",
+            );
+            let capture = ProviderAuditCapture::new(workspace.path(), request_id, capture_details);
+            let captured_response_body_json = captured_dump.as_ref().map(|dump| {
+                capture
+                    .response_json(Some(dump))
+                    .expect("serialize captured response")
+                    .expect("captured response detail")
+            });
+            let cancel_audit = broker_llm_cancellation_audit_outcome(
+                BROKER_DEFAULT_LLM_REQUEST_KIND,
+                true,
+                captured_response_body_json,
+                "broker request cancelled",
+            );
+            finish_broker_llm_audit(
+                Some(&context),
+                BrokerLlmAuditOutcome {
+                    final_state: cancel_audit.final_state,
+                    first_token_at: has_first_token.then_some("2026-07-12T00:00:01Z"),
+                    completed_at: "2026-07-12T00:00:02Z",
+                    usage: None,
+                    first_token_latency_ms: has_first_token.then_some(1000),
+                    total_latency_ms: 2000,
+                    status_code: None,
+                    response_body_json: cancel_audit.response_body_json.as_deref(),
+                },
+                &[],
+            );
+
+            let request = WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("audit db")
+                .llm_request(request_id)
+                .expect("request lookup")
+                .expect("persisted request");
+            assert_eq!(request.final_state, "cancelled");
+            let response = serde_json::from_str::<Value>(
+                request
+                    .response_body_json
+                    .as_deref()
+                    .expect("persisted cancelled response"),
+            )
+            .expect("valid cancelled response JSON");
+            if let Some(expected_partial) = expected_partial {
+                assert_eq!(response["format"], "provider_final_response_v1");
+                assert_eq!(response["state"], "failed");
+                assert_eq!(response["partial"], expected_partial);
+            } else {
+                assert_eq!(response, json!({ "cancelled": "broker request cancelled" }));
+            }
+        }
+    }
+
+    #[test]
+    fn broker_non_cancel_failures_remain_failed() {
+        for message in [
+            "provider request timed out",
+            "remote sidecar disconnected",
+            "provider stream failed",
+            "Runtime progress guard detected a repeated reasoning loop",
+        ] {
+            let outcome = broker_llm_cancellation_audit_outcome(
+                BROKER_DEFAULT_LLM_REQUEST_KIND,
+                false,
+                None,
+                message,
+            );
+            assert_eq!(outcome.final_state, "failed", "message: {message}");
+            assert_eq!(outcome.response_body_json, None, "message: {message}");
+        }
+    }
+
+    #[test]
     fn remote_sidecar_broker_error_audit_contract_uses_only_structured_cancel_code() {
         let cancelled = remote_sidecar_broker_error_audit_outcome(
             &json!({ "code": "cancelled", "message": "broker request cancelled" }),
