@@ -1938,11 +1938,15 @@ fn persist_llm_request(
                     total_latency_ms: Some(request.outcome.total_latency_ms),
                     status_code: request.outcome.status_code,
                     final_state: request.outcome.final_state,
-                    response_body_json: request
-                        .outcome
-                        .response_body_json
-                        .as_deref()
-                        .and_then(|value| api_audit_detail_json(value, save_details)),
+                    response_body_json: request.outcome.response_body_json.as_deref().and_then(
+                        |value| {
+                            persistable_audit_response_body_json(
+                                value,
+                                save_details,
+                                request.outcome.final_state,
+                            )
+                        },
+                    ),
                 },
             )
             .map_err(ApiError::from_workspace_error)?;
@@ -1985,11 +1989,15 @@ fn persist_llm_request(
                 request_body_json: (!request.request_body_json.is_empty())
                     .then(|| request.request_body_json.as_str())
                     .and_then(|value| api_audit_detail_json(value, save_details)),
-                response_body_json: request
-                    .outcome
-                    .response_body_json
-                    .as_deref()
-                    .and_then(|value| api_audit_detail_json(value, save_details)),
+                response_body_json: request.outcome.response_body_json.as_deref().and_then(
+                    |value| {
+                        persistable_audit_response_body_json(
+                            value,
+                            save_details,
+                            request.outcome.final_state,
+                        )
+                    },
+                ),
             })
             .map_err(ApiError::from_workspace_error)?;
         persist_llm_request_events(database, &request.id, &request.events, 0, save_details)

@@ -6543,6 +6543,31 @@ pub(crate) fn api_audit_detail_json<'a>(value: &'a str, save_details: bool) -> O
     save_details.then_some(value)
 }
 
+/// Response-body gate for audit persistence.
+///
+/// Unlike [`api_audit_detail_json`], cancelled finals keep a compact
+/// `{"cancelled": ...}` payload even when request/response detail capture is off.
+pub(crate) fn persistable_audit_response_body_json<'a>(
+    value: &'a str,
+    save_details: bool,
+    final_state: &str,
+) -> Option<&'a str> {
+    if save_details {
+        return Some(value);
+    }
+    if final_state == "cancelled" && is_compact_cancelled_audit_response(value) {
+        return Some(value);
+    }
+    None
+}
+
+fn is_compact_cancelled_audit_response(value: &str) -> bool {
+    match serde_json::from_str::<Value>(value) {
+        Ok(Value::Object(map)) => map.contains_key("cancelled"),
+        _ => false,
+    }
+}
+
 pub(crate) fn compact_audit_events(
     events: &[CapturedAuditEvent],
     save_details: bool,

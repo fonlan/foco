@@ -11369,7 +11369,18 @@ fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
 
 #[test]
 fn persist_chat_result_writes_cancelled_captured_llm_request() {
-    let workspace_dir = env::temp_dir().join(unique_id("foco-cancelled-audit-request-test"));
+    persist_chat_result_writes_cancelled_captured_llm_request_with_details(false);
+}
+
+#[test]
+fn persist_chat_result_writes_cancelled_captured_llm_request_with_details_enabled() {
+    persist_chat_result_writes_cancelled_captured_llm_request_with_details(true);
+}
+
+fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_details: bool) {
+    let workspace_dir = env::temp_dir().join(unique_id(&format!(
+        "foco-cancelled-audit-request-test-{save_details}"
+    )));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     {
         let mut database =
@@ -11388,6 +11399,11 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
         vec![PromptContextSource::StoredMessage { sequence: 0 }],
         984,
     );
+    context
+        .global_config
+        .app
+        .api_audit
+        .save_request_response_details = save_details;
     context.llm_request_id = "run-1".to_string();
     let turn_events = vec![CapturedAuditEvent {
         event_at: "2026-06-06T09:00:00Z".to_string(),
@@ -11407,7 +11423,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
         id: "llm-succeeded".to_string(),
         request_kind: "chat completion",
         request_started_at: "2026-06-06T08:59:00Z".to_string(),
-        request_body_json: "{}".to_string(),
+        request_body_json: r#"{"request":"wire"}"#.to_string(),
         events: Vec::new(),
         outcome: ChatAuditOutcome {
             first_token_at: Some("2026-06-06T08:59:00Z".to_string()),
@@ -11421,10 +11437,10 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
             reasoning_tokens: None,
             status_code: Some(200),
             final_state: "succeeded",
-            response_body_json: Some("{}".to_string()),
+            response_body_json: Some(r#"{"response":"wire"}"#.to_string()),
         },
     });
-    let capture = ProviderAuditCapture::new(&workspace_dir, "llm-cancelled", false);
+    let capture = ProviderAuditCapture::new(&workspace_dir, "llm-cancelled", save_details);
     context.capture_cancelled_llm_request(
         &capture,
         "llm-cancelled",
@@ -11453,18 +11469,48 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
             .expect("run audit lookup")
             .is_none()
     );
+    let succeeded_request = database
+        .llm_request("llm-succeeded")
+        .expect("succeeded request lookup")
+        .expect("succeeded request");
     let cancelled_request = database
         .llm_request("llm-cancelled")
         .expect("cancelled request lookup")
         .expect("cancelled request");
     assert_eq!(cancelled_request.final_state, "cancelled");
+    let cancelled_response = cancelled_request
+        .response_body_json
+        .as_deref()
+        .expect("cancelled response json must not be NULL");
     assert!(
-        cancelled_request
-            .response_body_json
-            .as_deref()
-            .expect("cancelled response json")
-            .contains("chat run cancelled")
+        cancelled_response.contains("chat run cancelled"),
+        "cancelled response should retain cancel reason: {cancelled_response}"
     );
+    if save_details {
+        assert_eq!(
+            succeeded_request.request_body_json.as_deref(),
+            Some(r#"{"request":"wire"}"#)
+        );
+        assert_eq!(
+            succeeded_request.response_body_json.as_deref(),
+            Some(r#"{"response":"wire"}"#)
+        );
+        // Details on: capture may upgrade to versioned failed response; either form is fine.
+        assert!(
+            cancelled_response.contains("chat run cancelled")
+                || cancelled_response.contains("provider_final_response_v1"),
+            "details-enabled cancelled response should keep cancel signal: {cancelled_response}"
+        );
+    } else {
+        assert!(succeeded_request.request_body_json.is_none());
+        assert!(succeeded_request.response_body_json.is_none());
+        let cancelled_value: Value =
+            serde_json::from_str(cancelled_response).expect("compact cancelled json");
+        assert_eq!(
+            cancelled_value.get("cancelled").and_then(Value::as_str),
+            Some("chat run cancelled")
+        );
+    }
     assert_eq!(
         database
             .llm_request_audit_count(LlmRequestAuditFilters {
@@ -11477,6 +11523,33 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn persistable_audit_response_body_json_keeps_compact_cancelled_when_details_off() {
+    let compact = r#"{"cancelled":"chat run cancelled"}"#;
+    let wire = r#"{"format":"provider_final_response_v1","error":{"message":"x"}}"#;
+    assert_eq!(
+        persistable_audit_response_body_json(compact, false, "cancelled"),
+        Some(compact)
+    );
+    assert_eq!(
+        persistable_audit_response_body_json(wire, false, "failed"),
+        None
+    );
+    assert_eq!(
+        persistable_audit_response_body_json(wire, true, "failed"),
+        Some(wire)
+    );
+    assert_eq!(
+        persistable_audit_response_body_json(compact, true, "cancelled"),
+        Some(compact)
+    );
+    // Non-compact cancelled payloads stay gated when details are off.
+    assert_eq!(
+        persistable_audit_response_body_json(wire, false, "cancelled"),
+        None
+    );
 }
 
 #[test]
