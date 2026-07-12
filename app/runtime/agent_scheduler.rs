@@ -766,10 +766,7 @@ async fn run_coordinator_task_inner(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
-    chat_context
-        .provider_request
-        .tools
-        .retain(|tool| allowed_tools.contains(&tool.name));
+    retain_agent_snapshot_tools(&mut chat_context.provider_request.tools, &allowed_tools);
     let collaboration_permissions = if task_input.collaboration_tools_enabled {
         instance.definition_snapshot.permissions.clone()
     } else {
@@ -1439,6 +1436,13 @@ fn neutral_agent_message(role: NeutralChatRole, content: String) -> NeutralChatM
         tool_call_id: None,
         tool_name: None,
     }
+}
+
+pub(crate) fn retain_agent_snapshot_tools(
+    tools: &mut Vec<foco_providers::NeutralToolDefinition>,
+    allowed_tools: &HashSet<String>,
+) {
+    tools.retain(|tool| allowed_tools.contains(&tool.name));
 }
 
 fn append_agent_collaboration_tools(

@@ -1,7 +1,10 @@
 use super::*;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, convert::Infallible};
+use std::{
+    collections::{BTreeSet, HashSet},
+    convert::Infallible,
+};
 
 use crate::runtime::agent_run_event_kind;
 use axum::{
@@ -8413,6 +8416,262 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
     );
     assert_eq!(user_metadata["queuedRun"]["assistantSequence"], json!(1));
     drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+async fn prepare_existing_chat_prompt_context_for_mode(
+    state: &AppState,
+    config: &GlobalConfig,
+    chat_id: &str,
+    session_mode: Option<&str>,
+    message: &str,
+) -> PreparedPromptContext {
+    prepare_prompt_context(
+        state,
+        config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: Some(chat_id.to_string()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: session_mode.map(str::to_string),
+            message: Some(message.to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ChatRun,
+    )
+    .await
+    .expect("prepare existing chat prompt context")
+}
+
+fn prompt_context_tool_names(context: &PreparedPromptContext) -> BTreeSet<String> {
+    context
+        .provider_request
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn retain_snapshot_and_collect_tool_names(
+    context: &mut PreparedPromptContext,
+    allowed_tools: &HashSet<String>,
+) -> BTreeSet<String> {
+    crate::runtime::retain_agent_snapshot_tools(&mut context.provider_request.tools, allowed_tools);
+    prompt_context_tool_names(context)
+}
+
+#[tokio::test]
+async fn plan_started_default_team_restores_runtime_tools_across_mode_switches() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-agent-tool-switch-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-agent-tool-switch-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.memory.enabled = true;
+    config.mcp.servers.push(McpServerConfig {
+        id: "docs".to_string(),
+        name: "Docs".to_string(),
+        enabled: true,
+        transport: "stdio".to_string(),
+        command: Some("test-mcp-server".to_string()),
+        args: Vec::new(),
+        url: None,
+        execution_host: foco_store::config::McpExecutionHost::Local,
+    });
+    let workspace_id = config.workspaces[0].id.clone();
+    let mcp_tool_name = "mcp__docs__search";
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let mcp_server = config.mcp.servers[0]
+        .to_definition()
+        .expect("mcp server definition");
+    state
+        .mcp_registry
+        .insert_test_server_tools(
+            mcp_server,
+            vec![McpToolDefinition {
+                name: mcp_tool_name.to_string(),
+                server_id: "docs".to_string(),
+                server_name: "Docs".to_string(),
+                original_name: "search".to_string(),
+                description: "Search docs.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            }],
+        )
+        .await;
+
+    let queued = crate::http::chat::queue_chat_message(
+        State(state.clone()),
+        AxumPath(workspace_id),
+        Json(QueueChatMessageRequest {
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: Some("plan".to_string()),
+            message: "Start by planning".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue Plan-started chat")
+    .0;
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let team = database
+        .agent_team_for_chat(&queued.chat_id)
+        .expect("team lookup")
+        .expect("default team");
+    assert_eq!(queued.agent_team_id.as_ref(), Some(&team.id));
+    let coordinator = database
+        .agent_instance(&team.coordinator_instance_id)
+        .expect("coordinator lookup")
+        .expect("default Coordinator");
+    let snapshot_tools = coordinator
+        .definition_snapshot
+        .allowed_tools
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let queued_task = database
+        .agent_task(queued.agent_task_id.as_ref().expect("queued task id"))
+        .expect("task lookup")
+        .expect("queued Coordinator task");
+    let task_input = serde_json::from_str::<CoordinatorTaskInput>(&queued_task.input_json)
+        .expect("Coordinator task input");
+    assert_eq!(task_input.session_mode.as_deref(), Some("plan"));
+    assert!(!task_input.collaboration_tools_enabled);
+    drop(database);
+
+    for tool_name in [
+        WRITE_FILE_TOOL,
+        EDIT_FILE_TOOL,
+        RUN_COMMAND_TOOL,
+        CREATE_TODO_GRAPH_TOOL,
+        UPDATE_TODO_GRAPH_TOOL,
+        MEMORY_WRITE_TOOL_NAME,
+        mcp_tool_name,
+    ] {
+        assert!(
+            snapshot_tools.contains(tool_name),
+            "new Plan-started default Coordinator snapshot should retain runtime tool {tool_name}"
+        );
+    }
+    for definition in foco_tools::agent_tool_definitions() {
+        assert!(
+            !snapshot_tools.contains(definition.name),
+            "default Coordinator snapshot must not absorb collaboration tool {}",
+            definition.name
+        );
+    }
+
+    let mutation_tools = [
+        WRITE_FILE_TOOL,
+        EDIT_FILE_TOOL,
+        RUN_COMMAND_TOOL,
+        CREATE_TODO_GRAPH_TOOL,
+        UPDATE_TODO_GRAPH_TOOL,
+        MEMORY_WRITE_TOOL_NAME,
+    ];
+
+    let mut first_plan = prepare_existing_chat_prompt_context_for_mode(
+        &state,
+        &config,
+        &queued.chat_id,
+        Some("plan"),
+        "Plan the change",
+    )
+    .await;
+    let first_plan_provider_tools = prompt_context_tool_names(&first_plan);
+    for tool_name in mutation_tools {
+        assert!(
+            !first_plan_provider_tools.contains(tool_name),
+            "Plan provider schema must exclude mutation tool {tool_name}"
+        );
+    }
+    assert!(first_plan_provider_tools.contains(MEMORY_SEARCH_TOOL_NAME));
+    assert!(first_plan_provider_tools.contains(mcp_tool_name));
+    let first_plan_effective_tools =
+        retain_snapshot_and_collect_tool_names(&mut first_plan, &snapshot_tools);
+    assert_eq!(first_plan_effective_tools, first_plan_provider_tools);
+
+    let mut first_normal = prepare_existing_chat_prompt_context_for_mode(
+        &state,
+        &config,
+        &queued.chat_id,
+        None,
+        "Implement the plan",
+    )
+    .await;
+    let first_normal_effective_tools =
+        retain_snapshot_and_collect_tool_names(&mut first_normal, &snapshot_tools);
+    for tool_name in mutation_tools {
+        assert!(
+            first_normal_effective_tools.contains(tool_name),
+            "normal follow-up should restore mutation tool {tool_name}"
+        );
+    }
+    assert!(first_normal_effective_tools.contains(mcp_tool_name));
+
+    let mut second_plan = prepare_existing_chat_prompt_context_for_mode(
+        &state,
+        &config,
+        &queued.chat_id,
+        Some("plan"),
+        "Revise the plan",
+    )
+    .await;
+    let second_plan_effective_tools =
+        retain_snapshot_and_collect_tool_names(&mut second_plan, &snapshot_tools);
+    for tool_name in mutation_tools {
+        assert!(
+            !second_plan_effective_tools.contains(tool_name),
+            "switching normal to Plan must narrow mutation tool {tool_name}"
+        );
+    }
+    assert!(second_plan_effective_tools.contains(MEMORY_SEARCH_TOOL_NAME));
+    assert!(second_plan_effective_tools.contains(mcp_tool_name));
+
+    let mut second_normal = prepare_existing_chat_prompt_context_for_mode(
+        &state,
+        &config,
+        &queued.chat_id,
+        None,
+        "Implement the revised plan",
+    )
+    .await;
+    let second_normal_effective_tools =
+        retain_snapshot_and_collect_tool_names(&mut second_normal, &snapshot_tools);
+    for tool_name in mutation_tools {
+        assert!(
+            second_normal_effective_tools.contains(tool_name),
+            "switching Plan back to normal must restore mutation tool {tool_name}"
+        );
+    }
+    assert!(second_normal_effective_tools.contains(mcp_tool_name));
+
+    drop(second_normal);
+    drop(second_plan);
+    drop(first_normal);
+    drop(first_plan);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
