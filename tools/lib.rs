@@ -2555,19 +2555,47 @@ mod tests {
             .as_array()
             .expect("update_spec required");
 
+        assert!(definition.strict);
+        assert_eq!(definition.input_schema["additionalProperties"], false);
         assert_eq!(
             properties["contentMarkdown"]["type"],
             json!(["string", "null"])
         );
         assert_eq!(properties["edits"]["type"], json!(["array", "null"]));
+        assert_eq!(properties["edits"]["items"]["additionalProperties"], false);
         assert_eq!(
             properties["edits"]["items"]["required"],
             json!(["oldText", "newText"])
         );
-        assert!(required.contains(&json!("contentMarkdown")));
-        assert!(required.contains(&json!("edits")));
+        assert_eq!(
+            properties["edits"]["items"]["properties"]["oldText"]["type"],
+            "string"
+        );
+        assert_eq!(
+            properties["edits"]["items"]["properties"]["newText"]["type"],
+            "string"
+        );
+        assert_eq!(
+            required,
+            &vec![
+                json!("expectedRevision"),
+                json!("contentMarkdown"),
+                json!("edits"),
+                json!("timeoutMs"),
+            ]
+        );
         assert!(definition.description.contains("Call read_spec first"));
+        assert!(
+            definition
+                .description
+                .contains("latest revision and exact content")
+        );
         assert!(definition.description.contains("Prefer edits"));
+        assert!(
+            definition
+                .description
+                .contains("exactly one non-null update payload")
+        );
     }
 
     #[test]
@@ -2631,6 +2659,7 @@ mod tests {
             json!({
                 "expectedRevision": 1,
                 "contentMarkdown": "# Project Spec\n\nVersion two",
+                "edits": null,
                 "timeoutMs": null
             }),
         );
@@ -2659,6 +2688,57 @@ mod tests {
             read_back.output["contentMarkdown"],
             second_update.output["contentMarkdown"]
         );
+    }
+
+    #[test]
+    fn update_spec_applies_single_edit_and_deletes_text() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let initial = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Spec\n\nKeep\nRemove me",
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!initial.is_error);
+
+        let single_edit = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "Keep", "newText": "Keep updated" }],
+                "timeoutMs": null
+            }),
+        );
+        assert!(!single_edit.is_error, "{}", single_edit.output);
+        assert_eq!(single_edit.output["revision"], 2);
+        assert_eq!(single_edit.output["editCount"], 1);
+        assert_eq!(
+            single_edit.output["contentMarkdown"],
+            "# Spec\n\nKeep updated\nRemove me"
+        );
+
+        let deletion = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 2,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "\nRemove me", "newText": "" }],
+                "timeoutMs": null
+            }),
+        );
+        assert!(!deletion.is_error, "{}", deletion.output);
+        assert_eq!(deletion.output["revision"], 3);
+        assert_eq!(deletion.output["editCount"], 1);
+        assert_eq!(deletion.output["lineCountBefore"], 4);
+        assert_eq!(deletion.output["lineCountAfter"], 3);
+        assert_eq!(deletion.output["contentMarkdown"], "# Spec\n\nKeep updated");
     }
 
     #[test]
@@ -2717,6 +2797,66 @@ mod tests {
                 .as_str()
                 .expect("stale patch error")
                 .contains("call read_spec again")
+        );
+    }
+
+    #[test]
+    fn update_spec_does_not_overwrite_changes_made_after_read_spec() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let initial = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Spec\n\nOriginal",
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!initial.is_error);
+
+        let read_before_concurrent_write = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "timeoutMs": null }),
+        );
+        assert_eq!(read_before_concurrent_write.output["revision"], 1);
+
+        let mut concurrent_database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("concurrent database");
+        let concurrent = concurrent_database
+            .update_workspace_spec_content(1, "# Spec\n\nConcurrent update")
+            .expect("concurrent update")
+            .expect("concurrent update won CAS");
+        assert_eq!(concurrent.revision, 2);
+
+        let rejected = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": read_before_concurrent_write.output["revision"],
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "Original", "newText": "Agent update" }],
+                "timeoutMs": null
+            }),
+        );
+        assert!(rejected.is_error);
+        assert!(
+            rejected.output["error"]
+                .as_str()
+                .expect("revision conflict error")
+                .contains("call read_spec again")
+        );
+
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "timeoutMs": null }),
+        );
+        assert_eq!(read_back.output["revision"], 2);
+        assert_eq!(
+            read_back.output["contentMarkdown"],
+            "# Spec\n\nConcurrent update"
         );
     }
 
