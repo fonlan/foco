@@ -6,6 +6,7 @@ mod image_tools;
 mod native_tools;
 mod provider_audit;
 mod questions;
+pub(crate) mod reasoning_loop_detector;
 mod sidecar_config;
 mod subscriptions;
 mod tool_events;
