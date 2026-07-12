@@ -22858,8 +22858,25 @@ async fn serve_main_chat_wire_fixture() -> (
                     seen.lock()
                         .expect("main chat request capture")
                         .push((headers, payload));
+                    let mut response_headers = HeaderMap::new();
+                    response_headers.insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("text/event-stream"),
+                    );
+                    response_headers.insert(
+                        header::AUTHORIZATION,
+                        header::HeaderValue::from_static("Bearer response-secret"),
+                    );
+                    response_headers.insert(
+                        header::HeaderName::from_static("x-api-key"),
+                        header::HeaderValue::from_static("response-api-key"),
+                    );
+                    response_headers.insert(
+                        header::SET_COOKIE,
+                        header::HeaderValue::from_static("session=response-cookie"),
+                    );
                     (
-                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        response_headers,
                         concat!(
                             "data: {\"id\":\"chat-fixture\",\"raw_chunk_secret\":\"chunk-only-secret\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Main chat wire OK\"}}]}\n\n",
                             "data: {\"id\":\"chat-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
@@ -23420,10 +23437,10 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
             .expect("wire body JSON"),
         *raw_body
     );
-    assert!(
-        request_body["headers"]["authorization"]
-            .as_str()
-            .is_some_and(|value| value == "[REDACTED]")
+    assert_eq!(request_body["headers"]["authorization"][0], "********");
+    assert_eq!(
+        request_body["headers"]["content-type"][0],
+        "application/json"
     );
     let response_body: Value = serde_json::from_str(
         request
@@ -23434,6 +23451,20 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
     .expect("parse main chat final response dump");
     assert_eq!(response_body["format"], "provider_final_response_v1");
     assert_eq!(response_body["state"], "succeeded");
+    assert_eq!(response_body["http"]["status"], 200);
+    assert_eq!(response_body["http"]["version"], "HTTP/1.1");
+    assert_eq!(
+        response_body["http"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["x-api-key"][0],
+        "response-api-key"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["set-cookie"][0],
+        "session=response-cookie"
+    );
     assert_eq!(response_body["text"], "Main chat wire OK");
     assert!(!response_body.to_string().contains("chunk-only-secret"));
     drop(database);

@@ -16,7 +16,7 @@ use genai::{
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
-use reqwest::{Request, StatusCode};
+use reqwest::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -24,8 +24,11 @@ pub const PROVIDER_WIRE_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_WIRE_REQUEST_DUMP_FORMAT: &str = "provider_request_v1";
 pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v1";
-const REDACTED_HEADER_VALUE: &str = "[REDACTED]";
+const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
+const MASKED_AUTHORIZATION_VALUE: &str = "********";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
+
+pub type ProviderHttpHeadersDump = BTreeMap<String, Vec<String>>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,11 +37,19 @@ pub struct ProviderWireRequestDump {
     pub version: u32,
     pub method: String,
     pub url: String,
-    pub headers: BTreeMap<String, String>,
+    pub headers: ProviderHttpHeadersDump,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_encoding: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHttpResponseHeadDump {
+    pub status: u16,
+    pub version: String,
+    pub headers: ProviderHttpHeadersDump,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +62,8 @@ pub enum ProviderFinalResponseDump {
     Succeeded {
         format: String,
         version: u32,
+        #[serde(default)]
+        http: Option<ProviderHttpResponseHeadDump>,
         text: String,
         reasoning: Option<String>,
         tool_calls: Vec<NeutralToolCall>,
@@ -61,6 +74,8 @@ pub enum ProviderFinalResponseDump {
     Failed {
         format: String,
         version: u32,
+        #[serde(default)]
+        http: Option<ProviderHttpResponseHeadDump>,
         partial: bool,
         error: String,
         status_code: Option<u16>,
@@ -69,6 +84,7 @@ pub enum ProviderFinalResponseDump {
 
 impl ProviderFinalResponseDump {
     fn succeeded(
+        http: Option<ProviderHttpResponseHeadDump>,
         text: String,
         reasoning: Option<String>,
         tool_calls: Vec<NeutralToolCall>,
@@ -79,6 +95,7 @@ impl ProviderFinalResponseDump {
         Self::Succeeded {
             format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
             version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            http,
             text,
             reasoning,
             tool_calls,
@@ -89,9 +106,19 @@ impl ProviderFinalResponseDump {
     }
 
     pub fn failed(error: impl Into<String>, status_code: Option<u16>, partial: bool) -> Self {
+        Self::failed_with_http(None, error, status_code, partial)
+    }
+
+    fn failed_with_http(
+        http: Option<ProviderHttpResponseHeadDump>,
+        error: impl Into<String>,
+        status_code: Option<u16>,
+        partial: bool,
+    ) -> Self {
         Self::Failed {
             format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
             version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            http,
             partial,
             error: error.into(),
             status_code,
@@ -825,6 +852,7 @@ pub struct NeutralChatStream {
     stream: genai::chat::ChatStream,
     error_context: ProviderErrorContext,
     wire_request_dump: Option<ProviderWireRequestDump>,
+    response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
     saw_response_event: bool,
     final_response_dump: Option<ProviderFinalResponseDump>,
 }
@@ -838,13 +866,24 @@ impl NeutralChatStream {
         self.final_response_dump.as_ref()
     }
 
+    fn response_head_dump(&self) -> Option<ProviderHttpResponseHeadDump> {
+        self.response_head
+            .as_ref()
+            .and_then(|response_head| response_head.lock().ok()?.clone())
+    }
+
     pub fn interrupted_final_response_dump(
         &self,
         message: impl Into<String>,
     ) -> Option<ProviderFinalResponseDump> {
-        self.wire_request_dump
-            .as_ref()
-            .map(|_| ProviderFinalResponseDump::failed(message, None, self.saw_response_event))
+        self.wire_request_dump.as_ref().map(|_| {
+            ProviderFinalResponseDump::failed_with_http(
+                self.response_head_dump(),
+                message,
+                None,
+                self.saw_response_event,
+            )
+        })
     }
 
     pub async fn next_event(
@@ -881,6 +920,7 @@ impl NeutralChatStream {
                 self.saw_response_event = true;
                 if self.wire_request_dump.is_some() {
                     self.final_response_dump = Some(ProviderFinalResponseDump::succeeded(
+                        self.response_head_dump(),
                         text.clone(),
                         reasoning.clone(),
                         tool_calls.clone(),
@@ -892,7 +932,8 @@ impl NeutralChatStream {
             }
             Ok(NeutralChatStreamEvent::Error { message }) => {
                 if self.wire_request_dump.is_some() {
-                    self.final_response_dump = Some(ProviderFinalResponseDump::failed(
+                    self.final_response_dump = Some(ProviderFinalResponseDump::failed_with_http(
+                        self.response_head_dump(),
                         message.clone(),
                         None,
                         self.saw_response_event,
@@ -901,7 +942,8 @@ impl NeutralChatStream {
             }
             Err(error) => {
                 if self.wire_request_dump.is_some() {
-                    self.final_response_dump = Some(ProviderFinalResponseDump::failed(
+                    self.final_response_dump = Some(ProviderFinalResponseDump::failed_with_http(
+                        self.response_head_dump(),
                         error.to_string(),
                         error.status_code(),
                         self.saw_response_event,
@@ -967,6 +1009,7 @@ pub async fn stream_chat_with_capture_observer(
     })?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
+    let captured_response_head = capture_details.then(|| Arc::new(Mutex::new(None)));
     let observer = if capture_details || request_observer.is_some() {
         let captured_request = captured_request.clone();
         Some(Arc::new(move |request: &Request| {
@@ -983,8 +1026,24 @@ pub async fn stream_chat_with_capture_observer(
     } else {
         None
     };
+    let response_observer = captured_response_head
+        .as_ref()
+        .map(|captured_response_head| {
+            let captured_response_head = captured_response_head.clone();
+            Arc::new(move |response: &Response| {
+                if let Ok(mut slot) = captured_response_head.lock() {
+                    *slot = Some(provider_http_response_head_dump(response));
+                }
+            }) as genai::ResponseHeadObserver
+        });
     let response = client
-        .exec_chat_stream_observed(model, chat_request, Some(&options), observer)
+        .exec_chat_stream_observed_with_response(
+            model,
+            chat_request,
+            Some(&options),
+            observer,
+            response_observer,
+        )
         .await
         .map_err(|source| ProviderRequestFailure {
             error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
@@ -996,6 +1055,7 @@ pub async fn stream_chat_with_capture_observer(
         stream: response.stream,
         error_context: error_context.with_phase("reading provider stream"),
         wire_request_dump,
+        response_head: captured_response_head,
         saw_response_event: false,
         final_response_dump: None,
     })
@@ -1544,22 +1604,6 @@ fn take_captured_request_dump(
 }
 
 fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
-    let headers = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            let name = name.as_str().to_string();
-            let value = if is_sensitive_header_name(&name) {
-                REDACTED_HEADER_VALUE.to_string()
-            } else {
-                value
-                    .to_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|_| "[NON_UTF8]".to_string())
-            };
-            (name, value)
-        })
-        .collect();
     let (body, body_encoding) = request
         .body()
         .and_then(|body| body.as_bytes())
@@ -1580,26 +1624,57 @@ fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
         version: PROVIDER_WIRE_REQUEST_DUMP_VERSION,
         method: request.method().as_str().to_string(),
         url: redact_url_credentials(request.url()),
-        headers,
+        headers: provider_http_headers_dump(request.headers()),
         body,
         body_encoding,
     }
 }
 
+fn provider_http_response_head_dump(response: &Response) -> ProviderHttpResponseHeadDump {
+    ProviderHttpResponseHeadDump {
+        status: response.status().as_u16(),
+        version: format!("{:?}", response.version()),
+        headers: provider_http_headers_dump(response.headers()),
+    }
+}
+
+fn provider_http_headers_dump(headers: &reqwest::header::HeaderMap) -> ProviderHttpHeadersDump {
+    headers
+        .keys()
+        .map(|name| {
+            let values = headers
+                .get_all(name)
+                .iter()
+                .map(|value| {
+                    if name.as_str().eq_ignore_ascii_case("authorization") {
+                        MASKED_AUTHORIZATION_VALUE.to_string()
+                    } else {
+                        value
+                            .to_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|_| "[NON_UTF8]".to_string())
+                    }
+                })
+                .collect();
+            (name.as_str().to_string(), values)
+        })
+        .collect()
+}
+
 fn redact_url_credentials(url: &reqwest::Url) -> String {
     let mut redacted = url.clone();
     if !redacted.username().is_empty() {
-        let _ = redacted.set_username(REDACTED_HEADER_VALUE);
+        let _ = redacted.set_username(REDACTED_CREDENTIAL_VALUE);
     }
     if redacted.password().is_some() {
-        let _ = redacted.set_password(Some(REDACTED_HEADER_VALUE));
+        let _ = redacted.set_password(Some(REDACTED_CREDENTIAL_VALUE));
     }
     if redacted.query().is_some() {
         let query = redacted
             .query_pairs()
             .map(|(name, value)| {
                 let value = if is_sensitive_query_name(&name) {
-                    REDACTED_HEADER_VALUE.to_string()
+                    REDACTED_CREDENTIAL_VALUE.to_string()
                 } else {
                     value.into_owned()
                 };
@@ -1624,7 +1699,7 @@ fn redact_json_credentials(value: &mut Value) {
         Value::Object(object) => {
             for (name, value) in object {
                 if is_sensitive_credential_name(name) {
-                    *value = Value::String(REDACTED_HEADER_VALUE.to_string());
+                    *value = Value::String(REDACTED_CREDENTIAL_VALUE.to_string());
                 } else {
                     redact_json_credentials(value);
                 }
@@ -1667,9 +1742,6 @@ fn is_sensitive_credential_name(name: &str) -> bool {
         || normalized.ends_with("token")
 }
 
-fn is_sensitive_header_name(name: &str) -> bool {
-    is_sensitive_credential_name(name)
-}
 fn normalize_stream_event(
     event: ChatStreamEvent,
 ) -> Result<NeutralChatStreamEvent, ProviderConfigError> {
@@ -2087,7 +2159,7 @@ mod tests {
                 };
                 requests.push(read_raw_http_request(&mut socket).await);
                 let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\nauthorization: Bearer response-secret\r\nx-api-key: response-api-key\r\nset-cookie: session=response-cookie\r\nx-fixture-response: response-header-value\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
                     response_body.len()
                 );
                 socket
@@ -2173,7 +2245,10 @@ mod tests {
         assert_eq!(dump.body.as_deref(), Some(raw.body.as_str()));
         assert_eq!(dump.body_encoding.as_deref(), Some("utf8"));
         assert_eq!(
-            dump.headers.get("x-fixture-header").map(String::as_str),
+            dump.headers
+                .get("x-fixture-header")
+                .and_then(|values| values.first())
+                .map(String::as_str),
             Some("fixture-header-value")
         );
         let raw_secret_header = raw
@@ -2182,9 +2257,18 @@ mod tests {
             .find(|(_, value)| value.contains("fixture-api-key"))
             .map(|(name, _)| name)
             .expect("provider authentication header");
+        let expected_secret_header_value =
+            if raw_secret_header.eq_ignore_ascii_case("authorization") {
+                MASKED_AUTHORIZATION_VALUE
+            } else {
+                "fixture-api-key"
+            };
         assert_eq!(
-            dump.headers.get(raw_secret_header).map(String::as_str),
-            Some(REDACTED_HEADER_VALUE)
+            dump.headers
+                .get(raw_secret_header)
+                .and_then(|values| values.first())
+                .map(String::as_str),
+            Some(expected_secret_header_value)
         );
         let body: Value = serde_json::from_str(&raw.body).expect("adapter request JSON");
         match kind_name {
@@ -3088,7 +3172,32 @@ mod tests {
     }
 
     #[test]
-    fn wire_dump_redacts_credentials_without_mutating_prompt_text() {
+    fn legacy_provider_final_response_v1_without_http_head_remains_readable() {
+        let dump: ProviderFinalResponseDump = serde_json::from_value(serde_json::json!({
+            "format": PROVIDER_FINAL_RESPONSE_DUMP_FORMAT,
+            "version": PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            "state": "succeeded",
+            "text": "historical response",
+            "reasoning": null,
+            "toolCalls": [],
+            "usage": null,
+            "stopReason": "stop",
+            "responseId": null
+        }))
+        .expect("legacy response dump");
+
+        assert!(matches!(
+            dump,
+            ProviderFinalResponseDump::Succeeded {
+                http: None,
+                text,
+                ..
+            } if text == "historical response"
+        ));
+    }
+
+    #[test]
+    fn wire_dump_only_masks_authorization_while_preserving_url_and_body_redaction() {
         let mut request = Request::new(
             reqwest::Method::POST,
             reqwest::Url::parse(
@@ -3103,6 +3212,10 @@ mod tests {
         request.headers_mut().insert(
             reqwest::header::HeaderName::from_static("x-provider-signature"),
             reqwest::header::HeaderValue::from_static("signature-secret"),
+        );
+        request.headers_mut().append(
+            reqwest::header::HeaderName::from_static("x-provider-signature"),
+            reqwest::header::HeaderValue::from_static("second-signature"),
         );
         *request.body_mut() = Some(
             serde_json::to_vec(&serde_json::json!({
@@ -3119,16 +3232,22 @@ mod tests {
         assert!(dump.url.contains("key=%5BREDACTED%5D"));
         assert!(dump.url.contains("topic=api-key-is-a-prompt"));
         assert_eq!(
-            dump.headers.get("authorization").map(String::as_str),
-            Some(REDACTED_HEADER_VALUE)
+            dump.headers
+                .get("authorization")
+                .and_then(|values| values.first())
+                .map(String::as_str),
+            Some(MASKED_AUTHORIZATION_VALUE)
         );
         assert_eq!(
-            dump.headers.get("x-provider-signature").map(String::as_str),
-            Some(REDACTED_HEADER_VALUE)
+            dump.headers.get("x-provider-signature"),
+            Some(&vec![
+                "signature-secret".to_string(),
+                "second-signature".to_string()
+            ])
         );
         let body: Value = serde_json::from_str(dump.body.as_deref().expect("body")).expect("json");
-        assert_eq!(body["api_key"], REDACTED_HEADER_VALUE);
-        assert_eq!(body["nested"]["accessToken"], REDACTED_HEADER_VALUE);
+        assert_eq!(body["api_key"], REDACTED_CREDENTIAL_VALUE);
+        assert_eq!(body["nested"]["accessToken"], REDACTED_CREDENTIAL_VALUE);
         assert_eq!(
             body["prompt"],
             "Keep api_key and token words in ordinary prompt text"
@@ -3264,11 +3383,17 @@ mod tests {
         assert_eq!(dump.method, "POST");
         assert!(dump.url.ends_with("/v1/chat/completions"));
         assert_eq!(
-            dump.headers.get("authorization").map(String::as_str),
-            Some(REDACTED_HEADER_VALUE)
+            dump.headers
+                .get("authorization")
+                .and_then(|values| values.first())
+                .map(String::as_str),
+            Some(MASKED_AUTHORIZATION_VALUE)
         );
         assert_eq!(
-            dump.headers.get("x-fixture-header").map(String::as_str),
+            dump.headers
+                .get("x-fixture-header")
+                .and_then(|values| values.first())
+                .map(String::as_str),
             Some("fixture-header-value")
         );
         let body = dump.body.as_deref().expect("request body");
@@ -3285,10 +3410,25 @@ mod tests {
         assert!(matches!(
             final_dump,
             ProviderFinalResponseDump::Succeeded {
+                http: Some(ProviderHttpResponseHeadDump {
+                    status: 200,
+                    version,
+                    headers,
+                }),
                 text,
                 stop_reason: Some(stop_reason),
                 ..
-            } if text == "final text" && stop_reason == "stop"
+            } if version == "HTTP/1.1"
+                && text == "final text"
+                && stop_reason == "stop"
+                && headers.get("authorization").and_then(|values| values.first()).map(String::as_str)
+                    == Some(MASKED_AUTHORIZATION_VALUE)
+                && headers.get("x-api-key").and_then(|values| values.first()).map(String::as_str)
+                    == Some("response-api-key")
+                && headers.get("set-cookie").and_then(|values| values.first()).map(String::as_str)
+                    == Some("session=response-cookie")
+                && headers.get("x-fixture-response").and_then(|values| values.first()).map(String::as_str)
+                    == Some("response-header-value")
         ));
 
         let raw_requests = fixture.await.expect("fixture task");
@@ -3297,6 +3437,50 @@ mod tests {
             .expect("raw HTTP request UTF-8");
         assert!(raw_request.contains("authorization: Bearer fixture-api-key"));
         assert!(raw_request.contains(body));
+    }
+
+    #[tokio::test]
+    async fn captures_http_response_head_for_non_success_stream() {
+        let (fixture_root, fixture) = spawn_raw_http_fixture(
+            "502 Bad Gateway",
+            "application/json",
+            r#"{"error":"upstream unavailable"}"#,
+        )
+        .await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "capture non-success response head",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open non-success fixture stream");
+        while stream.next_event().await.is_some() {}
+
+        assert!(matches!(
+            stream.final_response_dump(),
+            Some(ProviderFinalResponseDump::Failed {
+                http: Some(ProviderHttpResponseHeadDump {
+                    status: 502,
+                    version,
+                    headers,
+                }),
+                ..
+            }) if version == "HTTP/1.1"
+                && headers.get("authorization").and_then(|values| values.first()).map(String::as_str)
+                    == Some(MASKED_AUTHORIZATION_VALUE)
+                && headers.get("x-api-key").and_then(|values| values.first()).map(String::as_str)
+                    == Some("response-api-key")
+        ));
+        assert_eq!(fixture.await.expect("fixture task").len(), 1);
     }
 
     #[tokio::test]

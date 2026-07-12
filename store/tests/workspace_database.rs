@@ -6197,8 +6197,11 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             event_type: "text_delta",
             raw_chunk_json: Some(
                 r#"{
+                    "format": "provider_request_v1",
+                    "version": 1,
                     "headers": {
-                        "authorization": "Bearer streamed-secret"
+                        "authorization": "Bearer streamed-secret",
+                        "x-api-key": "streamed-api-key"
                     },
                     "delta": "H"
                 }"#,
@@ -6262,7 +6265,9 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     );
     let raw_chunk = events[0].raw_chunk_json.as_deref().expect("raw chunk json");
     assert!(raw_chunk.contains(r#""authorization":"[REDACTED]""#));
+    assert!(raw_chunk.contains(r#""x-api-key":"[REDACTED]""#));
     assert!(!raw_chunk.contains("streamed-secret"));
+    assert!(!raw_chunk.contains("streamed-api-key"));
     assert_eq!(events[1].event_type, "usage");
 
     database
@@ -6470,6 +6475,129 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("filtered audit count"),
         1
     );
+}
+
+#[test]
+fn versioned_provider_http_headers_only_mask_authorization() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "provider-http-headers",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai-chat",
+            model_id: "gpt-audit",
+            thinking_level: None,
+            request_started_at: "2026-07-12T08:00:00.000Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-12T08:00:01.000Z"),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: Some(1000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some(
+                r#"{
+                    "format":"provider_request_v1",
+                    "version":1,
+                    "method":"POST",
+                    "url":"https://example.test/v1/chat",
+                    "headers":{
+                        "Authorization":["Bearer request-secret"],
+                        "x-api-key":["request-api-key"],
+                        "cookie":["session=request-cookie"],
+                        "x-provider-signature":["request-signature"]
+                    },
+                    "body":"{\"apiKey\":\"body-secret\",\"prompt\":\"keep\"}",
+                    "metadata":{"password":"metadata-secret"}
+                }"#,
+            ),
+            response_body_json: Some(
+                r#"{
+                    "format":"provider_final_response_v1",
+                    "version":1,
+                    "state":"succeeded",
+                    "http":{
+                        "status":200,
+                        "version":"HTTP/1.1",
+                        "headers":{
+                            "authorization":["Bearer response-secret"],
+                            "set-cookie":["session=response-cookie"],
+                            "x-api-key":["response-api-key"],
+                            "x-provider-signature":["response-signature"]
+                        }
+                    },
+                    "text":"ok",
+                    "reasoning":null,
+                    "toolCalls":[],
+                    "usage":null,
+                    "stopReason":"stop",
+                    "responseId":null,
+                    "metadata":{"apiKey":"response-metadata-secret"}
+                }"#,
+            ),
+        })
+        .expect("versioned provider request insert");
+
+    let request = database
+        .llm_request("provider-http-headers")
+        .expect("provider request read")
+        .expect("provider request");
+    let request_body: Value = serde_json::from_str(
+        request
+            .request_body_json
+            .as_deref()
+            .expect("provider request body"),
+    )
+    .expect("provider request JSON");
+    assert_eq!(request_body["headers"]["Authorization"][0], "********");
+    assert_eq!(request_body["headers"]["x-api-key"][0], "request-api-key");
+    assert_eq!(
+        request_body["headers"]["cookie"][0],
+        "session=request-cookie"
+    );
+    assert_eq!(
+        request_body["headers"]["x-provider-signature"][0],
+        "request-signature"
+    );
+    assert_eq!(request_body["metadata"]["password"], "[REDACTED]");
+
+    let response_body: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("provider response body"),
+    )
+    .expect("provider response JSON");
+    assert_eq!(
+        response_body["http"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["set-cookie"][0],
+        "session=response-cookie"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["x-api-key"][0],
+        "response-api-key"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["x-provider-signature"][0],
+        "response-signature"
+    );
+    assert_eq!(response_body["metadata"]["apiKey"], "[REDACTED]");
 }
 
 #[test]

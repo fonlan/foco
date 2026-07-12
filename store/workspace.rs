@@ -14616,10 +14616,72 @@ fn redact_audit_json(value: &str, field: &'static str) -> Result<String, Workspa
     let mut parsed: Value = serde_json::from_str(value)
         .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })?;
 
-    redact_json_value(&mut parsed);
+    let format = parsed.get("format").and_then(Value::as_str);
+    let version = parsed.get("version").and_then(Value::as_u64);
+    match (field, format, version) {
+        ("request_body_json", Some("provider_request_v1"), Some(1)) => {
+            redact_provider_request_envelope(&mut parsed)
+        }
+        ("response_body_json", Some("provider_final_response_v1"), Some(1)) => {
+            redact_provider_response_envelope(&mut parsed)
+        }
+        _ => redact_json_value(&mut parsed),
+    }
 
     serde_json::to_string(&parsed)
         .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })
+}
+
+fn redact_provider_request_envelope(value: &mut Value) {
+    let headers = value
+        .as_object_mut()
+        .and_then(|object| object.remove("headers"));
+    redact_json_value(value);
+    if let (Some(object), Some(mut headers)) = (value.as_object_mut(), headers) {
+        mask_provider_authorization_header(&mut headers);
+        object.insert("headers".to_string(), headers);
+    }
+}
+
+fn redact_provider_response_envelope(value: &mut Value) {
+    let headers = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("http"))
+        .and_then(Value::as_object_mut)
+        .and_then(|http| http.remove("headers"));
+    redact_json_value(value);
+    if let (Some(http), Some(mut headers)) = (
+        value
+            .as_object_mut()
+            .and_then(|object| object.get_mut("http"))
+            .and_then(Value::as_object_mut),
+        headers,
+    ) {
+        mask_provider_authorization_header(&mut headers);
+        http.insert("headers".to_string(), headers);
+    }
+}
+
+fn mask_provider_authorization_header(headers: &mut Value) {
+    let Some(headers) = headers.as_object_mut() else {
+        return;
+    };
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            mask_provider_header_value(value);
+        }
+    }
+}
+
+fn mask_provider_header_value(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                *value = Value::String("********".to_string());
+            }
+        }
+        _ => *value = Value::String("********".to_string()),
+    }
 }
 
 fn redact_json_value(value: &mut Value) {

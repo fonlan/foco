@@ -1,6 +1,6 @@
-# genai wire-request observer fork
+# genai HTTP request/response observer fork
 
-Foco depends on a long-lived fork of `genai` so API audit details can observe the final application-layer HTTP request without reimplementing provider adapters. The full upstream source is not vendored in this repository.
+Foco depends on a long-lived fork of `genai` so API audit details can observe the final application-layer HTTP request and the real HTTP response head without reimplementing provider adapters. The full upstream source is not vendored in this repository.
 
 ## Pinned dependency
 
@@ -8,7 +8,7 @@ Foco depends on a long-lived fork of `genai` so API audit details can observe th
 - Foco fork: `fonlan/rust-genai`
 - Upstream baseline: `genai 0.6.4`, commit `bb38ad7d6c2c3bc86ecc84fd6f97a10ad7803e6d`
 - Patch branch: `foco/request-observer-0.6.4`
-- Pinned patch commit: `5f0ee426ce327ba71f67a6725e3503533ed33632`
+- Pinned patch commit: `1c92cd9711c8ead120e7c26ceb8ccc6dbb4661fa`
 
 The root `Cargo.toml` pins the fork by the full commit SHA. Do not replace the `rev` with a floating branch or tag. The fork is a Foco-maintained dependency and the observer patch is not planned for upstream submission.
 
@@ -16,28 +16,29 @@ The root `Cargo.toml` pins the fork by the full commit SHA. Do not replace the `
 
 For new audit records:
 
-- **Request** is the actual prepared HTTP method, URL, headers, and body passed to `reqwest`. Sensitive headers and URL userinfo are redacted before persistence.
-- **Response** is the provider adapter's final normalized completion or terminal error after streaming ends. Foco does not persist raw SSE frames or individual chunks in the API detail body.
+- **Request** is the actual prepared HTTP method, URL, headers, and body passed to `reqwest`. Every finalized HeaderMap field/value is retained, with only `Authorization` replaced by `********`; URL userinfo/query credentials and JSON-body credential fields keep their existing redaction rules.
+- **Response** contains the real HTTP status/version/headers captured before body or SSE consumption plus the provider adapter's final normalized completion or terminal error. Response headers use the same Authorization-only masking rule. Foco does not persist raw SSE frames or individual chunks in the API detail body.
+- This is a local audit feature, not a general secret scrubber: headers such as `X-API-Key`, `Cookie`, `Set-Cookie`, signatures, and token-named custom headers can be stored in workspace SQLite and shown in details.
 - TLS ciphertext, HTTP/2 frames, and TCP packets are outside this feature's scope.
 - Existing `save_request_response_details` and retention settings control whether request/final-response detail is retained. Older records remain readable as legacy normalized payloads.
 
 ## Minimal fork patch
 
-The fork adds an optional read-only prepared-request observer at the final genai send boundary:
+The fork adds optional read-only observers at the final genai streaming HTTP boundaries:
 
 1. the adapter performs model mapping and builds the provider-specific request;
 2. request overrides and adapter-specific headers/body are applied;
-3. a single `reqwest::Request` is built;
-4. the observer reads that same request;
-5. the same request is executed once.
+3. a single `reqwest::Request` is built and observed;
+4. the same request is executed once;
+5. when `reqwest::Response` exists, its status/version/HeaderMap are observed before status validation, body reads, or SSE decoding.
 
-The patch must not serialize the adapter request a second time or send a duplicate request. Foco's provider layer owns redaction and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes.
+The observers must not serialize the adapter request twice, send a duplicate request, consume the response body early, or fabricate response metadata for DNS/TLS/connection failures. Foco's provider layer owns Authorization masking, existing URL/body credential redaction, and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes.
 
 ## End-to-end acceptance in Foco
 
 Foco's completion gate is not the fork test alone. The repository keeps two layers of real HTTP regressions:
 
-- `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters` starts local servers for OpenAI Chat, OpenAI Responses, Anthropic, and Gemini. It compares the observer dump with the request actually received by the server, verifies provider-specific final mappings (model redirect, system/instructions, tools, thinking, prompt-cache-related options and supported overrides), checks credential redaction, and rejects duplicate sends.
+- `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters` starts local servers for OpenAI Chat, OpenAI Responses, Anthropic, and Gemini. It compares the observer dump with the request actually received by the server, verifies provider-specific final mappings (model redirect, system/instructions, tools, thinking, prompt-cache-related options and supported overrides), checks Authorization-only header masking plus existing URL/body credential redaction, and rejects duplicate sends.
 - `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire` runs the production main-chat stream against a local provider, then verifies the same final request body travels through the observer into SQLite and the AI statistics detail handler as `provider_request_v1`; the final aggregate is returned as `provider_final_response_v1` without chunk-only fields. The companion detail-disabled test verifies one send with no request/response detail.
 
 These tests are the hard regression against a UI-only or import-only integration. When the fork, genai baseline, adapter code, audit lifecycle, SQLite schema, or statistics detail API changes, rerun both provider tests and the focused app tests before claiming wire capture is complete.
@@ -49,16 +50,16 @@ Adapter behavior must be asserted from the actual finalized request rather than 
 When upgrading genai:
 
 1. Fetch the latest upstream history into the fork and identify the exact upstream release commit to use as the new baseline.
-2. Create a version-specific maintenance branch from that upstream commit. Reapply or cherry-pick only the minimal prepared-request observer patch, resolving conflicts explicitly at the final request-build/send boundary.
-3. Verify every adapter still passes through the observed boundary after model mapping, provider payload construction, `extra_body`, request overrides, and adapter-specific headers are applied.
-4. In the fork, run formatting plus the local observer HTTP/SSE fixture. It must prove that captured headers and body equal what the server receives and that the server receives exactly one request.
+2. Create a version-specific maintenance branch from that upstream commit. Reapply or cherry-pick only the minimal prepared-request and response-head observer patches, resolving conflicts explicitly at the final request-build/send and response-established/pre-body boundaries.
+3. Verify every streaming adapter still passes through both observed boundaries after model mapping, provider payload construction, `extra_body`, request overrides, and adapter-specific headers are applied.
+4. In the fork, run formatting plus the local observer HTTP/SSE fixtures. They must prove that captured request data equals what the server receives, response heads are captured for successful/non-2xx/pre-decode-failure paths, and the server receives exactly one request.
 5. Push the validated patch commit to `fonlan/rust-genai` before changing Foco. Record its full 40-character SHA.
 6. Update the root `Cargo.toml` `rev`, refresh `Cargo.lock`, and confirm the lockfile source resolves to that same fork commit.
 7. Run `cargo test -p foco-providers --locked`; the provider fixtures must continue to verify captured request bytes, request overrides, redaction, and final-response aggregation without raw SSE/chunk persistence.
 8. Run `cargo check -p foco-app --locked` to catch observer signature or stream-contract conflicts in audit callers.
 9. Review the fork diff against the selected upstream baseline and reject unrelated adapter behavior changes.
 
-If a future genai release supplies an equivalent prepared-request hook, Foco may adopt it and retire the fork patch after the same wire-capture and redaction regressions pass.
+If a future genai release supplies equivalent prepared-request and response-head hooks, Foco may adopt them and retire the fork patch after the same wire-capture and redaction regressions pass.
 
 ## License and provenance
 
