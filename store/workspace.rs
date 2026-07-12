@@ -37,25 +37,25 @@ pub use workspace_records::{
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
     CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
     LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
-    LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
-    LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRecord,
-    LlmRequestUsageRollupFilters, MessageRecord, MessageRoleCountRecord, NewAgentContextEntry,
-    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
-    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase,
-    NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection, NewRunEvent,
-    NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
-    NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
-    PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
-    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PromptContextInjectionRecord, RewriteChatFromUserMessage,
-    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
-    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
+    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
+    LlmRequestUsageRecord, LlmRequestUsageRollupFilters, MessageRecord, MessageRoleCountRecord,
+    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
+    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+    NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
+    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection,
+    PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
+    PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
+    RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
+    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
+    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
+    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -7256,6 +7256,53 @@ impl WorkspaceDatabase {
                     total_tokens: row.get(3)?,
                     latency_count: row.get(4)?,
                     latency_sum: row.get(5)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn llm_request_audit_request_kind_breakdown(
+        &self,
+        filters: LlmRequestAuditFilters<'_>,
+    ) -> Result<Vec<LlmRequestAuditRequestKindBreakdown>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                request_kind,
+                COUNT(*),
+                COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                COUNT(total_latency_ms),
+                COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY request_kind ORDER BY request_kind");
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditRequestKindBreakdown {
+                    request_kind: row.get(0)?,
+                    request_count: row.get(1)?,
+                    failed_requests: row.get(2)?,
+                    total_input_tokens: row.get(3)?,
+                    total_output_tokens: row.get(4)?,
+                    total_cache_read_tokens: row.get(5)?,
+                    total_cache_write_tokens: row.get(6)?,
+                    total_reasoning_tokens: row.get(7)?,
+                    total_tokens: row.get(8)?,
+                    latency_count: row.get(9)?,
+                    latency_sum: row.get(10)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;

@@ -15497,6 +15497,7 @@ fn ai_statistics_query_accepts_multiple_request_ids_and_legacy_request_id() {
         request_id: Some(" legacy-1,legacy-2 ".to_string()),
         request_ids: Some(" request-1, ,request-2 ".to_string()),
         chat_id: None,
+        request_kind: Some(" contextCompression ".to_string()),
         provider_id: None,
         model_id: None,
         status: None,
@@ -15512,6 +15513,7 @@ fn ai_statistics_query_accepts_multiple_request_ids_and_legacy_request_id() {
         filters.request_ids,
         vec!["request-1", "request-2", "legacy-1", "legacy-2"]
     );
+    assert_eq!(filters.request_kind.as_deref(), Some("contextCompression"));
 }
 
 #[test]
@@ -19335,6 +19337,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                     .to_string(),
             ),
             chat_id: Some("chat-internal-filter".to_string()),
+            request_kind: None,
             provider_id: None,
             model_id: None,
             status: None,
@@ -19353,6 +19356,45 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     assert_eq!(ai_stats.requests.len(), 1);
     assert_eq!(ai_stats.requests[0].id, "main-chat-request");
     assert_eq!(ai_stats.requests[0].request_kind, "chat completion");
+    assert_eq!(ai_stats.summary.request_kind_breakdown.len(), 1);
+    assert_eq!(
+        ai_stats.summary.request_kind_breakdown[0].request_kind,
+        "chat completion"
+    );
+
+    let Json(compression_stats) = crate::http::chat::ai_statistics(
+        State(state.clone()),
+        Query(AiStatisticsQuery {
+            workspace_id: Some(workspace_id.clone()),
+            request_id: None,
+            request_ids: None,
+            chat_id: Some("chat-internal-filter".to_string()),
+            request_kind: Some("contextCompression".to_string()),
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: None,
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("context compression AI statistics");
+    assert_eq!(compression_stats.total_count, 1);
+    assert_eq!(compression_stats.summary.total_requests, 1);
+    assert_eq!(compression_stats.summary.total_tokens, 550);
+    assert_eq!(compression_stats.requests.len(), 1);
+    assert_eq!(
+        compression_stats.requests[0].id,
+        "internal-context-compression"
+    );
+    assert_eq!(compression_stats.summary.request_kind_breakdown.len(), 1);
+    assert_eq!(
+        compression_stats.summary.request_kind_breakdown[0].request_kind,
+        "contextCompression"
+    );
 
     let Json(detail) = crate::http::chat::ai_statistics_detail(
         State(state.clone()),
@@ -19398,6 +19440,143 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     assert_eq!(internal_detail.request.request_kind, "contextCompression");
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn ai_statistics_merges_request_kind_breakdown_across_workspace_audit_sources() {
+    fn request<'a>(
+        id: &'a str,
+        workspace_id: &'a str,
+        final_state: &'a str,
+        input_tokens: i64,
+        output_tokens: i64,
+        total_latency_ms: i64,
+        request_started_at: &'a str,
+    ) -> NewLlmRequest<'a> {
+        NewLlmRequest {
+            id,
+            workspace_id,
+            chat_id: Some("chat-1"),
+            request_kind: "contextCompression",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "provider",
+            model_id: "model",
+            thinking_level: None,
+            request_started_at,
+            first_token_at: None,
+            completed_at: Some(request_started_at),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_read_tokens: Some(1),
+            cache_write_tokens: Some(2),
+            reasoning_tokens: Some(3),
+            first_token_latency_ms: None,
+            total_latency_ms: Some(total_latency_ms),
+            status_code: None,
+            final_state,
+            request_body_json: None,
+            response_body_json: None,
+        }
+    }
+
+    let workspace_one_dir = env::temp_dir().join(unique_id("foco-ai-stats-workspace-one"));
+    let workspace_two_dir = env::temp_dir().join(unique_id("foco-ai-stats-workspace-two"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-ai-stats-profile"));
+    fs::create_dir_all(&workspace_one_dir).expect("workspace one directory");
+    fs::create_dir_all(&workspace_two_dir).expect("workspace two directory");
+
+    let mut config = GlobalConfig::first_run(workspace_one_dir.clone());
+    let workspace_one_id = config.workspaces[0].id.clone();
+    let mut workspace_two = config.workspaces[0].clone();
+    workspace_two.id = "workspace-two".to_string();
+    workspace_two.name = "Workspace two".to_string();
+    workspace_two.path = workspace_two_dir.clone();
+    config.workspaces.push(workspace_two.clone());
+
+    for (workspace_path, request) in [
+        (
+            workspace_one_dir.as_path(),
+            request(
+                "compression-one",
+                &workspace_one_id,
+                "succeeded",
+                10,
+                5,
+                100,
+                "2026-07-11T10:00:00Z",
+            ),
+        ),
+        (
+            workspace_two_dir.as_path(),
+            request(
+                "compression-two",
+                &workspace_two.id,
+                "failed",
+                20,
+                7,
+                300,
+                "2026-07-11T11:00:00Z",
+            ),
+        ),
+    ] {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_path).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Context compression audit")
+            .expect("chat insert");
+        database
+            .insert_llm_request(request)
+            .expect("LLM request insert");
+    }
+
+    let state = test_app_state(config, profile_dir.clone());
+    let Json(stats) = crate::http::chat::ai_statistics(
+        State(state),
+        Query(AiStatisticsQuery {
+            workspace_id: None,
+            request_id: None,
+            request_ids: None,
+            chat_id: None,
+            request_kind: None,
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: Some(1),
+            page_size: Some(1),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("cross-workspace AI statistics");
+
+    assert_eq!(stats.total_count, 2);
+    assert_eq!(stats.total_pages, 2);
+    assert_eq!(stats.requests.len(), 1);
+    assert_eq!(stats.summary.total_requests, 2);
+    assert_eq!(stats.summary.total_tokens, 42);
+    assert_eq!(stats.summary.failed_requests, 1);
+    assert_eq!(stats.summary.request_kind_breakdown.len(), 1);
+    let compression = &stats.summary.request_kind_breakdown[0];
+    assert_eq!(compression.request_kind, "contextCompression");
+    assert_eq!(compression.request_count, 2);
+    assert_eq!(compression.failed_requests, 1);
+    assert_eq!(compression.total_input_tokens, 30);
+    assert_eq!(compression.total_output_tokens, 12);
+    assert_eq!(compression.total_cache_read_tokens, 2);
+    assert_eq!(compression.total_cache_write_tokens, 4);
+    assert_eq!(compression.total_reasoning_tokens, 6);
+    assert_eq!(compression.total_tokens, 42);
+    assert_eq!(compression.total_latency_ms, 400);
+    assert_eq!(compression.average_latency_ms, Some(200));
+
+    fs::remove_dir_all(workspace_one_dir).expect("remove workspace one directory");
+    fs::remove_dir_all(workspace_two_dir).expect("remove workspace two directory");
     remove_dir_if_exists(&profile_dir);
 }
 

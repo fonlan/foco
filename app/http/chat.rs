@@ -263,6 +263,7 @@ pub(crate) struct AiStatisticsQuery {
     pub(crate) request_id: Option<String>,
     pub(crate) request_ids: Option<String>,
     pub(crate) chat_id: Option<String>,
+    pub(crate) request_kind: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) model_id: Option<String>,
     pub(crate) status: Option<String>,
@@ -1941,6 +1942,7 @@ fn load_ai_statistics_response(
         workspace_count = workspaces.len(),
         chat_filter = filters.chat_id.as_deref().unwrap_or("<none>"),
         request_filters = ?filters.request_ids,
+        request_kind_filter = filters.request_kind.as_deref().unwrap_or("<none>"),
         provider_filter = filters.provider_id.as_deref().unwrap_or("<none>"),
         model_filter = filters.model_id.as_deref().unwrap_or("<none>"),
         status_filter = filters.status.as_deref().unwrap_or("<none>"),
@@ -1954,12 +1956,17 @@ fn load_ai_statistics_response(
     let mut merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint> = BTreeMap::new();
     let mut merged_models: BTreeMap<String, LlmRequestAuditModelBreakdown> = BTreeMap::new();
     let mut merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown> = BTreeMap::new();
+    let mut merged_request_kinds: BTreeMap<String, LlmRequestAuditRequestKindBreakdown> =
+        BTreeMap::new();
     let mut total_count = 0_i64;
     let page_limit = filters
         .offset
         .checked_add(filters.page_size)
         .ok_or_else(|| ApiError::bad_request("AI statistics page limit is too large"))?;
 
+    // Each configured workspace contributes exactly one audit database. For SSH workspaces,
+    // workspace_audit_path resolves to the main-process audit mirror rather than the sidecar
+    // SQLite database, so a brokered request is not counted twice.
     for workspace in workspaces {
         let workspace_started_at = Instant::now();
         tracing::info!(
@@ -1985,8 +1992,8 @@ fn load_ai_statistics_response(
             request_ids: &filters.request_ids,
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
-            request_kind: None,
-            exclude_request_kinds: if filters.chat_id.is_some() {
+            request_kind: filters.request_kind.as_deref(),
+            exclude_request_kinds: if filters.chat_id.is_some() && filters.request_kind.is_none() {
                 MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS
             } else {
                 &[]
@@ -2036,6 +2043,7 @@ fn load_ai_statistics_response(
                 &mut merged_trend,
                 &mut merged_models,
                 &mut merged_providers,
+                &mut merged_request_kinds,
             )?;
             tracing::info!(
                 workspace_id = %workspace.id,
@@ -2110,6 +2118,7 @@ fn load_ai_statistics_response(
         merged_trend,
         merged_models,
         merged_providers,
+        merged_request_kinds,
     );
     tracing::info!(
         elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
@@ -2142,7 +2151,14 @@ fn merge_ai_statistics_aggregates(
     merged_trend: &mut BTreeMap<String, LlmRequestAuditTrendPoint>,
     merged_models: &mut BTreeMap<String, LlmRequestAuditModelBreakdown>,
     merged_providers: &mut BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+    merged_request_kinds: &mut BTreeMap<String, LlmRequestAuditRequestKindBreakdown>,
 ) -> Result<(), ApiError> {
+    merge_llm_request_audit_request_kinds(
+        merged_request_kinds,
+        database
+            .llm_request_audit_request_kind_breakdown(audit_filters)
+            .map_err(ApiError::from_workspace_error)?,
+    );
     if ai_statistics_can_use_rollup(filters) {
         let rollup_filters = LlmRequestUsageRollupFilters {
             workspace_id: None,
@@ -2203,9 +2219,11 @@ fn merge_ai_statistics_aggregates(
 }
 
 fn ai_statistics_can_use_rollup(filters: &NormalizedAiStatisticsFilters) -> bool {
-    // ponytail: rollup is date-bucketed and has no request_id/chat_id; exact filters stay on facts.
+    // ponytail: rollup is date-bucketed and has no request_id/chat_id/request_kind;
+    // exact filters stay on facts.
     filters.request_ids.is_empty()
         && filters.chat_id.is_none()
+        && filters.request_kind.is_none()
         && filters.started_after.is_none()
         && filters.started_before.is_none()
         && !matches!(filters.status.as_deref(), Some("running"))
@@ -2284,6 +2302,29 @@ fn merge_llm_request_audit_providers(
             .and_modify(|entry| {
                 entry.request_count += row.request_count;
                 entry.success_count += row.success_count;
+                entry.total_tokens += row.total_tokens;
+                entry.latency_count += row.latency_count;
+                entry.latency_sum += row.latency_sum;
+            })
+            .or_insert(row);
+    }
+}
+
+fn merge_llm_request_audit_request_kinds(
+    target: &mut BTreeMap<String, LlmRequestAuditRequestKindBreakdown>,
+    rows: Vec<LlmRequestAuditRequestKindBreakdown>,
+) {
+    for row in rows {
+        target
+            .entry(row.request_kind.clone())
+            .and_modify(|entry| {
+                entry.request_count += row.request_count;
+                entry.failed_requests += row.failed_requests;
+                entry.total_input_tokens += row.total_input_tokens;
+                entry.total_output_tokens += row.total_output_tokens;
+                entry.total_cache_read_tokens += row.total_cache_read_tokens;
+                entry.total_cache_write_tokens += row.total_cache_write_tokens;
+                entry.total_reasoning_tokens += row.total_reasoning_tokens;
                 entry.total_tokens += row.total_tokens;
                 entry.latency_count += row.latency_count;
                 entry.latency_sum += row.latency_sum;

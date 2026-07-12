@@ -6647,6 +6647,17 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             .expect("valid main chat audit count after invalidation"),
         0
     );
+    let invalidated_breakdown = database
+        .llm_request_audit_request_kind_breakdown(main_chat_filters)
+        .expect("invalidated request kind breakdown");
+    assert_eq!(invalidated_breakdown.len(), 1);
+    assert_eq!(invalidated_breakdown[0].request_kind, "chat completion");
+    assert!(
+        database
+            .llm_request_audit_request_kind_breakdown(valid_main_chat_filters)
+            .expect("valid request kind breakdown after invalidation")
+            .is_empty()
+    );
 
     let summary = database
         .llm_request_audit_summary(main_chat_filters)
@@ -6666,6 +6677,136 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
         .expect("request kind audit rows");
     assert_eq!(request_kind_rows.len(), 1);
     assert_eq!(request_kind_rows[0].id, "main-chat-request");
+}
+
+#[test]
+fn llm_request_audit_request_kind_breakdown_uses_fact_filters_and_sums_usage() {
+    fn request<'a>(
+        id: &'a str,
+        request_kind: &'a str,
+        provider_id: &'a str,
+        final_state: &'a str,
+        request_started_at: &'a str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        reasoning_tokens: i64,
+        total_latency_ms: Option<i64>,
+    ) -> NewLlmRequest<'a> {
+        NewLlmRequest {
+            id,
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            request_kind,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id,
+            model_id: "model-1",
+            thinking_level: None,
+            request_started_at,
+            first_token_at: None,
+            completed_at: (final_state != "running").then_some(request_started_at),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_read_tokens: Some(cache_read_tokens),
+            cache_write_tokens: Some(cache_write_tokens),
+            reasoning_tokens: Some(reasoning_tokens),
+            first_token_latency_ms: None,
+            total_latency_ms,
+            status_code: None,
+            final_state,
+            request_body_json: None,
+            response_body_json: None,
+        }
+    }
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Request kind breakdown")
+        .expect("chat insert");
+    for request in [
+        request(
+            "chat-success",
+            "chat completion",
+            "provider-1",
+            "succeeded",
+            "2026-07-10T10:00:00Z",
+            10,
+            5,
+            2,
+            1,
+            3,
+            Some(100),
+        ),
+        request(
+            "compression-failed",
+            "contextCompression",
+            "provider-1",
+            "failed",
+            "2026-07-10T10:01:00Z",
+            20,
+            4,
+            6,
+            2,
+            8,
+            Some(300),
+        ),
+        request(
+            "other-running",
+            "prompt hook",
+            "provider-2",
+            "running",
+            "2026-07-10T10:02:00Z",
+            7,
+            1,
+            0,
+            0,
+            2,
+            None,
+        ),
+    ] {
+        database
+            .insert_llm_request(request)
+            .expect("llm request insert");
+    }
+
+    let breakdown = database
+        .llm_request_audit_request_kind_breakdown(LlmRequestAuditFilters {
+            chat_id: Some("chat-1"),
+            provider_id: Some("provider-1"),
+            started_after: Some("2026-07-10T10:00:30Z"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("request kind breakdown");
+    assert_eq!(breakdown.len(), 1);
+    let compression = &breakdown[0];
+    assert_eq!(compression.request_kind, "contextCompression");
+    assert_eq!(compression.request_count, 1);
+    assert_eq!(compression.failed_requests, 1);
+    assert_eq!(compression.total_input_tokens, 20);
+    assert_eq!(compression.total_output_tokens, 4);
+    assert_eq!(compression.total_cache_read_tokens, 6);
+    assert_eq!(compression.total_cache_write_tokens, 2);
+    assert_eq!(compression.total_reasoning_tokens, 8);
+    assert_eq!(compression.total_tokens, 24);
+    assert_eq!(compression.latency_count, 1);
+    assert_eq!(compression.latency_sum, 300);
+
+    let running = database
+        .llm_request_audit_request_kind_breakdown(LlmRequestAuditFilters {
+            final_state: Some("running"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("running request kind breakdown");
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].request_kind, "prompt hook");
+    assert_eq!(running[0].failed_requests, 1);
+    assert_eq!(running[0].latency_count, 0);
 }
 
 #[test]

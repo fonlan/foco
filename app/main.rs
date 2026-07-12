@@ -58,14 +58,14 @@ use foco_store::{
     },
     workspace::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord,
-        LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
-        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-        LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, MessageRoleCountRecord,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewPromptContextInjection, NewToolCall, NewToolResult, PromptContextInjectionRecord,
-        RewriteChatFromUserMessage, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
-        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+        LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
+        LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord,
+        LlmRequestRecord, MessageRecord, MessageRoleCountRecord, NewContextCompressionSnapshot,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
+        NewToolResult, PromptContextInjectionRecord, RewriteChatFromUserMessage, TodoGraphRecord,
+        TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
         workspace_database_path,
     },
 };
@@ -1531,6 +1531,7 @@ struct AiStatisticsSummary {
     failed_requests: i64,
     model_breakdown: Vec<AiStatisticsModelBreakdown>,
     provider_breakdown: Vec<AiStatisticsProviderBreakdown>,
+    request_kind_breakdown: Vec<AiStatisticsRequestKindBreakdown>,
     total_cache_read_tokens: i64,
     total_cache_write_tokens: i64,
     total_input_tokens: i64,
@@ -1538,6 +1539,22 @@ struct AiStatisticsSummary {
     total_requests: i64,
     total_tokens: i64,
     trend: Vec<AiStatisticsTrendPoint>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiStatisticsRequestKindBreakdown {
+    request_kind: String,
+    request_count: i64,
+    failed_requests: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    total_reasoning_tokens: i64,
+    total_tokens: i64,
+    total_latency_ms: i64,
+    average_latency_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -2260,6 +2277,7 @@ struct NormalizedAiStatisticsFilters {
     workspace_id: Option<String>,
     request_ids: Vec<String>,
     chat_id: Option<String>,
+    request_kind: Option<String>,
     provider_id: Option<String>,
     model_id: Option<String>,
     status: Option<String>,
@@ -7981,6 +7999,7 @@ fn normalized_ai_statistics_query(
         request_ids: normalized_request_ids(&mut query),
         workspace_id: optional_trimmed_string(query.workspace_id),
         chat_id: optional_trimmed_string(query.chat_id),
+        request_kind: optional_trimmed_string(query.request_kind),
         provider_id: optional_trimmed_string(query.provider_id),
         model_id: optional_trimmed_string(query.model_id),
         status: optional_trimmed_string(query.status),
@@ -8068,6 +8087,7 @@ fn ai_statistics_summary_from_aggregates(
     merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint>,
     merged_models: BTreeMap<String, LlmRequestAuditModelBreakdown>,
     merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+    merged_request_kinds: BTreeMap<String, LlmRequestAuditRequestKindBreakdown>,
 ) -> AiStatisticsSummary {
     let summary = merged_summary.unwrap_or_default();
     let mut model_breakdown: Vec<AiStatisticsModelBreakdown> = merged_models
@@ -8116,11 +8136,35 @@ fn ai_statistics_summary_from_aggregates(
             total_tokens: point.total_tokens,
         })
         .collect();
+    let mut request_kind_breakdown: Vec<AiStatisticsRequestKindBreakdown> = merged_request_kinds
+        .into_values()
+        .map(|row| AiStatisticsRequestKindBreakdown {
+            average_latency_ms: average_i64(row.latency_sum, row.latency_count),
+            request_kind: row.request_kind,
+            request_count: row.request_count,
+            failed_requests: row.failed_requests,
+            total_input_tokens: row.total_input_tokens,
+            total_output_tokens: row.total_output_tokens,
+            total_cache_read_tokens: row.total_cache_read_tokens,
+            total_cache_write_tokens: row.total_cache_write_tokens,
+            total_reasoning_tokens: row.total_reasoning_tokens,
+            total_tokens: row.total_tokens,
+            total_latency_ms: row.latency_sum,
+        })
+        .collect();
+    request_kind_breakdown.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.request_kind.cmp(&right.request_kind))
+    });
     AiStatisticsSummary {
         average_latency_ms: average_i64(summary.latency_sum, summary.latency_count),
         failed_requests: summary.failed_requests,
         model_breakdown,
         provider_breakdown,
+        request_kind_breakdown,
         total_cache_read_tokens: summary.total_cache_read_tokens,
         total_cache_write_tokens: summary.total_cache_write_tokens,
         total_input_tokens: summary.total_input_tokens,
@@ -8272,6 +8316,7 @@ fn llm_request_rows_summary(rows: &[LlmRequestAuditRow]) -> AiStatisticsSummary 
         failed_requests,
         model_breakdown: model_list,
         provider_breakdown: provider_list,
+        request_kind_breakdown: Vec::new(),
         total_cache_read_tokens,
         total_cache_write_tokens,
         total_input_tokens,

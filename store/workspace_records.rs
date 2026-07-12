@@ -1048,6 +1048,21 @@ pub struct LlmRequestAuditProviderBreakdown {
     pub latency_sum: i64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LlmRequestAuditRequestKindBreakdown {
+    pub request_kind: String,
+    pub request_count: i64,
+    pub failed_requests: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cache_write_tokens: i64,
+    pub total_reasoning_tokens: i64,
+    pub total_tokens: i64,
+    pub latency_count: i64,
+    pub latency_sum: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewLlmRequestEvent<'a> {
     pub id: &'a str,
