@@ -50,6 +50,7 @@ pub(crate) use questions::{
     AskQuestionInput, QuestionAnswer, QuestionAnswerResponse, QuestionItem, QuestionItemAnswer,
     QuestionOption, QuestionRegistry, QuestionRequest,
 };
+pub(crate) use reasoning_loop_detector::{ReasoningLoopDetector, reasoning_loop_guard_message};
 pub(crate) use sidecar_config::{SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle};
 pub(crate) use subscriptions::{
     ActiveChatRunRegistration, ActiveChatRunRegistry, ActiveChatRunSubscription,

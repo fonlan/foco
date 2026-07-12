@@ -97,9 +97,10 @@ use crate::{
     },
     runtime::{
         ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
-        ReadOnlyToolProgressDetector, RepeatedToolCallDetector, SidecarRuntimeConfigBundle,
-        ToolOutputDeltaEvent, ToolResourceLockRegistry, build_sidecar_runtime_config_bundle,
-        execute_image_tool, execute_tool, execute_web_tool,
+        ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
+        SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
+        reasoning_loop_guard_message,
     },
     save_config,
     skills::{
@@ -7574,6 +7575,7 @@ async fn remote_sidecar_run_broker_llm_turn(
             .await
             .map_err(|_| ())?;
     let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
+    let mut reasoning_loop_detector = ReasoningLoopDetector::default();
     loop {
         let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
             Ok(Some(envelope)) => envelope,
@@ -7635,6 +7637,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     );
                 } else if kind == "reasoningDelta" {
                     run_metrics.capture_first_output();
+                    let loop_detection = reasoning_loop_detector.push_delta(delta);
                     reasoning.push_str(delta);
                     *sequence += 1;
                     run_stream.record(
@@ -7645,6 +7648,70 @@ async fn remote_sidecar_run_broker_llm_turn(
                             "delta": delta,
                         }),
                     );
+                    if let Some(detection) = loop_detection {
+                        let message = reasoning_loop_guard_message(detection);
+                        remote_sidecar_cancel_broker_request_id(state, broker_request_id);
+                        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        let total_latency_ms = run_metrics.total_latency_ms();
+                        let metrics = remote_chat_metrics(
+                            model_id,
+                            provider_id,
+                            broker_request_id,
+                            run_metrics,
+                            total_latency_ms,
+                        );
+                        let metadata = json!({
+                            "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                            "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                            "metrics": metrics,
+                        });
+                        let assistant_sequence = database
+                            .message(assistant_message_id)
+                            .ok()
+                            .flatten()
+                            .map(|message| message.sequence)
+                            .unwrap_or_else(|| {
+                                database
+                                    .next_message_sequence_for_chat(chat_id)
+                                    .unwrap_or(0)
+                            });
+                        let _ = database.upsert_message_content(NewMessage {
+                            id: assistant_message_id,
+                            chat_id,
+                            role: "assistant",
+                            content: text,
+                            sequence: assistant_sequence,
+                            metadata_json: Some(&metadata.to_string()),
+                        });
+                        let _ = persist_sidecar_llm_audit(
+                            database,
+                            &state.workspace_id,
+                            chat_id,
+                            broker_request_id,
+                            provider_id,
+                            model_id,
+                            run_metrics,
+                            &completed_at,
+                            total_latency_ms,
+                            "failed",
+                            json!({
+                                "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
+                                "error": { "message": message },
+                                "partial": true,
+                            }),
+                        );
+                        *sequence += 1;
+                        run_stream.record(
+                            *sequence,
+                            json!({
+                                "type": "error",
+                                "message": message,
+                            }),
+                        );
+                        *sequence += 1;
+                        run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                        return Err(());
+                    }
                 } else if kind == "usageDelta" {
                     *sequence += 1;
                     run_stream.record(
@@ -13009,6 +13076,194 @@ mod tests {
             metadata["metrics"]["firstTokenLatencyMs"].as_i64()
         );
         assert_eq!(audit.total_latency_ms, Some(total_latency_ms));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_reasoning_loop_guard_cancels_broker_and_persists_partial_failure() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        run_stream.set_broker_request_id("broker-request-1".to_string());
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            let reasoning_period =
+                "Inspect the premise, compare the evidence, and restart the same analysis. ";
+            for _ in 0..24 {
+                pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "stream".to_string(),
+                        id: Some(id.clone()),
+                        method: None,
+                        payload: json!({
+                            "kind": "reasoningDelta",
+                            "delta": reasoning_period,
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send repeated reasoning delta");
+            }
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "reasoningDelta",
+                        "delta": "SENTINEL_AFTER_LOOP_GUARD",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send post-loop sentinel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 8, "outputTokens": 80 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send unreachable response");
+
+            loop {
+                let envelope = broker_rx.recv().await.expect("broker cancel");
+                if envelope.message_type == "cancel" {
+                    assert_eq!(envelope.id.as_deref(), Some(id.as_str()));
+                    break;
+                }
+            }
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        let mut sequence = 0_i64;
+        let result = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-1",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-1",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &mut database,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        assert!(result.is_err());
+        assert!(text.is_empty());
+        assert!(!reasoning.is_empty());
+        assert!(!reasoning.contains("SENTINEL_AFTER_LOOP_GUARD"));
+        let events = run_stream.snapshot_after(-1);
+        assert_eq!(
+            events
+                .iter()
+                .rev()
+                .take(2)
+                .map(|(_, event)| event["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["streamEnd", "error"]
+        );
+        let error_message = events
+            .iter()
+            .find_map(|(_, event)| {
+                (event["type"] == "error")
+                    .then(|| event["message"].as_str())
+                    .flatten()
+            })
+            .expect("reasoning loop error event");
+        assert!(error_message.contains("Runtime progress guard"));
+        assert!(error_message.contains("repeated reasoning loop"));
+        assert!(error_message.contains("Partial reasoning was preserved"));
+
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant message lookup")
+            .expect("assistant message");
+        let metadata: Value =
+            serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
+        assert_eq!(
+            metadata.get("reasoning").and_then(Value::as_str),
+            Some(reasoning.as_str())
+        );
+        let audit = database
+            .llm_request("broker-request-1")
+            .expect("sidecar audit lookup")
+            .expect("sidecar audit exists");
+        assert_eq!(audit.request_kind, BROKER_DEFAULT_LLM_REQUEST_KIND);
+        assert_eq!(audit.final_state, "failed");
+        let response: Value = serde_json::from_str(
+            audit
+                .response_body_json
+                .as_deref()
+                .expect("sidecar partial response"),
+        )
+        .expect("sidecar partial response JSON");
+        assert_eq!(response["requestKind"], BROKER_DEFAULT_LLM_REQUEST_KIND);
+        assert_eq!(response["partial"], true);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("repeated reasoning loop"))
+        );
     }
 
     #[tokio::test]

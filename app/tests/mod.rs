@@ -22606,6 +22606,58 @@ async fn serve_main_chat_wire_fixture() -> (
     (format!("http://{addr}/v1"), seen, task)
 }
 
+async fn serve_main_chat_reasoning_loop_fixture()
+-> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reasoning_period =
+        "Inspect the premise, compare the evidence, and restart the same analysis. ";
+    let mut body = String::new();
+    for _ in 0..24 {
+        body.push_str("data: ");
+        body.push_str(
+            &json!({
+                "id": "chat-reasoning-loop",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_content": reasoning_period }
+                }]
+            })
+            .to_string(),
+        );
+        body.push_str("\n\n");
+    }
+    body.push_str(
+        "data: {\"id\":\"chat-reasoning-loop\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"guard failed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    );
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen_for_handler = seen.clone();
+            move |Json(payload): Json<Value>| {
+                let seen = seen_for_handler.clone();
+                let body = body.clone();
+                async move {
+                    seen.lock()
+                        .expect("reasoning loop request capture")
+                        .push(payload);
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind reasoning loop fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("reasoning loop fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), seen, task)
+}
+
 #[derive(Clone, Copy)]
 enum MainChatToolConflictFixture {
     SameFileWrites,
@@ -22871,6 +22923,116 @@ async fn main_chat_write_read_edit_conflict_rejects_every_call_and_continues_nex
 #[tokio::test]
 async fn main_chat_project_spec_write_conflict_returns_tool_errors_and_continues_next_turn() {
     assert_main_chat_tool_conflict_recovers(MainChatToolConflictFixture::ProjectSpecWrites).await;
+}
+
+#[tokio::test]
+async fn main_chat_reasoning_loop_guard_stops_without_provider_retry_and_persists_partial() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, seen, server_task) = serve_main_chat_reasoning_loop_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 3;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Trigger the reasoning loop guard".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare reasoning loop chat context");
+    let chat_id = context.chat_id.clone();
+    let assistant_message_id = context.assistant_message_id.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_id = None;
+    let mut streamed_reasoning = String::new();
+    let mut error_message = None;
+    let mut stream_reset_count = 0;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_id = Some(id),
+            ChatSseEvent::ReasoningDelta { delta, .. } => streamed_reasoning.push_str(&delta),
+            ChatSseEvent::StreamReset { .. } => stream_reset_count += 1,
+            ChatSseEvent::Complete { .. } => completed = true,
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    let error_message = error_message.expect("reasoning loop guard error");
+    assert!(error_message.contains("Runtime progress guard"));
+    assert!(error_message.contains("repeated reasoning loop"));
+    assert!(error_message.contains("Partial reasoning was preserved"));
+    assert!(!streamed_reasoning.is_empty());
+    assert_eq!(stream_reset_count, 0);
+    assert!(!completed);
+    assert_eq!(
+        seen.lock().expect("reasoning loop request capture").len(),
+        1,
+        "runtime reasoning guard must not enter provider retry"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let assistant = database
+        .message(&assistant_message_id)
+        .expect("assistant message lookup")
+        .expect("assistant message persisted");
+    let metadata: Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
+    assert_eq!(
+        metadata.get("reasoning").and_then(Value::as_str),
+        Some(streamed_reasoning.as_str())
+    );
+    let request = database
+        .llm_request(&llm_request_id.expect("reasoning loop LLM request id"))
+        .expect("reasoning loop audit lookup")
+        .expect("reasoning loop audit exists");
+    assert_eq!(request.chat_id.as_deref(), Some(chat_id.as_str()));
+    assert_eq!(request.request_kind, "chat completion");
+    assert_eq!(request.final_state, "failed");
+    let response: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("partial provider response dump"),
+    )
+    .expect("partial provider response JSON");
+    assert_eq!(response["format"], "provider_final_response_v1");
+    assert_eq!(response["state"], "failed");
+    assert_eq!(response["partial"], true);
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("repeated reasoning loop"))
+    );
 }
 
 #[tokio::test]

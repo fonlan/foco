@@ -142,11 +142,11 @@ use crate::runtime::{
     ChatRunCancellation, CodeGraphIndexState, CoordinatorTaskInput, GuidanceMessage,
     ProviderAuditCapture, QuestionAnswer, QuestionAnswerResponse, QuestionRegistry,
     QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    RepeatedToolCallDetector, RipgrepStatus, RipgrepToolSummary, ToolOutputDeltaEvent,
-    ToolResourceLockRegistry, chat_run_subscription_stream, detect_ripgrep,
+    ReasoningLoopDetector, RepeatedToolCallDetector, RipgrepStatus, RipgrepToolSummary,
+    ToolOutputDeltaEvent, ToolResourceLockRegistry, chat_run_subscription_stream, detect_ripgrep,
     execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
-    pending_tool_calls, recently_active_code_graph_workspaces, ripgrep_tool_summary,
-    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
+    pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
+    ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
     spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
@@ -3114,6 +3114,7 @@ impl PreparedChatContext {
                         };
                         let mut turn_text = String::new();
                         let mut turn_reasoning = String::new();
+                        let mut reasoning_loop_detector = ReasoningLoopDetector::default();
                         let mut turn_first_token_at = None;
                         let mut turn_first_token_latency_ms = None;
                         let mut completed_turn = false;
@@ -3316,6 +3317,7 @@ impl PreparedChatContext {
                                         reasoning_started_at = Some(Instant::now());
                                         reasoning_duration_ms = None;
                                     }
+                                    let loop_detection = reasoning_loop_detector.push_delta(&delta);
                                     assistant_reasoning.push_str(&delta);
                                     turn_reasoning.push_str(&delta);
                                     let event = ChatSseEvent::ReasoningDelta {
@@ -3324,6 +3326,50 @@ impl PreparedChatContext {
                                     };
                                     events.push(captured_event(&event));
                                     yield event;
+
+                                    if let Some(detection) = loop_detection {
+                                        let message = reasoning_loop_guard_message(detection);
+                                        drop(provider_stream);
+                                        let event = ChatSseEvent::Error {
+                                            message: message.clone(),
+                                        };
+                                        events.push(captured_event(&event));
+                                        let outcome = failed_chat_audit_outcome(
+                                            &self,
+                                            turn_started_at,
+                                            &mut events,
+                                            &message,
+                                            None,
+                                        )
+                                        .await;
+                                        self.capture_failed_llm_request(
+                                            &turn_capture,
+                                            turn_llm_request_id,
+                                            turn_request_started_at,
+                                            turn_events,
+                                            turn_started_at,
+                                            &message,
+                                            None,
+                                            true,
+                                        );
+                                        let persisted_reasoning = non_empty_string(&assistant_reasoning);
+                                        if let Err(persist_error) = persist_chat_result(
+                                            &self,
+                                            &request_started_at,
+                                            outcome,
+                                            &events,
+                                            Some(&assistant_text),
+                                            persisted_reasoning.as_deref(),
+                                            &executed_tool_calls,
+                                        ) {
+                                            yield ChatSseEvent::Error {
+                                                message: persist_error.message,
+                                            };
+                                        } else {
+                                            yield event;
+                                        }
+                                        return;
+                                    }
                                 }
                                 NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
                                     capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);

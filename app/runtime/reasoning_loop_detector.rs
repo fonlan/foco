@@ -19,6 +19,13 @@ pub(crate) struct ReasoningLoopDetection {
     pub(crate) observed_char_count: usize,
 }
 
+pub(crate) fn reasoning_loop_guard_message(detection: ReasoningLoopDetection) -> String {
+    format!(
+        "Runtime progress guard stopped the provider stream after detecting a repeated reasoning loop (period {} characters, repeated {} times across {} observed characters). Partial reasoning was preserved.",
+        detection.period_char_count, detection.repeat_count, detection.observed_char_count
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct ReasoningLoopDetector {
     normalized_tail: VecDeque<char>,
