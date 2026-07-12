@@ -901,7 +901,7 @@ fn read_spec_definition() -> ToolDefinition {
 fn update_spec_definition() -> ToolDefinition {
     ToolDefinition {
         name: UPDATE_SPEC_TOOL,
-        description: "Update the Project Spec for the active workspace using expectedRevision optimistic locking. The spec is durable workspace context; do not use it for temporary todos, logs, secrets, personal preferences, or chat-only notes. Call read_spec first and retry from the latest revision if the update conflicts.",
+        description: "Update the Project Spec for the active workspace using expectedRevision optimistic locking. Call read_spec first and base the update on its latest revision and exact content. Prefer edits for precise patches; use contentMarkdown only when initializing the spec or when a complete rewrite is genuinely required. Provide exactly one non-null update payload. The spec is durable workspace context; do not use it for temporary todos, logs, secrets, personal preferences, or chat-only notes. Retry from the latest read_spec result if the update conflicts.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -911,15 +911,34 @@ fn update_spec_definition() -> ToolDefinition {
                     "description": "Revision returned by the latest read_spec call. The update fails if the stored revision changed."
                 },
                 "contentMarkdown": {
-                    "type": "string",
-                    "description": "Complete replacement Project Spec markdown content. Existing workspace spec size validation applies."
+                    "type": ["string", "null"],
+                    "description": "Complete replacement Project Spec markdown content, or null when using edits. Use only for initialization or a necessary complete rewrite. Existing workspace spec size validation applies."
+                },
+                "edits": {
+                    "type": ["array", "null"],
+                    "description": "Ordered exact-text patches, or null when using contentMarkdown. Each oldText must be non-empty and match the latest spec exactly once.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "oldText": {
+                                "type": "string",
+                                "description": "Exact text from the latest read_spec content. It must be non-empty and match exactly once when this edit is applied."
+                            },
+                            "newText": {
+                                "type": "string",
+                                "description": "Replacement text for the unique oldText match."
+                            }
+                        },
+                        "required": ["oldText", "newText"]
+                    }
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["expectedRevision", "contentMarkdown", "timeoutMs"]
+            "required": ["expectedRevision", "contentMarkdown", "edits", "timeoutMs"]
         }),
         strict: true,
     }

@@ -1071,7 +1071,8 @@ mod tests {
     };
     use foco_store::workspace::{
         NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-        NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep, WorkspaceDatabase,
+        NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WorkspaceDatabase,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -2542,6 +2543,34 @@ mod tests {
     }
 
     #[test]
+    fn update_spec_schema_supports_nullable_patch_and_replacement_payloads() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == UPDATE_SPEC_TOOL)
+            .expect("update_spec definition");
+        let properties = definition.input_schema["properties"]
+            .as_object()
+            .expect("update_spec properties");
+        let required = definition.input_schema["required"]
+            .as_array()
+            .expect("update_spec required");
+
+        assert_eq!(
+            properties["contentMarkdown"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(properties["edits"]["type"], json!(["array", "null"]));
+        assert_eq!(
+            properties["edits"]["items"]["required"],
+            json!(["oldText", "newText"])
+        );
+        assert!(required.contains(&json!("contentMarkdown")));
+        assert!(required.contains(&json!("edits")));
+        assert!(definition.description.contains("Call read_spec first"));
+        assert!(definition.description.contains("Prefer edits"));
+    }
+
+    #[test]
     fn spec_tools_round_trip_with_revision_conflict() {
         let workspace = tempfile::tempdir().expect("workspace");
 
@@ -2558,6 +2587,7 @@ mod tests {
         assert_eq!(initial.output["generatedAt"], Value::Null);
         assert_eq!(initial.output["updatedAt"], Value::Null);
 
+        // Legacy calls that omit the newer edits field remain valid.
         let first_update = execute_builtin_tool(
             workspace.path(),
             UPDATE_SPEC_TOOL,
@@ -2573,6 +2603,10 @@ mod tests {
             first_update.output["contentMarkdown"],
             "# Project Spec\n\nVersion one"
         );
+        assert_eq!(first_update.output["updateMode"], "fullReplacement");
+        assert_eq!(first_update.output["editCount"], 0);
+        assert_eq!(first_update.output["lineCountBefore"], 0);
+        assert_eq!(first_update.output["lineCountAfter"], 3);
 
         let stale_update = execute_builtin_tool(
             workspace.path(),
@@ -2606,6 +2640,10 @@ mod tests {
             second_update.output["contentMarkdown"],
             "# Project Spec\n\nVersion two"
         );
+        assert_eq!(second_update.output["updateMode"], "fullReplacement");
+        assert_eq!(second_update.output["editCount"], 0);
+        assert_eq!(second_update.output["lineCountBefore"], 3);
+        assert_eq!(second_update.output["lineCountAfter"], 3);
 
         let read_back = execute_builtin_tool(
             workspace.path(),
@@ -2613,7 +2651,176 @@ mod tests {
             json!({ "timeoutMs": null }),
         );
         assert!(!read_back.is_error);
-        assert_eq!(read_back.output, second_update.output);
+        assert_eq!(
+            read_back.output["revision"],
+            second_update.output["revision"]
+        );
+        assert_eq!(
+            read_back.output["contentMarkdown"],
+            second_update.output["contentMarkdown"]
+        );
+    }
+
+    #[test]
+    fn update_spec_applies_ordered_exact_text_edits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let initial_content = "# Spec\n\nAlpha\nBeta";
+        let initial = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": initial_content,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!initial.is_error);
+
+        let patched = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [
+                    { "oldText": "Alpha", "newText": "Gamma\nDelta" },
+                    { "oldText": "Delta\nBeta", "newText": "Delta\nEpsilon" }
+                ],
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!patched.is_error, "{}", patched.output);
+        assert_eq!(patched.output["revision"], 2);
+        assert_eq!(
+            patched.output["contentMarkdown"],
+            "# Spec\n\nGamma\nDelta\nEpsilon"
+        );
+        assert_eq!(patched.output["updateMode"], "patch");
+        assert_eq!(patched.output["editCount"], 2);
+        assert_eq!(patched.output["lineCountBefore"], 4);
+        assert_eq!(patched.output["lineCountAfter"], 5);
+
+        let stale_patch = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "Gamma", "newText": "Stale" }],
+                "timeoutMs": null
+            }),
+        );
+        assert!(stale_patch.is_error);
+        assert!(
+            stale_patch.output["error"]
+                .as_str()
+                .expect("stale patch error")
+                .contains("call read_spec again")
+        );
+    }
+
+    #[test]
+    fn update_spec_rejects_invalid_patches_without_partial_writes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let initial_content = "# Spec\n\nAlpha\nAlpha";
+        let initial = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": initial_content,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!initial.is_error);
+
+        let invalid_payloads = [
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "", "newText": "x" }],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "Alpha", "newText": "Changed" }],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [
+                    { "oldText": "# Spec", "newText": "# Changed" },
+                    { "oldText": "Missing", "newText": "Never applied" }
+                ],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [
+                    { "oldText": "# Spec", "newText": "# Changed" },
+                    { "oldText": "# Changed", "newText": "# Spec" }
+                ],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": "replacement",
+                "edits": [{ "oldText": "# Spec", "newText": "# Changed" }],
+                "timeoutMs": null
+            }),
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        ];
+
+        for payload in invalid_payloads {
+            let rejected = execute_builtin_tool(workspace.path(), UPDATE_SPEC_TOOL, payload);
+            assert!(rejected.is_error, "expected rejection: {}", rejected.output);
+
+            let read_back = execute_builtin_tool(
+                workspace.path(),
+                READ_SPEC_TOOL,
+                json!({ "timeoutMs": null }),
+            );
+            assert_eq!(read_back.output["revision"], 1);
+            assert_eq!(read_back.output["contentMarkdown"], initial_content);
+        }
+
+        let oversized = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{
+                    "oldText": "# Spec",
+                    "newText": "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1)
+                }],
+                "timeoutMs": null
+            }),
+        );
+        assert!(oversized.is_error);
+
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "timeoutMs": null }),
+        );
+        assert_eq!(read_back.output["revision"], 1);
+        assert_eq!(read_back.output["contentMarkdown"], initial_content);
     }
 
     #[test]
