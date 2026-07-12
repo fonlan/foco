@@ -1916,7 +1916,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/delete",
-            post(remote_sidecar_passthrough_unavailable),
+            post(remote_sidecar_delete_chat),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/agent-team",
@@ -5841,6 +5841,37 @@ async fn remote_sidecar_edit_chat_user_message(
         "skippedWorkspaceSpecJobIds": rewritten.skipped_workspace_spec_job_ids,
         "skippedMemoryExtractionJobIds": rewritten.skipped_memory_extraction_job_ids,
         "completedMemoriesPreserved": true,
+    })))
+}
+
+async fn remote_sidecar_delete_chat(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let chat_id = chat_id.trim().to_string();
+    if chat_id.is_empty() {
+        return Err(ApiError::bad_request("chat id must not be empty").into_response());
+    }
+    if remote_chat_active_run(&state, &chat_id).is_some() {
+        return Err(ApiError::conflict("chat already has an active remote run").into_response());
+    }
+
+    let mut database = sidecar_workspace_database(&state)?;
+    if !database
+        .delete_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    {
+        return Err(
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
+        );
+    }
+    drop(database);
+
+    remote_sidecar_clear_chat_run_streams(&state, &chat_id);
+
+    Ok(Json(json!({
+        "deleted": true,
+        "chatId": chat_id,
     })))
 }
 
@@ -12342,6 +12373,91 @@ mod tests {
             .expect("message read")
             .expect("message");
         assert_eq!(message.content, "original");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_delete_chat_removes_database_chat_and_clears_run_streams() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        drop(database);
+
+        let deleted_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "stale-run".to_string(),
+            "chat-1".to_string(),
+        );
+        remote_sidecar_insert_active_run_stream(
+            &state,
+            "other-run".to_string(),
+            "chat-2".to_string(),
+        );
+
+        let Json(response) =
+            remote_sidecar_delete_chat(State(state.clone()), AxumPath("chat-1".to_string()))
+                .await
+                .expect("delete response");
+
+        assert_eq!(response, json!({ "deleted": true, "chatId": "chat-1" }));
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        assert!(database.chat("chat-1").expect("chat query").is_none());
+        assert!(remote_sidecar_active_run_stream(&state, "stale-run").is_none());
+        assert!(remote_sidecar_active_run_stream(&state, "other-run").is_some());
+        assert!(deleted_stream.finished.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_delete_chat_rejects_empty_and_missing_chat_ids() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+
+        for (chat_id, expected_error) in [
+            ("   ", "chat id must not be empty"),
+            ("missing-chat", "chat was not found: missing-chat"),
+        ] {
+            let response =
+                remote_sidecar_delete_chat(State(state.clone()), AxumPath(chat_id.to_string()))
+                    .await
+                    .expect_err("invalid chat id should fail");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body");
+            let payload: Value = serde_json::from_slice(&body).expect("error response json");
+            assert_eq!(payload["error"], expected_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_delete_chat_rejects_active_run_without_mutation() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: "run-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            },
+        );
+
+        let response = remote_sidecar_delete_chat(State(state), AxumPath("chat-1".to_string()))
+            .await
+            .expect_err("active run should conflict");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body");
+        let payload: Value = serde_json::from_slice(&body).expect("error response json");
+        assert_eq!(payload["error"], "chat already has an active remote run");
+        assert!(database.chat("chat-1").expect("chat query").is_some());
     }
 
     #[test]

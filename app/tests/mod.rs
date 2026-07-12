@@ -24987,6 +24987,21 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
         .await
         .expect("agent team json");
     assert_eq!(body["team"]["id"], "remote-agent-team-chat-1");
+
+    let delete_response = reqwest::Client::new()
+        .post(format!(
+            "http://{app_addr}/api/workspaces/remote/chats/chat-1/delete"
+        ))
+        .send()
+        .await
+        .expect("proxied chat delete request");
+    assert_eq!(delete_response.status(), StatusCode::OK);
+    let body = delete_response
+        .json::<Value>()
+        .await
+        .expect("chat delete json");
+    assert_eq!(body, json!({ "deleted": true, "chatId": "chat-1" }));
+
     let mut ws_request =
         format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws?cols=111&rows=37")
             .into_client_request()
@@ -25032,6 +25047,7 @@ async fn serve_fake_sidecar_proxy_fixture(
     let expected_chat_stats = expected_http.clone();
     let expected_todo_graph = expected_http.clone();
     let expected_agent_team = expected_http.clone();
+    let expected_chat_delete = expected_http.clone();
     let expected_ws = expected_http.clone();
     let seen_auth = Arc::new(Mutex::new(Vec::new()));
     let http_seen = seen_auth.clone();
@@ -25040,6 +25056,7 @@ async fn serve_fake_sidecar_proxy_fixture(
     let chat_stats_seen = seen_auth.clone();
     let todo_graph_seen = seen_auth.clone();
     let agent_team_seen = seen_auth.clone();
+    let chat_delete_seen = seen_auth.clone();
     let ws_seen = seen_auth.clone();
     let app = axum::Router::new()
         .route(
@@ -25179,6 +25196,25 @@ async fn serve_fake_sidecar_proxy_fixture(
                         "tasks": [],
                     }))
                     .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/remote/workspace/chats/{chat_id}/delete",
+            axum::routing::post(move |headers: HeaderMap, AxumPath(chat_id): AxumPath<String>| {
+                let expected = expected_chat_delete.clone();
+                let seen = chat_delete_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({ "deleted": true, "chatId": chat_id })).into_response()
                 }
             }),
         )
