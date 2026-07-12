@@ -71,10 +71,11 @@ use std::os::windows::process::CommandExt;
 use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
-    api_audit_save_details, append_pending_tool_state_messages, config_snapshot,
-    estimate_tool_schema_tokens,
+    api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
+    config_snapshot, estimate_tool_schema_tokens,
     hooks::{
-        HookExecution, HookRuntime, PromptHookExecutor, PromptHookExecutorRequest, PromptHookFuture,
+        HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
+        PromptHookExecutorRequest, PromptHookFuture,
     },
     http::{
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
@@ -553,6 +554,53 @@ impl RemoteSidecarRuntimeToolState {
             return Ok(false);
         }
         let summary_token_count = estimate_text_tokens(&summary);
+        let workspace_path = PathBuf::from(&state.workspace_path);
+        let (_mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
+            match remote_sidecar_hook_environment(state).await {
+                Ok(environment) => environment,
+                Err(error) => {
+                    events.pop();
+                    run_stream.push_hook_notifications(vec![HookNotification {
+                        event: "PreCompact".to_string(),
+                        level: "error".to_string(),
+                        message: error.clone(),
+                    }]);
+                    return Err(ApiError::internal(error));
+                }
+            };
+        let pre_summary = hook_runtime
+            .run_hooks(HookRunRequest {
+                global_config: &global_hooks,
+                api_audit_save_details: api_audit_save_details(&global_config),
+                workspace_id,
+                workspace_path: &workspace_path,
+                event: "PreCompact",
+                match_value: None,
+                chat_id: Some(chat_id),
+                run_id: Some(run_id),
+                session_id: Some(chat_id),
+                tool_call_id: None,
+                model_id: Some(model_id),
+                provider_id: Some(provider_id),
+                provider_config: None,
+                llm_request_retry_count: retry_count,
+                permission_mode: None,
+                payload: json!({
+                    "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                    "coveredSequences": covered_sequences,
+                    "originalTokenCount": original_tokens,
+                    "summaryTokenCount": summary_token_count,
+                    "summary": summary.clone(),
+                }),
+            })
+            .await;
+        run_stream.push_hook_notifications(pre_summary.hook_messages("PreCompact"));
+        self.append_hook_context(messages, &pre_summary.additional_context);
+        if pre_summary.first_block_reason().is_some() {
+            events.pop();
+            return Ok(false);
+        }
+
         let metadata = json!({
             "kind": CONTEXT_COMPRESSION_KIND_LLM,
             "coveredSequences": covered_sequences,
@@ -595,7 +643,46 @@ impl RemoteSidecarRuntimeToolState {
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
         });
+
+        let post_summary = hook_runtime
+            .run_hooks(HookRunRequest {
+                global_config: &global_hooks,
+                api_audit_save_details: api_audit_save_details(&global_config),
+                workspace_id,
+                workspace_path: &workspace_path,
+                event: "PostCompact",
+                match_value: None,
+                chat_id: Some(chat_id),
+                run_id: Some(run_id),
+                session_id: Some(chat_id),
+                tool_call_id: None,
+                model_id: Some(model_id),
+                provider_id: Some(provider_id),
+                provider_config: None,
+                llm_request_retry_count: retry_count,
+                permission_mode: None,
+                payload: json!({
+                    "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                    "snapshotId": prepared.snapshot.id,
+                }),
+            })
+            .await;
+        run_stream.push_hook_notifications(post_summary.hook_messages("PostCompact"));
+        self.append_hook_context(messages, &post_summary.additional_context);
         Ok(true)
+    }
+
+    fn append_hook_context(&mut self, messages: &mut Vec<NeutralChatMessage>, contexts: &[String]) {
+        let message_count_before = messages.len();
+        append_hook_context_messages(
+            messages,
+            &mut self.message_source_sequences,
+            &mut self.message_context_sources,
+            contexts,
+        );
+        if self.active_tool_start_index == message_count_before {
+            self.active_tool_start_index = messages.len();
+        }
     }
 
     fn recover_after_round_cap(
@@ -1543,6 +1630,7 @@ struct RemoteActiveRunStream {
     broker_request_id: Arc<Mutex<Option<String>>>,
     events: Arc<Mutex<Vec<(i64, Value)>>>,
     tx: tokio::sync::broadcast::Sender<(i64, Value)>,
+    pending_hook_notifications: Arc<Mutex<Vec<HookNotification>>>,
     finished: Arc<AtomicBool>,
 }
 
@@ -1554,8 +1642,25 @@ impl RemoteActiveRunStream {
             broker_request_id: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(Vec::new())),
             tx,
+            pending_hook_notifications: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn push_hook_notifications(&self, notifications: Vec<HookNotification>) {
+        if notifications.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_hook_notifications.lock() {
+            pending.extend(notifications);
+        }
+    }
+
+    fn take_hook_notifications(&self) -> Vec<HookNotification> {
+        self.pending_hook_notifications
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
     }
 
     fn record(&self, sequence: i64, payload: Value) {
@@ -8661,7 +8766,7 @@ async fn remote_sidecar_chat_stream(
         loop {
             // Before every brokered chat completion request (first turn and tool follow-ups):
             // runtime tool-state compression, then 95%/overflow LLM compression, then pack.
-            let (packed_messages, compression_events) = match runtime_tool_state
+            let compression_result = runtime_tool_state
                 .ensure_compression_then_pack(
                     &mut current_request.messages,
                     &stream_state,
@@ -8675,8 +8780,17 @@ async fn remote_sidecar_chat_stream(
                     &provider_id,
                     &model_id,
                 )
-                .await
-            {
+                .await;
+            for notification in run_stream.take_hook_notifications() {
+                sequence += 1;
+                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
+                    "type": "hookNotification",
+                    "assistantMessageId": assistant_message_id,
+                    "notification": notification,
+                })));
+                last_yielded_sequence = sequence;
+            }
+            let (packed_messages, compression_events) = match compression_result {
                 Ok(result) => result,
                 Err(error) => {
                     let message = error.message;
@@ -13574,6 +13688,30 @@ mod tests {
 
         let (state, mut broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.hooks = serde_json::from_value(json!({
+            "auditEnabled": true,
+            "PreCompact": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "tee pre-compact-input.json >/dev/null; printf '%s' '{\"decision\":\"allow\",\"additionalContext\":\"pre remote context\",\"systemMessage\":\"pre compact ran\"}'"
+                }, {
+                    "type": "command",
+                    "command": "printf '%s' 'pre compact warning' >&2; exit 1"
+                }]
+            }],
+            "PostCompact": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "tee post-compact-input.json >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"post refusal does not rollback\"},\"additionalContext\":\"post remote context\"}'"
+                }]
+            }]
+        }))
+        .expect("compression hook config");
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
         let broker_state = state.clone();
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         let mut messages = vec![
@@ -13626,6 +13764,7 @@ mod tests {
                         "model-1",
                     )
                     .await
+                    .map(|(packed, events)| (packed, events, messages, runtime_tool_state))
             }
         });
 
@@ -13675,10 +13814,48 @@ mod tests {
             })
             .expect("response");
 
-        let (packed, events) = compress_task
+        let (packed, events, messages_after, runtime_after) = compress_task
             .await
             .expect("join")
             .expect("ensure compression");
+        let notifications = run_stream.take_hook_notifications();
+        assert!(notifications.iter().any(|notification| {
+            notification.event == "PreCompact" && notification.message == "pre compact ran"
+        }));
+        assert!(
+            notifications.iter().any(|notification| {
+                notification.event == "PreCompact"
+                    && notification.level == "warning"
+                    && notification.message.contains("pre compact warning")
+            }),
+            "notifications: {notifications:?}"
+        );
+        assert!(
+            notifications.iter().any(|notification| {
+                notification.event == "PostCompact"
+                    && notification
+                        .message
+                        .contains("post refusal does not rollback")
+            }),
+            "notifications: {notifications:?}"
+        );
+        assert_eq!(
+            messages_after.len(),
+            runtime_after.message_source_sequences.len()
+        );
+        assert_eq!(
+            messages_after.len(),
+            runtime_after.message_context_sources.len()
+        );
+        assert_eq!(runtime_after.active_tool_start_index, messages_after.len());
+        assert_eq!(
+            runtime_after
+                .message_context_sources
+                .iter()
+                .filter(|source| matches!(source, PromptContextSource::HookContext))
+                .count(),
+            2
+        );
         assert!(
             events
                 .iter()
@@ -13694,6 +13871,14 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("Context Compression Snapshot"))
         );
+        assert!(packed.iter().any(|message| {
+            message.content.contains("Hook Context")
+                && message.content.contains("pre remote context")
+        }));
+        assert!(packed.iter().any(|message| {
+            message.content.contains("Hook Context")
+                && message.content.contains("post remote context")
+        }));
         assert!(
             packed
                 .iter()
@@ -13715,6 +13900,227 @@ mod tests {
         assert!(metadata.get("contextUsage").is_some());
         assert!(metadata.get("triggerTokens").is_some());
         assert!(metadata.get("availableMessageTokens").is_some());
+
+        let pre_input: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.path().join("pre-compact-input.json"))
+                .expect("pre compact input"),
+        )
+        .expect("pre compact input json");
+        assert_eq!(
+            pre_input.get("cwd").and_then(Value::as_str),
+            workspace.path().to_str()
+        );
+        assert_eq!(
+            pre_input.pointer("/payload/kind").and_then(Value::as_str),
+            Some(CONTEXT_COMPRESSION_KIND_LLM)
+        );
+        assert!(
+            pre_input
+                .pointer("/payload/coveredSequences")
+                .and_then(Value::as_array)
+                .is_some_and(|sequences| !sequences.is_empty())
+        );
+        assert!(
+            pre_input
+                .pointer("/payload/originalTokenCount")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            pre_input
+                .pointer("/payload/summaryTokenCount")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(
+            pre_input
+                .pointer("/payload/summary")
+                .and_then(Value::as_str),
+            Some("compact remote summary for continuation")
+        );
+        let post_input: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.path().join("post-compact-input.json"))
+                .expect("post compact input"),
+        )
+        .expect("post compact input json");
+        assert_eq!(
+            post_input
+                .pointer("/payload/snapshotId")
+                .and_then(Value::as_str),
+            Some(snapshots[0].id.as_str())
+        );
+        let hook_runs = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db for hook runs")
+            .hook_runs(10)
+            .expect("hook runs");
+        assert_eq!(hook_runs.len(), 3);
+        assert_eq!(
+            hook_runs
+                .iter()
+                .filter(|run| run.event == "PreCompact")
+                .count(),
+            2
+        );
+        assert!(hook_runs.iter().any(|run| run.event == "PostCompact"));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_precompact_block_keeps_history_and_writes_no_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-block", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.hooks = serde_json::from_value(json!({
+            "auditEnabled": true,
+            "PreCompact": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "tee blocked-pre-compact-input.json >/dev/null; printf '%s' '{\"decision\":\"block\",\"reason\":\"keep full remote history\",\"additionalContext\":\"blocked pre context\"}'"
+                }]
+            }]
+        }))
+        .expect("blocking hook config");
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let broker_state = state.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-block".to_string());
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "blocked-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "blocked-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "blocked-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "blocked-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: Vec::new(),
+        };
+        let compress_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                runtime_tool_state
+                    .ensure_compression_then_pack(
+                        &mut messages,
+                        &state,
+                        &run_stream,
+                        &mut database,
+                        "workspace",
+                        "chat-block",
+                        "run-block",
+                        "msg-user-block",
+                        "msg-assistant-block",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await
+                    .map(|(packed, events)| (packed, events, messages, runtime_tool_state))
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        assert_eq!(
+            request.payload.get("requestKind").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "llmRequestId": "broker-block",
+                    "text": "summary that must not be committed",
+                    "toolCalls": [],
+                    "usage": { "inputTokens": 80, "outputTokens": 12 }
+                }),
+                timestamp: None,
+            })
+            .expect("response");
+
+        let (packed, events, messages_after, runtime_after) = compress_task
+            .await
+            .expect("join")
+            .expect("blocked compression should continue without snapshot");
+        assert!(events.iter().all(|event| {
+            event.kind != CONTEXT_COMPRESSION_KIND_LLM || event.status != "completed"
+        }));
+        assert!(runtime_after.compression_snapshots.is_empty());
+        assert_eq!(
+            messages_after.len(),
+            runtime_after.message_source_sequences.len()
+        );
+        assert_eq!(
+            messages_after.len(),
+            runtime_after.message_context_sources.len()
+        );
+        assert!(
+            packed
+                .iter()
+                .any(|message| { message.content.contains("blocked-history-0") })
+        );
+        assert!(packed.iter().any(|message| {
+            message.content.contains("Hook Context")
+                && message.content.contains("blocked pre context")
+        }));
+        let notifications = run_stream.take_hook_notifications();
+        assert!(notifications.iter().any(|notification| {
+            notification.event == "PreCompact"
+                && notification.level == "error"
+                && notification.message.contains("keep full remote history")
+        }));
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db")
+            .context_compression_snapshots_for_chat("chat-block")
+            .expect("snapshots");
+        assert!(snapshots.is_empty());
+        assert!(!workspace.path().join("post-compact-input.json").exists());
+        let hook_runs = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db for hook runs")
+            .hook_runs(10)
+            .expect("hook runs");
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].event, "PreCompact");
+        assert_eq!(hook_runs[0].status, "blocked");
     }
 
     /// Hard regression: compress succeeds → drop in-memory runtime → rebuild from remote SQLite
