@@ -1220,8 +1220,13 @@ export const aiStatisticsDetail = {
       }),
       format: "provider_request_v1",
       headers: {
-        authorization: "[REDACTED]",
-        "content-type": "application/json",
+        accept: ["application/json"],
+        authorization: ["********"],
+        "content-type": ["application/json"],
+        cookie: ["session=fixture-cookie"],
+        "x-api-key": ["fixture-api-key"],
+        "x-legacy-redacted": "[REDACTED]",
+        "x-real-ip": ["203.0.113.42"],
       },
       method: "POST",
       url: "https://api.example.test/v1/responses",
@@ -1229,6 +1234,17 @@ export const aiStatisticsDetail = {
     },
     responseBody: {
       format: "provider_final_response_v1",
+      http: {
+        headers: {
+          authorization: ["********"],
+          "content-type": ["application/json"],
+          "set-cookie": ["response-session=fixture-cookie"],
+          "x-api-key": ["fixture-response-api-key"],
+          "x-request-id": ["request-fixture-1"],
+        },
+        status: 200,
+        version: "HTTP/2.0",
+      },
       reasoning: "Finished reasoning.",
       responseId: "resp-test",
       state: "succeeded",

@@ -1122,7 +1122,7 @@ function ProviderRequestDetail({
       </div>
       <AuditJsonBlock
         copied={false}
-        label={t("Redacted headers")}
+        label={t("Request headers")}
         onCopy={() => onCopy(auditJsonText(requestBody.headers))}
         value={requestBody.headers}
       />
@@ -1150,6 +1150,7 @@ function ProviderResponseDetail({
   const { t } = useI18n();
   if (!isProviderFinalResponseDump(responseBody)) {
     const unavailable = detailStatus === "unavailable";
+    const compactCancelled = isCompactCancelledResponse(responseBody);
     return (
       <AuditDetailCard
         notice={
@@ -1159,86 +1160,76 @@ function ProviderResponseDetail({
               : t("Waiting for the final provider response...")
             : detailStatus === "malformed"
               ? t("Stored response detail is malformed legacy text.")
-              : t("Legacy normalized response record.")
+              : compactCancelled
+                ? t("Compact cancelled response record.")
+                : t("Legacy normalized response record.")
         }
         noticeTone={responseBody === null ? "neutral" : "warning"}
-        title={t("Response body")}
+        title={t("Final provider response")}
       >
-        <AuditJsonBlock
-          copied={copied}
-          label={t("Response body")}
-          onCopy={() => onCopy(auditJsonText(responseBody))}
-          value={responseBody}
-        />
+        {responseBody !== null ? (
+          <AuditJsonBlock
+            copied={copied}
+            label={t("Response body")}
+            onCopy={() => onCopy(auditJsonText(responseBody))}
+            value={responseBody}
+          />
+        ) : null}
       </AuditDetailCard>
     );
   }
 
+  const responseFailed =
+    detailStatus === "failed" ||
+    detailStatus === "partial" ||
+    responseBody.state === "failed";
+  const noticeParts: string[] = [];
   if (responseBody.state === "failed") {
-    return (
-      <AuditDetailCard
-        notice={
-          responseBody.partial
-            ? t("The stream ended before a complete response was received.")
-            : t("The provider request failed.")
-        }
-        noticeTone="error"
-        title={t("Final provider response")}
-      >
-        <div className="grid gap-3 sm:grid-cols-2">
-          <AuditMeta label={t("State")} value={t("Failed")} />
-          <AuditMeta
-            label={t("HTTP status")}
-            value={responseBody.statusCode?.toString() ?? "n/a"}
-          />
-        </div>
-        <AuditTextBlock
-          copied={copied}
-          label={t("Final error")}
-          onCopy={() => onCopy(responseBody.error)}
-          value={responseBody.error}
-        />
-      </AuditDetailCard>
+    noticeParts.push(
+      responseBody.partial
+        ? t("The stream ended before a complete response was received.")
+        : t("The provider request failed."),
+    );
+  }
+  if (!responseBody.http) {
+    noticeParts.push(
+      t("Response head was not captured for this historical record."),
     );
   }
 
   return (
-    <AuditDetailCard title={t("Final provider response")}>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <AuditMeta
-          label={t("Stop reason")}
-          value={responseBody.stopReason ?? "n/a"}
-        />
-        <AuditMeta
-          label={t("Response ID")}
-          value={responseBody.responseId ?? "n/a"}
-        />
-      </div>
-      <AuditTextBlock
-        copied={copied}
-        label={t("Final text")}
-        onCopy={() => onCopy(responseBody.text)}
-        value={responseBody.text}
-      />
-      {responseBody.reasoning ? (
-        <AuditTextBlock
-          copied={false}
-          label={t("Final reasoning")}
-          onCopy={() => onCopy(responseBody.reasoning ?? "")}
-          value={responseBody.reasoning}
-        />
+    <AuditDetailCard
+      notice={noticeParts.length > 0 ? noticeParts.join(" ") : undefined}
+      noticeTone={responseFailed ? "error" : "warning"}
+      title={t("Final provider response")}
+    >
+      {responseBody.http ? (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <AuditMeta
+              label={t("HTTP status")}
+              value={responseBody.http.status.toString()}
+            />
+            <AuditMeta
+              label={t("HTTP version")}
+              value={responseBody.http.version}
+            />
+          </div>
+          <AuditJsonBlock
+            copied={false}
+            label={t("Response headers")}
+            onCopy={() =>
+              onCopy(auditJsonText(responseBody.http?.headers ?? null))
+            }
+            value={responseBody.http.headers}
+          />
+        </>
       ) : null}
       <AuditJsonBlock
-        copied={false}
-        label={t("Tool calls")}
-        onCopy={() => onCopy(auditJsonText(responseBody.toolCalls))}
-        value={responseBody.toolCalls}
-      />
-      <AuditJsonBlock
-        copied={false}
-        label={t("Usage")}
-        onCopy={() => onCopy(auditJsonText(responseBody.usage))}
-        value={responseBody.usage}
+        copied={copied}
+        label={t("Response body")}
+        onCopy={() => onCopy(auditJsonText(responseBody))}
+        value={responseBody}
       />
     </AuditDetailCard>
   );
@@ -1274,39 +1265,6 @@ function AuditDetailCard({
   );
 }
 
-function AuditTextBlock({
-  copied,
-  label,
-  onCopy,
-  value,
-}: {
-  copied: boolean;
-  label: string;
-  onCopy: () => void;
-  value: string;
-}) {
-  const { t } = useI18n();
-  return (
-    <div className="audit-json-block min-w-0 rounded-xl border border-stone-200 bg-stone-950 text-stone-100 shadow-sm">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-800 px-3 py-2">
-        <span className="text-xs font-semibold text-stone-300">{label}</span>
-        <button
-          aria-label={t("Copy {{label}}", { label })}
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-stone-300 hover:bg-stone-800 hover:text-white"
-          onClick={onCopy}
-          type="button"
-        >
-          <Copy aria-hidden="true" className="size-3.5" />
-          {copied ? t("Copied") : t("Copy")}
-        </button>
-      </div>
-      <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words px-3 py-3 text-xs leading-5">
-        {value || t("No content")}
-      </pre>
-    </div>
-  );
-}
-
 function isProviderWireRequestDump(
   value: JsonValue | ProviderWireRequestDump | null,
 ): value is ProviderWireRequestDump {
@@ -1317,6 +1275,10 @@ function isProviderFinalResponseDump(
   value: JsonValue | ProviderFinalResponseDump | null,
 ): value is ProviderFinalResponseDump {
   return isJsonObject(value) && value.format === "provider_final_response_v1";
+}
+
+function isCompactCancelledResponse(value: JsonValue | null): boolean {
+  return isJsonObject(value) && typeof value.cancelled === "string";
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {

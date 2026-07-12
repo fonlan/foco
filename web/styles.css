@@ -914,6 +914,12 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.audit-json-code.panel-scroll {
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+  touch-action: auto;
+}
+
 .audit-json-code code {
   display: block;
 }

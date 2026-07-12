@@ -3734,10 +3734,87 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(dialog).getByText("https://api.example.test/v1/responses"),
     ).toBeInTheDocument();
-    expect(within(dialog).getByText('"authorization"')).toBeInTheDocument();
-    expect(within(dialog).getByText('"[REDACTED]"')).toBeInTheDocument();
-    expect(within(dialog).getByText("Done.")).toBeInTheDocument();
-    expect(within(dialog).getByText("Finished reasoning.")).toBeInTheDocument();
+    const requestHeadersBlock = within(dialog)
+      .getByText("Request headers")
+      .closest(".audit-json-block");
+    expect(requestHeadersBlock).not.toBeNull();
+    const requestHeadersViewer = requestHeadersBlock as HTMLElement;
+    for (const header of [
+      '"accept"',
+      '"authorization"',
+      '"content-type"',
+      '"cookie"',
+      '"x-api-key"',
+      '"x-real-ip"',
+    ]) {
+      expect(within(requestHeadersViewer).getByText(header)).toBeInTheDocument();
+    }
+    expect(
+      within(requestHeadersViewer).getAllByText('"application/json"'),
+    ).toHaveLength(2);
+    for (const value of [
+      '"********"',
+      '"session=fixture-cookie"',
+      '"fixture-api-key"',
+      '"203.0.113.42"',
+      '"[REDACTED]"',
+    ]) {
+      expect(within(requestHeadersViewer).getByText(value)).toBeInTheDocument();
+    }
+    await userEvent.click(
+      within(requestHeadersViewer).getByRole("button", {
+        name: "Copy Request headers",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      JSON.stringify(aiStatisticsDetail.request.requestBody.headers, null, 2),
+    );
+
+    const httpStatusMeta = within(dialog)
+      .getByText("HTTP status")
+      .parentElement as HTMLElement;
+    expect(within(httpStatusMeta).getByText("200")).toBeInTheDocument();
+    expect(within(dialog).getByText("HTTP version")).toBeInTheDocument();
+    expect(within(dialog).getByText("HTTP/2.0")).toBeInTheDocument();
+    const responseHeadersBlock = within(dialog)
+      .getByText("Response headers")
+      .closest(".audit-json-block");
+    expect(responseHeadersBlock).not.toBeNull();
+    const responseHeadersViewer = responseHeadersBlock as HTMLElement;
+    for (const value of [
+      '"********"',
+      '"response-session=fixture-cookie"',
+      '"fixture-response-api-key"',
+      '"request-fixture-1"',
+    ]) {
+      expect(within(responseHeadersViewer).getByText(value)).toBeInTheDocument();
+    }
+    await userEvent.click(
+      within(responseHeadersViewer).getByRole("button", {
+        name: "Copy Response headers",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      JSON.stringify(aiStatisticsDetail.request.responseBody.http.headers, null, 2),
+    );
+
+    const responseBodyBlock = within(dialog)
+      .getByText("Response body")
+      .closest(".audit-json-block");
+    expect(responseBodyBlock).not.toBeNull();
+    const responseBodyViewer = responseBodyBlock as HTMLElement;
+    expect(within(responseBodyViewer).getByText('"Done."')).toBeInTheDocument();
+    expect(
+      within(responseBodyViewer).getByText('"Finished reasoning."'),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText("Stop reason")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Response ID")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Final text")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Final reasoning"),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Tool calls")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Usage")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("Invalidated")).not.toBeInTheDocument();
     expect(
       within(dialog).queryByText("Invalidated reason"),
@@ -4238,7 +4315,7 @@ describe("app-panels-stats verification surfaces", () => {
       () => {
         expect(detailCalls).toBeGreaterThanOrEqual(2);
         expect(within(dialog).getByText("供应商最终响应")).toBeInTheDocument();
-        expect(within(dialog).getByText("Done.")).toBeInTheDocument();
+        expect(within(dialog).getByText('"Done."')).toBeInTheDocument();
       },
       { timeout: 2500 },
     );
@@ -4271,6 +4348,14 @@ describe("app-panels-stats verification surfaces", () => {
                   responseBody: {
                     error: "connection reset",
                     format: "provider_final_response_v1",
+                    http: {
+                      headers: {
+                        authorization: ["********"],
+                        "retry-after": ["1"],
+                      },
+                      status: 502,
+                      version: "HTTP/1.1",
+                    },
                     partial: true,
                     state: "failed",
                     statusCode: 502,
@@ -4310,11 +4395,25 @@ describe("app-panels-stats verification surfaces", () => {
     dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(
       within(dialog).getByText(
-        "The stream ended before a complete response was received.",
+        /The stream ended before a complete response was received\./,
       ),
     ).toBeInTheDocument();
-    expect(within(dialog).getByText("connection reset")).toBeInTheDocument();
-    expect(within(dialog).getByText("502")).toBeInTheDocument();
+    expect(within(dialog).getByText('"connection reset"')).toBeInTheDocument();
+    const failedHttpStatusMeta = within(dialog)
+      .getByText("HTTP status")
+      .parentElement as HTMLElement;
+    expect(within(failedHttpStatusMeta).getByText("502")).toBeInTheDocument();
+    expect(within(dialog).getByText("HTTP/1.1")).toBeInTheDocument();
+    const failedResponseHeaders = within(dialog)
+      .getByText("Response headers")
+      .closest(".audit-json-block");
+    expect(failedResponseHeaders).not.toBeNull();
+    expect(
+      within(failedResponseHeaders as HTMLElement).getByText('"retry-after"'),
+    ).toBeInTheDocument();
+    expect(
+      within(failedResponseHeaders as HTMLElement).getByText('"1"'),
+    ).toBeInTheDocument();
 
     fireEvent.click(dialog.parentElement as HTMLElement);
     detailMode = "pruned";
@@ -4326,6 +4425,108 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(dialog).getByText("Final response detail is unavailable or was pruned."),
     ).toBeInTheDocument();
+  });
+
+  it("shows historical response envelopes and compact cancellations without invented response heads", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let responseMode: "cancelled" | "historical" = "historical";
+    const historicalResponse = {
+      format: "provider_final_response_v1",
+      reasoning: "Historical reasoning.",
+      responseId: "resp-historical",
+      state: "succeeded",
+      stopReason: "stop",
+      text: "Historical response.",
+      toolCalls: [],
+      usage: null,
+      version: 1,
+    };
+    const cancelledResponse = { cancelled: "chat run cancelled" };
+
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              finalState: responseMode === "cancelled" ? "cancelled" : "succeeded",
+              responseBody:
+                responseMode === "cancelled"
+                  ? cancelledResponse
+                  : historicalResponse,
+              responseDetailStatus:
+                responseMode === "cancelled" ? "legacy" : "captured",
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "View request details" }),
+    );
+    let dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(
+      within(dialog).getByText(
+        "Response head was not captured for this historical record.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Response headers"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByText('"Historical response."'),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText('"Historical reasoning."'),
+    ).toBeInTheDocument();
+
+    fireEvent.click(dialog.parentElement as HTMLElement);
+    responseMode = "cancelled";
+    await userEvent.click(
+      screen.getByRole("button", { name: "View request details" }),
+    );
+    dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(
+      within(dialog).getByText("Compact cancelled response record."),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Response headers"),
+    ).not.toBeInTheDocument();
+    const responseBodyBlock = within(dialog)
+      .getByText("Response body")
+      .closest(".audit-json-block");
+    expect(responseBodyBlock).not.toBeNull();
+    const responseBodyViewer = responseBodyBlock as HTMLElement;
+    expect(
+      within(responseBodyViewer).getByText('"cancelled"'),
+    ).toBeInTheDocument();
+    expect(
+      within(responseBodyViewer).getByText('"chat run cancelled"'),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(responseBodyViewer).getByRole("button", {
+        name: "Copy Response body",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      JSON.stringify(cancelledResponse, null, 2),
+    );
   });
 
   it("loads saved API request audit column settings", async () => {

@@ -2134,19 +2134,28 @@ export type AiRequestAuditSummary = {
   invalidatedReason: string | null;
 };
 
+export type ProviderHttpHeadersDump = Record<string, string | string[]>;
+
 export type ProviderWireRequestDump = {
   body?: string;
   bodyEncoding?: string;
   format: "provider_request_v1";
-  headers: Record<string, string>;
+  headers: ProviderHttpHeadersDump;
   method: string;
   url: string;
   version: number;
 };
 
+export type ProviderHttpResponseHeadDump = {
+  headers: ProviderHttpHeadersDump;
+  status: number;
+  version: string;
+};
+
 export type ProviderFinalResponseDump =
   | {
       format: "provider_final_response_v1";
+      http?: ProviderHttpResponseHeadDump | null;
       reasoning: string | null;
       responseId: string | null;
       state: "succeeded";
@@ -2159,6 +2168,7 @@ export type ProviderFinalResponseDump =
   | {
       error: string;
       format: "provider_final_response_v1";
+      http?: ProviderHttpResponseHeadDump | null;
       partial: boolean;
       state: "failed";
       statusCode: number | null;
