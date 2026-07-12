@@ -280,12 +280,29 @@ const SkillStorePage = lazy(() =>
 const PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS = 3000;
 const PLAN_AUTO_RUN_REFRESH_MS = 3000;
 const REQUEST_STORM_DEDUPE_MS = 400;
+const WORKSPACE_SPEC_JOB_POLL_DELAYS_MS = [
+  1000,
+  2000,
+  4000,
+  8000,
+  15000,
+  30000,
+  45000,
+  60000,
+] as const;
+const WORKSPACE_SPEC_JOB_STEADY_POLL_MS = 60000;
 
 type SingleFlightEntry<T> = {
   promise: Promise<T>;
   queued?: boolean;
   settled: boolean;
   startedAtMs: number;
+};
+
+type WorkspaceSpecJobObserver = {
+  cancelled: boolean;
+  jobId: string;
+  promise: Promise<void>;
 };
 
 function requestStormDedupeNow() {
@@ -1270,6 +1287,9 @@ export function App() {
   const chatStatisticsRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
+  const workspaceSpecJobObserversRef = useRef<Map<string, WorkspaceSpecJobObserver>>(
+    new Map(),
+  );
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
@@ -1801,12 +1821,28 @@ export function App() {
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
+    for (const [workspaceId, observer] of workspaceSpecJobObserversRef.current) {
+      if (workspaceId !== activeWorkspaceId) {
+        observer.cancelled = true;
+        workspaceSpecJobObserversRef.current.delete(workspaceId);
+      }
+    }
     activeChatIdRef.current = activeChatId;
     activeChatKeyRef.current =
       activeChatId === null || isPendingChatId(activeChatId)
         ? activeChatKeyRef.current
         : chatRunKey(activeWorkspaceId, activeChatId);
   }, [activeChatId, activeWorkspaceId]);
+
+  useEffect(
+    () => () => {
+      for (const observer of workspaceSpecJobObserversRef.current.values()) {
+        observer.cancelled = true;
+      }
+      workspaceSpecJobObserversRef.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     const chatKey =
@@ -2559,13 +2595,18 @@ export function App() {
       setWorkspaceSpecPreviewEnabled(data.contentMarkdown.trim().length > 0);
       return data;
     } catch (requestError) {
+      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+        return null;
+      }
       setWorkspaceSpec(null);
       setWorkspaceSpecDraft("");
       setWorkspaceSpecPreviewEnabled(false);
       setWorkspaceSpecError(errorMessage(requestError));
       return null;
     } finally {
-      setIsLoadingWorkspaceSpec(false);
+      if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
+        setIsLoadingWorkspaceSpec(false);
+      }
     }
   }, []);
 
@@ -2848,59 +2889,84 @@ export function App() {
     [loadActivePlans, refreshWorkspaces],
   );
 
-  // ponytail: poll a queued spec job until it settles, then reload spec content.
-  // Ceiling: fixed backoff schedule (~165s total); upgrade path is an SSE/job push.
+  // ponytail: observe a queued spec job until it settles; an SSE/job push can replace
+  // this low-frequency tail later without changing the terminal-state handling.
   const pollWorkspaceSpecJobUntilSettled = useCallback(
-    async (workspaceId: string, jobId: string) => {
-      const attempts = [1000, 2000, 4000, 8000, 15000, 30000, 45000, 60000];
-      try {
-        for (const delayMs of attempts) {
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, delayMs);
-          });
-          if (activeWorkspaceIdRef.current !== workspaceId) {
+    (workspaceId: string, jobId: string) => {
+      const existing = workspaceSpecJobObserversRef.current.get(workspaceId);
+      if (existing?.jobId === jobId && !existing.cancelled) {
+        return existing.promise;
+      }
+      if (existing) {
+        existing.cancelled = true;
+      }
+
+      const observer: WorkspaceSpecJobObserver = {
+        cancelled: false,
+        jobId,
+        promise: Promise.resolve(),
+      };
+      observer.promise = (async () => {
+        let pollIndex = 0;
+        try {
+          while (!observer.cancelled) {
+            const delayMs =
+              WORKSPACE_SPEC_JOB_POLL_DELAYS_MS[pollIndex] ??
+              WORKSPACE_SPEC_JOB_STEADY_POLL_MS;
+            pollIndex += 1;
+            await new Promise<void>((resolve) => {
+              window.setTimeout(resolve, delayMs);
+            });
+            if (observer.cancelled || activeWorkspaceIdRef.current !== workspaceId) {
+              return;
+            }
+
+            let jobsResponse: WorkspaceSpecJobsResponse;
+            try {
+              jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
+                `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
+              );
+            } catch (requestError) {
+              if (!observer.cancelled && activeWorkspaceIdRef.current === workspaceId) {
+                setWorkspaceSpecError(errorMessage(requestError));
+              }
+              continue;
+            }
+            if (observer.cancelled || activeWorkspaceIdRef.current !== workspaceId) {
+              return;
+            }
+
+            setWorkspaceSpecError(null);
+            const job = jobsResponse.jobs.find((candidate) => candidate.id === jobId);
+            if (!job) {
+              continue;
+            }
+            setWorkspaceSpec((current) =>
+              current ? { ...current, latestJob: job } : current,
+            );
+            if (job.status === "queued" || job.status === "running") {
+              continue;
+            }
+            if (job.status === "completed") {
+              await loadWorkspaceSpec(workspaceId);
+            } else if (job.status === "failed" || job.status === "skipped") {
+              setWorkspaceSpecError(
+                job.errorMessage?.trim() ||
+                  (job.status === "skipped"
+                    ? "Workspace spec generation was skipped"
+                    : "Workspace spec generation failed"),
+              );
+            }
             return;
           }
-          const jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
-            `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
-          );
-          const job = jobsResponse.jobs.find(
-            (candidate) => candidate.id === jobId,
-          );
-          if (!job) {
-            continue;
+        } finally {
+          if (workspaceSpecJobObserversRef.current.get(workspaceId) === observer) {
+            workspaceSpecJobObserversRef.current.delete(workspaceId);
           }
-          setWorkspaceSpec((current) =>
-            current ? { ...current, latestJob: job } : current,
-          );
-          if (job.status === "queued" || job.status === "running") {
-            continue;
-          }
-          if (job.status === "completed" && activeWorkspaceIdRef.current === workspaceId) {
-            await loadWorkspaceSpec(workspaceId);
-          } else if (
-            (job.status === "failed" || job.status === "skipped") &&
-            activeWorkspaceIdRef.current === workspaceId
-          ) {
-            setWorkspaceSpecError(
-              job.errorMessage?.trim() ||
-                (job.status === "skipped"
-                  ? "Workspace spec generation was skipped"
-                  : "Workspace spec generation failed"),
-            );
-          }
-          return;
         }
-        if (activeWorkspaceIdRef.current === workspaceId) {
-          setWorkspaceSpecError(
-            "Workspace spec generation is still running; reload later to check progress.",
-          );
-        }
-      } catch (requestError) {
-        if (activeWorkspaceIdRef.current === workspaceId) {
-          setWorkspaceSpecError(errorMessage(requestError));
-        }
-      }
+      })();
+      workspaceSpecJobObserversRef.current.set(workspaceId, observer);
+      return observer.promise;
     },
     [loadWorkspaceSpec],
   );
@@ -3008,9 +3074,8 @@ export function App() {
       setWorkspaceSpec((current) =>
         current ? { ...current, latestJob: data.job } : current,
       );
-      // ponytail: poll the queued job to completion, then reload spec content so
-      // the panel updates without a manual refresh. Ceiling: fixed backoff
-      // schedule (~165s total); upgrade path is an SSE/job-event push.
+      // ponytail: keep observing the queued job through long local or brokered runs,
+      // then reload spec content so the panel updates without a manual refresh.
       void pollWorkspaceSpecJobUntilSettled(workspaceId, data.job.id);
       return true;
     } catch (requestError) {
