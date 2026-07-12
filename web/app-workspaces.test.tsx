@@ -857,7 +857,7 @@ describe("app-workspaces verification surfaces", () => {
     await waitFor(() => expect(leftButton).toBeEnabled());
   });
 
-  it("asks for confirmation before deleting a chat", async () => {
+  it("confirms deletion, accepts a lightweight response, and clears the active chat", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -869,6 +869,10 @@ describe("app-workspaces verification surfaces", () => {
     if (!historyButton) {
       throw new Error("Expected Tool run history item button");
     }
+
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    expect(window.location.href).toContain("chat-1");
 
     fireEvent.contextMenu(historyButton);
     const chatMenu = await screen.findByRole("menu", { name: "Tool run" });
@@ -899,9 +903,74 @@ describe("app-workspaces verification surfaces", () => {
         expect.objectContaining({ method: "POST" }),
       );
     });
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(([url]) => url === "/api/workspaces"),
+      ).toHaveLength(2);
+    });
     expect(screen.queryByRole("dialog", { name: "Delete this chat?" })).not.toBeInTheDocument();
     expect(screen.queryByText("Tool run")).not.toBeInTheDocument();
     expect(screen.getByText("Second chat")).toBeInTheDocument();
+    expect(screen.queryByText("Please inspect README.")).not.toBeInTheDocument();
+    expect(window.location.href).not.toContain("chat-1");
+  });
+
+  it("refreshes paginated remote chats after a lightweight delete response", async () => {
+    const remoteWorkspace = remoteWorkspaceFixture();
+    const remoteChats = Array.from({ length: 6 }, (_, index) =>
+      chatSummary(
+        `remote-chat-${index + 1}`,
+        `Remote chat ${index + 1}`,
+        `2026-06-05T${String(16 - index).padStart(2, "0")}:00:00Z`,
+        `2026-06-05T${String(16 - index).padStart(2, "0")}:05:00Z`,
+      ),
+    );
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+    appTestState.workspaceChatsByWorkspaceId = {
+      [remoteWorkspace.id]: remoteChats,
+    };
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await userEvent.click(
+      await within(workspaceList).findByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Remote project"),
+      }),
+    );
+    const firstRemoteChat = await within(workspaceList).findByText("Remote chat 1");
+    expect(within(workspaceList).queryByText("Remote chat 6")).not.toBeInTheDocument();
+    const firstRemoteChatButton = firstRemoteChat.closest("button");
+    if (!firstRemoteChatButton) {
+      throw new Error("Expected remote chat history item button");
+    }
+
+    fireEvent.contextMenu(firstRemoteChatButton);
+    const chatMenu = await screen.findByRole("menu", { name: "Remote chat 1" });
+    await userEvent.click(
+      within(chatMenu).getByRole("menuitem", { name: "Delete chat" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Delete this chat?" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm delete chat" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-remote/chats/remote-chat-1/delete",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    expect(await within(workspaceList).findByText("Remote chat 6")).toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Remote chat 1")).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => typeof url === "string" && url.startsWith("/api/workspaces/workspace-remote/chats?"),
+      ).length,
+    ).toBeGreaterThanOrEqual(2);
   });
 
   it("adds a workspace with a selectable slash-style path", async () => {

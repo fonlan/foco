@@ -2284,6 +2284,7 @@ export const appTestState: {
   pendingQuestionsResponse: QuestionRequestSummary[];
   answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
+  workspaceChatsByWorkspaceId: Record<string, Array<(typeof workspaceChats)[number]>>;
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   memoryDreamJobsResponses: MemoryDreamJobsResponse[];
   memoriesById: Record<string, MemoryFactRecord>;
@@ -2317,6 +2318,7 @@ export const appTestState: {
   pendingQuestionsResponse: [],
   answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
+  workspaceChatsByWorkspaceId: {},
   workspaceChatSearchResponseWorkspaces: null,
   memoryDreamJobsResponses: [],
   memoriesById: {
@@ -2431,8 +2433,26 @@ function workspaceChatSearchWorkspaces(query: string) {
     .filter((item): item is NonNullable<typeof item> => item !== null);
 }
 
+function persistedWorkspaceChats(workspaceId: string) {
+  const persisted = appTestState.workspaceChatsByWorkspaceId[workspaceId];
+  if (persisted) {
+    return persisted;
+  }
+  if (workspaceId === workspace.id) {
+    return workspaceChats;
+  }
+  if (workspaceId === secondaryWorkspace.id) {
+    return sideProjectChats;
+  }
+
+  const workspaceSummary = appTestState.workspaceResponseWorkspaces.find(
+    (item) => (item as { id?: string }).id === workspaceId,
+  ) as { chats?: Array<(typeof workspaceChats)[number]> } | undefined;
+  return workspaceSummary?.chats ?? [];
+}
+
 function workspaceChatsPage(workspaceId: string, cursor: string | null, includeChatId: string | null) {
-  const allChats = workspaceId === workspace.id ? workspaceChats : sideProjectChats;
+  const allChats = persistedWorkspaceChats(workspaceId);
   const limit = 5;
   const startIndex = cursor === "workspace-page-2" ? 5 : cursor === "workspace-page-3" ? 10 : 0;
   const pageChats = allChats.slice(startIndex, startIndex + limit);
@@ -2780,6 +2800,7 @@ export function resetAppTestEnvironment() {
   appTestState.pendingQuestionsResponse = [];
   appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
+  appTestState.workspaceChatsByWorkspaceId = {};
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.memoryDreamJobsResponses = [];
   appTestState.memoriesById = {
@@ -4151,17 +4172,42 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
-  if (path === "/api/workspaces/workspace-1/chats/chat-1/delete") {
-    return jsonResponse({
-      activeWorkspaceId: workspace.id,
-      workspaces: [
-        {
-          ...workspace,
-          chats: workspace.chats.filter((chat) => chat.id !== "chat-1"),
-        },
-        secondaryWorkspace,
-      ],
-    });
+  const workspaceChatDeleteMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/chats\/([^/]+)\/delete$/,
+  );
+  if (workspaceChatDeleteMatch && init?.method === "POST") {
+    const workspaceId = decodeURIComponent(workspaceChatDeleteMatch[1] ?? "");
+    const chatId = decodeURIComponent(workspaceChatDeleteMatch[2] ?? "");
+    const nextChats = persistedWorkspaceChats(workspaceId).filter((chat) => chat.id !== chatId);
+    appTestState.workspaceChatsByWorkspaceId = {
+      ...appTestState.workspaceChatsByWorkspaceId,
+      [workspaceId]: nextChats,
+    };
+    appTestState.workspaceResponseWorkspaces = appTestState.workspaceResponseWorkspaces.map(
+      (item) => {
+        const workspaceSummary = item as {
+          chatPagination?: { limit?: number };
+          chats?: Array<(typeof workspaceChats)[number]>;
+          id?: string;
+        };
+        if (workspaceSummary.id !== workspaceId) {
+          return item;
+        }
+
+        const limit = workspaceSummary.chatPagination?.limit ?? 5;
+        return {
+          ...(item as object),
+          chatPagination: {
+            hasMore: nextChats.length > limit,
+            limit,
+            nextCursor: nextChats.length > limit ? "workspace-page-2" : null,
+            total: nextChats.length,
+          },
+          chats: nextChats.slice(0, limit),
+        };
+      },
+    );
+    return jsonResponse({ deleted: true, chatId });
   }
 
   if (path === "/api/workspaces/workspace-1/chat/stream") {

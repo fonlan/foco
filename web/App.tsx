@@ -6366,25 +6366,25 @@ export function App() {
     setError(null);
 
     try {
-      const data = await requestJson<WorkspacesResponse>(
+      await requestJson<unknown>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/delete`,
         { method: "POST" },
       );
-      setWorkspaces(data.workspaces);
-      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
-      setActiveWorkspaceId((current) =>
-        data.workspaces.some((workspace) => workspace.id === current)
-          ? current
-          : data.activeWorkspaceId,
-      );
 
-      if (activeChatId === chatId) {
+      if (activeWorkspaceId === workspaceId && activeChatId === chatId) {
+        const nextOpenChatTabs = openChatTabsRef.current.filter(
+          (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
+        );
+        openChatTabsRef.current = nextOpenChatTabs;
+        setOpenChatTabs(nextOpenChatTabs);
         setActiveWorkspaceChatRefs(workspaceId, null);
         setActiveWorkspaceId(workspaceId);
         setActiveChatId(null);
+        setActiveMainTab({ chatId: null, type: "chat", workspaceId });
         setMessages([]);
         updateBrowserRoute({
           chatId: null,
+          tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
           viewMode: "chat",
           workspaceId,
         });
@@ -6398,6 +6398,7 @@ export function App() {
         current?.chatId === chatId ? null : current,
       );
       setPendingDeleteChat(null);
+      await refreshWorkspaces();
     } catch (requestError) {
       setError(errorMessage(requestError));
     }
