@@ -34,7 +34,6 @@ import type {
   AiRequestAuditDetail,
   AiRequestAuditSummary,
   AiRequestDetailResponse,
-  AiStatisticsRequestKindBreakdown,
   AiStatisticsSummary,
   AiStatsFilterState,
   AppLanguageId,
@@ -629,14 +628,6 @@ export function ApiStatsPanel({
             value={formatNumber(summary.failedRequests, language)}
           />
         </section>
-
-        {summary.requestKindBreakdown.length ? (
-          <RequestKindUsageBreakdown
-            breakdown={summary.requestKindBreakdown}
-            language={language}
-            t={t}
-          />
-        ) : null}
 
         {summary.totalRequests === 0 ? (
           <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
@@ -1456,76 +1447,6 @@ function AuditJsonBlock({
             value={jsonValue}
           />
         </code>
-      </div>
-    </section>
-  );
-}
-
-function RequestKindUsageBreakdown({
-  breakdown,
-  language,
-  t,
-}: {
-  breakdown: AiStatisticsRequestKindBreakdown[];
-  language: AppLanguageId;
-  t: Translate;
-}) {
-  const gridClass =
-    "grid min-w-[48rem] grid-cols-[minmax(11rem,1.4fr)_repeat(6,minmax(6rem,1fr))] items-center";
-
-  return (
-    <section className="min-w-0 overflow-hidden rounded-2xl border border-stone-200 bg-white/85 shadow-sm">
-      <div className="border-b border-stone-200 px-4 py-3">
-        <h3 className="text-sm font-semibold text-stone-950">
-          {t("Request usage breakdown")}
-        </h3>
-        <p className="mt-1 text-xs leading-5 text-stone-500">
-          {t(
-            "Compression usage is additional model cost and does not change the Current context usage metric.",
-          )}
-        </p>
-      </div>
-      <div className="panel-scroll overflow-x-auto text-sm">
-        <div
-          className={`${gridClass} border-b border-stone-200 bg-stone-50/80 text-xs font-semibold text-stone-500`}
-        >
-          <div className="px-4 py-3">{t("Request type")}</div>
-          <div className="px-4 py-3 text-right">{t("Requests")}</div>
-          <div className="px-4 py-3 text-right">{t("Usage tokens")}</div>
-          <div className="px-4 py-3 text-right">{t("Input tokens")}</div>
-          <div className="px-4 py-3 text-right">{t("Output tokens")}</div>
-          <div className="px-4 py-3 text-right">{t("Failures")}</div>
-          <div className="px-4 py-3 text-right">{t("Average duration")}</div>
-        </div>
-        <div className="divide-y divide-stone-100">
-          {breakdown.map((item) => (
-            <div className={gridClass} key={item.requestKind}>
-              <div className="px-4 py-3">
-                <span className={requestKindBadgeClass(item.requestKind)}>
-                  {requestKindLabel(item.requestKind, t)}
-                </span>
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-800">
-                {formatNumber(item.requestCount, language)}
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-800">
-                {formatCompactNumber(item.totalTokens, language)}
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-700">
-                {formatCompactNumber(item.totalInputTokens, language)}
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-700">
-                {formatCompactNumber(item.totalOutputTokens, language)}
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-700">
-                {formatNumber(item.failedRequests, language)}
-              </div>
-              <div className="px-4 py-3 text-right font-mono text-stone-700">
-                {formatNullableLatencySeconds(item.averageLatencyMs, language)}
-              </div>
-            </div>
-          ))}
-        </div>
       </div>
     </section>
   );

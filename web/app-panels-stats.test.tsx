@@ -4129,7 +4129,7 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
 
-  it("shows request kind badges, detail metadata, full breakdown, and unknown kinds", async () => {
+  it("keeps request kind filters, badges, and detail metadata without the usage breakdown", async () => {
     const unknownKind = "background maintenance";
     vi.mocked(fetch).mockImplementation((input, init) => {
       const rawPath =
@@ -4199,9 +4199,24 @@ describe("app-panels-stats verification surfaces", () => {
     );
     expect(auditTable).toBeDefined();
     expect(within(auditTable as HTMLElement).getByText(unknownKind)).toBeInTheDocument();
-    expect(screen.getByText("Request usage breakdown")).toBeInTheDocument();
-    expect(screen.getAllByText("Context compression").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText(unknownKind).length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("Request usage breakdown")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Compression usage is additional model cost and does not change the Current context usage metric.",
+      ),
+    ).not.toBeInTheDocument();
+
+    const requestTypeFilter = screen.getByRole("combobox", {
+      name: "Request type",
+    });
+    expect(
+      within(requestTypeFilter).getByRole("option", {
+        name: "Context compression",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(requestTypeFilter).getByRole("option", { name: unknownKind }),
+    ).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     const dialog = await screen.findByRole("dialog", { name: "Request details" });

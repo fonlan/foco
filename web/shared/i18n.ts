@@ -619,9 +619,6 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "All request types": "全部请求类型",
     "Chat completion": "聊天完成",
     "Prompt hook": "提示词 Hook",
-    "Request usage breakdown": "请求类型用量对比",
-    "Compression usage is additional model cost and does not change the Current context usage metric.":
-      "上下文压缩是额外的模型消耗，不会改变 Current 当前上下文用量的统计口径。",
     "Refresh request audit": "刷新请求审计",
     "Refresh request audit to load charts": "刷新请求审计以加载图表",
     Columns: "列",
