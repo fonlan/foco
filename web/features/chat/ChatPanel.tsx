@@ -2392,13 +2392,13 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
   );
 }
 
-type EditFileDiffLine = {
+type CompactReplacementDiffLine = {
   kind: "added" | "removed";
   text: string;
 };
 
-type EditFileDiff = {
-  lines: EditFileDiffLine[];
+type CompactReplacementDiff = {
+  lines: CompactReplacementDiffLine[];
 };
 
 type ToolCallViewMode = "compact" | "raw";
@@ -2417,36 +2417,51 @@ const ARRAY_COMPACT_SUMMARY_FIELDS = [
   "results",
 ];
 
-function successfulEditFileDiff(
+function replacementDiffLines(oldText: string, newText: string): CompactReplacementDiffLine[] {
+  return [
+    ...oldText.split("\n").map((text) => ({
+      kind: "removed" as const,
+      text,
+    })),
+    ...newText.split("\n").map((text) => ({
+      kind: "added" as const,
+      text,
+    })),
+  ];
+}
+
+function successfulCompactReplacementDiff(
   toolCall: ChatToolCallSummary,
   input: JsonValue,
-): EditFileDiff | null {
-  if (toolCall.name !== "edit_file" || toolCall.isError || toolCall.status !== "completed") {
-    return null;
-  }
-  if (!isJsonRecord(input)) {
+): CompactReplacementDiff | null {
+  if (toolCall.isError || toolCall.status !== "completed" || !isJsonRecord(input)) {
     return null;
   }
 
-  const oldStr = input.oldStr;
-  const newStr = input.newStr;
-  if (typeof oldStr !== "string" || typeof newStr !== "string") {
+  if (toolCall.name === "edit_file") {
+    const oldStr = input.oldStr;
+    const newStr = input.newStr;
+    if (typeof oldStr !== "string" || typeof newStr !== "string") {
+      return null;
+    }
+
+    // ponytail: this is replacement-snippet diff, not a full-file diff; upgrade when the backend returns real hunks/startLine.
+    return { lines: replacementDiffLines(oldStr, newStr) };
+  }
+
+  if (toolCall.name !== "update_spec" || !Array.isArray(input.edits) || input.edits.length === 0) {
     return null;
   }
 
-  // ponytail: this is replacement-snippet diff, not a full-file diff; upgrade when the backend returns real hunks/startLine.
-  return {
-    lines: [
-      ...oldStr.split("\n").map((text) => ({
-        kind: "removed" as const,
-        text,
-      })),
-      ...newStr.split("\n").map((text) => ({
-        kind: "added" as const,
-        text,
-      })),
-    ],
-  };
+  const lines: CompactReplacementDiffLine[] = [];
+  for (const edit of input.edits) {
+    if (!isJsonRecord(edit) || typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+      return null;
+    }
+    lines.push(...replacementDiffLines(edit.oldText, edit.newText));
+  }
+
+  return { lines };
 }
 
 function isJsonRecord(value: JsonValue | null | undefined): value is { [key: string]: JsonValue } {
@@ -2618,7 +2633,7 @@ function compactToolCallText(
   return output === null ? compactJson(input) : compactJson(output);
 }
 
-function EditFileDiffBlock({ diff }: { diff: EditFileDiff }) {
+function CompactReplacementDiffBlock({ diff }: { diff: CompactReplacementDiff }) {
   return (
     <div className="min-w-0">
       <div className="mb-1 font-semibold text-stone-500">Diff</div>
@@ -2696,13 +2711,13 @@ function CompactToolCallView({
   toolCall,
 }: {
   compactJson: (value: JsonValue) => string;
-  diff: EditFileDiff | null;
+  diff: CompactReplacementDiff | null;
   input: JsonValue;
   liveOutputText: string | null;
   toolCall: ChatToolCallSummary;
 }) {
   if (diff) {
-    return <EditFileDiffBlock diff={diff} />;
+    return <CompactReplacementDiffBlock diff={diff} />;
   }
 
   const specMarkdown = successfulSpecMarkdown(toolCall);
@@ -2850,7 +2865,7 @@ function ToolCallBlock({
   const { language, t } = useI18n();
   const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
   const input = normalizedToolInput(toolCall.input);
-  const editFileDiff = successfulEditFileDiff(toolCall, input);
+  const compactReplacementDiff = successfulCompactReplacementDiff(toolCall, input);
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
@@ -2928,7 +2943,7 @@ function ToolCallBlock({
           {viewMode === "compact" ? (
             <CompactToolCallView
               compactJson={compactToolJson}
-              diff={editFileDiff}
+              diff={compactReplacementDiff}
               input={input}
               liveOutputText={liveOutputText}
               toolCall={toolCall}
