@@ -938,6 +938,14 @@ pub struct PendingToolCall {
     pub arguments: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectedToolCall {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolExecutionPlan {
     pub groups: Vec<ToolExecutionGroup>,
@@ -1501,6 +1509,40 @@ pub fn plan_tool_execution(
     push_parallel_group(&mut groups, &mut pending_parallel_indices);
 
     Ok(ToolExecutionPlan { groups })
+}
+
+pub fn rejected_tool_batch(
+    tool_calls: &[PendingToolCall],
+    error: &ToolConflictError,
+) -> Option<Vec<RejectedToolCall>> {
+    if !is_recoverable_tool_conflict(error) {
+        return None;
+    }
+
+    let conflict = error.to_string();
+    Some(
+        tool_calls
+            .iter()
+            .map(|tool_call| RejectedToolCall {
+                call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+                message: format!(
+                    "Tool call '{}' ('{}') was not executed because the entire tool batch was rejected: {conflict}. No tool calls in this batch were executed. Retry with a non-conflicting batch. For same-file changes, use one write_file call or send ordered edit_file operations in separate tool-call rounds; do not mix write_file and edit_file for the same file. Do not repeat the unchanged batch.",
+                    tool_call.id, tool_call.name
+                ),
+            })
+            .collect(),
+    )
+}
+
+pub fn is_recoverable_tool_conflict(error: &ToolConflictError) -> bool {
+    matches!(
+        error,
+        ToolConflictError::SameFileWrite { .. }
+            | ToolConflictError::MixedFileWriteMethods { .. }
+            | ToolConflictError::ResourceConflict { .. }
+    )
 }
 
 pub fn tool_resource_locks(
@@ -2894,6 +2936,80 @@ mod tests {
         }];
 
         assert_eq!(plan_context_compression(&messages, 300, 1, 1), None);
+    }
+
+    #[test]
+    fn rejected_tool_batch_is_the_shared_recoverable_conflict_contract() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "ConflictCase.txt", "content": "first" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "ConflictCase.txt", "content": "second" }),
+            },
+        ];
+        let error = ToolConflictError::SameFileWrite {
+            path: "ConflictCase.txt".to_string(),
+            first_call_id: "call-a".to_string(),
+            second_call_id: "call-b".to_string(),
+        };
+
+        let rejected = rejected_tool_batch(&calls, &error).expect("recoverable rejection");
+
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].call_id, "call-a");
+        assert_eq!(rejected[0].tool_name, WRITE_FILE_TOOL_NAME);
+        assert_eq!(rejected[0].arguments["path"], "ConflictCase.txt");
+        for rejection in rejected {
+            assert!(rejection.message.contains("ConflictCase.txt"));
+            assert!(rejection.message.contains("call-a"));
+            assert!(rejection.message.contains("call-b"));
+            assert!(
+                rejection
+                    .message
+                    .contains("No tool calls in this batch were executed")
+            );
+            assert!(rejection.message.contains("separate tool-call rounds"));
+            assert!(
+                rejection
+                    .message
+                    .contains("do not mix write_file and edit_file")
+            );
+        }
+
+        assert!(is_recoverable_tool_conflict(
+            &ToolConflictError::MixedFileWriteMethods {
+                path: "file.rs".to_string(),
+                first_call_id: "call-a".to_string(),
+                second_call_id: "call-b".to_string(),
+            }
+        ));
+        assert!(is_recoverable_tool_conflict(
+            &ToolConflictError::ResourceConflict {
+                resource: ToolResource::ProjectSpec,
+                display_path: None,
+                first_call_id: "call-a".to_string(),
+                first_access: ToolResourceAccess::Read,
+                second_call_id: "call-b".to_string(),
+                second_access: ToolResourceAccess::Write,
+            }
+        ));
+        let missing_path = ToolConflictError::MissingPath {
+            tool_name: WRITE_FILE_TOOL_NAME.to_string(),
+            call_id: "call-a".to_string(),
+        };
+        assert!(!is_recoverable_tool_conflict(&missing_path));
+        assert_eq!(rejected_tool_batch(&calls, &missing_path), None);
+        assert!(!is_recoverable_tool_conflict(
+            &ToolConflictError::MissingScope {
+                tool_name: MEMORY_SEARCH_TOOL_NAME.to_string(),
+                call_id: "call-a".to_string(),
+            }
+        ));
     }
 
     #[test]

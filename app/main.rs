@@ -24,7 +24,7 @@ use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     AgentTaskId, ToolConflictError, build_available_tools_prompt, build_memory_prompt_section,
     build_project_spec_prompt_section, calculate_context_budget, estimate_json_tokens,
-    estimate_text_tokens, pack_context, plan_tool_execution,
+    estimate_text_tokens, pack_context, plan_tool_execution, rejected_tool_batch,
 };
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
@@ -8946,34 +8946,19 @@ fn rejected_tool_batch_results(
     tool_calls: &[NeutralToolCall],
     error: &ToolConflictError,
 ) -> Option<Vec<ExecutedToolCall>> {
-    match error {
-        ToolConflictError::SameFileWrite { .. }
-        | ToolConflictError::MixedFileWriteMethods { .. }
-        | ToolConflictError::ResourceConflict { .. } => {}
-        ToolConflictError::MissingPath { .. } | ToolConflictError::MissingScope { .. } => {
-            return None;
-        }
-    }
-
-    let conflict = error.to_string();
+    let rejections = rejected_tool_batch(&pending_tool_calls(tool_calls), error)?;
     let timestamp = utc_timestamp();
     Some(
-        tool_calls
-            .iter()
-            .map(|tool_call| {
-                let message = format!(
-                    "Tool call '{}' ('{}') was not executed because the entire tool batch was rejected: {conflict}. No tool calls in this batch were executed. Retry with a non-conflicting batch. For same-file changes, use one write_file call or send ordered edit_file operations in separate tool-call rounds; do not mix write_file and edit_file for the same file. Do not repeat the unchanged batch.",
-                    tool_call.call_id, tool_call.name
-                );
-                ExecutedToolCall {
-                    id: tool_call.call_id.clone(),
-                    name: tool_call.name.clone(),
-                    input: tool_call.arguments.clone(),
-                    output: json!({ "error": message }),
-                    is_error: true,
-                    started_at: timestamp.clone(),
-                    completed_at: timestamp.clone(),
-                }
+        rejections
+            .into_iter()
+            .map(|rejection| ExecutedToolCall {
+                id: rejection.call_id,
+                name: rejection.tool_name,
+                input: rejection.arguments,
+                output: json!({ "error": rejection.message }),
+                is_error: true,
+                started_at: timestamp.clone(),
+                completed_at: timestamp.clone(),
             })
             .collect(),
     )
