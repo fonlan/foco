@@ -73,7 +73,7 @@ use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
-    config_snapshot, estimate_tool_schema_tokens,
+    compact_cancelled_audit_response_body_json, config_snapshot, estimate_tool_schema_tokens,
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
         PromptHookExecutorRequest, PromptHookFuture,
@@ -950,6 +950,30 @@ fn broker_llm_final_state(
         "succeeded"
     } else {
         "failed"
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BrokerLlmCancellationAuditOutcome {
+    final_state: &'static str,
+    response_body_json: Option<String>,
+}
+
+fn broker_llm_cancellation_audit_outcome(
+    request_kind: &str,
+    explicit_broker_cancel: bool,
+    captured_response_body_json: Option<String>,
+    message: &str,
+) -> BrokerLlmCancellationAuditOutcome {
+    let user_cancel = explicit_broker_cancel && request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND;
+    BrokerLlmCancellationAuditOutcome {
+        final_state: if user_cancel { "cancelled" } else { "failed" },
+        response_body_json: if user_cancel {
+            captured_response_body_json
+                .or_else(|| Some(compact_cancelled_audit_response_body_json(message)))
+        } else {
+            captured_response_body_json
+        },
     }
 }
 
@@ -3749,21 +3773,27 @@ async fn broker_llm_stream(
                     event_type: "error".to_string(),
                     normalized_event: json!({ "type": "error", "code": "cancelled", "message": "broker request cancelled" }),
                 });
-                let response_body_json = audit_capture.as_ref().and_then(|capture| {
+                let captured_response_body_json = audit_capture.as_ref().and_then(|capture| {
                     capture
                         .failed_response_json("broker request cancelled", None, false)
                         .ok()
                         .flatten()
                 });
+                let cancel_audit = broker_llm_cancellation_audit_outcome(
+                    &request_kind,
+                    true,
+                    captured_response_body_json,
+                    "broker request cancelled",
+                );
                 finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
-                    final_state: "failed",
+                    final_state: cancel_audit.final_state,
                     first_token_at: None,
                     completed_at: &completed_at,
                     usage: None,
                     first_token_latency_ms: None,
                     total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
                     status_code: None,
-                    response_body_json: response_body_json.as_deref(),
+                    response_body_json: cancel_audit.response_body_json.as_deref(),
                 }, &audit_events);
                 let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
                 return;
@@ -3856,19 +3886,25 @@ async fn broker_llm_stream(
                         event_type: "error".to_string(),
                         normalized_event: json!({ "type": "error", "code": "cancelled", "message": "broker request cancelled" }),
                     });
-                    let response_body_json = stream
+                    let captured_response_body_json = stream
                         .interrupted_final_response_dump("broker request cancelled")
                         .as_ref()
                         .and_then(|dump| audit_capture.as_ref()?.response_json(Some(dump)).ok().flatten());
+                    let cancel_audit = broker_llm_cancellation_audit_outcome(
+                        &request_kind,
+                        true,
+                        captured_response_body_json,
+                        "broker request cancelled",
+                    );
                     finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
-                        final_state: "failed",
+                        final_state: cancel_audit.final_state,
                         first_token_at: first_token_at.as_deref(),
                         completed_at: &completed_at,
                         usage: final_usage.as_ref(),
                         first_token_latency_ms,
                         total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
                         status_code: None,
-                        response_body_json: response_body_json.as_deref(),
+                        response_body_json: cancel_audit.response_body_json.as_deref(),
                     }, &audit_events);
                     let _ = send_broker_error(write, Some(id), "cancelled", "broker request cancelled").await;
                     return;
@@ -12683,6 +12719,63 @@ mod tests {
             broker_llm_final_state(BROKER_PROMPT_HOOK_REQUEST_KIND, false, false),
             "failed"
         );
+    }
+
+    #[test]
+    fn broker_llm_cancellation_audit_contract_is_request_kind_and_signal_aware() {
+        let compact = broker_llm_cancellation_audit_outcome(
+            BROKER_DEFAULT_LLM_REQUEST_KIND,
+            true,
+            None,
+            "broker request cancelled",
+        );
+        assert_eq!(compact.final_state, "cancelled");
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                compact
+                    .response_body_json
+                    .as_deref()
+                    .expect("compact cancelled response"),
+            )
+            .expect("valid compact cancelled response"),
+            json!({ "cancelled": "broker request cancelled" })
+        );
+
+        let captured = r#"{"format":"provider_final_response_v1","partial":true}"#.to_string();
+        let detailed = broker_llm_cancellation_audit_outcome(
+            BROKER_DEFAULT_LLM_REQUEST_KIND,
+            true,
+            Some(captured.clone()),
+            "broker request cancelled",
+        );
+        assert_eq!(detailed.final_state, "cancelled");
+        assert_eq!(
+            detailed.response_body_json.as_deref(),
+            Some(captured.as_str())
+        );
+
+        for request_kind in [
+            BROKER_PROMPT_HOOK_REQUEST_KIND,
+            BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+        ] {
+            let internal = broker_llm_cancellation_audit_outcome(
+                request_kind,
+                true,
+                None,
+                "broker request cancelled",
+            );
+            assert_eq!(internal.final_state, "failed");
+            assert_eq!(internal.response_body_json, None);
+        }
+
+        let not_explicit = broker_llm_cancellation_audit_outcome(
+            BROKER_DEFAULT_LLM_REQUEST_KIND,
+            false,
+            None,
+            "stream error text says cancelled",
+        );
+        assert_eq!(not_explicit.final_state, "failed");
+        assert_eq!(not_explicit.response_body_json, None);
     }
 
     #[test]

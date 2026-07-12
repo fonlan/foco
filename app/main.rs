@@ -6577,6 +6577,10 @@ fn is_retryable_provider_status(status_code: u16) -> bool {
     matches!(status_code, 408 | 409 | 429 | 500..=599)
 }
 
+fn compact_cancelled_audit_response_body_json(message: &str) -> String {
+    json!({ "cancelled": message }).to_string()
+}
+
 fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
     ChatAuditOutcome {
         first_token_at: None,
@@ -6590,7 +6594,7 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
         reasoning_tokens: None,
         status_code: None,
         final_state: "cancelled",
-        response_body_json: Some(json!({ "cancelled": message }).to_string()),
+        response_body_json: Some(compact_cancelled_audit_response_body_json(message)),
     }
 }
 
