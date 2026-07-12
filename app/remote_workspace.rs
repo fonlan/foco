@@ -73,7 +73,9 @@ use crate::{
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_pending_tool_state_messages, config_snapshot,
     estimate_tool_schema_tokens,
-    hooks::HookRuntime,
+    hooks::{
+        HookExecution, HookRuntime, PromptHookExecutor, PromptHookExecutorRequest, PromptHookFuture,
+    },
     http::{
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
         spec::{
@@ -126,9 +128,11 @@ const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Broker `requestKind` values accepted for main-process LLM audit rows.
-const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] = &["chat completion", "contextCompression"];
+const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] =
+    &["chat completion", "contextCompression", "prompt hook"];
 const BROKER_DEFAULT_LLM_REQUEST_KIND: &str = "chat completion";
 const BROKER_CONTEXT_COMPRESSION_REQUEST_KIND: &str = "contextCompression";
+const BROKER_PROMPT_HOOK_REQUEST_KIND: &str = "prompt hook";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -834,7 +838,7 @@ struct BrokerLlmAuditContext {
     request_kind: String,
 }
 
-fn broker_llm_request_kind_from_payload(payload: &Value) -> String {
+fn broker_llm_request_kind_from_payload(payload: &Value) -> Result<String, String> {
     let raw = payload
         .get("requestKind")
         .and_then(Value::as_str)
@@ -842,13 +846,21 @@ fn broker_llm_request_kind_from_payload(payload: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(BROKER_DEFAULT_LLM_REQUEST_KIND);
     if BROKER_ALLOWED_LLM_REQUEST_KINDS.contains(&raw) {
-        raw.to_string()
+        Ok(raw.to_string())
     } else {
-        tracing::warn!(
-            request_kind = %raw,
-            "unsupported broker llm requestKind; falling back to chat completion"
-        );
-        BROKER_DEFAULT_LLM_REQUEST_KIND.to_string()
+        Err(format!("unsupported broker llm requestKind: {raw}"))
+    }
+}
+
+fn broker_llm_final_state(
+    request_kind: &str,
+    completed: bool,
+    has_tool_calls: bool,
+) -> &'static str {
+    if completed && !(request_kind == BROKER_PROMPT_HOOK_REQUEST_KIND && has_tool_calls) {
+        "succeeded"
+    } else {
+        "failed"
     }
 }
 
@@ -2099,10 +2111,14 @@ fn remote_sidecar_cancel_broker_request(
     let Some(broker_request_id) = run_stream.broker_request_id() else {
         return;
     };
+    remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+}
+
+fn remote_sidecar_cancel_broker_request_id(state: &RemoteSidecarState, broker_request_id: &str) {
     let cancel = ControlEnvelope {
         version: 1,
         message_type: "cancel".to_string(),
-        id: Some(broker_request_id),
+        id: Some(broker_request_id.to_string()),
         method: None,
         payload: json!({}),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
@@ -3303,6 +3319,7 @@ fn broker_llm_audit_context(
     state: &AppState,
     fallback_workspace_id: &str,
     payload: &Value,
+    request_kind: &str,
 ) -> Option<BrokerLlmAuditContext> {
     let workspace_id = payload
         .get("workspaceId")
@@ -3338,7 +3355,7 @@ fn broker_llm_audit_context(
                     .unwrap_or("")
             })
             .to_string(),
-        request_kind: broker_llm_request_kind_from_payload(payload),
+        request_kind: request_kind.to_string(),
     })
     .filter(|context| !context.request_id.is_empty())
 }
@@ -3488,6 +3505,13 @@ async fn broker_llm_stream(
     payload: Value,
     cancel_rx: Option<oneshot::Receiver<()>>,
 ) {
+    let request_kind = match broker_llm_request_kind_from_payload(&payload) {
+        Ok(request_kind) => request_kind,
+        Err(message) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", message).await;
+            return;
+        }
+    };
     let provider_id = match payload.get("providerId").and_then(Value::as_str) {
         Some(id) => id,
         None => {
@@ -3568,12 +3592,13 @@ async fn broker_llm_stream(
             }
         });
 
-    let audit_context =
-        broker_llm_audit_context(state, workspace_id, &payload).map(|mut context| {
+    let audit_context = broker_llm_audit_context(state, workspace_id, &payload, &request_kind).map(
+        |mut context| {
             // Broker RPC id is the durable audit request id (1:1 with the control message).
             context.request_id = id.to_string();
             context
-        });
+        },
+    );
     let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_started_instant = Instant::now();
     if let Some(context) = audit_context.as_ref() {
@@ -3603,7 +3628,7 @@ async fn broker_llm_stream(
             "requestKind": audit_context
                 .as_ref()
                 .map(|context| context.request_kind.as_str())
-                .unwrap_or(BROKER_DEFAULT_LLM_REQUEST_KIND),
+                .unwrap_or(request_kind.as_str()),
         }),
     }];
 
@@ -4076,10 +4101,28 @@ async fn broker_llm_stream(
                 })
         });
     let completed = stream.final_response_dump().is_some();
+    let prompt_hook_tool_call_failure = request_kind == BROKER_PROMPT_HOOK_REQUEST_KIND
+        && completed
+        && !final_tool_calls.is_empty();
+    if prompt_hook_tool_call_failure {
+        audit_events.push(BrokerLlmAuditEvent {
+            event_at: completed_at.clone(),
+            event_type: "error".to_string(),
+            normalized_event: json!({
+                "type": "error",
+                "code": "unsupported_tool_calls",
+                "message": "prompt hook completed with unsupported tool calls",
+            }),
+        });
+    }
     finish_broker_llm_audit(
         audit_context.as_ref(),
         BrokerLlmAuditOutcome {
-            final_state: if completed { "succeeded" } else { "failed" },
+            final_state: broker_llm_final_state(
+                &request_kind,
+                completed,
+                !final_tool_calls.is_empty(),
+            ),
             first_token_at: first_token_at.as_deref(),
             completed_at: &completed_at,
             usage: final_usage.as_ref(),
@@ -7222,18 +7265,100 @@ fn remote_sidecar_close_unexecuted_tool_calls(
         .collect()
 }
 
+async fn remote_sidecar_hook_environment(
+    state: &RemoteSidecarState,
+) -> Result<
+    (
+        Arc<McpRegistry>,
+        HookRuntime,
+        foco_store::config::HookConfig,
+        foco_store::config::GlobalConfig,
+        u32,
+    ),
+    String,
+> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let bundle = state
+        .runtime_config
+        .lock()
+        .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
+        .clone();
+    let mut global_config = foco_store::config::GlobalConfig::first_run(workspace_path.clone());
+    let (global_hooks, retry_count, mcp_config) = if let Some(bundle) = bundle {
+        global_config.agent_definitions = bundle.payload.agent_definitions.clone();
+        global_config.prompts = bundle.payload.prompts.clone();
+        global_config.models = bundle.payload.models.clone();
+        global_config.hooks = bundle.payload.hooks.clone();
+        global_config.mcp = bundle.payload.mcp.clone();
+        global_config.memory = bundle.payload.memory.clone();
+        global_config.spec = bundle.payload.spec.clone();
+        global_config.plan = bundle.payload.plan.clone();
+        (
+            bundle.payload.hooks,
+            bundle.payload.app.llm_request_retry_count,
+            bundle.payload.mcp,
+        )
+    } else {
+        (
+            foco_store::config::HookConfig::default(),
+            foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT,
+            global_config.mcp.clone(),
+        )
+    };
+    let definitions = mcp_config
+        .servers
+        .iter()
+        .map(foco_store::config::McpServerConfig::to_definition)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| format!("failed to prepare remote sidecar MCP servers: {source}"))?;
+    let mcp_registry = Arc::new(McpRegistry::default());
+    mcp_registry
+        .sync_workspace_servers(&state.workspace_id, &workspace_path, true, &definitions)
+        .await
+        .map_err(|source| format!("failed to sync remote sidecar MCP servers: {source}"))?;
+    let hook_runtime = HookRuntime::with_prompt_executor(
+        mcp_registry.clone(),
+        Arc::new(RemoteSidecarPromptHookExecutor {
+            state: state.clone(),
+        }),
+    );
+    Ok((
+        mcp_registry,
+        hook_runtime,
+        global_hooks,
+        global_config,
+        retry_count,
+    ))
+}
+
 async fn remote_sidecar_execute_tool_call(
     state: &RemoteSidecarState,
     tool_call: NeutralToolCall,
     chat_id: &str,
     run_id: &str,
     assistant_message_id: &str,
+    provider_id: &str,
+    model_id: &str,
 ) -> (Value, bool, String, String, Vec<Value>) {
     // ponytail: remote sidecar reuses the shared execute_tool path one call at a time.
     // Ceiling: this duplicates a thin slice of main chat wiring; if remote tools grow
     // parallelism/question hooks, extract a dedicated remote tool runtime helper.
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let workspace_path = PathBuf::from(&state.workspace_path);
+    let (mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
+        match remote_sidecar_hook_environment(state).await {
+            Ok(environment) => environment,
+            Err(error) => {
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                return (
+                    json!({ "error": error }),
+                    true,
+                    started_at,
+                    completed_at,
+                    Vec::new(),
+                );
+            }
+        };
     let tool_output_events = Arc::new(AsyncMutex::new(Vec::<Value>::new()));
     let question_events = Arc::new(AsyncMutex::new(Vec::<Value>::new()));
     let (tool_output_tx, mut tool_output_rx) = mpsc::unbounded_channel::<ToolOutputDeltaEvent>();
@@ -7268,24 +7393,13 @@ async fn remote_sidecar_execute_tool_call(
         }
     });
 
-    let global_config = foco_store::config::GlobalConfig::first_run(workspace_path.clone());
-    let mcp_registry = Arc::new(McpRegistry::default());
-    let hook_runtime = HookRuntime::new(mcp_registry.clone());
     let execution = execute_tool(
         mcp_registry,
         hook_runtime,
-        &foco_store::config::HookConfig::default(),
+        &global_hooks,
         false,
         &global_config,
-        &foco_providers::ProviderConnectionConfig {
-            kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
-                .expect("openai responses kind"),
-            base_url: None,
-            api_key: None,
-            proxy_url: None,
-            request_overrides: Vec::new(),
-            model_redirects: Vec::new(),
-        },
+        None,
         &foco_store::config::WebSearchSettings::default(),
         QuestionRegistry::default(),
         question_tx.clone(),
@@ -7298,7 +7412,7 @@ async fn remote_sidecar_execute_tool_call(
             run_id: run_id.to_string(),
             tool_call_id: tool_call.call_id.clone(),
             target_status: MemoryStatus::Pending,
-            memory_settings: foco_store::config::MemorySettings::default(),
+            memory_settings: global_config.memory.clone(),
         },
         None,
         ToolResourceLockRegistry::default(),
@@ -7311,9 +7425,9 @@ async fn remote_sidecar_execute_tool_call(
         chat_id,
         None,
         run_id,
-        "remote-sidecar-tool-loop",
-        "remote-sidecar",
-        0,
+        model_id,
+        provider_id,
+        retry_count,
         &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
@@ -7596,6 +7710,333 @@ async fn remote_sidecar_run_broker_llm_turn(
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
                 return Err(());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteSidecarPromptHookExecutor {
+    state: RemoteSidecarState,
+}
+
+impl PromptHookExecutor for RemoteSidecarPromptHookExecutor {
+    fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture {
+        let state = self.state.clone();
+        Box::pin(async move { remote_sidecar_run_broker_prompt_hook(&state, request).await })
+    }
+}
+
+fn persist_remote_prompt_hook_audit(
+    database: &mut WorkspaceDatabase,
+    request: &PromptHookExecutorRequest,
+    request_id: &str,
+    provider_id: &str,
+    metrics: &RemoteSidecarRunMetrics,
+    final_state: &str,
+    response_body: Value,
+) {
+    let Some(chat_id) = request.chat_id.as_deref() else {
+        return;
+    };
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let _ = persist_sidecar_llm_audit_for_kind(
+        database,
+        &request.workspace_id,
+        chat_id,
+        request_id,
+        BROKER_PROMPT_HOOK_REQUEST_KIND,
+        provider_id,
+        &request.hook_request.model_id,
+        metrics,
+        &completed_at,
+        metrics.total_latency_ms(),
+        final_state,
+        response_body,
+    );
+}
+
+async fn remote_sidecar_run_broker_prompt_hook(
+    state: &RemoteSidecarState,
+    request: PromptHookExecutorRequest,
+) -> Result<HookExecution, String> {
+    let provider_id = request
+        .provider_id
+        .as_deref()
+        .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
+    let broker_request_id = unique_id("broker-prompt-hook");
+    let run_stream = request
+        .run_id
+        .as_deref()
+        .and_then(|run_id| remote_sidecar_active_run_stream(state, run_id));
+    let mut database =
+        WorkspaceDatabase::open_or_create(&request.workspace_path).map_err(|source| {
+            format!("failed to open workspace database for prompt hook audit: {source}")
+        })?;
+    let mut metrics = RemoteSidecarRunMetrics::new();
+    let timeout_duration = Duration::from_millis(request.timeout_ms);
+    if run_stream
+        .as_ref()
+        .is_some_and(RemoteActiveRunStream::is_finished)
+    {
+        let message = "prompt hook was cancelled".to_string();
+        persist_remote_prompt_hook_audit(
+            &mut database,
+            &request,
+            &broker_request_id,
+            provider_id,
+            &metrics,
+            "failed",
+            json!({
+                "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                "cancelled": true,
+                "error": { "message": message },
+            }),
+        );
+        return Err(message);
+    }
+    if let Some(run_stream) = run_stream.as_ref() {
+        run_stream.set_broker_request_id(broker_request_id.clone());
+    }
+    let broker_payload = json!({
+        "workspaceId": request.workspace_id,
+        "chatId": request.chat_id,
+        "runId": request.run_id,
+        "requestId": broker_request_id,
+        "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+        "providerId": provider_id,
+        "modelId": request.hook_request.model_id,
+        "request": request.hook_request,
+    });
+    let mut broker_rx = match timeout(
+        timeout_duration,
+        remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
+    )
+    .await
+    {
+        Ok(Ok(broker_rx)) => broker_rx,
+        Ok(Err(_)) => {
+            let message = "prompt hook failed: remote broker is unavailable".to_string();
+            persist_remote_prompt_hook_audit(
+                &mut database,
+                &request,
+                &broker_request_id,
+                provider_id,
+                &metrics,
+                "failed",
+                json!({
+                    "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                    "error": { "message": message },
+                }),
+            );
+            return Err(message);
+        }
+        Err(_) => {
+            let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
+            persist_remote_prompt_hook_audit(
+                &mut database,
+                &request,
+                &broker_request_id,
+                provider_id,
+                &metrics,
+                "failed",
+                json!({
+                    "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                    "error": { "message": message },
+                }),
+            );
+            return Err(message);
+        }
+    };
+    let mut output = String::new();
+    let mut saw_tool_call = false;
+
+    loop {
+        if run_stream
+            .as_ref()
+            .is_some_and(RemoteActiveRunStream::is_finished)
+        {
+            let message = "prompt hook was cancelled".to_string();
+            persist_remote_prompt_hook_audit(
+                &mut database,
+                &request,
+                &broker_request_id,
+                provider_id,
+                &metrics,
+                "failed",
+                json!({
+                    "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                    "cancelled": true,
+                    "error": { "message": message },
+                }),
+            );
+            remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+            return Err(message);
+        }
+
+        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                let message =
+                    "prompt hook failed: remote broker closed before completion".to_string();
+                persist_remote_prompt_hook_audit(
+                    &mut database,
+                    &request,
+                    &broker_request_id,
+                    provider_id,
+                    &metrics,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                        "error": { "message": message },
+                    }),
+                );
+                return Err(message);
+            }
+            Err(_) => {
+                let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
+                persist_remote_prompt_hook_audit(
+                    &mut database,
+                    &request,
+                    &broker_request_id,
+                    provider_id,
+                    &metrics,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                        "error": { "message": message },
+                        "partial": true,
+                    }),
+                );
+                remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+                return Err(message);
+            }
+        };
+
+        match envelope.message_type.as_str() {
+            "stream" => match envelope
+                .payload
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+            {
+                "textDelta" => {
+                    let delta = envelope
+                        .payload
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !delta.is_empty() {
+                        metrics.capture_first_output();
+                        output.push_str(delta);
+                    }
+                }
+                "reasoningDelta" => metrics.capture_first_output(),
+                "usageDelta" => {
+                    if let Some(usage) = envelope.payload.get("usage") {
+                        metrics.merge_usage_value(usage);
+                    }
+                }
+                "toolCall" => saw_tool_call = true,
+                _ => {}
+            },
+            "response" => {
+                let audit_request_id = envelope
+                    .payload
+                    .get("llmRequestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&broker_request_id)
+                    .to_string();
+                if metrics.usage.input_tokens.is_none() && metrics.usage.output_tokens.is_none() {
+                    if let Some(usage) = envelope.payload.get("usage") {
+                        metrics.merge_usage_value(usage);
+                    }
+                }
+                if output.is_empty() {
+                    if let Some(text) = envelope.payload.get("text").and_then(Value::as_str) {
+                        output = text.to_string();
+                    }
+                }
+                let response_tool_calls = envelope
+                    .payload
+                    .get("toolCalls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
+                    .unwrap_or_default();
+                if saw_tool_call || !response_tool_calls.is_empty() {
+                    let message = "prompt hook completed with unsupported tool calls".to_string();
+                    persist_remote_prompt_hook_audit(
+                        &mut database,
+                        &request,
+                        &audit_request_id,
+                        provider_id,
+                        &metrics,
+                        "failed",
+                        json!({
+                            "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                            "error": { "message": message },
+                        }),
+                    );
+                    return Err(message);
+                }
+                persist_remote_prompt_hook_audit(
+                    &mut database,
+                    &request,
+                    &audit_request_id,
+                    provider_id,
+                    &metrics,
+                    "succeeded",
+                    json!({
+                        "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                        "status": "ok",
+                        "outputChars": output.chars().count(),
+                        "usage": metrics.usage_value(),
+                    }),
+                );
+                return Ok(HookExecution {
+                    exit_code: Some(0),
+                    stdout: output.clone(),
+                    stderr: String::new(),
+                    output_json: serde_json::from_str(&output).ok(),
+                    is_error: false,
+                });
+            }
+            "error" => {
+                let code = envelope
+                    .payload
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let broker_message = envelope
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote broker unavailable");
+                let cancelled = code == "cancelled"
+                    || broker_message.contains("cancelled")
+                    || run_stream
+                        .as_ref()
+                        .is_some_and(RemoteActiveRunStream::is_finished);
+                let message = if cancelled {
+                    "prompt hook was cancelled".to_string()
+                } else {
+                    format!("prompt hook failed: {broker_message}")
+                };
+                persist_remote_prompt_hook_audit(
+                    &mut database,
+                    &request,
+                    &broker_request_id,
+                    provider_id,
+                    &metrics,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+                        "cancelled": cancelled,
+                        "error": { "message": message },
+                    }),
+                );
+                return Err(message);
             }
             _ => {}
         }
@@ -8492,6 +8933,8 @@ async fn remote_sidecar_chat_stream(
                             &chat_id,
                             &run_id,
                             &assistant_message_id,
+                            &provider_id,
+                            &model_id,
                         ).await;
                         let _ = remote_sidecar_record_tool_result(
                             &mut database,
@@ -11904,22 +12347,49 @@ mod tests {
     }
 
     #[test]
-    fn broker_llm_request_kind_accepts_chat_and_context_compression() {
+    fn broker_llm_request_kind_allowlist_rejects_unknown_values() {
         assert_eq!(
-            broker_llm_request_kind_from_payload(&json!({})),
+            broker_llm_request_kind_from_payload(&json!({})).expect("default request kind"),
             "chat completion"
         );
         assert_eq!(
-            broker_llm_request_kind_from_payload(&json!({ "requestKind": "chat completion" })),
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "chat completion" }))
+                .expect("chat request kind"),
             "chat completion"
         );
         assert_eq!(
-            broker_llm_request_kind_from_payload(&json!({ "requestKind": "contextCompression" })),
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "contextCompression" }))
+                .expect("compression request kind"),
             "contextCompression"
         );
         assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "prompt hook" }))
+                .expect("prompt hook request kind"),
+            "prompt hook"
+        );
+        assert_eq!(
             broker_llm_request_kind_from_payload(&json!({ "requestKind": "memory extraction" })),
-            "chat completion"
+            Err("unsupported broker llm requestKind: memory extraction".to_string())
+        );
+    }
+
+    #[test]
+    fn broker_prompt_hook_tool_calls_are_a_failed_audit_outcome() {
+        assert_eq!(
+            broker_llm_final_state(BROKER_PROMPT_HOOK_REQUEST_KIND, true, false),
+            "succeeded"
+        );
+        assert_eq!(
+            broker_llm_final_state(BROKER_PROMPT_HOOK_REQUEST_KIND, true, true),
+            "failed"
+        );
+        assert_eq!(
+            broker_llm_final_state(BROKER_DEFAULT_LLM_REQUEST_KIND, true, true),
+            "succeeded"
+        );
+        assert_eq!(
+            broker_llm_final_state(BROKER_PROMPT_HOOK_REQUEST_KIND, false, false),
+            "failed"
         );
     }
 
@@ -12550,6 +13020,213 @@ mod tests {
                 .expect("tool calls")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_prompt_hook_uses_broker_without_assistant_deltas_or_chat_usage() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            assert_eq!(request.method.as_deref(), Some("llm.stream"));
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some(BROKER_PROMPT_HOOK_REQUEST_KIND)
+            );
+            assert_eq!(
+                request.payload.get("providerId").and_then(Value::as_str),
+                Some("provider-1")
+            );
+            let payload_json = request.payload.to_string();
+            assert!(!payload_json.contains("apiKey"));
+            assert!(!payload_json.contains("proxyUrl"));
+            let hook_request = request
+                .payload
+                .get("request")
+                .expect("hook request payload");
+            assert!(
+                hook_request
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            );
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "{\"decision\":\"allow\",\"additionalContext\":\"remote context\"}"
+                    }),
+                    timestamp: None,
+                })
+                .expect("send prompt hook text");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "usageDelta",
+                        "usage": { "inputTokens": 8, "outputTokens": 3 }
+                    }),
+                    timestamp: None,
+                })
+                .expect("send prompt hook usage");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "llmRequestId": id,
+                        "text": "",
+                        "usage": { "inputTokens": 8, "outputTokens": 3 },
+                        "toolCalls": []
+                    }),
+                    timestamp: None,
+                })
+                .expect("send prompt hook response");
+        });
+        let request = PromptHookExecutorRequest {
+            hook_request: NeutralChatRequest {
+                model_id: "model-1".to_string(),
+                messages: vec![NeutralChatMessage {
+                    role: foco_providers::NeutralChatRole::User,
+                    content: "Evaluate the hook input.".to_string(),
+                    attachments: Vec::new(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                }],
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(1024),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+            },
+            workspace_id: "workspace".to_string(),
+            workspace_path: workspace.path().to_path_buf(),
+            chat_id: Some("chat-1".to_string()),
+            run_id: Some("remote-run-1".to_string()),
+            event: "PreCompact".to_string(),
+            provider_id: Some("provider-1".to_string()),
+            provider_config: None,
+            api_audit_save_details: false,
+            timeout_ms: 1_000,
+        };
+
+        let execution = remote_sidecar_run_broker_prompt_hook(&state, request)
+            .await
+            .expect("prompt hook execution");
+        broker.await.expect("broker task");
+
+        assert_eq!(execution.exit_code, Some(0));
+        assert_eq!(
+            execution
+                .output_json
+                .as_ref()
+                .and_then(|value| value.get("additionalContext"))
+                .and_then(Value::as_str),
+            Some("remote context")
+        );
+        assert!(run_stream.snapshot_after(0).is_empty());
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("prompt hook audit rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_kind, BROKER_PROMPT_HOOK_REQUEST_KIND);
+        assert_eq!(rows[0].final_state, "succeeded");
+        assert_eq!(rows[0].input_tokens, Some(8));
+        assert_eq!(rows[0].output_tokens, Some(3));
+        let main_chat_rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("main chat rows");
+        assert!(main_chat_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_prompt_hook_offline_wait_respects_hook_timeout_and_audits_failure() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let request = PromptHookExecutorRequest {
+            hook_request: NeutralChatRequest {
+                model_id: "model-1".to_string(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(1024),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+            },
+            workspace_id: "workspace".to_string(),
+            workspace_path: workspace.path().to_path_buf(),
+            chat_id: Some("chat-1".to_string()),
+            run_id: Some("remote-run-timeout".to_string()),
+            event: "PreCompact".to_string(),
+            provider_id: Some("provider-1".to_string()),
+            provider_config: None,
+            api_audit_save_details: false,
+            timeout_ms: 20,
+        };
+
+        let started_at = Instant::now();
+        let error = remote_sidecar_run_broker_prompt_hook(&state, request)
+            .await
+            .expect_err("offline broker should time out");
+
+        assert!(error.contains("timed out after 20 ms"));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("prompt hook audit rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_kind, BROKER_PROMPT_HOOK_REQUEST_KIND);
+        assert_eq!(rows[0].final_state, "failed");
     }
 
     #[tokio::test]

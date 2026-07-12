@@ -6564,6 +6564,14 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             None,
         ),
         request(
+            "internal-prompt-hook",
+            "prompt hook",
+            450,
+            45,
+            "2026-07-06T10:00:02.500Z",
+            None,
+        ),
+        request(
             "main-chat-request",
             "chat completion",
             10,
@@ -6583,7 +6591,7 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             ..LlmRequestAuditFilters::default()
         })
         .expect("all chat audit rows");
-    assert_eq!(all_chat_rows.len(), 5);
+    assert_eq!(all_chat_rows.len(), 6);
 
     let main_chat_filters = LlmRequestAuditFilters {
         chat_id: Some("chat-1"),

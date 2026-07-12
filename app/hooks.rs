@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -34,11 +36,60 @@ const HOOK_OUTPUT_PREVIEW_CHARS: usize = 4000;
 #[derive(Clone)]
 pub struct HookRuntime {
     mcp_registry: Arc<McpRegistry>,
+    prompt_executor: Arc<dyn PromptHookExecutor>,
+}
+
+pub(crate) type PromptHookFuture =
+    Pin<Box<dyn Future<Output = Result<HookExecution, String>> + Send>>;
+
+pub(crate) trait PromptHookExecutor: Send + Sync {
+    fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture;
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptHookExecutorRequest {
+    pub(crate) hook_request: NeutralChatRequest,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) chat_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) event: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) provider_config: Option<ProviderConnectionConfig>,
+    pub(crate) api_audit_save_details: bool,
+    pub(crate) timeout_ms: u64,
+}
+
+struct DirectPromptHookExecutor;
+
+impl PromptHookExecutor for DirectPromptHookExecutor {
+    fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture {
+        Box::pin(async move {
+            let provider_config = request
+                .provider_config
+                .clone()
+                .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
+            run_prompt_hook_attempt(&provider_config, request).await
+        })
+    }
 }
 
 impl HookRuntime {
     pub fn new(mcp_registry: Arc<McpRegistry>) -> Self {
-        Self { mcp_registry }
+        Self {
+            mcp_registry,
+            prompt_executor: Arc::new(DirectPromptHookExecutor),
+        }
+    }
+
+    pub(crate) fn with_prompt_executor(
+        mcp_registry: Arc<McpRegistry>,
+        prompt_executor: Arc<dyn PromptHookExecutor>,
+    ) -> Self {
+        Self {
+            mcp_registry,
+            prompt_executor,
+        }
     }
 
     pub async fn run_hooks(&self, request: HookRunRequest<'_>) -> HookRunSummary {
@@ -183,7 +234,9 @@ impl HookRuntime {
             HOOK_HANDLER_MCP_TOOL => {
                 run_mcp_hook(&self.mcp_registry, handler, request, input, timeout_ms).await
             }
-            HOOK_HANDLER_PROMPT => run_prompt_hook(handler, request, input, timeout_ms).await,
+            HOOK_HANDLER_PROMPT => {
+                run_prompt_hook(&self.prompt_executor, handler, request, input, timeout_ms).await
+            }
             other => Err(format!("unsupported hook handler type: {other}")),
         };
 
@@ -635,6 +688,7 @@ async fn run_mcp_hook(
 }
 
 async fn run_prompt_hook(
+    executor: &Arc<dyn PromptHookExecutor>,
     handler: &HookHandler,
     request: &HookRunRequest<'_>,
     input: Value,
@@ -644,9 +698,6 @@ async fn run_prompt_hook(
         .prompt
         .as_deref()
         .ok_or_else(|| "prompt hook is missing prompt".to_string())?;
-    let provider_config = request
-        .provider_config
-        .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
     let model_id = request
         .model_id
         .ok_or_else(|| "prompt hook requires an active model".to_string())?;
@@ -680,11 +731,21 @@ async fn run_prompt_hook(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     };
+    let executor_request = PromptHookExecutorRequest {
+        hook_request,
+        workspace_id: request.workspace_id.to_string(),
+        workspace_path: request.workspace_path.to_path_buf(),
+        chat_id: request.chat_id.map(str::to_string),
+        run_id: request.run_id.map(str::to_string),
+        event: request.event.to_string(),
+        provider_id: request.provider_id.map(str::to_string),
+        provider_config: request.provider_config.cloned(),
+        api_audit_save_details: request.api_audit_save_details,
+        timeout_ms,
+    };
 
     for attempt_index in 0..=request.llm_request_retry_count {
-        match run_prompt_hook_attempt(provider_config, hook_request.clone(), request, timeout_ms)
-            .await
-        {
+        match executor.execute(executor_request.clone()).await {
             Ok(execution) => return Ok(execution),
             Err(error) if attempt_index >= request.llm_request_retry_count => return Err(error),
             Err(_) => {}
@@ -696,12 +757,10 @@ async fn run_prompt_hook(
 
 async fn run_prompt_hook_attempt(
     provider_config: &ProviderConnectionConfig,
-    hook_request: NeutralChatRequest,
-    request: &HookRunRequest<'_>,
-    timeout_ms: u64,
+    request: PromptHookExecutorRequest,
 ) -> Result<HookExecution, String> {
-    let mut audited_stream =
-        audited_prompt_hook_stream(provider_config, hook_request, request, timeout_ms).await?;
+    let timeout_ms = request.timeout_ms;
+    let mut audited_stream = audited_prompt_hook_stream(provider_config, request.clone()).await?;
     let mut first_token_at = None;
     let mut first_token_latency_ms = None;
     let mut usage = None;
@@ -896,32 +955,31 @@ impl AuditedPromptHookStream {
 
 async fn audited_prompt_hook_stream(
     provider_config: &ProviderConnectionConfig,
-    hook_request: NeutralChatRequest,
-    request: &HookRunRequest<'_>,
-    timeout_ms: u64,
+    request: PromptHookExecutorRequest,
 ) -> Result<AuditedPromptHookStream, String> {
-    let workspace_id = request.workspace_id;
+    let workspace_id = &request.workspace_id;
     let provider_id = request
         .provider_id
+        .as_deref()
         .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
     let request_id = format!("llm-hook-{}", uuid_suffix());
     let request_started_at = utc_timestamp();
     let mut database =
-        WorkspaceDatabase::open_or_create(request.workspace_path).map_err(|source| {
+        WorkspaceDatabase::open_or_create(&request.workspace_path).map_err(|source| {
             format!("failed to open workspace database for prompt hook audit: {source}")
         })?;
     database
         .insert_llm_request(NewLlmRequest {
             id: &request_id,
             workspace_id,
-            chat_id: request.chat_id,
+            chat_id: request.chat_id.as_deref(),
             request_kind: "prompt hook",
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
             agent_attempt_id: None,
             provider_id,
-            model_id: &hook_request.model_id,
+            model_id: &request.hook_request.model_id,
             thinking_level: None,
             request_started_at: &request_started_at,
             first_token_at: None,
@@ -952,9 +1010,9 @@ async fn audited_prompt_hook_stream(
                 "requestKind": "prompt hook",
                 "llmRequestId": &request_id,
                 "workspaceId": workspace_id,
-                "chatId": request.chat_id,
-                "runId": request.run_id,
-                "event": request.event,
+                "chatId": request.chat_id.as_deref(),
+                "runId": request.run_id.as_deref(),
+                "event": &request.event,
             })
             .to_string(),
         })
@@ -962,16 +1020,16 @@ async fn audited_prompt_hook_stream(
     drop(database);
 
     let capture = ProviderAuditCapture::new(
-        request.workspace_path,
+        &request.workspace_path,
         request_id.clone(),
         request.api_audit_save_details,
     );
     let started_at = std::time::Instant::now();
     match timeout(
-        Duration::from_millis(timeout_ms),
+        Duration::from_millis(request.timeout_ms),
         stream_chat_with_capture_observer(
             provider_config,
-            hook_request,
+            request.hook_request.clone(),
             request.api_audit_save_details,
             capture.observer(),
         ),
@@ -1001,7 +1059,7 @@ async fn audited_prompt_hook_stream(
                 )
                 .map_err(|error| error.message)?;
             fail_prompt_hook_audit(
-                request.workspace_path,
+                &request.workspace_path,
                 &request_id,
                 started_at,
                 source.status_code().map(i64::from),
@@ -1012,12 +1070,12 @@ async fn audited_prompt_hook_stream(
             Err(format!("prompt hook provider call failed: {source}"))
         }
         Err(_) => {
-            let message = format!("prompt hook timed out after {timeout_ms} ms");
+            let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
             let response_body_json = capture
                 .failed_response_json(message.clone(), None, false)
                 .map_err(|error| error.message)?;
             fail_prompt_hook_audit(
-                request.workspace_path,
+                &request.workspace_path,
                 &request_id,
                 started_at,
                 None,
@@ -1130,12 +1188,12 @@ fn hook_handler_key(event: &str, matcher: Option<&str>, handler: &HookHandler) -
 }
 
 #[derive(Debug)]
-struct HookExecution {
-    exit_code: Option<i64>,
-    stdout: String,
-    stderr: String,
-    output_json: Option<Value>,
-    is_error: bool,
+pub(crate) struct HookExecution {
+    pub(crate) exit_code: Option<i64>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) output_json: Option<Value>,
+    pub(crate) is_error: bool,
 }
 
 struct HookHandlerResult {
@@ -1410,7 +1468,9 @@ fn uuid_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foco_store::config::{HOOK_HANDLER_COMMAND, HOOK_HANDLER_HTTP, HookMatcherGroup};
+    use foco_store::config::{
+        HOOK_HANDLER_COMMAND, HOOK_HANDLER_HTTP, HOOK_HANDLER_PROMPT, HookMatcherGroup,
+    };
     use serde_json::json;
     use tempfile::TempDir;
     use tokio::{
@@ -1464,6 +1524,32 @@ mod tests {
         }
     }
 
+    struct StaticPromptExecutor;
+
+    impl PromptHookExecutor for StaticPromptExecutor {
+        fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture {
+            Box::pin(async move {
+                assert_eq!(request.hook_request.model_id, "model-1");
+                assert!(request.hook_request.tools.is_empty());
+                assert!(request.provider_config.is_none());
+                let stdout = json!({
+                    "hookSpecificOutput": {
+                        "permissionDecision": "allow",
+                        "additionalContext": "broker context"
+                    }
+                })
+                .to_string();
+                Ok(HookExecution {
+                    exit_code: Some(0),
+                    output_json: serde_json::from_str(&stdout).ok(),
+                    stdout,
+                    stderr: String::new(),
+                    is_error: false,
+                })
+            })
+        }
+    }
+
     #[test]
     fn matcher_and_if_filter_follow_hook_rules() {
         assert!(matcher_matches(None, None));
@@ -1490,6 +1576,56 @@ mod tests {
         assert!(if_filter_matches(Some("run_command(git *)"), &request));
         assert!(!if_filter_matches(Some("run_command(cargo *)"), &request));
         assert!(!if_filter_matches(Some("malformed"), &request));
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_uses_injected_executor_without_provider_secret() {
+        let workspace = TempDir::new().expect("workspace");
+        let mut config = HookConfig::default();
+        config.hooks.insert(
+            "PreCompact".to_string(),
+            vec![HookMatcherGroup {
+                enabled: true,
+                matcher: Some("llm".to_string()),
+                hooks: vec![HookHandler {
+                    enabled: true,
+                    handler_type: HOOK_HANDLER_PROMPT.to_string(),
+                    if_filter: None,
+                    command: None,
+                    args: Vec::new(),
+                    shell: None,
+                    url: None,
+                    server_id: None,
+                    tool_name: None,
+                    prompt: Some("Evaluate compaction.".to_string()),
+                    timeout: Some(1_000),
+                    async_hook: false,
+                    async_rewake: false,
+                    status_message: None,
+                    input: None,
+                }],
+            }],
+        );
+        let runtime = HookRuntime::with_prompt_executor(
+            Arc::new(McpRegistry::default()),
+            Arc::new(StaticPromptExecutor),
+        );
+        let mut request = hook_request(
+            &config,
+            workspace.path(),
+            "PreCompact",
+            json!({ "kind": "llm" }),
+        );
+        request.match_value = Some("llm".to_string());
+
+        let summary = runtime.run_hooks(request).await;
+
+        assert_eq!(summary.decisions, vec![HookDecision::Allow]);
+        assert_eq!(
+            summary.additional_context,
+            vec!["broker context".to_string()]
+        );
+        assert!(summary.errors.is_empty());
     }
 
     #[test]

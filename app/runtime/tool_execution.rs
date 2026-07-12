@@ -414,7 +414,7 @@ async fn execute_tool_call(
         &global_hooks,
         api_audit_save_details,
         &global_config,
-        &provider_config,
+        Some(&provider_config),
         &web_search_settings,
         question_registry,
         question_event_tx,
@@ -491,7 +491,7 @@ pub(crate) async fn execute_tool(
     global_hooks: &HookConfig,
     api_audit_save_details: bool,
     global_config: &GlobalConfig,
-    provider_config: &ProviderConnectionConfig,
+    provider_config: Option<&ProviderConnectionConfig>,
     web_search_settings: &WebSearchSettings,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
@@ -532,7 +532,7 @@ pub(crate) async fn execute_tool(
             tool_call_id: Some(tool_call_id),
             model_id: Some(model_id),
             provider_id: Some(provider_id),
-            provider_config: Some(provider_config),
+            provider_config,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -582,7 +582,7 @@ pub(crate) async fn execute_tool(
                         tool_call_id: Some(tool_call_id),
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
-                        provider_config: Some(provider_config),
+                        provider_config,
                         llm_request_retry_count,
                         permission_mode: Some("ask"),
                         payload: json!({
@@ -628,7 +628,7 @@ pub(crate) async fn execute_tool(
                                 tool_call_id: Some(tool_call_id),
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
-                                provider_config: Some(provider_config),
+                                provider_config,
                                 llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
@@ -681,7 +681,7 @@ pub(crate) async fn execute_tool(
                                 tool_call_id: Some(tool_call_id),
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
-                                provider_config: Some(provider_config),
+                                provider_config,
                                 llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
@@ -2479,7 +2479,7 @@ async fn execute_ask_question(
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
     api_audit_save_details: bool,
-    provider_config: &ProviderConnectionConfig,
+    provider_config: Option<&ProviderConnectionConfig>,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
@@ -2534,7 +2534,7 @@ async fn execute_ask_question(
             tool_call_id: Some(tool_call_id),
             model_id: Some(model_id),
             provider_id: Some(provider_id),
-            provider_config: Some(provider_config),
+            provider_config,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -2575,7 +2575,7 @@ async fn execute_ask_question(
                         tool_call_id: Some(tool_call_id),
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
-                        provider_config: Some(provider_config),
+                        provider_config,
                         llm_request_retry_count,
                         permission_mode: None,
                         payload: json!({
@@ -2668,7 +2668,7 @@ async fn execute_ask_question(
             tool_call_id: Some(tool_call_id),
             model_id: Some(model_id),
             provider_id: Some(provider_id),
-            provider_config: Some(provider_config),
+            provider_config,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -3302,7 +3302,7 @@ mod tests {
             &HookConfig::default(),
             true,
             &GlobalConfig::first_run(workspace.path().to_path_buf()),
-            &ProviderConnectionConfig {
+            Some(&ProviderConnectionConfig {
                 kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
                     .expect("provider kind"),
                 base_url: None,
@@ -3310,7 +3310,7 @@ mod tests {
                 proxy_url: None,
                 request_overrides: Vec::new(),
                 model_redirects: Vec::new(),
-            },
+            }),
             &WebSearchSettings::default(),
             QuestionRegistry::default(),
             mpsc::unbounded_channel().0,

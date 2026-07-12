@@ -22,17 +22,33 @@ pub(crate) struct SidecarRuntimeConfigBundle {
     pub(crate) payload: SidecarRuntimeConfigPayload,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SidecarRuntimeAppSettings {
     #[serde(default)]
     pub(crate) runtime_tool_state_compression_enabled: bool,
     #[serde(default = "default_sidecar_app_language")]
     pub(crate) language: String,
+    #[serde(default = "default_sidecar_llm_request_retry_count")]
+    pub(crate) llm_request_retry_count: u32,
 }
 
 fn default_sidecar_app_language() -> String {
     "en".to_string()
+}
+
+fn default_sidecar_llm_request_retry_count() -> u32 {
+    foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT
+}
+
+impl Default for SidecarRuntimeAppSettings {
+    fn default() -> Self {
+        Self {
+            runtime_tool_state_compression_enabled: false,
+            language: default_sidecar_app_language(),
+            llm_request_retry_count: default_sidecar_llm_request_retry_count(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -43,6 +59,7 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) prompts: PromptSettings,
     pub(crate) models: Vec<ModelSettings>,
+    #[serde(default)]
     pub(crate) hooks: HookConfig,
     pub(crate) mcp: McpConfig,
     pub(crate) memory: MemorySettings,
@@ -103,6 +120,7 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
                 .app
                 .runtime_tool_state_compression_enabled,
             language: config.app.language.clone(),
+            llm_request_retry_count: config.app.llm_request_retry_count,
         },
         agent_definitions: config.agent_definitions.clone(),
         prompts: config.prompts.clone(),
@@ -406,6 +424,41 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_runtime_bundle_syncs_global_hooks_and_hashes_changes() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.hooks = serde_json::from_value(serde_json::json!({
+            "PreCompact": [{
+                "matcher": "llm",
+                "hooks": [{
+                    "type": "prompt",
+                    "prompt": "Return an allow decision."
+                }]
+            }]
+        }))
+        .expect("hook config");
+
+        let before = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        assert_eq!(before.payload.hooks, config.hooks);
+        let before_json = serde_json::to_string(&before).expect("bundle json");
+        assert!(before_json.contains("Return an allow decision."));
+
+        config
+            .hooks
+            .hooks
+            .get_mut("PreCompact")
+            .expect("PreCompact groups")[0]
+            .hooks[0]
+            .prompt = Some("Return a block decision.".to_string());
+        let after = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
+            .expect("updated runtime bundle");
+
+        assert_ne!(before.hash, after.hash);
+    }
+
+    #[test]
     fn sidecar_runtime_bundle_deserializes_legacy_skill_payload_defaults() {
         let profile = tempfile::tempdir().expect("profile");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -418,6 +471,7 @@ mod tests {
             .and_then(Value::as_object_mut)
             .expect("payload object");
         payload.remove("app");
+        payload.remove("hooks");
         payload.remove("globalSkills");
         payload.remove("disabledSkillKeys");
         payload.remove("disabledSkillLocationIds");
@@ -437,6 +491,11 @@ mod tests {
             .expect("legacy bundle parse");
 
         assert!(!parsed.payload.app.runtime_tool_state_compression_enabled);
+        assert_eq!(
+            parsed.payload.app.llm_request_retry_count,
+            foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT
+        );
+        assert_eq!(parsed.payload.hooks, HookConfig::default());
         assert!(parsed.payload.global_skills.is_empty());
         assert!(parsed.payload.disabled_skill_keys.is_empty());
         assert!(parsed.payload.disabled_skill_location_ids.is_empty());

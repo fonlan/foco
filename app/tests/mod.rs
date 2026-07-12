@@ -1337,14 +1337,14 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         &HookConfig::default(),
         true,
         &global_config,
-        &ProviderConnectionConfig {
+        Some(&ProviderConnectionConfig {
             kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
             request_overrides: Vec::new(),
             model_redirects: Vec::new(),
-        },
+        }),
         &WebSearchSettings::default(),
         QuestionRegistry::default(),
         mpsc::unbounded_channel().0,
