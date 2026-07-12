@@ -7601,7 +7601,7 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failing_claimed_task_retries_after_database_gate_contention() {
+async fn failing_claimed_task_uses_reserved_database_capacity() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-fail-retry-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let team_id = foco_agent::AgentTeamId::new("agent-team-fail-retry").expect("team id");
@@ -7673,13 +7673,13 @@ async fn failing_claimed_task_retries_after_database_gate_contention() {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(2300)).await;
+    tokio::time::timeout(Duration::from_secs(1), retry)
+        .await
+        .expect("critical database operation should use reserved capacity")
+        .expect("retry task joined")
+        .expect("failure persisted through reserved capacity");
     drop(gate_1);
     drop(gate_2);
-    retry
-        .await
-        .expect("retry task joined")
-        .expect("failure persisted after retry");
 
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
     assert_eq!(

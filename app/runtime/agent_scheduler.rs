@@ -179,7 +179,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
 pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
     for workspace in &config.workspaces {
-        let mut database = open_workspace_database(&workspace.path)?;
+        let mut database = open_workspace_database_critical(&workspace.path)?;
         for record in database
             .startup_agent_reconciliation()
             .map_err(ApiError::from_workspace_error)?
@@ -312,7 +312,7 @@ async fn schedule_runnable_tasks(
             let Ok(permit) = permits.clone().try_acquire_owned() else {
                 break 'scan;
             };
-            let database = open_workspace_database(&workspace.path)?;
+            let database = open_workspace_database_critical(&workspace.path)?;
             let completed_plan_tasks = database
                 .completed_running_plan_phase_agent_tasks()
                 .map_err(ApiError::from_workspace_error)?;
@@ -321,7 +321,7 @@ async fn schedule_runnable_tasks(
                 crate::plan_runtime::sync_plan_phase_for_agent_task(state, workspace, &task_id)
                     .await?;
             }
-            let mut database = open_workspace_database(&workspace.path)?;
+            let mut database = open_workspace_database_critical(&workspace.path)?;
             for recovered_task in database
                 .recover_interrupted_agent_wait_tasks(
                     RESTART_INTERRUPTION_REASON,
@@ -372,6 +372,7 @@ async fn schedule_runnable_tasks(
                 drop(permit);
                 continue;
             };
+            drop(database);
             if let Err(error) =
                 crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
                     &workspace.path,
@@ -382,6 +383,7 @@ async fn schedule_runnable_tasks(
                 drop(permit);
                 continue;
             }
+            let mut database = open_workspace_database_critical(&workspace.path)?;
             if let Err(error) = insert_agent_event(
                 &mut database,
                 &claimed.team_id,
@@ -391,6 +393,7 @@ async fn schedule_runnable_tasks(
                 Some(&attempt_id),
                 json!({}),
             ) {
+                drop(database);
                 let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
                 continue;
@@ -413,10 +416,12 @@ async fn schedule_runnable_tasks(
                     ),
                 }),
             ) {
+                drop(database);
                 let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
                 continue;
             }
+            drop(database);
             let state = state.clone();
             let workspace = workspace.clone();
             runs.spawn(async move {
@@ -505,7 +510,7 @@ async fn run_coordinator_task_inner(
     task_id: &AgentTaskId,
     attempt_id: &AgentAttemptId,
 ) -> Result<(), ApiError> {
-    let database = open_workspace_database(&workspace.path)?;
+    let database = open_workspace_database_critical(&workspace.path)?;
     let task = database
         .agent_task(task_id)
         .map_err(ApiError::from_workspace_error)?
@@ -625,7 +630,7 @@ async fn run_coordinator_task_inner(
         task_id: Some(task.id.clone()),
         attempt_id: Some(attempt_id.clone()),
     };
-    let database = open_workspace_database(&workspace.path)?;
+    let database = open_workspace_database_critical(&workspace.path)?;
     chat_context.plan_phase_provenance = database
         .plan_phase_attempt_for_agent_task(&task.id)
         .map_err(ApiError::from_workspace_error)?
@@ -658,7 +663,7 @@ async fn run_coordinator_task_inner(
     chat_context.session_upload_paths = Some(session_upload_paths);
 
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
-    let next_run_event_sequence = open_workspace_database(&workspace.path)?
+    let next_run_event_sequence = open_workspace_database_critical(&workspace.path)?
         .next_run_event_sequence(task.id.as_str())
         .map_err(ApiError::from_workspace_error)?;
     let registration = state.active_chat_runs.register(
@@ -784,7 +789,7 @@ fn apply_agent_prompt_layers(
 ) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
     validate_agent_definition_system_prompt(instance)?;
 
-    let database = open_workspace_database(workspace_path)?;
+    let database = open_workspace_database_critical(workspace_path)?;
     let context_snapshot = database
         .latest_agent_context_snapshot(&instance.id, instance.context_generation)
         .map_err(ApiError::from_workspace_error)?;
@@ -1548,7 +1553,7 @@ fn consume_agent_messages(
     if message_ids.is_empty() {
         return Ok(());
     }
-    let mut database = open_workspace_database(workspace_path)?;
+    let mut database = open_workspace_database_critical(workspace_path)?;
     for message_id in message_ids {
         let message = database
             .agent_message(message_id)
@@ -1588,7 +1593,7 @@ fn persist_agent_task_context(
     attempt_id: &AgentAttemptId,
     outcome: &AgentRunOutcome,
 ) -> Result<(), ApiError> {
-    let mut database = open_workspace_database(workspace_path)?;
+    let mut database = open_workspace_database_critical(workspace_path)?;
     let latest_snapshot = database
         .latest_agent_context_snapshot(&instance.id, instance.context_generation)
         .map_err(ApiError::from_workspace_error)?;
@@ -1764,7 +1769,7 @@ fn finish_claimed_task(
     attempt_id: &AgentAttemptId,
     outcome: AgentRunOutcome,
 ) -> Result<(), ApiError> {
-    let instance = open_workspace_database(workspace_path)?
+    let instance = open_workspace_database_critical(workspace_path)?
         .agent_instance(&task.owner_instance_id)
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| {
@@ -1817,7 +1822,7 @@ fn finish_claimed_task(
         .as_ref()
         .map(|value| agent_task_outcome_json(value, "error_json"))
         .transpose()?;
-    let mut database = open_workspace_database(workspace_path)?;
+    let mut database = open_workspace_database_critical(workspace_path)?;
     let updated = database
         .update_agent_task_state(AgentTaskStateUpdate {
             team_id: &task.team_id,
@@ -1858,6 +1863,7 @@ fn finish_claimed_task(
         Some(attempt_id),
         payload,
     )?;
+    drop(database);
     crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
         workspace_path,
         &task.id,
@@ -1905,7 +1911,7 @@ fn fail_claimed_task(
     task_id: &AgentTaskId,
     message: &str,
 ) -> Result<(), ApiError> {
-    let mut database = open_workspace_database(workspace_path)?;
+    let mut database = open_workspace_database_critical(workspace_path)?;
     let Some(task) = database
         .agent_task(task_id)
         .map_err(ApiError::from_workspace_error)?
@@ -1939,6 +1945,7 @@ fn fail_claimed_task(
     database
         .fail_plan_phase_run(&task.id, message)
         .map_err(ApiError::from_workspace_error)?;
+    drop(database);
     crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
         workspace_path,
         &task.id,
@@ -2886,7 +2893,7 @@ mod tests {
     #[test]
     fn agent_task_model_selection_uses_queued_user_message_override() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let mut database = open_workspace_database(workspace.path()).expect("database");
+        let mut database = open_workspace_database_critical(workspace.path()).expect("database");
         let team_id = foco_agent::AgentTeamId::new("agent-team-model-selection").expect("team id");
         let coordinator_id = foco_agent::AgentInstanceId::new("agent-instance-model-selection")
             .expect("instance id");
