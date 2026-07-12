@@ -27,8 +27,9 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    ContextBudget, build_memory_prompt_section, build_project_spec_prompt_section,
-    calculate_context_budget, estimate_text_tokens,
+    ContextBudget, PendingToolCall, RejectedToolCall, build_memory_prompt_section,
+    build_project_spec_prompt_section, calculate_context_budget, estimate_text_tokens,
+    plan_tool_execution, rejected_tool_batch,
 };
 use foco_mcp::McpRegistry;
 use foco_providers::{
@@ -7260,11 +7261,20 @@ fn remote_sidecar_capture_pending_tool_calls(
     tool_calls: &[NeutralToolCall],
 ) -> Vec<Value> {
     let allowed_tools = remote_sidecar_executable_tool_names();
+    let tool_calls = tool_calls
+        .iter()
+        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    remote_sidecar_capture_tool_calls(assistant_message_id, &tool_calls)
+}
+
+fn remote_sidecar_capture_tool_calls(
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+) -> Vec<Value> {
     let mut events = Vec::new();
     for tool_call in tool_calls {
-        if !allowed_tools.contains(tool_call.name.as_str()) {
-            continue;
-        }
         events.push(json!({
             "type": "toolCall",
             "assistantMessageId": assistant_message_id,
@@ -7278,9 +7288,6 @@ fn remote_sidecar_capture_pending_tool_calls(
             },
         }));
     }
-    if events.is_empty() {
-        return Vec::new();
-    }
     events
 }
 
@@ -7292,10 +7299,22 @@ fn remote_sidecar_record_pending_tool_calls(
     tool_calls: &[NeutralToolCall],
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
     let allowed_tools = remote_sidecar_executable_tool_names();
+    let tool_calls = tool_calls
+        .iter()
+        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    remote_sidecar_record_tool_calls(database, chat_id, run_id, assistant_message_id, &tool_calls)
+}
+
+fn remote_sidecar_record_tool_calls(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
     for tool_call in tool_calls {
-        if !allowed_tools.contains(tool_call.name.as_str()) {
-            continue;
-        }
         let input_json =
             serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "null".to_string());
         database.upsert_tool_call(foco_store::workspace::NewToolCall {
@@ -7311,6 +7330,68 @@ fn remote_sidecar_record_pending_tool_calls(
         })?;
     }
     Ok(())
+}
+
+fn remote_sidecar_pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingToolCall> {
+    tool_calls
+        .iter()
+        .map(|tool_call| PendingToolCall {
+            id: tool_call.call_id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+        })
+        .collect()
+}
+
+fn remote_sidecar_reject_tool_batch(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    assistant_message_id: &str,
+    tool_calls: &[NeutralToolCall],
+    rejections: &[RejectedToolCall],
+) -> (Vec<Value>, Vec<NeutralChatMessage>) {
+    let _ = remote_sidecar_record_tool_calls(
+        database,
+        chat_id,
+        run_id,
+        assistant_message_id,
+        tool_calls,
+    );
+    let mut events = remote_sidecar_capture_tool_calls(assistant_message_id, tool_calls);
+    let mut messages = Vec::with_capacity(rejections.len());
+    for rejection in rejections {
+        let tool_call = NeutralToolCall {
+            call_id: rejection.call_id.clone(),
+            name: rejection.tool_name.clone(),
+            arguments: rejection.arguments.clone(),
+            thought_signatures: None,
+        };
+        let output = json!({ "error": rejection.message });
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let _ = remote_sidecar_record_tool_result(
+            database, &tool_call, &output, true, &timestamp, &timestamp,
+        );
+        events.push(json!({
+            "type": "toolResult",
+            "assistantMessageId": assistant_message_id,
+            "toolCallId": rejection.call_id,
+            "output": output,
+            "isError": true,
+            "startedAt": timestamp,
+            "completedAt": timestamp,
+        }));
+        messages.push(NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(rejection.call_id.clone()),
+            tool_name: Some(rejection.tool_name.clone()),
+        });
+    }
+    (events, messages)
 }
 
 fn remote_sidecar_record_tool_result(
@@ -9046,8 +9127,6 @@ async fn remote_sidecar_chat_stream(
                         cleanup_guard.disarm();
                         break;
                     }
-                    let allowed_tools = remote_sidecar_executable_tool_names();
-
                     let mut next_messages = current_request.messages.clone();
                     let mut batch_messages = vec![NeutralChatMessage {
                         role: NeutralChatRole::Assistant,
@@ -9058,93 +9137,125 @@ async fn remote_sidecar_chat_stream(
                         tool_call_id: None,
                         tool_name: None,
                     }];
+                    let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
+                    let _tool_execution_plan = plan_tool_execution(&pending_tool_calls);
+                    let rejections = _tool_execution_plan
+                        .as_ref()
+                        .err()
+                        .and_then(|error| rejected_tool_batch(&pending_tool_calls, error));
 
-                    let runnable_tool_calls = tool_calls
-                        .iter()
-                        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let _ = remote_sidecar_record_pending_tool_calls(
-                        &mut database,
-                        &chat_id,
-                        &run_id,
-                        &assistant_message_id,
-                        &runnable_tool_calls,
-                    );
-                    let mut followup_sse_events = remote_sidecar_capture_pending_tool_calls(
-                        &assistant_message_id,
-                        &runnable_tool_calls,
-                    );
-                    for tool_call in &tool_calls {
-                        if !allowed_tools.contains(tool_call.name.as_str()) {
-                            let output = json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) });
-                            let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let followup_sse_events = if let Some(rejections) = rejections {
+                        let (events, messages) = remote_sidecar_reject_tool_batch(
+                            &mut database,
+                            &chat_id,
+                            &run_id,
+                            &assistant_message_id,
+                            &tool_calls,
+                            &rejections,
+                        );
+                        batch_messages.extend(messages);
+                        events
+                    } else {
+                        let allowed_tools = remote_sidecar_executable_tool_names();
+                        let runnable_tool_calls = tool_calls
+                            .iter()
+                            .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let _ = remote_sidecar_record_pending_tool_calls(
+                            &mut database,
+                            &chat_id,
+                            &run_id,
+                            &assistant_message_id,
+                            &runnable_tool_calls,
+                        );
+                        let mut events = remote_sidecar_capture_pending_tool_calls(
+                            &assistant_message_id,
+                            &runnable_tool_calls,
+                        );
+                        for tool_call in &tool_calls {
+                            if !allowed_tools.contains(tool_call.name.as_str()) {
+                                let output = json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) });
+                                let started_at =
+                                    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                                let completed_at =
+                                    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                                let _ = remote_sidecar_record_tool_result(
+                                    &mut database,
+                                    tool_call,
+                                    &output,
+                                    true,
+                                    &started_at,
+                                    &completed_at,
+                                );
+                                events.push(json!({
+                                    "type": "toolResult",
+                                    "assistantMessageId": assistant_message_id,
+                                    "toolCallId": tool_call.call_id,
+                                    "output": output,
+                                    "isError": true,
+                                    "startedAt": started_at,
+                                    "completedAt": completed_at,
+                                }));
+                                batch_messages.push(NeutralChatMessage {
+                                    role: NeutralChatRole::Tool,
+                                    content: serde_json::to_string(&output)
+                                        .unwrap_or_else(|_| "null".to_string()),
+                                    attachments: Vec::new(),
+                                    reasoning: None,
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: Some(tool_call.call_id.clone()),
+                                    tool_name: Some(tool_call.name.clone()),
+                                });
+                                continue;
+                            }
+                            let (
+                                output,
+                                is_error,
+                                started_at,
+                                completed_at,
+                                mut extra_events,
+                            ) = remote_sidecar_execute_tool_call(
+                                &stream_state,
+                                tool_call.clone(),
+                                &chat_id,
+                                &run_id,
+                                &assistant_message_id,
+                                &provider_id,
+                                &model_id,
+                            )
+                            .await;
                             let _ = remote_sidecar_record_tool_result(
                                 &mut database,
                                 tool_call,
                                 &output,
-                                true,
+                                is_error,
                                 &started_at,
                                 &completed_at,
                             );
-                            followup_sse_events.push(json!({
+                            events.append(&mut extra_events);
+                            events.push(json!({
                                 "type": "toolResult",
                                 "assistantMessageId": assistant_message_id,
                                 "toolCallId": tool_call.call_id,
                                 "output": output,
-                                "isError": true,
+                                "isError": is_error,
                                 "startedAt": started_at,
                                 "completedAt": completed_at,
                             }));
                             batch_messages.push(NeutralChatMessage {
                                 role: NeutralChatRole::Tool,
-                                content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
+                                content: serde_json::to_string(&output)
+                                    .unwrap_or_else(|_| "null".to_string()),
                                 attachments: Vec::new(),
                                 reasoning: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: Some(tool_call.call_id.clone()),
                                 tool_name: Some(tool_call.name.clone()),
                             });
-                            continue;
                         }
-                        let (output, is_error, started_at, completed_at, mut extra_events) = remote_sidecar_execute_tool_call(
-                            &stream_state,
-                            tool_call.clone(),
-                            &chat_id,
-                            &run_id,
-                            &assistant_message_id,
-                            &provider_id,
-                            &model_id,
-                        ).await;
-                        let _ = remote_sidecar_record_tool_result(
-                            &mut database,
-                            tool_call,
-                            &output,
-                            is_error,
-                            &started_at,
-                            &completed_at,
-                        );
-                        followup_sse_events.append(&mut extra_events);
-                        followup_sse_events.push(json!({
-                            "type": "toolResult",
-                            "assistantMessageId": assistant_message_id,
-                            "toolCallId": tool_call.call_id,
-                            "output": output,
-                            "isError": is_error,
-                            "startedAt": started_at,
-                            "completedAt": completed_at,
-                        }));
-                        batch_messages.push(NeutralChatMessage {
-                            role: NeutralChatRole::Tool,
-                            content: serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()),
-                            attachments: Vec::new(),
-                            reasoning: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: Some(tool_call.call_id.clone()),
-                            tool_name: Some(tool_call.name.clone()),
-                        });
-                    }
+                        events
+                    };
                     runtime_tool_state
                         .append_runtime_tool_batch(&mut next_messages, batch_messages);
                     tool_loop_guard.record_executed_round();
@@ -15347,6 +15458,92 @@ mod tests {
                 "unexpected tool schema leaked: {unexpected}"
             );
         }
+    }
+
+    #[test]
+    fn remote_sidecar_recoverable_conflict_rejects_entire_batch_before_execution() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let conflict_path = workspace.path().join("conflict.txt");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
+
+        let tool_calls = vec![
+            NeutralToolCall {
+                call_id: "call-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "conflict.txt", "content": "first" }),
+                thought_signatures: None,
+            },
+            NeutralToolCall {
+                call_id: "call-edit".to_string(),
+                name: "edit_file".to_string(),
+                arguments: json!({
+                    "path": "conflict.txt",
+                    "oldStr": "first",
+                    "newStr": "second",
+                    "replaceAll": false
+                }),
+                thought_signatures: None,
+            },
+        ];
+        let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
+        let planning_error =
+            plan_tool_execution(&pending_tool_calls).expect_err("mixed write methods conflict");
+        let rejections = rejected_tool_batch(&pending_tool_calls, &planning_error)
+            .expect("recoverable batch rejection");
+
+        let (events, messages) = remote_sidecar_reject_tool_batch(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "msg-assistant-1",
+            &tool_calls,
+            &rejections,
+        );
+
+        assert!(
+            !conflict_path.exists(),
+            "rejected batch must have no file side effect"
+        );
+        assert_eq!(events.len(), 4);
+        assert!(events[..2].iter().all(|event| event["type"] == "toolCall"));
+        assert!(events[2..].iter().all(|event| {
+            event["type"] == "toolResult"
+                && event["isError"] == true
+                && event["output"]["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("entire tool batch was rejected"))
+        }));
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| {
+            message.role == NeutralChatRole::Tool
+                && message.content.contains("entire tool batch was rejected")
+        }));
+
+        let stored = database
+            .tool_calls_for_message("msg-assistant-1")
+            .expect("stored tool calls");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|tool_call| {
+            tool_call.status == "error"
+                && tool_call
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.is_error)
+        }));
     }
 
     #[tokio::test]
