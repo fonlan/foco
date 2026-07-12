@@ -3825,6 +3825,46 @@ describe("app-panels-stats verification surfaces", () => {
     expect(requestBodyBlock).not.toBeNull();
     const requestBodyViewer = requestBodyBlock as HTMLElement;
     expect(requestBodyViewer).toHaveClass("audit-json-block");
+
+    const requestHeadersCode = requestHeadersViewer.querySelector(
+      ".audit-json-code",
+    );
+    const responseHeadersCode = responseHeadersViewer.querySelector(
+      ".audit-json-code",
+    );
+    const requestBodyCode = requestBodyViewer.querySelector(".audit-json-code");
+    const responseBodyCode = responseBodyViewer.querySelector(
+      ".audit-json-code",
+    );
+    for (const codeViewer of [
+      requestHeadersCode,
+      responseHeadersCode,
+      requestBodyCode,
+      responseBodyCode,
+    ]) {
+      expect(codeViewer).not.toBeNull();
+      expect(codeViewer).toHaveClass("audit-json-code", "panel-scroll");
+    }
+    expect(requestHeadersCode).toHaveAttribute(
+      "data-audit-json-size",
+      "headers",
+    );
+    expect(responseHeadersCode).toHaveAttribute(
+      "data-audit-json-size",
+      "headers",
+    );
+    expect(requestBodyCode).toHaveAttribute("data-audit-json-size", "body");
+    expect(responseBodyCode).toHaveAttribute("data-audit-json-size", "body");
+    expect(requestHeadersCode?.getAttribute("data-audit-json-size")).toBe(
+      responseHeadersCode?.getAttribute("data-audit-json-size"),
+    );
+    expect(requestBodyCode?.getAttribute("data-audit-json-size")).toBe(
+      responseBodyCode?.getAttribute("data-audit-json-size"),
+    );
+    expect(requestHeadersCode?.getAttribute("data-audit-json-size")).not.toBe(
+      requestBodyCode?.getAttribute("data-audit-json-size"),
+    );
+
     expect(within(requestBodyViewer).getByText('"input"')).toHaveClass(
       "audit-json-token-key",
     );

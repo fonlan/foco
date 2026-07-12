@@ -1115,12 +1115,14 @@ function ProviderRequestDetail({
         copied={false}
         label={t("Request headers")}
         onCopy={() => onCopy(auditJsonText(requestBody.headers))}
+        size="headers"
         value={requestBody.headers}
       />
       <AuditJsonBlock
         copied={copied}
         label={t("Request body")}
         onCopy={() => onCopy(requestBody.body ?? "")}
+        size="body"
         value={bodyValue}
       />
     </AuditDetailCard>
@@ -1212,6 +1214,7 @@ function ProviderResponseDetail({
             onCopy={() =>
               onCopy(auditJsonText(responseBody.http?.headers ?? null))
             }
+            size="headers"
             value={responseBody.http.headers}
           />
         </>
@@ -1220,6 +1223,7 @@ function ProviderResponseDetail({
         copied={copied}
         label={t("Response body")}
         onCopy={() => onCopy(auditJsonText(responseBody))}
+        size="body"
         value={responseBody}
       />
     </AuditDetailCard>
@@ -1298,15 +1302,19 @@ function AuditMeta({ label, value }: { label: string; value: string }) {
   );
 }
 
+type AuditJsonBlockSize = "auto" | "body" | "headers";
+
 function AuditJsonBlock({
   copied,
   label,
   onCopy,
+  size = "auto",
   value,
 }: {
   copied: boolean;
   label: string;
   onCopy: () => void;
+  size?: AuditJsonBlockSize;
   value: JsonValue | null;
 }) {
   const { t } = useI18n();
@@ -1436,7 +1444,11 @@ function AuditJsonBlock({
           </button>
         </div>
       </div>
-      <div className="audit-json-code panel-scroll" ref={codeScrollerRef}>
+      <div
+        className="audit-json-code panel-scroll"
+        data-audit-json-size={size}
+        ref={codeScrollerRef}
+      >
         <code>
           <JsonTreeNode
             collapsedPaths={collapsedPaths}

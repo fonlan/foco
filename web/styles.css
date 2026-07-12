@@ -914,6 +914,14 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.audit-json-code[data-audit-json-size="headers"] {
+  height: clamp(12rem, 24vh, 16rem);
+}
+
+.audit-json-code[data-audit-json-size="body"] {
+  height: clamp(18rem, 38vh, 26rem);
+}
+
 .audit-json-code.panel-scroll {
   overscroll-behavior-x: contain;
   overscroll-behavior-y: auto;
