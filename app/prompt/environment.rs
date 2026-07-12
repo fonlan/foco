@@ -18,7 +18,7 @@ pub(crate) fn environment_context_message(
     let wsl = is_wsl_environment();
 
     Ok(neutral_text_message(
-        NeutralChatRole::User,
+        NeutralChatRole::Developer,
         format!(
             "## Environment Context\n\n{}",
             markdown_code_block(

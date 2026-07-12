@@ -187,7 +187,7 @@ fn prompt_file_message(
     }
 
     Ok(Some(neutral_text_message(
-        NeutralChatRole::User,
+        NeutralChatRole::Developer,
         format!(
             "## Prompt File Context\n\nSource: {prefix}\n\nPath: `{}`\n\n{}",
             path.display(),
@@ -203,7 +203,7 @@ fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
     }
 
     Some(neutral_text_message(
-        NeutralChatRole::User,
+        NeutralChatRole::Developer,
         format!(
             "## Extra Prompt Context\n\nSource: {EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{}",
             markdown_code_block("markdown", content)

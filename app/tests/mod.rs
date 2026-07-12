@@ -3925,7 +3925,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
     .expect("extra prompt message");
 
     assert_eq!(agents_messages.len(), 1);
-    assert_eq!(agents_messages[0].role, NeutralChatRole::User);
+    assert_eq!(agents_messages[0].role, NeutralChatRole::Developer);
     assert!(
         agents_messages[0]
             .content
@@ -3938,7 +3938,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .contains("```markdown\nWorkspace instructions.")
     );
     assert_eq!(prompt_messages.len(), 1);
-    assert_eq!(prompt_messages[0].role, NeutralChatRole::User);
+    assert_eq!(prompt_messages[0].role, NeutralChatRole::Developer);
     assert!(
         prompt_messages[0]
             .content
@@ -3954,7 +3954,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .content
             .contains("```markdown\nConfigured prompt instructions.")
     );
-    assert_eq!(extra_prompt_message.role, NeutralChatRole::User);
+    assert_eq!(extra_prompt_message.role, NeutralChatRole::Developer);
     assert!(
         extra_prompt_message
             .content
@@ -16611,7 +16611,7 @@ Search memory before repo work.
     assert!(
         prompt_messages
             .iter()
-            .all(|message| message.role == NeutralChatRole::User)
+            .all(|message| message.role == NeutralChatRole::Developer)
     );
     assert!(
         prompt_messages[0]
@@ -16668,7 +16668,7 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(environment_messages.len(), 1);
-    assert_eq!(environment_messages[0].role, NeutralChatRole::User);
+    assert_eq!(environment_messages[0].role, NeutralChatRole::Developer);
     assert!(environment_messages[0].content.contains(&format!(
         "\"workspaceDirectory\": \"{}\"",
         workspace_dir.display()
@@ -16708,7 +16708,7 @@ Search memory before repo work.
         );
         assert!(!context_injections[0].messages_json.contains("## Skills"));
         assert!(
-            !context_injections[0]
+            context_injections[0]
                 .messages_json
                 .contains("\"role\":\"developer\"")
         );
@@ -16779,7 +16779,7 @@ Updated full instructions.
     assert!(
         existing_prompt_messages
             .iter()
-            .all(|message| message.role == NeutralChatRole::User)
+            .all(|message| message.role == NeutralChatRole::Developer)
     );
     assert!(
         existing_prompt_messages[0]
@@ -18091,7 +18091,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
     );
     assert_eq!(
         first_context.provider_request.messages[first_spec_index].role,
-        NeutralChatRole::User
+        NeutralChatRole::Developer
     );
     assert_eq!(
         first_context.message_context_sources[first_spec_index],

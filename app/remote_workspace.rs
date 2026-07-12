@@ -8863,7 +8863,7 @@ fn remote_project_spec_message(
         return None;
     }
     Some(neutral_text_message(
-        NeutralChatRole::User,
+        NeutralChatRole::Developer,
         format!(
             "## Project Spec Context\n\nSource: Project Spec snapshot for this chat:\n\nRevision: {revision}\n\n{}",
             markdown_code_block("markdown", content_markdown)
@@ -17110,18 +17110,26 @@ mod tests {
                 "unexpected tool schema leaked: {unexpected}"
             );
         }
-        assert!(
-            request
-                .messages
-                .iter()
-                .any(|message| message.content.contains("## Environment Context"))
-        );
+        assert!(request.messages.iter().any(|message| {
+            message.role == NeutralChatRole::Developer
+                && message.content.contains("## Environment Context")
+        }));
         assert!(
             request
                 .messages
                 .iter()
                 .any(|message| message.role == NeutralChatRole::User && message.content == "hello")
         );
+    }
+
+    #[test]
+    fn remote_project_spec_context_uses_developer_role() {
+        let message = remote_project_spec_message(7, "# Project Spec\n\nRemote context")
+            .expect("project spec message");
+
+        assert_eq!(message.role, NeutralChatRole::Developer);
+        assert!(message.content.contains("## Project Spec Context"));
+        assert!(message.content.contains("Revision: 7"));
     }
 
     #[test]
