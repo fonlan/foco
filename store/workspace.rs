@@ -17,7 +17,7 @@ use rusqlite::{
     types::Value as SqlValue,
 };
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::WorkspaceConfig;
 use crate::memory::{
@@ -4750,21 +4750,54 @@ impl WorkspaceDatabase {
                     message: format!("chat was not found: {chat_id}"),
                 })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
-        if let Some(queued_run) = chat_metadata.get_mut(QUEUED_CHAT_METADATA_KEY) {
-            let Some(queued_run_object) = queued_run.as_object_mut() else {
-                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: "chat metadata.queuedRun must be an object".to_string(),
-                });
-            };
-            queued_run_object.insert("status".to_string(), Value::String("running".to_string()));
-            queued_run_object.insert(
-                "assistantMessageId".to_string(),
-                Value::String(assistant_message_id.to_string()),
-            );
-            queued_run_object.insert(
-                "assistantSequence".to_string(),
-                Value::Number(assistant_sequence.into()),
-            );
+        // Rebuild when missing: list/message APIs may clear queuedRun before the Agent task
+        // is visible (new chat insert has queuedRun before team/task exists).
+        match chat_metadata.get_mut(QUEUED_CHAT_METADATA_KEY) {
+            Some(queued_run) => {
+                let Some(queued_run_object) = queued_run.as_object_mut() else {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "chat metadata.queuedRun must be an object".to_string(),
+                    });
+                };
+                let existing_user_message_id = queued_run_object
+                    .get("userMessageId")
+                    .or_else(|| queued_run_object.get("user_message_id"))
+                    .and_then(Value::as_str);
+                if let Some(existing_user_message_id) = existing_user_message_id
+                    && existing_user_message_id != user_message_id
+                {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!(
+                            "chat metadata.queuedRun.userMessageId '{existing_user_message_id}' does not match '{user_message_id}'"
+                        ),
+                    });
+                }
+                queued_run_object
+                    .insert("status".to_string(), Value::String("running".to_string()));
+                queued_run_object.insert(
+                    "userMessageId".to_string(),
+                    Value::String(user_message_id.to_string()),
+                );
+                queued_run_object.insert(
+                    "assistantMessageId".to_string(),
+                    Value::String(assistant_message_id.to_string()),
+                );
+                queued_run_object.insert(
+                    "assistantSequence".to_string(),
+                    Value::Number(assistant_sequence.into()),
+                );
+            }
+            None => {
+                chat_metadata.insert(
+                    QUEUED_CHAT_METADATA_KEY.to_string(),
+                    json!({
+                        "status": "running",
+                        "userMessageId": user_message_id,
+                        "assistantMessageId": assistant_message_id,
+                        "assistantSequence": assistant_sequence,
+                    }),
+                );
+            }
         }
         let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
             WorkspaceDatabaseError::InvalidMessageMetadata {
@@ -4779,21 +4812,34 @@ impl WorkspaceDatabase {
         })?;
         let mut message_metadata =
             parse_json_object(&message.metadata_json, "user message metadata")?;
-        if let Some(queued_run) = message_metadata.get_mut(QUEUED_MESSAGE_METADATA_KEY) {
-            let Some(queued_run_object) = queued_run.as_object_mut() else {
-                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: "message metadata.queuedRun must be an object".to_string(),
-                });
-            };
-            queued_run_object.insert("status".to_string(), Value::String("running".to_string()));
-            queued_run_object.insert(
-                "assistantMessageId".to_string(),
-                Value::String(assistant_message_id.to_string()),
-            );
-            queued_run_object.insert(
-                "assistantSequence".to_string(),
-                Value::Number(assistant_sequence.into()),
-            );
+        match message_metadata.get_mut(QUEUED_MESSAGE_METADATA_KEY) {
+            Some(queued_run) => {
+                let Some(queued_run_object) = queued_run.as_object_mut() else {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "message metadata.queuedRun must be an object".to_string(),
+                    });
+                };
+                queued_run_object
+                    .insert("status".to_string(), Value::String("running".to_string()));
+                queued_run_object.insert(
+                    "assistantMessageId".to_string(),
+                    Value::String(assistant_message_id.to_string()),
+                );
+                queued_run_object.insert(
+                    "assistantSequence".to_string(),
+                    Value::Number(assistant_sequence.into()),
+                );
+            }
+            None => {
+                message_metadata.insert(
+                    QUEUED_MESSAGE_METADATA_KEY.to_string(),
+                    json!({
+                        "status": "running",
+                        "assistantMessageId": assistant_message_id,
+                        "assistantSequence": assistant_sequence,
+                    }),
+                );
+            }
         }
         let message_metadata_json = serde_json::to_string(&message_metadata).map_err(|source| {
             WorkspaceDatabaseError::InvalidMessageMetadata {

@@ -10799,6 +10799,92 @@ fn queued_run_stays_visible_while_coordinator_task_is_waiting() {
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[test]
+fn mark_chat_queued_run_started_recovers_after_stale_queue_cleanup() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-rebuild-queued-run-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let chat_id = "chat-rebuild-queued-run";
+    let user_message_id = "user-rebuild-queued-run";
+    let assistant_message_id = "assistant-rebuild-queued-run";
+    let chat_metadata_json = format!(
+        r#"{{"source":"plan_phase","queuedRun":{{"status":"queued","userMessageId":"{user_message_id}","assistantMessageId":"{assistant_message_id}","assistantSequence":1,"modelId":"gpt-5.4","providerId":"openai-responses","content":"Hello"}}}}"#
+    );
+    let message_metadata_json = format!(
+        r#"{{"source":"plan_phase","queuedRun":{{"status":"queued","assistantMessageId":"{assistant_message_id}","assistantSequence":1,"modelId":"gpt-5.4","providerId":"openai-responses"}}}}"#
+    );
+
+    database
+        .insert_chat_with_metadata(chat_id, "Rebuild queued run", &chat_metadata_json)
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: user_message_id,
+            chat_id,
+            role: "user",
+            content: "Hello",
+            sequence: 0,
+            metadata_json: Some(&message_metadata_json),
+        })
+        .expect("message insert");
+
+    // Simulate the new-chat race: UI list/message load clears queuedRun before the
+    // Agent team/task exists, so the run identity is gone when the coordinator starts.
+    let chat = database.chat(chat_id).expect("chat read").expect("chat");
+    let summary =
+        chat_summary(&mut database, chat, CodeChangeStats::default(), None).expect("chat summary");
+    assert!(summary.queued_run.is_none());
+
+    database
+        .mark_chat_queued_run_started(chat_id, user_message_id, assistant_message_id, 1)
+        .expect("rebuild queued run on start");
+
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Hello".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.chat_id = chat_id.to_string();
+    context.queued_user_message_id = Some(user_message_id.to_string());
+    context.assistant_message_id = assistant_message_id.to_string();
+    context.assistant_sequence = 1;
+    context.agent_primary_chat_output = true;
+
+    persist_running_llm_request(
+        &context,
+        "request-rebuild-queued-run",
+        "2026-07-12T03:19:20Z",
+        Some("{}"),
+        &[],
+    )
+    .expect("running audit should accept rebuilt queued run");
+
+    let chat_metadata = parse_json_value(
+        &database
+            .chat(chat_id)
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+        "chat metadata",
+    )
+    .expect("chat metadata json");
+    assert_eq!(chat_metadata["source"], "plan_phase");
+    assert_eq!(chat_metadata["queuedRun"]["status"], "running");
+    assert_eq!(chat_metadata["queuedRun"]["userMessageId"], user_message_id);
+    assert_eq!(
+        chat_metadata["queuedRun"]["assistantMessageId"],
+        assistant_message_id
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 #[tokio::test]
 async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-waiting-team-stream-test"));

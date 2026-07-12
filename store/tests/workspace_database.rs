@@ -4217,6 +4217,78 @@ fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
 }
 
 #[test]
+fn mark_chat_queued_run_started_rebuilds_missing_queued_run_metadata() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat_with_metadata(
+            "chat-missing-queued",
+            "Missing queued run",
+            r#"{"source":"plan_phase","planId":"plan-1","phaseId":"phase-1"}"#,
+        )
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-missing-queued",
+            chat_id: "chat-missing-queued",
+            role: "user",
+            content: "implement phase",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"source":"plan_phase","modelId":"model","providerId":"provider"}"#,
+            ),
+        })
+        .expect("message insert");
+
+    database
+        .mark_chat_queued_run_started(
+            "chat-missing-queued",
+            "user-missing-queued",
+            "assistant-missing-queued",
+            1,
+        )
+        .expect("rebuild missing queued run");
+
+    let chat_metadata: Value = serde_json::from_str(
+        &database
+            .chat("chat-missing-queued")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    let message_metadata: Value = serde_json::from_str(
+        &database
+            .message("user-missing-queued")
+            .expect("message read")
+            .expect("message")
+            .metadata_json,
+    )
+    .expect("message metadata json");
+
+    assert_eq!(chat_metadata["source"], "plan_phase");
+    assert_eq!(chat_metadata["queuedRun"]["status"], "running");
+    assert_eq!(
+        chat_metadata["queuedRun"]["userMessageId"],
+        "user-missing-queued"
+    );
+    assert_eq!(
+        chat_metadata["queuedRun"]["assistantMessageId"],
+        "assistant-missing-queued"
+    );
+    assert_eq!(chat_metadata["queuedRun"]["assistantSequence"], 1);
+    assert_eq!(message_metadata["source"], "plan_phase");
+    assert_eq!(message_metadata["queuedRun"]["status"], "running");
+    assert_eq!(
+        message_metadata["queuedRun"]["assistantMessageId"],
+        "assistant-missing-queued"
+    );
+    assert_eq!(message_metadata["queuedRun"]["assistantSequence"], 1);
+}
+
+#[test]
 fn set_chat_queued_run_adds_run_to_existing_chat_metadata() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
