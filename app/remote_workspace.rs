@@ -28,7 +28,7 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
     ContextBudget, build_memory_prompt_section, build_project_spec_prompt_section,
-    calculate_context_budget,
+    calculate_context_budget, estimate_text_tokens,
 };
 use foco_mcp::McpRegistry;
 use foco_providers::{
@@ -69,7 +69,8 @@ use tungstenite::client::IntoClientRequest;
 use std::os::windows::process::CommandExt;
 
 use crate::{
-    ApiError, AppResult, AppState, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
+    ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
+    CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_pending_tool_state_messages, config_snapshot,
     estimate_tool_schema_tokens,
     hooks::HookRuntime,
@@ -83,9 +84,13 @@ use crate::{
     },
     markdown_code_block, neutral_text_message, neutral_tool_definition,
     prompt::{
-        active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-        compress_all_runtime_tool_state_messages, compress_runtime_tool_state_messages_if_needed,
-        configured_extra_prompt_message, environment_context_message, pack_neutral_messages,
+        LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
+        builtin_tool_definitions_for_runtime, compress_all_runtime_tool_state_messages,
+        compress_runtime_tool_state_messages_if_needed, configured_extra_prompt_message,
+        context_compression_summary_has_benefit, context_message_groups, context_token_breakdown,
+        context_usage_segments, context_usage_segments_total, environment_context_message,
+        insert_context_compression_snapshot_record, llm_context_compression_trigger_tokens,
+        pack_neutral_messages, plan_llm_context_compression, prepare_context_compression_snapshot,
     },
     runtime::{
         ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
@@ -106,7 +111,7 @@ use crate::{
         prepare_remote_workspace_spec_generation_job,
         recover_stale_running_workspace_spec_job_for_path,
     },
-    unique_id, workspace_by_id,
+    unique_id, utc_timestamp, workspace_by_id,
 };
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
@@ -120,6 +125,10 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Broker `requestKind` values accepted for main-process LLM audit rows.
+const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] = &["chat completion", "contextCompression"];
+const BROKER_DEFAULT_LLM_REQUEST_KIND: &str = "chat completion";
+const BROKER_CONTEXT_COMPRESSION_REQUEST_KIND: &str = "contextCompression";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -163,60 +172,56 @@ struct RemoteSidecarRuntimeToolState {
     runtime_tool_state_compression_count: usize,
     context_budget: ContextBudget,
     compression_enabled: bool,
+    /// Active (non-superseded) compression snapshots loaded from / written to the remote workspace DB.
+    compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
+}
+
+/// Lightweight remote prompt context: messages plus durable source metadata for snapshot replay.
+struct RemotePreparedChatContext {
+    provider_request: NeutralChatRequest,
+    message_source_sequences: Vec<Option<i64>>,
+    message_context_sources: Vec<PromptContextSource>,
+    active_tool_start_index: usize,
+    compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
+    context_budget: ContextBudget,
+    compression_enabled: bool,
+}
+
+struct RemoteSidecarHistoryMessages {
+    messages: Vec<NeutralChatMessage>,
+    /// Database `message.sequence` for each expanded neutral message (assistant tool results share it).
+    sequences: Vec<i64>,
 }
 
 impl RemoteSidecarRuntimeToolState {
+    fn from_prepared(prepared: &RemotePreparedChatContext) -> Self {
+        Self {
+            message_source_sequences: prepared.message_source_sequences.clone(),
+            message_context_sources: prepared.message_context_sources.clone(),
+            active_tool_start_index: prepared.active_tool_start_index,
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: prepared.context_budget.clone(),
+            compression_enabled: prepared.compression_enabled,
+            compression_snapshots: prepared.compression_snapshots.clone(),
+        }
+    }
+
     fn for_request(
         state: &RemoteSidecarState,
         request: &NeutralChatRequest,
     ) -> Result<Self, ApiError> {
-        let bundle = state
-            .runtime_config
-            .lock()
-            .ok()
-            .and_then(|config| config.clone());
-        let compression_enabled = bundle
-            .as_ref()
-            .is_some_and(|bundle| bundle.payload.app.runtime_tool_state_compression_enabled);
-        let context_budget = bundle
-            .as_ref()
-            .and_then(|bundle| {
-                bundle
-                    .payload
-                    .models
-                    .iter()
-                    .find(|model| model.id == request.model_id)
-            })
-            .and_then(|model| model.limits.as_ref())
-            .map(|limits| {
-                calculate_context_budget(
-                    limits.context_window,
-                    limits.max_output_tokens,
-                    0,
-                    estimate_tool_schema_tokens(&request.tools),
-                )
-                .map_err(|source| ApiError::bad_request(source.to_string()))
-            })
-            .transpose()?
-            .unwrap_or(ContextBudget {
-                context_window: u64::MAX,
-                max_output_tokens: 0,
-                system_prompt_tokens: 0,
-                tool_schema_tokens: 0,
-                safety_tokens: 0,
-                available_message_tokens: u64::MAX,
-            });
-        let message_context_sources = remote_sidecar_initial_context_sources(&request.messages);
-
-        Ok(Self {
+        // Legacy path for tests that build a bare NeutralChatRequest without DB provenance.
+        let prepared = RemotePreparedChatContext {
+            provider_request: request.clone(),
             message_source_sequences: vec![None; request.messages.len()],
-            message_context_sources,
+            message_context_sources: remote_sidecar_initial_context_sources(&request.messages),
             active_tool_start_index: request.messages.len(),
-            next_runtime_tool_batch_index: 0,
-            runtime_tool_state_compression_count: 0,
-            context_budget,
-            compression_enabled,
-        })
+            compression_snapshots: Vec::new(),
+            context_budget: remote_sidecar_context_budget_for_request(state, request)?,
+            compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
+        };
+        Ok(Self::from_prepared(&prepared))
     }
 
     fn append_runtime_tool_batch(
@@ -267,6 +272,328 @@ impl RemoteSidecarRuntimeToolState {
         )
     }
 
+    /// Ensure runtime tool-state + optional LLM compression, then pack for the next broker request.
+    /// Returns packed messages and compression events for the stream to emit before broker dispatch.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_compression_then_pack(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        state: &RemoteSidecarState,
+        run_stream: &RemoteActiveRunStream,
+        database: &mut WorkspaceDatabase,
+        workspace_id: &str,
+        chat_id: &str,
+        run_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<
+        (
+            Vec<NeutralChatMessage>,
+            Vec<RemoteSidecarContextCompressionEventDetail>,
+        ),
+        ApiError,
+    > {
+        let events = self
+            .ensure_context_compression(
+                messages,
+                state,
+                run_stream,
+                database,
+                workspace_id,
+                chat_id,
+                run_id,
+                user_message_id,
+                assistant_message_id,
+                provider_id,
+                model_id,
+            )
+            .await?;
+        let packed = pack_neutral_messages(
+            messages.clone(),
+            &self.message_source_sequences,
+            &self.message_context_sources,
+            &self.context_budget,
+            self.active_tool_start_index,
+        )
+        .map_err(remote_sidecar_context_overflow_error)?;
+        Ok((packed, events))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_context_compression(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        state: &RemoteSidecarState,
+        run_stream: &RemoteActiveRunStream,
+        database: &mut WorkspaceDatabase,
+        workspace_id: &str,
+        chat_id: &str,
+        run_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Vec<RemoteSidecarContextCompressionEventDetail>, ApiError> {
+        let mut events = Vec::new();
+        let mut runtime_tool_state_compressed = self.compress_runtime_tool_state_with_events(
+            messages,
+            false,
+            provider_id,
+            model_id,
+            &mut events,
+        )?;
+
+        let mut message_groups = context_message_groups(
+            messages,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+            self.active_tool_start_index,
+        )?;
+        let segments = context_usage_segments(&self.context_budget, &message_groups);
+        let total_used_context_tokens = context_usage_segments_total(&segments);
+        if total_used_context_tokens
+            >= llm_context_compression_trigger_tokens(self.context_budget.context_window)
+        {
+            let applied = self
+                .ensure_llm_context_compression(
+                    messages,
+                    &message_groups,
+                    &mut events,
+                    LlmContextCompressionMode::Normal,
+                    state,
+                    run_stream,
+                    database,
+                    workspace_id,
+                    chat_id,
+                    run_id,
+                    user_message_id,
+                    assistant_message_id,
+                    provider_id,
+                    model_id,
+                )
+                .await?;
+            if applied {
+                return Ok(events);
+            }
+        }
+
+        let mut breakdown = context_token_breakdown(&message_groups);
+        if breakdown.required_tokens > self.context_budget.available_message_tokens {
+            if !runtime_tool_state_compressed {
+                runtime_tool_state_compressed |= self.compress_runtime_tool_state_with_events(
+                    messages,
+                    true,
+                    provider_id,
+                    model_id,
+                    &mut events,
+                )?;
+            }
+            message_groups = context_message_groups(
+                messages,
+                &self.message_source_sequences,
+                &self.message_context_sources,
+                self.active_tool_start_index,
+            )?;
+            breakdown = context_token_breakdown(&message_groups);
+            if breakdown.required_tokens > self.context_budget.available_message_tokens {
+                let _ = self
+                    .ensure_llm_context_compression(
+                        messages,
+                        &message_groups,
+                        &mut events,
+                        LlmContextCompressionMode::RequiredOverflow,
+                        state,
+                        run_stream,
+                        database,
+                        workspace_id,
+                        chat_id,
+                        run_id,
+                        user_message_id,
+                        assistant_message_id,
+                        provider_id,
+                        model_id,
+                    )
+                    .await?;
+            }
+        }
+
+        let _ = runtime_tool_state_compressed;
+        Ok(events)
+    }
+
+    fn compress_runtime_tool_state_with_events(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        force: bool,
+        provider_id: &str,
+        model_id: &str,
+        events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
+    ) -> Result<bool, ApiError> {
+        let compression_started_at = utc_timestamp();
+        let compressed = self.compress_if_needed(messages, force)?;
+        if !compressed {
+            return Ok(false);
+        }
+        events.push(RemoteSidecarContextCompressionEventDetail {
+            status: "start".to_string(),
+            kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+            snapshot_id: None,
+            original_token_count: None,
+            summary_token_count: None,
+            started_at: Some(compression_started_at.clone()),
+            completed_at: None,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+        });
+        events.push(RemoteSidecarContextCompressionEventDetail {
+            status: "completed".to_string(),
+            kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+            snapshot_id: None,
+            original_token_count: None,
+            summary_token_count: None,
+            started_at: Some(compression_started_at),
+            completed_at: Some(utc_timestamp()),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+        });
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_llm_context_compression(
+        &mut self,
+        messages: &mut Vec<NeutralChatMessage>,
+        message_groups: &[crate::ContextMessageGroup],
+        events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
+        mode: LlmContextCompressionMode,
+        state: &RemoteSidecarState,
+        run_stream: &RemoteActiveRunStream,
+        database: &mut WorkspaceDatabase,
+        workspace_id: &str,
+        chat_id: &str,
+        run_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<bool, ApiError> {
+        let Some(plan) = plan_llm_context_compression(
+            messages,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+            &self.compression_snapshots,
+            message_groups,
+            self.context_budget.available_message_tokens,
+            mode,
+        )?
+        else {
+            return Ok(false);
+        };
+        let covered_indices = plan.covered_message_indices;
+        let original_tokens = plan.original_tokens;
+        let source_summary = plan.source_summary;
+        let covered_snapshot_ids = plan.covered_snapshot_ids;
+        let covered_sequences = plan.covered_sequences;
+        let compression_started_at = utc_timestamp();
+        events.push(RemoteSidecarContextCompressionEventDetail {
+            status: "start".to_string(),
+            kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+            snapshot_id: None,
+            original_token_count: Some(i64::try_from(original_tokens).map_err(|_| {
+                ApiError::internal("context compression original token count exceeds i64")
+            })?),
+            summary_token_count: None,
+            started_at: Some(compression_started_at.clone()),
+            completed_at: None,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+        });
+
+        let summary = match remote_sidecar_run_broker_context_compression_summary(
+            state,
+            Some(run_stream),
+            database,
+            workspace_id,
+            chat_id,
+            run_id,
+            user_message_id,
+            assistant_message_id,
+            provider_id,
+            model_id,
+            &source_summary,
+        )
+        .await
+        {
+            RemoteSidecarContextCompressionOutcome::Succeeded { summary, .. } => summary,
+            RemoteSidecarContextCompressionOutcome::Cancelled => {
+                events.pop();
+                return Err(ApiError::bad_request(
+                    "context compression summary was cancelled",
+                ));
+            }
+            RemoteSidecarContextCompressionOutcome::Failed { message } => {
+                events.pop();
+                return Err(ApiError::bad_request(
+                    remote_sidecar_context_compression_failure_message(
+                        RemoteSidecarContextCompressionFailureKind::SummaryGeneration,
+                        &message,
+                    ),
+                ));
+            }
+        };
+
+        if !context_compression_summary_has_benefit(&summary, original_tokens) {
+            events.pop();
+            return Ok(false);
+        }
+        let summary_token_count = estimate_text_tokens(&summary);
+        let metadata = json!({
+            "kind": CONTEXT_COMPRESSION_KIND_LLM,
+            "coveredSequences": covered_sequences,
+            "coveredSnapshotIds": covered_snapshot_ids,
+            "supersededSnapshotIds": covered_snapshot_ids,
+            "triggerTokens": llm_context_compression_trigger_tokens(self.context_budget.context_window),
+            "availableMessageTokens": self.context_budget.available_message_tokens,
+        });
+        let prepared = prepare_context_compression_snapshot(
+            chat_id,
+            run_id,
+            messages,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+            self.active_tool_start_index,
+            &self.compression_snapshots,
+            &self.context_budget,
+            &covered_indices,
+            summary,
+            original_tokens,
+            summary_token_count,
+            metadata,
+        )?;
+        insert_context_compression_snapshot_record(database, &prepared)?;
+
+        *messages = prepared.replaced.messages;
+        self.message_source_sequences = prepared.replaced.message_source_sequences;
+        self.message_context_sources = prepared.replaced.message_context_sources;
+        self.active_tool_start_index = prepared.replaced.active_tool_start_index;
+        self.compression_snapshots.push(prepared.snapshot.clone());
+
+        events.push(RemoteSidecarContextCompressionEventDetail {
+            status: "completed".to_string(),
+            kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+            snapshot_id: Some(prepared.snapshot.id.clone()),
+            original_token_count: Some(prepared.snapshot.original_token_count),
+            summary_token_count: Some(prepared.snapshot.summary_token_count),
+            started_at: Some(compression_started_at),
+            completed_at: Some(utc_timestamp()),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+        });
+        Ok(true)
+    }
+
     fn recover_after_round_cap(
         &mut self,
         messages: &mut Vec<NeutralChatMessage>,
@@ -295,6 +622,7 @@ impl RemoteSidecarRuntimeToolState {
         &mut self,
         messages: &mut Vec<NeutralChatMessage>,
     ) -> Result<Vec<NeutralChatMessage>, ApiError> {
+        // Synchronous path used by unit tests; production chat loop uses ensure_compression_then_pack.
         self.compress_if_needed(messages, false)?;
         match pack_neutral_messages(
             messages.clone(),
@@ -319,6 +647,55 @@ impl RemoteSidecarRuntimeToolState {
             }
         }
     }
+}
+
+fn remote_sidecar_runtime_tool_state_compression_enabled(state: &RemoteSidecarState) -> bool {
+    state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone())
+        .is_some_and(|bundle| bundle.payload.app.runtime_tool_state_compression_enabled)
+}
+
+fn remote_sidecar_context_budget_for_request(
+    state: &RemoteSidecarState,
+    request: &NeutralChatRequest,
+) -> Result<ContextBudget, ApiError> {
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone());
+    bundle
+        .as_ref()
+        .and_then(|bundle| {
+            bundle
+                .payload
+                .models
+                .iter()
+                .find(|model| model.id == request.model_id)
+        })
+        .and_then(|model| model.limits.as_ref())
+        .map(|limits| {
+            calculate_context_budget(
+                limits.context_window,
+                limits.max_output_tokens,
+                0,
+                estimate_tool_schema_tokens(&request.tools),
+            )
+            .map_err(|source| ApiError::bad_request(source.to_string()))
+        })
+        .transpose()?
+        .map(Ok)
+        .unwrap_or(Ok(ContextBudget {
+            context_window: u64::MAX,
+            max_output_tokens: 0,
+            system_prompt_tokens: 0,
+            tool_schema_tokens: 0,
+            safety_tokens: 0,
+            available_message_tokens: u64::MAX,
+        }))
 }
 
 fn remote_sidecar_initial_context_sources(
@@ -372,13 +749,6 @@ fn remote_sidecar_tool_round_cap_error(max_tool_rounds: usize) -> String {
     format!(
         "agent run exceeded {max_tool_rounds} tool continuation rounds and had no runtime tool state to compress"
     )
-}
-
-fn remote_sidecar_context_overflow_error(source: ApiError) -> ApiError {
-    ApiError::bad_request(format!(
-        "remote sidecar context exceeds the model input budget after runtime tool-state compression and request packing; LLM context compression is not available in the sidecar: {}",
-        source.message
-    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -461,6 +831,25 @@ struct BrokerLlmAuditContext {
     chat_id: Option<String>,
     chat_title: Option<String>,
     request_id: String,
+    request_kind: String,
+}
+
+fn broker_llm_request_kind_from_payload(payload: &Value) -> String {
+    let raw = payload
+        .get("requestKind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(BROKER_DEFAULT_LLM_REQUEST_KIND);
+    if BROKER_ALLOWED_LLM_REQUEST_KINDS.contains(&raw) {
+        raw.to_string()
+    } else {
+        tracing::warn!(
+            request_kind = %raw,
+            "unsupported broker llm requestKind; falling back to chat completion"
+        );
+        BROKER_DEFAULT_LLM_REQUEST_KIND.to_string()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1197,6 +1586,10 @@ impl RemoteActiveRunStream {
 
     fn mark_finished(&self) {
         self.finished.store(true, Ordering::Relaxed);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 }
 
@@ -2945,6 +3338,7 @@ fn broker_llm_audit_context(
                     .unwrap_or("")
             })
             .to_string(),
+        request_kind: broker_llm_request_kind_from_payload(payload),
     })
     .filter(|context| !context.request_id.is_empty())
 }
@@ -2993,7 +3387,7 @@ fn insert_broker_llm_audit_start_inner(
         id: &context.request_id,
         workspace_id: &context.workspace_id,
         chat_id: context.chat_id.as_deref(),
-        request_kind: "chat completion",
+        request_kind: &context.request_kind,
         agent_team_id: None,
         agent_instance_id: None,
         agent_task_id: None,
@@ -3176,6 +3570,7 @@ async fn broker_llm_stream(
 
     let audit_context =
         broker_llm_audit_context(state, workspace_id, &payload).map(|mut context| {
+            // Broker RPC id is the durable audit request id (1:1 with the control message).
             context.request_id = id.to_string();
             context
         });
@@ -3205,6 +3600,10 @@ async fn broker_llm_stream(
             "type": "start",
             "providerId": provider_id,
             "modelId": model_id,
+            "requestKind": audit_context
+                .as_ref()
+                .map(|context| context.request_kind.as_str())
+                .unwrap_or(BROKER_DEFAULT_LLM_REQUEST_KIND),
         }),
     }];
 
@@ -3312,6 +3711,7 @@ async fn broker_llm_stream(
     let mut sequence = 0u64;
     let mut final_usage: Option<NeutralUsage> = None;
     let mut final_tool_calls = Vec::<NeutralToolCall>::new();
+    let mut final_text = String::new();
     let mut first_token_at: Option<String> = None;
     let mut first_token_latency_ms: Option<i64> = None;
     loop {
@@ -3396,6 +3796,7 @@ async fn broker_llm_stream(
         };
         match event {
             NeutralChatStreamEvent::TextDelta { delta } => {
+                final_text.push_str(&delta);
                 sequence += 1;
                 if first_token_at.is_none() {
                     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -3583,13 +3984,17 @@ async fn broker_llm_stream(
                 }
             }
             NeutralChatStreamEvent::Complete {
-                text: _,
+                text,
                 reasoning: _,
                 tool_calls,
                 usage,
                 stop_reason: _,
                 response_id: _,
             } => {
+                // Prefer stream deltas when present; use Complete text only as a full-body fallback.
+                if final_text.is_empty() && !text.trim().is_empty() {
+                    final_text = text;
+                }
                 if let Some(usage) = usage.as_ref() {
                     audit_events.push(BrokerLlmAuditEvent {
                         event_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3705,6 +4110,7 @@ async fn broker_llm_stream(
         payload: json!({
             "status": "ok",
             "llmRequestId": id,
+            "text": final_text,
             "usage": final_usage,
             "toolCalls": final_tool_calls,
         }),
@@ -5885,13 +6291,44 @@ fn persist_sidecar_llm_audit(
     final_state: &str,
     response_body: Value,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    persist_sidecar_llm_audit_for_kind(
+        database,
+        workspace_id,
+        chat_id,
+        request_id,
+        BROKER_DEFAULT_LLM_REQUEST_KIND,
+        provider_id,
+        model_id,
+        run_metrics,
+        completed_at,
+        total_latency_ms,
+        final_state,
+        response_body,
+    )
+}
+
+/// Sidecar mirror audit for a single LLM request. Does not mark provider_request_v1 wire dumps.
+fn persist_sidecar_llm_audit_for_kind(
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    chat_id: &str,
+    request_id: &str,
+    request_kind: &str,
+    provider_id: &str,
+    model_id: &str,
+    run_metrics: &RemoteSidecarRunMetrics,
+    completed_at: &str,
+    total_latency_ms: i64,
+    final_state: &str,
+    response_body: Value,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
     let response_body_json = response_body.to_string();
     if database.llm_request(request_id)?.is_none() {
         database.insert_llm_request(NewLlmRequest {
             id: request_id,
             workspace_id,
             chat_id: Some(chat_id),
-            request_kind: "chat completion",
+            request_kind,
             agent_team_id: None,
             agent_instance_id: None,
             agent_task_id: None,
@@ -6288,9 +6725,49 @@ fn remote_sidecar_provider_request(
     model_id: &str,
     thinking_level: Value,
 ) -> Result<NeutralChatRequest, axum::response::Response> {
-    let mut raw_messages =
-        remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
-            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    Ok(remote_sidecar_prepare_chat_context(
+        state,
+        database,
+        chat_id,
+        queued_user_message_id,
+        assistant_message_id,
+        model_id,
+        thinking_level,
+    )?
+    .provider_request)
+}
+
+fn remote_sidecar_prepare_chat_context(
+    state: &RemoteSidecarState,
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    queued_user_message_id: &str,
+    assistant_message_id: &str,
+    model_id: &str,
+    thinking_level: Value,
+) -> Result<RemotePreparedChatContext, axum::response::Response> {
+    let history = remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let compression_snapshots = database
+        .context_compression_snapshots_for_chat(chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let compression_snapshots = crate::prompt::active_compression_snapshots(&compression_snapshots);
+    let covered_sequences = crate::prompt::snapshot_covered_sequences(&compression_snapshots);
+
+    let mut filtered_messages = Vec::new();
+    let mut filtered_sequences = Vec::new();
+    for (message, sequence) in history
+        .messages
+        .into_iter()
+        .zip(history.sequences.into_iter())
+    {
+        if covered_sequences.contains(&sequence) {
+            continue;
+        }
+        filtered_messages.push(message);
+        filtered_sequences.push(sequence);
+    }
+
     let requested_skill_ids =
         remote_sidecar_requested_skill_ids(database, chat_id, queued_user_message_id)?;
     let bundle = state
@@ -6300,85 +6777,215 @@ fn remote_sidecar_provider_request(
         .and_then(|config| config.clone());
     let (skill_routing_message, selected_skill_entries) =
         remote_sidecar_skill_context(state, bundle.as_ref(), &requested_skill_ids)?;
-    apply_sidecar_selected_skills(&selected_skill_entries, &mut raw_messages)?;
+    apply_sidecar_selected_skills(&selected_skill_entries, &mut filtered_messages)?;
     let requested_thinking_level = serde_json::from_value(thinking_level).ok();
+    let tools = remote_sidecar_executable_tool_schemas();
 
-    let Some(bundle) = bundle else {
-        let mut messages = Vec::with_capacity(raw_messages.len() + 1);
-        messages.extend(skill_routing_message);
-        messages.extend(raw_messages);
-        return Ok(NeutralChatRequest {
-            model_id: model_id.to_string(),
-            messages,
-            tools: remote_sidecar_executable_tool_schemas(),
-            thinking_level: requested_thinking_level,
-            max_output_tokens: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        });
-    };
-    let payload = &bundle.payload;
-    let Some(model) = payload.models.iter().find(|model| model.id == model_id) else {
-        let mut messages = Vec::with_capacity(raw_messages.len() + 1);
-        messages.extend(skill_routing_message);
-        messages.extend(raw_messages);
-        return Ok(NeutralChatRequest {
-            model_id: model_id.to_string(),
-            messages,
-            tools: remote_sidecar_executable_tool_schemas(),
-            thinking_level: requested_thinking_level,
-            max_output_tokens: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        });
-    };
+    let mut messages =
+        Vec::with_capacity(filtered_messages.len() + 9 + compression_snapshots.len());
+    let mut message_source_sequences = Vec::with_capacity(messages.capacity());
+    let mut message_context_sources = Vec::with_capacity(messages.capacity());
 
-    let workspace_path = Path::new(&state.workspace_path);
-    let mut messages = Vec::with_capacity(raw_messages.len() + 9);
-    messages.push(neutral_text_message(
-        NeutralChatRole::System,
-        active_system_prompt(&payload.prompts, &model.system_prompt_name)
-            .map_err(|e| e.into_response())?,
-    ));
-    messages.push(neutral_text_message(
-        NeutralChatRole::System,
-        build_project_spec_prompt_section(),
-    ));
-    if payload.memory.enabled {
-        messages.push(neutral_text_message(
-            NeutralChatRole::System,
-            build_memory_prompt_section(),
-        ));
+    if let Some(bundle) = bundle.as_ref() {
+        let payload = &bundle.payload;
+        if let Some(model) = payload.models.iter().find(|model| model.id == model_id) {
+            remote_sidecar_push_reserved(
+                &mut messages,
+                &mut message_source_sequences,
+                &mut message_context_sources,
+                neutral_text_message(
+                    NeutralChatRole::System,
+                    active_system_prompt(&payload.prompts, &model.system_prompt_name)
+                        .map_err(|e| e.into_response())?,
+                ),
+            );
+            remote_sidecar_push_reserved(
+                &mut messages,
+                &mut message_source_sequences,
+                &mut message_context_sources,
+                neutral_text_message(NeutralChatRole::System, build_project_spec_prompt_section()),
+            );
+            if payload.memory.enabled {
+                remote_sidecar_push_reserved(
+                    &mut messages,
+                    &mut message_source_sequences,
+                    &mut message_context_sources,
+                    neutral_text_message(NeutralChatRole::System, build_memory_prompt_section()),
+                );
+            }
+            if let Some(message) = skill_routing_message {
+                remote_sidecar_push_reserved(
+                    &mut messages,
+                    &mut message_source_sequences,
+                    &mut message_context_sources,
+                    message,
+                );
+            }
+            if let Some(message) = configured_extra_prompt_message(&payload.prompts) {
+                remote_sidecar_push_reserved(
+                    &mut messages,
+                    &mut message_source_sequences,
+                    &mut message_context_sources,
+                    message,
+                );
+            }
+            let workspace_path = Path::new(&state.workspace_path);
+            if let Ok(mut agent_messages) = agents_prompt_messages(workspace_path) {
+                for message in agent_messages.drain(..) {
+                    remote_sidecar_push_reserved(
+                        &mut messages,
+                        &mut message_source_sequences,
+                        &mut message_context_sources,
+                        message,
+                    );
+                }
+            }
+            if let Ok(message) = environment_context_message(workspace_path) {
+                remote_sidecar_push_reserved(
+                    &mut messages,
+                    &mut message_source_sequences,
+                    &mut message_context_sources,
+                    message,
+                );
+            }
+            if let Some(message) = remote_project_spec_context_message(database, chat_id)? {
+                messages.push(message);
+                message_source_sequences.push(None);
+                message_context_sources.push(PromptContextSource::ProjectSpec);
+            }
+
+            remote_sidecar_append_snapshots_and_history(
+                &mut messages,
+                &mut message_source_sequences,
+                &mut message_context_sources,
+                &compression_snapshots,
+                filtered_messages,
+                filtered_sequences,
+            );
+            let active_tool_start_index = messages.len();
+            // ponytail: keep the remote schema list to tools with a real Phase 1 execution path.
+            return remote_sidecar_finish_prepared_context(
+                state,
+                NeutralChatRequest {
+                    model_id: model_id.to_string(),
+                    messages,
+                    tools,
+                    thinking_level: requested_thinking_level
+                        .or_else(|| model.thinking_level.clone()),
+                    max_output_tokens: model
+                        .limits
+                        .as_ref()
+                        .and_then(|limits| u32::try_from(limits.max_output_tokens).ok()),
+                    prompt_cache_key: None,
+                    prompt_cache_retention: None,
+                },
+                message_source_sequences,
+                message_context_sources,
+                active_tool_start_index,
+                compression_snapshots,
+            );
+        }
     }
+
     if let Some(message) = skill_routing_message {
-        messages.push(message);
+        remote_sidecar_push_reserved(
+            &mut messages,
+            &mut message_source_sequences,
+            &mut message_context_sources,
+            message,
+        );
     }
-    if let Some(message) = configured_extra_prompt_message(&payload.prompts) {
-        messages.push(message);
-    }
-    if let Ok(mut agent_messages) = agents_prompt_messages(workspace_path) {
-        messages.append(&mut agent_messages);
-    }
-    if let Ok(message) = environment_context_message(workspace_path) {
-        messages.push(message);
-    }
-    if let Some(message) = remote_project_spec_context_message(database, chat_id)? {
-        messages.push(message);
-    }
-    messages.extend(raw_messages);
+    remote_sidecar_append_snapshots_and_history(
+        &mut messages,
+        &mut message_source_sequences,
+        &mut message_context_sources,
+        &compression_snapshots,
+        filtered_messages,
+        filtered_sequences,
+    );
+    let active_tool_start_index = messages.len();
+    remote_sidecar_finish_prepared_context(
+        state,
+        NeutralChatRequest {
+            model_id: model_id.to_string(),
+            messages,
+            tools,
+            thinking_level: requested_thinking_level,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        },
+        message_source_sequences,
+        message_context_sources,
+        active_tool_start_index,
+        compression_snapshots,
+    )
+}
 
-    // ponytail: keep the remote schema list to tools with a real Phase 1 execution path.
-    Ok(NeutralChatRequest {
-        model_id: model_id.to_string(),
-        messages,
-        tools: remote_sidecar_executable_tool_schemas(),
-        thinking_level: requested_thinking_level.or_else(|| model.thinking_level.clone()),
-        max_output_tokens: model
-            .limits
-            .as_ref()
-            .and_then(|limits| u32::try_from(limits.max_output_tokens).ok()),
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
+fn remote_sidecar_push_reserved(
+    messages: &mut Vec<NeutralChatMessage>,
+    sequences: &mut Vec<Option<i64>>,
+    sources: &mut Vec<PromptContextSource>,
+    message: NeutralChatMessage,
+) {
+    messages.push(message);
+    sequences.push(None);
+    sources.push(PromptContextSource::ReservedPrompt);
+}
+
+fn remote_sidecar_append_snapshots_and_history(
+    messages: &mut Vec<NeutralChatMessage>,
+    sequences: &mut Vec<Option<i64>>,
+    sources: &mut Vec<PromptContextSource>,
+    compression_snapshots: &[foco_store::workspace::ContextCompressionSnapshotRecord],
+    filtered_messages: Vec<NeutralChatMessage>,
+    filtered_sequences: Vec<i64>,
+) {
+    for snapshot in compression_snapshots {
+        messages.push(crate::prompt::compression_snapshot_message(snapshot));
+        sequences.push(None);
+        sources.push(PromptContextSource::CompressionSnapshot);
+    }
+    let last_user_sequence = filtered_messages
+        .iter()
+        .zip(filtered_sequences.iter())
+        .rev()
+        .find(|(message, _)| message.role == NeutralChatRole::User)
+        .map(|(_, sequence)| *sequence);
+    for (message, sequence) in filtered_messages
+        .into_iter()
+        .zip(filtered_sequences.into_iter())
+    {
+        let source =
+            if message.role == NeutralChatRole::User && Some(sequence) == last_user_sequence {
+                PromptContextSource::CurrentUser { sequence }
+            } else {
+                PromptContextSource::StoredMessage { sequence }
+            };
+        messages.push(message);
+        sequences.push(Some(sequence));
+        sources.push(source);
+    }
+}
+
+fn remote_sidecar_finish_prepared_context(
+    state: &RemoteSidecarState,
+    provider_request: NeutralChatRequest,
+    message_source_sequences: Vec<Option<i64>>,
+    message_context_sources: Vec<PromptContextSource>,
+    active_tool_start_index: usize,
+    compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
+) -> Result<RemotePreparedChatContext, axum::response::Response> {
+    let context_budget = remote_sidecar_context_budget_for_request(state, &provider_request)
+        .map_err(|e| e.into_response())?;
+    Ok(RemotePreparedChatContext {
+        provider_request,
+        message_source_sequences,
+        message_context_sources,
+        active_tool_start_index,
+        compression_snapshots,
+        context_budget,
+        compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
     })
 }
 
@@ -6386,7 +6993,7 @@ fn remote_sidecar_chat_messages_for_request(
     database: &WorkspaceDatabase,
     chat_id: &str,
     assistant_message_id: &str,
-) -> Result<Vec<NeutralChatMessage>, foco_store::workspace::WorkspaceDatabaseError> {
+) -> Result<RemoteSidecarHistoryMessages, foco_store::workspace::WorkspaceDatabaseError> {
     let messages = database.messages_for_chat(chat_id)?;
     let target_sequence = messages
         .iter()
@@ -6405,6 +7012,7 @@ fn remote_sidecar_chat_messages_for_request(
     }
 
     let mut raw_messages = Vec::new();
+    let mut sequences = Vec::new();
     for message in messages {
         if target_sequence.is_some_and(|sequence| message.sequence > sequence) {
             break;
@@ -6412,6 +7020,7 @@ fn remote_sidecar_chat_messages_for_request(
         if message.role == "assistant" && message.id == assistant_message_id {
             continue;
         }
+        let sequence = message.sequence;
         let metadata = serde_json::from_str::<Value>(&message.metadata_json).unwrap_or(Value::Null);
         let reasoning = metadata
             .get("reasoning")
@@ -6454,10 +7063,17 @@ fn remote_sidecar_chat_messages_for_request(
             tool_call_id: None,
             tool_name: None,
         });
-        raw_messages.extend(tool_message_parts);
+        sequences.push(sequence);
+        for tool_message in tool_message_parts {
+            raw_messages.push(tool_message);
+            sequences.push(sequence);
+        }
     }
 
-    Ok(raw_messages)
+    Ok(RemoteSidecarHistoryMessages {
+        messages: raw_messages,
+        sequences,
+    })
 }
 
 fn remote_neutral_tool_call_from_record(
@@ -6866,9 +7482,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
                     .unwrap_or_default();
-                // Prefer Complete toolCalls when present; stream chunks may still be partial.
+                // Prefer Complete toolCalls when present; fall back to streamed merges when
+                // the final response omits toolCalls (partial stream arguments already merged).
                 let tool_calls = if response_tool_calls.is_empty() {
-                    Vec::new()
+                    collected_tool_calls.clone()
                 } else {
                     merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
                 };
@@ -6985,6 +7602,441 @@ async fn remote_sidecar_run_broker_llm_turn(
     }
 }
 
+/// Outcome of a brokered context-compression summary request (isolated from chat turn metrics).
+#[derive(Debug)]
+enum RemoteSidecarContextCompressionOutcome {
+    /// Complete + non-empty text; summary estimated tokens are still unchecked by the caller.
+    Succeeded {
+        summary: String,
+        request_id: String,
+        usage: NeutralUsage,
+    },
+    Failed {
+        message: String,
+    },
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteSidecarContextCompressionEventDetail {
+    status: String,
+    kind: String,
+    snapshot_id: Option<String>,
+    original_token_count: Option<i64>,
+    summary_token_count: Option<i64>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    provider_id: String,
+    model_id: String,
+}
+
+fn remote_sidecar_context_compression_sse_event(
+    assistant_message_id: &str,
+    detail: &RemoteSidecarContextCompressionEventDetail,
+) -> Value {
+    json!({
+        "type": "contextCompression",
+        "assistantMessageId": assistant_message_id,
+        "snapshotId": detail.snapshot_id,
+        "kind": detail.kind,
+        "status": detail.status,
+        "detail": {
+            "status": detail.status,
+            "kind": detail.kind,
+            "snapshotId": detail.snapshot_id,
+            "originalTokenCount": detail.original_token_count,
+            "summaryTokenCount": detail.summary_token_count,
+            "startedAt": detail.started_at,
+            "completedAt": detail.completed_at,
+            "providerId": detail.provider_id,
+            "modelId": detail.model_id,
+        },
+    })
+}
+
+/// Run a dedicated `llm.stream` compression request.
+/// Deltas are aggregated only in-memory; they are not emitted as assistant text/reasoning SSE.
+/// Chat `RemoteSidecarRunMetrics` is not updated.
+async fn remote_sidecar_run_broker_context_compression_summary(
+    state: &RemoteSidecarState,
+    run_stream: Option<&RemoteActiveRunStream>,
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    chat_id: &str,
+    run_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    source_summary: &str,
+) -> RemoteSidecarContextCompressionOutcome {
+    let request =
+        crate::prompt::build_context_compression_summary_request(model_id, source_summary);
+    let broker_request_id = unique_id("broker-ctx-compress");
+    if let Some(run_stream) = run_stream {
+        run_stream.set_broker_request_id(broker_request_id.clone());
+    }
+    let broker_payload = json!({
+        "workspaceId": workspace_id,
+        "chatId": chat_id,
+        "runId": run_id,
+        "requestId": broker_request_id,
+        "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "providerId": provider_id,
+        "modelId": model_id,
+        "request": request,
+    });
+
+    let mut broker_rx = match remote_sidecar_broker_request(
+        state,
+        &broker_request_id,
+        "llm.stream",
+        broker_payload,
+    )
+    .await
+    {
+        Ok(rx) => rx,
+        Err(_) => {
+            return RemoteSidecarContextCompressionOutcome::Failed {
+                message: "context compression summary failed: remote broker is unavailable"
+                    .to_string(),
+            };
+        }
+    };
+
+    let mut compression_metrics = RemoteSidecarRunMetrics::new();
+    let mut output_text = String::new();
+    let mut saw_tool_call = false;
+    let timeout_duration = Duration::from_millis(crate::LLM_CONTEXT_COMPRESSION_TIMEOUT_MS);
+
+    loop {
+        if run_stream.is_some_and(|stream| stream.is_finished()) {
+            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let total_latency_ms = compression_metrics.total_latency_ms();
+            let _ = persist_sidecar_llm_audit_for_kind(
+                database,
+                workspace_id,
+                chat_id,
+                &broker_request_id,
+                BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                provider_id,
+                model_id,
+                &compression_metrics,
+                &completed_at,
+                total_latency_ms,
+                "failed",
+                json!({
+                    "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    "cancelled": true,
+                    "error": { "message": "context compression summary was cancelled" },
+                }),
+            );
+            if let Some(run_stream) = run_stream {
+                remote_sidecar_cancel_broker_request(state, run_stream);
+            }
+            return RemoteSidecarContextCompressionOutcome::Cancelled;
+        }
+
+        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                let message =
+                    "context compression summary failed: remote broker closed before completion";
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = compression_metrics.total_latency_ms();
+                let _ = persist_sidecar_llm_audit_for_kind(
+                    database,
+                    workspace_id,
+                    chat_id,
+                    &broker_request_id,
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    provider_id,
+                    model_id,
+                    &compression_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        "error": { "message": message },
+                    }),
+                );
+                return RemoteSidecarContextCompressionOutcome::Failed {
+                    message: message.to_string(),
+                };
+            }
+            Err(_) => {
+                let message = format!(
+                    "context compression summary timed out after {} ms",
+                    crate::LLM_CONTEXT_COMPRESSION_TIMEOUT_MS
+                );
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = compression_metrics.total_latency_ms();
+                let _ = persist_sidecar_llm_audit_for_kind(
+                    database,
+                    workspace_id,
+                    chat_id,
+                    &broker_request_id,
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    provider_id,
+                    model_id,
+                    &compression_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        "error": { "message": message },
+                        "partial": true,
+                    }),
+                );
+                if let Some(run_stream) = run_stream {
+                    remote_sidecar_cancel_broker_request(state, run_stream);
+                }
+                return RemoteSidecarContextCompressionOutcome::Failed { message };
+            }
+        };
+
+        match envelope.message_type.as_str() {
+            "stream" => {
+                let kind = envelope
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match kind {
+                    "textDelta" => {
+                        let delta = envelope
+                            .payload
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !delta.is_empty() {
+                            compression_metrics.capture_first_output();
+                            output_text.push_str(delta);
+                        }
+                    }
+                    "reasoningDelta" => {
+                        compression_metrics.capture_first_output();
+                    }
+                    "usageDelta" => {
+                        if let Some(usage) = envelope.payload.get("usage") {
+                            compression_metrics.merge_usage_value(usage);
+                        }
+                    }
+                    "toolCall" => {
+                        saw_tool_call = true;
+                    }
+                    _ => {}
+                }
+            }
+            "response" => {
+                let audit_request_id = envelope
+                    .payload
+                    .get("llmRequestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&broker_request_id)
+                    .to_string();
+                // Prefer already-streamed usage; response usage is a fallback only.
+                if compression_metrics.usage.input_tokens.is_none()
+                    && compression_metrics.usage.output_tokens.is_none()
+                {
+                    if let Some(usage) = envelope.payload.get("usage") {
+                        compression_metrics.merge_usage_value(usage);
+                    }
+                }
+                if let Some(response_text) = envelope.payload.get("text").and_then(Value::as_str) {
+                    if output_text.is_empty() && !response_text.trim().is_empty() {
+                        output_text = response_text.to_string();
+                    }
+                }
+                let response_tool_calls = envelope
+                    .payload
+                    .get("toolCalls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
+                    .unwrap_or_default();
+                if saw_tool_call || !response_tool_calls.is_empty() {
+                    let message = "context compression summary called unsupported tool".to_string();
+                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let total_latency_ms = compression_metrics.total_latency_ms();
+                    let _ = persist_sidecar_llm_audit_for_kind(
+                        database,
+                        workspace_id,
+                        chat_id,
+                        &audit_request_id,
+                        BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        provider_id,
+                        model_id,
+                        &compression_metrics,
+                        &completed_at,
+                        total_latency_ms,
+                        "failed",
+                        json!({
+                            "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                            "error": { "message": message },
+                        }),
+                    );
+                    return RemoteSidecarContextCompressionOutcome::Failed { message };
+                }
+                let summary = output_text.trim().to_string();
+                if summary.is_empty() {
+                    let message = "context compression summary returned empty text".to_string();
+                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    let total_latency_ms = compression_metrics.total_latency_ms();
+                    let _ = persist_sidecar_llm_audit_for_kind(
+                        database,
+                        workspace_id,
+                        chat_id,
+                        &audit_request_id,
+                        BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        provider_id,
+                        model_id,
+                        &compression_metrics,
+                        &completed_at,
+                        total_latency_ms,
+                        "failed",
+                        json!({
+                            "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                            "error": { "message": message },
+                        }),
+                    );
+                    return RemoteSidecarContextCompressionOutcome::Failed { message };
+                }
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = compression_metrics.total_latency_ms();
+                let _ = persist_sidecar_llm_audit_for_kind(
+                    database,
+                    workspace_id,
+                    chat_id,
+                    &audit_request_id,
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    provider_id,
+                    model_id,
+                    &compression_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "succeeded",
+                    json!({
+                        "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        "status": "ok",
+                        "summaryChars": summary.chars().count(),
+                        "usage": compression_metrics.usage_value(),
+                    }),
+                );
+                return RemoteSidecarContextCompressionOutcome::Succeeded {
+                    summary,
+                    request_id: audit_request_id,
+                    usage: compression_metrics.usage.clone(),
+                };
+            }
+            "error" => {
+                let code = envelope
+                    .payload
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let message = envelope
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote broker unavailable");
+                let cancelled = code == "cancelled"
+                    || message.contains("cancelled")
+                    || run_stream.is_some_and(|stream| stream.is_finished());
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = compression_metrics.total_latency_ms();
+                if cancelled {
+                    let _ = persist_sidecar_llm_audit_for_kind(
+                        database,
+                        workspace_id,
+                        chat_id,
+                        &broker_request_id,
+                        BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        provider_id,
+                        model_id,
+                        &compression_metrics,
+                        &completed_at,
+                        total_latency_ms,
+                        "failed",
+                        json!({
+                            "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                            "cancelled": true,
+                            "error": { "message": "context compression summary was cancelled" },
+                        }),
+                    );
+                    return RemoteSidecarContextCompressionOutcome::Cancelled;
+                }
+                let message = format!("context compression summary failed: {message}");
+                let _ = persist_sidecar_llm_audit_for_kind(
+                    database,
+                    workspace_id,
+                    chat_id,
+                    &broker_request_id,
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    provider_id,
+                    model_id,
+                    &compression_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "failed",
+                    json!({
+                        "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                        "error": { "message": message },
+                    }),
+                );
+                return RemoteSidecarContextCompressionOutcome::Failed { message };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Classify compression failure for user-facing errors (Phase 2+ pack/overflow paths).
+fn remote_sidecar_context_compression_failure_message(
+    kind: RemoteSidecarContextCompressionFailureKind,
+    detail: &str,
+) -> String {
+    match kind {
+        RemoteSidecarContextCompressionFailureKind::SummaryGeneration => {
+            if detail.is_empty() {
+                "context compression summary generation failed".to_string()
+            } else {
+                format!("context compression summary generation failed: {detail}")
+            }
+        }
+        RemoteSidecarContextCompressionFailureKind::NoBenefit => {
+            "context compression summary produced no token savings; original context was kept"
+                .to_string()
+        }
+        RemoteSidecarContextCompressionFailureKind::StillOverBudget => {
+            if detail.is_empty() {
+                "context still exceeds the model input budget after LLM compression".to_string()
+            } else {
+                format!(
+                    "context still exceeds the model input budget after LLM compression: {detail}"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteSidecarContextCompressionFailureKind {
+    SummaryGeneration,
+    NoBenefit,
+    StillOverBudget,
+}
+
+fn remote_sidecar_context_overflow_error(source: ApiError) -> ApiError {
+    ApiError::bad_request(remote_sidecar_context_compression_failure_message(
+        RemoteSidecarContextCompressionFailureKind::StillOverBudget,
+        &source.message,
+    ))
+}
+
 fn remote_project_spec_context_message(
     database: &WorkspaceDatabase,
     chat_id: &str,
@@ -7096,7 +8148,7 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
-    let initial_provider_request = match remote_sidecar_provider_request(
+    let initial_prepared = match remote_sidecar_prepare_chat_context(
         &state,
         &database,
         &chat_id,
@@ -7105,20 +8157,15 @@ async fn remote_sidecar_chat_stream(
         &model_id,
         payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
     ) {
-        Ok(request) => request,
+        Ok(prepared) => prepared,
         Err(response) => {
             let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
             return Err(response);
         }
     };
+    let initial_provider_request = initial_prepared.provider_request.clone();
     let initial_runtime_tool_state =
-        match RemoteSidecarRuntimeToolState::for_request(&state, &initial_provider_request) {
-            Ok(runtime_tool_state) => runtime_tool_state,
-            Err(error) => {
-                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-                return Err(error.into_response());
-            }
-        };
+        RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -7171,13 +8218,25 @@ async fn remote_sidecar_chat_stream(
         let mut last_yielded_sequence = sequence;
 
         loop {
-            // The sidecar intentionally stops short of LLM-generated snapshot compression. It
-            // shares deterministic runtime tool-state compression with local chat, then packs a
-            // request clone so optional history cannot grow without bound before broker dispatch.
-            let packed_messages = match runtime_tool_state
-                .packed_messages_for_request(&mut current_request.messages)
+            // Before every brokered chat completion request (first turn and tool follow-ups):
+            // runtime tool-state compression, then 95%/overflow LLM compression, then pack.
+            let (packed_messages, compression_events) = match runtime_tool_state
+                .ensure_compression_then_pack(
+                    &mut current_request.messages,
+                    &stream_state,
+                    &run_stream,
+                    &mut database,
+                    &stream_state.workspace_id,
+                    &chat_id,
+                    &run_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &provider_id,
+                    &model_id,
+                )
+                .await
             {
-                Ok(messages) => messages,
+                Ok(result) => result,
                 Err(error) => {
                     let message = error.message;
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -7207,6 +8266,15 @@ async fn remote_sidecar_chat_stream(
                     break;
                 }
             };
+            for detail in compression_events {
+                sequence += 1;
+                yield Ok(remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    remote_sidecar_context_compression_sse_event(&assistant_message_id, &detail),
+                ));
+                last_yielded_sequence = sequence;
+            }
             let mut broker_request = current_request.clone();
             broker_request.messages = packed_messages;
             let broker_request_id = unique_id("broker-request");
@@ -7216,6 +8284,7 @@ async fn remote_sidecar_chat_stream(
                 "chatId": chat_id,
                 "chatTitle": chat.title,
                 "runId": run_id,
+                "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
                 "providerId": provider_id,
                 "modelId": model_id,
                 "request": broker_request,
@@ -8775,9 +9844,10 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Vec<NeutralToolCall>>(value).ok())
                     .unwrap_or_default();
-                // Prefer Complete toolCalls when present; stream chunks may still be partial.
+                // Prefer Complete toolCalls when present; fall back to streamed merges when
+                // the final response omits toolCalls (partial stream arguments already merged).
                 let tool_calls = if response_tool_calls.is_empty() {
-                    Vec::new()
+                    collected_tool_calls.clone()
                 } else {
                     merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
                 };
@@ -9326,6 +10396,7 @@ mod tests {
                 available_message_tokens,
             },
             compression_enabled,
+            compression_snapshots: Vec::new(),
         }
     }
 
@@ -9731,13 +10802,9 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("LLM context compression is not available")
+                .contains("context still exceeds the model input budget after LLM compression")
         );
-        assert!(
-            error
-                .message
-                .contains("after runtime tool-state compression and request packing")
-        );
+        assert!(error.message.contains("required"));
     }
     #[tokio::test]
     async fn remote_sidecar_terminal_session_accepts_empty_post_and_persists_contract() {
@@ -10763,6 +11830,7 @@ mod tests {
             chat_id: Some("chat-1".to_string()),
             chat_title: Some("Remote chat".to_string()),
             request_id: "remote-run-1".to_string(),
+            request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
         };
         let started_at = "2026-07-08T00:00:00Z";
         insert_broker_llm_audit_start(&context, "provider-1", "model-1", None, started_at);
@@ -10833,6 +11901,78 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn broker_llm_request_kind_accepts_chat_and_context_compression() {
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({})),
+            "chat completion"
+        );
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "chat completion" })),
+            "chat completion"
+        );
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "contextCompression" })),
+            "contextCompression"
+        );
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "memory extraction" })),
+            "chat completion"
+        );
+    }
+
+    #[test]
+    fn brokered_context_compression_audit_is_excluded_from_main_chat_statistics() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = BrokerLlmAuditContext {
+            audit_path: workspace.path().to_path_buf(),
+            workspace_id: "remote-ws".to_string(),
+            chat_id: Some("chat-1".to_string()),
+            chat_title: Some("Remote chat".to_string()),
+            request_id: "ctx-compress-1".to_string(),
+            request_kind: BROKER_CONTEXT_COMPRESSION_REQUEST_KIND.to_string(),
+        };
+        let started_at = "2026-07-08T00:00:00Z";
+        insert_broker_llm_audit_start(&context, "provider-1", "model-1", None, started_at);
+        finish_broker_llm_audit(
+            Some(&context),
+            BrokerLlmAuditOutcome {
+                final_state: "succeeded",
+                first_token_at: Some("2026-07-08T00:00:01Z"),
+                completed_at: "2026-07-08T00:00:02Z",
+                usage: None,
+                first_token_latency_ms: Some(1000),
+                total_latency_ms: 2000,
+                status_code: None,
+                response_body_json: Some(r#"{"requestKind":"contextCompression"}"#),
+            },
+            &[],
+        );
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit db");
+        let request = database
+            .llm_request("ctx-compress-1")
+            .expect("request row")
+            .expect("inserted");
+        assert_eq!(request.request_kind, "contextCompression");
+        let main_chat_rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("audit rows");
+        assert!(main_chat_rows.is_empty());
+        let all_rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("all rows");
+        assert_eq!(all_rows.len(), 1);
+        assert_eq!(all_rows[0].request_kind, "contextCompression");
     }
 
     #[test]
@@ -11403,16 +12543,1278 @@ mod tests {
         assert_eq!(run_metrics.usage.input_tokens, Some(4));
         assert_eq!(run_metrics.usage.output_tokens, Some(2));
         assert!(run_metrics.first_token_latency_ms.is_some());
-        let tool_calls = database
-            .tool_calls_for_message("msg-assistant-1")
-            .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].status, "running");
+        // Recording pending tool calls / SSE toolCall events is the outer tool loop's job.
         assert!(
-            run_stream
-                .snapshot_after(0)
+            database
+                .tool_calls_for_message("msg-assistant-1")
+                .expect("tool calls")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_context_compression_summary_aggregates_text_without_chat_metrics() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            assert_eq!(request.method.as_deref(), Some("llm.stream"));
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some("contextCompression")
+            );
+            let request_body = request
+                .payload
+                .get("request")
+                .cloned()
+                .expect("compression request body");
+            let tools = request_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(tools.is_empty());
+            assert!(
+                request_body
+                    .get("thinking_level")
+                    .map(|value| value.is_null())
+                    .unwrap_or(true)
+            );
+            assert_eq!(
+                request_body
+                    .get("max_output_tokens")
+                    .and_then(Value::as_u64),
+                Some(2048)
+            );
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "User wants "
+                    }),
+                    timestamp: None,
+                })
+                .expect("send text delta");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "reasoningDelta",
+                        "delta": "should not surface"
+                    }),
+                    timestamp: None,
+                })
+                .expect("send reasoning delta");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "usageDelta",
+                        "usage": { "inputTokens": 12, "outputTokens": 4 }
+                    }),
+                    timestamp: None,
+                })
+                .expect("send usage");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "llmRequestId": id,
+                        "text": "User wants remote compression.",
+                        "usage": { "inputTokens": 12, "outputTokens": 4 },
+                        "toolCalls": []
+                    }),
+                    timestamp: None,
+                })
+                .expect("send response");
+        });
+
+        let outcome = remote_sidecar_run_broker_context_compression_summary(
+            &state,
+            Some(&run_stream),
+            &mut database,
+            "workspace",
+            "chat-1",
+            "remote-run-1",
+            "msg-user-1",
+            "msg-assistant-1",
+            "provider-1",
+            "model-1",
+            "goal: compress earlier turns",
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        match outcome {
+            RemoteSidecarContextCompressionOutcome::Succeeded {
+                summary,
+                request_id,
+                usage,
+            } => {
+                // Stream deltas take precedence over response text when non-empty.
+                assert_eq!(summary, "User wants");
+                assert!(!request_id.is_empty());
+                assert_eq!(usage.input_tokens, Some(12));
+                assert_eq!(usage.output_tokens, Some(4));
+            }
+            other => panic!("expected succeeded summary, got {other:?}"),
+        }
+
+        // Compression must not record assistant-facing SSE deltas.
+        assert!(run_stream.snapshot_after(0).is_empty());
+
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_kind, "contextCompression");
+        assert_eq!(rows[0].final_state, "succeeded");
+        // Sidecar mirror audit never stores provider_request_v1 wire dumps.
+        let full = database
+            .llm_request(&rows[0].id)
+            .expect("full request")
+            .expect("row");
+        assert!(full.request_body_json.is_none());
+        assert!(!crate::prompt::context_compression_summary_has_benefit(
+            "User wants",
+            1
+        ));
+        assert!(crate::prompt::context_compression_summary_has_benefit(
+            "short", 10_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_context_compression_summary_rejects_empty_and_tool_calls() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+
+        // Empty text
+        {
+            let (state, mut broker_rx) =
+                test_sidecar_state(workspace.path().display().to_string(), 1);
+            let broker_state = state.clone();
+            let broker = tokio::spawn(async move {
+                let request = loop {
+                    let envelope = broker_rx.recv().await.expect("broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let id = request.id.clone().expect("request id");
+                let pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&id)
+                    .cloned()
+                    .expect("pending");
+                pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "response".to_string(),
+                        id: Some(id),
+                        method: None,
+                        payload: json!({
+                            "text": "   ",
+                            "usage": { "inputTokens": 1, "outputTokens": 0 },
+                            "toolCalls": []
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send empty response");
+            });
+            let outcome = remote_sidecar_run_broker_context_compression_summary(
+                &state,
+                None,
+                &mut database,
+                "workspace",
+                "chat-1",
+                "remote-run-empty",
+                "msg-user-1",
+                "msg-assistant-1",
+                "provider-1",
+                "model-1",
+                "source",
+            )
+            .await;
+            broker.await.expect("broker");
+            match outcome {
+                RemoteSidecarContextCompressionOutcome::Failed { message } => {
+                    assert!(message.contains("empty text"));
+                }
+                other => panic!("expected failed empty summary, got {other:?}"),
+            }
+        }
+
+        // Tool call
+        {
+            let (state, mut broker_rx) =
+                test_sidecar_state(workspace.path().display().to_string(), 1);
+            let broker_state = state.clone();
+            let broker = tokio::spawn(async move {
+                let request = loop {
+                    let envelope = broker_rx.recv().await.expect("broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let id = request.id.clone().expect("request id");
+                let pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&id)
+                    .cloned()
+                    .expect("pending");
+                pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "response".to_string(),
+                        id: Some(id),
+                        method: None,
+                        payload: json!({
+                            "text": "should not count",
+                            "toolCalls": [{
+                                "callId": "call-1",
+                                "name": "read_file",
+                                "arguments": { "path": "a" }
+                            }]
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send tool response");
+            });
+            let outcome = remote_sidecar_run_broker_context_compression_summary(
+                &state,
+                None,
+                &mut database,
+                "workspace",
+                "chat-1",
+                "remote-run-tools",
+                "msg-user-1",
+                "msg-assistant-1",
+                "provider-1",
+                "model-1",
+                "source",
+            )
+            .await;
+            broker.await.expect("broker");
+            match outcome {
+                RemoteSidecarContextCompressionOutcome::Failed { message } => {
+                    assert!(message.contains("unsupported tool"));
+                }
+                other => panic!("expected failed tool summary, got {other:?}"),
+            }
+        }
+
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.request_kind == "contextCompression" && row.final_state == "failed")
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_context_compression_failure_messages_are_distinct() {
+        assert!(
+            remote_sidecar_context_compression_failure_message(
+                RemoteSidecarContextCompressionFailureKind::SummaryGeneration,
+                "timeout",
+            )
+            .contains("summary generation failed")
+        );
+        assert!(
+            remote_sidecar_context_compression_failure_message(
+                RemoteSidecarContextCompressionFailureKind::NoBenefit,
+                "",
+            )
+            .contains("no token savings")
+        );
+        assert!(
+            remote_sidecar_context_compression_failure_message(
+                RemoteSidecarContextCompressionFailureKind::StillOverBudget,
+                "required",
+            )
+            .contains("still exceeds the model input budget")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_ensure_compression_persists_llm_snapshot_via_broker() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let broker_state = state.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "old-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "old-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: Vec::new(),
+        };
+
+        let compress_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                runtime_tool_state
+                    .ensure_compression_then_pack(
+                        &mut messages,
+                        &state,
+                        &run_stream,
+                        &mut database,
+                        "workspace",
+                        "chat-1",
+                        "run-1",
+                        "msg-user-1",
+                        "msg-assistant-1",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        assert_eq!(request.method.as_deref(), Some("llm.stream"));
+        assert_eq!(
+            request.payload.get("requestKind").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "stream".to_string(),
+                id: Some(id.clone()),
+                method: None,
+                payload: json!({
+                    "kind": "textDelta",
+                    "delta": "compact remote summary for continuation"
+                }),
+                timestamp: None,
+            })
+            .expect("stream delta");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "llmRequestId": "broker-ctx-1",
+                    "text": "compact remote summary for continuation",
+                    "toolCalls": [],
+                    "usage": { "inputTokens": 100, "outputTokens": 20 }
+                }),
+                timestamp: None,
+            })
+            .expect("response");
+
+        let (packed, events) = compress_task
+            .await
+            .expect("join")
+            .expect("ensure compression");
+        assert!(
+            events
                 .iter()
-                .any(|(_, event)| event.get("type").and_then(Value::as_str) == Some("toolCall"))
+                .any(|event| event.kind == CONTEXT_COMPRESSION_KIND_LLM && event.status == "start")
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == CONTEXT_COMPRESSION_KIND_LLM
+                && event.status == "completed"
+                && event.snapshot_id.is_some()
+        }));
+        assert!(
+            packed
+                .iter()
+                .any(|message| message.content.contains("Context Compression Snapshot"))
+        );
+        assert!(
+            packed
+                .iter()
+                .all(|message| !message.content.contains("old-history-0"))
+        );
+
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db")
+            .context_compression_snapshots_for_chat("chat-1")
+            .expect("snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].chat_id, "chat-1");
+        assert_eq!(snapshots[0].run_id, "run-1");
+        assert!(snapshots[0].summary.contains("compact remote summary"));
+        let metadata: Value =
+            serde_json::from_str(&snapshots[0].metadata_json).expect("metadata json");
+        assert_eq!(metadata.get("kind").and_then(Value::as_str), Some("llm"));
+        assert!(metadata.get("coveredSequences").is_some());
+        assert!(metadata.get("contextUsage").is_some());
+        assert!(metadata.get("triggerTokens").is_some());
+        assert!(metadata.get("availableMessageTokens").is_some());
+    }
+
+    /// Hard regression: compress succeeds → drop in-memory runtime → rebuild from remote SQLite
+    /// must keep snapshot and never resurrect covered history.
+    #[tokio::test]
+    async fn remote_sidecar_llm_compression_survives_sqlite_rebuild_without_reviving_covered_history()
+     {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let history = [
+            ("msg-user-0", "user", "old-history-0 ".repeat(400), 0_i64),
+            (
+                "msg-assistant-0",
+                "assistant",
+                "old-history-1 ".repeat(400),
+                1,
+            ),
+            ("msg-user-1", "user", "old-history-2 ".repeat(400), 2),
+            (
+                "msg-assistant-1",
+                "assistant",
+                "old-history-3 ".repeat(400),
+                3,
+            ),
+            ("msg-user-2", "user", "current turn".to_string(), 4),
+            ("msg-assistant-2", "assistant", String::new(), 5),
+        ];
+        for (id, role, content, sequence) in history {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-1",
+                    role,
+                    content: &content,
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("insert message");
+        }
+
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .prompts
+            .system_prompts
+            .push(foco_store::config::SystemPromptSettings {
+                name: "RemoteSystem".to_string(),
+                content: "remote system prompt marker".to_string(),
+            });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: "RemoteSystem".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        // In-memory ensure path (same as production stream) with a small injected window.
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "old-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "old-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: Vec::new(),
+        };
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let broker_state = state.clone();
+        let compress_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                runtime_tool_state
+                    .ensure_compression_then_pack(
+                        &mut messages,
+                        &state,
+                        &run_stream,
+                        &mut database,
+                        "workspace",
+                        "chat-1",
+                        "run-rebuild-1",
+                        "msg-user-2",
+                        "msg-assistant-2",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        assert_eq!(
+            request.payload.get("requestKind").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "llmRequestId": "broker-rebuild-1",
+                    "text": "compact remote summary survives rebuild",
+                    "toolCalls": [],
+                    "usage": { "inputTokens": 80, "outputTokens": 12 }
+                }),
+                timestamp: None,
+            })
+            .expect("response");
+
+        let (packed, events) = compress_task
+            .await
+            .expect("join")
+            .expect("ensure compression");
+        assert!(events.iter().any(|event| {
+            event.kind == CONTEXT_COMPRESSION_KIND_LLM && event.status == "completed"
+        }));
+        assert!(
+            packed
+                .iter()
+                .any(|message| message.content.contains("Context Compression Snapshot"))
+        );
+
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db for snapshot")
+            .context_compression_snapshots_for_chat("chat-1")
+            .expect("snapshots");
+        assert_eq!(snapshots.len(), 1);
+        let metadata: Value =
+            serde_json::from_str(&snapshots[0].metadata_json).expect("metadata json");
+        let covered_sequences = metadata
+            .get("coveredSequences")
+            .and_then(Value::as_array)
+            .expect("coveredSequences")
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect::<HashSet<_>>();
+        assert!(
+            !covered_sequences.is_empty(),
+            "LLM snapshot must cover at least one DB sequence"
+        );
+        assert!(
+            covered_sequences.contains(&0),
+            "oldest history should be covered in Normal mode"
+        );
+        // Covered marker text must not remain in the packed prompt (summary uses abstract text).
+        if covered_sequences.contains(&0) {
+            assert!(
+                packed
+                    .iter()
+                    .all(|message| !message.content.contains("old-history-0"))
+            );
+        }
+
+        // Drop in-memory runtime completely and rebuild only from remote SQLite.
+        drop(packed);
+        drop(events);
+        let reopened = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen db");
+        let rebuilt = remote_sidecar_prepare_chat_context(
+            &state,
+            &reopened,
+            "chat-1",
+            "msg-user-2",
+            "msg-assistant-2",
+            "model-1",
+            Value::Null,
+        )
+        .expect("rebuild prepare");
+
+        assert_eq!(rebuilt.compression_snapshots.len(), 1);
+        assert!(
+            rebuilt
+                .compression_snapshots
+                .iter()
+                .any(|snapshot| snapshot.summary.contains("survives rebuild"))
+        );
+        assert!(rebuilt.provider_request.messages.iter().any(|message| {
+            message.content.contains("Context Compression Snapshot")
+                && message.content.contains("survives rebuild")
+        }));
+        // Active snapshot replay must skip every covered sequence; do not revive them.
+        assert!(
+            !rebuilt
+                .message_source_sequences
+                .iter()
+                .any(|sequence| sequence.is_some_and(|value| covered_sequences.contains(&value)))
+        );
+        if covered_sequences.contains(&0) {
+            assert!(
+                rebuilt
+                    .provider_request
+                    .messages
+                    .iter()
+                    .all(|message| !message.content.contains("old-history-0"))
+            );
+        }
+        if covered_sequences.contains(&1) {
+            assert!(
+                rebuilt
+                    .provider_request
+                    .messages
+                    .iter()
+                    .all(|message| !message.content.contains("old-history-1"))
+            );
+        }
+        assert!(
+            rebuilt
+                .provider_request
+                .messages
+                .iter()
+                .any(|message| message.role == NeutralChatRole::User
+                    && message.content == "current turn")
+        );
+        // Current user sequence must still be present (not covered).
+        assert!(
+            rebuilt
+                .message_source_sequences
+                .iter()
+                .any(|sequence| *sequence == Some(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_ensure_compression_leaves_no_snapshot_on_broker_failure() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let broker_state = state.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "old-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "old-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: Vec::new(),
+        };
+
+        let compress_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                runtime_tool_state
+                    .ensure_compression_then_pack(
+                        &mut messages,
+                        &state,
+                        &run_stream,
+                        &mut database,
+                        "workspace",
+                        "chat-1",
+                        "run-fail-1",
+                        "msg-user-1",
+                        "msg-assistant-1",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "error".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "code": "broker_disconnected",
+                    "message": "remote broker disconnected"
+                }),
+                timestamp: None,
+            })
+            .expect("error");
+
+        let error = compress_task
+            .await
+            .expect("join")
+            .expect_err("compression must fail on broker disconnect");
+        assert!(error.message.contains("summary generation failed"));
+
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db")
+            .context_compression_snapshots_for_chat("chat-1")
+            .expect("snapshots");
+        assert!(
+            snapshots.is_empty(),
+            "failed compression must not leave a half snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_ensure_compression_keeps_history_when_summary_has_no_benefit() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let broker_state = state.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "old-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "old-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: Vec::new(),
+        };
+
+        let compress_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                runtime_tool_state
+                    .ensure_compression_then_pack(
+                        &mut messages,
+                        &state,
+                        &run_stream,
+                        &mut database,
+                        "workspace",
+                        "chat-1",
+                        "run-no-benefit-1",
+                        "msg-user-1",
+                        "msg-assistant-1",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await
+                    .map(|(packed, events)| (packed, events, messages, runtime_tool_state))
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        // Return a huge "summary" so estimate_text_tokens is not smaller than originals.
+        let huge_summary = "x".repeat(50_000);
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "llmRequestId": "broker-no-benefit-1",
+                    "text": huge_summary,
+                    "toolCalls": [],
+                    "usage": { "inputTokens": 10, "outputTokens": 10 }
+                }),
+                timestamp: None,
+            })
+            .expect("response");
+
+        let (packed, events, messages_after, runtime_after) = compress_task
+            .await
+            .expect("join")
+            .expect("no-benefit path should not hard-fail");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != CONTEXT_COMPRESSION_KIND_LLM
+                    || event.status != "completed")
+        );
+        assert!(
+            messages_after
+                .iter()
+                .any(|message| message.content.contains("old-history-0"))
+        );
+        assert!(runtime_after.compression_snapshots.is_empty());
+        assert!(
+            packed
+                .iter()
+                .any(|message| message.content.contains("old-history-0"))
+        );
+
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db")
+            .context_compression_snapshots_for_chat("chat-1")
+            .expect("snapshots");
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn remote_sidecar_prepare_filters_superseded_snapshots_and_keeps_active_only() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        for message in [
+            NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "old goal",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "old answer",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-user-2",
+                chat_id: "chat-1",
+                role: "user",
+                content: "mid",
+                sequence: 2,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-2",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "mid answer",
+                sequence: 3,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-user-3",
+                chat_id: "chat-1",
+                role: "user",
+                content: "continue",
+                sequence: 4,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-3",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 5,
+                metadata_json: Some("{}"),
+            },
+        ] {
+            database.insert_message(message).expect("insert message");
+        }
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "ctx-old",
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    sequence: 0,
+                    summary: "first compression",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 1,
+                    original_token_count: 100,
+                    summary_token_count: 20,
+                    metadata_json: Some(
+                        r#"{"kind":"llm","coveredSequences":[0,1],"coveredSnapshotIds":[],"supersededSnapshotIds":[]}"#,
+                    ),
+                },
+            )
+            .expect("insert old snapshot");
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "ctx-new",
+                    chat_id: "chat-1",
+                    run_id: "run-2",
+                    sequence: 1,
+                    summary: "second compression supersedes first",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 3,
+                    original_token_count: 200,
+                    summary_token_count: 30,
+                    metadata_json: Some(
+                        r#"{"kind":"llm","coveredSequences":[0,1,2,3],"coveredSnapshotIds":["ctx-old"],"supersededSnapshotIds":["ctx-old"]}"#,
+                    ),
+                },
+            )
+            .expect("insert new snapshot");
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .prompts
+            .system_prompts
+            .push(foco_store::config::SystemPromptSettings {
+                name: "RemoteSystem".to_string(),
+                content: "remote system prompt marker".to_string(),
+            });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: "RemoteSystem".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let prepared = remote_sidecar_prepare_chat_context(
+            &state,
+            &database,
+            "chat-1",
+            "msg-user-3",
+            "msg-assistant-3",
+            "model-1",
+            Value::Null,
+        )
+        .expect("prepared");
+
+        assert_eq!(prepared.compression_snapshots.len(), 1);
+        assert_eq!(prepared.compression_snapshots[0].id, "ctx-new");
+        assert!(prepared.provider_request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("second compression supersedes first")
+        }));
+        assert!(prepared.provider_request.messages.iter().all(|message| {
+            !message.content.contains("first compression")
+                && message.content != "old goal"
+                && message.content != "mid"
+        }));
+        assert!(
+            prepared
+                .provider_request
+                .messages
+                .iter()
+                .any(|message| message.content == "continue")
+        );
+    }
+
+    #[test]
+    fn plan_llm_context_compression_required_overflow_covers_runtime_snapshots_even_if_must_keep() {
+        // Mirrors app/tests ensure_context_compression_tries_llm_for_required_overflow_snapshots:
+        // Normal cannot cover must_keep recent runtime snapshots; RequiredOverflow can.
+        let messages = vec![
+            neutral_text_message(NeutralChatRole::System, "system".to_string()),
+            neutral_text_message(NeutralChatRole::System, "stable ".repeat(80)),
+            neutral_text_message(NeutralChatRole::User, "snapshot a ".repeat(120)),
+            neutral_text_message(NeutralChatRole::User, "snapshot b ".repeat(120)),
+            neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+        ];
+        let sequences = vec![None, None, None, None, Some(9)];
+        let sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::StableInjection,
+            PromptContextSource::RuntimeToolStateSnapshot,
+            PromptContextSource::RuntimeToolStateSnapshot,
+            PromptContextSource::CurrentUser { sequence: 9 },
+        ];
+        let groups = crate::prompt::context_message_groups(
+            &messages,
+            &sequences,
+            &sources,
+            messages.len() - 1,
+        )
+        .expect("groups");
+        assert!(
+            crate::prompt::plan_llm_context_compression(
+                &messages,
+                &sequences,
+                &sources,
+                &[],
+                &groups,
+                8,
+                crate::prompt::LlmContextCompressionMode::Normal,
+            )
+            .expect("normal plan")
+            .is_none()
+                || crate::prompt::llm_context_compression_group_indices(
+                    &groups,
+                    8,
+                    crate::prompt::LlmContextCompressionMode::Normal,
+                )
+                .is_empty()
+        );
+        let overflow = crate::prompt::plan_llm_context_compression(
+            &messages,
+            &sequences,
+            &sources,
+            &[],
+            &groups,
+            8,
+            crate::prompt::LlmContextCompressionMode::RequiredOverflow,
+        )
+        .expect("overflow plan")
+        .expect("some overflow plan");
+        assert!(overflow.covered_message_indices.contains(&2));
+        assert!(overflow.covered_message_indices.contains(&3));
+        assert!(!overflow.covered_sequences.contains(&9));
+    }
+
+    #[test]
+    fn remote_sidecar_context_compression_sse_event_matches_local_shape() {
+        let event = remote_sidecar_context_compression_sse_event(
+            "assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-1".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        assert_eq!(
+            event.get("assistantMessageId").and_then(Value::as_str),
+            Some("assistant-1")
+        );
+        assert_eq!(
+            event.get("snapshotId").and_then(Value::as_str),
+            Some("ctx-1")
+        );
+        assert_eq!(event.get("kind").and_then(Value::as_str), Some("llm"));
+        assert_eq!(
+            event.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        let detail = event.get("detail").expect("detail");
+        assert_eq!(
+            detail.get("providerId").and_then(Value::as_str),
+            Some("provider-1")
+        );
+        assert_eq!(
+            detail.get("modelId").and_then(Value::as_str),
+            Some("model-1")
+        );
+        assert_eq!(
+            detail.get("originalTokenCount").and_then(Value::as_i64),
+            Some(1200)
         );
     }
 
@@ -11752,10 +14154,12 @@ mod tests {
         )
         .expect("record tool result");
 
-        let messages =
+        let history =
             remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
                 .expect("chat messages");
+        let messages = history.messages;
         assert_eq!(messages.len(), 3);
+        assert_eq!(history.sequences, vec![0, 1, 1]);
         assert_eq!(messages[0].role, NeutralChatRole::User);
         assert_eq!(messages[1].role, NeutralChatRole::Assistant);
         assert_eq!(messages[1].tool_calls.len(), 1);
@@ -11843,11 +14247,13 @@ mod tests {
             database.insert_message(message).expect("insert message");
         }
 
-        let messages =
+        let history =
             remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
                 .expect("chat messages");
+        let messages = history.messages;
 
         assert_eq!(messages.len(), 2);
+        assert_eq!(history.sequences, vec![0, 2]);
         assert_eq!(messages[0].content, "first");
         assert_eq!(messages[1].content, "second");
     }
@@ -11930,6 +14336,240 @@ mod tests {
             "# Selected Skills\n\n```json\n[\n  {\n    \"name\": \"Demo\",\n    \"path\": \"/global/demo/SKILL.md\"\n  }\n]\n```\n\n## Skill 1: Demo\n\nPath: `/global/demo/SKILL.md`\n\n### Instructions\n\n# Demo\n\nDo it.\n\n## End Selected Skills\n\nhello"
         );
         assert_eq!(messages[0].role, NeutralChatRole::User);
+    }
+
+    #[test]
+    fn remote_sidecar_prepare_chat_context_uses_real_sequences_and_skips_covered_history() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        for message in [
+            NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "old goal",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "old answer",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-user-2",
+                chat_id: "chat-1",
+                role: "user",
+                content: "continue",
+                sequence: 2,
+                metadata_json: Some("{}"),
+            },
+            NewMessage {
+                id: "msg-assistant-2",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 3,
+                metadata_json: Some("{}"),
+            },
+        ] {
+            database.insert_message(message).expect("insert message");
+        }
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "ctx-1",
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    sequence: 0,
+                    summary: "compressed earlier turns",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 1,
+                    original_token_count: 100,
+                    summary_token_count: 20,
+                    metadata_json: Some(
+                        r#"{"kind":"llm","coveredSequences":[0,1],"coveredSnapshotIds":[],"supersededSnapshotIds":[]}"#,
+                    ),
+                },
+            )
+            .expect("insert snapshot");
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config
+            .prompts
+            .system_prompts
+            .push(foco_store::config::SystemPromptSettings {
+                name: "RemoteSystem".to_string(),
+                content: "remote system prompt marker".to_string(),
+            });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: "RemoteSystem".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let prepared = remote_sidecar_prepare_chat_context(
+            &state,
+            &database,
+            "chat-1",
+            "msg-user-2",
+            "msg-assistant-2",
+            "model-1",
+            Value::Null,
+        )
+        .expect("prepared context");
+
+        assert_eq!(
+            prepared.provider_request.messages.len(),
+            prepared.message_source_sequences.len()
+        );
+        assert_eq!(
+            prepared.provider_request.messages.len(),
+            prepared.message_context_sources.len()
+        );
+        assert_eq!(prepared.compression_snapshots.len(), 1);
+        assert_eq!(prepared.compression_snapshots[0].id, "ctx-1");
+        assert!(
+            prepared
+                .provider_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Context Compression Snapshot"))
+        );
+        assert!(
+            prepared
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| message.content != "old goal" && message.content != "old answer")
+        );
+        assert!(prepared.provider_request.messages.iter().any(|message| {
+            message.role == NeutralChatRole::User && message.content == "continue"
+        }));
+        assert!(
+            prepared
+                .message_context_sources
+                .iter()
+                .any(|source| matches!(source, PromptContextSource::CurrentUser { sequence: 2 }))
+        );
+        assert!(
+            prepared
+                .message_source_sequences
+                .iter()
+                .any(|sequence| *sequence == Some(2))
+        );
+        assert!(
+            !prepared
+                .message_source_sequences
+                .iter()
+                .any(|sequence| *sequence == Some(0) || *sequence == Some(1))
+        );
+        assert_eq!(
+            prepared.active_tool_start_index,
+            prepared.provider_request.messages.len()
+        );
+        assert!(prepared.context_budget.context_window < u64::MAX);
+    }
+
+    #[test]
+    fn plan_llm_context_compression_shared_candidates_match_local_rules() {
+        // Normal mode keeps the latest two compressible groups; cover older history only.
+        let messages = vec![
+            neutral_text_message(NeutralChatRole::System, "system".to_string()),
+            neutral_text_message(NeutralChatRole::User, "old-0".to_string()),
+            neutral_text_message(NeutralChatRole::Assistant, "reply-0".to_string()),
+            neutral_text_message(NeutralChatRole::User, "old-1".to_string()),
+            neutral_text_message(NeutralChatRole::Assistant, "reply-1".to_string()),
+            neutral_text_message(NeutralChatRole::User, "old-2".to_string()),
+            neutral_text_message(NeutralChatRole::Assistant, "reply-2".to_string()),
+            neutral_text_message(NeutralChatRole::User, "current".to_string()),
+        ];
+        let sequences = vec![
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+        ];
+        let sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::StoredMessage { sequence: 0 },
+            PromptContextSource::StoredMessage { sequence: 1 },
+            PromptContextSource::StoredMessage { sequence: 2 },
+            PromptContextSource::StoredMessage { sequence: 3 },
+            PromptContextSource::StoredMessage { sequence: 4 },
+            PromptContextSource::StoredMessage { sequence: 5 },
+            PromptContextSource::CurrentUser { sequence: 6 },
+        ];
+        let groups =
+            crate::prompt::context_message_groups(&messages, &sequences, &sources, messages.len())
+                .expect("groups");
+        let plan = crate::prompt::plan_llm_context_compression(
+            &messages,
+            &sequences,
+            &sources,
+            &[],
+            &groups,
+            10_000,
+            crate::prompt::LlmContextCompressionMode::Normal,
+        )
+        .expect("plan")
+        .expect("some plan");
+        assert!(!plan.covered_message_indices.is_empty());
+        assert!(plan.covered_sequences.contains(&0));
+        assert!(!plan.covered_sequences.contains(&6));
+        assert!(plan.original_tokens > 0);
+        assert!(!plan.source_summary.is_empty());
+
+        let snapshot_message = neutral_text_message(
+            NeutralChatRole::System,
+            "## Context Compression Snapshot\n\nsummary".to_string(),
+        );
+        let replaced = crate::prompt::apply_compression_snapshot_to_messages(
+            &messages,
+            &sequences,
+            &sources,
+            messages.len(),
+            &plan.covered_message_indices,
+            snapshot_message,
+        );
+        assert_eq!(
+            replaced.messages.len(),
+            replaced.message_source_sequences.len()
+        );
+        assert_eq!(
+            replaced.messages.len(),
+            replaced.message_context_sources.len()
+        );
+        assert!(replaced.active_tool_start_index <= replaced.messages.len());
     }
 
     #[test]

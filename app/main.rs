@@ -231,13 +231,13 @@ const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 // Metadata kind for deterministic local context compression snapshots.
 const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
 // Metadata kind for model-generated fallback context compression snapshots.
-const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
+pub(crate) const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
 // Event kind for lossy in-progress tool-state compression.
-const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToolState";
+pub(crate) const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToolState";
 // Timeout for model-generated fallback compression requests.
-const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
 // Maximum output tokens requested for model-generated fallback compression summaries.
-const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
+pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Percent of the model context budget reserved for memory profile and retrieved facts.
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 // Maximum active memory facts considered when building query-specific memory context.
@@ -2328,7 +2328,7 @@ enum PromptContextSourceBucket {
 }
 
 #[derive(Clone)]
-struct ContextMessageGroup {
+pub(crate) struct ContextMessageGroup {
     message_indices: Vec<usize>,
     estimated_tokens: u64,
     must_keep: bool,
@@ -8395,7 +8395,7 @@ fn cached_model_record(
     Ok(cache.and_then(|cache| cache.models.into_iter().find(|model| model.key == key)))
 }
 
-fn utc_timestamp() -> String {
+pub(crate) fn utc_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 

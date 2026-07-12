@@ -238,28 +238,162 @@ pub(crate) enum LlmContextCompressionMode {
     RequiredOverflow,
 }
 
+/// Pure planning input for LLM context compression (local + remote).
+#[derive(Clone, Debug)]
+pub(crate) struct LlmContextCompressionPlan {
+    pub covered_message_indices: Vec<usize>,
+    pub original_tokens: u64,
+    pub source_summary: String,
+    pub covered_sequences: Vec<i64>,
+    pub covered_snapshot_ids: Vec<String>,
+}
+
+/// Message arrays after replacing covered indices with a compression snapshot message.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplacedPromptMessages {
+    pub messages: Vec<NeutralChatMessage>,
+    pub message_source_sequences: Vec<Option<i64>>,
+    pub message_context_sources: Vec<PromptContextSource>,
+    pub active_tool_start_index: usize,
+}
+
+/// Select covered groups/messages and build summary source text without I/O or provider calls.
+pub(crate) fn plan_llm_context_compression(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
+    compression_snapshots: &[ContextCompressionSnapshotRecord],
+    message_groups: &[ContextMessageGroup],
+    available_message_tokens: u64,
+    mode: LlmContextCompressionMode,
+) -> Result<Option<LlmContextCompressionPlan>, ApiError> {
+    validate_prompt_context_lengths(messages, message_source_sequences, message_context_sources)?;
+    let covered_group_indices =
+        llm_context_compression_group_indices(message_groups, available_message_tokens, mode);
+    if covered_group_indices.is_empty() {
+        return Ok(None);
+    }
+    let covered_message_indices = message_group_indices(message_groups, &covered_group_indices)?;
+    let original_tokens = covered_message_indices
+        .iter()
+        .map(|index| neutral_message_estimated_tokens(&messages[*index]))
+        .sum::<u64>();
+    if original_tokens == 0 {
+        return Ok(None);
+    }
+    let source_summary = context_compression_summary_allowing_snapshots(
+        messages,
+        message_source_sequences,
+        &covered_message_indices,
+    )?;
+    let covered_snapshot_ids = compression_covered_snapshot_ids(
+        messages,
+        message_context_sources,
+        &covered_message_indices,
+    );
+    let covered_sequences = compression_covered_sequences_allowing_snapshots(
+        messages,
+        message_source_sequences,
+        compression_snapshots,
+        &covered_message_indices,
+    );
+    Ok(Some(LlmContextCompressionPlan {
+        covered_message_indices,
+        original_tokens,
+        source_summary,
+        covered_sequences,
+        covered_snapshot_ids,
+    }))
+}
+
+/// Replace covered messages with a snapshot system message; keeps parallel arrays aligned.
+pub(crate) fn apply_compression_snapshot_to_messages(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
+    active_tool_start_index: usize,
+    covered_indices: &[usize],
+    snapshot_message: NeutralChatMessage,
+) -> ReplacedPromptMessages {
+    ReplacedPromptMessages {
+        messages: replace_covered_messages_with_snapshot(
+            messages,
+            covered_indices,
+            snapshot_message,
+        ),
+        message_source_sequences: replace_covered_sequences_with_snapshot(
+            message_source_sequences,
+            covered_indices,
+        ),
+        message_context_sources: replace_covered_sources_with_snapshot(
+            message_context_sources,
+            covered_indices,
+            PromptContextSource::CompressionSnapshot,
+        ),
+        active_tool_start_index: compressed_active_tool_start_index(
+            active_tool_start_index,
+            covered_indices,
+        ),
+    }
+}
+
+/// Build a snapshot record shell (metadata_json left empty for the caller to fill).
+pub(crate) fn build_context_compression_snapshot_record(
+    id: String,
+    chat_id: String,
+    run_id: String,
+    sequence: i64,
+    summary: String,
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+    original_tokens: u64,
+    summary_token_count: u64,
+    created_at: String,
+) -> Result<ContextCompressionSnapshotRecord, ApiError> {
+    let original_token_count = i64::try_from(original_tokens)
+        .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
+    let summary_token_count_i64 = i64::try_from(summary_token_count)
+        .map_err(|_| ApiError::internal("context compression summary token count exceeds i64"))?;
+    let (source_message_start_sequence, source_message_end_sequence) =
+        compression_source_sequence_range(message_source_sequences, covered_indices);
+    Ok(ContextCompressionSnapshotRecord {
+        id,
+        chat_id,
+        run_id,
+        sequence,
+        summary,
+        source_message_start_sequence,
+        source_message_end_sequence,
+        original_token_count,
+        summary_token_count: summary_token_count_i64,
+        created_at,
+        metadata_json: String::new(),
+    })
+}
+
 async fn ensure_llm_context_compression(
     context: &mut PreparedChatContext,
     message_groups: &[ContextMessageGroup],
     events: &mut Vec<ContextCompressionEventDetail>,
     mode: LlmContextCompressionMode,
 ) -> Result<bool, ApiError> {
-    let covered_group_indices = llm_context_compression_group_indices(
+    let Some(plan) = plan_llm_context_compression(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        &context.compression_snapshots,
         message_groups,
         context.context_budget.available_message_tokens,
         mode,
-    );
-    if covered_group_indices.is_empty() {
+    )?
+    else {
         return Ok(false);
-    }
-    let covered_indices = message_group_indices(message_groups, &covered_group_indices)?;
-    let original_tokens = covered_indices
-        .iter()
-        .map(|index| neutral_message_estimated_tokens(&context.provider_request.messages[*index]))
-        .sum::<u64>();
-    if original_tokens == 0 {
-        return Ok(false);
-    }
+    };
+    let covered_indices = plan.covered_message_indices;
+    let original_tokens = plan.original_tokens;
+    let source_summary = plan.source_summary;
+    let covered_snapshot_ids = plan.covered_snapshot_ids;
+    let covered_sequences = plan.covered_sequences;
     let compression_started_at = utc_timestamp();
     events.push(context_compression_event_detail(
         "start",
@@ -274,29 +408,12 @@ async fn ensure_llm_context_compression(
         context,
     ));
 
-    let source_summary = context_compression_summary_allowing_snapshots(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &covered_indices,
-    )?;
     let summary = llm_context_compression_summary(context, &source_summary).await?;
-    let summary_token_count = estimate_text_tokens(&summary);
-    if summary_token_count >= original_tokens {
+    if !context_compression_summary_has_benefit(&summary, original_tokens) {
         events.pop();
         return Ok(false);
     }
-
-    let covered_snapshot_ids = compression_covered_snapshot_ids(
-        &context.provider_request.messages,
-        &context.message_context_sources,
-        &covered_indices,
-    );
-    let covered_sequences = compression_covered_sequences_allowing_snapshots(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &context.compression_snapshots,
-        &covered_indices,
-    );
+    let summary_token_count = estimate_text_tokens(&summary);
     let pre_summary = context
         .hook_runtime
         .run_hooks(HookRunRequest {
@@ -453,12 +570,13 @@ pub(crate) fn llm_context_compression_group_indices(
     covered_indices
 }
 
-async fn llm_context_compression_summary(
-    context: &mut PreparedChatContext,
+/// Build the provider request used by local and remote LLM context compression summaries.
+pub(crate) fn build_context_compression_summary_request(
+    model_id: &str,
     source_summary: &str,
-) -> Result<String, ApiError> {
-    let request = NeutralChatRequest {
-        model_id: context.model_id.clone(),
+) -> NeutralChatRequest {
+    NeutralChatRequest {
+        model_id: model_id.to_string(),
         messages: vec![
             neutral_text_message(
                 NeutralChatRole::System,
@@ -476,7 +594,19 @@ async fn llm_context_compression_summary(
         max_output_tokens: Some(LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
-    };
+    }
+}
+
+/// True when the summary is strictly smaller than the covered original token estimate.
+pub(crate) fn context_compression_summary_has_benefit(summary: &str, original_tokens: u64) -> bool {
+    estimate_text_tokens(summary) < original_tokens
+}
+
+async fn llm_context_compression_summary(
+    context: &mut PreparedChatContext,
+    source_summary: &str,
+) -> Result<String, ApiError> {
+    let request = build_context_compression_summary_request(&context.model_id, source_summary);
     let request_id = unique_id("llm");
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();
@@ -765,6 +895,91 @@ async fn llm_context_compression_summary(
     Ok(summary)
 }
 
+/// Prepared snapshot write + in-memory replacement. Callers insert into their
+/// WorkspaceDatabase first, then apply `replaced` only on success.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedContextCompressionSnapshot {
+    pub snapshot: ContextCompressionSnapshotRecord,
+    pub replaced: ReplacedPromptMessages,
+    pub summary: String,
+}
+
+/// Build snapshot record + replacement arrays without opening a database.
+/// Fills `metadata.contextUsage` from the post-replacement prompt layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_context_compression_snapshot(
+    chat_id: &str,
+    run_id: &str,
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
+    active_tool_start_index: usize,
+    compression_snapshots: &[ContextCompressionSnapshotRecord],
+    context_budget: &foco_agent::ContextBudget,
+    covered_indices: &[usize],
+    summary: String,
+    original_tokens: u64,
+    summary_token_count: u64,
+    mut metadata: Value,
+) -> Result<PreparedContextCompressionSnapshot, ApiError> {
+    let snapshot_id = unique_id("ctx");
+    let snapshot_sequence = next_context_snapshot_sequence(compression_snapshots)?;
+    let mut snapshot = build_context_compression_snapshot_record(
+        snapshot_id,
+        chat_id.to_string(),
+        run_id.to_string(),
+        snapshot_sequence,
+        summary.clone(),
+        message_source_sequences,
+        covered_indices,
+        original_tokens,
+        summary_token_count,
+        utc_timestamp(),
+    )?;
+    let replaced = apply_compression_snapshot_to_messages(
+        messages,
+        message_source_sequences,
+        message_context_sources,
+        active_tool_start_index,
+        covered_indices,
+        compression_snapshot_message(&snapshot),
+    );
+    metadata["contextUsage"] = post_compression_context_usage_metadata_from_budget(
+        context_budget,
+        &replaced.messages,
+        &replaced.message_source_sequences,
+        &replaced.message_context_sources,
+        replaced.active_tool_start_index,
+    )?;
+    snapshot.metadata_json = metadata.to_string();
+    Ok(PreparedContextCompressionSnapshot {
+        snapshot,
+        replaced,
+        summary,
+    })
+}
+
+/// Insert a prepared snapshot into an already-open workspace database.
+pub(crate) fn insert_context_compression_snapshot_record(
+    database: &mut WorkspaceDatabase,
+    prepared: &PreparedContextCompressionSnapshot,
+) -> Result<(), ApiError> {
+    database
+        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+            id: &prepared.snapshot.id,
+            chat_id: &prepared.snapshot.chat_id,
+            run_id: &prepared.snapshot.run_id,
+            sequence: prepared.snapshot.sequence,
+            summary: &prepared.summary,
+            source_message_start_sequence: prepared.snapshot.source_message_start_sequence,
+            source_message_end_sequence: prepared.snapshot.source_message_end_sequence,
+            original_token_count: prepared.snapshot.original_token_count,
+            summary_token_count: prepared.snapshot.summary_token_count,
+            metadata_json: Some(&prepared.snapshot.metadata_json),
+        })
+        .map_err(ApiError::from_workspace_error)
+}
+
 fn persist_context_compression_snapshot(
     context: &mut PreparedChatContext,
     covered_indices: &[usize],
@@ -772,79 +987,38 @@ fn persist_context_compression_snapshot(
     original_tokens: u64,
     summary_token_count: u64,
     kind: &str,
-    mut metadata: Value,
+    metadata: Value,
 ) -> Result<ContextCompressionSnapshotRecord, ApiError> {
-    let snapshot_id = unique_id("ctx");
-    let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
-    let original_token_count = i64::try_from(original_tokens)
-        .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
-    let summary_token_count_i64 = i64::try_from(summary_token_count)
-        .map_err(|_| ApiError::internal("context compression summary token count exceeds i64"))?;
-    let (source_message_start_sequence, source_message_end_sequence) =
-        compression_source_sequence_range(&context.message_source_sequences, covered_indices);
-
-    let mut snapshot = ContextCompressionSnapshotRecord {
-        id: snapshot_id,
-        chat_id: context.chat_id.clone(),
-        run_id: context.llm_request_id.clone(),
-        sequence: snapshot_sequence,
-        summary: summary.clone(),
-        source_message_start_sequence,
-        source_message_end_sequence,
-        original_token_count,
-        summary_token_count: summary_token_count_i64,
-        created_at: utc_timestamp(),
-        metadata_json: String::new(),
-    };
-    let replaced_messages = replace_covered_messages_with_snapshot(
+    let prepared = prepare_context_compression_snapshot(
+        &context.chat_id,
+        &context.llm_request_id,
         &context.provider_request.messages,
-        covered_indices,
-        compression_snapshot_message(&snapshot),
-    );
-    let replaced_sequences =
-        replace_covered_sequences_with_snapshot(&context.message_source_sequences, covered_indices);
-    let replaced_sources = replace_covered_sources_with_snapshot(
+        &context.message_source_sequences,
         &context.message_context_sources,
+        context.active_tool_start_index,
+        &context.compression_snapshots,
+        &context.context_budget,
         covered_indices,
-        PromptContextSource::CompressionSnapshot,
-    );
-    let replaced_active_tool_start_index =
-        compressed_active_tool_start_index(context.active_tool_start_index, covered_indices);
-    metadata["contextUsage"] = post_compression_context_usage_metadata(
-        context,
-        &replaced_messages,
-        &replaced_sequences,
-        &replaced_sources,
-        replaced_active_tool_start_index,
+        summary,
+        original_tokens,
+        summary_token_count,
+        metadata,
     )?;
-    let metadata_json = metadata.to_string();
-    snapshot.metadata_json = metadata_json.clone();
 
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    database
-        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
-            id: &snapshot.id,
-            chat_id: &context.chat_id,
-            run_id: &context.llm_request_id,
-            sequence: snapshot_sequence,
-            summary: &summary,
-            source_message_start_sequence,
-            source_message_end_sequence,
-            original_token_count,
-            summary_token_count: summary_token_count_i64,
-            metadata_json: Some(&metadata_json),
-        })
-        .map_err(ApiError::from_workspace_error)?;
+    insert_context_compression_snapshot_record(&mut database, &prepared)?;
 
-    context.provider_request.messages = replaced_messages;
-    context.message_source_sequences = replaced_sequences;
-    context.message_context_sources = replaced_sources;
-    context.active_tool_start_index = replaced_active_tool_start_index;
-    context.compression_snapshots.push(snapshot.clone());
+    context.provider_request.messages = prepared.replaced.messages;
+    context.message_source_sequences = prepared.replaced.message_source_sequences;
+    context.message_context_sources = prepared.replaced.message_context_sources;
+    context.active_tool_start_index = prepared.replaced.active_tool_start_index;
+    context
+        .compression_snapshots
+        .push(prepared.snapshot.clone());
 
     tracing::debug!(kind = kind, "created context compression snapshot");
-    Ok(snapshot)
+    Ok(prepared.snapshot)
 }
 
 fn compression_source_sequence_range(
@@ -1585,6 +1759,13 @@ fn next_context_snapshot_sequence(
     }
 
     Ok(next)
+}
+
+#[allow(dead_code)]
+pub(crate) fn next_context_compression_snapshot_sequence(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> Result<i64, ApiError> {
+    next_context_snapshot_sequence(snapshots)
 }
 
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
@@ -2349,8 +2530,8 @@ pub(crate) fn prompt_context_source_bucket_label(
     }
 }
 
-fn post_compression_context_usage_metadata(
-    context: &PreparedChatContext,
+fn post_compression_context_usage_metadata_from_budget(
+    budget: &foco_agent::ContextBudget,
     messages: &[NeutralChatMessage],
     source_sequences: &[Option<i64>],
     sources: &[PromptContextSource],
@@ -2358,11 +2539,11 @@ fn post_compression_context_usage_metadata(
 ) -> Result<Value, ApiError> {
     let message_groups =
         context_message_groups(messages, source_sequences, sources, active_tool_start_index)?;
-    let segments = context_usage_segments(&context.context_budget, &message_groups);
+    let segments = context_usage_segments(budget, &message_groups);
     Ok(json!({
-        "contextWindow": context.context_budget.context_window,
-        "maxOutputTokens": context.context_budget.max_output_tokens,
-        "triggerTokens": context_window_compression_trigger_tokens(context.context_budget.context_window),
+        "contextWindow": budget.context_window,
+        "maxOutputTokens": budget.max_output_tokens,
+        "triggerTokens": context_window_compression_trigger_tokens(budget.context_window),
         "totalUsedTokens": context_usage_segments_total(&segments),
         "segments": segments,
     }))
