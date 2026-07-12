@@ -8823,6 +8823,93 @@ fn agent_task_state_updates_are_conditional_and_attempts_are_durable() {
 }
 
 #[test]
+fn agent_task_state_update_for_attempt_rejects_replaced_attempt() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-attempt-guard", "attempt-guard");
+    let task_id = AgentTaskId::new("agent-task-attempt-guard").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    let first_attempt = AgentAttemptId::new("agent-attempt-guard-first").expect("first attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &first_attempt)
+        .expect("claim first")
+        .expect("first claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(r#"{"message":"first failed"}"#),
+                interruption_reason: None,
+            })
+            .expect("fail first")
+    );
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Failed,
+                transition: AgentTaskTransition::Retry,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("retry first")
+    );
+    let second_attempt =
+        AgentAttemptId::new("agent-attempt-guard-second").expect("second attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &second_attempt)
+        .expect("claim second")
+        .expect("second claimed");
+
+    assert!(
+        !database
+            .update_agent_task_state_for_attempt(
+                AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Fail,
+                    result_json: None,
+                    error_json: Some(r#"{"message":"stale recovery"}"#),
+                    interruption_reason: None,
+                },
+                &first_attempt,
+            )
+            .expect("stale attempt update")
+    );
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Running
+    );
+    let attempts = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts");
+    assert_eq!(attempts[0].status, foco_agent::AgentAttemptStatus::Failed);
+    assert_eq!(attempts[1].id, second_attempt);
+    assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
+}
+
+#[test]
 fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");

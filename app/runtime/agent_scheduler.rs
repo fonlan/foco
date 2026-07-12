@@ -1,8 +1,11 @@
 use std::{
-    collections::HashSet,
+    any::Any,
+    collections::{HashMap, HashSet},
+    future::Future,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -20,11 +23,12 @@ use foco_store::{
         NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, WorkspaceDatabase,
     },
 };
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Semaphore, mpsc},
-    task::{JoinHandle, JoinSet},
+    sync::{Semaphore, mpsc, watch},
+    task::{Id as TokioTaskId, JoinHandle, JoinSet},
     time,
 };
 
@@ -53,8 +57,19 @@ const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
-const AGENT_TASK_DB_RETRY_ATTEMPTS: usize = 4;
-const AGENT_TASK_DB_RETRY_DELAY: Duration = Duration::from_millis(500);
+const AGENT_TASK_DB_SHORT_RETRY_ATTEMPTS: usize = 4;
+const AGENT_TASK_DB_SHORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const AGENT_LIFECYCLE_DB_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const AGENT_LIFECYCLE_DB_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const AGENT_LIFECYCLE_DB_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const AGENT_LIFECYCLE_DB_RETRY_MAX_DELAY: Duration = Duration::from_millis(2);
+const AGENT_LIFECYCLE_DB_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const AGENT_LIFECYCLE_DB_RETRY_ERROR_AFTER: Duration = Duration::from_secs(120);
+const AGENT_LIFECYCLE_DB_RETRY_ERROR_INTERVAL: Duration = Duration::from_secs(120);
 const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
 const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
 
@@ -125,6 +140,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
 
     let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
     let mut runs = JoinSet::new();
+    let mut run_identities = HashMap::new();
     let mut shutdown_rx = state.app_shutdown_rx.clone();
     let mut scan = true;
     let mut next_deadline_at: Option<DateTime<Utc>> = None;
@@ -132,7 +148,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     loop {
         if scan {
             scan = false;
-            match schedule_runnable_tasks(&state, &permits, &mut runs).await {
+            match schedule_runnable_tasks(&state, &permits, &mut runs, &mut run_identities).await {
                 Ok(result) => next_deadline_at = result.next_deadline_at,
                 Err(error) => {
                     next_deadline_at = Some(
@@ -157,9 +173,9 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
                 }
                 scan = true;
             }
-            completed = runs.join_next(), if !runs.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    tracing::error!(error = %error, "Agent scheduler run task panicked");
+            completed = runs.join_next_with_id(), if !runs.is_empty() => {
+                if let Some(result) = completed {
+                    handle_agent_run_join_result(&state, result, &mut run_identities).await;
                 }
                 scan = true;
             }
@@ -169,10 +185,94 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
         }
     }
 
-    while let Some(result) = runs.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(error = %error, "Agent scheduler run failed during shutdown");
+    while let Some(result) = runs.join_next_with_id().await {
+        handle_agent_run_join_result(&state, result, &mut run_identities).await;
+    }
+}
+
+async fn handle_agent_run_join_result(
+    state: &AppState,
+    result: Result<(TokioTaskId, AgentCoordinatorRunCompletion), tokio::task::JoinError>,
+    run_identities: &mut HashMap<TokioTaskId, AgentCoordinatorRunIdentity>,
+) {
+    match result {
+        Ok((run_id, completion)) => {
+            run_identities.remove(&run_id);
+            if let AgentCoordinatorRunExit::Panicked(panic_message) = completion.exit {
+                let reason = format!("Coordinator task panicked: {panic_message}");
+                recover_abnormal_coordinator_exit(state, &completion.identity, &reason).await;
+            }
         }
+        Err(error) => {
+            let run_id = error.id();
+            let Some(identity) = run_identities.remove(&run_id) else {
+                tracing::error!(error = %error, "Agent scheduler run exited without tracked identity");
+                return;
+            };
+            let reason = if error.is_cancelled() {
+                format!("Coordinator task future was cancelled: {error}")
+            } else {
+                format!("Coordinator task future exited abnormally: {error}")
+            };
+            recover_abnormal_coordinator_exit(state, &identity, &reason).await;
+        }
+    }
+}
+
+async fn recover_abnormal_coordinator_exit(
+    state: &AppState,
+    identity: &AgentCoordinatorRunIdentity,
+    reason: &str,
+) {
+    tracing::error!(
+        workspace_id = %identity.workspace.id,
+        task_id = %identity.task_id,
+        attempt_id = %identity.attempt_id,
+        reason,
+        "Coordinator task future exited before normal lifecycle closure"
+    );
+    match fail_claimed_task_durably(state, identity, reason).await {
+        Ok(()) => {
+            if let Err(wake_error) = state.agent_scheduler.wake() {
+                tracing::warn!(
+                    workspace_id = %identity.workspace.id,
+                    task_id = %identity.task_id,
+                    attempt_id = %identity.attempt_id,
+                    error = %wake_error.message,
+                    "failed to wake Agent scheduler after abnormal task recovery"
+                );
+            }
+        }
+        Err(persist_error) => {
+            tracing::error!(
+                workspace_id = %identity.workspace.id,
+                task_id = %identity.task_id,
+                attempt_id = %identity.attempt_id,
+                original_error = reason,
+                closure_error = %persist_error.message,
+                "failed to recover abnormal Coordinator task exit"
+            );
+        }
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "Coordinator task panicked with a non-string payload".to_string()
+}
+
+async fn capture_agent_coordinator_exit<F>(future: F) -> AgentCoordinatorRunExit
+where
+    F: Future<Output = ()>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(()) => AgentCoordinatorRunExit::Finished,
+        Err(payload) => AgentCoordinatorRunExit::Panicked(panic_payload_message(payload)),
     }
 }
 
@@ -295,6 +395,23 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
     Ok(())
 }
 
+#[derive(Clone)]
+struct AgentCoordinatorRunIdentity {
+    workspace: WorkspaceConfig,
+    task_id: AgentTaskId,
+    attempt_id: AgentAttemptId,
+}
+
+enum AgentCoordinatorRunExit {
+    Finished,
+    Panicked(String),
+}
+
+struct AgentCoordinatorRunCompletion {
+    identity: AgentCoordinatorRunIdentity,
+    exit: AgentCoordinatorRunExit,
+}
+
 #[derive(Default)]
 struct AgentSchedulerScan {
     next_deadline_at: Option<DateTime<Utc>>,
@@ -303,7 +420,8 @@ struct AgentSchedulerScan {
 async fn schedule_runnable_tasks(
     state: &AppState,
     permits: &Arc<Semaphore>,
-    runs: &mut JoinSet<()>,
+    runs: &mut JoinSet<AgentCoordinatorRunCompletion>,
+    run_identities: &mut HashMap<TokioTaskId, AgentCoordinatorRunIdentity>,
 ) -> Result<AgentSchedulerScan, ApiError> {
     let config = config_snapshot(state)?;
     let mut scan = AgentSchedulerScan::default();
@@ -373,14 +491,19 @@ async fn schedule_runnable_tasks(
                 continue;
             };
             drop(database);
+            let identity = AgentCoordinatorRunIdentity {
+                workspace: workspace.clone(),
+                task_id: claimed.id.clone(),
+                attempt_id: attempt_id.clone(),
+            };
             if let Err(error) =
                 crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
                     &workspace.path,
                     &claimed.id,
                 )
             {
-                let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
+                fail_claimed_task_after_scheduler_error(state, &identity, &error).await?;
                 continue;
             }
             let mut database = open_workspace_database_critical(&workspace.path)?;
@@ -394,8 +517,8 @@ async fn schedule_runnable_tasks(
                 json!({}),
             ) {
                 drop(database);
-                let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
+                fail_claimed_task_after_scheduler_error(state, &identity, &error).await?;
                 continue;
             }
             if let Err(error) = insert_agent_event(
@@ -417,20 +540,66 @@ async fn schedule_runnable_tasks(
                 }),
             ) {
                 drop(database);
-                let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
+                fail_claimed_task_after_scheduler_error(state, &identity, &error).await?;
                 continue;
             }
             drop(database);
-            let state = state.clone();
-            let workspace = workspace.clone();
-            runs.spawn(async move {
+            let run_state = state.clone();
+            let run_identity = identity.clone();
+            let abort_handle = runs.spawn(async move {
                 let _permit = permit;
-                run_coordinator_task(state, workspace, claimed.id, attempt_id).await;
+                let exit = capture_agent_coordinator_exit(run_coordinator_task(
+                    run_state,
+                    run_identity.workspace.clone(),
+                    run_identity.task_id.clone(),
+                    run_identity.attempt_id.clone(),
+                ))
+                .await;
+                AgentCoordinatorRunCompletion {
+                    identity: run_identity,
+                    exit,
+                }
             });
+            run_identities.insert(abort_handle.id(), identity);
         }
     }
     Ok(scan)
+}
+
+async fn fail_claimed_task_after_scheduler_error(
+    state: &AppState,
+    identity: &AgentCoordinatorRunIdentity,
+    original_error: &ApiError,
+) -> Result<(), ApiError> {
+    match fail_claimed_task_durably(state, identity, &original_error.message).await {
+        Ok(()) => {
+            if let Err(wake_error) = state.agent_scheduler.wake() {
+                tracing::warn!(
+                    workspace_id = %identity.workspace.id,
+                    task_id = %identity.task_id,
+                    attempt_id = %identity.attempt_id,
+                    error = %wake_error.message,
+                    "failed to wake Agent scheduler after failed task closure"
+                );
+            }
+            Ok(())
+        }
+        Err(closure_error) => {
+            tracing::error!(
+                workspace_id = %identity.workspace.id,
+                task_id = %identity.task_id,
+                attempt_id = %identity.attempt_id,
+                original_error = %original_error.message,
+                closure_error = %closure_error.message,
+                "failed to close claimed Agent task after scheduler error"
+            );
+            Err(ApiError::internal(format!(
+                "Agent scheduler operation failed: {}; failed to persist task failure: {}",
+                original_error.message, closure_error.message
+            )))
+        }
+    }
 }
 
 fn record_next_agent_deadline(
@@ -480,6 +649,11 @@ async fn run_coordinator_task(
     task_id: AgentTaskId,
     attempt_id: AgentAttemptId,
 ) {
+    let identity = AgentCoordinatorRunIdentity {
+        workspace: workspace.clone(),
+        task_id: task_id.clone(),
+        attempt_id: attempt_id.clone(),
+    };
     if let Err(error) = run_coordinator_task_inner(&state, &workspace, &task_id, &attempt_id).await
     {
         tracing::error!(
@@ -490,18 +664,28 @@ async fn run_coordinator_task(
             "Coordinator task failed"
         );
         if let Err(persist_error) =
-            fail_claimed_task_with_retry(&workspace.path, &task_id, &error.message).await
+            fail_claimed_task_durably(&state, &identity, &error.message).await
         {
             tracing::error!(
                 workspace_id = %workspace.id,
                 task_id = %task_id,
                 attempt_id = %attempt_id,
-                error = %persist_error.message,
+                original_error = %error.message,
+                closure_error = %persist_error.message,
                 "failed to persist failed Coordinator task"
             );
+            return;
         }
     }
-    let _ = state.agent_scheduler.wake();
+    if let Err(wake_error) = state.agent_scheduler.wake() {
+        tracing::warn!(
+            workspace_id = %workspace.id,
+            task_id = %task_id,
+            attempt_id = %attempt_id,
+            error = %wake_error.message,
+            "failed to wake Agent scheduler after Coordinator task closure"
+        );
+    }
 }
 
 async fn run_coordinator_task_inner(
@@ -623,7 +807,10 @@ async fn run_coordinator_task_inner(
         chat_context.provider_request.prompt_cache_retention =
             Some(PROMPT_CACHE_RETENTION_24H.to_string());
     }
-    consume_agent_messages(&workspace.path, &consumed_agent_message_ids)?;
+    retry_agent_runtime_database_operation("consume Agent messages", || {
+        consume_agent_messages(&workspace.path, &consumed_agent_message_ids)
+    })
+    .await?;
     chat_context.agent_associations = AgentRunAssociations {
         team_id: Some(task.team_id.clone()),
         instance_id: Some(task.owner_instance_id.clone()),
@@ -678,15 +865,45 @@ async fn run_coordinator_task_inner(
         guidance_tx,
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
-    retry_agent_runtime_database_operation("persist Agent task context", || {
-        persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)
-    })
+    let lifecycle_context =
+        AgentLifecycleOperationContext::from_identity(workspace, task_id, attempt_id);
+    retry_agent_lifecycle_database_operation(
+        "persist Agent task context",
+        &lifecycle_context,
+        state.app_shutdown_rx.clone(),
+        || persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome),
+    )
     .await?;
-    retry_agent_runtime_database_operation("finish Agent task", || {
-        finish_claimed_task(&workspace.path, &task, attempt_id, outcome.clone())
-    })
+    retry_agent_lifecycle_database_operation(
+        "finish Agent task",
+        &lifecycle_context,
+        state.app_shutdown_rx.clone(),
+        || finish_claimed_task(&workspace.path, &task, attempt_id, outcome.clone()),
+    )
     .await?;
     crate::plan_runtime::sync_plan_phase_for_agent_task(state, workspace, &task.id).await
+}
+
+struct AgentLifecycleOperationContext<'a> {
+    workspace_id: &'a str,
+    workspace_path: &'a Path,
+    task_id: &'a AgentTaskId,
+    attempt_id: Option<&'a AgentAttemptId>,
+}
+
+impl<'a> AgentLifecycleOperationContext<'a> {
+    fn from_identity(
+        workspace: &'a WorkspaceConfig,
+        task_id: &'a AgentTaskId,
+        attempt_id: &'a AgentAttemptId,
+    ) -> Self {
+        Self {
+            workspace_id: &workspace.id,
+            workspace_path: &workspace.path,
+            task_id,
+            attempt_id: Some(attempt_id),
+        }
+    }
 }
 
 async fn retry_agent_runtime_database_operation<T, F>(
@@ -696,20 +913,20 @@ async fn retry_agent_runtime_database_operation<T, F>(
 where
     F: FnMut() -> Result<T, ApiError>,
 {
-    for attempt in 1..=AGENT_TASK_DB_RETRY_ATTEMPTS {
+    for attempt in 1..=AGENT_TASK_DB_SHORT_RETRY_ATTEMPTS {
         match operation() {
             Ok(value) => return Ok(value),
             Err(error)
-                if attempt < AGENT_TASK_DB_RETRY_ATTEMPTS
+                if attempt < AGENT_TASK_DB_SHORT_RETRY_ATTEMPTS
                     && is_workspace_database_concurrency_error(&error) =>
             {
                 tracing::warn!(
                     operation = operation_name,
                     attempt,
                     error = %error.message,
-                    "Agent runtime database operation hit concurrency limit; retrying"
+                    "Agent runtime database operation hit concurrency limit; short retry"
                 );
-                time::sleep(AGENT_TASK_DB_RETRY_DELAY).await;
+                time::sleep(AGENT_TASK_DB_SHORT_RETRY_DELAY).await;
             }
             Err(error) => return Err(error),
         }
@@ -718,14 +935,126 @@ where
     unreachable!("retry loop always returns")
 }
 
+async fn retry_agent_lifecycle_database_operation<T, F>(
+    operation_name: &'static str,
+    context: &AgentLifecycleOperationContext<'_>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut operation: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut() -> Result<T, ApiError>,
+{
+    let started_at = Instant::now();
+    let mut attempt = 0_u64;
+    let mut retry_delay = AGENT_LIFECYCLE_DB_RETRY_INITIAL_DELAY;
+    let mut next_warning_at = Duration::ZERO;
+    let mut next_error_at = AGENT_LIFECYCLE_DB_RETRY_ERROR_AFTER;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_workspace_database_concurrency_error(&error) => {
+                let elapsed = started_at.elapsed();
+                if elapsed >= next_error_at {
+                    tracing::error!(
+                        workspace_id = context.workspace_id,
+                        workspace_path = %context.workspace_path.display(),
+                        task_id = %context.task_id,
+                        attempt_id = context.attempt_id.map(ToString::to_string),
+                        operation = operation_name,
+                        retry_attempt = attempt,
+                        elapsed_ms = elapsed.as_millis(),
+                        error = %error.message,
+                        "Agent lifecycle database operation remains blocked; runtime health degraded"
+                    );
+                    next_error_at = elapsed.saturating_add(AGENT_LIFECYCLE_DB_RETRY_ERROR_INTERVAL);
+                } else if elapsed >= next_warning_at {
+                    tracing::warn!(
+                        workspace_id = context.workspace_id,
+                        workspace_path = %context.workspace_path.display(),
+                        task_id = %context.task_id,
+                        attempt_id = context.attempt_id.map(ToString::to_string),
+                        operation = operation_name,
+                        retry_attempt = attempt,
+                        elapsed_ms = elapsed.as_millis(),
+                        retry_delay_ms = retry_delay.as_millis(),
+                        error = %error.message,
+                        "Agent lifecycle database operation hit concurrency limit; retrying durably"
+                    );
+                    next_warning_at =
+                        elapsed.saturating_add(AGENT_LIFECYCLE_DB_RETRY_WARNING_INTERVAL);
+                }
+
+                if *shutdown_rx.borrow() {
+                    return Err(ApiError::internal(format!(
+                        "{SHUTDOWN_MESSAGE} while waiting to {operation_name}"
+                    )));
+                }
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return Err(ApiError::internal(format!(
+                                "{SHUTDOWN_MESSAGE} while waiting to {operation_name}"
+                            )));
+                        }
+                    }
+                    _ = time::sleep(retry_delay) => {}
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(AGENT_LIFECYCLE_DB_RETRY_MAX_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn fail_claimed_task_durably(
+    state: &AppState,
+    identity: &AgentCoordinatorRunIdentity,
+    message: &str,
+) -> Result<(), ApiError> {
+    let context = AgentLifecycleOperationContext::from_identity(
+        &identity.workspace,
+        &identity.task_id,
+        &identity.attempt_id,
+    );
+    retry_agent_lifecycle_database_operation(
+        "fail claimed Agent task",
+        &context,
+        state.app_shutdown_rx.clone(),
+        || {
+            fail_claimed_task(
+                &identity.workspace.path,
+                &identity.task_id,
+                Some(&identity.attempt_id),
+                message,
+            )
+        },
+    )
+    .await
+}
+
 pub(crate) async fn fail_claimed_task_with_retry(
     workspace_path: &Path,
     task_id: &AgentTaskId,
     message: &str,
 ) -> Result<(), ApiError> {
-    retry_agent_runtime_database_operation("fail claimed Agent task", || {
-        fail_claimed_task(workspace_path, task_id, message)
-    })
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let workspace_id = workspace_path.display().to_string();
+    let context = AgentLifecycleOperationContext {
+        workspace_id: &workspace_id,
+        workspace_path,
+        task_id,
+        attempt_id: None,
+    };
+    retry_agent_lifecycle_database_operation(
+        "fail claimed Agent task",
+        &context,
+        shutdown_rx,
+        || fail_claimed_task(workspace_path, task_id, None, message),
+    )
     .await
 }
 
@@ -1824,15 +2153,18 @@ fn finish_claimed_task(
         .transpose()?;
     let mut database = open_workspace_database_critical(workspace_path)?;
     let updated = database
-        .update_agent_task_state(AgentTaskStateUpdate {
-            team_id: &task.team_id,
-            task_id: &task.id,
-            expected_status: AgentTaskStatus::Running,
-            transition,
-            result_json: result_json.as_deref(),
-            error_json: error_json.as_deref(),
-            interruption_reason: None,
-        })
+        .update_agent_task_state_for_attempt(
+            AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task.id,
+                expected_status: AgentTaskStatus::Running,
+                transition,
+                result_json: result_json.as_deref(),
+                error_json: error_json.as_deref(),
+                interruption_reason: None,
+            },
+            attempt_id,
+        )
         .map_err(ApiError::from_workspace_error)?;
     if !updated {
         return Err(ApiError::internal(format!(
@@ -1909,6 +2241,7 @@ fn agent_task_worktree_result(
 fn fail_claimed_task(
     workspace_path: &Path,
     task_id: &AgentTaskId,
+    expected_attempt_id: Option<&AgentAttemptId>,
     message: &str,
 ) -> Result<(), ApiError> {
     let mut database = open_workspace_database_critical(workspace_path)?;
@@ -1931,17 +2264,35 @@ fn fail_claimed_task(
         });
         error_json = error.to_string();
     }
-    database
-        .update_agent_task_state(AgentTaskStateUpdate {
-            team_id: &task.team_id,
-            task_id: &task.id,
-            expected_status: AgentTaskStatus::Running,
-            transition: AgentTaskTransition::Fail,
-            result_json: None,
-            error_json: Some(&error_json),
-            interruption_reason: None,
-        })
-        .map_err(ApiError::from_workspace_error)?;
+    let update = AgentTaskStateUpdate {
+        team_id: &task.team_id,
+        task_id: &task.id,
+        expected_status: AgentTaskStatus::Running,
+        transition: AgentTaskTransition::Fail,
+        result_json: None,
+        error_json: Some(&error_json),
+        interruption_reason: None,
+    };
+    let updated = match expected_attempt_id {
+        Some(attempt_id) => database.update_agent_task_state_for_attempt(update, attempt_id),
+        None => database.update_agent_task_state(update),
+    }
+    .map_err(ApiError::from_workspace_error)?;
+    if !updated {
+        return Ok(());
+    }
+    insert_agent_event(
+        &mut database,
+        &task.team_id,
+        "task_failed",
+        Some(&task.owner_instance_id),
+        Some(&task.id),
+        expected_attempt_id,
+        json!({
+            "outcome": error,
+            "recoveryReason": "coordinator_lifecycle_closure",
+        }),
+    )?;
     database
         .fail_plan_phase_run(&task.id, message)
         .map_err(ApiError::from_workspace_error)?;
@@ -2229,6 +2580,86 @@ mod tests {
         assert!(permits.try_acquire_owned().is_ok());
     }
 
+    #[tokio::test]
+    async fn coordinator_exit_capture_turns_panic_into_recoverable_result() {
+        let exit = capture_agent_coordinator_exit(async {
+            panic!("synthetic Coordinator panic");
+        })
+        .await;
+
+        match exit {
+            AgentCoordinatorRunExit::Panicked(message) => {
+                assert_eq!(message, "synthetic Coordinator panic");
+            }
+            AgentCoordinatorRunExit::Finished => panic!("panic must not look like normal finish"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_database_retry_outlives_short_retry_budget() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let task_id = AgentTaskId::new("agent-task-durable-retry").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-durable-retry").expect("attempt id");
+        let context = AgentLifecycleOperationContext {
+            workspace_id: "workspace-durable-retry",
+            workspace_path: workspace.path(),
+            task_id: &task_id,
+            attempt_id: Some(&attempt_id),
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut attempts = 0;
+
+        let value = retry_agent_lifecycle_database_operation(
+            "test durable retry",
+            &context,
+            shutdown_rx,
+            || {
+                attempts += 1;
+                if attempts <= AGENT_TASK_DB_SHORT_RETRY_ATTEMPTS + 2 {
+                    return Err(ApiError::internal(
+                        "workspace database concurrency limit reached: synthetic pressure",
+                    ));
+                }
+                Ok("persisted")
+            },
+        )
+        .await
+        .expect("durable retry succeeds after the short retry budget");
+
+        assert_eq!(value, "persisted");
+        assert_eq!(attempts, AGENT_TASK_DB_SHORT_RETRY_ATTEMPTS + 3);
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_database_retry_stops_for_shutdown() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let task_id = AgentTaskId::new("agent-task-retry-shutdown").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-retry-shutdown").expect("attempt id");
+        let context = AgentLifecycleOperationContext {
+            workspace_id: "workspace-retry-shutdown",
+            workspace_path: workspace.path(),
+            task_id: &task_id,
+            attempt_id: Some(&attempt_id),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("request shutdown");
+
+        let error = retry_agent_lifecycle_database_operation::<(), _>(
+            "test shutdown-aware retry",
+            &context,
+            shutdown_rx,
+            || {
+                Err(ApiError::internal(
+                    "workspace database concurrency limit reached: synthetic pressure",
+                ))
+            },
+        )
+        .await
+        .expect_err("shutdown stops durable retry");
+
+        assert!(error.message.contains(SHUTDOWN_MESSAGE));
+    }
+
     #[test]
     fn agent_scheduler_deadline_delay_has_idle_and_past_deadline_bounds() {
         let past = Utc::now() - chrono::Duration::seconds(1);
@@ -2396,6 +2827,7 @@ mod tests {
         fail_claimed_task(
             workspace.path(),
             &task_id,
+            None,
             "Agent task result_json exceeds 65536 bytes",
         )
         .expect("fail claimed task");
@@ -2409,6 +2841,18 @@ mod tests {
         assert_eq!(plan.phases[0].status, "failed");
         assert_eq!(plan.phases[0].steps[0].status, "failed");
         assert_eq!(plan.phases[0].attempts[0].status, "failed");
+        let failure_event = database
+            .agent_events_after(&team_id, -1)
+            .expect("events")
+            .into_iter()
+            .find(|event| event.event_type == "task_failed")
+            .expect("task failed event");
+        assert_eq!(failure_event.task_id.as_ref(), Some(&task_id));
+        assert!(
+            failure_event
+                .payload_json
+                .contains("coordinator_lifecycle_closure")
+        );
     }
 
     #[test]

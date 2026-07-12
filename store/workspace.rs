@@ -9887,6 +9887,22 @@ impl WorkspaceDatabase {
         &mut self,
         update: AgentTaskStateUpdate<'_>,
     ) -> Result<bool, WorkspaceDatabaseError> {
+        self.update_agent_task_state_inner(update, None)
+    }
+
+    pub fn update_agent_task_state_for_attempt(
+        &mut self,
+        update: AgentTaskStateUpdate<'_>,
+        expected_attempt_id: &AgentAttemptId,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        self.update_agent_task_state_inner(update, Some(expected_attempt_id))
+    }
+
+    fn update_agent_task_state_inner(
+        &mut self,
+        update: AgentTaskStateUpdate<'_>,
+        expected_attempt_id: Option<&AgentAttemptId>,
+    ) -> Result<bool, WorkspaceDatabaseError> {
         if update.transition == AgentTaskTransition::Start {
             return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
                 message: "queued tasks must be started through claim_runnable_agent_task"
@@ -9913,11 +9929,20 @@ impl WorkspaceDatabase {
         let owner_instance_id = transaction
             .query_row(
                 "SELECT owner_instance_id FROM agent_tasks
-                 WHERE id = ?1 AND team_id = ?2 AND status = ?3",
+                 WHERE id = ?1 AND team_id = ?2 AND status = ?3
+                   AND (
+                       ?4 IS NULL
+                       OR EXISTS (
+                           SELECT 1 FROM agent_attempts
+                           WHERE id = ?4 AND task_id = ?1 AND team_id = ?2
+                             AND status = CASE WHEN ?3 = 'waiting' THEN 'suspended' ELSE 'running' END
+                       )
+                   )",
                 params![
                     update.task_id.as_str(),
                     update.team_id.as_str(),
-                    update.expected_status.as_str()
+                    update.expected_status.as_str(),
+                    expected_attempt_id.map(AgentAttemptId::as_str)
                 ],
                 |row| row.get::<_, String>(0),
             )
@@ -9989,14 +10014,16 @@ impl WorkspaceDatabase {
                     "UPDATE agent_attempts
                      SET status = ?3, completed_at = ?4, interruption_reason = ?5
                      WHERE task_id = ?1 AND team_id = ?2
-                       AND status = ?6",
+                       AND status = ?6
+                       AND (?7 IS NULL OR id = ?7)",
                     params![
                         update.task_id.as_str(),
                         update.team_id.as_str(),
                         attempt_target.as_str(),
                         attempt_completed_at,
                         update.interruption_reason,
-                        source_attempt_status
+                        source_attempt_status,
+                        expected_attempt_id.map(AgentAttemptId::as_str)
                     ],
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
