@@ -1329,6 +1329,7 @@ function AuditJsonBlock({
     [jsonValue],
   );
   const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
+  const codeScrollerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setCollapsedPaths(new Set());
@@ -1341,6 +1342,53 @@ function AuditJsonBlock({
   const expandAll = useCallback(() => {
     setCollapsedPaths(new Set());
   }, []);
+
+  const forwardWheelAtVerticalBoundary = useCallback((event: WheelEvent) => {
+    if (
+      event.deltaY === 0 ||
+      Math.abs(event.deltaY) <= Math.abs(event.deltaX)
+    ) {
+      return;
+    }
+
+    const codeScroller = event.currentTarget as HTMLElement;
+    const atTop = codeScroller.scrollTop <= 0;
+    const atBottom =
+      codeScroller.scrollTop + codeScroller.clientHeight >=
+      codeScroller.scrollHeight - 1;
+    if ((event.deltaY < 0 && !atTop) || (event.deltaY > 0 && !atBottom)) {
+      return;
+    }
+
+    const detailScroller = findVerticalScrollAncestor(codeScroller.parentElement);
+    if (!detailScroller || detailScroller === codeScroller) {
+      return;
+    }
+    const deltaUnit =
+      event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? 16
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? detailScroller.clientHeight
+          : 1;
+    const previousScrollTop = detailScroller.scrollTop;
+    detailScroller.scrollTop += event.deltaY * deltaUnit;
+    if (detailScroller.scrollTop !== previousScrollTop) {
+      event.preventDefault();
+    }
+  }, []);
+
+  useEffect(() => {
+    const codeScroller = codeScrollerRef.current;
+    if (!codeScroller) {
+      return;
+    }
+    codeScroller.addEventListener("wheel", forwardWheelAtVerticalBoundary, {
+      passive: false,
+    });
+    return () => {
+      codeScroller.removeEventListener("wheel", forwardWheelAtVerticalBoundary);
+    };
+  }, [forwardWheelAtVerticalBoundary]);
 
   const togglePath = useCallback((path: string) => {
     setCollapsedPaths((current) => {
@@ -1397,7 +1445,7 @@ function AuditJsonBlock({
           </button>
         </div>
       </div>
-      <div className="audit-json-code panel-scroll">
+      <div className="audit-json-code panel-scroll" ref={codeScrollerRef}>
         <code>
           <JsonTreeNode
             collapsedPaths={collapsedPaths}

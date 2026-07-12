@@ -16,30 +16,41 @@ The root `Cargo.toml` pins the fork by the full commit SHA. Do not replace the `
 
 For new audit records:
 
-- **Request** is the actual prepared HTTP method, URL, headers, and body passed to `reqwest`. Every finalized HeaderMap field/value is retained, with only `Authorization` replaced by `********`; URL userinfo/query credentials and JSON-body credential fields keep their existing redaction rules.
-- **Response** contains the real HTTP status/version/headers captured before body or SSE consumption plus the provider adapter's final normalized completion or terminal error. Response headers use the same Authorization-only masking rule. Foco does not persist raw SSE frames or individual chunks in the API detail body.
+- **Request** is the actual prepared HTTP method, URL, headers, and body passed to `reqwest`. Every HeaderMap field/value visible immediately before the prepared request is sent is retained, with only `Authorization` replaced by `********`; URL userinfo/query credentials and JSON-body credential fields keep their existing redaction rules. Transport or proxy layers may still add or rewrite headers after this observer boundary, and those later mutations are not guaranteed to appear in the audit record.
+- **Response** contains the real HTTP status/version/headers captured after `reqwest::Response` is established and before body or SSE consumption, plus the provider adapter's final normalized completion or terminal error. Response headers use the same Authorization-only masking rule. The UI renders status/version, a response-headers JSON block, and one complete final response-envelope JSON block. Foco does not persist raw SSE frames or individual chunks in the API detail body.
 - This is a local audit feature, not a general secret scrubber: headers such as `X-API-Key`, `Cookie`, `Set-Cookie`, signatures, and token-named custom headers can be stored in workspace SQLite and shown in details.
 - TLS ciphertext, HTTP/2 frames, and TCP packets are outside this feature's scope.
 - Existing `save_request_response_details` and retention settings control whether request/final-response detail is retained. Older records remain readable as legacy normalized payloads.
 
 ## Minimal fork patch
 
-The fork adds optional read-only observers at the final genai streaming HTTP boundaries:
+The fork exports `PreparedRequestObserver` and `ResponseHeadObserver`, and exposes the capture-aware streaming entry point `exec_chat_stream_observed_with_response`. The observers are optional and read-only at the final genai streaming HTTP boundaries:
 
 1. the adapter performs model mapping and builds the provider-specific request;
 2. request overrides and adapter-specific headers/body are applied;
-3. a single `reqwest::Request` is built and observed;
+3. a single `reqwest::Request` is built and passed to `PreparedRequestObserver` immediately before send;
 4. the same request is executed once;
-5. when `reqwest::Response` exists, its status/version/HeaderMap are observed before status validation, body reads, or SSE decoding.
+5. when `reqwest::Response` exists, `ResponseHeadObserver` receives its status/version/HeaderMap before status validation, body reads, or SSE decoding.
 
-The observers must not serialize the adapter request twice, send a duplicate request, consume the response body early, or fabricate response metadata for DNS/TLS/connection failures. Foco's provider layer owns Authorization masking, existing URL/body credential redaction, and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes.
+The observers must not serialize the adapter request twice, send a duplicate request, consume the response body early, or fabricate response metadata. Availability is deliberately tied to whether a real HTTP response was established:
+
+| Outcome | Request observer | Response-head observer |
+| --- | --- | --- |
+| 2xx streaming response | Available before the single send | Available before the first body/SSE read |
+| Non-2xx HTTP response | Available before the single send | Available before status/error handling |
+| HTTP response established, then stream/body decoding fails | Available | Available; the captured head remains attached to the failed/partial final envelope |
+| DNS, TLS, connect, or proxy failure before an HTTP response | Available when the request was prepared | Unavailable; Foco must not synthesize status, version, or headers |
+
+Foco's provider layer owns Authorization masking, existing URL/body credential redaction, and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes. Neither observer promises visibility into headers inserted or rewritten by transport/proxy code after its boundary.
 
 ## End-to-end acceptance in Foco
 
-Foco's completion gate is not the fork test alone. The repository keeps two layers of real HTTP regressions:
+Foco's completion gate is not the fork test alone. The repository keeps multiple layers of real HTTP regressions:
 
 - `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters` starts local servers for OpenAI Chat, OpenAI Responses, Anthropic, and Gemini. It compares the observer dump with the request actually received by the server, verifies provider-specific final mappings (model redirect, system/instructions, tools, thinking, prompt-cache-related options and supported overrides), checks Authorization-only header masking plus existing URL/body credential redaction, and rejects duplicate sends.
-- `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire` runs the production main-chat stream against a local provider, then verifies the same final request body travels through the observer into SQLite and the AI statistics detail handler as `provider_request_v1`; the final aggregate is returned as `provider_final_response_v1` without chunk-only fields. The companion detail-disabled test verifies one send with no request/response detail.
+- `providers/lib.rs::tests::captures_final_wire_request_and_only_final_response`, `captures_http_response_head_for_non_success_stream`, and `connection_failure_before_http_response_does_not_fabricate_response_head` fix the response-head availability matrix: successful and non-2xx responses preserve real status/version/headers before body consumption, while a connect failure has no fabricated HTTP head.
+- `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire` runs the production main-chat stream against a local provider, then verifies the same final request body and representative response headers (`Content-Type`, `X-Request-ID`, `Set-Cookie`, and masked `Authorization`) travel through the observers into SQLite and the AI statistics detail handler. The final aggregate is returned as `provider_final_response_v1` without chunk-only fields. The companion detail-disabled test verifies one send with no request/response detail.
+- `web/app-panels-stats.test.tsx` covers Request/Response headers, status/version, complete final response JSON, successful/failed/partial/legacy states, and nested JSON scrolling. Vertical wheel input stays in an inner code scroller until it reaches the top or bottom, then advances the outer detail scroller; horizontal wheel input remains native to the code block.
 
 These tests are the hard regression against a UI-only or import-only integration. When the fork, genai baseline, adapter code, audit lifecycle, SQLite schema, or statistics detail API changes, rerun both provider tests and the focused app tests before claiming wire capture is complete.
 

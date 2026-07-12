@@ -22872,6 +22872,10 @@ async fn serve_main_chat_wire_fixture() -> (
                         header::HeaderValue::from_static("response-api-key"),
                     );
                     response_headers.insert(
+                        header::HeaderName::from_static("x-request-id"),
+                        header::HeaderValue::from_static("main-chat-fixture-request-id"),
+                    );
+                    response_headers.insert(
                         header::SET_COOKIE,
                         header::HeaderValue::from_static("session=response-cookie"),
                     );
@@ -23462,6 +23466,14 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
         "response-api-key"
     );
     assert_eq!(
+        response_body["http"]["headers"]["x-request-id"][0],
+        "main-chat-fixture-request-id"
+    );
+    assert_eq!(
+        response_body["http"]["headers"]["content-type"][0],
+        "text/event-stream"
+    );
+    assert_eq!(
         response_body["http"]["headers"]["set-cookie"][0],
         "session=response-cookie"
     );
@@ -23492,6 +23504,29 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
             .as_ref()
             .and_then(|value| value["format"].as_str()),
         Some("provider_final_response_v1")
+    );
+    let detail_response = detail
+        .request
+        .response_body
+        .as_ref()
+        .expect("detail response body");
+    assert_eq!(detail_response["http"]["status"], 200);
+    assert_eq!(detail_response["http"]["version"], "HTTP/1.1");
+    assert_eq!(
+        detail_response["http"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        detail_response["http"]["headers"]["x-request-id"][0],
+        "main-chat-fixture-request-id"
+    );
+    assert_eq!(
+        detail_response["http"]["headers"]["content-type"][0],
+        "text/event-stream"
+    );
+    assert_eq!(
+        detail_response["http"]["headers"]["set-cookie"][0],
+        "session=response-cookie"
     );
 }
 

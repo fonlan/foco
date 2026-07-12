@@ -3484,6 +3484,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_failure_before_http_response_does_not_fabricate_response_head() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unused fixture address");
+        let addr = listener.local_addr().expect("unused fixture address");
+        drop(listener);
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "fail before response head",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("connection failures surface through the stream");
+        assert!(stream.wire_request_dump().is_some());
+        while stream.next_event().await.is_some() {}
+
+        assert!(matches!(
+            stream.final_response_dump(),
+            Some(ProviderFinalResponseDump::Failed {
+                http: None,
+                status_code: None,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn capture_disabled_keeps_request_and_response_details_empty() {
         let response = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",

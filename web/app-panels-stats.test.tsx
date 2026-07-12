@@ -3853,6 +3853,84 @@ describe("app-panels-stats verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("forwards audit JSON wheel input only at vertical boundaries", async () => {
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "View request details" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Request details",
+    });
+    const responseBodyBlock = within(dialog)
+      .getByText("Response body")
+      .closest(".audit-json-block");
+    const codeScroller = responseBodyBlock?.querySelector(
+      ".audit-json-code",
+    ) as HTMLElement | null;
+    const detailScroller = codeScroller?.closest(
+      ".overflow-y-auto",
+    ) as HTMLElement | null;
+    if (!codeScroller || !detailScroller) {
+      throw new Error("Expected nested response JSON and detail scrollers");
+    }
+
+    detailScroller.style.overflowY = "auto";
+    Object.defineProperties(detailScroller, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 900 },
+    });
+    Object.defineProperties(codeScroller, {
+      clientHeight: { configurable: true, value: 120 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+    detailScroller.scrollTop = 200;
+
+    codeScroller.scrollTop = 100;
+    const internalWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    codeScroller.dispatchEvent(internalWheel);
+    expect(detailScroller.scrollTop).toBe(200);
+    expect(internalWheel.defaultPrevented).toBe(false);
+
+    codeScroller.scrollTop = 280;
+    const bottomWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    codeScroller.dispatchEvent(bottomWheel);
+    expect(detailScroller.scrollTop).toBe(240);
+    expect(bottomWheel.defaultPrevented).toBe(true);
+
+    codeScroller.scrollTop = 0;
+    const topWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: -30,
+    });
+    codeScroller.dispatchEvent(topWheel);
+    expect(detailScroller.scrollTop).toBe(210);
+    expect(topWheel.defaultPrevented).toBe(true);
+
+    codeScroller.scrollTop = 280;
+    const horizontalWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaX: 50,
+      deltaY: 10,
+    });
+    codeScroller.dispatchEvent(horizontalWheel);
+    expect(detailScroller.scrollTop).toBe(210);
+    expect(horizontalWheel.defaultPrevented).toBe(false);
+  });
+
   it("lets four-digit API audit page buttons grow with content", async () => {
     vi.mocked(fetch).mockImplementation((input, init) => {
       const rawPath =
