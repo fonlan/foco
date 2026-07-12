@@ -947,10 +947,16 @@ impl WorkspaceDatabase {
     }
 
     pub fn disable_plan_auto_run_if_idle(&mut self) -> Result<bool, WorkspaceDatabaseError> {
-        Ok(matches!(
+        if !matches!(
             self.next_plan_auto_run_candidate()?,
             PlanAutoRunSelection::Idle
-        ))
+        ) || self.plan_auto_run_has_in_flight()?
+        {
+            return Ok(false);
+        }
+
+        self.set_plan_auto_run_enabled(false)?;
+        Ok(true)
     }
 
     pub fn plan_auto_run_has_in_flight(&self) -> Result<bool, WorkspaceDatabaseError> {

@@ -353,6 +353,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_disables_auto_run_after_all_plans_finish() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let config = foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        {
+            let mut database =
+                foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+                    .expect("database");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: "finished-plan",
+                    title: "Finished plan",
+                    overview: "Auto-run should stop after the queue drains.",
+                    status: "completed",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: "finished-phase",
+                        title: "Finished phase",
+                        summary: "Done.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "finished-step",
+                            title: "Finished step",
+                            detail: "Done.",
+                            acceptance: vec!["done".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create completed plan");
+            database
+                .set_plan_auto_run_enabled(true)
+                .expect("enable auto-run");
+        }
+
+        assert!(!dispatch_plan_auto_run(&state).await.expect("dispatch scan"));
+
+        let database = foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database");
+        let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(!auto_run.desired_enabled);
+        assert!(!auto_run.enabled);
+        assert!(!auto_run.busy);
+    }
+
+    #[tokio::test]
     async fn scheduler_preserves_desired_auto_run_at_cancelled_phase_barrier_without_dispatch() {
         let workspace = tempfile::tempdir().expect("workspace");
         let profile = tempfile::tempdir().expect("profile");

@@ -1018,7 +1018,7 @@ fn plan_auto_run_cancelled_phase_blocks_later_plan_and_is_not_busy() {
 }
 
 #[test]
-fn plan_auto_run_idle_preserves_desired_preference() {
+fn plan_auto_run_idle_disables_desired_preference() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
@@ -1031,11 +1031,11 @@ fn plan_auto_run_idle_preserves_desired_preference() {
     assert!(
         database
             .disable_plan_auto_run_if_idle()
-            .expect("observe idle auto-run")
+            .expect("disable idle auto-run")
     );
     let state = database.plan_auto_run_state().expect("state");
-    assert!(state.desired_enabled);
-    assert!(state.enabled);
+    assert!(!state.desired_enabled);
+    assert!(!state.enabled);
     assert!(!state.busy);
 }
 
