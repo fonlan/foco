@@ -1290,7 +1290,7 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
         NeutralChatRole::Developer => {
             validate_instruction_message(message, "developer")?;
 
-            Ok(ChatMessage::system(message.content.clone()))
+            Ok(ChatMessage::developer(message.content.clone()))
         }
         NeutralChatRole::User => {
             if message.content.trim().is_empty() && message.attachments.is_empty() {
@@ -2749,7 +2749,10 @@ mod tests {
 
         assert_eq!(chat_request.system.as_deref(), Some("Base system."));
         assert_eq!(chat_request.messages.len(), 2);
-        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::System);
+        assert_eq!(
+            chat_request.messages[0].role,
+            genai::chat::ChatRole::Developer
+        );
         assert_eq!(
             chat_request.messages[0].content.first_text(),
             Some("## Skills\n\n- Name: html-ppt")
@@ -2758,6 +2761,44 @@ mod tests {
         assert_eq!(
             chat_request.messages[1].content.first_text(),
             Some("Continue.")
+        );
+    }
+
+    #[test]
+    fn validates_developer_messages_as_instructions() {
+        let mut with_attachment =
+            neutral_text_message(NeutralChatRole::Developer, "Developer prompt.");
+        with_attachment.attachments.push(NeutralChatAttachment {
+            id: "attachment-1".to_string(),
+            name: "prompt.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            size_bytes: 6,
+            content_base64: Some("cHJvbXB0".to_string()),
+            path: None,
+        });
+        let attachment_error = genai_message(&with_attachment).expect_err("developer attachment");
+        assert!(
+            attachment_error
+                .to_string()
+                .contains("developer messages cannot contain attachments")
+        );
+
+        let empty_error = genai_message(&neutral_text_message(NeutralChatRole::Developer, "   "))
+            .expect_err("empty developer message");
+        assert!(
+            empty_error
+                .to_string()
+                .contains("chat message content must not be empty")
+        );
+
+        let mut with_tool_state =
+            neutral_text_message(NeutralChatRole::Developer, "Developer prompt.");
+        with_tool_state.tool_call_id = Some("call-1".to_string());
+        let tool_state_error = genai_message(&with_tool_state).expect_err("developer tool state");
+        assert!(
+            tool_state_error
+                .to_string()
+                .contains("developer messages cannot contain tool state")
         );
     }
 
@@ -2778,7 +2819,10 @@ mod tests {
             Some("Base system.\n\nProject spec.")
         );
         assert_eq!(chat_request.messages.len(), 2);
-        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::System);
+        assert_eq!(
+            chat_request.messages[0].role,
+            genai::chat::ChatRole::Developer
+        );
         assert_eq!(
             chat_request.messages[0].content.first_text(),
             Some("## Skills\n\n- Name: html-ppt")
