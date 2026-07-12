@@ -977,6 +977,27 @@ fn broker_llm_cancellation_audit_outcome(
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct RemoteSidecarBrokerErrorAuditOutcome {
+    final_state: &'static str,
+    response_body: Value,
+}
+
+fn remote_sidecar_broker_error_audit_outcome(
+    payload: &Value,
+    message: &str,
+) -> RemoteSidecarBrokerErrorAuditOutcome {
+    let cancelled = payload.get("code").and_then(Value::as_str) == Some("cancelled");
+    RemoteSidecarBrokerErrorAuditOutcome {
+        final_state: if cancelled { "cancelled" } else { "failed" },
+        response_body: if cancelled {
+            json!({ "cancelled": message })
+        } else {
+            json!({ "error": { "message": message } })
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BrokerLlmAuditEvent {
     event_at: String,
@@ -7973,6 +7994,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("remote broker unavailable");
+                let audit_outcome =
+                    remote_sidecar_broker_error_audit_outcome(&envelope.payload, message);
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = run_metrics.total_latency_ms();
                 let _ = persist_sidecar_llm_audit(
@@ -7985,8 +8008,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     run_metrics,
                     &completed_at,
                     total_latency_ms,
-                    "failed",
-                    json!({ "error": { "message": message } }),
+                    audit_outcome.final_state,
+                    audit_outcome.response_body,
                 );
                 *sequence += 1;
                 run_stream.record(
@@ -12779,6 +12802,34 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_broker_error_audit_contract_uses_only_structured_cancel_code() {
+        let cancelled = remote_sidecar_broker_error_audit_outcome(
+            &json!({ "code": "cancelled", "message": "broker request cancelled" }),
+            "broker request cancelled",
+        );
+        assert_eq!(cancelled.final_state, "cancelled");
+        assert_eq!(
+            cancelled.response_body,
+            json!({ "cancelled": "broker request cancelled" })
+        );
+
+        for payload in [
+            json!({ "code": "provider_error", "message": "provider said cancelled" }),
+            json!({ "message": "broker request cancelled" }),
+        ] {
+            let failed = remote_sidecar_broker_error_audit_outcome(
+                &payload,
+                payload["message"].as_str().expect("error message"),
+            );
+            assert_eq!(failed.final_state, "failed");
+            assert_eq!(
+                failed.response_body,
+                json!({ "error": { "message": payload["message"].clone() } })
+            );
+        }
+    }
+
+    #[test]
     fn brokered_context_compression_audit_is_excluded_from_main_chat_statistics() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let context = BrokerLlmAuditContext {
@@ -13280,6 +13331,106 @@ mod tests {
             metadata["metrics"]["firstTokenLatencyMs"].as_i64()
         );
         assert_eq!(audit.total_latency_ms, Some(total_latency_ms));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_cancelled_broker_error_persists_cancelled_compact_mirror() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "code": "cancelled",
+                        "message": "broker request cancelled",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send cancelled broker error");
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        let mut sequence = 0_i64;
+        let result = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-1",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-1",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &mut database,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        assert!(result.is_err());
+        let audit = database
+            .llm_request("remote-run-1")
+            .expect("sidecar audit lookup")
+            .expect("sidecar audit exists");
+        assert_eq!(audit.request_kind, BROKER_DEFAULT_LLM_REQUEST_KIND);
+        assert_eq!(audit.final_state, "cancelled");
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                audit
+                    .response_body_json
+                    .as_deref()
+                    .expect("compact cancelled mirror body"),
+            )
+            .expect("compact cancelled mirror JSON"),
+            json!({ "cancelled": "broker request cancelled" })
+        );
+        let events = run_stream.snapshot_after(-1);
+        assert_eq!(
+            events
+                .iter()
+                .rev()
+                .take(2)
+                .map(|(_, event)| event["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["streamEnd", "error"]
+        );
     }
 
     #[tokio::test]
