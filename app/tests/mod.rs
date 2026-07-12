@@ -13515,6 +13515,10 @@ fn workspace_spec_update_queue_decision_reports_skip_reasons() {
         }
     );
     assert_eq!(
+        workspace_spec_update_queue_decision("succeeded", true, None, true, None),
+        WorkspaceSpecUpdateQueueDecision::NeedsSpecState
+    );
+    assert_eq!(
         workspace_spec_update_queue_decision(
             "succeeded",
             true,
@@ -13576,6 +13580,82 @@ fn workspace_spec_update_queue_decision_reports_skip_reasons() {
         ),
         WorkspaceSpecUpdateQueueDecision::Queue
     );
+}
+
+#[test]
+fn workspace_spec_static_skip_gates_do_not_open_workspace_database() {
+    for (case, final_state, agent_primary_chat_output, session_mode, spec_auto_enabled) in [
+        ("failed", "failed", true, None, true),
+        ("cancelled", "cancelled", true, None, true),
+        ("non-primary", "succeeded", false, None, true),
+        ("plan", "succeeded", true, Some("plan"), true),
+        ("auto-disabled", "succeeded", true, None, false),
+    ] {
+        let workspace_dir = env::temp_dir().join(unique_id(&format!(
+            "foco-project-spec-{case}-no-db-open-test"
+        )));
+        let mut context = workspace_spec_update_test_context(workspace_dir.clone());
+        context.agent_primary_chat_output = agent_primary_chat_output;
+        context.session_mode = session_mode.map(str::to_string);
+        context.global_config.spec.auto_enabled = spec_auto_enabled;
+
+        queue_workspace_spec_update_job(&context, final_state)
+            .expect("static spec update gate should skip");
+
+        assert!(
+            !workspace_dir.exists(),
+            "{case} static gate unexpectedly opened the workspace database"
+        );
+    }
+}
+
+#[test]
+fn workspace_spec_ineligible_states_do_not_queue_update_jobs() {
+    for state in ["missing", "disabled", "empty"] {
+        let workspace_dir = env::temp_dir().join(unique_id(&format!(
+            "foco-project-spec-{state}-noqueue-test"
+        )));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        seed_workspace_spec_update_messages(&workspace_dir, true);
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            match state {
+                "missing" => {}
+                "disabled" => {
+                    database
+                        .upsert_workspace_spec_settings(false, false)
+                        .expect("disabled spec settings");
+                    database
+                        .update_workspace_spec_content(0, "# Project Spec\n\nDisabled spec.")
+                        .expect("disabled spec content");
+                }
+                "empty" => {
+                    database
+                        .upsert_workspace_spec_settings(true, false)
+                        .expect("enabled spec settings");
+                }
+                _ => unreachable!(),
+            }
+        }
+        let context = workspace_spec_update_test_context(workspace_dir.clone());
+
+        queue_workspace_spec_update_job(&context, "succeeded")
+            .expect("ineligible spec state should skip update");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .workspace_spec_jobs(10)
+                .expect("workspace spec jobs")
+                .is_empty(),
+            "{state} workspace spec unexpectedly queued an update job"
+        );
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
 }
 
 #[test]
@@ -13841,7 +13921,7 @@ fn workspace_spec_update_job_skips_stale_manual_edit() {
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
-fn seed_workspace_spec_update_chat(workspace_dir: &std::path::Path, include_assistant: bool) {
+fn seed_workspace_spec_update_messages(workspace_dir: &std::path::Path, include_assistant: bool) {
     let mut database = WorkspaceDatabase::open_or_create(workspace_dir).expect("workspace db");
     database
         .insert_chat("chat-1", "Spec update chat")
@@ -13868,6 +13948,11 @@ fn seed_workspace_spec_update_chat(workspace_dir: &std::path::Path, include_assi
             })
             .expect("assistant message insert");
     }
+}
+
+fn seed_workspace_spec_update_chat(workspace_dir: &std::path::Path, include_assistant: bool) {
+    seed_workspace_spec_update_messages(workspace_dir, include_assistant);
+    let mut database = WorkspaceDatabase::open_or_create(workspace_dir).expect("workspace db");
     database
         .upsert_workspace_spec_settings(true, false)
         .expect("spec settings");

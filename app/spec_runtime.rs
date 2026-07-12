@@ -263,6 +263,7 @@ impl WorkspaceSpecUpdateSpecState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceSpecUpdateQueueDecision {
+    NeedsSpecState,
     Queue,
     Skip { reason: &'static str },
 }
@@ -296,7 +297,7 @@ pub(crate) fn workspace_spec_update_queue_decision(
         };
     }
     let Some(spec_state) = spec_state else {
-        return WorkspaceSpecUpdateQueueDecision::Queue;
+        return WorkspaceSpecUpdateQueueDecision::NeedsSpecState;
     };
     if !spec_state.exists {
         return WorkspaceSpecUpdateQueueDecision::Skip {
@@ -441,7 +442,10 @@ pub(crate) fn queue_workspace_spec_update_job_with_id(
         context.global_config.spec.auto_enabled,
         None,
     ) {
-        WorkspaceSpecUpdateQueueDecision::Queue => {}
+        WorkspaceSpecUpdateQueueDecision::NeedsSpecState => {}
+        WorkspaceSpecUpdateQueueDecision::Queue => {
+            unreachable!("workspace spec state is required before queueing an update job")
+        }
         WorkspaceSpecUpdateQueueDecision::Skip { reason } => {
             log_workspace_spec_update_queue_skip(context, final_state, reason, None);
             return Ok(());
@@ -461,6 +465,9 @@ pub(crate) fn queue_workspace_spec_update_job_with_id(
         context.global_config.spec.auto_enabled,
         Some(spec_state),
     ) {
+        WorkspaceSpecUpdateQueueDecision::NeedsSpecState => {
+            unreachable!("workspace spec state remained unknown after loading it")
+        }
         WorkspaceSpecUpdateQueueDecision::Queue => {}
         WorkspaceSpecUpdateQueueDecision::Skip { reason } => {
             log_workspace_spec_update_queue_skip(context, final_state, reason, Some(spec_state));
