@@ -3943,6 +3943,117 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBe(true);
   });
 
+  it("persists request kind filters through stats routing and pagination", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/stats?page=2&requestKind=contextCompression",
+    );
+
+    renderApp();
+
+    const requestTypeFilter = await screen.findByRole("combobox", {
+      name: "Request type",
+    });
+    expect(requestTypeFilter).toHaveValue("contextCompression");
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some(
+          (url) =>
+            url.searchParams.get("requestKind") === "contextCompression" &&
+            url.searchParams.get("page") === "2",
+        ),
+      ).toBe(true),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Go to page 3" }));
+    await waitFor(() => {
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get("page")).toBe("3");
+      expect(params.get("requestKind")).toBe("contextCompression");
+    });
+  });
+
+  it("shows request kind badges, detail metadata, full breakdown, and unknown kinds", async () => {
+    const unknownKind = "background maintenance";
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            requests: [
+              {
+                ...aiStatistics.requests[0],
+                requestKind: unknownKind,
+              },
+            ],
+            summary: {
+              ...aiStatistics.summary,
+              requestKindBreakdown: [
+                ...aiStatistics.summary.requestKindBreakdown,
+                {
+                  averageLatencyMs: 300,
+                  failedRequests: 1,
+                  requestCount: 2,
+                  requestKind: unknownKind,
+                  totalCacheReadTokens: 0,
+                  totalCacheWriteTokens: 0,
+                  totalInputTokens: 90,
+                  totalLatencyMs: 600,
+                  totalOutputTokens: 10,
+                  totalReasoningTokens: 0,
+                  totalTokens: 100,
+                },
+              ],
+            },
+          }),
+        );
+      }
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              requestKind: unknownKind,
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+
+    const tables = await screen.findAllByRole("table");
+    const auditTable = tables.find((table) =>
+      within(table).queryByRole("button", { name: "View request details" }),
+    );
+    expect(auditTable).toBeDefined();
+    expect(within(auditTable as HTMLElement).getByText(unknownKind)).toBeInTheDocument();
+    expect(screen.getByText("Request usage breakdown")).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(unknownKind).length).toBeGreaterThanOrEqual(2);
+
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(within(dialog).getByText("Request type")).toBeInTheDocument();
+    expect(within(dialog).getByText(unknownKind)).toBeInTheDocument();
+  });
+
   it("loads API details from the stats URL page", async () => {
     window.history.replaceState(null, "", "/stats?page=2");
 

@@ -52,6 +52,26 @@ describe("useAiStatisticsData", () => {
     expect(requestUrl).toContain("startedAfter=");
   });
 
+  it("includes requestKind in statistics queries", async () => {
+    let hook: ReturnType<typeof useAiStatisticsData> | null = null;
+    render(<HookProbe onHook={(value) => (hook = value)} />);
+    await act(async () => undefined);
+
+    await act(async () => {
+      hook?.updateAuditFilters({ requestKind: "contextCompression" });
+    });
+    await act(async () => undefined);
+
+    const requestUrls = vi
+      .mocked(fetch)
+      .mock.calls.map(([input]) => new URL(String(input), "http://localhost"));
+    expect(
+      requestUrls.some(
+        (url) => url.searchParams.get("requestKind") === "contextCompression",
+      ),
+    ).toBe(true);
+  });
+
   it("clears the previous copied timeout before scheduling another one", async () => {
     const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
     let hook: ReturnType<typeof useAiStatisticsData> | null = null;
@@ -97,6 +117,7 @@ const emptyAiStatisticsResponse = {
     failedRequests: 0,
     modelBreakdown: [],
     providerBreakdown: [],
+    requestKindBreakdown: [],
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
     totalInputTokens: 0,

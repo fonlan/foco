@@ -13728,6 +13728,7 @@ function emptyAiStatisticsSummary(): AiStatisticsSummary {
     failedRequests: 0,
     modelBreakdown: [],
     providerBreakdown: [],
+    requestKindBreakdown: [],
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
     totalInputTokens: 0,

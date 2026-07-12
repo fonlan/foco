@@ -34,6 +34,7 @@ import type {
   AiRequestAuditDetail,
   AiRequestAuditSummary,
   AiRequestDetailResponse,
+  AiStatisticsRequestKindBreakdown,
   AiStatisticsSummary,
   AiStatsFilterState,
   AppLanguageId,
@@ -51,6 +52,12 @@ import {
   readAiStatsVisibleColumnIds,
   writeAiStatsVisibleColumnIds,
 } from "./ai-stats-preferences";
+import {
+  CHAT_COMPLETION_REQUEST_KIND,
+  CONTEXT_COMPRESSION_REQUEST_KIND,
+  requestKindBadgeClass,
+  requestKindLabel,
+} from "./request-kind";
 import { useAiStatisticsData } from "./use-ai-statistics-data";
 
 const DualLineChartCard = lazy(() =>
@@ -213,6 +220,19 @@ export function ApiStatsPanel({
       .sort((left, right) => left.label.localeCompare(right.label)) ?? [],
     requests.map((request) => request.modelId),
   );
+  const requestKindOptions = auditOptions(
+    [CHAT_COMPLETION_REQUEST_KIND, CONTEXT_COMPRESSION_REQUEST_KIND].map(
+      (requestKind) => ({
+        label: requestKindLabel(requestKind, t),
+        value: requestKind,
+      }),
+    ),
+    [
+      ...requests.map((request) => request.requestKind),
+      ...summary.requestKindBreakdown.map((item) => item.requestKind),
+    ],
+    (requestKind) => requestKindLabel(requestKind, t),
+  );
   const statusOptions = auditOptions(
     ["succeeded", "failed", "running", "cancelled", "completed"].map(
       (status) => ({
@@ -271,6 +291,18 @@ export function ApiStatsPanel({
             {modelLabels.get(request.modelId) ?? request.modelId}
           </div>
         </div>
+      ),
+    },
+    {
+      cellClassName: "px-4 py-3 text-stone-700",
+      id: "requestKind",
+      label: t("Request type"),
+      render: (request) => (
+        <span className={requestKindBadgeClass(request.requestKind)}>
+          <span className="truncate">
+            {requestKindLabel(request.requestKind, t)}
+          </span>
+        </span>
       ),
     },
     {
@@ -482,7 +514,7 @@ export function ApiStatsPanel({
               />
             </button>
           </div>
-          <div className="mt-4 grid gap-3 border-t border-stone-200 pt-4 md:grid-cols-2 xl:grid-cols-7">
+          <div className="mt-4 grid gap-3 border-t border-stone-200 pt-4 md:grid-cols-2 xl:grid-cols-8">
             <FilterSelect
               label={t("Workspace")}
               onChange={(value) =>
@@ -518,6 +550,13 @@ export function ApiStatsPanel({
               options={modelOptions}
               placeholder={t("All models")}
               value={filters.modelId}
+            />
+            <FilterSelect
+              label={t("Request type")}
+              onChange={(value) => updateFilters({ requestKind: value })}
+              options={requestKindOptions}
+              placeholder={t("All request types")}
+              value={filters.requestKind}
             />
             <FilterSelect
               label={t("Status")}
@@ -590,6 +629,14 @@ export function ApiStatsPanel({
             value={formatNumber(summary.failedRequests, language)}
           />
         </section>
+
+        {summary.requestKindBreakdown.length ? (
+          <RequestKindUsageBreakdown
+            breakdown={summary.requestKindBreakdown}
+            language={language}
+            t={t}
+          />
+        ) : null}
 
         {summary.totalRequests === 0 ? (
           <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
@@ -952,6 +999,14 @@ function AiRequestDetailDialog({
                 />
                 <AuditMeta label={t("Provider")} value={request.providerId} />
                 <AuditMeta label={t("Model")} value={request.modelId} />
+                <AuditMeta
+                  label={t("Request type")}
+                  value={requestKindLabel(request.requestKind, t)}
+                />
+                <AuditMeta
+                  label={t("Thinking level")}
+                  value={request.thinkingLevel ?? t("Default")}
+                />
                 <AuditMeta
                   label={t("Request time")}
                   value={formatAuditDate(request.requestStartedAt, language)}
@@ -1396,6 +1451,76 @@ function AuditJsonBlock({
   );
 }
 
+function RequestKindUsageBreakdown({
+  breakdown,
+  language,
+  t,
+}: {
+  breakdown: AiStatisticsRequestKindBreakdown[];
+  language: AppLanguageId;
+  t: Translate;
+}) {
+  const gridClass =
+    "grid min-w-[48rem] grid-cols-[minmax(11rem,1.4fr)_repeat(6,minmax(6rem,1fr))] items-center";
+
+  return (
+    <section className="min-w-0 overflow-hidden rounded-2xl border border-stone-200 bg-white/85 shadow-sm">
+      <div className="border-b border-stone-200 px-4 py-3">
+        <h3 className="text-sm font-semibold text-stone-950">
+          {t("Request usage breakdown")}
+        </h3>
+        <p className="mt-1 text-xs leading-5 text-stone-500">
+          {t(
+            "Compression usage is additional model cost and does not change the Current context usage metric.",
+          )}
+        </p>
+      </div>
+      <div className="panel-scroll overflow-x-auto text-sm">
+        <div
+          className={`${gridClass} border-b border-stone-200 bg-stone-50/80 text-xs font-semibold text-stone-500`}
+        >
+          <div className="px-4 py-3">{t("Request type")}</div>
+          <div className="px-4 py-3 text-right">{t("Requests")}</div>
+          <div className="px-4 py-3 text-right">{t("Usage tokens")}</div>
+          <div className="px-4 py-3 text-right">{t("Input tokens")}</div>
+          <div className="px-4 py-3 text-right">{t("Output tokens")}</div>
+          <div className="px-4 py-3 text-right">{t("Failures")}</div>
+          <div className="px-4 py-3 text-right">{t("Average duration")}</div>
+        </div>
+        <div className="divide-y divide-stone-100">
+          {breakdown.map((item) => (
+            <div className={gridClass} key={item.requestKind}>
+              <div className="px-4 py-3">
+                <span className={requestKindBadgeClass(item.requestKind)}>
+                  {requestKindLabel(item.requestKind, t)}
+                </span>
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-800">
+                {formatNumber(item.requestCount, language)}
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-800">
+                {formatCompactNumber(item.totalTokens, language)}
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-700">
+                {formatCompactNumber(item.totalInputTokens, language)}
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-700">
+                {formatCompactNumber(item.totalOutputTokens, language)}
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-700">
+                {formatNumber(item.failedRequests, language)}
+              </div>
+              <div className="px-4 py-3 text-right font-mono text-stone-700">
+                {formatNullableLatencySeconds(item.averageLatencyMs, language)}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function StatsCard({
   icon: Icon,
   label,
@@ -1424,6 +1549,7 @@ function emptyAiStatisticsSummary(): AiStatisticsSummary {
     failedRequests: 0,
     modelBreakdown: [],
     providerBreakdown: [],
+    requestKindBreakdown: [],
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
     totalInputTokens: 0,

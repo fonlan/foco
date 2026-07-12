@@ -2194,11 +2194,26 @@ type AiStatisticsTrendPoint = {
   totalTokens: number;
 };
 
+export type AiStatisticsRequestKindBreakdown = {
+  requestKind: string;
+  requestCount: number;
+  failedRequests: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalReasoningTokens: number;
+  totalTokens: number;
+  totalLatencyMs: number;
+  averageLatencyMs: number | null;
+};
+
 export type AiStatisticsSummary = {
   averageLatencyMs: number | null;
   failedRequests: number;
   modelBreakdown: AiStatisticsModelBreakdown[];
   providerBreakdown: AiStatisticsProviderBreakdown[];
+  requestKindBreakdown: AiStatisticsRequestKindBreakdown[];
   totalCacheReadTokens: number;
   totalCacheWriteTokens: number;
   totalInputTokens: number;
@@ -2227,6 +2242,7 @@ export type AiStatsFilterState = {
   chatId: string;
   providerId: string;
   modelId: string;
+  requestKind: string;
   status: string;
   startedAfter: string;
   startedBefore: string;

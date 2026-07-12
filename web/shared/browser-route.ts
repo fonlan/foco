@@ -17,6 +17,7 @@ const STATS_FILTER_QUERY_PARAMS = [
   ["chatId", "chatId"],
   ["providerId", "providerId"],
   ["modelId", "modelId"],
+  ["requestKind", "requestKind"],
   ["status", "status"],
   ["startedAfter", "startedAfter"],
   ["startedBefore", "startedBefore"],
