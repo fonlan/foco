@@ -97,6 +97,7 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() => {
       expect(screen.getByText("Please inspect CONTRIBUTING.md.")).toBeInTheDocument();
       expect(screen.queryByText("Done.")).not.toBeInTheDocument();
+      expect(screen.queryByRole("textbox", { name: "Edit message" })).not.toBeInTheDocument();
     });
     const editRequest = vi.mocked(fetch).mock.calls.find(([input]) =>
       input.toString().includes("/messages/message-user/edit"),

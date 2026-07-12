@@ -264,6 +264,7 @@ function ChatPanelComponent({
     content: string,
     selectedSkillIds: string[],
     attachments: ComposerAttachment[],
+    onAccepted: () => void,
   ) => Promise<boolean>;
   onSelectEditAttachments: (onSelected: (attachments: ComposerAttachment[]) => void) => void;
   onGuideActiveRun: () => void;
@@ -744,15 +745,19 @@ function ChatPanelComponent({
     setEditingAttachments([]);
   }, [skills]);
 
-  const cancelEditingMessage = useCallback(() => {
-    if (isSavingEditedMessage) {
-      return;
-    }
+  const clearEditingMessage = useCallback(() => {
     setEditingMessageId(null);
     setEditingMessageText("");
     setEditingSkillIds([]);
     setEditingAttachments([]);
-  }, [isSavingEditedMessage]);
+  }, []);
+
+  const cancelEditingMessage = useCallback(() => {
+    if (isSavingEditedMessage) {
+      return;
+    }
+    clearEditingMessage();
+  }, [clearEditingMessage, isSavingEditedMessage]);
 
   const saveEditedMessage = useCallback(async (message: ShellMessage) => {
     const trimmed = editingMessageText.trim();
@@ -768,18 +773,19 @@ function ChatPanelComponent({
       return;
     }
     setIsSavingEditedMessage(true);
+    let editAccepted = false;
     try {
-      const saved = await onEditMessage(message, trimmed, editingSkillIds, editingAttachments);
-      if (saved) {
-        setEditingMessageId(null);
-        setEditingMessageText("");
-        setEditingSkillIds([]);
-        setEditingAttachments([]);
-      }
+      await onEditMessage(message, trimmed, editingSkillIds, editingAttachments, () => {
+        if (editAccepted) {
+          return;
+        }
+        editAccepted = true;
+        clearEditingMessage();
+      });
     } finally {
       setIsSavingEditedMessage(false);
     }
-  }, [editingAttachments, editingMessageText, editingSkillIds, isSavingEditedMessage, messages, onEditMessage, t]);
+  }, [clearEditingMessage, editingAttachments, editingMessageText, editingSkillIds, isSavingEditedMessage, messages, onEditMessage, t]);
 
   return (
     <div

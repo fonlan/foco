@@ -7038,6 +7038,7 @@ export function App() {
     content: string,
     editedSkillIds: string[],
     attachments: ComposerAttachment[],
+    onAccepted: () => void,
   ): Promise<boolean> {
     const workspaceId = activeWorkspaceIdRef.current;
     const chatId = activeChatIdRef.current;
@@ -7094,6 +7095,7 @@ export function App() {
           },
         },
       ]);
+      onAccepted();
       updateQueuedRunRequestsForChatKey(chatKey, () => []);
       updateScheduledWorkspaceRuns((current) => current.filter((run) => run.chatKey !== chatKey));
       setRetryRunRequest(null);
