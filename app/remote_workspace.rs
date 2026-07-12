@@ -45,10 +45,10 @@ use foco_store::{
     },
     workspace::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage, TodoGraphFilter,
-        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceSpecJobRecord,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        workspace_database_path,
+        NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
+        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        WorkspaceSpecTriggerType, workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -10278,29 +10278,66 @@ async fn remote_sidecar_terminal_ws(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<RemoteSidecarState>,
     AxumPath(session_id): AxumPath<String>,
-) -> axum::response::Response {
-    let ws_path = sidecar_workspace_path(&state).to_path_buf();
-    ws.on_upgrade(move |socket| async move {
+    Query(query): Query<RemoteTerminalSocketQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let context = remote_sidecar_terminal_socket_context(&state, &session_id, query)?;
+    Ok(ws.on_upgrade(move |socket| async move {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         crate::terminal::handle_terminal_socket(
             socket,
             shutdown_tx.subscribe(),
             crate::terminal::TerminalRegistry::default(),
-            ws_path,
+            context.workspace_path,
             "bash".to_string(),
-            foco_store::workspace::TerminalSessionRecord {
-                id: session_id.clone(),
-                name: String::new(),
-                working_directory: String::new(),
-                created_at: String::new(),
-                updated_at: String::new(),
-                closed_at: None,
-                metadata_json: String::new(),
-            },
-            80,
-            24,
+            context.session,
+            context.cols,
+            context.rows,
         )
         .await;
+    }))
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTerminalSocketQuery {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+#[derive(Debug)]
+struct RemoteTerminalSocketContext {
+    workspace_path: PathBuf,
+    session: TerminalSessionRecord,
+    cols: u16,
+    rows: u16,
+}
+
+fn remote_sidecar_terminal_socket_context(
+    state: &RemoteSidecarState,
+    session_id: &str,
+    query: RemoteTerminalSocketQuery,
+) -> Result<RemoteTerminalSocketContext, ApiError> {
+    let workspace_path = sidecar_workspace_path(state).to_path_buf();
+    let database = WorkspaceDatabase::open_or_create(&workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let session = database
+        .terminal_session(session_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("terminal session was not found: {session_id}"))
+        })?;
+
+    if session.closed_at.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "terminal session is closed: {session_id}"
+        )));
+    }
+
+    Ok(RemoteTerminalSocketContext {
+        workspace_path,
+        session,
+        cols: query.cols.unwrap_or(80),
+        rows: query.rows.unwrap_or(24),
     })
 }
 
@@ -11614,7 +11651,7 @@ mod tests {
                 "/api/remote/workspace/terminal/session",
                 post(remote_sidecar_terminal_session),
             )
-            .with_state(state);
+            .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -11661,7 +11698,169 @@ mod tests {
         assert_eq!(session.id, session_id);
         assert_eq!(session.name, "Remote Terminal");
         assert_eq!(session.working_directory, workspace_path);
+        assert!(!session.working_directory.is_empty());
+        assert!(Path::new(&session.working_directory).is_dir());
 
+        let default_context = remote_sidecar_terminal_socket_context(
+            &state,
+            session_id,
+            RemoteTerminalSocketQuery::default(),
+        )
+        .expect("default terminal socket context");
+        assert_eq!(default_context.workspace_path, workspace.path());
+        assert_eq!(default_context.session.working_directory, workspace_path);
+        assert_eq!((default_context.cols, default_context.rows), (80, 24));
+
+        let sized_context = remote_sidecar_terminal_socket_context(
+            &state,
+            session_id,
+            RemoteTerminalSocketQuery {
+                cols: Some(132),
+                rows: Some(43),
+            },
+        )
+        .expect("sized terminal socket context");
+        assert_eq!((sized_context.cols, sized_context.rows), (132, 43));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_terminal_ws_rejects_missing_and_closed_sessions_before_upgrade() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_path = workspace.path().display().to_string();
+        let (state, _) = test_sidecar_state(workspace_path.clone(), 0);
+        let closed_session_id = "remote-term-closed";
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .upsert_terminal_session(foco_store::workspace::NewTerminalSession {
+                id: closed_session_id,
+                name: "Remote Terminal",
+                working_directory: &workspace_path,
+                metadata_json: None,
+            })
+            .expect("persist closed terminal session");
+        database
+            .close_terminal_session(closed_session_id)
+            .expect("close terminal session");
+        drop(database);
+
+        let missing_error = remote_sidecar_terminal_socket_context(
+            &state,
+            "remote-term-missing",
+            RemoteTerminalSocketQuery::default(),
+        )
+        .expect_err("missing terminal session must be rejected");
+        assert_eq!(
+            missing_error.message(),
+            "terminal session was not found: remote-term-missing"
+        );
+        let closed_error = remote_sidecar_terminal_socket_context(
+            &state,
+            closed_session_id,
+            RemoteTerminalSocketQuery::default(),
+        )
+        .expect_err("closed terminal session must be rejected");
+        assert_eq!(
+            closed_error.message(),
+            "terminal session is closed: remote-term-closed"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal websocket test server");
+        let address = listener.local_addr().expect("terminal websocket address");
+        let app = Router::new()
+            .route(
+                "/api/remote/workspace/terminal/{session_id}/ws",
+                get(remote_sidecar_terminal_ws),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve terminal websocket test route");
+        });
+
+        for session_id in ["remote-term-missing", closed_session_id] {
+            let error = connect_async(format!(
+                "ws://{address}/api/remote/workspace/terminal/{session_id}/ws"
+            ))
+            .await
+            .expect_err("invalid terminal session must fail websocket handshake");
+            match error {
+                tungstenite::Error::Http(response) => {
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                }
+                other => panic!("expected HTTP websocket rejection, got {other}"),
+            }
+        }
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_sidecar_terminal_create_then_websocket_starts_in_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_path = workspace.path().display().to_string();
+        let (state, _) = test_sidecar_state(workspace_path.clone(), 0);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal integration test server");
+        let address = listener.local_addr().expect("terminal integration address");
+        let app = Router::new()
+            .route(
+                "/api/remote/workspace/terminal/session",
+                post(remote_sidecar_terminal_session),
+            )
+            .route(
+                "/api/remote/workspace/terminal/{session_id}/ws",
+                get(remote_sidecar_terminal_ws),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve terminal integration routes");
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/remote/workspace/terminal/session"
+            ))
+            .send()
+            .await
+            .expect("create remote terminal session");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = response.json().await.expect("terminal response json");
+        let session_id = payload["id"].as_str().expect("terminal response id");
+
+        let (mut socket, _) = connect_async(format!(
+            "ws://{address}/api/remote/workspace/terminal/{session_id}/ws?cols=132&rows=43"
+        ))
+        .await
+        .expect("connect remote terminal websocket");
+        let message = timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("terminal started event timeout")
+            .expect("terminal websocket message")
+            .expect("terminal websocket event");
+        let text = match message {
+            tungstenite::Message::Text(text) => text,
+            other => panic!("expected terminal text event, got {other:?}"),
+        };
+        let event: Value = serde_json::from_str(text.as_str()).expect("terminal event json");
+        assert_eq!(event["type"], "started");
+        assert_eq!(event["cwd"], workspace_path);
+        assert_ne!(event["type"], "error");
+        assert_ne!(
+            event["message"],
+            "terminal working directory does not exist: "
+        );
+
+        socket.close(None).await.expect("close terminal websocket");
         server.abort();
     }
 

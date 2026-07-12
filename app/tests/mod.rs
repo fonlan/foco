@@ -24987,9 +24987,10 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
         .await
         .expect("agent team json");
     assert_eq!(body["team"]["id"], "remote-agent-team-chat-1");
-    let mut ws_request = format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws")
-        .into_client_request()
-        .expect("websocket request");
+    let mut ws_request =
+        format!("ws://{app_addr}/api/workspaces/remote/terminal/session-1/ws?cols=111&rows=37")
+            .into_client_request()
+            .expect("websocket request");
     ws_request.headers_mut().insert(
         header::CONNECTION,
         "Upgrade".parse().expect("connection header"),
@@ -25184,7 +25185,9 @@ async fn serve_fake_sidecar_proxy_fixture(
         .route(
             "/api/remote/workspace/terminal/{session_id}/ws",
             axum::routing::get(
-                move |headers: HeaderMap, ws: axum::extract::WebSocketUpgrade| {
+                move |headers: HeaderMap,
+                      Query(query): Query<HashMap<String, String>>,
+                      ws: axum::extract::WebSocketUpgrade| {
                     let expected = expected_ws.clone();
                     let seen = ws_seen.clone();
                     async move {
@@ -25196,6 +25199,11 @@ async fn serve_fake_sidecar_proxy_fixture(
                         seen.lock().expect("seen auth").push(auth.clone());
                         if auth != expected {
                             return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        if query.get("cols").map(String::as_str) != Some("111")
+                            || query.get("rows").map(String::as_str) != Some("37")
+                        {
+                            return StatusCode::BAD_REQUEST.into_response();
                         }
                         ws.on_upgrade(|mut socket| async move {
                             while let Some(Ok(message)) = socket.recv().await {
