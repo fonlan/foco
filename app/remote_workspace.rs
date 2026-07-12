@@ -15461,7 +15461,187 @@ mod tests {
     }
 
     #[test]
-    fn remote_sidecar_recoverable_conflict_rejects_entire_batch_before_execution() {
+    fn remote_sidecar_allowed_read_only_batch_and_run_command_remain_plannable() {
+        let tool_calls = vec![
+            NeutralToolCall {
+                call_id: "call-read-a".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "Cargo.toml" }),
+                thought_signatures: None,
+            },
+            NeutralToolCall {
+                call_id: "call-read-b".to_string(),
+                name: "find_files".to_string(),
+                arguments: json!({ "path": ".", "include": ["*.rs"], "exclude": null }),
+                thought_signatures: None,
+            },
+            NeutralToolCall {
+                call_id: "call-command".to_string(),
+                name: "run_command".to_string(),
+                arguments: json!({ "command": "git", "args": ["status", "--short"] }),
+                thought_signatures: None,
+            },
+        ];
+        let allowed_tools = remote_sidecar_executable_tool_names();
+        assert!(
+            tool_calls
+                .iter()
+                .all(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+        );
+
+        let plan = plan_tool_execution(&remote_sidecar_pending_tool_calls(&tool_calls))
+            .expect("allowed remote batch must remain plannable");
+
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].call_indices, vec![0, 1]);
+        assert_eq!(plan.groups[1].call_indices, vec![2]);
+    }
+
+    fn remote_sidecar_conflict_tool_calls(kind: &str) -> Vec<NeutralToolCall> {
+        match kind {
+            "same-file-write" => vec![
+                NeutralToolCall {
+                    call_id: "call-write-a".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "conflict.txt", "content": "first" }),
+                    thought_signatures: None,
+                },
+                NeutralToolCall {
+                    call_id: "call-write-b".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "conflict.txt", "content": "second" }),
+                    thought_signatures: None,
+                },
+            ],
+            "mixed-file-write-methods" => vec![
+                NeutralToolCall {
+                    call_id: "call-write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "conflict.txt", "content": "first" }),
+                    thought_signatures: None,
+                },
+                NeutralToolCall {
+                    call_id: "call-edit".to_string(),
+                    name: "edit_file".to_string(),
+                    arguments: json!({
+                        "path": "conflict.txt",
+                        "oldStr": "first",
+                        "newStr": "second",
+                        "replaceAll": false
+                    }),
+                    thought_signatures: None,
+                },
+            ],
+            "resource-conflict" => vec![
+                NeutralToolCall {
+                    call_id: "call-spec-read".to_string(),
+                    name: "read_spec".to_string(),
+                    arguments: json!({}),
+                    thought_signatures: None,
+                },
+                NeutralToolCall {
+                    call_id: "call-spec-write".to_string(),
+                    name: "update_spec".to_string(),
+                    arguments: json!({
+                        "expectedRevision": 1,
+                        "edits": [{ "oldText": "before", "newText": "after" }],
+                        "contentMarkdown": null
+                    }),
+                    thought_signatures: None,
+                },
+            ],
+            other => panic!("unsupported conflict fixture: {other}"),
+        }
+    }
+
+    #[test]
+    fn remote_sidecar_recoverable_conflicts_reject_entire_batch_before_execution() {
+        for kind in [
+            "same-file-write",
+            "mixed-file-write-methods",
+            "resource-conflict",
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let conflict_path = workspace.path().join("conflict.txt");
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+            database
+                .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+                .expect("insert chat");
+            database
+                .insert_message(NewMessage {
+                    id: "msg-assistant-1",
+                    chat_id: "chat-1",
+                    role: "assistant",
+                    content: "",
+                    sequence: 1,
+                    metadata_json: Some("{}"),
+                })
+                .expect("insert assistant placeholder");
+
+            let tool_calls = remote_sidecar_conflict_tool_calls(kind);
+            let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
+            let planning_error =
+                plan_tool_execution(&pending_tool_calls).expect_err("recoverable conflict");
+            let rejections = rejected_tool_batch(&pending_tool_calls, &planning_error)
+                .expect("recoverable batch rejection");
+
+            let (events, messages) = remote_sidecar_reject_tool_batch(
+                &mut database,
+                "chat-1",
+                "run-1",
+                "msg-assistant-1",
+                &tool_calls,
+                &rejections,
+            );
+
+            assert!(
+                !conflict_path.exists(),
+                "rejected {kind} batch must have no file side effect"
+            );
+            assert_eq!(events.len(), 4, "fixture: {kind}");
+            assert!(
+                events[..2].iter().all(|event| event["type"] == "toolCall"),
+                "fixture: {kind}"
+            );
+            assert!(
+                events[2..].iter().all(|event| {
+                    event["type"] == "toolResult"
+                        && event["isError"] == true
+                        && event["output"]["error"].as_str().is_some_and(|message| {
+                            message.contains("entire tool batch was rejected")
+                        })
+                }),
+                "fixture: {kind}"
+            );
+            assert_eq!(messages.len(), 2, "fixture: {kind}");
+            assert!(
+                messages.iter().all(|message| {
+                    message.role == NeutralChatRole::Tool
+                        && message.content.contains("entire tool batch was rejected")
+                }),
+                "fixture: {kind}"
+            );
+
+            let stored = database
+                .tool_calls_for_message("msg-assistant-1")
+                .expect("stored tool calls");
+            assert_eq!(stored.len(), 2, "fixture: {kind}");
+            assert!(
+                stored.iter().all(|tool_call| {
+                    tool_call.status == "error"
+                        && tool_call
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.is_error)
+                }),
+                "fixture: {kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_conflict_errors_continue_to_next_broker_turn() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let conflict_path = workspace.path().join("conflict.txt");
         let mut database =
@@ -15471,79 +15651,132 @@ mod tests {
             .expect("insert chat");
         database
             .insert_message(NewMessage {
-                id: "msg-assistant-1",
+                id: "msg-user-1",
                 chat_id: "chat-1",
-                role: "assistant",
-                content: "",
-                sequence: 1,
+                role: "user",
+                content: "trigger a conflicting tool batch",
+                sequence: 0,
                 metadata_json: Some("{}"),
             })
-            .expect("insert assistant placeholder");
+            .expect("insert user message");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
 
-        let tool_calls = vec![
-            NeutralToolCall {
-                call_id: "call-write".to_string(),
-                name: "write_file".to_string(),
-                arguments: json!({ "path": "conflict.txt", "content": "first" }),
-                thought_signatures: None,
-            },
-            NeutralToolCall {
-                call_id: "call-edit".to_string(),
-                name: "edit_file".to_string(),
-                arguments: json!({
-                    "path": "conflict.txt",
-                    "oldStr": "first",
-                    "newStr": "second",
-                    "replaceAll": false
-                }),
-                thought_signatures: None,
-            },
-        ];
-        let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
-        let planning_error =
-            plan_tool_execution(&pending_tool_calls).expect_err("mixed write methods conflict");
-        let rejections = rejected_tool_batch(&pending_tool_calls, &planning_error)
-            .expect("recoverable batch rejection");
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
 
-        let (events, messages) = remote_sidecar_reject_tool_batch(
-            &mut database,
-            "chat-1",
-            "run-1",
-            "msg-assistant-1",
-            &tool_calls,
-            &rejections,
-        );
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let first_request = loop {
+                let envelope = broker_rx.recv().await.expect("first broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let first_id = first_request.id.expect("first request id");
+            let first_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&first_id)
+                .cloned()
+                .expect("first pending response channel");
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(first_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 4, "outputTokens": 2 },
+                        "toolCalls": remote_sidecar_conflict_tool_calls("mixed-file-write-methods"),
+                    }),
+                    timestamp: None,
+                })
+                .expect("send conflicting response");
 
+            let second_request = loop {
+                let envelope = broker_rx.recv().await.expect("second broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let followup_messages = second_request.payload["request"]["messages"]
+                .as_array()
+                .expect("followup messages");
+            let rejected_results = followup_messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "tool"
+                        && message["content"].as_str().is_some_and(|content| {
+                            content.contains("entire tool batch was rejected")
+                        })
+                })
+                .count();
+            assert_eq!(rejected_results, 2);
+
+            let second_id = second_request.id.expect("second request id");
+            let second_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&second_id)
+                .cloned()
+                .expect("second pending response channel");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(second_id.clone()),
+                    method: None,
+                    payload: json!({ "kind": "textDelta", "delta": "recovered" }),
+                    timestamp: None,
+                })
+                .expect("send recovered text");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(second_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 6, "outputTokens": 1 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send final response");
+        });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("conflict recovery SSE body should finish")
+        .expect("SSE bytes");
+        broker.await.expect("broker task");
+
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert_eq!(text.matches("\"type\":\"toolCall\"").count(), 2);
+        assert_eq!(text.matches("\"type\":\"toolResult\"").count(), 2);
+        assert_eq!(text.matches("\"isError\":true").count(), 2);
+        assert!(text.contains("recovered"));
+        assert!(text.contains("\"type\":\"complete\""));
         assert!(
             !conflict_path.exists(),
-            "rejected batch must have no file side effect"
+            "conflicting write/edit calls must never reach the executor"
         );
-        assert_eq!(events.len(), 4);
-        assert!(events[..2].iter().all(|event| event["type"] == "toolCall"));
-        assert!(events[2..].iter().all(|event| {
-            event["type"] == "toolResult"
-                && event["isError"] == true
-                && event["output"]["error"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("entire tool batch was rejected"))
-        }));
-        assert_eq!(messages.len(), 2);
-        assert!(messages.iter().all(|message| {
-            message.role == NeutralChatRole::Tool
-                && message.content.contains("entire tool batch was rejected")
-        }));
-
-        let stored = database
-            .tool_calls_for_message("msg-assistant-1")
-            .expect("stored tool calls");
-        assert_eq!(stored.len(), 2);
-        assert!(stored.iter().all(|tool_call| {
-            tool_call.status == "error"
-                && tool_call
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result.is_error)
-        }));
     }
 
     #[tokio::test]
