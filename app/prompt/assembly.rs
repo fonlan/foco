@@ -267,18 +267,23 @@ pub(crate) async fn prepare_prompt_context(
     let web_search_available = web_search_enabled(&config.web_search);
     let mut builtin_tool_definitions =
         builtin_tool_definitions_for_runtime(ripgrep_available, web_search_available);
-    if plan_mode {
-        builtin_tool_definitions.retain(|tool| plan_mode_builtin_tool_allowed(tool.name));
-    }
-    let memory_tool_definitions = if config.memory.enabled {
-        let mut tools = memory_tool_definitions();
-        if plan_mode {
-            tools.retain(|tool| tool.name != MEMORY_WRITE_TOOL_NAME);
-        }
-        tools
+    let mut memory_tool_definitions = if config.memory.enabled {
+        memory_tool_definitions()
     } else {
         Vec::new()
     };
+    let mut default_agent_tool_capabilities = builtin_tool_definitions
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .chain(memory_tool_definitions.iter().map(|tool| tool.name.clone()))
+        .chain(mcp_tools.iter().map(|tool| tool.name.clone()))
+        .collect::<Vec<_>>();
+    default_agent_tool_capabilities.sort();
+    default_agent_tool_capabilities.dedup();
+    if plan_mode {
+        builtin_tool_definitions.retain(|tool| plan_mode_builtin_tool_allowed(tool.name));
+        memory_tool_definitions.retain(|tool| tool.name != MEMORY_WRITE_TOOL_NAME);
+    }
     let mut neutral_tools = builtin_tool_definitions
         .iter()
         .cloned()
@@ -603,6 +608,7 @@ pub(crate) async fn prepare_prompt_context(
         model_id: model.id.clone(),
         provider_config,
         provider_request,
+        default_agent_tool_capabilities,
         context_budget,
         memory_context_tokens: memory_context
             .as_ref()

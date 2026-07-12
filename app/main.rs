@@ -2294,6 +2294,7 @@ struct PreparedPromptContext {
     provider_id: String,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
+    default_agent_tool_capabilities: Vec<String>,
     context_budget: foco_agent::ContextBudget,
     memory_context_tokens: u64,
     memory_budget_tokens: u64,

@@ -1426,12 +1426,7 @@ async fn default_agent_allowed_tools(
     _config: &GlobalConfig,
     prompt_context: &PreparedPromptContext,
 ) -> Result<Vec<String>, ApiError> {
-    let mut tools = prompt_context
-        .provider_request
-        .tools
-        .iter()
-        .map(|definition| definition.name.clone())
-        .collect::<Vec<_>>();
+    let mut tools = prompt_context.default_agent_tool_capabilities.clone();
     tools.sort();
     tools.dedup();
     Ok(tools)

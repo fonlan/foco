@@ -4852,6 +4852,7 @@ fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
         provider_id: context.provider_id,
         provider_config: context.provider_config,
         provider_request: context.provider_request,
+        default_agent_tool_capabilities: Vec::new(),
         context_budget: context.context_budget,
         memory_context_tokens: 0,
         memory_budget_tokens: 0,
@@ -16960,6 +16961,12 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
 
     assert!(!tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
     assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+    assert!(
+        !context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == MEMORY_SEARCH_TOOL_NAME || tool == MEMORY_WRITE_TOOL_NAME)
+    );
     let available_tools_message = context
         .provider_request
         .messages
@@ -17098,7 +17105,19 @@ Use this only after reading the skill file.
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<BTreeSet<_>>();
+    let default_agent_tool_capabilities = context
+        .default_agent_tool_capabilities
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
 
+    assert!(default_agent_tool_capabilities.contains(WRITE_FILE_TOOL));
+    assert!(default_agent_tool_capabilities.contains(EDIT_FILE_TOOL));
+    assert!(default_agent_tool_capabilities.contains(RUN_COMMAND_TOOL));
+    assert!(default_agent_tool_capabilities.contains(CREATE_TODO_GRAPH_TOOL));
+    assert!(default_agent_tool_capabilities.contains(UPDATE_TODO_GRAPH_TOOL));
+    assert!(default_agent_tool_capabilities.contains(MEMORY_WRITE_TOOL_NAME));
+    assert!(default_agent_tool_capabilities.contains(mcp_tool_name));
     assert!(tool_names.contains(READ_FILE_TOOL));
     assert!(tool_names.contains(CREATE_PLAN_TOOL));
     assert!(tool_names.contains(GET_PLANS_TOOL));
@@ -17362,6 +17381,12 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         .collect::<BTreeSet<_>>();
 
     assert!(!tool_names.contains(SEARCH_TEXT_TOOL));
+    assert!(
+        !context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == SEARCH_TEXT_TOOL)
+    );
     let available_tools_message = context
         .provider_request
         .messages
@@ -17421,6 +17446,18 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
 
     assert!(!tool_names.contains(WEB_SEARCH_TOOL));
     assert!(tool_names.contains(WEB_FETCH_TOOL));
+    assert!(
+        !context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == WEB_SEARCH_TOOL)
+    );
+    assert!(
+        context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == WEB_FETCH_TOOL)
+    );
     let available_tools_message = context
         .provider_request
         .messages
