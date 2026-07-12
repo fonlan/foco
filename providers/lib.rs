@@ -2206,6 +2206,7 @@ mod tests {
         };
         let mut request = neutral_request(vec![
             neutral_text_message(NeutralChatRole::System, "adapter system"),
+            neutral_text_message(NeutralChatRole::Developer, "adapter developer"),
             neutral_text_message(NeutralChatRole::User, "adapter user"),
         ]);
         request.model_id = model_id.to_string();
@@ -2272,7 +2273,7 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&raw.body).expect("adapter request JSON");
         match kind_name {
-            OPENAI_CHAT_KIND | OPENAI_RESPONSES_KIND => {
+            OPENAI_CHAT_KIND | OPENAI_RESPONSES_KIND | DEEPSEEK_KIND => {
                 assert_eq!(
                     body.get("foco_fixture").and_then(Value::as_str),
                     Some("finalized-body-override"),
@@ -2294,7 +2295,66 @@ mod tests {
                     1000
                 );
             }
-            _ => unreachable!("fixture covers primary adapters only"),
+            _ => unreachable!("fixture covers primary adapters and compatible fallback"),
+        }
+        match kind_name {
+            OPENAI_CHAT_KIND => {
+                assert_eq!(
+                    body["messages"],
+                    serde_json::json!([
+                        {"role": "system", "content": "adapter system"},
+                        {"role": "developer", "content": "adapter developer"},
+                        {"role": "user", "content": "adapter user"}
+                    ])
+                );
+            }
+            OPENAI_RESPONSES_KIND => {
+                assert_eq!(body["instructions"], "adapter system");
+                assert_eq!(
+                    body["input"],
+                    serde_json::json!([
+                        {"role": "developer", "content": "adapter developer"},
+                        {"role": "user", "content": "adapter user"}
+                    ])
+                );
+            }
+            ANTHROPIC_KIND => {
+                assert_eq!(body["system"], "adapter system\n\nadapter developer");
+                assert_eq!(
+                    body["messages"],
+                    serde_json::json!([
+                        {"role": "user", "content": "adapter user"}
+                    ])
+                );
+                assert!(!raw.body.contains("\"role\":\"developer\""));
+            }
+            GEMINI_KIND => {
+                assert_eq!(
+                    body["systemInstruction"],
+                    serde_json::json!({
+                        "parts": [{"text": "adapter system\nadapter developer"}]
+                    })
+                );
+                assert_eq!(
+                    body["contents"],
+                    serde_json::json!([
+                        {"role": "user", "parts": [{"text": "adapter user"}]}
+                    ])
+                );
+                assert!(!raw.body.contains("\"role\":\"developer\""));
+            }
+            DEEPSEEK_KIND => {
+                assert_eq!(
+                    body["messages"],
+                    serde_json::json!([
+                        {"role": "system", "content": "adapter system"},
+                        {"role": "system", "content": "adapter developer"},
+                        {"role": "user", "content": "adapter user"}
+                    ])
+                );
+                assert!(!raw.body.contains("\"role\":\"developer\""));
+            }
+            _ => unreachable!("fixture covers primary adapters and compatible fallback"),
         }
         if kind_name != GEMINI_KIND {
             assert!(raw.body.contains(&format!("upstream-{model_id}")));
@@ -2302,6 +2362,7 @@ mod tests {
             assert!(raw.target.contains(&format!("upstream-{model_id}")));
         }
         assert!(raw.body.contains("adapter system"));
+        assert!(raw.body.contains("adapter developer"));
         assert!(raw.body.contains("fixture_tool"));
         let final_response = stream
             .final_response_dump()
@@ -3370,6 +3431,22 @@ mod tests {
             "fixture-gemini-model",
             ":streamGenerateContent",
             gemini,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_fixture_falls_back_developer_to_system() {
+        let deepseek = concat!(
+            "data: {\"raw_chunk_secret\":\"chunk-only-secret\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deepseek ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_adapter_captures_finalized_request_once(
+            DEEPSEEK_KIND,
+            "fixture-deepseek-model",
+            "/chat/completions",
+            deepseek,
         )
         .await;
     }
