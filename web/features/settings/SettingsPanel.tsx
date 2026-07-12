@@ -3352,15 +3352,30 @@ export function SettingsPanel({
     setIsSavingWorkspace(true);
     setError(null);
 
+    const workspaceId = workspaceForm.id.trim();
+    const shouldSaveSpec = Boolean(workspaceId) && isWorkspaceSpecSettingsLoaded;
+    const nextSpecEnabled = workspaceForm.specEnabled;
+    const nextSpecInjectEnabled = workspaceForm.specEnabled
+      ? workspaceForm.specInjectEnabled
+      : false;
+    const isRemoteWorkspace = Boolean(workspaceForm.serverId?.trim());
+    const remotePathValue = isRemoteWorkspace
+      ? (workspaceForm.remotePath ?? workspaceForm.path).trim()
+      : "";
+    const localPathValue = workspaceForm.path.trim();
+
     try {
-      const workspaceId = workspaceForm.id;
+      if (!workspaceId) {
+        throw new Error(t("Workspace was not found."));
+      }
+
       const data = await requestJson<SettingsResponse>("/api/workspaces/manual", {
         body: JSON.stringify({
           id: workspaceId,
           name: workspaceForm.name,
-          path: workspaceForm.serverId ? (workspaceForm.remotePath ?? workspaceForm.path) : workspaceForm.path,
-          serverId: workspaceForm.serverId ?? null,
-          remotePath: workspaceForm.serverId ? (workspaceForm.remotePath ?? workspaceForm.path) : null,
+          path: isRemoteWorkspace ? remotePathValue : localPathValue,
+          serverId: isRemoteWorkspace ? workspaceForm.serverId : null,
+          remotePath: isRemoteWorkspace ? remotePathValue : null,
           pinned: workspaceForm.pinned,
           terminalShell: workspaceForm.terminalShell,
           commonCommands: workspaceForm.commonCommands,
@@ -3371,16 +3386,19 @@ export function SettingsPanel({
       setSettings(data);
       onSettingsChange(data);
       await onWorkspacesChange();
-      if (editingWorkspace && isWorkspaceSpecSettingsLoaded) {
+      if (shouldSaveSpec) {
         const savedSpec = await saveWorkspaceSpecSettingsRequest(
           workspaceId,
-          workspaceForm.specEnabled,
-          workspaceForm.specEnabled ? workspaceForm.specInjectEnabled : false,
+          nextSpecEnabled,
+          nextSpecInjectEnabled,
         );
         setWorkspaceForm((current) =>
           current.id === workspaceId
             ? {
                 ...current,
+                path: isRemoteWorkspace ? remotePathValue : localPathValue,
+                remotePath: isRemoteWorkspace ? remotePathValue : null,
+                serverId: isRemoteWorkspace ? workspaceForm.serverId : null,
                 specEnabled: savedSpec.settings.enabled,
                 specInjectEnabled: savedSpec.settings.injectEnabled,
               }
@@ -8360,10 +8378,14 @@ export function SettingsPanel({
                             className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                             name="workspace-path"
                             onChange={(event) =>
-                              setWorkspaceForm((current) => ({
-                                ...current,
-                                path: event.target.value,
-                              }))
+                              setWorkspaceForm((current) => {
+                                const nextPath = event.target.value;
+                                return {
+                                  ...current,
+                                  path: nextPath,
+                                  remotePath: current.serverId ? nextPath : current.remotePath,
+                                };
+                              })
                             }
                             placeholder="C:/Users/name/workspace"
                             value={workspaceForm.path}

@@ -1131,6 +1131,10 @@ describe("app-workspaces verification surfaces", () => {
       }),
     );
 
+    // Refresh workspaces/settings after save (same as page reload).
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit workspace Remote project" }),
     );
