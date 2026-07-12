@@ -1010,6 +1010,71 @@ where
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn agent_lifecycle_retry_until_shutdown_for_test(
+    workspace_path: &Path,
+    task_id: &AgentTaskId,
+    attempt_id: &AgentAttemptId,
+    shutdown_rx: watch::Receiver<bool>,
+    started_tx: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), ApiError> {
+    let workspace_id = workspace_path.display().to_string();
+    let context = AgentLifecycleOperationContext {
+        workspace_id: &workspace_id,
+        workspace_path,
+        task_id,
+        attempt_id: Some(attempt_id),
+    };
+    let mut started_tx = Some(started_tx);
+    retry_agent_lifecycle_database_operation("test shutdown handoff", &context, shutdown_rx, || {
+        if let Some(started_tx) = started_tx.take() {
+            let _ = started_tx.send(());
+        }
+        Err(ApiError::internal(
+            "workspace database concurrency limit reached: synthetic sustained pressure",
+        ))
+    })
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn recover_panicked_coordinator_for_test(
+    state: &AppState,
+    workspace: WorkspaceConfig,
+    task_id: AgentTaskId,
+    attempt_id: AgentAttemptId,
+) -> Result<(), ApiError> {
+    let exit = capture_agent_coordinator_exit(async {
+        panic!("synthetic Coordinator panic after claim");
+    })
+    .await;
+    let AgentCoordinatorRunExit::Panicked(message) = exit else {
+        return Err(ApiError::internal(
+            "synthetic Coordinator panic completed normally",
+        ));
+    };
+    let identity = AgentCoordinatorRunIdentity {
+        workspace,
+        task_id,
+        attempt_id,
+    };
+    let reason = format!("Coordinator task panicked: {message}");
+    recover_abnormal_coordinator_exit(state, &identity, &reason).await;
+    let database = open_workspace_database_critical(&identity.workspace.path)?;
+    let task = database
+        .agent_task(&identity.task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal("panic recovery task was not found"))?;
+    if task.status != AgentTaskStatus::Failed {
+        return Err(ApiError::internal(format!(
+            "panic recovery left Agent task '{}' in state '{}'",
+            task.id,
+            task.status.as_str()
+        )));
+    }
+    Ok(())
+}
+
 async fn fail_claimed_task_durably(
     state: &AppState,
     identity: &AgentCoordinatorRunIdentity,

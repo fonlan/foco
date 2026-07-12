@@ -7600,6 +7600,71 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+fn insert_claimed_agent_task(
+    workspace_dir: &Path,
+    suffix: &str,
+) -> (
+    foco_agent::AgentTeamId,
+    foco_agent::AgentInstanceId,
+    foco_agent::AgentTaskId,
+    foco_agent::AgentAttemptId,
+) {
+    let chat_id = format!("chat-{suffix}");
+    let team_id = foco_agent::AgentTeamId::new(format!("agent-team-{suffix}")).expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new(format!("agent-instance-{suffix}")).expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new(format!("agent-task-{suffix}")).expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new(format!("agent-attempt-{suffix}")).expect("attempt id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new(format!("agent-definition-{suffix}")).expect("definition id"),
+        revision: 1,
+        name: format!("Coordinator {suffix}"),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Close the claimed task reliably.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    let mut database = WorkspaceDatabase::open_or_create(workspace_dir).expect("database");
+    database
+        .insert_chat(&chat_id, &format!("Agent lifecycle {suffix}"))
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id: &chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    (team_id, instance_id, task_id, attempt_id)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failing_claimed_task_uses_reserved_database_capacity() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-fail-retry-test"));
@@ -7699,6 +7764,217 @@ async fn failing_claimed_task_uses_reserved_database_capacity() {
     );
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_database_gate_times_out_while_critical_capacity_remains_available() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let gate_1 = open_workspace_database(workspace.path()).expect("first ordinary holder");
+    let gate_2 = open_workspace_database(workspace.path()).expect("second ordinary holder");
+    let workspace_path = workspace.path().to_path_buf();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        let started_at = Instant::now();
+        let error = match open_workspace_database(&workspace_path) {
+            Ok(_) => panic!("third ordinary open must hit the concurrency limit"),
+            Err(error) => error,
+        };
+        (error, started_at.elapsed())
+    });
+    started_rx.await.expect("ordinary waiter started");
+
+    let (error, waited) = timeout(Duration::from_secs(7), waiter)
+        .await
+        .expect("ordinary gate timeout should be bounded")
+        .expect("ordinary waiter joined");
+    assert!(
+        waited >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+        "ordinary waiter returned too early after {waited:?}"
+    );
+    assert!(
+        error
+            .message
+            .contains("workspace database concurrency limit reached"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("gate=ordinary"), "{}", error.message);
+    assert!(error.message.contains("ordinary=0/2"), "{}", error.message);
+
+    let critical_started_at = Instant::now();
+    let critical = open_workspace_database_critical(workspace.path())
+        .expect("reserved critical capacity remains available");
+    assert!(
+        critical_started_at.elapsed() < Duration::from_secs(1),
+        "critical open should not wait behind ordinary saturation"
+    );
+    drop(critical);
+    drop(gate_1);
+    drop(gate_2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claimed_task_closes_after_pressure_outlives_the_legacy_retry_window() {
+    const LEGACY_RETRY_WINDOW: Duration = Duration::from_millis(9_500);
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (_, _, task_id, _) = insert_claimed_agent_task(workspace.path(), "legacy-window");
+    let gate_1 = open_workspace_database(workspace.path()).expect("first ordinary holder");
+    let gate_2 = open_workspace_database(workspace.path()).expect("second ordinary holder");
+    let gate_3 = open_workspace_database_critical(workspace.path()).expect("critical holder");
+    let workspace_path = workspace.path().to_path_buf();
+    let retry_task_id = task_id.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let retry = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        crate::runtime::fail_claimed_task_with_retry(
+            &workspace_path,
+            &retry_task_id,
+            "synthetic failure after sustained database pressure",
+        )
+        .await
+    });
+    started_rx.await.expect("durable closure started");
+
+    tokio::time::sleep(LEGACY_RETRY_WINDOW + Duration::from_millis(500)).await;
+    assert!(
+        !retry.is_finished(),
+        "closure must keep waiting beyond the legacy four-attempt budget"
+    );
+    drop(gate_3);
+    timeout(Duration::from_secs(2), retry)
+        .await
+        .expect("closure should finish after critical capacity is released")
+        .expect("closure task joined")
+        .expect("failure persisted after sustained pressure");
+    drop(gate_1);
+    drop(gate_2);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Failed
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Failed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_panic_is_closed_without_leaving_a_running_attempt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let config = prompt_test_config(workspace.path().to_path_buf());
+    let workspace_config = config.workspaces[0].clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let (team_id, _, task_id, attempt_id) =
+        insert_claimed_agent_task(workspace.path(), "panic-recovery");
+
+    crate::runtime::recover_panicked_coordinator_for_test(
+        &state,
+        workspace_config,
+        task_id.clone(),
+        attempt_id.clone(),
+    )
+    .await
+    .expect("panic recovery persists task failure");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let task = database.agent_task(&task_id).expect("task").expect("task");
+    assert_eq!(task.status, foco_agent::AgentTaskStatus::Failed);
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Failed
+    );
+    let events = database
+        .agent_events_after(&team_id, -1)
+        .expect("agent events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_failed"
+            && event.attempt_id.as_ref() == Some(&attempt_id)
+            && event.payload_json.contains("Coordinator task panicked")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_hands_running_task_to_startup_reconciliation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let config = prompt_test_config(workspace.path().to_path_buf());
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let (_, _, task_id, attempt_id) =
+        insert_claimed_agent_task(workspace.path(), "shutdown-reconciliation");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let retry_workspace = workspace.path().to_path_buf();
+    let retry_task_id = task_id.clone();
+    let retry_attempt_id = attempt_id.clone();
+    let shutdown_rx = state.app_shutdown_rx.clone();
+    let retry = tokio::spawn(async move {
+        crate::runtime::agent_lifecycle_retry_until_shutdown_for_test(
+            &retry_workspace,
+            &retry_task_id,
+            &retry_attempt_id,
+            shutdown_rx,
+            started_tx,
+        )
+        .await
+    });
+    started_rx.await.expect("durable retry started");
+    state
+        .app_shutdown_tx
+        .send(true)
+        .expect("request application shutdown");
+    let error = timeout(Duration::from_secs(1), retry)
+        .await
+        .expect("shutdown should stop durable retry")
+        .expect("retry task joined")
+        .expect_err("shutdown leaves reconciliation work for next startup");
+    assert!(
+        error.message.contains(SHUTDOWN_MESSAGE),
+        "{}",
+        error.message
+    );
+
+    {
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        assert_eq!(
+            database
+                .agent_task(&task_id)
+                .expect("task")
+                .expect("task")
+                .status,
+            foco_agent::AgentTaskStatus::Running
+        );
+    }
+    reconcile_agent_runtime(&state).expect("startup reconciliation closes the orphaned run");
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Interrupted
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Interrupted
+    );
 }
 
 #[tokio::test]

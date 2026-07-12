@@ -20,7 +20,10 @@ pub(crate) use agent_scheduler::{
     validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
-pub(crate) use agent_scheduler::{fail_claimed_task_with_retry, reconcile_agent_runtime};
+pub(crate) use agent_scheduler::{
+    agent_lifecycle_retry_until_shutdown_for_test, fail_claimed_task_with_retry,
+    reconcile_agent_runtime, recover_panicked_coordinator_for_test,
+};
 #[cfg(test)]
 pub(crate) use api_audit::should_vacuum_workspace_database;
 pub(crate) use api_audit::{spawn_api_audit_cleanup_once, spawn_api_audit_cleanup_scheduler};
