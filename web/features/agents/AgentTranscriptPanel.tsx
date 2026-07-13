@@ -1,6 +1,7 @@
 import { ArrowLeft, Bot, ListChecks, LoaderCircle, RefreshCw, User } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
+import { CHAT_BOTTOM_LOCK_THRESHOLD_PX } from "../../app/constants";
 import type {
   AgentTranscriptItemView,
   AgentTranscriptResponse,
@@ -112,10 +113,21 @@ export function AgentTranscriptPanel({
   const itemsRef = useRef(items);
   const pageRef = useRef(page);
   const hasMoreRef = useRef(hasMore);
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
-  const scrollTopRef = useRef(initialCache?.scrollTop ?? 0);
-  const stickToBottomRef = useRef(initialCache?.stickToBottom ?? true);
   const identityKey = `${workspaceId}:${chatId}:${instanceId}`;
+  const messageScrollRef = useRef<HTMLDivElement | null>(null);
+  const messageScrollContentRef = useRef<HTMLDivElement | null>(null);
+  const scrollTopRef = useRef(initialCache?.scrollTop ?? 0);
+  const shouldLockToBottomRef = useRef(initialCache?.stickToBottom ?? true);
+  const userScrollIntentRef = useRef(false);
+  const previousIdentityKeyRef = useRef(identityKey);
+  const previousItemCountRef = useRef(items.length);
+  const pendingScrollRestoreRef = useRef<"bottom" | "top" | null>(
+    initialCache?.hasBaseline
+      ? initialCache.stickToBottom
+        ? "bottom"
+        : "top"
+      : null,
+  );
   const identityKeyRef = useRef(identityKey);
   const snapshotMatchesChat = snapshot?.team.chatId === chatId;
   const instanceExists = instance !== null && snapshotMatchesChat;
@@ -131,6 +143,19 @@ export function AgentTranscriptPanel({
     transcriptRequestGenerationRef.current += 1;
   }, []);
 
+  const scrollMessageListToBottom = useCallback(() => {
+    const element = messageScrollRef.current;
+    if (!element) {
+      return;
+    }
+    element.scrollTop = element.scrollHeight;
+    window.requestAnimationFrame(() => {
+      if (shouldLockToBottomRef.current) {
+        element.scrollTop = element.scrollHeight;
+      }
+    });
+  }, []);
+
   const persistTranscriptCache = useCallback(() => {
     if (!hasTranscriptBaselineRef.current && itemsRef.current.length === 0) {
       return;
@@ -140,8 +165,8 @@ export function AgentTranscriptPanel({
       hasMore: hasMoreRef.current,
       items: itemsRef.current,
       page: pageRef.current,
-      scrollTop: scrollContainerRef.current?.scrollTop ?? scrollTopRef.current,
-      stickToBottom: stickToBottomRef.current,
+      scrollTop: messageScrollRef.current?.scrollTop ?? scrollTopRef.current,
+      stickToBottom: shouldLockToBottomRef.current,
     });
   }, []);
 
@@ -178,8 +203,8 @@ export function AgentTranscriptPanel({
           hasMore: data.hasMore,
           items: nextItems,
           page: data.page,
-          scrollTop: scrollContainerRef.current?.scrollTop ?? scrollTopRef.current,
-          stickToBottom: stickToBottomRef.current,
+          scrollTop: messageScrollRef.current?.scrollTop ?? scrollTopRef.current,
+          stickToBottom: shouldLockToBottomRef.current,
         });
       } catch (err) {
         if (
@@ -208,30 +233,30 @@ export function AgentTranscriptPanel({
     cancelActiveTranscriptRequest();
     setIsTranscriptLoading(false);
 
-    const cache = isIdentityChange
-      ? readTranscriptCacheRef.current()
-      : initialCacheRef.current;
-    if (cache?.hasBaseline) {
-      setItems(cache.items);
-      setPage(cache.page);
-      setHasMore(cache.hasMore);
-      setTranscriptError(null);
-      hasTranscriptBaselineRef.current = true;
-      scrollTopRef.current = cache.scrollTop;
-      stickToBottomRef.current = cache.stickToBottom;
-      requestAnimationFrame(() => {
-        if (scrollContainerRef.current) {
-          scrollContainerRef.current.scrollTop = cache.scrollTop;
-        }
-      });
-    } else {
-      setItems([]);
-      setPage(1);
-      setHasMore(false);
-      setTranscriptError(null);
-      hasTranscriptBaselineRef.current = false;
-      scrollTopRef.current = 0;
-      stickToBottomRef.current = true;
+    // Only apply cache scroll/items restore on true identity changes.
+    // First mount already seeds state + pendingScrollRestoreRef from lazy init;
+    // re-queuing pending here would clobber live unlock after soft refresh.
+    if (isIdentityChange) {
+      const cache = readTranscriptCacheRef.current();
+      if (cache?.hasBaseline) {
+        setItems(cache.items);
+        setPage(cache.page);
+        setHasMore(cache.hasMore);
+        setTranscriptError(null);
+        hasTranscriptBaselineRef.current = true;
+        scrollTopRef.current = cache.scrollTop;
+        shouldLockToBottomRef.current = cache.stickToBottom;
+        pendingScrollRestoreRef.current = cache.stickToBottom ? "bottom" : "top";
+      } else {
+        setItems([]);
+        setPage(1);
+        setHasMore(false);
+        setTranscriptError(null);
+        hasTranscriptBaselineRef.current = false;
+        scrollTopRef.current = 0;
+        shouldLockToBottomRef.current = true;
+        pendingScrollRestoreRef.current = null;
+      }
     }
 
     const currentSnapshot = snapshotRef.current;
@@ -279,7 +304,8 @@ export function AgentTranscriptPanel({
       setTranscriptError(null);
       hasTranscriptBaselineRef.current = false;
       scrollTopRef.current = 0;
-      stickToBottomRef.current = true;
+      shouldLockToBottomRef.current = true;
+      pendingScrollRestoreRef.current = null;
       writeTranscriptCacheRef.current({
         hasBaseline: false,
         hasMore: false,
@@ -300,6 +326,73 @@ export function AgentTranscriptPanel({
     snapshot,
   ]);
 
+  useLayoutEffect(() => {
+    const element = messageScrollRef.current;
+    const identityChanged = previousIdentityKeyRef.current !== identityKey;
+    const wasEmpty = previousItemCountRef.current === 0;
+    previousIdentityKeyRef.current = identityKey;
+    previousItemCountRef.current = items.length;
+
+    const pendingRestore = pendingScrollRestoreRef.current;
+    if (pendingRestore) {
+      // Keep pending until the scroll container is mounted so layout can retry.
+      if (!element) {
+        return;
+      }
+      pendingScrollRestoreRef.current = null;
+      if (pendingRestore === "bottom" || items.length === 0) {
+        shouldLockToBottomRef.current = items.length > 0;
+        if (items.length > 0) {
+          scrollMessageListToBottom();
+        } else {
+          element.scrollTop = 0;
+        }
+        return;
+      }
+      shouldLockToBottomRef.current = false;
+      element.scrollTop = scrollTopRef.current;
+      return;
+    }
+
+    if (items.length === 0) {
+      shouldLockToBottomRef.current = false;
+      if (element) {
+        element.scrollTop = 0;
+      }
+      return;
+    }
+
+    if (identityChanged || wasEmpty) {
+      shouldLockToBottomRef.current = true;
+      scrollMessageListToBottom();
+    }
+  }, [identityKey, items.length, scrollMessageListToBottom]);
+
+  useLayoutEffect(() => {
+    if (!shouldLockToBottomRef.current) {
+      return;
+    }
+    scrollMessageListToBottom();
+  }, [items, scrollMessageListToBottom]);
+
+  useLayoutEffect(() => {
+    const container = messageScrollRef.current;
+    const content = messageScrollContentRef.current;
+    if (!container || !content) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (shouldLockToBottomRef.current) {
+        scrollMessageListToBottom();
+      }
+    });
+    observer.observe(container);
+    observer.observe(content);
+
+    return () => observer.disconnect();
+  }, [scrollMessageListToBottom]);
+
   const refreshTranscript = useCallback(async () => {
     await onRefresh();
     if (instanceExists) {
@@ -313,14 +406,30 @@ export function AgentTranscriptPanel({
     }
   }, [hasMore, isTranscriptLoading, loadTranscript, page]);
 
+  const markUserScrollIntent = useCallback(() => {
+    userScrollIntentRef.current = true;
+  }, []);
+
   const handleScroll = useCallback(() => {
-    const node = scrollContainerRef.current;
-    if (!node) {
+    const element = messageScrollRef.current;
+    if (!element) {
       return;
     }
-    scrollTopRef.current = node.scrollTop;
-    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-    stickToBottomRef.current = distanceFromBottom <= 48;
+    scrollTopRef.current = element.scrollTop;
+
+    if (itemsRef.current.length === 0) {
+      shouldLockToBottomRef.current = false;
+      userScrollIntentRef.current = false;
+      return;
+    }
+
+    const isAtBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight <=
+      CHAT_BOTTOM_LOCK_THRESHOLD_PX;
+    if (isAtBottom || userScrollIntentRef.current) {
+      shouldLockToBottomRef.current = isAtBottom;
+    }
+    userScrollIntentRef.current = false;
   }, []);
 
   const displayError = error ?? transcriptError;
@@ -387,13 +496,17 @@ export function AgentTranscriptPanel({
 
       <div
         className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
+        onKeyDown={markUserScrollIntent}
         onScroll={handleScroll}
-        ref={scrollContainerRef}
+        onTouchMove={markUserScrollIntent}
+        onWheel={markUserScrollIntent}
+        ref={messageScrollRef}
       >
         <div
           className={`message-stack mx-auto flex w-full flex-col ${
             items.length ? "max-w-5xl gap-4" : "max-w-3xl"
           }`}
+          ref={messageScrollContentRef}
         >
           {displayError ? (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">

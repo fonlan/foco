@@ -1,4 +1,4 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +19,238 @@ import {
   resetAppTestEnvironment,
   settings,
 } from "./test-utils/app-test-harness";
+
+function installMessageListScrollMetrics(
+  messageList: HTMLElement,
+  options?: { clientHeight?: number; scrollHeight?: number; scrollTop?: number },
+) {
+  let scrollHeight = options?.scrollHeight ?? 1000;
+  const clientHeight = options?.clientHeight ?? 500;
+  let scrollTop = options?.scrollTop ?? 0;
+  Object.defineProperties(messageList, {
+    clientHeight: { configurable: true, get: () => clientHeight },
+    scrollHeight: {
+      configurable: true,
+      get: () => scrollHeight,
+      set: (value: number) => {
+        scrollHeight = value;
+      },
+    },
+    scrollTop: {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = Math.min(value, Math.max(0, scrollHeight - clientHeight));
+      },
+    },
+  });
+  return {
+    get clientHeight() {
+      return clientHeight;
+    },
+    get scrollHeight() {
+      return scrollHeight;
+    },
+    set scrollHeight(value: number) {
+      scrollHeight = value;
+    },
+    get scrollTop() {
+      return scrollTop;
+    },
+    set scrollTop(value: number) {
+      scrollTop = Math.min(value, Math.max(0, scrollHeight - clientHeight));
+    },
+  };
+}
+
+async function withMessageListScrollPrototypeMocks<T>(
+  run: () => Promise<T>,
+  options?: { clientHeight?: number; scrollHeight?: number },
+): Promise<T> {
+  const scrollHeight = options?.scrollHeight ?? 1000;
+  const clientHeight = options?.clientHeight ?? 500;
+  const scrollTops = new WeakMap<HTMLElement, number>();
+  const previousScrollHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "scrollHeight",
+  );
+  const previousClientHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "clientHeight",
+  );
+  const previousScrollTop = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "scrollTop",
+  );
+
+  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+    configurable: true,
+    get(this: HTMLElement) {
+      if (this.classList?.contains("message-list")) {
+        return scrollHeight;
+      }
+      return previousScrollHeight?.get?.call(this) ?? 0;
+    },
+  });
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get(this: HTMLElement) {
+      if (this.classList?.contains("message-list")) {
+        return clientHeight;
+      }
+      return previousClientHeight?.get?.call(this) ?? 0;
+    },
+  });
+  Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+    configurable: true,
+    get(this: HTMLElement) {
+      if (this.classList?.contains("message-list")) {
+        return scrollTops.get(this) ?? 0;
+      }
+      return previousScrollTop?.get?.call(this) ?? 0;
+    },
+    set(this: HTMLElement, value: number) {
+      if (this.classList?.contains("message-list")) {
+        scrollTops.set(
+          this,
+          Math.min(Number(value), Math.max(0, scrollHeight - clientHeight)),
+        );
+        return;
+      }
+      previousScrollTop?.set?.call(this, value);
+    },
+  });
+
+  try {
+    return await run();
+  } finally {
+    if (previousScrollHeight) {
+      Object.defineProperty(HTMLElement.prototype, "scrollHeight", previousScrollHeight);
+    }
+    if (previousClientHeight) {
+      Object.defineProperty(HTMLElement.prototype, "clientHeight", previousClientHeight);
+    }
+    if (previousScrollTop) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", previousScrollTop);
+    }
+  }
+}
+
+function agentTranscriptPanelMessageList() {
+  const transcriptPanel = screen
+    .getByText("Worker, inspect the current task.")
+    .closest(".chat-panel");
+  if (!(transcriptPanel instanceof HTMLElement)) {
+    throw new Error("Expected agent transcript panel");
+  }
+  const messageList = transcriptPanel.querySelector(".message-list");
+  if (!(messageList instanceof HTMLElement)) {
+    throw new Error("Expected agent transcript message list");
+  }
+  return messageList;
+}
+
+function installTrackingResizeObserver() {
+  type TrackedObserver = {
+    callback: ResizeObserverCallback;
+    targets: Set<Element>;
+  };
+  const observers: TrackedObserver[] = [];
+  const PreviousResizeObserver = window.ResizeObserver;
+
+  class TrackingResizeObserver implements ResizeObserver {
+    private readonly tracked: TrackedObserver;
+
+    constructor(callback: ResizeObserverCallback) {
+      this.tracked = { callback, targets: new Set() };
+      observers.push(this.tracked);
+    }
+
+    observe(target: Element) {
+      this.tracked.targets.add(target);
+      const contentRect = {
+        bottom: 300,
+        height: 300,
+        left: 0,
+        right: 800,
+        toJSON: () => ({}),
+        top: 0,
+        width: 800,
+        x: 0,
+        y: 0,
+      } satisfies DOMRectReadOnly;
+      this.tracked.callback(
+        [
+          {
+            borderBoxSize: [],
+            contentBoxSize: [],
+            contentRect,
+            devicePixelContentBoxSize: [],
+            target,
+          } satisfies ResizeObserverEntry,
+        ],
+        this,
+      );
+    }
+
+    unobserve(target: Element) {
+      this.tracked.targets.delete(target);
+    }
+
+    disconnect() {
+      this.tracked.targets.clear();
+    }
+  }
+
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: TrackingResizeObserver,
+  });
+
+  return {
+    flush(target?: Element) {
+      for (const observer of observers) {
+        const targets =
+          target != null
+            ? observer.targets.has(target)
+              ? [target]
+              : []
+            : [...observer.targets];
+        for (const observed of targets) {
+          const contentRect = {
+            bottom: 300,
+            height: 300,
+            left: 0,
+            right: 800,
+            toJSON: () => ({}),
+            top: 0,
+            width: 800,
+            x: 0,
+            y: 0,
+          } satisfies DOMRectReadOnly;
+          observer.callback(
+            [
+              {
+                borderBoxSize: [],
+                contentBoxSize: [],
+                contentRect,
+                devicePixelContentBoxSize: [],
+                target: observed,
+              } satisfies ResizeObserverEntry,
+            ],
+            observer as unknown as ResizeObserver,
+          );
+        }
+      }
+    },
+    restore() {
+      Object.defineProperty(window, "ResizeObserver", {
+        configurable: true,
+        value: PreviousResizeObserver,
+      });
+    },
+  };
+}
 
 function stubDefaultAgentComposerDefaults() {
   const baseModel = settings.configuredModels[0]!;
@@ -1001,6 +1233,327 @@ describe("app agents verification surfaces", () => {
       expect(chat1TranscriptRequestCount).toBeGreaterThan(transcriptCountBeforeReopen);
     });
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+  });
+
+  it("locks the agent transcript list to the bottom on first load and keeps lock without user intent", async () => {
+    let transcriptVersion = 0;
+    const resizeObserver = installTrackingResizeObserver();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const path = url.startsWith("http://127.0.0.1")
+            ? new URL(url).pathname
+            : url.split("?")[0];
+          if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+            return jsonResponse(agentTeamSnapshot);
+          }
+          if (path.endsWith("/agent-instance-worker/transcript")) {
+            if (transcriptVersion === 0) {
+              return jsonResponse(agentTranscriptResponse);
+            }
+            return jsonResponse({
+              ...agentTranscriptResponse,
+              items: [
+                ...agentTranscriptResponse.items,
+                {
+                  author: "Worker",
+                  content: "Streaming follow-up line.",
+                  createdAt: "2026-06-05T10:00:05Z",
+                  id: "message:agent-message-follow-up",
+                  kind: "Reply",
+                  metrics: null,
+                  parts: [],
+                  role: "assistant",
+                  status: null,
+                  taskStatus: "running",
+                },
+              ],
+              totalCount: 4,
+            });
+          }
+          return mockFetch(input, init);
+        }),
+      );
+      renderApp();
+
+      await userEvent.click(await screen.findByText("Tool run"));
+      await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+      expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+      const messageList = agentTranscriptPanelMessageList();
+      const metrics = installMessageListScrollMetrics(messageList);
+      const transcriptPanel = messageList.closest(".chat-panel");
+      expect(transcriptPanel).not.toBeNull();
+
+      // Metrics are installed after first paint; refresh re-runs lock layout with mocked heights.
+      await userEvent.click(
+        within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+      );
+      await waitFor(() => expect(messageList.scrollTop).toBe(500));
+
+      // Programmatic scroll without user intent must not unlock.
+      fireEvent.scroll(messageList);
+      metrics.scrollHeight = 1200;
+      transcriptVersion = 1;
+      await userEvent.click(
+        within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+      );
+      expect(await screen.findByText("Streaming follow-up line.")).toBeInTheDocument();
+      await waitFor(() => expect(messageList.scrollTop).toBe(700));
+
+      // Panel ResizeObserver must keep stick-to-bottom when content grows.
+      metrics.scrollHeight = 1300;
+      await act(async () => {
+        resizeObserver.flush(messageList.querySelector(".message-stack") as Element);
+      });
+      await waitFor(() => expect(messageList.scrollTop).toBe(800));
+    } finally {
+      resizeObserver.restore();
+    }
+  });
+
+  it("unlocks agent transcript bottom lock after user scroll intent and relocks near bottom", async () => {
+    let transcriptVersion = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          if (transcriptVersion === 0) {
+            return jsonResponse(agentTranscriptResponse);
+          }
+          return jsonResponse({
+            ...agentTranscriptResponse,
+            items: [
+              ...agentTranscriptResponse.items,
+              {
+                author: "Worker",
+                content: `Unlocked growth ${transcriptVersion}.`,
+                createdAt: "2026-06-05T10:00:06Z",
+                id: `message:agent-message-growth-${transcriptVersion}`,
+                kind: "Reply",
+                metrics: null,
+                parts: [],
+                role: "assistant",
+                status: null,
+                taskStatus: "running",
+              },
+            ],
+            totalCount: 4,
+          });
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const messageList = agentTranscriptPanelMessageList();
+    const metrics = installMessageListScrollMetrics(messageList);
+    const transcriptPanel = messageList.closest(".chat-panel");
+    expect(transcriptPanel).not.toBeNull();
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    await waitFor(() => expect(messageList.scrollTop).toBe(500));
+
+    fireEvent.wheel(messageList);
+    messageList.scrollTop = 120;
+    fireEvent.scroll(messageList);
+    expect(messageList.scrollTop).toBe(120);
+
+    transcriptVersion = 1;
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    expect(await screen.findByText("Unlocked growth 1.")).toBeInTheDocument();
+    metrics.scrollHeight = 1300;
+    await waitFor(() => {
+      expect(messageList.scrollTop).toBe(120);
+    });
+
+    // Soft refresh that grows items after unlock must not re-apply cache bottom restore.
+    transcriptVersion = 2;
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    expect(await screen.findByText("Unlocked growth 2.")).toBeInTheDocument();
+    metrics.scrollHeight = 1400;
+    await waitFor(() => {
+      expect(messageList.scrollTop).toBe(120);
+    });
+
+    // Relock when user scrolls back into the bottom threshold.
+    messageList.scrollTop = metrics.scrollHeight - metrics.clientHeight;
+    fireEvent.scroll(messageList);
+    transcriptVersion = 3;
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    expect(await screen.findByText("Unlocked growth 3.")).toBeInTheDocument();
+    await waitFor(() => expect(messageList.scrollTop).toBe(900));
+  });
+
+  it("restores stick-to-bottom and scrollTop from agent transcript tab cache", async () => {
+    const transcriptRefreshGate = deferred<void>();
+    let deferBackgroundRefresh = false;
+    let transcriptRequestCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          transcriptRequestCount += 1;
+          if (deferBackgroundRefresh && transcriptRequestCount > 1) {
+            await transcriptRefreshGate.promise;
+          }
+          return jsonResponse(agentTranscriptResponse);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const lockedList = agentTranscriptPanelMessageList();
+    installMessageListScrollMetrics(lockedList);
+    const lockedPanel = lockedList.closest(".chat-panel");
+    expect(lockedPanel).not.toBeNull();
+    await userEvent.click(
+      within(lockedPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    await waitFor(() => expect(lockedList.scrollTop).toBe(500));
+
+    deferBackgroundRefresh = true;
+    await withMessageListScrollPrototypeMocks(async () => {
+      await userEvent.click(await screen.findByRole("tab", { name: /Tool run/ }));
+      await userEvent.click(await screen.findByRole("tab", { name: /Worker/ }));
+      expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+      const restoredLockedList = agentTranscriptPanelMessageList();
+      await waitFor(() => expect(restoredLockedList.scrollTop).toBe(500));
+
+      fireEvent.wheel(restoredLockedList);
+      restoredLockedList.scrollTop = 80;
+      fireEvent.scroll(restoredLockedList);
+      expect(restoredLockedList.scrollTop).toBe(80);
+
+      await userEvent.click(await screen.findByRole("tab", { name: /Tool run/ }));
+      await userEvent.click(await screen.findByRole("tab", { name: /Worker/ }));
+      expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+      const restoredScrolledList = agentTranscriptPanelMessageList();
+      await waitFor(() => expect(restoredScrolledList.scrollTop).toBe(80));
+
+      await act(async () => {
+        transcriptRefreshGate.resolve();
+      });
+      await waitFor(() => expect(restoredScrolledList.scrollTop).toBe(80));
+    });
+  });
+
+  it("does not re-lock after soft refresh once the user unlocks on the same mount", async () => {
+    let transcriptVersion = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          if (transcriptVersion === 0) {
+            return jsonResponse(agentTranscriptResponse);
+          }
+          const growthItems = Array.from({ length: transcriptVersion }, (_, index) => {
+            const version = index + 1;
+            return {
+              author: "Worker",
+              content: `Soft growth ${version}.`,
+              createdAt: `2026-06-05T10:00:0${version}Z`,
+              id: `message:agent-message-soft-${version}`,
+              kind: "Reply",
+              metrics: null,
+              parts: [],
+              role: "assistant",
+              status: null,
+              taskStatus: "running",
+            };
+          });
+          return jsonResponse({
+            ...agentTranscriptResponse,
+            items: [...agentTranscriptResponse.items, ...growthItems],
+            totalCount: agentTranscriptResponse.items.length + growthItems.length,
+          });
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const messageList = agentTranscriptPanelMessageList();
+    const metrics = installMessageListScrollMetrics(messageList);
+    const transcriptPanel = messageList.closest(".chat-panel");
+    expect(transcriptPanel).not.toBeNull();
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    await waitFor(() => expect(messageList.scrollTop).toBe(500));
+
+    // Unlock without remounting (simulates reading history while running soft refresh continues).
+    fireEvent.wheel(messageList);
+    messageList.scrollTop = 90;
+    fireEvent.scroll(messageList);
+    expect(messageList.scrollTop).toBe(90);
+
+    transcriptVersion = 1;
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    expect(await screen.findByText("Soft growth 1.")).toBeInTheDocument();
+    metrics.scrollHeight = 1500;
+    await waitFor(() => {
+      expect(messageList.scrollTop).toBe(90);
+    });
+
+    transcriptVersion = 2;
+    await userEvent.click(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    );
+    expect(await screen.findByText("Soft growth 2.")).toBeInTheDocument();
+    metrics.scrollHeight = 1600;
+    await waitFor(() => {
+      expect(messageList.scrollTop).toBe(90);
+    });
   });
 
   it("reveals the Agents panel and refreshes when an Agent instance is created", async () => {
