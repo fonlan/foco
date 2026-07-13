@@ -2593,13 +2593,23 @@ pub(crate) fn llm_context_compression_trigger_tokens(context_window: u64) -> u64
     context_window.saturating_mul(19) / 20
 }
 
+pub(crate) struct ContextUsageInput<'a> {
+    pub(crate) messages: &'a [NeutralChatMessage],
+    pub(crate) message_source_sequences: &'a [Option<i64>],
+    pub(crate) message_context_sources: &'a [PromptContextSource],
+    pub(crate) active_tool_start_index: usize,
+    pub(crate) context_budget: &'a foco_agent::ContextBudget,
+    pub(crate) memory_context_tokens: u64,
+    pub(crate) memory_budget_tokens: u64,
+}
+
 pub(crate) fn context_usage_response(
-    context: &PreparedPromptContext,
+    context: ContextUsageInput<'_>,
 ) -> Result<ContextUsageResponse, ApiError> {
     let message_groups = context_message_groups(
-        &context.provider_request.messages,
-        &context.message_source_sequences,
-        &context.message_context_sources,
+        context.messages,
+        context.message_source_sequences,
+        context.message_context_sources,
         context.active_tool_start_index,
     )?;
     let assembled_message_tokens = message_groups
@@ -2609,7 +2619,7 @@ pub(crate) fn context_usage_response(
     let available_message_tokens = context.context_budget.available_message_tokens;
     let context_window = context.context_budget.context_window;
     let max_output_tokens = context.context_budget.max_output_tokens;
-    let assembled_segments = context_usage_segments(&context.context_budget, &message_groups);
+    let assembled_segments = context_usage_segments(context.context_budget, &message_groups);
     let assembled_total_used_context_tokens = context_usage_segments_total(&assembled_segments);
     let token_breakdown = context_token_breakdown(&message_groups);
     let (packed_message_tokens, packed_groups) =
@@ -2651,7 +2661,7 @@ pub(crate) fn context_usage_response(
         .is_empty();
     let has_llm_compression_plan =
         normal_llm_compression_plan || required_overflow_llm_compression_plan;
-    let segments = context_usage_segments(&context.context_budget, &packed_groups);
+    let segments = context_usage_segments(context.context_budget, &packed_groups);
     let total_used_context_tokens = context_usage_segments_total(&segments);
     let usage_percent = percentage_ceil(total_used_context_tokens, context_window);
     let assembled_usage_percent =

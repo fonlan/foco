@@ -1873,7 +1873,9 @@ pub(crate) async fn context_usage(
     )
     .await?;
 
-    Ok(Json(context_usage_response(&prompt_context)?))
+    Ok(Json(context_usage_response(
+        prompt_context.context_usage_input(),
+    )?))
 }
 
 pub(crate) async fn answer_question(

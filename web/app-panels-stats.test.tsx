@@ -22,6 +22,7 @@ import {
   chatMemory,
   chatMessages,
   chatStatistics,
+  contextUsage,
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
@@ -75,6 +76,89 @@ describe("app-panels-stats verification surfaces", () => {
 
       return new URL(rawPath, "http://localhost");
     });
+  }
+
+  function configureRemoteSessionStatistics() {
+    const workspaceId = "workspace-remote";
+    const chatId = "remote-chat-1";
+    const title = "Remote metrics";
+    const remoteChat = chatSummary(
+      chatId,
+      title,
+      "2026-07-12T08:00:00Z",
+      "2026-07-12T08:05:00Z",
+    );
+    const remoteWorkspace = {
+      ...secondaryWorkspace,
+      chatPagination: { hasMore: false, limit: 5, nextCursor: null, total: 1 },
+      chats: [remoteChat],
+      connectionStatus: "ready",
+      displayPath: "dev-box:/home/fonla/repos/remote-project",
+      id: workspaceId,
+      name: "Remote project",
+      path: "dev-box:/home/fonla/repos/remote-project",
+      remotePath: "/home/fonla/repos/remote-project",
+      serverId: "server-1",
+      serverName: "dev-box",
+    };
+    const chatKey = `${workspaceId}/${chatId}`;
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [
+        ...appTestState.settingsResponse.workspaces,
+        {
+          commonCommands: remoteWorkspace.commonCommands,
+          connectionStatus: remoteWorkspace.connectionStatus,
+          displayPath: remoteWorkspace.displayPath,
+          id: remoteWorkspace.id,
+          isDefault: false,
+          lastRemoteError: remoteWorkspace.lastRemoteError,
+          logoUrl: remoteWorkspace.logoUrl,
+          name: remoteWorkspace.name,
+          path: remoteWorkspace.path,
+          pinned: remoteWorkspace.pinned,
+          remotePath: remoteWorkspace.remotePath,
+          serverId: remoteWorkspace.serverId,
+          serverName: remoteWorkspace.serverName,
+          terminalShell: remoteWorkspace.terminalShell,
+        },
+      ],
+    };
+    appTestState.chatMessagesResponsesByChatKey = {
+      [chatKey]: {
+        ...chatMessages,
+        chat: { ...chatMessages.chat, id: chatId, title },
+      },
+    };
+    appTestState.chatStatisticsResponsesByChatKey = {
+      [chatKey]: {
+        ...chatStatistics,
+        chatId,
+        compression: {
+          ...chatStatistics.compression,
+          llmSnapshotCount: 2,
+          runtimeToolStateSnapshotCount: 9,
+          savedTokenCount: 7654,
+        },
+        modelBreakdown: [{ modelId: "remote-gpt", requestCount: 3, totalTokens: 23456 }],
+        providerBreakdown: [
+          {
+            averageLatencyMs: 3200,
+            failedCount: 0,
+            providerId: "remote-provider",
+            requestCount: 3,
+            successCount: 3,
+            successRate: 1,
+            totalTokens: 23456,
+          },
+        ],
+        toolBreakdown: [{ callCount: 4, toolName: "read_file" }],
+        workspaceId,
+      },
+    };
+
+    return { chatId, title, workspaceId };
   }
 
   it("defaults Source Control diff to the active isolated coordinator worktree", async () => {
@@ -3178,6 +3262,42 @@ describe("app-panels-stats verification surfaces", () => {
         ([url]) => url === "/api/workspaces/workspace-1/context-usage",
       ),
     ).toBe(true);
+  });
+
+  it("renders remote tools, compression, model/provider, and current context usage", async () => {
+    const { chatId, workspaceId } = configureRemoteSessionStatistics();
+    const chatKey = `${workspaceId}/${chatId}`;
+    appTestState.contextUsageResponseQueuesByChatKey = {
+      [chatKey]: [
+        {
+          ...contextUsage,
+          totalUsedContextTokens: 78080,
+          usagePercent: 61,
+        },
+      ],
+    };
+    window.history.replaceState(null, "", `/${workspaceId}/${chatId}`);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
+
+    expect(await screen.findByText("remote-gpt")).toBeInTheDocument();
+    expect(screen.getByText("remote-provider")).toBeInTheDocument();
+    expect(screen.getByText("Provider calls")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.getByText("LLM compression snapshots")).toBeInTheDocument();
+    const tokensSaved = screen
+      .getByText("Tokens saved")
+      .closest(".context-stats-row") as HTMLElement | null;
+    expect(tokensSaved).not.toBeNull();
+    expect(within(tokensSaved!).getByText("7,654")).toBeInTheDocument();
+    expect(screen.queryByText("Runtime tool-state snapshots")).not.toBeInTheDocument();
+
+    const timeline = await screen.findByLabelText("Context usage timeline");
+    expect(within(timeline).getByText("61%")).toBeInTheDocument();
+    expect(
+      timeline.querySelector(".context-usage-history-stack"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows tool history compression when runtime tool-state compression is enabled", async () => {

@@ -4875,7 +4875,8 @@ fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
         pending_memory_retrieval: None,
         pending_spec_snapshot: None,
     };
-    let usage = context_usage_response(&preview).expect("context usage response");
+    let usage =
+        context_usage_response(preview.context_usage_input()).expect("context usage response");
 
     assert!(usage.assembled_usage_percent > 100);
     assert!(usage.usage_percent < usage.assembled_usage_percent);
@@ -19496,8 +19497,8 @@ async fn context_usage_preview_uses_only_active_compression_snapshots() {
     assert!(assembled_text.contains("visible tail message"));
     assert_eq!(prompt_context.compression_snapshots.len(), 1);
 
-    let usage =
-        context_usage_response(&prompt_context).expect("context usage from assembled prompt");
+    let usage = context_usage_response(prompt_context.context_usage_input())
+        .expect("context usage from assembled prompt");
     let compression_entry = usage
         .token_breakdown
         .by_source
@@ -20315,8 +20316,8 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     )
     .await
     .expect("prompt context");
-    let usage =
-        context_usage_response(&prompt_context).expect("context usage from assembled prompt");
+    let usage = context_usage_response(prompt_context.context_usage_input())
+        .expect("context usage from assembled prompt");
 
     assert!(
         usage.used_message_tokens
@@ -24952,6 +24953,32 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
             .contains("stream-start")
     );
 
+    let context_usage_payload = json!({
+        "chatId": "chat-1",
+        "modelId": "model-1",
+        "providerId": "provider-1",
+        "skillIds": ["workspace:workspace:workspace-demo"],
+        "assistantDraft": "draft",
+        "assistantDraftReasoning": "reasoning",
+    });
+    let context_usage_response = reqwest::Client::new()
+        .post(format!(
+            "http://{app_addr}/api/workspaces/remote/context-usage"
+        ))
+        .json(&context_usage_payload)
+        .send()
+        .await
+        .expect("proxied context usage request");
+    assert_eq!(context_usage_response.status(), StatusCode::OK);
+    let body = context_usage_response
+        .json::<Value>()
+        .await
+        .expect("context usage json");
+    assert_eq!(body["contextWindow"], 128_000);
+    assert_eq!(body["totalUsedContextTokens"], 4_800);
+    assert_eq!(body["usagePercent"], 4);
+    assert!(body.get("remoteApproximation").is_none());
+
     let stats_response = reqwest::get(format!(
         "http://{app_addr}/api/workspaces/remote/chats/chat-1/statistics"
     ))
@@ -24962,7 +24989,11 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
         .json::<Value>()
         .await
         .expect("statistics json");
-    assert_eq!(body["statistics"], true);
+    assert_eq!(body["workspaceId"], "remote");
+    assert_eq!(body["chatId"], "chat-1");
+    assert_eq!(body["toolBreakdown"][0]["toolName"], "read_file");
+    assert_eq!(body["compression"]["runtimeToolStateSnapshotCount"], 1);
+    assert_eq!(body["contextUsageTimeline"][0]["contextWindow"], 128_000);
 
     let todo_response = reqwest::get(format!(
         "http://{app_addr}/api/workspaces/remote/chats/chat-1/todo-graph"
@@ -25044,6 +25075,7 @@ async fn serve_fake_sidecar_proxy_fixture(
     let expected_http = format!("Bearer {token}");
     let expected_chat = expected_http.clone();
     let expected_chat_stream = expected_http.clone();
+    let expected_context_usage = expected_http.clone();
     let expected_chat_stats = expected_http.clone();
     let expected_todo_graph = expected_http.clone();
     let expected_agent_team = expected_http.clone();
@@ -25053,6 +25085,7 @@ async fn serve_fake_sidecar_proxy_fixture(
     let http_seen = seen_auth.clone();
     let chat_seen = seen_auth.clone();
     let chat_stream_seen = seen_auth.clone();
+    let context_usage_seen = seen_auth.clone();
     let chat_stats_seen = seen_auth.clone();
     let todo_graph_seen = seen_auth.clone();
     let agent_team_seen = seen_auth.clone();
@@ -25138,6 +25171,78 @@ async fn serve_fake_sidecar_proxy_fixture(
             }),
         )
         .route(
+            "/api/remote/workspace/context-usage",
+            axum::routing::post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let expected = expected_context_usage.clone();
+                let seen = context_usage_seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    seen.lock().expect("seen auth").push(auth.clone());
+                    if auth != expected {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let content_type = headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok());
+                    if content_type != Some("application/json")
+                        || payload
+                            != json!({
+                                "chatId": "chat-1",
+                                "modelId": "model-1",
+                                "providerId": "provider-1",
+                                "skillIds": ["workspace:workspace:workspace-demo"],
+                                "assistantDraft": "draft",
+                                "assistantDraftReasoning": "reasoning",
+                            })
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    Json(json!({
+                        "usedMessageTokens": 704,
+                        "assembledMessageTokens": 1_920,
+                        "assembledUsagePercent": 5,
+                        "postCompressionMessageTokens": 1_920,
+                        "packedMessageTokens": 704,
+                        "availableMessageTokens": 120_000,
+                        "contextWindow": 128_000,
+                        "maxOutputTokens": 4_096,
+                        "systemPromptTokens": 200,
+                        "toolSchemaTokens": 300,
+                        "historyTokens": 204,
+                        "compressionSnapshotTokens": 0,
+                        "totalUsedContextTokens": 4_800,
+                        "memoryContextTokens": 0,
+                        "memoryBudgetTokens": 0,
+                        "usagePercent": 4,
+                        "compressionTriggerTokens": 102_400,
+                        "compressionTriggerPercent": 80,
+                        "llmCompressionTriggerTokens": 121_600,
+                        "llmCompressionTriggerPercent": 95,
+                        "hasLlmCompressionPlan": false,
+                        "willCompressOnNextSend": false,
+                        "segments": {
+                            "systemPrompt": 200,
+                            "toolSchema": 300,
+                            "compressionSnapshot": 0,
+                            "history": 204,
+                            "reservedOutput": 0,
+                        },
+                        "tokenBreakdown": {
+                            "requiredTokens": 500,
+                            "optionalTokens": 204,
+                            "compressibleTokens": 204,
+                            "bySource": [],
+                        },
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
             "/api/remote/workspace/chats/{chat_id}/statistics",
             axum::routing::get(move |headers: HeaderMap| {
                 let expected = expected_chat_stats.clone();
@@ -25152,7 +25257,55 @@ async fn serve_fake_sidecar_proxy_fixture(
                     if auth != expected {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    Json(json!({ "statistics": true })).into_response()
+                    Json(json!({
+                        "workspaceId": "remote",
+                        "chatId": "chat-1",
+                        "messageCount": 3,
+                        "userMessageCount": 1,
+                        "assistantMessageCount": 1,
+                        "toolMessageCount": 1,
+                        "totalRequests": 1,
+                        "failedRequests": 0,
+                        "totalInputTokens": 120,
+                        "totalOutputTokens": 30,
+                        "totalCacheReadTokens": 0,
+                        "totalCacheWriteTokens": 0,
+                        "totalTokens": 150,
+                        "totalLatencyMs": 200,
+                        "averageLatencyMs": 200,
+                        "memoryReferences": 1,
+                        "createdMemories": 1,
+                        "codeChangeStats": { "additions": 3, "deletions": 1 },
+                        "modelBreakdown": [],
+                        "providerBreakdown": [],
+                        "toolBreakdown": [{ "toolName": "read_file", "callCount": 1 }],
+                        "compression": {
+                            "snapshotCount": 1,
+                            "ruleSnapshotCount": 1,
+                            "llmSnapshotCount": 0,
+                            "runtimeToolStateSnapshotCount": 1,
+                            "originalTokenCount": 100,
+                            "summaryTokenCount": 20,
+                            "savedTokenCount": 80
+                        },
+                        "contextUsageTimeline": [{
+                            "snapshotId": "snapshot-1",
+                            "sequence": 1,
+                            "kind": "rule",
+                            "contextWindow": 128000,
+                            "maxOutputTokens": 4096,
+                            "triggerTokens": 102400,
+                            "totalUsedTokens": 4800,
+                            "segments": {
+                                "systemPrompt": 200,
+                                "toolSchema": 300,
+                                "compressionSnapshot": 100,
+                                "history": 104,
+                                "reservedOutput": 4096
+                            }
+                        }]
+                    }))
+                    .into_response()
                 }
             }),
         )

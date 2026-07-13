@@ -5,7 +5,7 @@ mod prompt_files;
 
 pub(crate) use assembly::{plan_mode_builtin_tool_allowed, prepare_prompt_context};
 pub(crate) use compression::{
-    LlmContextCompressionMode, active_compression_snapshots,
+    ContextUsageInput, LlmContextCompressionMode, active_compression_snapshots,
     apply_compression_snapshot_to_messages, build_context_compression_summary_request,
     compress_all_runtime_tool_state_messages, compress_runtime_tool_state_messages_if_needed,
     compression_snapshot_message, context_compression_summary_has_benefit, context_message_groups,

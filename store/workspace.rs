@@ -5986,6 +5986,27 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn run_ids_for_chat(&self, chat_id: &str) -> Result<Vec<String>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT run_id
+                 FROM (
+                     SELECT run_id FROM run_events WHERE chat_id = ?1
+                     UNION
+                     SELECT run_id FROM tool_calls WHERE chat_id = ?1
+                 )
+                 WHERE TRIM(run_id) <> ''
+                 ORDER BY run_id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| row.get(0))
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn history_run_events_for_chat(
         &self,
         chat_id: &str,

@@ -15,6 +15,7 @@ import {
   defaultComposerPlaceholder,
   chatMemory,
   chatMessages,
+  contextUsage,
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
@@ -74,6 +75,64 @@ function activePlan(id: string, title: string) {
     title,
     updatedAt: timestamp,
   };
+}
+
+const remoteWorkspaceId = "workspace-remote";
+const remoteChatId = "remote-chat-1";
+const remoteChatTitle = "Remote tool run";
+
+function configureRemoteChat() {
+  const remoteChat = chatSummary(
+    remoteChatId,
+    remoteChatTitle,
+    "2026-07-12T08:00:00Z",
+    "2026-07-12T08:05:00Z",
+  );
+  const remoteWorkspace = {
+    ...secondaryWorkspace,
+    chatPagination: { hasMore: false, limit: 5, nextCursor: null, total: 1 },
+    chats: [remoteChat],
+    connectionStatus: "ready",
+    displayPath: "dev-box:/home/fonla/repos/remote-project",
+    id: remoteWorkspaceId,
+    name: "Remote project",
+    path: "dev-box:/home/fonla/repos/remote-project",
+    remotePath: "/home/fonla/repos/remote-project",
+    serverId: "server-1",
+    serverName: "dev-box",
+  };
+  const chatKey = `${remoteWorkspaceId}/${remoteChatId}`;
+  appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+  appTestState.settingsResponse = {
+    ...appTestState.settingsResponse,
+    workspaces: [
+      ...appTestState.settingsResponse.workspaces,
+      {
+        commonCommands: remoteWorkspace.commonCommands,
+        connectionStatus: remoteWorkspace.connectionStatus,
+        displayPath: remoteWorkspace.displayPath,
+        id: remoteWorkspace.id,
+        isDefault: false,
+        lastRemoteError: remoteWorkspace.lastRemoteError,
+        logoUrl: remoteWorkspace.logoUrl,
+        name: remoteWorkspace.name,
+        path: remoteWorkspace.path,
+        pinned: remoteWorkspace.pinned,
+        remotePath: remoteWorkspace.remotePath,
+        serverId: remoteWorkspace.serverId,
+        serverName: remoteWorkspace.serverName,
+        terminalShell: remoteWorkspace.terminalShell,
+      },
+    ],
+  };
+  appTestState.chatMessagesResponsesByChatKey = {
+    [chatKey]: {
+      ...chatMessages,
+      chat: { ...chatMessages.chat, id: remoteChatId, title: remoteChatTitle },
+    },
+  };
+
+  return { chatKey, remoteWorkspace };
 }
 
 describe("app-chat-stream verification surfaces", () => {
@@ -477,6 +536,98 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
+  });
+
+  it("uses a terminal remote context usage refresh after streamEnd", async () => {
+    const { chatKey } = configureRemoteChat();
+    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    renderApp();
+
+    const composer = await screen.findByPlaceholderText(
+      `Ask Foco anything about Remote project...`,
+    );
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
+    await userEvent.type(composer, "continue remotely");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
+      { ...contextUsage, usagePercent: 33 },
+    ];
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 55%" }),
+    ).toHaveTextContent("55%");
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 33%" }),
+    ).toHaveTextContent("33%");
+  });
+
+  it("refreshes terminal context usage after a remote stream error", async () => {
+    const { chatKey } = configureRemoteChat();
+    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    renderApp();
+
+    const composer = await screen.findByPlaceholderText(
+      `Ask Foco anything about Remote project...`,
+    );
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
+    await userEvent.type(composer, "fail remotely");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
+      { ...contextUsage, usagePercent: 39 },
+    ];
+
+    await act(async () => {
+      enqueueChatStreamEvent({ message: "Remote broker failed.", type: "error" });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 39%" }),
+    ).toHaveTextContent("39%");
+  });
+
+  it("refreshes terminal context usage after a remote run is cancelled", async () => {
+    const { chatKey } = configureRemoteChat();
+    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    renderApp();
+
+    const composer = await screen.findByPlaceholderText(
+      `Ask Foco anything about Remote project...`,
+    );
+    await userEvent.type(composer, "cancel remotely");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
+      { ...contextUsage, usagePercent: 42 },
+    ];
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 42%" }),
+    ).toHaveTextContent("42%");
   });
 
   it("refreshes context usage on complete when no usage event was sent", async () => {

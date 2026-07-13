@@ -80,6 +80,7 @@ use crate::{
         PromptHookExecutorRequest, PromptHookFuture,
     },
     http::{
+        chat::{ContextUsageRequest, ContextUsageResponse},
         remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
         spec::{
             SaveWorkspaceSpecRequest, WorkspaceSpecResponse, WorkspaceSpecSettingsRequest,
@@ -95,13 +96,14 @@ use crate::{
     memory_tool_definitions, merge_hook_summaries, neutral_mcp_tool_definition,
     neutral_text_message, neutral_tool_definition,
     prompt::{
-        LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
+        ContextUsageInput, LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
         builtin_tool_definitions_for_runtime, compress_all_runtime_tool_state_messages,
         compress_runtime_tool_state_messages_if_needed, configured_extra_prompt_message,
         context_compression_summary_has_benefit, context_message_groups, context_token_breakdown,
-        context_usage_segments, context_usage_segments_total, environment_context_message,
-        insert_context_compression_snapshot_record, llm_context_compression_trigger_tokens,
-        pack_neutral_messages, plan_llm_context_compression, plan_mode_builtin_tool_allowed,
+        context_usage_response, context_usage_segments, context_usage_segments_total,
+        environment_context_message, insert_context_compression_snapshot_record,
+        llm_context_compression_trigger_tokens, pack_neutral_messages,
+        plan_llm_context_compression, plan_mode_builtin_tool_allowed,
         prepare_context_compression_snapshot, tool_prompt_infos,
     },
     runtime::{
@@ -3564,6 +3566,10 @@ async fn handle_broker_request(
         .await;
         return;
     }
+    if method == "memory.global.createdForRunIds" {
+        broker_memory_global_created_for_run_ids(state, &write, &id, request.payload).await;
+        return;
+    }
 
     let broker_tool_method = matches!(
         method.as_str(),
@@ -4518,6 +4524,52 @@ async fn broker_memory_global_search(
     payload: Value,
 ) {
     broker_execute_global_memory_tool(state, write, id, "memory_search", payload).await;
+}
+
+async fn broker_memory_global_created_for_run_ids(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    payload: Value,
+) {
+    let Some(run_ids) = payload.get("runIds").and_then(Value::as_array) else {
+        let _ = send_broker_error(write, Some(id), "bad_request", "missing runIds").await;
+        return;
+    };
+    if run_ids.len() > 512 {
+        let _ = send_broker_error(write, Some(id), "bad_request", "too many runIds").await;
+        return;
+    }
+    let run_ids = run_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let memory_db = match MemoryDatabase::open_or_create_global_at(&state.memory_database_file) {
+        Ok(database) => database,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", format!("{error}")).await;
+            return;
+        }
+    };
+    let created_memories = match memory_db.facts_created_from_source_run_ids(&run_ids) {
+        Ok(facts) => facts.len() as i64,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", format!("{error}")).await;
+            return;
+        }
+    };
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({ "status": "ok", "createdMemories": created_memories }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+    let _ = send_broker_envelope(write, &response).await;
 }
 
 async fn broker_memory_global_write(
@@ -6275,7 +6327,7 @@ async fn remote_sidecar_delete_chat(
 async fn remote_sidecar_chat_statistics(
     State(state): State<RemoteSidecarState>,
     AxumPath(chat_id): AxumPath<String>,
-) -> Result<Json<Value>, axum::response::Response> {
+) -> Result<Json<crate::http::chat::ChatStatisticsResponse>, axum::response::Response> {
     let database = sidecar_workspace_database(&state)?;
     if database
         .chat(&chat_id)
@@ -6287,81 +6339,166 @@ async fn remote_sidecar_chat_statistics(
         );
     }
 
-    let counts = database
+    let message_counts = database
         .message_role_counts_for_chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let mut message_count = 0_i64;
-    let mut user_message_count = 0_i64;
-    let mut assistant_message_count = 0_i64;
-    let mut tool_message_count = 0_i64;
-    for count in counts {
-        message_count += count.count;
-        match count.role.as_str() {
-            "user" => user_message_count = count.count,
-            "assistant" => assistant_message_count = count.count,
-            "tool" => tool_message_count = count.count,
-            _ => {}
-        }
-    }
-    let code_change_stats = database
-        .code_change_stats_for_chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let request_count = database
+    let llm_rows = database
         .llm_request_audit_count(LlmRequestAuditFilters {
             chat_id: Some(&chat_id),
             exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
             valid_only: true,
             ..LlmRequestAuditFilters::default()
         })
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let llm_rows = database
-        .llm_request_audit_rows(LlmRequestAuditFilters {
-            chat_id: Some(&chat_id),
-            exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
-            valid_only: true,
-            limit: Some(request_count),
-            offset: Some(0),
-            ..LlmRequestAuditFilters::default()
+        .and_then(|request_count| {
+            database.llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some(&chat_id),
+                exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                valid_only: true,
+                limit: Some(request_count),
+                offset: Some(0),
+                ..LlmRequestAuditFilters::default()
+            })
         })
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let total_latency_ms = llm_rows
-        .iter()
-        .filter_map(|row| row.total_latency_ms)
-        .sum::<i64>();
-    let ai_summary = crate::llm_request_rows_summary(&llm_rows);
-    Ok(Json(json!({
-        "workspaceId": state.workspace_id,
-        "chatId": chat_id,
-        "messageCount": message_count,
-        "userMessageCount": user_message_count,
-        "assistantMessageCount": assistant_message_count,
-        "toolMessageCount": tool_message_count,
-        "totalRequests": ai_summary.total_requests,
-        "failedRequests": ai_summary.failed_requests,
-        "totalInputTokens": ai_summary.total_input_tokens,
-        "totalOutputTokens": ai_summary.total_output_tokens,
-        "totalCacheReadTokens": ai_summary.total_cache_read_tokens,
-        "totalCacheWriteTokens": ai_summary.total_cache_write_tokens,
-        "totalTokens": ai_summary.total_tokens,
-        "totalLatencyMs": total_latency_ms,
-        "averageLatencyMs": ai_summary.average_latency_ms,
-        "memoryReferences": 0,
-        "createdMemories": 0,
-        "codeChangeStats": code_change_stats,
-        "modelBreakdown": ai_summary.model_breakdown,
-        "providerBreakdown": ai_summary.provider_breakdown,
-        "toolBreakdown": [],
-        "compression": {
-            "snapshotCount": 0,
-            "ruleSnapshotCount": 0,
-            "llmSnapshotCount": 0,
-            "runtimeToolStateSnapshotCount": 0,
-            "originalTokenCount": 0,
-            "summaryTokenCount": 0,
-            "savedTokenCount": 0
-        },
-        "contextUsageTimeline": []
-    })))
+    let prompt_injections = database
+        .prompt_context_injections_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let compression_snapshots = database
+        .context_compression_snapshots_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let messages = database
+        .messages_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let runtime_tool_state_snapshot_count = database
+        .runtime_tool_state_compression_count_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let code_change_stats = database
+        .code_change_stats_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let tool_breakdown = database
+        .tool_call_counts_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .map(crate::chat_tool_breakdown)
+        .collect();
+    // The broker's RPC id differs from the remote chat run id. Global memory
+    // sources carry the latter, so derive it from sidecar-persisted run events
+    // instead of the mirrored LLM audit row ids.
+    let run_ids = database
+        .run_ids_for_chat(&chat_id)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    drop(database);
+
+    let models = state
+        .runtime_config
+        .lock()
+        .map_err(|_| {
+            ApiError::internal("remote sidecar runtime config lock is poisoned").into_response()
+        })?
+        .as_ref()
+        .map(|bundle| bundle.payload.models.clone())
+        .unwrap_or_default();
+    let created_workspace_memories = MemoryDatabase::open_workspace_at(workspace_database_path(
+        Path::new(&state.workspace_path),
+    ))
+    .map_err(|e| ApiError::from_memory_error(e).into_response())?
+    .facts_created_from_chat_sources(&chat_id)
+    .map_err(|e| ApiError::from_memory_error(e).into_response())?
+    .len() as i64;
+    let created_global_memories =
+        remote_sidecar_global_memory_count_for_run_ids(&state, &run_ids).await?;
+
+    Ok(Json(
+        crate::chat_statistics_response(
+            &state.workspace_id,
+            &chat_id,
+            crate::chat_message_role_counts(message_counts),
+            llm_rows,
+            prompt_injections,
+            compression_snapshots,
+            messages,
+            &models,
+            runtime_tool_state_snapshot_count,
+            code_change_stats,
+            tool_breakdown,
+            created_workspace_memories + created_global_memories,
+        )
+        .map_err(|error| error.into_response())?,
+    ))
+}
+
+async fn remote_sidecar_global_memory_count_for_run_ids(
+    state: &RemoteSidecarState,
+    run_ids: &HashSet<String>,
+) -> Result<i64, axum::response::Response> {
+    if run_ids.is_empty() {
+        return Ok(0);
+    }
+    if state.ws_count.load(Ordering::Relaxed) == 0 {
+        return Err(ApiError::bad_gateway(
+            "remote broker is unavailable; global memory statistics cannot be determined",
+        )
+        .into_response());
+    }
+
+    let request_id = unique_id("broker-memory-statistics");
+    let mut sorted_run_ids = run_ids.iter().cloned().collect::<Vec<_>>();
+    sorted_run_ids.sort();
+    let mut broker_rx = remote_sidecar_broker_request(
+        state,
+        &request_id,
+        "memory.global.createdForRunIds",
+        json!({ "runIds": sorted_run_ids }),
+    )
+    .await?;
+    let envelope = match timeout(Duration::from_secs(5), broker_rx.recv()).await {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => {
+            state.broker_pending.lock().await.remove(&request_id);
+            return Err(ApiError::bad_gateway(
+                "remote broker closed before global memory statistics completed",
+            )
+            .into_response());
+        }
+        Err(_) => {
+            state.broker_pending.lock().await.remove(&request_id);
+            return Err(ApiError::bad_gateway(
+                "remote broker timed out while loading global memory statistics",
+            )
+            .into_response());
+        }
+    };
+
+    match envelope.message_type.as_str() {
+        "response" => envelope
+            .payload
+            .get("createdMemories")
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "remote broker returned an invalid global memory statistics response",
+                )
+                .into_response()
+            }),
+        "error" => {
+            let message = envelope
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown broker error");
+            Err(ApiError::bad_gateway(format!(
+                "remote broker global-memory statistics failed: {message}"
+            ))
+            .into_response())
+        }
+        other => Err(ApiError::bad_gateway(format!(
+            "remote broker returned unexpected global-memory statistics event: {other}"
+        ))
+        .into_response()),
+    }
 }
 
 async fn remote_sidecar_chat_todo_graph(
@@ -7568,6 +7705,53 @@ fn remote_sidecar_prepare_chat_context(
     tool_catalog: Arc<RemoteToolCatalog>,
     session_mode: Option<String>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
+    let requested_skill_ids =
+        remote_sidecar_requested_skill_ids(database, chat_id, queued_user_message_id)?;
+    let requested_thinking_level = serde_json::from_value(thinking_level).ok();
+    remote_sidecar_prepare_chat_context_with_options(
+        state,
+        database,
+        chat_id,
+        RemoteChatContextOptions {
+            assistant_message_id: Some(assistant_message_id),
+            model_id,
+            requested_skill_ids: &requested_skill_ids,
+            requested_thinking_level,
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            tool_catalog,
+            session_mode,
+        },
+    )
+}
+
+struct RemoteChatContextOptions<'a> {
+    assistant_message_id: Option<&'a str>,
+    model_id: &'a str,
+    requested_skill_ids: &'a [String],
+    requested_thinking_level: Option<String>,
+    assistant_draft: Option<&'a str>,
+    assistant_draft_reasoning: Option<&'a str>,
+    tool_catalog: Arc<RemoteToolCatalog>,
+    session_mode: Option<String>,
+}
+
+fn remote_sidecar_prepare_chat_context_with_options(
+    state: &RemoteSidecarState,
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    options: RemoteChatContextOptions<'_>,
+) -> Result<RemotePreparedChatContext, axum::response::Response> {
+    let RemoteChatContextOptions {
+        assistant_message_id,
+        model_id,
+        requested_skill_ids,
+        requested_thinking_level,
+        assistant_draft,
+        assistant_draft_reasoning,
+        tool_catalog,
+        session_mode,
+    } = options;
     let history = remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     let compression_snapshots = database
@@ -7578,11 +7762,7 @@ fn remote_sidecar_prepare_chat_context(
 
     let mut filtered_messages = Vec::new();
     let mut filtered_sequences = Vec::new();
-    for (message, sequence) in history
-        .messages
-        .into_iter()
-        .zip(history.sequences.into_iter())
-    {
+    for (message, sequence) in history.messages.into_iter().zip(history.sequences) {
         if covered_sequences.contains(&sequence) {
             continue;
         }
@@ -7590,8 +7770,6 @@ fn remote_sidecar_prepare_chat_context(
         filtered_sequences.push(sequence);
     }
 
-    let requested_skill_ids =
-        remote_sidecar_requested_skill_ids(database, chat_id, queued_user_message_id)?;
     let bundle = state
         .runtime_config
         .lock()
@@ -7603,9 +7781,8 @@ fn remote_sidecar_prepare_chat_context(
         &tool_catalog.mcp_prompt_tools,
     ));
     let (skill_routing_message, selected_skill_entries) =
-        remote_sidecar_skill_context(state, bundle.as_ref(), &requested_skill_ids)?;
+        remote_sidecar_skill_context(state, bundle.as_ref(), requested_skill_ids)?;
     apply_sidecar_selected_skills(&selected_skill_entries, &mut filtered_messages)?;
-    let requested_thinking_level = serde_json::from_value(thinking_level).ok();
     let tools = tool_catalog.tools.clone();
     let todo_graph_context = database
         .todo_graph(chat_id)
@@ -7713,6 +7890,13 @@ fn remote_sidecar_prepare_chat_context(
                 filtered_messages,
                 filtered_sequences,
             );
+            remote_sidecar_append_assistant_draft(
+                &mut messages,
+                &mut message_source_sequences,
+                &mut message_context_sources,
+                assistant_draft,
+                assistant_draft_reasoning,
+            );
             let active_tool_start_index = messages.len();
             return remote_sidecar_finish_prepared_context(
                 state,
@@ -7768,6 +7952,13 @@ fn remote_sidecar_prepare_chat_context(
         filtered_messages,
         filtered_sequences,
     );
+    remote_sidecar_append_assistant_draft(
+        &mut messages,
+        &mut message_source_sequences,
+        &mut message_context_sources,
+        assistant_draft,
+        assistant_draft_reasoning,
+    );
     let active_tool_start_index = messages.len();
     remote_sidecar_finish_prepared_context(
         state,
@@ -7819,10 +8010,7 @@ fn remote_sidecar_append_snapshots_and_history(
         .rev()
         .find(|(message, _)| message.role == NeutralChatRole::User)
         .map(|(_, sequence)| *sequence);
-    for (message, sequence) in filtered_messages
-        .into_iter()
-        .zip(filtered_sequences.into_iter())
-    {
+    for (message, sequence) in filtered_messages.into_iter().zip(filtered_sequences) {
         let source =
             if message.role == NeutralChatRole::User && Some(sequence) == last_user_sequence {
                 PromptContextSource::CurrentUser { sequence }
@@ -7833,6 +8021,25 @@ fn remote_sidecar_append_snapshots_and_history(
         sequences.push(Some(sequence));
         sources.push(source);
     }
+}
+
+fn remote_sidecar_append_assistant_draft(
+    messages: &mut Vec<NeutralChatMessage>,
+    sequences: &mut Vec<Option<i64>>,
+    sources: &mut Vec<PromptContextSource>,
+    assistant_draft: Option<&str>,
+    assistant_draft_reasoning: Option<&str>,
+) {
+    if assistant_draft.is_none() && assistant_draft_reasoning.is_none() {
+        return;
+    }
+
+    messages.push(crate::neutral_assistant_message(
+        assistant_draft.unwrap_or_default().to_string(),
+        assistant_draft_reasoning.map(str::to_string),
+    ));
+    sequences.push(None);
+    sources.push(PromptContextSource::AssistantDraft);
 }
 
 fn remote_sidecar_finish_prepared_context(
@@ -7863,13 +8070,15 @@ fn remote_sidecar_finish_prepared_context(
 fn remote_sidecar_chat_messages_for_request(
     database: &WorkspaceDatabase,
     chat_id: &str,
-    assistant_message_id: &str,
+    assistant_message_id: Option<&str>,
 ) -> Result<RemoteSidecarHistoryMessages, foco_store::workspace::WorkspaceDatabaseError> {
     let messages = database.messages_for_chat(chat_id)?;
-    let target_sequence = messages
-        .iter()
-        .find(|message| message.id == assistant_message_id)
-        .map(|message| message.sequence);
+    let target_sequence = assistant_message_id.and_then(|assistant_message_id| {
+        messages
+            .iter()
+            .find(|message| message.id == assistant_message_id)
+            .map(|message| message.sequence)
+    });
     let tool_calls = database.tool_calls_for_chat(chat_id)?;
     let mut tool_calls_by_message = HashMap::<String, Vec<_>>::new();
     for tool_call in tool_calls {
@@ -7888,7 +8097,7 @@ fn remote_sidecar_chat_messages_for_request(
         if target_sequence.is_some_and(|sequence| message.sequence > sequence) {
             break;
         }
-        if message.role == "assistant" && message.id == assistant_message_id {
+        if message.role == "assistant" && assistant_message_id == Some(message.id.as_str()) {
             continue;
         }
         let sequence = message.sequence;
@@ -10594,47 +10803,128 @@ async fn remote_sidecar_chat_guidance(
 }
 
 async fn remote_sidecar_context_usage(
-    State(_state): State<RemoteSidecarState>,
-    Json(_payload): Json<Value>,
-) -> Result<Json<Value>, axum::response::Response> {
-    Ok(Json(json!({
-        "usedMessageTokens": 0,
-        "assembledMessageTokens": 0,
-        "assembledUsagePercent": 0,
-        "postCompressionMessageTokens": 0,
-        "packedMessageTokens": 0,
-        "availableMessageTokens": 0,
-        "contextWindow": 0,
-        "maxOutputTokens": 0,
-        "systemPromptTokens": 0,
-        "toolSchemaTokens": 0,
-        "historyTokens": 0,
-        "compressionSnapshotTokens": 0,
-        "totalUsedContextTokens": 0,
-        "memoryContextTokens": 0,
-        "memoryBudgetTokens": 0,
-        "usagePercent": 0,
-        "compressionTriggerTokens": 0,
-        "compressionTriggerPercent": 0,
-        "llmCompressionTriggerTokens": 0,
-        "llmCompressionTriggerPercent": 0,
-        "hasLlmCompressionPlan": false,
-        "willCompressOnNextSend": false,
-        "segments": {
-            "systemPrompt": 0,
-            "toolSchema": 0,
-            "compressionSnapshot": 0,
-            "history": 0,
-            "reservedOutput": 0,
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<ContextUsageRequest>,
+) -> Result<Json<ContextUsageResponse>, axum::response::Response> {
+    let ContextUsageRequest {
+        chat_id,
+        model_id,
+        provider_id,
+        thinking_level,
+        skill_ids,
+        assistant_draft,
+        assistant_draft_reasoning,
+    } = request;
+    let chat_id = chat_id
+        .map(|chat_id| chat_id.trim().to_string())
+        .filter(|chat_id| !chat_id.is_empty())
+        .ok_or_else(|| ApiError::bad_request("chat id must not be empty").into_response())?;
+
+    remote_sidecar_validate_context_preview_model(&state, &model_id, provider_id.as_deref())
+        .map_err(|error| error.into_response())?;
+
+    let bundle = state
+        .runtime_config
+        .lock()
+        .map_err(|_| {
+            ApiError::internal("remote sidecar runtime configuration lock is poisoned")
+                .into_response()
+        })?
+        .clone();
+    let tool_catalog = remote_sidecar_tool_catalog(&state, bundle.as_ref(), None).await?;
+    let database = sidecar_workspace_database(&state)?;
+    database
+        .chat(&chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
+        })?;
+
+    let requested_skill_ids = skill_ids.unwrap_or_default();
+    let prepared = remote_sidecar_prepare_chat_context_with_options(
+        &state,
+        &database,
+        &chat_id,
+        RemoteChatContextOptions {
+            assistant_message_id: None,
+            model_id: &model_id,
+            requested_skill_ids: &requested_skill_ids,
+            requested_thinking_level: thinking_level,
+            assistant_draft: assistant_draft.as_deref(),
+            assistant_draft_reasoning: assistant_draft_reasoning.as_deref(),
+            tool_catalog,
+            session_mode: None,
         },
-        "tokenBreakdown": {
-            "requiredTokens": 0,
-            "optionalTokens": 0,
-            "compressibleTokens": 0,
-            "bySource": [],
-        },
-        "remoteApproximation": true,
-    })))
+    )?;
+    if prepared.context_budget.context_window == u64::MAX {
+        return Err(ApiError::internal(
+            "remote runtime configuration changed while context usage was prepared",
+        )
+        .into_response());
+    }
+
+    let usage = context_usage_response(ContextUsageInput {
+        messages: &prepared.provider_request.messages,
+        message_source_sequences: &prepared.message_source_sequences,
+        message_context_sources: &prepared.message_context_sources,
+        active_tool_start_index: prepared.active_tool_start_index,
+        context_budget: &prepared.context_budget,
+        memory_context_tokens: 0,
+        memory_budget_tokens: 0,
+    })
+    .map_err(|error| error.into_response())?;
+
+    Ok(Json(usage))
+}
+
+fn remote_sidecar_validate_context_preview_model(
+    state: &RemoteSidecarState,
+    model_id: &str,
+    provider_id: Option<&str>,
+) -> Result<(), ApiError> {
+    if model_id.trim().is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    let runtime_config = state
+        .runtime_config
+        .lock()
+        .map_err(|_| ApiError::internal("remote runtime configuration lock is unavailable"))?;
+    let bundle = runtime_config.as_ref().ok_or_else(|| {
+        ApiError::bad_request("remote runtime configuration has not been synchronized")
+    })?;
+    let model = bundle
+        .payload
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "remote context preview model was not found: {model_id}"
+            ))
+        })?;
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "remote context preview model is disabled: {model_id}"
+        )));
+    }
+    if model.limits.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "remote context preview model has no context limits: {model_id}"
+        )));
+    }
+    if let Some(provider_id) = provider_id.map(str::trim).filter(|value| !value.is_empty())
+        && !model
+            .provider_ids
+            .iter()
+            .any(|configured_provider_id| configured_provider_id == provider_id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "remote context preview provider is not available for model: {provider_id}"
+        )));
+    }
+
+    Ok(())
 }
 
 fn parse_remote_audit_detail(value: Option<&str>) -> Option<Value> {
@@ -12379,6 +12669,350 @@ mod tests {
         forward_rx
     }
 
+    #[tokio::test]
+    async fn remote_sidecar_chat_statistics_reuses_local_aggregation_and_brokered_global_memory() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let mut config = remote_test_config(workspace.path());
+        let mut second_model = config.models[0].clone();
+        second_model.id = "model-2".to_string();
+        second_model.display_name = "Model 2".to_string();
+        second_model.provider_ids = vec!["provider-2".to_string()];
+        second_model.active_provider_id = Some("provider-2".to_string());
+        config.models.push(second_model);
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        for (id, role, content, sequence, metadata_json) in [
+            ("message-user", "user", "inspect this", 0, "{}"),
+            (
+                "message-assistant",
+                "assistant",
+                "I will inspect it",
+                1,
+                r#"{"codeChangeStats":{"additions":3,"deletions":1}}"#,
+            ),
+            ("message-tool", "tool", "{}", 2, "{}"),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-1",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some(metadata_json),
+                })
+                .expect("insert message");
+        }
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: "main-request",
+                workspace_id: "workspace",
+                chat_id: Some("chat-1"),
+                request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-1",
+                model_id: "model-1",
+                thinking_level: None,
+                request_started_at: "2026-07-13T00:00:00Z",
+                first_token_at: Some("2026-07-13T00:00:01Z"),
+                completed_at: Some("2026-07-13T00:00:02Z"),
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                cache_read_tokens: Some(8),
+                cache_write_tokens: Some(4),
+                reasoning_tokens: None,
+                first_token_latency_ms: Some(1000),
+                total_latency_ms: Some(2000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("insert main request");
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: "main-request-2",
+                workspace_id: "workspace",
+                chat_id: Some("chat-1"),
+                request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-2",
+                model_id: "model-2",
+                thinking_level: None,
+                request_started_at: "2026-07-13T00:00:03Z",
+                first_token_at: Some("2026-07-13T00:00:04Z"),
+                completed_at: Some("2026-07-13T00:00:05Z"),
+                input_tokens: Some(40),
+                output_tokens: Some(10),
+                cache_read_tokens: Some(2),
+                cache_write_tokens: Some(1),
+                reasoning_tokens: None,
+                first_token_latency_ms: Some(1000),
+                total_latency_ms: Some(2000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("insert second main request");
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: "compression-request",
+                workspace_id: "workspace",
+                chat_id: Some("chat-1"),
+                request_kind: BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-1",
+                model_id: "model-1",
+                thinking_level: None,
+                request_started_at: "2026-07-13T00:00:00Z",
+                first_token_at: Some("2026-07-13T00:00:01Z"),
+                completed_at: Some("2026-07-13T00:00:02Z"),
+                input_tokens: Some(999),
+                output_tokens: Some(999),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: Some(1000),
+                total_latency_ms: Some(2000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("insert compression request");
+        database
+            .insert_prompt_context_injection(foco_store::workspace::NewPromptContextInjection {
+                id: "injection-1",
+                chat_id: "chat-1",
+                kind: "turn_memory",
+                sequence: Some(0),
+                messages_json: "[]",
+                memory_keys_json: r#"["workspace:fact-1"]"#,
+                memory_summaries_json: r#"[{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Remember this.","pinned":false,"source":"direct"}]"#,
+            })
+            .expect("insert prompt injection");
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "snapshot-rule",
+                    chat_id: "chat-1",
+                    run_id: "main-request",
+                    sequence: 1,
+                    summary: "rule summary",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 1,
+                    original_token_count: 100,
+                    summary_token_count: 20,
+                    metadata_json: Some("{}"),
+                },
+            )
+            .expect("insert rule snapshot");
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "snapshot-llm",
+                    chat_id: "chat-1",
+                    run_id: "main-request",
+                    sequence: 2,
+                    summary: "llm summary",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 1,
+                    original_token_count: 80,
+                    summary_token_count: 10,
+                    metadata_json: Some(r#"{"kind":"llm","supersedes":"snapshot-rule"}"#),
+                },
+            )
+            .expect("insert llm snapshot");
+        database
+            .insert_run_event(foco_store::workspace::NewRunEvent {
+                id: "runtime-compression-event",
+                chat_id: "chat-1",
+                run_id: "remote-run-1",
+                sequence: 0,
+                event_type: "context_compression",
+                payload_json: r#"{"kind":"runtimeToolState"}"#,
+            })
+            .expect("insert runtime compression event");
+        database
+            .insert_tool_call(foco_store::workspace::NewToolCall {
+                id: "tool-call-1",
+                chat_id: "chat-1",
+                run_id: "remote-run-1",
+                message_id: Some("message-assistant"),
+                tool_name: "read_file",
+                input_json: r#"{"path":"src/lib.rs"}"#,
+                status: "completed",
+                started_at: "2026-07-13T00:00:00Z",
+                completed_at: Some("2026-07-13T00:00:01Z"),
+            })
+            .expect("insert tool call");
+        drop(database);
+
+        let task_state = state.clone();
+        let statistics_task = tokio::spawn(async move {
+            remote_sidecar_chat_statistics(State(task_state), AxumPath("chat-1".to_string())).await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker statistics request should arrive")
+            .expect("broker request");
+        assert_eq!(
+            request.method.as_deref(),
+            Some("memory.global.createdForRunIds")
+        );
+        assert_eq!(request.payload["runIds"], json!(["remote-run-1"]));
+        let request_id = request.id.expect("broker request id");
+        state
+            .broker_pending
+            .lock()
+            .await
+            .get(&request_id)
+            .expect("pending broker response sender")
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: json!({ "status": "ok", "createdMemories": 2 }),
+                timestamp: None,
+            })
+            .expect("send broker response");
+
+        let Json(statistics) = statistics_task
+            .await
+            .expect("statistics task")
+            .expect("statistics response");
+        assert_eq!(statistics.message_count, 3);
+        assert_eq!(statistics.user_message_count, 1);
+        assert_eq!(statistics.assistant_message_count, 1);
+        assert_eq!(statistics.tool_message_count, 1);
+        assert_eq!(statistics.total_requests, 2);
+        assert_eq!(statistics.total_input_tokens, 160);
+        assert_eq!(statistics.total_output_tokens, 40);
+        assert_eq!(statistics.memory_references, 1);
+        assert_eq!(statistics.created_memories, 2);
+        assert_eq!(statistics.code_change_stats.additions, 3);
+        assert_eq!(statistics.code_change_stats.deletions, 1);
+        assert_eq!(statistics.tool_breakdown.len(), 1);
+        assert_eq!(statistics.tool_breakdown[0].tool_name, "read_file");
+        assert_eq!(statistics.tool_breakdown[0].call_count, 1);
+        assert!(
+            statistics
+                .model_breakdown
+                .iter()
+                .any(|entry| { entry.model_id == "model-1" && entry.request_count == 1 })
+        );
+        assert!(
+            statistics
+                .model_breakdown
+                .iter()
+                .any(|entry| { entry.model_id == "model-2" && entry.request_count == 1 })
+        );
+        assert!(
+            statistics
+                .provider_breakdown
+                .iter()
+                .any(|entry| { entry.provider_id == "provider-1" && entry.request_count == 1 })
+        );
+        assert!(
+            statistics
+                .provider_breakdown
+                .iter()
+                .any(|entry| { entry.provider_id == "provider-2" && entry.request_count == 1 })
+        );
+        assert_eq!(statistics.compression.snapshot_count, 2);
+        assert_eq!(statistics.compression.rule_snapshot_count, 1);
+        assert_eq!(statistics.compression.llm_snapshot_count, 1);
+        assert_eq!(statistics.compression.runtime_tool_state_snapshot_count, 1);
+        assert_eq!(statistics.compression.saved_token_count, 150);
+        assert_eq!(statistics.context_usage_timeline.len(), 2);
+        assert!(
+            statistics
+                .context_usage_timeline
+                .iter()
+                .any(|entry| entry.snapshot_id == "snapshot-rule")
+        );
+        assert!(
+            statistics
+                .context_usage_timeline
+                .iter()
+                .any(|entry| entry.snapshot_id == "snapshot-llm")
+        );
+        assert!(
+            statistics
+                .context_usage_timeline
+                .iter()
+                .all(|entry| entry.context_window == 128_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_global_memory_statistics_accepts_broker_zero() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let run_ids = HashSet::from(["main-request".to_string()]);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            remote_sidecar_global_memory_count_for_run_ids(&task_state, &run_ids).await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker request should arrive")
+            .expect("broker request");
+        let request_id = request.id.expect("broker request id");
+        state
+            .broker_pending
+            .lock()
+            .await
+            .get(&request_id)
+            .expect("pending broker response sender")
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: json!({ "status": "ok", "createdMemories": 0 }),
+                timestamp: None,
+            })
+            .expect("send broker response");
+        assert_eq!(
+            task.await
+                .expect("broker statistics task")
+                .expect("broker statistics response"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_global_memory_statistics_reports_broker_unavailability() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let run_ids = HashSet::from(["main-request".to_string()]);
+        let error = remote_sidecar_global_memory_count_for_run_ids(&state, &run_ids)
+            .await
+            .expect_err("broker unavailability must not become a zero count");
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+    }
+
     async fn test_remote_prepare_chat_context(
         state: &RemoteSidecarState,
         database: &WorkspaceDatabase,
@@ -13494,6 +14128,373 @@ mod tests {
             .expect("insert assistant placeholder");
     }
 
+    #[tokio::test]
+    async fn remote_sidecar_context_usage_rebuilds_static_history_snapshots_skills_and_draft() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        write_remote_test_skill(
+            &workspace.path().join(".claude").join("skills"),
+            "workspace-demo",
+            "Workspace demo skill.",
+            "Workspace skill preview marker.",
+        );
+        fs::write(
+            workspace.path().join("AGENTS.md"),
+            "Remote preview AGENTS marker.\n",
+        )
+        .expect("AGENTS.md");
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        for (id, role, content, sequence) in [
+            (
+                "msg-user-covered",
+                "user",
+                "covered source message marker",
+                0,
+            ),
+            (
+                "msg-assistant-covered",
+                "assistant",
+                "covered tool round marker",
+                1,
+            ),
+            (
+                "msg-assistant-large",
+                "assistant",
+                &"large historical response ".repeat(1_000),
+                2,
+            ),
+            ("msg-user-tail", "user", "visible tail message marker", 3),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-1",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("insert message");
+        }
+        let covered_tool_call = NeutralToolCall {
+            call_id: "call-covered".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "covered.txt", "startLine": null, "endLine": null }),
+            thought_signatures: None,
+        };
+        let allowed_tools = HashSet::from(["read_file".to_string()]);
+        remote_sidecar_record_pending_tool_calls(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "msg-assistant-covered",
+            std::slice::from_ref(&covered_tool_call),
+            &allowed_tools,
+        )
+        .expect("record covered tool call");
+        remote_sidecar_record_tool_result(
+            &mut database,
+            &covered_tool_call,
+            &json!({ "content": "covered tool result marker" }),
+            false,
+            "2026-07-13T00:00:00Z",
+            "2026-07-13T00:00:01Z",
+        )
+        .expect("record covered tool result");
+        let visible_tool_call = NeutralToolCall {
+            call_id: "call-visible".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "visible.txt", "startLine": null, "endLine": null }),
+            thought_signatures: None,
+        };
+        remote_sidecar_record_pending_tool_calls(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "msg-assistant-large",
+            std::slice::from_ref(&visible_tool_call),
+            &allowed_tools,
+        )
+        .expect("record visible tool call");
+        remote_sidecar_record_tool_result(
+            &mut database,
+            &visible_tool_call,
+            &json!({ "content": "visible tool result marker" }),
+            false,
+            "2026-07-13T00:00:00Z",
+            "2026-07-13T00:00:01Z",
+        )
+        .expect("record visible tool result");
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "snapshot-superseded",
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    sequence: 1,
+                    summary: "superseded summary marker",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 0,
+                    original_token_count: 100,
+                    summary_token_count: 10,
+                    metadata_json: None,
+                },
+            )
+            .expect("insert superseded snapshot");
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "snapshot-active",
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    sequence: 2,
+                    summary: "active compressed summary marker",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 1,
+                    original_token_count: 200,
+                    summary_token_count: 20,
+                    metadata_json: Some(
+                        r#"{"coveredSequences":[0,1],"supersededSnapshotIds":["snapshot-superseded"]}"#,
+                    ),
+                },
+            )
+            .expect("insert active snapshot");
+
+        let (state, broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let _broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        let mut config = remote_test_config(workspace.path());
+        config.models[0].limits = Some(foco_store::config::ModelLimits {
+            context_window: 12_288,
+            max_output_tokens: 128,
+        });
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+        let runtime_bundle = state.runtime_config.lock().expect("runtime config").clone();
+        let tool_catalog = remote_sidecar_tool_catalog(&state, runtime_bundle.as_ref(), None)
+            .await
+            .expect("tool catalog");
+
+        let requested_skill_ids = vec!["workspace:workspace:workspace-demo".to_string()];
+        let prepared = match remote_sidecar_prepare_chat_context_with_options(
+            &state,
+            &database,
+            "chat-1",
+            RemoteChatContextOptions {
+                assistant_message_id: None,
+                model_id: "model-1",
+                requested_skill_ids: &requested_skill_ids,
+                requested_thinking_level: None,
+                assistant_draft: Some("assistant draft marker"),
+                assistant_draft_reasoning: Some("assistant draft reasoning marker"),
+                tool_catalog,
+                session_mode: None,
+            },
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("context preview error body");
+                panic!(
+                    "context preview preparation failed with {status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        };
+        let assembled_text = prepared
+            .provider_request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(assembled_text.contains("active compressed summary marker"));
+        assert!(assembled_text.contains("visible tail message marker"));
+        assert!(assembled_text.contains("Workspace skill preview marker."));
+        assert!(assembled_text.contains("Remote preview AGENTS marker."));
+        assert!(!assembled_text.contains("covered source message marker"));
+        assert!(!assembled_text.contains("covered tool result marker"));
+        assert!(!assembled_text.contains("superseded summary marker"));
+        assert!(prepared.provider_request.messages.iter().any(|message| {
+            message.role == NeutralChatRole::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.call_id == "call-visible")
+        }));
+        assert!(prepared.provider_request.messages.iter().any(|message| {
+            message.role == NeutralChatRole::Tool
+                && message.tool_call_id.as_deref() == Some("call-visible")
+                && message.content.contains("visible tool result marker")
+        }));
+        assert!(prepared.provider_request.messages.iter().any(|message| {
+            message.content == "assistant draft marker"
+                && message.reasoning.as_deref() == Some("assistant draft reasoning marker")
+        }));
+        drop(database);
+
+        let usage = remote_sidecar_context_usage(
+            State(state),
+            Json(ContextUsageRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model-1".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                thinking_level: None,
+                skill_ids: Some(requested_skill_ids),
+                assistant_draft: Some("assistant draft marker".to_string()),
+                assistant_draft_reasoning: Some("assistant draft reasoning marker".to_string()),
+            }),
+        )
+        .await
+        .expect("context usage response")
+        .0;
+
+        assert_eq!(usage.context_window, 12_288);
+        assert_eq!(usage.max_output_tokens, 128);
+        assert!(usage.total_used_context_tokens > 0);
+        assert!(usage.usage_percent > 0);
+        assert!(usage.compression_snapshot_tokens > 0);
+        assert!(usage.token_breakdown.compressible_tokens > 0);
+        assert!(usage.has_llm_compression_plan);
+        assert!(usage.will_compress_on_next_send);
+        assert!(usage.assembled_usage_percent > usage.usage_percent);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_context_usage_rejects_unsynchronized_runtime_unknown_model_and_chat() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+
+        let unsynchronized = match remote_sidecar_context_usage(
+            State(state.clone()),
+            Json(ContextUsageRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model-1".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+            }),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("missing runtime bundle must fail"),
+        };
+        assert_eq!(unsynchronized.status(), StatusCode::BAD_REQUEST);
+
+        let bundle = build_sidecar_runtime_config_bundle(
+            workspace.path(),
+            &remote_test_config(workspace.path()),
+            1,
+        )
+        .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let unknown_model = match remote_sidecar_context_usage(
+            State(state.clone()),
+            Json(ContextUsageRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "unknown-model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+            }),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("unknown model must fail"),
+        };
+        assert_eq!(unknown_model.status(), StatusCode::BAD_REQUEST);
+
+        let mut disabled_config = remote_test_config(workspace.path());
+        disabled_config.models[0].enabled = false;
+        let disabled_bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &disabled_config, 2)
+                .expect("disabled runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(disabled_bundle);
+        let disabled_model = match remote_sidecar_context_usage(
+            State(state.clone()),
+            Json(ContextUsageRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model-1".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+            }),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("disabled model must fail"),
+        };
+        assert_eq!(disabled_model.status(), StatusCode::BAD_REQUEST);
+
+        let mut no_limits_config = remote_test_config(workspace.path());
+        no_limits_config.models[0].limits = None;
+        let no_limits_bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &no_limits_config, 3)
+                .expect("no-limits runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(no_limits_bundle);
+        let no_limits_model = match remote_sidecar_context_usage(
+            State(state.clone()),
+            Json(ContextUsageRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model-1".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+            }),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("model without limits must fail"),
+        };
+        assert_eq!(no_limits_model.status(), StatusCode::BAD_REQUEST);
+
+        let valid_bundle = build_sidecar_runtime_config_bundle(
+            workspace.path(),
+            &remote_test_config(workspace.path()),
+            4,
+        )
+        .expect("valid runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(valid_bundle);
+
+        let missing_chat = match remote_sidecar_context_usage(
+            State(state),
+            Json(ContextUsageRequest {
+                chat_id: Some("missing-chat".to_string()),
+                model_id: "model-1".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                thinking_level: None,
+                skill_ids: None,
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+            }),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("missing chat must fail"),
+        };
+        assert_eq!(missing_chat.status(), StatusCode::BAD_REQUEST);
+    }
     #[tokio::test]
     async fn remote_sidecar_edit_chat_user_message_truncates_history_and_survives_reload() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -19103,7 +20104,7 @@ mod tests {
         .expect("record tool result");
 
         let history =
-            remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
+            remote_sidecar_chat_messages_for_request(&database, "chat-1", Some("msg-assistant-2"))
                 .expect("chat messages");
         let messages = history.messages;
         assert_eq!(messages.len(), 3);
@@ -19196,7 +20197,7 @@ mod tests {
         }
 
         let history =
-            remote_sidecar_chat_messages_for_request(&database, "chat-1", "msg-assistant-2")
+            remote_sidecar_chat_messages_for_request(&database, "chat-1", Some("msg-assistant-2"))
                 .expect("chat messages");
         let messages = history.messages;
 

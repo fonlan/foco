@@ -2256,6 +2256,9 @@ export const scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]
 export const appTestState: {
   activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null;
   chatStreamControllers: Map<string, ReadableStreamDefaultController<Uint8Array>>;
+  chatMessagesResponsesByChatKey: Record<string, typeof chatMessages>;
+  chatStatisticsResponsesByChatKey: Record<string, typeof chatStatistics>;
+  contextUsageResponseQueuesByChatKey: Record<string, Array<typeof contextUsage>>;
   terminalSessionCounter: number;
   chatStreamCounter: number;
   chatQueueCounter: number;
@@ -2300,6 +2303,9 @@ export const appTestState: {
 } = {
   activeChatStreamController: null,
   chatStreamControllers: new Map<string, ReadableStreamDefaultController<Uint8Array>>(),
+  chatMessagesResponsesByChatKey: {},
+  chatStatisticsResponsesByChatKey: {},
+  contextUsageResponseQueuesByChatKey: {},
   terminalSessionCounter: 0,
   chatStreamCounter: 0,
   chatQueueCounter: 0,
@@ -2783,6 +2789,9 @@ import { App } from "../App";
 export function resetAppTestEnvironment() {
   appTestState.activeChatStreamController = null;
   appTestState.chatStreamControllers = new Map();
+  appTestState.chatMessagesResponsesByChatKey = {};
+  appTestState.chatStatisticsResponsesByChatKey = {};
+  appTestState.contextUsageResponseQueuesByChatKey = {};
   appTestState.terminalSessionCounter = 0;
   appTestState.chatStreamCounter = 0;
   appTestState.chatQueueCounter = 0;
@@ -4113,19 +4122,28 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(appTestState.workspaceGitDiffResponse);
   }
 
-  if (path === "/api/workspaces/workspace-1/context-usage") {
+  const contextUsageMatch = path.match(/^\/api\/workspaces\/([^/]+)\/context-usage$/);
+  if (contextUsageMatch) {
+    const workspaceId = decodeURIComponent(contextUsageMatch[1] ?? "");
     const body =
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as {
             chatId?: string | null;
           })
         : {};
+    const responses = appTestState.contextUsageResponseQueuesByChatKey[
+      `${workspaceId}/${body.chatId ?? ""}`
+    ];
+    const configuredResponse = responses?.shift();
+    if (configuredResponse) {
+      return jsonResponse(configuredResponse);
+    }
 
+    const isSecondLocalChat = workspaceId === workspace.id && body.chatId === "chat-2";
     return jsonResponse({
       ...contextUsage,
-      usagePercent: body.chatId === "chat-2" ? 23 : contextUsage.usagePercent,
-      usedMessageTokens:
-        body.chatId === "chat-2" ? 25520 : contextUsage.usedMessageTokens,
+      usagePercent: isSecondLocalChat ? 23 : contextUsage.usagePercent,
+      usedMessageTokens: isSecondLocalChat ? 25520 : contextUsage.usedMessageTokens,
     });
   }
 
@@ -4207,6 +4225,30 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  const configuredChatMessagesMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/chats\/([^/]+)\/messages$/,
+  );
+  if (configuredChatMessagesMatch) {
+    const workspaceId = decodeURIComponent(configuredChatMessagesMatch[1] ?? "");
+    const chatId = decodeURIComponent(configuredChatMessagesMatch[2] ?? "");
+    const response = appTestState.chatMessagesResponsesByChatKey[`${workspaceId}/${chatId}`];
+    if (response) {
+      return jsonResponse({ ...response, activeRun: null });
+    }
+  }
+
+  const configuredChatStatisticsMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/chats\/([^/]+)\/statistics$/,
+  );
+  if (configuredChatStatisticsMatch) {
+    const workspaceId = decodeURIComponent(configuredChatStatisticsMatch[1] ?? "");
+    const chatId = decodeURIComponent(configuredChatStatisticsMatch[2] ?? "");
+    const response = appTestState.chatStatisticsResponsesByChatKey[`${workspaceId}/${chatId}`];
+    if (response) {
+      return jsonResponse(response);
+    }
+  }
+
   const workspaceChatDeleteMatch = path.match(
     /^\/api\/workspaces\/([^/]+)\/chats\/([^/]+)\/delete$/,
   );
@@ -4245,17 +4287,19 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse({ deleted: true, chatId });
   }
 
-  if (path === "/api/workspaces/workspace-1/chat/stream") {
+  const chatStreamMatch = path.match(/^\/api\/workspaces\/([^/]+)\/chat\/stream$/);
+  if (chatStreamMatch) {
+    const workspaceId = decodeURIComponent(chatStreamMatch[1] ?? "");
     const body =
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as { chatId?: string | null })
         : {};
-    return chatStreamResponse(body.chatId ?? "chat-1");
+    return chatStreamResponse(
+      body.chatId ?? (workspaceId === "workspace-2" ? "side-chat-stream" : "chat-1"),
+    );
   }
-  if (
-    path === "/api/workspaces/workspace-1/chat/queue" ||
-    path === "/api/workspaces/workspace-2/chat/queue"
-  ) {
+  const chatQueueMatch = path.match(/^\/api\/workspaces\/([^/]+)\/chat\/queue$/);
+  if (chatQueueMatch) {
     const body =
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
@@ -4283,8 +4327,14 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return chatStreamResponse("chat-1");
   }
 
-  if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/cancel") {
-    return jsonResponse({ ok: true, runId: "request-stream" });
+  const chatRunCancelMatch = path.match(
+    /^\/api\/workspaces\/[^/]+\/chat\/runs\/([^/]+)\/cancel$/,
+  );
+  if (chatRunCancelMatch) {
+    return jsonResponse({
+      ok: true,
+      runId: decodeURIComponent(chatRunCancelMatch[1] ?? ""),
+    });
   }
 
   if (path === "/api/workspaces/workspace-1/chat/guidance") {
@@ -4297,14 +4347,6 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       id: "guidance-1",
       parts: [],
     });
-  }
-
-  if (path === "/api/workspaces/workspace-2/chat/stream") {
-    const body =
-      typeof init?.body === "string"
-        ? (JSON.parse(init.body) as { chatId?: string | null })
-        : {};
-    return chatStreamResponse(body.chatId ?? "side-chat-stream");
   }
 
   return jsonResponse({ error: `Unhandled test route: ${url}` }, { status: 404 });

@@ -7978,6 +7978,7 @@ export function App() {
     let liveAssistantDraftReasoning = "";
     let lastLiveContextUsageRefreshAtMs = Date.now();
     let hasGuidanceTurns = false;
+    let terminalContextUsageRefreshRequested = false;
     const textDeltaBuffer = createTextDeltaBuffer();
     const reasoningDeltaBuffer = createReasoningDeltaBuffer();
     const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
@@ -7986,11 +7987,11 @@ export function App() {
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
-    const refreshRunContextUsage = () => {
+    const refreshRunContextUsage = (): boolean => {
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
       if (!modelId || !providerId) {
-        return;
+        return false;
       }
 
       void refreshContextUsage({
@@ -8001,6 +8002,14 @@ export function App() {
         thinkingLevel: selectedThinkingLevelRef.current,
         workspaceId: activeRun.workspaceId,
       });
+      return true;
+    };
+    const refreshTerminalContextUsage = () => {
+      if (terminalContextUsageRefreshRequested) {
+        return;
+      }
+
+      terminalContextUsageRefreshRequested = refreshRunContextUsage();
     };
     const scheduleLiveContextUsageRefresh = () => {
       if (!liveAssistantDraft && !liveAssistantDraftReasoning) {
@@ -8703,6 +8712,7 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          refreshTerminalContextUsage();
           refreshActiveAgentTeamSnapshot(activeRun.workspaceId, activeRun.chatId);
           void refreshMessagesAfterSpecJobSettles(
             activeRun.workspaceId,
@@ -8772,6 +8782,9 @@ export function App() {
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
+      if (!shouldReconnect) {
+        refreshTerminalContextUsage();
+      }
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
         if (shouldReconnect) {
@@ -8881,6 +8894,7 @@ export function App() {
     let streamHadError = false;
     let hasGuidanceTurns = false;
     let activeRunId: string | null = null;
+    let terminalContextUsageRefreshRequested = false;
     const abortController = new AbortController();
     const textDeltaBuffer = createTextDeltaBuffer();
     const reasoningDeltaBuffer = createReasoningDeltaBuffer();
@@ -8890,7 +8904,11 @@ export function App() {
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
-    const refreshRunContextUsage = () => {
+    const refreshRunContextUsage = (): boolean => {
+      if (!requestChatId) {
+        return false;
+      }
+
       void refreshContextUsage({
         chatId: requestChatId,
         modelId: request.modelId,
@@ -8899,6 +8917,14 @@ export function App() {
         thinkingLevel: request.thinkingLevel,
         workspaceId: request.workspaceId,
       });
+      return true;
+    };
+    const refreshTerminalContextUsage = () => {
+      if (terminalContextUsageRefreshRequested) {
+        return;
+      }
+
+      terminalContextUsageRefreshRequested = refreshRunContextUsage();
     };
     const scheduleLiveContextUsageRefresh = () => {
       if (!liveAssistantDraft && !liveAssistantDraftReasoning) {
@@ -9769,6 +9795,7 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          refreshTerminalContextUsage();
           if (requestChatId) {
             refreshActiveAgentTeamSnapshot(request.workspaceId, requestChatId);
             void refreshMessagesAfterSpecJobSettles(
@@ -9831,6 +9858,7 @@ export function App() {
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
+      refreshTerminalContextUsage();
       if (
         activeRunAbortByChatKeyRef.current.get(currentRunningChatKey) ===
         abortController

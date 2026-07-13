@@ -124,10 +124,11 @@ use crate::memory_runtime::{
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
-    active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-    configured_extra_prompt_message, configured_prompt_messages, context_usage_response,
-    context_usage_segments_total, context_window_compression_trigger_tokens,
-    ensure_context_compression, environment_context_message, interleaved_tool_state_messages,
+    ContextUsageInput, active_system_prompt, agents_prompt_messages,
+    builtin_tool_definitions_for_runtime, configured_extra_prompt_message,
+    configured_prompt_messages, context_usage_response, context_usage_segments_total,
+    context_window_compression_trigger_tokens, ensure_context_compression,
+    environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
     persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
     system_prompt_summaries, tool_prompt_infos,
@@ -2320,6 +2321,20 @@ struct PreparedPromptContext {
     pending_context_injections: Vec<PendingPromptContextInjection>,
     pending_memory_retrieval: Option<PendingMemoryRetrieval>,
     pending_spec_snapshot: Option<PendingChatSpecSnapshot>,
+}
+
+impl PreparedPromptContext {
+    fn context_usage_input(&self) -> ContextUsageInput<'_> {
+        ContextUsageInput {
+            messages: &self.provider_request.messages,
+            message_source_sequences: &self.message_source_sequences,
+            message_context_sources: &self.message_context_sources,
+            active_tool_start_index: self.active_tool_start_index,
+            context_budget: &self.context_budget,
+            memory_context_tokens: self.memory_context_tokens,
+            memory_budget_tokens: self.memory_budget_tokens,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -8675,7 +8690,7 @@ fn chat_summary(
     })
 }
 
-fn chat_statistics_response(
+pub(crate) fn chat_statistics_response(
     workspace_id: &str,
     chat_id: &str,
     message_counts: ChatMessageRoleCounts,
@@ -8727,7 +8742,9 @@ fn chat_statistics_response(
     })
 }
 
-fn chat_message_role_counts(records: Vec<MessageRoleCountRecord>) -> ChatMessageRoleCounts {
+pub(crate) fn chat_message_role_counts(
+    records: Vec<MessageRoleCountRecord>,
+) -> ChatMessageRoleCounts {
     let mut counts = ChatMessageRoleCounts::default();
     for record in records {
         counts.message_count += record.count;
@@ -8912,7 +8929,7 @@ fn compression_snapshot_kind(snapshot: &ContextCompressionSnapshotRecord) -> &'s
         .unwrap_or(CONTEXT_COMPRESSION_KIND_RULE)
 }
 
-fn chat_tool_breakdown(record: ToolCallCountRecord) -> ChatToolBreakdown {
+pub(crate) fn chat_tool_breakdown(record: ToolCallCountRecord) -> ChatToolBreakdown {
     ChatToolBreakdown {
         tool_name: record.tool_name,
         call_count: record.call_count,

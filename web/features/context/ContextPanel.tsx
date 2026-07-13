@@ -2297,6 +2297,11 @@ function ContextStatsTab({
     label: item.modelId,
     value: item.requestCount,
   }));
+  const providerChart = statistics.providerBreakdown.map((item) => ({
+    id: item.providerId,
+    label: item.providerId,
+    value: item.requestCount,
+  }));
   const contextBreakdownBySource = Array.isArray(contextUsage?.tokenBreakdown?.bySource)
     ? contextUsage.tokenBreakdown.bySource
     : [];
@@ -2365,6 +2370,14 @@ function ContextStatsTab({
         <ContextMiniBarChart
           data={modelChart}
           emptyLabel={t("No model calls yet.")}
+          valueFormatter={(value) => formatNumber(value, language)}
+        />
+      </ContextStatsSection>
+
+      <ContextStatsSection title={t("Provider calls")}>
+        <ContextMiniBarChart
+          data={providerChart}
+          emptyLabel={t("No provider calls yet.")}
           valueFormatter={(value) => formatNumber(value, language)}
         />
       </ContextStatsSection>
