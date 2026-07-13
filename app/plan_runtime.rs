@@ -1545,7 +1545,7 @@ fn plan_merge_prompt(
         "You are running in a fresh isolated worktree based on the current shared workspace. Recreate the intended phase changes from the source diff. Do not create a git commit; Foco will merge and commit after this task completes."
     };
     let mut message = format!(
-        "Resolve this failed automated plan phase merge.\n\n{workspace_instruction}\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}\n\nMerge failure:\n{}\n\nSource worktree diff:\n{}",
+        "Resolve this failed automated plan phase merge.\n\n{workspace_instruction}\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}\n\nMerge failure:\n{}\n\nSource worktree diff:\n```diff\n{}\n```",
         plan.title,
         plan.overview,
         phase.sequence + 1,
@@ -2096,6 +2096,46 @@ mod tests {
             source_url: "https://models.dev/api.json".to_string(),
             refreshed_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn plan_merge_prompt_wraps_source_diff_in_code_fence() {
+        let phase = phase_record_for_prompt();
+        let plan = plan_record_for_prompt(phase.clone());
+        let source_diff = "\
+*** Begin Patch
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,3 +1,4 @@
+ # heading
+ * bullet
+ _underscore_
+ `inline code`
+";
+
+        let prompt = plan_merge_prompt(
+            &plan,
+            &phase,
+            PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+            "fast-forward rejected",
+            source_diff,
+        );
+
+        assert!(prompt.contains("Source worktree diff:"));
+        let marker = "Source worktree diff:\n```diff\n";
+        let start = prompt
+            .find(marker)
+            .expect("source diff should open with a diff fence");
+        let body_start = start + marker.len();
+        let body_end = prompt[body_start..]
+            .find("\n```")
+            .map(|offset| body_start + offset)
+            .expect("source diff fence should close");
+        assert_eq!(&prompt[body_start..body_end], source_diff);
+        assert!(
+            !prompt.contains(&format!("Source worktree diff:\n{source_diff}")),
+            "source_diff must not appear bare after the heading"
+        );
     }
 
     #[test]
