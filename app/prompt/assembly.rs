@@ -641,7 +641,7 @@ struct ProjectSpecPromptContext {
     pending_snapshot: Option<PendingChatSpecSnapshot>,
 }
 
-fn plan_mode_builtin_tool_allowed(tool_name: &str) -> bool {
+pub(crate) fn plan_mode_builtin_tool_allowed(tool_name: &str) -> bool {
     matches!(
         tool_name,
         READ_FILE_TOOL

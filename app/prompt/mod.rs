@@ -3,7 +3,7 @@ mod compression;
 mod environment;
 mod prompt_files;
 
-pub(crate) use assembly::prepare_prompt_context;
+pub(crate) use assembly::{plan_mode_builtin_tool_allowed, prepare_prompt_context};
 pub(crate) use compression::{
     LlmContextCompressionMode, active_compression_snapshots,
     apply_compression_snapshot_to_messages, build_context_compression_summary_request,

@@ -375,6 +375,54 @@ pub(crate) fn execute_memory_search_tool(
     }))
 }
 
+pub(crate) fn merge_memory_search_results(
+    scope: MemoryToolSearchScope,
+    results: impl IntoIterator<Item = Value>,
+) -> Result<Value, ApiError> {
+    let mut seen = HashSet::new();
+    let mut memories = Vec::new();
+
+    for result in results {
+        let result_memories = result
+            .get("memories")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ApiError::internal("memory search result is missing memories"))?;
+        for memory in result_memories {
+            let fact_scope = memory
+                .get("scope")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::internal("memory search result is missing scope"))?;
+            let fact_id = memory
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::internal("memory search result is missing id"))?;
+            if seen.insert((fact_scope.to_string(), fact_id.to_string())) {
+                memories.push(memory.clone());
+            }
+        }
+    }
+
+    let fact_ids = memories
+        .iter()
+        .filter_map(|memory| memory.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let total_source_count = memories
+        .iter()
+        .filter_map(|memory| memory.get("sourceCount").and_then(Value::as_i64))
+        .sum::<i64>();
+
+    Ok(json!({
+        "summary": {
+            "scope": scope.as_str(),
+            "count": memories.len(),
+            "factIds": fact_ids,
+            "sourceCount": total_source_count,
+        },
+        "memories": memories,
+    }))
+}
+
 pub(crate) fn collect_memory_search_matches(
     database: &mut MemoryDatabase,
     query: &str,
@@ -667,5 +715,50 @@ pub(crate) fn memory_retrieval_tool_definition() -> NeutralToolDefinition {
             "required": ["factKeys"]
         }),
         strict: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_memory_search_results_preserves_scope_order_and_scope_qualified_deduplication() {
+        let merged = merge_memory_search_results(
+            MemoryToolSearchScope::Auto,
+            [
+                json!({
+                    "memories": [{ "id": "fact-1", "scope": "chat", "sourceCount": 1 }]
+                }),
+                json!({
+                    "memories": [
+                        { "id": "fact-1", "scope": "workspace", "sourceCount": 2 },
+                        { "id": "fact-2", "scope": "workspace", "sourceCount": 3 }
+                    ]
+                }),
+                json!({
+                    "memories": [{ "id": "fact-3", "scope": "global", "sourceCount": 4 }]
+                }),
+            ],
+        )
+        .expect("merged memory search results");
+
+        assert_eq!(
+            merged,
+            json!({
+                "summary": {
+                    "scope": "auto",
+                    "count": 4,
+                    "factIds": ["fact-1", "fact-1", "fact-2", "fact-3"],
+                    "sourceCount": 10,
+                },
+                "memories": [
+                    { "id": "fact-1", "scope": "chat", "sourceCount": 1 },
+                    { "id": "fact-1", "scope": "workspace", "sourceCount": 2 },
+                    { "id": "fact-2", "scope": "workspace", "sourceCount": 3 },
+                    { "id": "fact-3", "scope": "global", "sourceCount": 4 }
+                ]
+            })
+        );
     }
 }

@@ -440,49 +440,81 @@ async fn execute_tool_call(
     .await;
     let completed_at_text = utc_timestamp();
     let mut hook_summary = tool_execution.hook_summary;
+    let post_summary = run_post_tool_hooks(
+        &hook_runtime,
+        &global_hooks,
+        api_audit_save_details,
+        workspace_id,
+        workspace_path,
+        chat_id,
+        run_id,
+        model_id,
+        provider_id,
+        Some(&provider_config),
+        llm_request_retry_count,
+        &tool_call,
+        &tool_execution.execution,
+    )
+    .await;
+    merge_hook_summaries(&mut hook_summary, post_summary);
 
-    let executed = executed_tool_call(
-        tool_call,
-        tool_execution.execution,
-        started_at_text,
-        completed_at_text,
-    );
-    let post_event = if executed.is_error {
+    ToolHookOutcome {
+        tool_call: executed_tool_call(
+            tool_call,
+            tool_execution.execution,
+            started_at_text,
+            completed_at_text,
+        ),
+        hook_summary,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_post_tool_hooks(
+    hook_runtime: &HookRuntime,
+    global_hooks: &HookConfig,
+    api_audit_save_details: bool,
+    workspace_id: &str,
+    workspace_path: &Path,
+    chat_id: &str,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
+    provider_config: Option<&ProviderConnectionConfig>,
+    llm_request_retry_count: u32,
+    tool_call: &NeutralToolCall,
+    execution: &ToolExecution,
+) -> HookRunSummary {
+    let post_event = if execution.is_error {
         "PostToolUseFailure"
     } else {
         "PostToolUse"
     };
-    let post_summary = hook_runtime
+    hook_runtime
         .run_hooks(HookRunRequest {
-            global_config: &global_hooks,
+            global_config: global_hooks,
             api_audit_save_details,
             workspace_id,
             workspace_path,
             event: post_event,
-            match_value: Some(executed.name.clone()),
+            match_value: Some(tool_call.name.clone()),
             chat_id: Some(chat_id),
             run_id: Some(run_id),
             session_id: Some(chat_id),
-            tool_call_id: Some(&executed.id),
+            tool_call_id: Some(&tool_call.call_id),
             model_id: Some(model_id),
             provider_id: Some(provider_id),
-            provider_config: Some(&provider_config),
+            provider_config,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
-                "toolName": executed.name.clone(),
-                "toolInput": executed.input.clone(),
-                "toolOutput": executed.output.clone(),
-                "isError": executed.is_error,
+                "toolName": tool_call.name,
+                "toolInput": tool_call.arguments,
+                "toolOutput": execution.output,
+                "isError": execution.is_error,
             }),
         })
-        .await;
-    merge_hook_summaries(&mut hook_summary, post_summary);
-
-    ToolHookOutcome {
-        tool_call: executed,
-        hook_summary,
-    }
+        .await
 }
 
 pub(crate) async fn execute_tool(

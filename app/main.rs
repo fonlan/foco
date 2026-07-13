@@ -1107,12 +1107,11 @@ async fn sync_all_mcp_workspaces(
     Ok(())
 }
 
-async fn sync_mcp_workspace(
-    registry: &Arc<McpRegistry>,
-    workspace: &WorkspaceConfig,
-    config: &GlobalConfig,
-) -> Result<(), foco_mcp::McpError> {
-    let workspace = if workspace.is_remote() {
+fn mcp_registry_workspace<'a>(
+    workspace: &'a WorkspaceConfig,
+    config: &'a GlobalConfig,
+) -> &'a WorkspaceConfig {
+    if workspace.is_remote() {
         config
             .workspaces
             .iter()
@@ -1120,7 +1119,15 @@ async fn sync_mcp_workspace(
             .unwrap_or(workspace)
     } else {
         workspace
-    };
+    }
+}
+
+async fn sync_mcp_workspace(
+    registry: &Arc<McpRegistry>,
+    workspace: &WorkspaceConfig,
+    config: &GlobalConfig,
+) -> Result<(), foco_mcp::McpError> {
+    let workspace = mcp_registry_workspace(workspace, config);
     let definitions = mcp_server_definitions(config)?;
 
     registry

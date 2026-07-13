@@ -35,7 +35,8 @@ pub(crate) use code_graph::{
     spawn_code_graph_index_initialization, spawn_code_graph_workspace_initialization_if_needed,
 };
 pub(crate) use image_tools::{
-    execute_image_tool, image_model_available, image_tool_timeout_ms, is_image_tool_name,
+    BrokeredImageFile, execute_image_tool, image_model_available, image_tool_timeout_ms,
+    is_image_tool_name, materialize_brokered_image_result,
 };
 #[cfg(all(test, windows))]
 pub(crate) use native_tools::find_system_ripgrep;
@@ -60,13 +61,13 @@ pub(crate) use subscriptions::{
     ActiveChatRunSummary, ChatRunCancellation, GuidanceMessage, chat_run_subscription_stream,
 };
 pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
-pub(crate) use tool_execution::execute_tool;
 #[cfg(test)]
 pub(crate) use tool_execution::wait_for_tool_resource_lock;
 pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
     RepeatedToolCallDetector, execute_tool_calls_parallel, is_agent_tool_name, pending_tool_calls,
 };
+pub(crate) use tool_execution::{execute_tool, run_post_tool_hooks};
 pub(crate) use tool_locks::{
     ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
     ToolResourceLockRegistry,

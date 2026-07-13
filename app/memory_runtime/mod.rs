@@ -41,6 +41,6 @@ pub(crate) use tools::{
     execute_memory_write_tool,
 };
 pub(crate) use tools::{
-    MemoryToolContext, execute_memory_tool, is_memory_tool_name, memory_tool_definitions,
-    memory_tool_timeout_ms,
+    MemoryToolContext, MemoryToolSearchScope, execute_memory_tool, is_memory_tool_name,
+    memory_tool_definitions, memory_tool_timeout_ms, merge_memory_search_results,
 };

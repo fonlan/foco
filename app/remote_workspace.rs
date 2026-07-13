@@ -25,13 +25,14 @@ use axum::{
     },
     routing::{any, get, patch, post, put},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    ContextBudget, PendingToolCall, RejectedToolCall, build_memory_prompt_section,
-    build_project_spec_prompt_section, calculate_context_budget, estimate_text_tokens,
-    plan_tool_execution, rejected_tool_batch,
+    ContextBudget, PendingToolCall, RejectedToolCall, build_available_tools_prompt,
+    build_memory_prompt_section, build_project_spec_prompt_section, calculate_context_budget,
+    estimate_text_tokens, plan_tool_execution, rejected_tool_batch,
 };
-use foco_mcp::McpRegistry;
+use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
@@ -86,7 +87,13 @@ use crate::{
         },
         terminal::TerminalSessionResponse,
     },
-    markdown_code_block, neutral_text_message, neutral_tool_definition,
+    markdown_code_block,
+    memory_runtime::{
+        MemoryToolContext, MemoryToolSearchScope, execute_memory_tool, memory_tool_timeout_ms,
+        merge_memory_search_results,
+    },
+    memory_tool_definitions, merge_hook_summaries, neutral_mcp_tool_definition,
+    neutral_text_message, neutral_tool_definition,
     prompt::{
         LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
         builtin_tool_definitions_for_runtime, compress_all_runtime_tool_state_messages,
@@ -94,14 +101,16 @@ use crate::{
         context_compression_summary_has_benefit, context_message_groups, context_token_breakdown,
         context_usage_segments, context_usage_segments_total, environment_context_message,
         insert_context_compression_snapshot_record, llm_context_compression_trigger_tokens,
-        pack_neutral_messages, plan_llm_context_compression, prepare_context_compression_snapshot,
+        pack_neutral_messages, plan_llm_context_compression, plan_mode_builtin_tool_allowed,
+        prepare_context_compression_snapshot, tool_prompt_infos,
     },
     runtime::{
-        ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
+        BrokeredImageFile, ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
         ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
         SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
         build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
-        reasoning_loop_guard_message,
+        image_tool_timeout_ms, materialize_brokered_image_result, reasoning_loop_guard_message,
+        run_post_tool_hooks, web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -116,7 +125,7 @@ use crate::{
         prepare_remote_workspace_spec_generation_job,
         recover_stale_running_workspace_spec_job_for_path,
     },
-    unique_id, utc_timestamp, workspace_by_id,
+    todo_graph_context_message, unique_id, utc_timestamp, workspace_by_id,
 };
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
@@ -130,6 +139,8 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_BROKERED_IMAGE_FILE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BROKERED_IMAGE_TOTAL_BYTES: usize = 24 * 1024 * 1024;
 /// Broker `requestKind` values accepted for main-process LLM audit rows.
 const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] =
     &["chat completion", "contextCompression", "prompt hook"];
@@ -183,9 +194,41 @@ struct RemoteSidecarRuntimeToolState {
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
 }
 
+/// Run-scoped tool routing snapshot shared by prompt assembly and execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteToolRoute {
+    SidecarLocal,
+    Broker { method: &'static str },
+    McpWorkspace,
+    McpLocal,
+}
+
+#[derive(Clone)]
+struct RemoteToolCatalog {
+    tools: Vec<NeutralToolDefinition>,
+    routes: HashMap<String, RemoteToolRoute>,
+    allowed_names: HashSet<String>,
+    workspace_mcp_registry: Arc<McpRegistry>,
+    builtin_prompt_tools: Vec<foco_tools::ToolDefinition>,
+    memory_prompt_tools: Vec<NeutralToolDefinition>,
+    mcp_prompt_tools: Vec<McpToolDefinition>,
+}
+
+impl RemoteToolCatalog {
+    fn route(&self, name: &str) -> Option<&RemoteToolRoute> {
+        self.routes.get(name)
+    }
+
+    fn allows(&self, name: &str) -> bool {
+        self.allowed_names.contains(name)
+    }
+}
+
 /// Lightweight remote prompt context: messages plus durable source metadata for snapshot replay.
 struct RemotePreparedChatContext {
     provider_request: NeutralChatRequest,
+    tool_catalog: Arc<RemoteToolCatalog>,
+    session_mode: Option<String>,
     message_source_sequences: Vec<Option<i64>>,
     message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
@@ -219,8 +262,23 @@ impl RemoteSidecarRuntimeToolState {
         request: &NeutralChatRequest,
     ) -> Result<Self, ApiError> {
         // Legacy path for tests that build a bare NeutralChatRequest without DB provenance.
+        let tool_catalog = Arc::new(RemoteToolCatalog {
+            tools: request.tools.clone(),
+            routes: request
+                .tools
+                .iter()
+                .map(|tool| (tool.name.clone(), RemoteToolRoute::SidecarLocal))
+                .collect(),
+            allowed_names: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+            workspace_mcp_registry: Arc::new(McpRegistry::default()),
+            builtin_prompt_tools: Vec::new(),
+            memory_prompt_tools: Vec::new(),
+            mcp_prompt_tools: Vec::new(),
+        });
         let prepared = RemotePreparedChatContext {
             provider_request: request.clone(),
+            tool_catalog,
+            session_mode: None,
             message_source_sequences: vec![None; request.messages.len()],
             message_context_sources: remote_sidecar_initial_context_sources(&request.messages),
             active_tool_start_index: request.messages.len(),
@@ -558,7 +616,7 @@ impl RemoteSidecarRuntimeToolState {
         let summary_token_count = estimate_text_tokens(&summary);
         let workspace_path = PathBuf::from(&state.workspace_path);
         let (_mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
-            match remote_sidecar_hook_environment(state).await {
+            match remote_sidecar_hook_environment(state, None).await {
                 Ok(environment) => environment,
                 Err(error) => {
                     events.pop();
@@ -1671,6 +1729,71 @@ struct ControlEnvelope {
     timestamp: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerToolContext {
+    #[serde(default)]
+    workspace_id: String,
+    #[serde(default)]
+    chat_id: String,
+    #[serde(default)]
+    run_id: String,
+    #[serde(default)]
+    assistant_message_id: String,
+    #[serde(default)]
+    tool_call_id: String,
+    #[serde(default)]
+    provider_id: String,
+    #[serde(default)]
+    model_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerToolCallPayload {
+    #[serde(default)]
+    arguments: Value,
+    #[serde(default)]
+    context: BrokerToolContext,
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
+fn broker_tool_call_payload(payload: Value) -> BrokerToolCallPayload {
+    serde_json::from_value::<BrokerToolCallPayload>(payload.clone()).unwrap_or(
+        BrokerToolCallPayload {
+            arguments: payload,
+            context: BrokerToolContext::default(),
+            tool_name: None,
+        },
+    )
+}
+
+struct BrokerImageTransferDirectory {
+    path: PathBuf,
+}
+
+impl BrokerImageTransferDirectory {
+    fn create(root: &Path) -> Result<Self, io::Error> {
+        let path = root
+            .join(".foco")
+            .join("broker-image-transfer")
+            .join(unique_id("transfer"));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BrokerImageTransferDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[derive(Clone)]
 struct RemoteActiveRunStream {
     chat_id: String,
@@ -1745,6 +1868,14 @@ impl RemoteActiveRunStream {
     fn set_broker_request_id(&self, id: String) {
         if let Ok(mut broker_request_id) = self.broker_request_id.lock() {
             *broker_request_id = Some(id);
+        }
+    }
+
+    fn clear_broker_request_id(&self, id: &str) {
+        if let Ok(mut broker_request_id) = self.broker_request_id.lock()
+            && broker_request_id.as_deref() == Some(id)
+        {
+            *broker_request_id = None;
         }
     }
 
@@ -3420,46 +3551,100 @@ async fn handle_broker_request(
         }
     };
 
-    match method.as_str() {
-        "llm.stream" => {
-            broker_llm_stream(
-                state,
-                &write,
-                server_id,
-                workspace_id,
-                &id,
-                request.payload,
-                cancel_rx,
-            )
-            .await;
-        }
-        "memory.global.search" => {
-            broker_memory_global_search(state, &write, &id, request.payload).await;
-        }
-        "memory.global.write" => {
-            broker_memory_global_write(state, &write, &id, request.payload).await;
-        }
-        "web.search" => {
-            broker_web_search(state, &write, &id, request.payload).await;
-        }
-        "web.fetch" => {
-            broker_web_fetch(state, &write, &id, request.payload).await;
-        }
-        "image.generate" => {
-            broker_image_generate(state, &write, &id, request.payload).await;
-        }
-        "ui.askQuestion" => {
-            broker_ask_question(state, &write, &id, request.payload).await;
-        }
-        other => {
+    if method == "llm.stream" {
+        broker_llm_stream(
+            state,
+            &write,
+            server_id,
+            workspace_id,
+            &id,
+            request.payload,
+            cancel_rx,
+        )
+        .await;
+        return;
+    }
+
+    let broker_tool_method = matches!(
+        method.as_str(),
+        "memory.global.search"
+            | "memory.global.write"
+            | "web.search"
+            | "web.fetch"
+            | "image.generate"
+            | "ui.askQuestion"
+            | "mcp.execute"
+    );
+    if broker_tool_method {
+        let context = broker_tool_call_payload(request.payload.clone()).context;
+        if context.workspace_id != workspace_id
+            || context.chat_id.trim().is_empty()
+            || context.run_id.trim().is_empty()
+            || context.assistant_message_id.trim().is_empty()
+            || context.tool_call_id.trim().is_empty()
+        {
             let _ = send_broker_error(
                 &write,
                 Some(&id),
-                "unknown_method",
-                format!("unknown broker method: {other}"),
+                "bad_request",
+                "brokered tool context is incomplete or belongs to another workspace",
             )
             .await;
+            return;
         }
+    }
+
+    let broker_tool = async {
+        match method.as_str() {
+            "memory.global.search" => {
+                broker_memory_global_search(state, &write, &id, request.payload).await;
+            }
+            "memory.global.write" => {
+                broker_memory_global_write(state, &write, &id, request.payload).await;
+            }
+            "web.search" => {
+                broker_web_search(state, &write, &id, request.payload).await;
+            }
+            "web.fetch" => {
+                broker_web_fetch(state, &write, &id, request.payload).await;
+            }
+            "image.generate" => {
+                broker_image_generate(state, &write, &id, request.payload).await;
+            }
+            "ui.askQuestion" => {
+                broker_ask_question(state, &write, &id, request.payload).await;
+            }
+            "tools.discover" => {
+                broker_remote_tool_discovery(state, &write, workspace_id, &id).await;
+            }
+            "mcp.execute" => {
+                broker_mcp_execute(state, &write, workspace_id, &id, request.payload).await;
+            }
+            other => {
+                let _ = send_broker_error(
+                    &write,
+                    Some(&id),
+                    "unknown_method",
+                    format!("unknown broker method: {other}"),
+                )
+                .await;
+            }
+        }
+    };
+    if let Some(mut cancel_rx) = cancel_rx {
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                let _ = send_broker_error(
+                    &write,
+                    Some(&id),
+                    "cancelled",
+                    "brokered tool request was cancelled",
+                ).await;
+            }
+            _ = broker_tool => {}
+        }
+    } else {
+        broker_tool.await;
     }
 }
 
@@ -4326,143 +4511,90 @@ async fn broker_llm_stream(
     let _ = send_broker_envelope(write, &response).await;
 }
 
-/// Handle `memory.global.search`: search the local global memory database.
 async fn broker_memory_global_search(
     state: &AppState,
     write: &SharedBrokerWsWrite,
     id: &str,
     payload: Value,
 ) {
-    let query = payload
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if query.is_empty() {
-        let _ = send_broker_error(write, Some(id), "bad_request", "missing query").await;
-        return;
-    }
-    let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(10) as u32;
-
-    let memory_db = match MemoryDatabase::open_or_create_global_at(&state.memory_database_file) {
-        Ok(db) => db,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
-            return;
-        }
-    };
-    let results = match memory_db.search_enabled_active_facts_for_scope(query, None, None, limit) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
-            return;
-        }
-    };
-    let response = ControlEnvelope {
-        version: 1,
-        message_type: "response".to_string(),
-        id: Some(id.to_string()),
-        method: None,
-        payload: json!({ "status": "ok", "results": results, "query": query }),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
-    let _ = send_broker_envelope(write, &response).await;
+    broker_execute_global_memory_tool(state, write, id, "memory_search", payload).await;
 }
 
-/// Handle `memory.global.write`: write a manual fact into the local global memory database.
 async fn broker_memory_global_write(
     state: &AppState,
     write: &SharedBrokerWsWrite,
     id: &str,
     payload: Value,
 ) {
-    let fact = payload
-        .get("fact")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if fact.is_empty() {
-        let _ = send_broker_error(write, Some(id), "bad_request", "missing fact").await;
-        return;
-    }
-    let kind = payload
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(MemoryKind::parse)
-        .transpose();
-    let kind = match kind {
-        Ok(Some(kind)) => kind,
-        Ok(None) => MemoryKind::UserNote,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "bad_request", format!("{e}")).await;
-            return;
-        }
-    };
-    let confidence = payload.get("confidence").and_then(Value::as_f64);
-    let pinned = payload
-        .get("pinned")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let reason = payload
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("remote sidecar broker memory write");
-    let source_id = unique_id("broker-memory-source");
-    let fact_id = unique_id("memory");
-    let source_ids = [source_id.as_str()];
-    let metadata_json = json!({
-        "brokered": true,
-        "requestId": id,
-        "reason": reason,
-    })
-    .to_string();
-
-    let mut memory_db = match MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
-    {
-        Ok(db) => db,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
-            return;
-        }
-    };
-    if let Err(e) = memory_db.insert_source(NewMemorySource {
-        id: &source_id,
-        scope: MemoryScope::Global,
-        chat_id: None,
-        source_type: MemorySourceType::ToolCall,
-        source_id: Some(id),
-        title: "Remote broker memory write",
-        content: reason,
-        metadata_json: &metadata_json,
-    }) {
-        let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
-        return;
-    }
-    if let Err(e) = memory_db.insert_fact(NewMemoryFact {
-        id: &fact_id,
-        scope: MemoryScope::Global,
-        chat_id: None,
-        status: MemoryStatus::Active,
-        kind,
-        fact,
-        confidence,
-        pinned,
-        source_ids: &source_ids,
-        metadata_json: &metadata_json,
-    }) {
-        let _ = send_broker_error(write, Some(id), "internal_error", format!("{e}")).await;
-        return;
-    }
-
-    let response = ControlEnvelope {
-        version: 1,
-        message_type: "response".to_string(),
-        id: Some(id.to_string()),
-        method: None,
-        payload: json!({ "status": "ok", "factId": fact_id }),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
-    let _ = send_broker_envelope(write, &response).await;
+    broker_execute_global_memory_tool(state, write, id, "memory_write", payload).await;
 }
+
+async fn broker_execute_global_memory_tool(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    tool_name: &str,
+    payload: Value,
+) {
+    let payload = broker_tool_call_payload(payload);
+    if payload.arguments.get("scope").and_then(Value::as_str) != Some("global") {
+        let _ = send_broker_error(
+            write,
+            Some(id),
+            "bad_request",
+            "global memory broker only accepts scope=global",
+        )
+        .await;
+        return;
+    }
+    let memory_settings = match config_snapshot(state) {
+        Ok(config) => config.memory,
+        Err(error) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "internal_error",
+                error.message().to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+    let context = MemoryToolContext {
+        enabled: memory_settings.enabled,
+        workspace_path: PathBuf::from(&state.user_profile_dir),
+        global_memory_database_file: state.memory_database_file.clone(),
+        chat_id: payload.context.chat_id,
+        run_id: payload.context.run_id,
+        tool_call_id: payload.context.tool_call_id,
+        target_status: MemoryStatus::Pending,
+        memory_settings,
+    };
+    let tool_name = tool_name.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_memory_tool(&context, &tool_name, payload.arguments)
+    })
+    .await
+    .map_err(|source| format!("memory broker worker failed: {source}"))
+    .and_then(|result| result);
+    match result {
+        Ok(result) => {
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id.to_string()),
+                method: None,
+                payload: json!({ "status": "ok", "result": result }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let _ = send_broker_envelope(write, &response).await;
+        }
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
+        }
+    }
+}
+
 /// Handle `web.search`: delegate to the local web search tool.
 async fn broker_web_search(
     state: &AppState,
@@ -4470,60 +4602,53 @@ async fn broker_web_search(
     id: &str,
     payload: Value,
 ) {
-    let config = match config_snapshot(state) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ =
-                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
-            return;
-        }
-    };
-    let result = match execute_web_tool(
-        &config.web_search,
-        "web_search",
-        payload.clone(),
-        Duration::from_secs(15),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
-            return;
-        }
-    };
-    let response = ControlEnvelope {
-        version: 1,
-        message_type: "response".to_string(),
-        id: Some(id.to_string()),
-        method: None,
-        payload: json!({ "status": "ok", "result": result }),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
-    let _ = send_broker_envelope(write, &response).await;
+    broker_web_tool(state, write, id, "web_search", payload).await;
 }
 
 /// Handle `web.fetch`: delegate to the local web fetch tool.
 async fn broker_web_fetch(state: &AppState, write: &SharedBrokerWsWrite, id: &str, payload: Value) {
+    broker_web_tool(state, write, id, "web_fetch", payload).await;
+}
+
+async fn broker_web_tool(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    tool_name: &str,
+    payload: Value,
+) {
+    let arguments = broker_tool_call_payload(payload).arguments;
+    let timeout_ms = match web_tool_timeout_ms(&arguments) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", error).await;
+            return;
+        }
+    };
     let config = match config_snapshot(state) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ =
-                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+        Ok(config) => config,
+        Err(error) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "internal_error",
+                error.message().to_string(),
+            )
+            .await;
             return;
         }
     };
     let result = match execute_web_tool(
         &config.web_search,
-        "web_fetch",
-        payload.clone(),
-        Duration::from_secs(15),
+        tool_name,
+        arguments,
+        Duration::from_millis(timeout_ms),
     )
     .await
     {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
+        Ok(result) => result,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
             return;
         }
     };
@@ -4538,58 +4663,147 @@ async fn broker_web_fetch(state: &AppState, write: &SharedBrokerWsWrite, id: &st
     let _ = send_broker_envelope(write, &response).await;
 }
 
-/// Handle `image.generate`: delegate to the local image generation tool.
-/// ponytail: requires the default workspace path for output directory;
-/// workspace_path is not yet passed by the sidecar, fall back to a
-/// temporary directory for now.
+/// Handle `image.generate`: generate with local provider credentials and transfer bounded bytes.
 async fn broker_image_generate(
     state: &AppState,
     write: &SharedBrokerWsWrite,
     id: &str,
     payload: Value,
 ) {
+    let payload = broker_tool_call_payload(payload);
     let config = match config_snapshot(state) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ =
-                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+        Ok(config) => config,
+        Err(error) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "internal_error",
+                error.message().to_string(),
+            )
+            .await;
             return;
         }
     };
-    let workspace_path = Path::new(&state.user_profile_dir);
-    let timeout = Duration::from_millis(std::cmp::min(
+    let temporary_workspace = match BrokerImageTransferDirectory::create(&state.user_profile_dir) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "internal_error",
+                format!("failed to create image transfer directory: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    let timeout = Duration::from_millis(
         payload
+            .arguments
             .get("timeoutMs")
             .and_then(Value::as_u64)
-            .unwrap_or(300_000),
-        600_000,
-    ));
-    let result = match execute_image_tool(
+            .unwrap_or(300_000)
+            .min(600_000),
+    );
+    let mut image_arguments = payload.arguments.clone();
+    image_arguments["outputDir"] = Value::String("generated".to_string());
+    let mut result = match execute_image_tool(
         &config,
-        workspace_path,
-        "_broker_",
-        "_broker_",
+        temporary_workspace.path(),
+        &payload.context.chat_id,
+        &payload.context.run_id,
         "image_gen",
-        payload.clone(),
+        image_arguments,
         timeout,
     )
     .await
     {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", e).await;
+        Ok(result) => result,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
             return;
         }
     };
+    let transferred_files = match package_brokered_image_files(temporary_workspace.path(), &result)
+    {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
+            return;
+        }
+    };
+    result["files"] = Value::Array(Vec::new());
     let response = ControlEnvelope {
         version: 1,
         message_type: "response".to_string(),
         id: Some(id.to_string()),
         method: None,
-        payload: json!({ "status": "ok", "result": result }),
+        payload: json!({
+            "status": "ok",
+            "result": result,
+            "files": transferred_files,
+        }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
     let _ = send_broker_envelope(write, &response).await;
+}
+
+fn package_brokered_image_files(
+    workspace_path: &Path,
+    result: &Value,
+) -> Result<Vec<BrokeredImageFile>, String> {
+    let files = result
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "image generation result is missing files".to_string())?;
+    if files.is_empty() || files.len() > 4 {
+        return Err("image generation returned an invalid file count".to_string());
+    }
+    let mut total_bytes = 0_usize;
+    files
+        .iter()
+        .map(|file| {
+            let relative_path = file
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "image generation result is missing a file path".to_string())?;
+            let path = workspace_path.join(relative_path);
+            let canonical_path = fs::canonicalize(&path)
+                .map_err(|source| format!("failed to resolve generated image: {source}"))?;
+            let canonical_workspace = fs::canonicalize(workspace_path)
+                .map_err(|source| format!("failed to resolve image workspace: {source}"))?;
+            if !canonical_path.starts_with(&canonical_workspace) {
+                return Err("generated image escaped the transfer directory".to_string());
+            }
+            let bytes = fs::read(&canonical_path)
+                .map_err(|source| format!("failed to read generated image: {source}"))?;
+            if bytes.is_empty() || bytes.len() > MAX_BROKERED_IMAGE_FILE_BYTES {
+                return Err(
+                    "generated image exceeds the 10 MiB per-file transfer limit".to_string()
+                );
+            }
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            if total_bytes > MAX_BROKERED_IMAGE_TOTAL_BYTES {
+                return Err("generated images exceed the 24 MiB transfer limit".to_string());
+            }
+            let file_name = canonical_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "generated image file name is invalid".to_string())?
+                .to_string();
+            Ok(BrokeredImageFile {
+                file_name,
+                mime_type: file
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "image generation result is missing MIME type".to_string())?
+                    .to_string(),
+                bytes: bytes.len(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                data_base64: BASE64_STANDARD.encode(bytes),
+            })
+        })
+        .collect()
 }
 
 /// Handle `ui.askQuestion`: register a pending question and block until the
@@ -4605,65 +4819,248 @@ async fn broker_ask_question(
 ) {
     use crate::runtime::AskQuestionInput;
 
-    let input: AskQuestionInput = match serde_json::from_value(payload.clone()) {
-        Ok(i) => i,
-        Err(e) => {
+    let payload = broker_tool_call_payload(payload);
+    let input: AskQuestionInput = match serde_json::from_value(payload.arguments) {
+        Ok(input) => input,
+        Err(error) => {
             let _ = send_broker_error(
                 write,
                 Some(id),
                 "bad_request",
-                format!("invalid askQuestion payload: {e}"),
+                format!("invalid askQuestion payload: {error}"),
             )
             .await;
             return;
         }
     };
+    if payload.context.workspace_id.trim().is_empty()
+        || payload.context.chat_id.trim().is_empty()
+        || payload.context.tool_call_id.trim().is_empty()
+    {
+        let _ = send_broker_error(
+            write,
+            Some(id),
+            "bad_request",
+            "askQuestion broker context is incomplete",
+        )
+        .await;
+        return;
+    }
     let question_id = unique_id("broker-question");
-    let question_req = crate::runtime::QuestionRequest {
+    let question_request = crate::runtime::QuestionRequest {
         id: question_id.clone(),
-        tool_call_id: format!("broker-{id}"),
-        workspace_id: String::new(),
-        chat_id: String::new(),
+        tool_call_id: payload.context.tool_call_id,
+        workspace_id: payload.context.workspace_id,
+        chat_id: payload.context.chat_id,
         questions: input
             .questions
             .into_iter()
-            .map(|q| crate::runtime::QuestionItem {
+            .map(|question| crate::runtime::QuestionItem {
                 id: unique_id("broker-q"),
-                question: q.question,
-                options: q.options.unwrap_or_default(),
-                allow_free_text: q.allow_free_text,
+                question: question.question,
+                options: question.options.unwrap_or_default(),
+                allow_free_text: question.allow_free_text,
             })
             .collect(),
     };
-    let registration = match state.question_registry.register(question_req) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ =
-                send_broker_error(write, Some(id), "internal_error", e.message().to_string()).await;
+    let registration = match state.question_registry.register(question_request.clone()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "internal_error",
+                error.message().to_string(),
+            )
+            .await;
             return;
         }
     };
-    // Wait for the user's answer
-    let answer_result = registration.answer_rx.await;
-    let answer_payload = match answer_result {
-        Ok(answer) => json!({
-            "status": "ok",
-            "answers": answer.answers,
+    let question_event = ControlEnvelope {
+        version: 1,
+        message_type: "stream".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({
+            "event": {
+                "type": "questionRequest",
+                "assistantMessageId": payload.context.assistant_message_id,
+                "request": question_request,
+            }
         }),
-        Err(_) => json!({
-            "status": "cancelled",
-            "answers": [],
-        }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
+    if send_broker_envelope(write, &question_event).await.is_err() {
+        return;
+    }
+
+    match registration.answer_rx.await {
+        Ok(answer) => {
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id.to_string()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "result": {
+                        "questionId": question_id,
+                        "answers": answer.answers,
+                    }
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let _ = send_broker_envelope(write, &response).await;
+        }
+        Err(_) => {
+            let _ = send_broker_error(
+                write,
+                Some(id),
+                "cancelled",
+                "question was cancelled before the user answered",
+            )
+            .await;
+        }
+    }
+}
+
+fn local_hosted_mcp_server_ids(config: &foco_store::config::GlobalConfig) -> HashSet<String> {
+    config
+        .mcp
+        .servers
+        .iter()
+        .filter_map(|server| server.to_definition().ok())
+        .filter(|server| {
+            server.enabled && server.effective_execution_host() == McpExecutionHost::Local
+        })
+        .map(|server| server.id)
+        .collect()
+}
+
+async fn broker_remote_tool_discovery(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    workspace_id: &str,
+    id: &str,
+) {
+    let config = match config_snapshot(state) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", error.message()).await;
+            return;
+        }
+    };
+    let workspace = match workspace_by_id(&config, workspace_id) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", error.message()).await;
+            return;
+        }
+    };
+    if let Err(error) = crate::sync_mcp_workspace(&state.mcp_registry, workspace, &config).await {
+        tracing::warn!(workspace_id, error = %error, "failed to discover local-hosted MCP tools");
+    }
+    let registry_workspace = crate::mcp_registry_workspace(workspace, &config);
+    let local_server_ids = local_hosted_mcp_server_ids(&config);
+    let mut mcp_tools = state
+        .mcp_registry
+        .tool_definitions(&registry_workspace.id)
+        .await
+        .into_iter()
+        .filter(|tool| local_server_ids.contains(&tool.server_id))
+        .collect::<Vec<_>>();
+    mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
     let response = ControlEnvelope {
         version: 1,
         message_type: "response".to_string(),
         id: Some(id.to_string()),
         method: None,
-        payload: answer_payload,
+        payload: json!({
+            "status": "ok",
+            "webSearchAvailable": crate::runtime::web_search_enabled(&config.web_search),
+            "mcpTools": mcp_tools,
+        }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
     let _ = send_broker_envelope(write, &response).await;
+}
+
+async fn broker_mcp_execute(
+    state: &AppState,
+    write: &SharedBrokerWsWrite,
+    workspace_id: &str,
+    id: &str,
+    payload: Value,
+) {
+    let payload = broker_tool_call_payload(payload);
+    let tool_name = match payload.tool_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => name,
+        _ => {
+            let _ = send_broker_error(write, Some(id), "bad_request", "missing toolName").await;
+            return;
+        }
+    };
+    let arguments = payload.arguments;
+    let config = match config_snapshot(state) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "internal_error", error.message()).await;
+            return;
+        }
+    };
+    let workspace = match workspace_by_id(&config, workspace_id) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", error.message()).await;
+            return;
+        }
+    };
+    if let Err(error) = crate::sync_mcp_workspace(&state.mcp_registry, workspace, &config).await {
+        let _ = send_broker_error(write, Some(id), "tool_error", error.to_string()).await;
+        return;
+    }
+    let registry_workspace = crate::mcp_registry_workspace(workspace, &config);
+    let local_server_ids = local_hosted_mcp_server_ids(&config);
+    let local_tool_available = state
+        .mcp_registry
+        .tool_definitions(&registry_workspace.id)
+        .await
+        .iter()
+        .any(|tool| tool.name == tool_name && local_server_ids.contains(&tool.server_id));
+    if !local_tool_available {
+        let _ = send_broker_error(
+            write,
+            Some(id),
+            "bad_request",
+            format!("MCP tool is not available on the local execution host: {tool_name}"),
+        )
+        .await;
+        return;
+    }
+    match state
+        .mcp_registry
+        .execute_tool(&registry_workspace.id, tool_name, arguments)
+        .await
+    {
+        Ok(execution) => {
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id.to_string()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "result": execution.output,
+                    "isError": execution.is_error,
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let _ = send_broker_envelope(write, &response).await;
+        }
+        Err(error) => {
+            let _ = send_broker_error(write, Some(id), "tool_error", error.to_string()).await;
+        }
+    }
 }
 
 async fn send_broker_envelope(
@@ -6621,38 +7018,213 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
     }
 }
 
-fn remote_sidecar_executable_tool_schemas() -> Vec<NeutralToolDefinition> {
-    builtin_tool_definitions_for_runtime(true, false)
-        .into_iter()
-        .filter(|tool| {
-            matches!(classify_tool_route(tool.name), ToolRoute::SidecarLocal)
-                && !matches!(
-                    tool.name,
-                    "write_file"
-                        | "edit_file"
-                        | "create_todo_graph"
-                        | "update_todo_graph"
-                        | "get_todo_graph"
-                        | "create_plan"
-                        | "get_plans"
-                        | "update_plan"
-                        | "update_plan_step"
-                        | "delete_plan"
-                        | "read_spec"
-                        | "update_spec"
-                        | "agent_list"
-                        | "agent_get_task"
-                        | "agent_send_message"
-                        | "agent_delegate_task"
-                        | "agent_cancel_task"
-                        | "agent_wait_tasks"
-                        | "agent_transfer_task"
-                        | "agent_create_instances"
-                        | "sleep"
-                )
-        })
-        .map(neutral_tool_definition)
-        .collect()
+#[derive(Default)]
+struct RemoteBrokerToolDiscovery {
+    web_search_available: bool,
+    local_mcp_tools: Vec<McpToolDefinition>,
+}
+
+fn remote_sidecar_session_mode(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    queued_user_message_id: &str,
+) -> Result<Option<String>, axum::response::Response> {
+    let message = database
+        .message(queued_user_message_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request("queued user message was not found").into_response()
+        })?;
+    if message.chat_id != chat_id || message.role != "user" {
+        return Err(
+            ApiError::bad_request("queued user message does not belong to this chat")
+                .into_response(),
+        );
+    }
+    let metadata = serde_json::from_str::<Value>(&message.metadata_json).unwrap_or(Value::Null);
+    let queued_run = metadata.get("queuedRun");
+    let session_mode = metadata
+        .get("sessionMode")
+        .or_else(|| metadata.get("session_mode"))
+        .or_else(|| queued_run.and_then(|run| run.get("sessionMode")))
+        .or_else(|| queued_run.and_then(|run| run.get("session_mode")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(str::to_string);
+    if session_mode.as_deref().is_some_and(|mode| mode != "plan") {
+        return Err(ApiError::bad_request(format!(
+            "unsupported session mode: {}",
+            session_mode.as_deref().unwrap_or_default()
+        ))
+        .into_response());
+    }
+    Ok(session_mode)
+}
+
+async fn remote_sidecar_broker_tool_discovery(
+    state: &RemoteSidecarState,
+) -> Result<RemoteBrokerToolDiscovery, axum::response::Response> {
+    #[cfg(test)]
+    if state.ws_count.load(Ordering::Relaxed) == 0 || state.broker_tx.receiver_count() == 0 {
+        return Ok(RemoteBrokerToolDiscovery::default());
+    }
+    let request_id = unique_id("broker-tool-discovery");
+    let mut response_rx = remote_sidecar_broker_request(
+        state,
+        &request_id,
+        "tools.discover",
+        json!({ "workspaceId": state.workspace_id }),
+    )
+    .await?;
+    let response = timeout(BROKER_REQUEST_TIMEOUT, response_rx.recv())
+        .await
+        .map_err(|_| ApiError::internal("remote tool discovery timed out").into_response())?
+        .ok_or_else(|| ApiError::internal("remote tool discovery disconnected").into_response())?;
+    if response.message_type == "error" {
+        let message = response
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("remote tool discovery failed");
+        return Err(ApiError::internal(message).into_response());
+    }
+    let local_mcp_tools = response
+        .payload
+        .get("mcpTools")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    Ok(RemoteBrokerToolDiscovery {
+        web_search_available: response
+            .payload
+            .get("webSearchAvailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        local_mcp_tools,
+    })
+}
+
+fn remote_builtin_route(name: &str) -> RemoteToolRoute {
+    match classify_tool_route(name) {
+        ToolRoute::SidecarLocal => RemoteToolRoute::SidecarLocal,
+        ToolRoute::BrokerNeeded => RemoteToolRoute::Broker {
+            method: match name {
+                "ask_question" => "ui.askQuestion",
+                "web_search" => "web.search",
+                "web_fetch" => "web.fetch",
+                "image_gen" => "image.generate",
+                "memory_search" => "memory.global.search",
+                "memory_write" => "memory.global.write",
+                _ => "tools.execute",
+            },
+        },
+    }
+}
+
+async fn remote_sidecar_tool_catalog(
+    state: &RemoteSidecarState,
+    bundle: Option<&SidecarRuntimeConfigBundle>,
+    session_mode: Option<&str>,
+) -> Result<Arc<RemoteToolCatalog>, axum::response::Response> {
+    let discovery = match remote_sidecar_broker_tool_discovery(state).await {
+        Ok(discovery) => discovery,
+        Err(response) => {
+            tracing::warn!(
+                workspace_id = %state.workspace_id,
+                status = %response.status(),
+                "remote broker tool discovery failed; continuing without broker-discovered tools"
+            );
+            RemoteBrokerToolDiscovery::default()
+        }
+    };
+    let workspace_mcp_registry = remote_sidecar_workspace_mcp_registry(state)
+        .await
+        .map_err(|message| ApiError::internal(message).into_response())?;
+    Ok(build_remote_tool_catalog(
+        bundle,
+        session_mode,
+        discovery,
+        workspace_mcp_registry,
+        &state.workspace_id,
+        remote_sidecar_ripgrep_available().await,
+    )
+    .await)
+}
+
+async fn remote_sidecar_ripgrep_available() -> bool {
+    Command::new("rg")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+async fn build_remote_tool_catalog(
+    bundle: Option<&SidecarRuntimeConfigBundle>,
+    session_mode: Option<&str>,
+    discovery: RemoteBrokerToolDiscovery,
+    workspace_mcp_registry: Arc<McpRegistry>,
+    workspace_id: &str,
+    ripgrep_available: bool,
+) -> Arc<RemoteToolCatalog> {
+    let mut workspace_mcp_tools = workspace_mcp_registry.tool_definitions(workspace_id).await;
+    workspace_mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut local_mcp_tools = discovery.local_mcp_tools;
+    local_mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let plan_mode = session_mode == Some("plan");
+    let mut builtin_tools =
+        builtin_tool_definitions_for_runtime(ripgrep_available, discovery.web_search_available)
+            .into_iter()
+            .filter(|tool| !tool.name.starts_with("agent_"))
+            .collect::<Vec<_>>();
+    let mut memory_tools = if bundle.is_some_and(|bundle| bundle.payload.memory.enabled) {
+        memory_tool_definitions()
+    } else {
+        Vec::new()
+    };
+    if plan_mode {
+        builtin_tools.retain(|tool| plan_mode_builtin_tool_allowed(tool.name));
+        memory_tools.retain(|tool| tool.name != "memory_write");
+    }
+
+    let mut routes = HashMap::new();
+    let mut tools = Vec::new();
+    for tool in &builtin_tools {
+        routes.insert(tool.name.to_string(), remote_builtin_route(tool.name));
+        tools.push(neutral_tool_definition(tool.clone()));
+    }
+    for tool in &memory_tools {
+        routes.insert(tool.name.clone(), remote_builtin_route(&tool.name));
+        tools.push(tool.clone());
+    }
+
+    let mut seen_mcp_names = HashSet::new();
+    let mut mcp_prompt_tools = Vec::new();
+    for (mcp_tools, route) in [
+        (workspace_mcp_tools, RemoteToolRoute::McpWorkspace),
+        (local_mcp_tools, RemoteToolRoute::McpLocal),
+    ] {
+        for tool in mcp_tools {
+            if !seen_mcp_names.insert(tool.name.clone()) || routes.contains_key(&tool.name) {
+                continue;
+            }
+            routes.insert(tool.name.clone(), route.clone());
+            tools.push(neutral_mcp_tool_definition(&tool));
+            mcp_prompt_tools.push(tool);
+        }
+    }
+    let allowed_names = routes.keys().cloned().collect();
+    Arc::new(RemoteToolCatalog {
+        tools,
+        routes,
+        allowed_names,
+        workspace_mcp_registry,
+        builtin_prompt_tools: builtin_tools,
+        memory_prompt_tools: memory_tools,
+        mcp_prompt_tools,
+    })
 }
 
 #[derive(Clone)]
@@ -6954,7 +7526,7 @@ fn apply_sidecar_selected_skills(
     Ok(())
 }
 
-fn remote_sidecar_provider_request(
+async fn remote_sidecar_provider_request(
     state: &RemoteSidecarState,
     database: &WorkspaceDatabase,
     chat_id: &str,
@@ -6963,6 +7535,14 @@ fn remote_sidecar_provider_request(
     model_id: &str,
     thinking_level: Value,
 ) -> Result<NeutralChatRequest, axum::response::Response> {
+    let session_mode = remote_sidecar_session_mode(database, chat_id, queued_user_message_id)?;
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone());
+    let tool_catalog =
+        remote_sidecar_tool_catalog(state, bundle.as_ref(), session_mode.as_deref()).await?;
     Ok(remote_sidecar_prepare_chat_context(
         state,
         database,
@@ -6971,6 +7551,8 @@ fn remote_sidecar_provider_request(
         assistant_message_id,
         model_id,
         thinking_level,
+        tool_catalog,
+        session_mode,
     )?
     .provider_request)
 }
@@ -6983,6 +7565,8 @@ fn remote_sidecar_prepare_chat_context(
     assistant_message_id: &str,
     model_id: &str,
     thinking_level: Value,
+    tool_catalog: Arc<RemoteToolCatalog>,
+    session_mode: Option<String>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
     let history = remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
@@ -7013,11 +7597,22 @@ fn remote_sidecar_prepare_chat_context(
         .lock()
         .ok()
         .and_then(|config| config.clone());
+    let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos(
+        &tool_catalog.builtin_prompt_tools,
+        &tool_catalog.memory_prompt_tools,
+        &tool_catalog.mcp_prompt_tools,
+    ));
     let (skill_routing_message, selected_skill_entries) =
         remote_sidecar_skill_context(state, bundle.as_ref(), &requested_skill_ids)?;
     apply_sidecar_selected_skills(&selected_skill_entries, &mut filtered_messages)?;
     let requested_thinking_level = serde_json::from_value(thinking_level).ok();
-    let tools = remote_sidecar_executable_tool_schemas();
+    let tools = tool_catalog.tools.clone();
+    let todo_graph_context = database
+        .todo_graph(chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .map(todo_graph_context_message)
+        .transpose()
+        .map_err(|error| error.into_response())?;
 
     let mut messages =
         Vec::with_capacity(filtered_messages.len() + 9 + compression_snapshots.len());
@@ -7027,13 +7622,18 @@ fn remote_sidecar_prepare_chat_context(
     if let Some(bundle) = bundle.as_ref() {
         let payload = &bundle.payload;
         if let Some(model) = payload.models.iter().find(|model| model.id == model_id) {
+            let system_prompt_name = if session_mode.as_deref() == Some("plan") {
+                foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME
+            } else {
+                &model.system_prompt_name
+            };
             remote_sidecar_push_reserved(
                 &mut messages,
                 &mut message_source_sequences,
                 &mut message_context_sources,
                 neutral_text_message(
                     NeutralChatRole::System,
-                    active_system_prompt(&payload.prompts, &model.system_prompt_name)
+                    active_system_prompt(&payload.prompts, system_prompt_name)
                         .map_err(|e| e.into_response())?,
                 ),
             );
@@ -7051,7 +7651,15 @@ fn remote_sidecar_prepare_chat_context(
                     neutral_text_message(NeutralChatRole::System, build_memory_prompt_section()),
                 );
             }
-            if let Some(message) = skill_routing_message {
+            if let Some(available_tools_prompt) = available_tools_prompt.clone() {
+                remote_sidecar_push_reserved(
+                    &mut messages,
+                    &mut message_source_sequences,
+                    &mut message_context_sources,
+                    neutral_text_message(NeutralChatRole::System, available_tools_prompt),
+                );
+            }
+            if let Some(message) = skill_routing_message.clone() {
                 remote_sidecar_push_reserved(
                     &mut messages,
                     &mut message_source_sequences,
@@ -7091,6 +7699,11 @@ fn remote_sidecar_prepare_chat_context(
                 message_source_sequences.push(None);
                 message_context_sources.push(PromptContextSource::ProjectSpec);
             }
+            if let Some(message) = todo_graph_context.clone() {
+                messages.push(message);
+                message_source_sequences.push(None);
+                message_context_sources.push(PromptContextSource::TodoGraph);
+            }
 
             remote_sidecar_append_snapshots_and_history(
                 &mut messages,
@@ -7101,7 +7714,6 @@ fn remote_sidecar_prepare_chat_context(
                 filtered_sequences,
             );
             let active_tool_start_index = messages.len();
-            // ponytail: keep the remote schema list to tools with a real Phase 1 execution path.
             return remote_sidecar_finish_prepared_context(
                 state,
                 NeutralChatRequest {
@@ -7117,6 +7729,8 @@ fn remote_sidecar_prepare_chat_context(
                     prompt_cache_key: None,
                     prompt_cache_retention: None,
                 },
+                tool_catalog,
+                session_mode,
                 message_source_sequences,
                 message_context_sources,
                 active_tool_start_index,
@@ -7125,6 +7739,14 @@ fn remote_sidecar_prepare_chat_context(
         }
     }
 
+    if let Some(available_tools_prompt) = available_tools_prompt {
+        remote_sidecar_push_reserved(
+            &mut messages,
+            &mut message_source_sequences,
+            &mut message_context_sources,
+            neutral_text_message(NeutralChatRole::System, available_tools_prompt),
+        );
+    }
     if let Some(message) = skill_routing_message {
         remote_sidecar_push_reserved(
             &mut messages,
@@ -7132,6 +7754,11 @@ fn remote_sidecar_prepare_chat_context(
             &mut message_context_sources,
             message,
         );
+    }
+    if let Some(message) = todo_graph_context {
+        messages.push(message);
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::TodoGraph);
     }
     remote_sidecar_append_snapshots_and_history(
         &mut messages,
@@ -7153,6 +7780,8 @@ fn remote_sidecar_prepare_chat_context(
             prompt_cache_key: None,
             prompt_cache_retention: None,
         },
+        tool_catalog,
+        session_mode,
         message_source_sequences,
         message_context_sources,
         active_tool_start_index,
@@ -7209,6 +7838,8 @@ fn remote_sidecar_append_snapshots_and_history(
 fn remote_sidecar_finish_prepared_context(
     state: &RemoteSidecarState,
     provider_request: NeutralChatRequest,
+    tool_catalog: Arc<RemoteToolCatalog>,
+    session_mode: Option<String>,
     message_source_sequences: Vec<Option<i64>>,
     message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
@@ -7218,6 +7849,8 @@ fn remote_sidecar_finish_prepared_context(
         .map_err(|e| e.into_response())?;
     Ok(RemotePreparedChatContext {
         provider_request,
+        tool_catalog,
+        session_mode,
         message_source_sequences,
         message_context_sources,
         active_tool_start_index,
@@ -7325,13 +7958,6 @@ fn remote_neutral_tool_call_from_record(
     }
 }
 
-fn remote_sidecar_executable_tool_names() -> HashSet<String> {
-    remote_sidecar_executable_tool_schemas()
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect()
-}
-
 fn merge_remote_tool_calls(
     existing: &[NeutralToolCall],
     incoming: &[NeutralToolCall],
@@ -7347,8 +7973,8 @@ fn merge_remote_tool_calls(
 fn remote_sidecar_capture_pending_tool_calls(
     assistant_message_id: &str,
     tool_calls: &[NeutralToolCall],
+    allowed_tools: &HashSet<String>,
 ) -> Vec<Value> {
-    let allowed_tools = remote_sidecar_executable_tool_names();
     let tool_calls = tool_calls
         .iter()
         .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
@@ -7385,8 +8011,8 @@ fn remote_sidecar_record_pending_tool_calls(
     run_id: &str,
     assistant_message_id: &str,
     tool_calls: &[NeutralToolCall],
+    allowed_tools: &HashSet<String>,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let allowed_tools = remote_sidecar_executable_tool_names();
     let tool_calls = tool_calls
         .iter()
         .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
@@ -7508,13 +8134,41 @@ fn remote_sidecar_record_tool_result(
     Ok(())
 }
 
+fn remote_sidecar_close_cancelled_tool_batch(
+    database: &mut WorkspaceDatabase,
+    assistant_message_id: &str,
+    current_tool_call: &NeutralToolCall,
+    current_output: &Value,
+    current_is_error: bool,
+    current_started_at: &str,
+    current_completed_at: &str,
+    remaining_tool_calls: &[NeutralToolCall],
+    allowed_tools: &HashSet<String>,
+) {
+    let _ = remote_sidecar_record_tool_result(
+        database,
+        current_tool_call,
+        current_output,
+        current_is_error,
+        current_started_at,
+        current_completed_at,
+    );
+    let _ = remote_sidecar_close_unexecuted_tool_calls(
+        database,
+        assistant_message_id,
+        remaining_tool_calls,
+        allowed_tools,
+        "remote run was cancelled before this tool call executed",
+    );
+}
+
 fn remote_sidecar_close_unexecuted_tool_calls(
     database: &mut WorkspaceDatabase,
     assistant_message_id: &str,
     tool_calls: &[NeutralToolCall],
+    allowed_tools: &HashSet<String>,
     reason: &str,
 ) -> Vec<Value> {
-    let allowed_tools = remote_sidecar_executable_tool_names();
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     tool_calls
         .iter()
@@ -7540,8 +8194,34 @@ fn remote_sidecar_close_unexecuted_tool_calls(
         .collect()
 }
 
+async fn remote_sidecar_workspace_mcp_registry(
+    state: &RemoteSidecarState,
+) -> Result<Arc<McpRegistry>, String> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let mcp_config = state
+        .runtime_config
+        .lock()
+        .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
+        .as_ref()
+        .map(|bundle| bundle.payload.mcp.clone())
+        .unwrap_or_else(|| foco_store::config::GlobalConfig::first_run(workspace_path.clone()).mcp);
+    let definitions = mcp_config
+        .servers
+        .iter()
+        .map(foco_store::config::McpServerConfig::to_definition)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| format!("failed to prepare remote sidecar MCP servers: {source}"))?;
+    let mcp_registry = Arc::new(McpRegistry::default());
+    mcp_registry
+        .sync_workspace_servers(&state.workspace_id, &workspace_path, true, &definitions)
+        .await
+        .map_err(|source| format!("failed to sync remote sidecar MCP servers: {source}"))?;
+    Ok(mcp_registry)
+}
+
 async fn remote_sidecar_hook_environment(
     state: &RemoteSidecarState,
+    workspace_mcp_registry: Option<Arc<McpRegistry>>,
 ) -> Result<
     (
         Arc<McpRegistry>,
@@ -7559,7 +8239,7 @@ async fn remote_sidecar_hook_environment(
         .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
         .clone();
     let mut global_config = foco_store::config::GlobalConfig::first_run(workspace_path.clone());
-    let (global_hooks, retry_count, mcp_config) = if let Some(bundle) = bundle {
+    let (global_hooks, retry_count) = if let Some(bundle) = bundle {
         global_config.agent_definitions = bundle.payload.agent_definitions.clone();
         global_config.prompts = bundle.payload.prompts.clone();
         global_config.models = bundle.payload.models.clone();
@@ -7571,26 +8251,17 @@ async fn remote_sidecar_hook_environment(
         (
             bundle.payload.hooks,
             bundle.payload.app.llm_request_retry_count,
-            bundle.payload.mcp,
         )
     } else {
         (
             foco_store::config::HookConfig::default(),
             foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT,
-            global_config.mcp.clone(),
         )
     };
-    let definitions = mcp_config
-        .servers
-        .iter()
-        .map(foco_store::config::McpServerConfig::to_definition)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| format!("failed to prepare remote sidecar MCP servers: {source}"))?;
-    let mcp_registry = Arc::new(McpRegistry::default());
-    mcp_registry
-        .sync_workspace_servers(&state.workspace_id, &workspace_path, true, &definitions)
-        .await
-        .map_err(|source| format!("failed to sync remote sidecar MCP servers: {source}"))?;
+    let mcp_registry = match workspace_mcp_registry {
+        Some(registry) => registry,
+        None => remote_sidecar_workspace_mcp_registry(state).await?,
+    };
     let hook_runtime = HookRuntime::with_prompt_executor(
         mcp_registry.clone(),
         Arc::new(RemoteSidecarPromptHookExecutor {
@@ -7606,22 +8277,362 @@ async fn remote_sidecar_hook_environment(
     ))
 }
 
+fn remote_sidecar_memory_tool_context(
+    state: &RemoteSidecarState,
+    chat_id: &str,
+    run_id: &str,
+    tool_call_id: &str,
+) -> Result<MemoryToolContext, String> {
+    let memory_settings = state
+        .runtime_config
+        .lock()
+        .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
+        .as_ref()
+        .map(|bundle| bundle.payload.memory.clone())
+        .unwrap_or_default();
+    Ok(MemoryToolContext {
+        enabled: memory_settings.enabled,
+        workspace_path: PathBuf::from(&state.workspace_path),
+        global_memory_database_file: PathBuf::from(&state.workspace_path)
+            .join(".foco/remote-sidecar-global-memory-is-brokered.sqlite"),
+        chat_id: chat_id.to_string(),
+        run_id: run_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        target_status: MemoryStatus::Pending,
+        memory_settings,
+    })
+}
+
+async fn remote_sidecar_execute_local_memory_tool(
+    context: MemoryToolContext,
+    tool_name: String,
+    arguments: Value,
+) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || execute_memory_tool(&context, &tool_name, arguments))
+        .await
+        .map_err(|source| format!("remote memory worker failed: {source}"))?
+}
+
+fn remote_memory_arguments_with_scope(arguments: &Value, scope: &str) -> Result<Value, String> {
+    let mut arguments = arguments.clone();
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| "memory tool arguments must be an object".to_string())?;
+    object.insert("scope".to_string(), Value::String(scope.to_string()));
+    Ok(arguments)
+}
+
+async fn remote_sidecar_execute_memory_tool(
+    state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+    tool_call: &NeutralToolCall,
+    context: BrokerToolContext,
+    event_tx: mpsc::UnboundedSender<Value>,
+) -> Result<(Value, bool), String> {
+    let memory_context = remote_sidecar_memory_tool_context(
+        state,
+        &context.chat_id,
+        &context.run_id,
+        &context.tool_call_id,
+    )?;
+    if !memory_context.enabled {
+        return Err("memory tools are disabled in settings".to_string());
+    }
+    let scope = tool_call
+        .arguments
+        .get("scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "memory tool scope must be a string".to_string())?;
+
+    if tool_call.name == "memory_write" {
+        if scope == "global" {
+            return remote_sidecar_execute_broker_tool(
+                state,
+                run_stream,
+                tool_call,
+                "memory.global.write",
+                tool_call.arguments.clone(),
+                context,
+                event_tx,
+            )
+            .await;
+        }
+        let output = remote_sidecar_execute_local_memory_tool(
+            memory_context,
+            tool_call.name.clone(),
+            tool_call.arguments.clone(),
+        )
+        .await?;
+        return Ok((output, false));
+    }
+
+    let scope = MemoryToolSearchScope::parse(scope).map_err(|error| error.message)?;
+    match scope {
+        MemoryToolSearchScope::Global => {
+            remote_sidecar_execute_broker_tool(
+                state,
+                run_stream,
+                tool_call,
+                "memory.global.search",
+                tool_call.arguments.clone(),
+                context,
+                event_tx,
+            )
+            .await
+        }
+        MemoryToolSearchScope::Workspace | MemoryToolSearchScope::Chat => {
+            let output = remote_sidecar_execute_local_memory_tool(
+                memory_context,
+                tool_call.name.clone(),
+                tool_call.arguments.clone(),
+            )
+            .await?;
+            Ok((output, false))
+        }
+        MemoryToolSearchScope::Auto => {
+            let chat = remote_sidecar_execute_local_memory_tool(
+                memory_context.clone(),
+                tool_call.name.clone(),
+                remote_memory_arguments_with_scope(&tool_call.arguments, "chat")?,
+            )
+            .await?;
+            let workspace = remote_sidecar_execute_local_memory_tool(
+                memory_context,
+                tool_call.name.clone(),
+                remote_memory_arguments_with_scope(&tool_call.arguments, "workspace")?,
+            )
+            .await?;
+            let (global, global_is_error) = remote_sidecar_execute_broker_tool(
+                state,
+                run_stream,
+                tool_call,
+                "memory.global.search",
+                remote_memory_arguments_with_scope(&tool_call.arguments, "global")?,
+                context,
+                event_tx,
+            )
+            .await?;
+            if global_is_error {
+                return Ok((global, true));
+            }
+            let merged =
+                merge_memory_search_results(MemoryToolSearchScope::Auto, [chat, workspace, global])
+                    .map_err(|error| error.message)?;
+            Ok((merged, false))
+        }
+    }
+}
+
+async fn remote_sidecar_execute_broker_tool(
+    state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+    tool_call: &NeutralToolCall,
+    method: &str,
+    arguments: Value,
+    context: BrokerToolContext,
+    event_tx: mpsc::UnboundedSender<Value>,
+) -> Result<(Value, bool), String> {
+    let request_id = unique_id("broker-tool");
+    let payload = BrokerToolCallPayload {
+        arguments: arguments.clone(),
+        context: context.clone(),
+        tool_name: (method == "mcp.execute").then(|| tool_call.name.clone()),
+    };
+    let wait_timeout = match method {
+        "image.generate" => Duration::from_millis(image_tool_timeout_ms(&arguments)?),
+        "memory.global.search" | "memory.global.write" => {
+            Duration::from_millis(memory_tool_timeout_ms(&arguments)?)
+        }
+        "web.search" | "web.fetch" => Duration::from_millis(web_tool_timeout_ms(&arguments)?),
+        "ui.askQuestion" => BROKER_OFFLINE_RUN_TIMEOUT,
+        _ => BROKER_REQUEST_TIMEOUT,
+    };
+    let mut response_rx = remote_sidecar_broker_request(
+        state,
+        &request_id,
+        method,
+        serde_json::to_value(payload)
+            .map_err(|source| format!("failed to serialize brokered tool request: {source}"))?,
+    )
+    .await
+    .map_err(|_| format!("remote broker is unavailable for tool '{}'", tool_call.name))?;
+    run_stream.set_broker_request_id(request_id.clone());
+    let response = timeout(wait_timeout, async {
+        loop {
+            if run_stream.is_finished() {
+                return Err(format!(
+                    "brokered tool '{}' was cancelled with its remote run",
+                    tool_call.name
+                ));
+            }
+            tokio::select! {
+                response = response_rx.recv() => {
+                    let response = response.ok_or_else(|| {
+                        format!("brokered tool '{}' disconnected", tool_call.name)
+                    })?;
+                    if response.message_type == "stream" {
+                        if let Some(event) = response.payload.get("event").cloned() {
+                            let _ = event_tx.send(event);
+                        }
+                        continue;
+                    }
+                    return Ok::<_, String>(response);
+                }
+                _ = sleep(Duration::from_millis(200)) => {}
+            }
+        }
+    })
+    .await;
+    run_stream.clear_broker_request_id(&request_id);
+    let response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            remote_sidecar_cancel_broker_request_id(state, &request_id);
+            state.broker_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        Err(_) => {
+            remote_sidecar_cancel_broker_request_id(state, &request_id);
+            state.broker_pending.lock().await.remove(&request_id);
+            return Err(format!("brokered tool '{}' timed out", tool_call.name));
+        }
+    };
+    if response.message_type == "error" {
+        return Err(response
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("brokered tool failed")
+            .to_string());
+    }
+    let is_error = response
+        .payload
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut output = response
+        .payload
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| response.payload.clone());
+    if method == "image.generate" && !is_error {
+        let files = response
+            .payload
+            .get("files")
+            .cloned()
+            .ok_or_else(|| "image broker response is missing transferred files".to_string())?;
+        let files = serde_json::from_value::<Vec<BrokeredImageFile>>(files)
+            .map_err(|source| format!("image broker response is invalid: {source}"))?;
+        output = materialize_brokered_image_result(
+            Path::new(&state.workspace_path),
+            &context.chat_id,
+            &context.run_id,
+            &arguments,
+            output,
+            files,
+        )?;
+    }
+    Ok((output, is_error))
+}
+
 async fn remote_sidecar_execute_tool_call(
     state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+    tool_catalog: &RemoteToolCatalog,
+    broker_event_tx: mpsc::UnboundedSender<Value>,
     tool_call: NeutralToolCall,
     chat_id: &str,
+    session_mode: Option<&str>,
     run_id: &str,
     assistant_message_id: &str,
     provider_id: &str,
     model_id: &str,
-) -> (Value, bool, String, String, Vec<Value>) {
+) -> (Value, bool, String, String, Vec<Value>, Vec<String>) {
     // ponytail: remote sidecar reuses the shared execute_tool path one call at a time.
     // Ceiling: this duplicates a thin slice of main chat wiring; if remote tools grow
     // parallelism/question hooks, extract a dedicated remote tool runtime helper.
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let route = match tool_catalog.route(&tool_call.name) {
+        Some(route) => route,
+        None => {
+            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            return (
+                json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) }),
+                true,
+                started_at,
+                completed_at,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    };
+    if matches!(
+        route,
+        RemoteToolRoute::Broker { .. } | RemoteToolRoute::McpLocal
+    ) {
+        let context = BrokerToolContext {
+            workspace_id: state.workspace_id.clone(),
+            chat_id: chat_id.to_string(),
+            run_id: run_id.to_string(),
+            assistant_message_id: assistant_message_id.to_string(),
+            tool_call_id: tool_call.call_id.clone(),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+        };
+        let result = if matches!(tool_call.name.as_str(), "memory_search" | "memory_write") {
+            remote_sidecar_execute_memory_tool(
+                state,
+                run_stream,
+                &tool_call,
+                context,
+                broker_event_tx,
+            )
+            .await
+        } else {
+            let method = match route {
+                RemoteToolRoute::Broker { method } => *method,
+                RemoteToolRoute::McpLocal => "mcp.execute",
+                _ => unreachable!(),
+            };
+            remote_sidecar_execute_broker_tool(
+                state,
+                run_stream,
+                &tool_call,
+                method,
+                tool_call.arguments.clone(),
+                context,
+                broker_event_tx,
+            )
+            .await
+        };
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        return match result {
+            Ok((output, is_error)) => (
+                output,
+                is_error,
+                started_at,
+                completed_at,
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(error) => (
+                json!({ "error": error }),
+                true,
+                started_at,
+                completed_at,
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+    }
     let workspace_path = PathBuf::from(&state.workspace_path);
-    let (mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
-        match remote_sidecar_hook_environment(state).await {
+    let (_hook_mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
+        match remote_sidecar_hook_environment(
+            state,
+            Some(tool_catalog.workspace_mcp_registry.clone()),
+        )
+        .await
+        {
             Ok(environment) => environment,
             Err(error) => {
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -7630,6 +8641,7 @@ async fn remote_sidecar_execute_tool_call(
                     true,
                     started_at,
                     completed_at,
+                    Vec::new(),
                     Vec::new(),
                 );
             }
@@ -7669,8 +8681,8 @@ async fn remote_sidecar_execute_tool_call(
     });
 
     let execution = execute_tool(
-        mcp_registry,
-        hook_runtime,
+        tool_catalog.workspace_mcp_registry.clone(),
+        hook_runtime.clone(),
         &global_hooks,
         false,
         &global_config,
@@ -7698,7 +8710,7 @@ async fn remote_sidecar_execute_tool_call(
         &workspace_path,
         &workspace_path,
         chat_id,
-        None,
+        session_mode,
         run_id,
         model_id,
         provider_id,
@@ -7715,11 +8727,47 @@ async fn remote_sidecar_execute_tool_call(
     let _ = tool_output_collector.await;
 
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut hook_summary = execution.hook_summary;
+    let post_summary = run_post_tool_hooks(
+        &hook_runtime,
+        &global_hooks,
+        false,
+        &state.workspace_id,
+        &workspace_path,
+        chat_id,
+        run_id,
+        model_id,
+        provider_id,
+        None,
+        retry_count,
+        &tool_call,
+        &execution.execution,
+    )
+    .await;
+    merge_hook_summaries(&mut hook_summary, post_summary);
+
     let mut followup_events = tool_output_events.lock().await.clone();
     followup_events.extend(question_events.lock().await.clone());
+    followup_events.extend(hook_summary.hook_messages("ToolHook").into_iter().map(
+        |notification| {
+            json!({
+                "type": "hookNotification",
+                "assistantMessageId": assistant_message_id,
+                "notification": notification,
+            })
+        },
+    ));
+    let additional_context = hook_summary.additional_context;
     let is_error = execution.execution.is_error;
     let output = execution.execution.output;
-    (output, is_error, started_at, completed_at, followup_events)
+    (
+        output,
+        is_error,
+        started_at,
+        completed_at,
+        followup_events,
+        additional_context,
+    )
 }
 
 async fn remote_sidecar_run_broker_llm_turn(
@@ -8905,7 +9953,7 @@ async fn remote_sidecar_chat_stream(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id =
         remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
-    let mut database = sidecar_workspace_database(&state)?;
+    let database = sidecar_workspace_database(&state)?;
     let chat = database
         .chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
@@ -8932,6 +9980,19 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
+    let session_mode = remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id)?;
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone());
+    drop(database);
+    let tool_catalog =
+        match remote_sidecar_tool_catalog(&state, bundle.as_ref(), session_mode.as_deref()).await {
+            Ok(catalog) => catalog,
+            Err(response) => return Err(response),
+        };
+    let mut database = sidecar_workspace_database(&state)?;
     let initial_prepared = match remote_sidecar_prepare_chat_context(
         &state,
         &database,
@@ -8940,6 +10001,8 @@ async fn remote_sidecar_chat_stream(
         &assistant_message_id,
         &model_id,
         payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+        tool_catalog,
+        session_mode,
     ) {
         Ok(prepared) => prepared,
         Err(response) => {
@@ -8948,6 +10011,8 @@ async fn remote_sidecar_chat_stream(
         }
     };
     let initial_provider_request = initial_prepared.provider_request.clone();
+    let tool_catalog = initial_prepared.tool_catalog.clone();
+    let session_mode = initial_prepared.session_mode.clone();
     let initial_runtime_tool_state =
         RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
     let run = RemoteActiveRunSummary {
@@ -9001,7 +10066,7 @@ async fn remote_sidecar_chat_stream(
         })));
         let mut last_yielded_sequence = sequence;
 
-        loop {
+        'run: loop {
             // Before every brokered chat completion request (first turn and tool follow-ups):
             // runtime tool-state compression, then 95%/overflow LLM compression, then pack.
             let compression_result = runtime_tool_state
@@ -9176,6 +10241,7 @@ async fn remote_sidecar_chat_stream(
                             &mut database,
                             &assistant_message_id,
                             &tool_calls,
+                            &tool_catalog.allowed_names,
                             &message,
                         ) {
                             sequence += 1;
@@ -9234,6 +10300,7 @@ async fn remote_sidecar_chat_stream(
                         .err()
                         .and_then(|error| rejected_tool_batch(&pending_tool_calls, error));
 
+                    let mut batch_hook_additional_context = Vec::new();
                     let followup_sse_events = if let Some(rejections) = rejections {
                         let (events, messages) = remote_sidecar_reject_tool_batch(
                             &mut database,
@@ -9246,7 +10313,7 @@ async fn remote_sidecar_chat_stream(
                         batch_messages.extend(messages);
                         events
                     } else {
-                        let allowed_tools = remote_sidecar_executable_tool_names();
+                        let allowed_tools = &tool_catalog.allowed_names;
                         let runnable_tool_calls = tool_calls
                             .iter()
                             .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
@@ -9258,12 +10325,14 @@ async fn remote_sidecar_chat_stream(
                             &run_id,
                             &assistant_message_id,
                             &runnable_tool_calls,
+                            allowed_tools,
                         );
                         let mut events = remote_sidecar_capture_pending_tool_calls(
                             &assistant_message_id,
                             &runnable_tool_calls,
+                            allowed_tools,
                         );
-                        for tool_call in &tool_calls {
+                        for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
                             if !allowed_tools.contains(tool_call.name.as_str()) {
                                 let output = json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) });
                                 let started_at =
@@ -9299,22 +10368,56 @@ async fn remote_sidecar_chat_stream(
                                 });
                                 continue;
                             }
+                            let (broker_event_tx, mut broker_event_rx) = mpsc::unbounded_channel();
+                            let execution = remote_sidecar_execute_tool_call(
+                                &stream_state,
+                                &run_stream,
+                                &tool_catalog,
+                                broker_event_tx,
+                                tool_call.clone(),
+                                &chat_id,
+                                session_mode.as_deref(),
+                                &run_id,
+                                &assistant_message_id,
+                                &provider_id,
+                                &model_id,
+                            );
+                            tokio::pin!(execution);
                             let (
                                 output,
                                 is_error,
                                 started_at,
                                 completed_at,
                                 mut extra_events,
-                            ) = remote_sidecar_execute_tool_call(
-                                &stream_state,
-                                tool_call.clone(),
-                                &chat_id,
-                                &run_id,
-                                &assistant_message_id,
-                                &provider_id,
-                                &model_id,
-                            )
-                            .await;
+                                additional_context,
+                            ) = loop {
+                                tokio::select! {
+                                    result = &mut execution => break result,
+                                    Some(event) = broker_event_rx.recv() => {
+                                        sequence += 1;
+                                        yield Ok(remote_sidecar_record_run_event(
+                                            &run_stream,
+                                            sequence,
+                                            event,
+                                        ));
+                                        last_yielded_sequence = sequence;
+                                    }
+                                }
+                            };
+                            if run_stream.is_finished() {
+                                remote_sidecar_close_cancelled_tool_batch(
+                                    &mut database,
+                                    &assistant_message_id,
+                                    tool_call,
+                                    &output,
+                                    is_error,
+                                    &started_at,
+                                    &completed_at,
+                                    &tool_calls[tool_call_index + 1..],
+                                    allowed_tools,
+                                );
+                                break 'run;
+                            }
                             let _ = remote_sidecar_record_tool_result(
                                 &mut database,
                                 tool_call,
@@ -9324,6 +10427,7 @@ async fn remote_sidecar_chat_stream(
                                 &completed_at,
                             );
                             events.append(&mut extra_events);
+                            batch_hook_additional_context.extend(additional_context);
                             events.push(json!({
                                 "type": "toolResult",
                                 "assistantMessageId": assistant_message_id,
@@ -9348,6 +10452,12 @@ async fn remote_sidecar_chat_stream(
                     };
                     runtime_tool_state
                         .append_runtime_tool_batch(&mut next_messages, batch_messages);
+                    append_hook_context_messages(
+                        &mut next_messages,
+                        &mut runtime_tool_state.message_source_sequences,
+                        &mut runtime_tool_state.message_context_sources,
+                        &batch_hook_additional_context,
+                    );
                     tool_loop_guard.record_executed_round();
                     runtime_tool_state.append_runtime_guard_message(
                         &mut next_messages,
@@ -11226,6 +12336,79 @@ mod tests {
         )
     }
 
+    fn test_sidecar_broker_with_tool_discovery(
+        state: RemoteSidecarState,
+        mut broker_rx: tokio::sync::broadcast::Receiver<ControlEnvelope>,
+    ) -> mpsc::UnboundedReceiver<ControlEnvelope> {
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let envelope = match broker_rx.recv().await {
+                    Ok(envelope) => envelope,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("tools.discover")
+                {
+                    let Some(id) = envelope.id.as_deref() else {
+                        continue;
+                    };
+                    let pending = state.broker_pending.lock().await.get(id).cloned();
+                    if let Some(pending) = pending {
+                        let _ = pending.send(ControlEnvelope {
+                            version: 1,
+                            message_type: "response".to_string(),
+                            id: Some(id.to_string()),
+                            method: None,
+                            payload: json!({
+                                "status": "ok",
+                                "webSearchAvailable": false,
+                                "mcpTools": [],
+                            }),
+                            timestamp: None,
+                        });
+                    }
+                    continue;
+                }
+                if forward_tx.send(envelope).is_err() {
+                    break;
+                }
+            }
+        });
+        forward_rx
+    }
+
+    async fn test_remote_prepare_chat_context(
+        state: &RemoteSidecarState,
+        database: &WorkspaceDatabase,
+        chat_id: &str,
+        queued_user_message_id: &str,
+        assistant_message_id: &str,
+        model_id: &str,
+        thinking_level: Value,
+    ) -> Result<RemotePreparedChatContext, axum::response::Response> {
+        let session_mode = remote_sidecar_session_mode(database, chat_id, queued_user_message_id)?;
+        let bundle = state
+            .runtime_config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone());
+        let tool_catalog =
+            remote_sidecar_tool_catalog(state, bundle.as_ref(), session_mode.as_deref()).await?;
+        remote_sidecar_prepare_chat_context(
+            state,
+            database,
+            chat_id,
+            queued_user_message_id,
+            assistant_message_id,
+            model_id,
+            thinking_level,
+            tool_catalog,
+            session_mode,
+        )
+    }
+
     fn test_remote_tool_call(
         call_id: impl Into<String>,
         path: impl Into<String>,
@@ -11623,12 +12806,14 @@ mod tests {
             })
             .expect("assistant insert");
         let tool_call = test_remote_tool_call("pending", "pending.rs");
+        let allowed_tools = HashSet::from([tool_call.name.clone()]);
         remote_sidecar_record_pending_tool_calls(
             &mut database,
             "chat-1",
             "run-1",
             "assistant-1",
             std::slice::from_ref(&tool_call),
+            &allowed_tools,
         )
         .expect("pending tool call");
 
@@ -11636,6 +12821,7 @@ mod tests {
             &mut database,
             "assistant-1",
             std::slice::from_ref(&tool_call),
+            &allowed_tools,
             "compressed at round cap",
         );
 
@@ -11647,6 +12833,65 @@ mod tests {
             .expect("tool calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].status, "error");
+    }
+
+    #[test]
+    fn remote_sidecar_cancelled_tool_batch_closes_current_and_remaining_pending_calls() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant insert");
+        let tool_calls = vec![
+            test_remote_tool_call("current", "current.rs"),
+            test_remote_tool_call("remaining-1", "remaining-1.rs"),
+            test_remote_tool_call("remaining-2", "remaining-2.rs"),
+        ];
+        let allowed_tools = HashSet::from(["read_file".to_string()]);
+        remote_sidecar_record_pending_tool_calls(
+            &mut database,
+            "chat-1",
+            "run-1",
+            "assistant-1",
+            &tool_calls,
+            &allowed_tools,
+        )
+        .expect("pending tool calls");
+
+        remote_sidecar_close_cancelled_tool_batch(
+            &mut database,
+            "assistant-1",
+            &tool_calls[0],
+            &json!({ "error": "remote run was cancelled" }),
+            true,
+            "2026-07-12T00:00:00Z",
+            "2026-07-12T00:00:01Z",
+            &tool_calls[1..],
+            &allowed_tools,
+        );
+
+        let statuses = database
+            .tool_calls_for_message("assistant-1")
+            .expect("tool calls")
+            .into_iter()
+            .map(|tool_call| (tool_call.id, tool_call.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("current".to_string(), "error".to_string()),
+                ("remaining-1".to_string(), "error".to_string()),
+                ("remaining-2".to_string(), "error".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -13480,8 +14725,9 @@ mod tests {
                 metadata_json: Some("{}"),
             })
             .expect("insert user message");
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
 
         let response = remote_sidecar_chat_stream(
             State(state.clone()),
@@ -13614,8 +14860,9 @@ mod tests {
                 metadata_json: Some("{}"),
             })
             .expect("insert user message");
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
 
         let response = remote_sidecar_chat_stream(
             State(state.clone()),
@@ -14727,8 +15974,9 @@ mod tests {
             .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
             .expect("insert chat");
 
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
         let mut config =
             foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
         config.hooks = serde_json::from_value(json!({
@@ -15013,8 +16261,9 @@ mod tests {
         database
             .insert_chat_with_metadata("chat-block", "Remote chat", "{}")
             .expect("insert chat");
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
         let mut config =
             foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
         config.hooks = serde_json::from_value(json!({
@@ -15206,8 +16455,9 @@ mod tests {
                 .expect("insert message");
         }
 
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
         let mut config =
             foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
         config
@@ -15374,7 +16624,7 @@ mod tests {
         drop(packed);
         drop(events);
         let reopened = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen db");
-        let rebuilt = remote_sidecar_prepare_chat_context(
+        let rebuilt = test_remote_prepare_chat_context(
             &state,
             &reopened,
             "chat-1",
@@ -15383,6 +16633,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("rebuild prepare");
 
         assert_eq!(rebuilt.compression_snapshots.len(), 1);
@@ -15672,8 +16923,8 @@ mod tests {
         assert!(snapshots.is_empty());
     }
 
-    #[test]
-    fn remote_sidecar_prepare_filters_superseded_snapshots_and_keeps_active_only() {
+    #[tokio::test]
+    async fn remote_sidecar_prepare_filters_superseded_snapshots_and_keeps_active_only() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -15801,7 +17052,7 @@ mod tests {
             .expect("runtime bundle");
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);
 
-        let prepared = remote_sidecar_prepare_chat_context(
+        let prepared = test_remote_prepare_chat_context(
             &state,
             &database,
             "chat-1",
@@ -15810,6 +17061,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("prepared");
 
         assert_eq!(prepared.compression_snapshots.len(), 1);
@@ -16086,53 +17338,1299 @@ mod tests {
     }
 
     #[test]
-    fn remote_sidecar_executable_tool_schemas_expose_only_phase1_tools() {
-        let tools = remote_sidecar_executable_tool_schemas();
-        let tool_names = tools
+    fn remote_sidecar_session_mode_reads_queued_run_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-plan", "Plan chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-plan",
+                chat_id: "chat-plan",
+                role: "user",
+                content: "plan this",
+                sequence: 0,
+                metadata_json: Some(r#"{"queuedRun":{"sessionMode":"plan"}}"#),
+            })
+            .expect("insert user message");
+
+        assert_eq!(
+            remote_sidecar_session_mode(&database, "chat-plan", "msg-user-plan")
+                .expect("session mode")
+                .as_deref(),
+            Some("plan")
+        );
+    }
+
+    #[test]
+    fn local_mcp_registry_workspace_uses_local_host_for_remote_requests() {
+        let local_workspace = tempfile::tempdir().expect("local workspace tempdir");
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(local_workspace.path().to_path_buf());
+        let local_id = config.workspaces[0].id.clone();
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote-mcp".to_string(),
+            name: "Remote MCP".to_string(),
+            path: PathBuf::from("/remote/mcp"),
+            location: WorkspaceLocation::Ssh {
+                server_id: "server".to_string(),
+                remote_path: "/remote/mcp".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        });
+        let remote = config
+            .workspaces
             .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<HashSet<_>>();
+            .find(|workspace| workspace.id == "remote-mcp")
+            .expect("remote workspace");
 
-        for expected in ["read_file", "find_files", "search_text", "run_command"] {
-            assert!(
-                tool_names.contains(expected),
-                "missing tool schema: {expected}"
-            );
-        }
+        assert_eq!(crate::mcp_registry_workspace(remote, &config).id, local_id);
+    }
+
+    async fn test_remote_sidecar_local_catalog(
+        workspace_path: &Path,
+        session_mode: Option<&str>,
+    ) -> (RemoteSidecarState, Arc<RemoteToolCatalog>) {
+        let (state, _) = test_sidecar_state(workspace_path.to_string_lossy().to_string(), 0);
+        let catalog = build_remote_tool_catalog(
+            None,
+            session_mode,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        (state, catalog)
+    }
+
+    async fn test_execute_remote_sidecar_local_tool(
+        state: &RemoteSidecarState,
+        catalog: &RemoteToolCatalog,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        session_mode: Option<&str>,
+    ) -> (Value, bool, Vec<Value>, Vec<String>) {
+        let run_stream = RemoteActiveRunStream::new("chat-tools".to_string());
+        let (broker_event_tx, _broker_event_rx) = mpsc::unbounded_channel();
+        let (output, is_error, _started_at, _completed_at, events, additional_context) =
+            remote_sidecar_execute_tool_call(
+                state,
+                &run_stream,
+                catalog,
+                broker_event_tx,
+                NeutralToolCall {
+                    call_id: tool_call_id.to_string(),
+                    name: tool_name.to_string(),
+                    arguments,
+                    thought_signatures: None,
+                },
+                "chat-tools",
+                session_mode,
+                "run-tools",
+                "msg-assistant-tools",
+                "provider",
+                "model",
+            )
+            .await;
+        (output, is_error, events, additional_context)
+    }
+
+    async fn test_execute_remote_sidecar_broker_tool(
+        state: &RemoteSidecarState,
+        catalog: Arc<RemoteToolCatalog>,
+        broker_rx: &mut tokio::sync::broadcast::Receiver<ControlEnvelope>,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        response_type: &str,
+        response_payload: Value,
+    ) -> ((Value, bool, Vec<Value>, Vec<String>), ControlEnvelope) {
+        let execution_state = state.clone();
+        let call_id = call_id.to_string();
+        let tool_name = tool_name.to_string();
+        let execution = tokio::spawn(async move {
+            test_execute_remote_sidecar_local_tool(
+                &execution_state,
+                &catalog,
+                &call_id,
+                &tool_name,
+                arguments,
+                None,
+            )
+            .await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker tool request timeout")
+            .expect("broker tool request");
+        let request_id = request.id.clone().expect("broker tool request id");
+        let pending = state
+            .broker_pending
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned()
+            .expect("broker tool pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: response_type.to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: response_payload,
+                timestamp: None,
+            })
+            .expect("send broker tool response");
+        let result = timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("broker tool execution timeout")
+            .expect("broker tool execution task");
+        (result, request)
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_local_file_tools_write_edit_and_sleep_in_remote_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, catalog) = test_remote_sidecar_local_catalog(workspace.path(), None).await;
+
+        let (write, write_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-write",
+            "write_file",
+            json!({
+                "path": "notes.txt",
+                "content": "alpha\nbeta\n",
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!write_error, "{write}");
+        assert!(write["bytes"].as_u64().is_some(), "{write}");
+        assert!(write["linesAdded"].as_u64().is_some(), "{write}");
+        assert!(write["linesRemoved"].as_u64().is_some(), "{write}");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).expect("written file"),
+            "alpha\nbeta\n"
+        );
+
+        let (edit, edit_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-edit",
+            "edit_file",
+            json!({
+                "path": "notes.txt",
+                "oldStr": "beta",
+                "newStr": "gamma",
+                "replaceAll": false,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!edit_error, "{edit}");
+        assert_eq!(edit["replacements"], 1);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).expect("edited file"),
+            "alpha\ngamma\n"
+        );
+
+        let (sleep_output, sleep_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-sleep",
+            "sleep",
+            json!({ "durationMs": 1, "timeoutMs": 1000 }),
+            None,
+        )
+        .await;
+        assert!(!sleep_error, "{sleep_output}");
+        assert_eq!(sleep_output["durationMs"], 1);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_local_todo_and_plan_tools_use_remote_chat_database_and_session_mode() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-tools", "Remote tools", "{}")
+            .expect("insert chat");
+        drop(database);
+        let (state, normal_catalog) =
+            test_remote_sidecar_local_catalog(workspace.path(), None).await;
+
+        let (todo, todo_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-todo-create",
+            "create_todo_graph",
+            json!({
+                "tasks": [{
+                    "id": "task-1",
+                    "title": "Remote todo",
+                    "status": "ready",
+                    "dependsOn": [],
+                    "acceptance": ["persisted"],
+                    "summary": "created remotely",
+                    "createdAt": null,
+                    "updatedAt": null,
+                    "subtasks": []
+                }],
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!todo_error, "{todo}");
+        assert_eq!(todo["chatId"], "chat-tools");
+        assert_eq!(todo["tasks"][0]["id"], "task-1");
+
+        let (todo_read, todo_read_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-todo-get",
+            "get_todo_graph",
+            json!({
+                "status": null,
+                "taskId": null,
+                "includeSubtasks": true,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!todo_read_error, "{todo_read}");
+        assert_eq!(todo_read["tasks"][0]["title"], "Remote todo");
+
+        let (todo_updated, todo_update_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-todo-update",
+            "update_todo_graph",
+            json!({
+                "taskId": "task-1",
+                "patch": {
+                    "title": null,
+                    "status": "completed",
+                    "dependsOn": null,
+                    "acceptance": null,
+                    "summary": "finished remotely",
+                    "subtasks": null
+                },
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!todo_update_error, "{todo_updated}");
+        assert_eq!(todo_updated["updatedTask"]["status"], "completed");
+        assert_eq!(todo_updated["tasks"][0]["summary"], "finished remotely");
+
+        let create_plan_arguments = json!({
+            "id": "plan-remote-tools",
+            "title": "Remote plan",
+            "overview": "Stored in sidecar DB",
+            "status": "draft",
+            "sourceChatId": "untrusted-chat",
+            "phases": [{
+                "id": "phase-1",
+                "title": "Phase",
+                "summary": null,
+                "steps": [{
+                    "id": "step-1",
+                    "title": "Step",
+                    "detail": null,
+                    "acceptance": ["done"]
+                }]
+            }],
+            "timeoutMs": null
+        });
+        let (plan, plan_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-plan-create",
+            "create_plan",
+            create_plan_arguments.clone(),
+            None,
+        )
+        .await;
+        assert!(!plan_error, "{plan}");
+        assert_eq!(plan["plan"]["sourceChatId"], "chat-tools", "{plan}");
+        assert_eq!(plan["plan"]["status"], "draft", "{plan}");
+
+        let (plans, plans_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-plan-list",
+            "get_plans",
+            json!({
+                "view": "all",
+                "status": null,
+                "page": 1,
+                "pageSize": null,
+                "limit": 99,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!plans_error, "{plans}");
+        assert_eq!(plans["pageSize"], 10);
+        assert_eq!(plans["plans"][0]["id"], "plan-remote-tools");
+
+        let (updated_plan, updated_plan_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-plan-update",
+            "update_plan",
+            json!({
+                "planId": "plan-remote-tools",
+                "title": "Remote plan updated",
+                "overview": null,
+                "status": null,
+                "errorMessage": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!updated_plan_error, "{updated_plan}");
+        assert_eq!(updated_plan["plan"]["title"], "Remote plan updated");
+
+        let (updated_step, updated_step_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-plan-step-update",
+            "update_plan_step",
+            json!({
+                "planId": "plan-remote-tools",
+                "stepId": "step-1",
+                "title": "Step updated",
+                "detail": null,
+                "acceptance": null,
+                "status": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!updated_step_error, "{updated_step}");
+        assert_eq!(
+            updated_step["plan"]["phases"][0]["steps"][0]["title"],
+            "Step updated"
+        );
+
+        let (deleted, deleted_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &normal_catalog,
+            "call-plan-delete",
+            "delete_plan",
+            json!({ "planId": "plan-remote-tools", "timeoutMs": null }),
+            None,
+        )
+        .await;
+        assert!(!deleted_error, "{deleted}");
+        assert_eq!(deleted["deleted"], true);
+
+        let (_plan_state, plan_catalog) =
+            test_remote_sidecar_local_catalog(workspace.path(), Some("plan")).await;
+        let (blocked, blocked_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &plan_catalog,
+            "call-plan-mode-create",
+            "create_plan",
+            json!({
+                "id": "plan-blocked-status",
+                "title": "Blocked",
+                "overview": "Plan mode status guard",
+                "status": "draft",
+                "sourceChatId": null,
+                "phases": [],
+                "timeoutMs": null
+            }),
+            Some("plan"),
+        )
+        .await;
+        assert!(blocked_error);
+        assert!(blocked["error"].as_str().is_some_and(|message| {
+            message.contains("Plan Mode cannot modify plan, phase, or step status")
+        }));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_local_spec_tools_use_remote_revision_cas_and_exact_edits() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, catalog) = test_remote_sidecar_local_catalog(workspace.path(), None).await;
+
+        let (initial, initial_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-spec-initial",
+            "update_spec",
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Remote Spec\n\nAlpha",
+                "edits": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!initial_error, "{initial}");
+        assert_eq!(initial["revision"], 1);
+
+        let (patched, patched_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-spec-patch",
+            "update_spec",
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": null,
+                "edits": [{ "oldText": "Alpha", "newText": "Beta" }],
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!patched_error, "{patched}");
+        assert_eq!(patched["revision"], 2);
+        assert_eq!(patched["contentMarkdown"], "# Remote Spec\n\nBeta");
+
+        let (stale, stale_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-spec-stale",
+            "update_spec",
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": "stale replacement",
+                "edits": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(stale_error);
+        assert!(
+            stale["error"]
+                .as_str()
+                .is_some_and(|message| { message.contains("revision changed") })
+        );
+
+        let (read, read_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-spec-read",
+            "read_spec",
+            json!({ "timeoutMs": null }),
+            None,
+        )
+        .await;
+        assert!(!read_error, "{read}");
+        assert_eq!(read["revision"], 2);
+        assert_eq!(read["contentMarkdown"], "# Remote Spec\n\nBeta");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_tool_catalog_exposes_runtime_capabilities_and_filters_plan_mode() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.memory.enabled = true;
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle.clone());
+
+        let normal = remote_sidecar_tool_catalog(&state, Some(&bundle), None)
+            .await
+            .expect("normal catalog");
         for expected in [
-            "graph_find_symbols",
-            "graph_find_callers",
-            "graph_find_callees",
-            "graph_find_references",
-            "graph_related_files",
-            "graph_explore",
-        ] {
-            assert!(
-                tool_names.contains(expected),
-                "missing tool schema: {expected}"
-            );
-        }
-
-        for unexpected in [
+            "read_file",
             "write_file",
             "edit_file",
+            "run_command",
+            "sleep",
+            "create_todo_graph",
+            "create_plan",
+            "read_spec",
+            "update_spec",
             "ask_question",
-            "web_search",
             "web_fetch",
             "image_gen",
             "memory_search",
             "memory_write",
-            "read_spec",
-            "update_spec",
+        ] {
+            assert!(normal.allows(expected), "missing normal tool: {expected}");
+        }
+        assert!(!normal.allows("web_search"));
+        assert!(
+            normal
+                .allowed_names
+                .iter()
+                .all(|name| !name.starts_with("agent_"))
+        );
+
+        let plan = remote_sidecar_tool_catalog(&state, Some(&bundle), Some("plan"))
+            .await
+            .expect("plan catalog");
+        for hidden in [
+            "write_file",
+            "edit_file",
+            "run_command",
             "create_todo_graph",
             "update_todo_graph",
-            "get_todo_graph",
+            "update_spec",
+            "memory_write",
         ] {
-            assert!(
-                !tool_names.contains(unexpected),
-                "unexpected tool schema leaked: {unexpected}"
-            );
+            assert!(!plan.allows(hidden), "plan tool leaked: {hidden}");
         }
+        for visible in [
+            "read_file",
+            "get_todo_graph",
+            "create_plan",
+            "get_plans",
+            "web_fetch",
+            "ask_question",
+            "sleep",
+            "memory_search",
+        ] {
+            assert!(plan.allows(visible), "missing plan tool: {visible}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_tool_catalog_degrades_when_broker_discovery_fails() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let response_state = state.clone();
+        tokio::spawn(async move {
+            let request = broker_rx.recv().await.expect("tool discovery request");
+            assert_eq!(request.method.as_deref(), Some("tools.discover"));
+            let id = request.id.expect("tool discovery request id");
+            let pending = response_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending discovery request");
+            let _ = pending.send(ControlEnvelope {
+                version: 1,
+                message_type: "error".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "code": "broker_unavailable",
+                    "message": "broker discovery failed",
+                }),
+                timestamp: None,
+            });
+        });
+
+        let catalog = remote_sidecar_tool_catalog(&state, None, None)
+            .await
+            .expect("fallback catalog");
+        assert!(catalog.allows("read_file"));
+        assert!(catalog.allows("web_fetch"));
+        assert!(!catalog.allows("web_search"));
+        assert!(catalog.mcp_prompt_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_tool_catalog_routes_both_mcp_hosts_and_deduplicates_stably() {
+        fn mcp_tool(name: &str, server_id: &str) -> McpToolDefinition {
+            McpToolDefinition {
+                name: name.to_string(),
+                server_id: server_id.to_string(),
+                server_name: server_id.to_string(),
+                original_name: name.rsplit("__").next().unwrap_or(name).to_string(),
+                description: format!("Tool from {server_id}"),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        let workspace_registry = Arc::new(McpRegistry::default());
+        workspace_registry
+            .insert_test_server_tools(
+                foco_mcp::McpServerDefinition {
+                    id: "workspace-docs".to_string(),
+                    name: "Workspace Docs".to_string(),
+                    enabled: true,
+                    transport: foco_mcp::McpTransportKind::Stdio,
+                    command: Some("workspace-docs".to_string()),
+                    args: Vec::new(),
+                    url: None,
+                    execution_host: McpExecutionHost::Workspace,
+                },
+                vec![mcp_tool("mcp__docs__search", "workspace-docs")],
+            )
+            .await;
+        let discovery = RemoteBrokerToolDiscovery {
+            web_search_available: true,
+            local_mcp_tools: vec![
+                mcp_tool("mcp__docs__search", "local-duplicate"),
+                mcp_tool("mcp__local__lookup", "local-only"),
+            ],
+        };
+
+        let catalog = build_remote_tool_catalog(
+            None,
+            Some("plan"),
+            discovery,
+            workspace_registry,
+            "workspace",
+            false,
+        )
+        .await;
+
+        assert!(catalog.allows("web_search"));
+        assert!(!catalog.allows("search_text"));
+        assert!(catalog.allows("mcp__docs__search"));
+        assert!(catalog.allows("mcp__local__lookup"));
+        assert_eq!(
+            catalog.route("mcp__docs__search"),
+            Some(&RemoteToolRoute::McpWorkspace)
+        );
+        assert_eq!(
+            catalog.route("mcp__local__lookup"),
+            Some(&RemoteToolRoute::McpLocal)
+        );
+        assert_eq!(
+            catalog
+                .tools
+                .iter()
+                .filter(|tool| tool.name == "mcp__docs__search")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_tool_catalog_keeps_schema_routes_and_runtime_gates_in_lockstep() {
+        fn mcp_tool(name: &str, server_id: &str) -> McpToolDefinition {
+            McpToolDefinition {
+                name: name.to_string(),
+                server_id: server_id.to_string(),
+                server_name: server_id.to_string(),
+                original_name: name.rsplit("__").next().unwrap_or(name).to_string(),
+                description: format!("Tool from {server_id}"),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_registry = Arc::new(McpRegistry::default());
+        workspace_registry
+            .insert_test_server_tools(
+                foco_mcp::McpServerDefinition {
+                    id: "workspace-tools".to_string(),
+                    name: "Workspace tools".to_string(),
+                    enabled: true,
+                    transport: foco_mcp::McpTransportKind::Stdio,
+                    command: Some("workspace-tools".to_string()),
+                    args: Vec::new(),
+                    url: None,
+                    execution_host: McpExecutionHost::Workspace,
+                },
+                vec![mcp_tool("mcp__workspace__lookup", "workspace-tools")],
+            )
+            .await;
+        let local_mcp = mcp_tool("mcp__local__lookup", "local-tools");
+        let mut enabled_config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        enabled_config.memory.enabled = true;
+        let enabled_bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &enabled_config, 1)
+                .expect("enabled runtime bundle");
+
+        let normal = build_remote_tool_catalog(
+            Some(&enabled_bundle),
+            None,
+            RemoteBrokerToolDiscovery {
+                web_search_available: true,
+                local_mcp_tools: vec![local_mcp.clone()],
+            },
+            workspace_registry.clone(),
+            "workspace",
+            false,
+        )
+        .await;
+        assert!(normal.tools.iter().all(|tool| {
+            normal.allows(tool.name.as_str()) && normal.route(tool.name.as_str()).is_some()
+        }));
+        assert!(matches!(
+            normal.route("web_search"),
+            Some(RemoteToolRoute::Broker {
+                method: "web.search"
+            })
+        ));
+        assert!(matches!(
+            normal.route("memory_search"),
+            Some(RemoteToolRoute::Broker {
+                method: "memory.global.search"
+            })
+        ));
+        assert_eq!(
+            normal.route("mcp__workspace__lookup"),
+            Some(&RemoteToolRoute::McpWorkspace)
+        );
+        assert_eq!(
+            normal.route("mcp__local__lookup"),
+            Some(&RemoteToolRoute::McpLocal)
+        );
+
+        let plan = build_remote_tool_catalog(
+            Some(&enabled_bundle),
+            Some("plan"),
+            RemoteBrokerToolDiscovery {
+                web_search_available: true,
+                local_mcp_tools: vec![local_mcp],
+            },
+            workspace_registry,
+            "workspace",
+            false,
+        )
+        .await;
+        assert!(plan.tools.iter().all(|tool| {
+            plan.allows(tool.name.as_str()) && plan.route(tool.name.as_str()).is_some()
+        }));
+        for hidden in [
+            "write_file",
+            "edit_file",
+            "run_command",
+            "create_todo_graph",
+            "update_spec",
+            "memory_write",
+        ] {
+            assert!(!plan.allows(hidden), "plan tool leaked: {hidden}");
+        }
+        for retained in [
+            "mcp__workspace__lookup",
+            "mcp__local__lookup",
+            "web_search",
+            "memory_search",
+        ] {
+            assert!(plan.allows(retained), "plan tool missing: {retained}");
+        }
+
+        let disabled_bundle = build_sidecar_runtime_config_bundle(
+            workspace.path(),
+            &foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf()),
+            1,
+        )
+        .expect("disabled runtime bundle");
+        let disabled = build_remote_tool_catalog(
+            Some(&disabled_bundle),
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            "workspace",
+            false,
+        )
+        .await;
+        assert!(!disabled.allows("memory_search"));
+        assert!(!disabled.allows("memory_write"));
+        assert!(!disabled.allows("web_search"));
+        assert!(disabled.allows("web_fetch"));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_routes_supported_tools_with_context_and_local_mcp_name() {
+        fn mcp_tool(name: &str, server_id: &str) -> McpToolDefinition {
+            McpToolDefinition {
+                name: name.to_string(),
+                server_id: server_id.to_string(),
+                server_name: server_id.to_string(),
+                original_name: name.rsplit("__").next().unwrap_or(name).to_string(),
+                description: format!("Tool from {server_id}"),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.memory.enabled = true;
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle.clone());
+        let catalog = build_remote_tool_catalog(
+            Some(&bundle),
+            None,
+            RemoteBrokerToolDiscovery {
+                web_search_available: true,
+                local_mcp_tools: vec![mcp_tool("mcp__local__lookup", "local-tools")],
+            },
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let cases = [
+            (
+                "call-question",
+                "ask_question",
+                json!({ "questions": [] }),
+                "ui.askQuestion",
+            ),
+            (
+                "call-search",
+                "web_search",
+                json!({ "query": "remote tools", "timeoutMs": null }),
+                "web.search",
+            ),
+            (
+                "call-fetch",
+                "web_fetch",
+                json!({ "url": "https://example.test", "timeoutMs": null }),
+                "web.fetch",
+            ),
+            (
+                "call-memory-search",
+                "memory_search",
+                json!({
+                    "query": "remote memory",
+                    "scope": "global",
+                    "limit": 1,
+                    "includeRelated": false,
+                    "timeoutMs": null,
+                }),
+                "memory.global.search",
+            ),
+            (
+                "call-memory-write",
+                "memory_write",
+                json!({
+                    "scope": "global",
+                    "kind": "project_fact",
+                    "fact": "brokered global memory",
+                    "confidence": null,
+                    "pinned": null,
+                    "reason": null,
+                    "timeoutMs": null,
+                }),
+                "memory.global.write",
+            ),
+            (
+                "call-local-mcp",
+                "mcp__local__lookup",
+                json!({ "query": "remote tools" }),
+                "mcp.execute",
+            ),
+        ];
+
+        for (call_id, tool_name, arguments, method) in cases {
+            let ((output, is_error, events, additional_context), request) =
+                test_execute_remote_sidecar_broker_tool(
+                    &state,
+                    catalog.clone(),
+                    &mut broker_rx,
+                    call_id,
+                    tool_name,
+                    arguments,
+                    "response",
+                    json!({ "status": "ok", "result": { "method": method } }),
+                )
+                .await;
+            assert!(!is_error, "{tool_name}: {output}");
+            assert_eq!(output["method"], method);
+            assert!(events.is_empty());
+            assert!(additional_context.is_empty());
+            assert_eq!(request.method.as_deref(), Some(method));
+            assert_eq!(
+                request.payload["context"]["workspaceId"],
+                state.workspace_id.as_str()
+            );
+            assert_eq!(request.payload["context"]["chatId"], "chat-tools");
+            assert_eq!(request.payload["context"]["toolCallId"], call_id);
+            if method == "mcp.execute" {
+                assert_eq!(request.payload["toolName"], "mcp__local__lookup");
+            } else {
+                assert!(matches!(
+                    request.payload.get("toolName"),
+                    None | Some(Value::Null)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_image_transfer_materializes_only_remote_validated_files() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let bytes = b"\x89PNG\r\n\x1a\nremote-image";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let arguments = json!({ "outputDir": ".foco/image-gen", "timeoutMs": 1_000 });
+
+        let ((output, is_error, _, _), request) = test_execute_remote_sidecar_broker_tool(
+            &state,
+            catalog.clone(),
+            &mut broker_rx,
+            "call-image-valid",
+            "image_gen",
+            arguments.clone(),
+            "response",
+            json!({
+                "status": "ok",
+                "result": { "files": [] },
+                "files": [{
+                    "fileName": "remote.png",
+                    "mimeType": "image/png",
+                    "bytes": bytes.len(),
+                    "sha256": sha256,
+                    "dataBase64": BASE64_STANDARD.encode(bytes),
+                }],
+            }),
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(request.method.as_deref(), Some("image.generate"));
+        assert_eq!(output["files"][0]["path"], ".foco/image-gen/remote.png");
+        assert!(workspace.path().join(".foco/image-gen/remote.png").exists());
+
+        let ((partial_output, partial_is_error, _, _), _) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog,
+                &mut broker_rx,
+                "call-image-partial",
+                "image_gen",
+                arguments,
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": { "files": [] },
+                    "files": [{
+                        "fileName": "partial.png",
+                        "mimeType": "image/png",
+                        "bytes": bytes.len(),
+                        "sha256": "invalid",
+                        "dataBase64": BASE64_STANDARD.encode(bytes),
+                    }],
+                }),
+            )
+            .await;
+        assert!(partial_is_error);
+        assert!(
+            partial_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("checksum")),
+            "{partial_output}"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".foco/image-gen/partial.png")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_tool_timeout_cancels_and_clears_pending_request() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let execution_state = state.clone();
+        let execution = tokio::spawn(async move {
+            test_execute_remote_sidecar_local_tool(
+                &execution_state,
+                &catalog,
+                "call-timeout",
+                "web_fetch",
+                json!({ "url": "https://example.test", "timeoutMs": 1 }),
+                None,
+            )
+            .await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker request timeout")
+            .expect("broker request");
+        assert_eq!(request.method.as_deref(), Some("web.fetch"));
+        let cancel = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker cancellation timeout")
+            .expect("broker cancellation");
+        assert_eq!(cancel.message_type, "cancel");
+        assert_eq!(cancel.id, request.id);
+
+        let (output, is_error, _, _) = timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("timed-out tool execution")
+            .expect("timed-out tool task");
+        assert!(is_error);
+        assert!(
+            output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("timed out")),
+            "{output}"
+        );
+        assert!(state.broker_pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_memory_scopes_keep_workspace_and_chat_local_and_global_failures_atomic()
+    {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-tools", "Remote tools", "{}")
+            .expect("insert chat");
+        drop(database);
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.memory.enabled = true;
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle.clone());
+        let catalog = build_remote_tool_catalog(
+            Some(&bundle),
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        for (call_id, scope) in [
+            ("call-memory-workspace", "workspace"),
+            ("call-memory-chat", "chat"),
+        ] {
+            let (output, is_error, _, _) = test_execute_remote_sidecar_local_tool(
+                &state,
+                &catalog,
+                call_id,
+                "memory_write",
+                json!({
+                    "scope": scope,
+                    "kind": "project_fact",
+                    "fact": format!("{scope} memory"),
+                    "confidence": null,
+                    "pinned": null,
+                    "reason": null,
+                    "timeoutMs": null,
+                }),
+                None,
+            )
+            .await;
+            assert!(!is_error, "{scope}: {output}");
+            assert_eq!(output["summary"]["scope"], scope);
+            assert_eq!(output["summary"]["status"], "pending");
+        }
+        assert!(matches!(
+            broker_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let ((auto_output, auto_is_error, _, _), auto_request) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog.clone(),
+                &mut broker_rx,
+                "call-memory-auto",
+                "memory_search",
+                json!({
+                    "query": "memory",
+                    "scope": "auto",
+                    "limit": 10,
+                    "includeRelated": false,
+                    "timeoutMs": null,
+                }),
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "summary": {
+                            "scope": "global",
+                            "count": 1,
+                            "factIds": ["global-memory"],
+                            "sourceCount": 1,
+                        },
+                        "memories": [{
+                            "id": "global-memory",
+                            "scope": "global",
+                            "chatId": null,
+                            "status": "active",
+                            "kind": "project_fact",
+                            "fact": "global memory",
+                            "confidence": null,
+                            "pinned": false,
+                            "isLatest": true,
+                            "updatedAt": "2026-01-01T00:00:00Z",
+                            "sourceCount": 1,
+                            "matchSource": "direct",
+                        }],
+                    },
+                }),
+            )
+            .await;
+        assert!(!auto_is_error, "{auto_output}");
+        assert_eq!(auto_request.method.as_deref(), Some("memory.global.search"));
+        assert_eq!(auto_request.payload["arguments"]["scope"], "global");
+        assert_eq!(auto_output["summary"]["scope"], "auto");
+        assert_eq!(auto_output["summary"]["count"], 1);
+
+        let ((global_output, global_is_error, _, _), global_request) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog,
+                &mut broker_rx,
+                "call-memory-global-error",
+                "memory_write",
+                json!({
+                    "scope": "global",
+                    "kind": "project_fact",
+                    "fact": "must not be partially written",
+                    "confidence": null,
+                    "pinned": null,
+                    "reason": null,
+                    "timeoutMs": null,
+                }),
+                "error",
+                json!({ "code": "tool_error", "message": "global memory store rejected write" }),
+            )
+            .await;
+        assert!(global_is_error);
+        assert_eq!(
+            global_request.method.as_deref(),
+            Some("memory.global.write")
+        );
+        assert!(
+            global_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("rejected write")),
+            "{global_output}"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".foco/remote-sidecar-global-memory-is-brokered.sqlite")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_rejects_hidden_tools_and_keeps_workspace_mcp_failures_off_broker() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let plan_catalog = build_remote_tool_catalog(
+            None,
+            Some("plan"),
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let (hidden_output, hidden_is_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &plan_catalog,
+            "call-hidden-write",
+            "write_file",
+            json!({
+                "path": "must-not-exist.txt",
+                "content": "blocked",
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": null,
+            }),
+            Some("plan"),
+        )
+        .await;
+        assert!(hidden_is_error);
+        assert!(
+            hidden_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("cannot execute tool 'write_file'"))
+        );
+        assert!(!workspace.path().join("must-not-exist.txt").exists());
+
+        let workspace_registry = Arc::new(McpRegistry::default());
+        workspace_registry
+            .insert_test_server_tools(
+                foco_mcp::McpServerDefinition {
+                    id: "workspace-failure".to_string(),
+                    name: "Workspace failure".to_string(),
+                    enabled: true,
+                    transport: foco_mcp::McpTransportKind::Stdio,
+                    command: Some("workspace-failure".to_string()),
+                    args: Vec::new(),
+                    url: None,
+                    execution_host: McpExecutionHost::Workspace,
+                },
+                vec![McpToolDefinition {
+                    name: "mcp__workspace_failure__lookup".to_string(),
+                    server_id: "workspace-failure".to_string(),
+                    server_name: "Workspace failure".to_string(),
+                    original_name: "lookup".to_string(),
+                    description: "Fails because its test service is not running".to_string(),
+                    input_schema: json!({ "type": "object" }),
+                }],
+            )
+            .await;
+        let workspace_catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            workspace_registry,
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let (mcp_output, mcp_is_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &workspace_catalog,
+            "call-workspace-mcp",
+            "mcp__workspace_failure__lookup",
+            json!({ "query": "failure" }),
+            None,
+        )
+        .await;
+        assert!(mcp_is_error);
+        assert!(mcp_output["error"].as_str().is_some());
+        assert!(matches!(
+            broker_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -16157,7 +18655,11 @@ mod tests {
                 thought_signatures: None,
             },
         ];
-        let allowed_tools = remote_sidecar_executable_tool_names();
+        let allowed_tools = HashSet::from([
+            "read_file".to_string(),
+            "find_files".to_string(),
+            "run_command".to_string(),
+        ]);
         assert!(
             tool_calls
                 .iter()
@@ -16334,8 +18836,9 @@ mod tests {
                 metadata_json: Some("{}"),
             })
             .expect("insert user message");
-        let (state, mut broker_rx) =
+        let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
 
         let response = remote_sidecar_chat_stream(
             State(state.clone()),
@@ -16499,6 +19002,7 @@ mod tests {
                 arguments: json!({ "path": "Cargo.toml", "startLine": null, "endLine": null }),
                 thought_signatures: None,
             }],
+            &HashSet::from(["read_file".to_string()]),
         )
         .expect("record tool call");
         remote_sidecar_record_tool_result(
@@ -16580,6 +19084,7 @@ mod tests {
                 arguments: json!({ "path": "Cargo.toml", "startLine": null, "endLine": null }),
                 thought_signatures: None,
             }],
+            &HashSet::from(["read_file".to_string()]),
         )
         .expect("record tool call");
         remote_sidecar_record_tool_result(
@@ -16781,8 +19286,8 @@ mod tests {
         assert_eq!(messages[0].role, NeutralChatRole::User);
     }
 
-    #[test]
-    fn remote_sidecar_prepare_chat_context_uses_real_sequences_and_skips_covered_history() {
+    #[tokio::test]
+    async fn remote_sidecar_prepare_chat_context_uses_real_sequences_and_skips_covered_history() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -16876,7 +19381,7 @@ mod tests {
             .expect("runtime bundle");
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);
 
-        let prepared = remote_sidecar_prepare_chat_context(
+        let prepared = test_remote_prepare_chat_context(
             &state,
             &database,
             "chat-1",
@@ -16885,6 +19390,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("prepared context");
 
         assert_eq!(
@@ -17015,8 +19521,8 @@ mod tests {
         assert!(replaced.active_tool_start_index <= replaced.messages.len());
     }
 
-    #[test]
-    fn remote_sidecar_provider_request_includes_synced_system_prompt() {
+    #[tokio::test]
+    async fn remote_sidecar_provider_request_includes_synced_system_prompt() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -17085,6 +19591,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("provider request");
 
         assert_eq!(request.messages[0].role, NeutralChatRole::System);
@@ -17098,13 +19605,25 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<HashSet<_>>();
-        for expected in ["read_file", "find_files", "search_text"] {
+        for expected in [
+            "read_file",
+            "find_files",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "ask_question",
+            "web_fetch",
+            "image_gen",
+            "create_todo_graph",
+            "create_plan",
+            "read_spec",
+        ] {
             assert!(
                 tool_names.contains(expected),
                 "missing tool schema: {expected}"
             );
         }
-        for unexpected in ["ask_question", "web_search", "memory_search", "write_file"] {
+        for unexpected in ["web_search", "memory_search", "memory_write", "agent_list"] {
             assert!(
                 !tool_names.contains(unexpected),
                 "unexpected tool schema leaked: {unexpected}"
@@ -17132,8 +19651,9 @@ mod tests {
         assert!(message.content.contains("Revision: 7"));
     }
 
-    #[test]
-    fn remote_sidecar_provider_request_injects_persisted_mixed_skills_once_and_orders_context() {
+    #[tokio::test]
+    async fn remote_sidecar_provider_request_injects_persisted_mixed_skills_once_and_orders_context()
+     {
         let profile = tempfile::tempdir().expect("profile tempdir");
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         write_remote_test_skill(
@@ -17182,6 +19702,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("provider request");
 
         let routing_index = request
@@ -17253,6 +19774,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("rebuilt provider request");
         assert_eq!(
             rebuilt
@@ -17276,8 +19798,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_sidecar_provider_request_restores_legacy_queued_run_skill_ids() {
+    #[tokio::test]
+    async fn remote_sidecar_provider_request_restores_legacy_queued_run_skill_ids() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         write_remote_test_skill(
             &workspace.path().join(".agents").join("skills"),
@@ -17313,6 +19835,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("provider request");
 
         assert!(
@@ -17352,8 +19875,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_sidecar_provider_request_rejects_invalid_persisted_skill_selection() {
+    #[tokio::test]
+    async fn remote_sidecar_provider_request_rejects_invalid_persisted_skill_selection() {
         let profile = tempfile::tempdir().expect("profile tempdir");
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         write_remote_test_skill(
@@ -17390,6 +19913,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect_err("duplicate selection should fail");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -17457,8 +19981,8 @@ mod tests {
         assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn remote_sidecar_provider_request_filters_disabled_workspace_skill_locations() {
+    #[tokio::test]
+    async fn remote_sidecar_provider_request_filters_disabled_workspace_skill_locations() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         write_remote_test_skill(
             &workspace.path().join(".agents").join("skills"),
@@ -17491,6 +20015,7 @@ mod tests {
             "model-1",
             Value::Null,
         )
+        .await
         .expect("provider request");
         let routing = request
             .messages

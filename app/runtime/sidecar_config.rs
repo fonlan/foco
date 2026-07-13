@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use foco_store::config::{
-    AgentDefinitionSettings, GlobalConfig, HookConfig, McpConfig, McpExecutionHost, MemorySettings,
-    ModelSettings, PlanSettings, PromptSettings, SKILL_SCOPE_GLOBAL, SpecSettings,
+    AgentDefinitionSettings, GlobalConfig, HookConfig, McpConfig, MemorySettings, ModelSettings,
+    PlanSettings, PromptSettings, SKILL_SCOPE_GLOBAL, SpecSettings,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -152,10 +152,9 @@ fn sidecar_mcp_config(config: &McpConfig) -> McpConfig {
     let mut config = config.clone();
     config.servers.retain(|server| {
         server.enabled
-            && matches!(
-                server.execution_host,
-                McpExecutionHost::Auto | McpExecutionHost::Workspace
-            )
+            && server.to_definition().is_ok_and(|definition| {
+                definition.effective_execution_host() == foco_mcp::McpExecutionHost::Workspace
+            })
     });
     config
 }
@@ -220,7 +219,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use foco_store::config::ProviderSettings;
+    use foco_store::config::{McpExecutionHost, McpServerConfig, ProviderSettings};
     use serde_json::Value;
 
     fn write_skill(root: &Path, id: &str, description: &str, instructions: &str) {
@@ -285,6 +284,70 @@ mod tests {
             Value::Bool(true)
         );
         assert_ne!(disabled.hash, enabled.hash);
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_syncs_only_workspace_hosted_mcp_servers() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.mcp.servers = vec![
+            McpServerConfig {
+                id: "auto-stdio".to_string(),
+                name: "Auto stdio".to_string(),
+                enabled: true,
+                transport: "stdio".to_string(),
+                command: Some("workspace-secret-command".to_string()),
+                args: vec!["workspace-arg".to_string()],
+                url: None,
+                execution_host: McpExecutionHost::Auto,
+            },
+            McpServerConfig {
+                id: "auto-http".to_string(),
+                name: "Auto HTTP".to_string(),
+                enabled: true,
+                transport: "streamable-http".to_string(),
+                command: None,
+                args: Vec::new(),
+                url: Some("https://user:local-secret@example.test/mcp".to_string()),
+                execution_host: McpExecutionHost::Auto,
+            },
+            McpServerConfig {
+                id: "explicit-local".to_string(),
+                name: "Explicit local".to_string(),
+                enabled: true,
+                transport: "stdio".to_string(),
+                command: Some("local-secret-command".to_string()),
+                args: Vec::new(),
+                url: None,
+                execution_host: McpExecutionHost::Local,
+            },
+            McpServerConfig {
+                id: "explicit-workspace".to_string(),
+                name: "Explicit workspace".to_string(),
+                enabled: true,
+                transport: "streamable-http".to_string(),
+                command: None,
+                args: Vec::new(),
+                url: Some("https://remote.example.test/mcp".to_string()),
+                execution_host: McpExecutionHost::Workspace,
+            },
+        ];
+
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime bundle");
+        let ids = bundle
+            .payload
+            .mcp
+            .servers
+            .iter()
+            .map(|server| server.id.as_str())
+            .collect::<Vec<_>>();
+        let serialized = serde_json::to_string(&bundle).expect("bundle json");
+
+        assert_eq!(ids, vec!["auto-stdio", "explicit-workspace"]);
+        assert!(!serialized.contains("local-secret"));
+        assert!(!serialized.contains("user:local-secret"));
     }
 
     #[test]

@@ -116,6 +116,124 @@ pub(crate) fn image_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
         Some(_) => Err("timeoutMs must be an integer or null".to_string()),
     }
 }
+const MAX_BROKERED_IMAGE_FILE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BROKERED_IMAGE_TOTAL_BYTES: usize = 24 * 1024 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BrokeredImageFile {
+    pub(crate) file_name: String,
+    pub(crate) mime_type: String,
+    pub(crate) bytes: usize,
+    pub(crate) sha256: String,
+    pub(crate) data_base64: String,
+}
+
+pub(crate) fn materialize_brokered_image_result(
+    workspace_path: &Path,
+    chat_id: &str,
+    run_id: &str,
+    arguments: &Value,
+    mut result: Value,
+    files: Vec<BrokeredImageFile>,
+) -> Result<Value, String> {
+    if files.is_empty() || files.len() > usize::from(MAX_IMAGE_GEN_COUNT) {
+        return Err(format!(
+            "brokered image transfer must contain between 1 and {MAX_IMAGE_GEN_COUNT} files"
+        ));
+    }
+    let output_dir = image_output_dir(
+        workspace_path,
+        chat_id,
+        run_id,
+        arguments.get("outputDir").and_then(Value::as_str),
+    )?;
+    fs::create_dir_all(&output_dir)
+        .map_err(|source| format!("failed to create remote image output directory: {source}"))?;
+    ensure_workspace_child_dir(workspace_path, &output_dir)?;
+
+    let mut total_bytes = 0_usize;
+    let mut written_paths = Vec::new();
+    let materialized = (|| {
+        let mut output_files = Vec::with_capacity(files.len());
+        for (index, file) in files.into_iter().enumerate() {
+            if file.bytes == 0 || file.bytes > MAX_BROKERED_IMAGE_FILE_BYTES {
+                return Err(format!(
+                    "brokered image file '{}' has invalid size {}",
+                    file.file_name, file.bytes
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(file.bytes);
+            if total_bytes > MAX_BROKERED_IMAGE_TOTAL_BYTES {
+                return Err("brokered image transfer exceeds 24 MiB".to_string());
+            }
+            let bytes = BASE64_STANDARD
+                .decode(&file.data_base64)
+                .map_err(|source| format!("failed to decode brokered image: {source}"))?;
+            if bytes.len() != file.bytes {
+                return Err(format!(
+                    "brokered image file '{}' size does not match transfer metadata",
+                    file.file_name
+                ));
+            }
+            let detected_format = detect_image_format(&bytes).ok_or_else(|| {
+                format!(
+                    "brokered image file '{}' has unsupported format",
+                    file.file_name
+                )
+            })?;
+            if output_mime_type(detected_format) != file.mime_type {
+                return Err(format!(
+                    "brokered image file '{}' MIME type does not match content",
+                    file.file_name
+                ));
+            }
+            let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+            if actual_sha256 != file.sha256 {
+                return Err(format!(
+                    "brokered image file '{}' checksum does not match",
+                    file.file_name
+                ));
+            }
+            let file_name = safe_path_component(&file.file_name);
+            if file_name.is_empty() || file_name != file.file_name {
+                return Err("brokered image file name is unsafe".to_string());
+            }
+            let path = output_dir.join(&file_name);
+            let temporary_path = output_dir.join(format!(".{file_name}.{index}.tmp"));
+            if let Err(source) = fs::write(&temporary_path, &bytes) {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(format!(
+                    "failed to write remote image temporary file: {source}"
+                ));
+            }
+            if let Err(source) = fs::rename(&temporary_path, &path) {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(format!("failed to finalize remote image file: {source}"));
+            }
+            written_paths.push(path.clone());
+            output_files.push(json!({
+                "path": workspace_relative_path(workspace_path, &path)?,
+                "mimeType": file.mime_type,
+                "bytes": file.bytes,
+                "sha256": file.sha256,
+            }));
+        }
+        Ok(output_files)
+    })();
+
+    let output_files = match materialized {
+        Ok(files) => files,
+        Err(error) => {
+            for path in written_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
+    result["files"] = Value::Array(output_files);
+    Ok(result)
+}
 
 pub(crate) async fn execute_image_tool(
     config: &GlobalConfig,
@@ -583,5 +701,75 @@ mod tests {
         let error = image_output_dir(Path::new("/workspace"), "chat", "run", Some("../out"))
             .expect_err("escape should fail");
         assert!(error.contains("inside the workspace"));
+    }
+
+    #[test]
+    fn materialize_brokered_image_result_writes_only_remote_paths() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let bytes = b"\x89PNG\r\n\x1a\nremote-image";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+
+        let result = materialize_brokered_image_result(
+            workspace.path(),
+            "chat",
+            "run",
+            &json!({ "outputDir": ".foco/image-gen" }),
+            json!({ "files": [] }),
+            vec![BrokeredImageFile {
+                file_name: "generated.png".to_string(),
+                mime_type: "image/png".to_string(),
+                bytes: bytes.len(),
+                sha256: sha256.clone(),
+                data_base64: BASE64_STANDARD.encode(bytes),
+            }],
+        )
+        .expect("materialized image result");
+
+        assert_eq!(
+            result,
+            json!({
+                "files": [{
+                    "path": ".foco/image-gen/generated.png",
+                    "mimeType": "image/png",
+                    "bytes": bytes.len(),
+                    "sha256": sha256,
+                }]
+            })
+        );
+        assert_eq!(
+            fs::read(workspace.path().join(".foco/image-gen/generated.png"))
+                .expect("remote image file"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn materialize_brokered_image_result_rejects_bad_checksum_without_file() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let bytes = b"\x89PNG\r\n\x1a\nremote-image";
+
+        let error = materialize_brokered_image_result(
+            workspace.path(),
+            "chat",
+            "run",
+            &json!({ "outputDir": ".foco/image-gen" }),
+            json!({ "files": [] }),
+            vec![BrokeredImageFile {
+                file_name: "generated.png".to_string(),
+                mime_type: "image/png".to_string(),
+                bytes: bytes.len(),
+                sha256: "invalid".to_string(),
+                data_base64: BASE64_STANDARD.encode(bytes),
+            }],
+        )
+        .expect_err("checksum mismatch should fail");
+
+        assert!(error.contains("checksum"));
+        assert!(
+            !workspace
+                .path()
+                .join(".foco/image-gen/generated.png")
+                .exists()
+        );
     }
 }
