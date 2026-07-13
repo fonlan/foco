@@ -17413,10 +17413,10 @@ mod tests {
     }
 
     #[test]
-    fn finish_broker_llm_audit_persists_cancelled_compact_and_captured_responses() {
+    fn finish_broker_llm_audit_persists_cancelled_null_detail_and_captured_v1_responses() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let cases = [
-            ("cancel-compact", None, None, false, false),
+            ("cancel-null-detail", None, None, false, false),
             (
                 "cancel-versioned",
                 Some(foco_providers::ProviderFinalResponseDump::failed(
@@ -18071,7 +18071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_sidecar_cancelled_broker_error_persists_cancelled_compact_mirror() {
+    async fn remote_sidecar_cancelled_broker_error_persists_cancelled_null_detail_mirror() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -18350,20 +18350,9 @@ mod tests {
             .expect("sidecar audit exists");
         assert_eq!(audit.request_kind, BROKER_DEFAULT_LLM_REQUEST_KIND);
         assert_eq!(audit.final_state, "failed");
-        let response: Value = serde_json::from_str(
-            audit
-                .response_body_json
-                .as_deref()
-                .expect("sidecar partial response"),
-        )
-        .expect("sidecar partial response JSON");
-        assert_eq!(response["requestKind"], BROKER_DEFAULT_LLM_REQUEST_KIND);
-        assert_eq!(response["partial"], true);
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("repeated reasoning loop"))
-        );
+        // Sidecar mirror: structured columns only; partial/error stay in SSE + message metadata.
+        assert_eq!(audit.request_body_json, None);
+        assert_eq!(audit.response_body_json, None);
     }
 
     #[tokio::test]
@@ -23095,8 +23084,6 @@ mod tests {
         database
             .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
             .expect("insert chat");
-        let response_body =
-            json!({ "type": "complete", "metrics": { "llmRequestIds": ["remote-run-1"] } });
 
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         run_metrics.capture_first_output();
@@ -23115,7 +23102,8 @@ mod tests {
             &completed_at,
             total_latency_ms,
             "succeeded",
-            response_body.clone(),
+            // Callers may still pass a body; mirror must ignore it and keep detail NULL.
+            json!({ "type": "complete", "metrics": { "llmRequestIds": ["remote-run-1"] } }),
         )
         .expect("persist sidecar audit");
 
@@ -23124,6 +23112,7 @@ mod tests {
             .expect("llm request read")
             .expect("llm request");
         assert_eq!(record.request_body_json, None);
+        assert_eq!(record.response_body_json, None);
         assert_eq!(record.input_tokens, Some(12));
         assert_eq!(record.output_tokens, Some(5));
         assert_eq!(
@@ -23131,14 +23120,7 @@ mod tests {
             run_metrics.first_token_latency_ms
         );
         assert_eq!(record.total_latency_ms, Some(total_latency_ms));
-        let response_body_json = serde_json::from_str::<Value>(
-            record
-                .response_body_json
-                .as_deref()
-                .expect("response body json"),
-        )
-        .expect("response body parse");
-        assert_eq!(response_body_json, response_body);
+        assert_eq!(record.final_state, "succeeded");
     }
 
     #[test]

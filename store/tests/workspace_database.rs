@@ -3704,17 +3704,17 @@ fn infers_runtime_tool_state_compression_from_saved_request_bodies() {
         (
             "request-1",
             &task_1,
-            r#"{"messages":[{"content":"Runtime tool-state compression snapshot Runtime tool-state compression snapshot"}]}"#,
+            r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"Runtime tool-state compression snapshot Runtime tool-state compression snapshot"}"#,
         ),
         (
             "request-2",
             &task_1,
-            r#"{"messages":[{"content":"Runtime tool-state compression snapshot"}]}"#,
+            r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"Runtime tool-state compression snapshot"}"#,
         ),
         (
             "request-3",
             &task_2,
-            r#"{"messages":[{"content":"Runtime tool-state compression snapshot"}]}"#,
+            r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"Runtime tool-state compression snapshot"}"#,
         ),
     ] {
         database

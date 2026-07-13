@@ -14696,15 +14696,23 @@ fn prune_non_v1_llm_audit_details(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), WorkspaceDatabaseError> {
-    if !table_exists(connection, database_path, "llm_requests")? {
+    // Migration fixtures may stub llm_requests without detail columns; only prune when present.
+    if !table_has_columns(
+        connection,
+        database_path,
+        "llm_requests",
+        &["request_body_json", "response_body_json"],
+    )? {
         return Ok(());
     }
 
-    // Idempotent non-schema cleanup: drop any detail that is not valid provider_*_v1.
-    // Never rewrite legacy JSON into a forged v1 envelope.
+    // Best-effort: never block open behind a concurrent IMMEDIATE writer. The cleanup is
+    // idempotent and the next successful open will prune remaining non-v1 details.
     connection
-        .execute_batch(
-            r#"
+        .busy_timeout(Duration::from_millis(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let prune_result = connection.execute_batch(
+        r#"
             UPDATE llm_requests
             SET request_body_json = NULL
             WHERE request_body_json IS NOT NULL
@@ -14723,10 +14731,25 @@ fn prune_non_v1_llm_audit_details(
                 OR COALESCE(json_extract(response_body_json, '$.version'), 0) <> 1
               );
             "#,
-        )
+    );
+    connection
+        .busy_timeout(WORKSPACE_DATABASE_BUSY_TIMEOUT)
         .map_err(|source| sqlite_error(database_path, source))?;
 
-    Ok(())
+    match prune_result {
+        Ok(()) => Ok(()),
+        Err(source) if is_sqlite_busy_error(&source) => Ok(()),
+        Err(source) => Err(sqlite_error(database_path, source)),
+    }
+}
+
+fn is_sqlite_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::DatabaseBusy
+                || code.code == rusqlite::ErrorCode::DatabaseLocked
+    )
 }
 
 fn is_valid_audit_detail_format(value: &str, field: &'static str) -> bool {

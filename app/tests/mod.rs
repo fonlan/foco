@@ -10997,14 +10997,8 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         memories_used: Vec::new(),
     });
 
-    persist_running_llm_request(
-        &context,
-        "request-1",
-        "2026-06-06T09:00:00Z",
-        Some("{}"),
-        &[],
-    )
-    .expect("persist running LLM request");
+    persist_running_llm_request(&context, "request-1", "2026-06-06T09:00:00Z", None, &[])
+        .expect("persist running LLM request");
     persist_chat_result(
         &context,
         "2026-06-06T09:00:00Z",
@@ -11481,14 +11475,9 @@ fn persist_running_llm_request_rejects_replaced_queued_run() {
     context.queued_user_message_id = Some("user-old".to_string());
     context.assistant_message_id = "assistant-old".to_string();
 
-    let error = persist_running_llm_request(
-        &context,
-        "request-old",
-        "2026-07-10T10:00:00Z",
-        Some("{}"),
-        &[],
-    )
-    .expect_err("replaced queued run must reject audit start");
+    let error =
+        persist_running_llm_request(&context, "request-old", "2026-07-10T10:00:00Z", None, &[])
+            .expect_err("replaced queued run must reject audit start");
 
     assert_eq!(
         error.message,
@@ -12025,7 +12014,7 @@ fn mark_chat_queued_run_started_recovers_after_stale_queue_cleanup() {
         &context,
         "request-rebuild-queued-run",
         "2026-07-12T03:19:20Z",
-        Some("{}"),
+        None,
         &[],
     )
     .expect("running audit should accept rebuilt queued run");
@@ -12337,7 +12326,7 @@ async fn worker_chat_context_does_not_replace_parent_queued_run() {
         &context,
         "worker-request",
         "2026-07-11T05:00:00Z",
-        Some("{}"),
+        None,
         &[],
     )
     .expect("worker audit start");
@@ -20766,7 +20755,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                 800,
                 80,
                 "2026-07-06T10:00:04Z",
-                Some(r#"{"requestKind":"workspace spec update"}"#),
+                None,
             ),
             request(
                 "internal-memory-retrieval",
@@ -20784,7 +20773,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                 500,
                 50,
                 "2026-07-06T10:00:02Z",
-                Some(r#"{"requestKind":"contextCompression"}"#),
+                None,
             ),
             request(
                 "internal-memory-extraction",

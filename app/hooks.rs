@@ -28,7 +28,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
-use crate::{api_audit_detail_json, runtime::ProviderAuditCapture};
+use crate::{persistable_audit_response_body_json, runtime::ProviderAuditCapture};
 
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const HOOK_OUTPUT_PREVIEW_CHARS: usize = 4000;
@@ -895,9 +895,9 @@ impl AuditedPromptHookStream {
                     total_latency_ms: Some(elapsed_millis(self.started_at)),
                     status_code: Some(200),
                     final_state: "succeeded",
-                    response_body_json: response_body_json
-                        .as_deref()
-                        .and_then(|value| api_audit_detail_json(value, self.save_details)),
+                    response_body_json: response_body_json.as_deref().and_then(|value| {
+                        persistable_audit_response_body_json(value, self.save_details, "succeeded")
+                    }),
                 },
             )
             .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
@@ -1152,7 +1152,11 @@ fn fail_prompt_hook_audit(
                 total_latency_ms: Some(elapsed_millis(started_at)),
                 status_code: status_code.filter(|code| *code > 0),
                 final_state: "failed",
-                response_body_json: api_audit_detail_json(response_body_json, save_details),
+                response_body_json: persistable_audit_response_body_json(
+                    response_body_json,
+                    save_details,
+                    "failed",
+                ),
             },
         )
         .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;

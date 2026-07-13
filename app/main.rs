@@ -2844,8 +2844,8 @@ impl PreparedChatContext {
             .ok()
             .flatten()
             .unwrap_or_default();
-        // Prefer versioned wire response when details capture is enabled; keep the
-        // compact cancelled payload when details are off so the cancel reason is retained.
+        // When details capture is enabled, prefer a captured/synthetic provider_final_response_v1.
+        // When details are off, failed_response_json yields None so response detail stays NULL.
         let wire_response_body_json = capture
             .failed_response_json(message, None, true)
             .ok()
@@ -6915,7 +6915,18 @@ pub(crate) fn api_audit_save_details(config: &GlobalConfig) -> bool {
 }
 
 pub(crate) fn api_audit_detail_json<'a>(value: &'a str, save_details: bool) -> Option<&'a str> {
-    save_details.then_some(value)
+    if !save_details {
+        return None;
+    }
+    // Request detail may only be a versioned provider wire dump; placeholders like "{}"
+    // or Neutral payloads must not reach SQLite.
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        return None;
+    };
+    let is_v1 = parsed.get("format").and_then(serde_json::Value::as_str)
+        == Some("provider_request_v1")
+        && parsed.get("version").and_then(serde_json::Value::as_u64) == Some(1);
+    is_v1.then_some(value)
 }
 
 /// Response-body gate for audit persistence.
