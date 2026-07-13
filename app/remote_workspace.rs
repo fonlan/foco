@@ -16599,6 +16599,12 @@ mod tests {
 
         let mut config = remote_test_config(workspace.path());
         config.app.api_audit.save_request_response_details = true;
+        // Prefer SSH + empty legacy path so audit lands in profile remote-workspace-audit.
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: "/remote/project".to_string(),
+        };
         config.providers.push(foco_store::config::ProviderSettings {
             id: "provider-1".to_string(),
             name: "Provider 1".to_string(),
@@ -16772,7 +16778,9 @@ mod tests {
             provider_body.clone()
         };
 
-        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit database");
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        let database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit database");
         let request = database
             .llm_request(&broker_request_id)
             .expect("broker audit lookup")
@@ -16886,6 +16894,426 @@ mod tests {
                 .expect("detail response body")["http"]["headers"]["x-broker-multi"],
             json!(["first", "second"])
         );
+    }
+
+    /// Full production-shaped remote path:
+    /// real sidecar chat handler → control WS → main-process broker → mock provider HTTP →
+    /// profile `remote-workspace-audit` mirror → AI Statistics list/detail.
+    /// Sidecar SQLite keeps structured metrics only (detail columns stay NULL).
+    #[tokio::test]
+    async fn remote_ssh_sidecar_chat_turn_persists_real_wire_to_profile_audit_mirror() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let sidecar_workspace = tempfile::tempdir().expect("sidecar workspace tempdir");
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let provider_requests = provider_requests.clone();
+                move |
+                    method: axum::http::Method,
+                    uri: axum::http::Uri,
+                    headers: axum::http::HeaderMap,
+                    body: axum::body::Bytes,
+                | {
+                    let provider_requests = provider_requests.clone();
+                    async move {
+                        provider_requests
+                            .lock()
+                            .expect("provider request capture")
+                            .push((method, uri.path().to_string(), headers, body.to_vec()));
+                        let mut response = axum::response::Response::new(axum::body::Body::from(
+                            concat!(
+                                "data: {\"id\":\"ssh-wire-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SSH sidecar wire OK\"}}]}\n\n",
+                                "data: {\"id\":\"ssh-wire-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        ));
+                        let headers = response.headers_mut();
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_static("text/event-stream"),
+                        );
+                        headers.insert(
+                            header::AUTHORIZATION,
+                            header::HeaderValue::from_static("Bearer response-secret"),
+                        );
+                        headers.insert(
+                            header::HeaderName::from_static("x-api-key"),
+                            header::HeaderValue::from_static("response-key-visible"),
+                        );
+                        headers.append(
+                            header::HeaderName::from_static("x-ssh-multi"),
+                            header::HeaderValue::from_static("alpha"),
+                        );
+                        headers.append(
+                            header::HeaderName::from_static("x-ssh-multi"),
+                            header::HeaderValue::from_static("beta"),
+                        );
+                        response
+                    }
+                }
+            }),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(sidecar_workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.app.llm_request_retry_count = 0;
+        let workspace_id = config.workspaces[0].id.clone();
+        // Real SSH workspace with empty legacy path → audit mirror under profile.
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: sidecar_workspace.path().display().to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("ssh-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(sidecar_workspace.path()).expect("sidecar db");
+        database
+            .insert_chat_with_metadata("chat-ssh-wire", "SSH wire chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-ssh",
+                chat_id: "chat-ssh-wire",
+                role: "user",
+                content: "Capture the real SSH sidecar provider wire.",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        drop(database);
+
+        let (sidecar_state, _broker_rx) =
+            test_sidecar_state(sidecar_workspace.path().to_string_lossy().to_string(), 0);
+        // Align sidecar identity with the SSH workspace id used by main-process audit.
+        let mut sidecar_state = sidecar_state;
+        sidecar_state.workspace_id = workspace_id.clone();
+        sidecar_state.token = "ssh-control-token".to_string();
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sidecar control");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_app = Router::new()
+            .route(CONTROL_WS_PATH, get(remote_control_ws))
+            .layer(axum::middleware::from_fn_with_state(
+                sidecar_state.clone(),
+                sidecar_bearer_auth,
+            ))
+            .with_state(sidecar_state.clone());
+        let control_task = tokio::spawn(async move {
+            axum::serve(control_listener, control_app)
+                .await
+                .expect("serve sidecar control");
+        });
+
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "ssh-control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .expect("connect main-process control websocket");
+
+        // Wait until config.sync has populated runtime config on the sidecar.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if sidecar_state
+                    .runtime_config
+                    .lock()
+                    .expect("runtime config")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sidecar runtime config sync timeout");
+
+        let response = remote_sidecar_chat_stream(
+            State(sidecar_state.clone()),
+            Json(json!({
+                "chatId": "chat-ssh-wire",
+                "queuedUserMessageId": "msg-user-ssh",
+                "visibleAssistantMessageId": "msg-assistant-ssh",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("sidecar chat SSE");
+
+        let bytes = timeout(
+            Duration::from_secs(15),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("SSH sidecar chat should finish")
+        .expect("SSE bytes");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(
+            text.contains("SSH sidecar wire OK"),
+            "SSE should include provider text: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"complete\""),
+            "SSE complete: {text}"
+        );
+        assert!(
+            !text.contains("\"type\":\"error\""),
+            "SSE must not error: {text}"
+        );
+
+        connection_task.abort();
+        let _ = connection_task.await;
+        control_task.abort();
+        let _ = control_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        let provider_body = {
+            let provider_requests = provider_requests.lock().expect("provider requests");
+            assert_eq!(
+                provider_requests.len(),
+                1,
+                "exactly one real provider HTTP turn"
+            );
+            let (method, path, headers, provider_body) = &provider_requests[0];
+            assert_eq!(*method, axum::http::Method::POST);
+            assert_eq!(path, "/v1/chat/completions");
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer ssh-provider-test-key")
+            );
+            provider_body.clone()
+        };
+
+        let assistant = WorkspaceDatabase::open_or_create(sidecar_workspace.path())
+            .expect("sidecar db reopen")
+            .message("msg-assistant-ssh")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let llm_request_ids = metadata["metrics"]["llmRequestIds"]
+            .as_array()
+            .expect("llmRequestIds")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            llm_request_ids.len(),
+            1,
+            "one broker id for a single text turn"
+        );
+        let broker_request_id = llm_request_ids[0].clone();
+        assert!(
+            !broker_request_id.is_empty() && !broker_request_id.starts_with("run-"),
+            "durable id must be the broker request id, not a run-level summary"
+        );
+
+        // Sidecar mirror: structured columns only; detail columns always NULL.
+        let sidecar_db =
+            WorkspaceDatabase::open_or_create(sidecar_workspace.path()).expect("sidecar audit db");
+        let sidecar_rows = sidecar_db
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-ssh-wire"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("sidecar audit rows");
+        assert_eq!(sidecar_rows.len(), 1);
+        assert_eq!(sidecar_rows[0].id, broker_request_id);
+        let sidecar_request = sidecar_db
+            .llm_request(&broker_request_id)
+            .expect("sidecar request lookup")
+            .expect("sidecar request");
+        assert_eq!(sidecar_request.request_body_json, None);
+        assert_eq!(sidecar_request.response_body_json, None);
+        assert_eq!(sidecar_request.final_state, "succeeded");
+        drop(sidecar_db);
+
+        // Main-process profile audit mirror holds the only real provider_*_v1 dumps.
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        assert!(
+            audit_path
+                .to_string_lossy()
+                .contains("remote-workspace-audit"),
+            "audit path should be under profile remote-workspace-audit: {}",
+            audit_path.display()
+        );
+        let audit_db = WorkspaceDatabase::open_or_create(&audit_path).expect("main audit db");
+        let audit_rows = audit_db
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-ssh-wire"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("main audit rows");
+        assert_eq!(
+            audit_rows.len(),
+            1,
+            "no extra run-level normalized LLM row on main audit mirror"
+        );
+        assert_eq!(audit_rows[0].id, broker_request_id);
+        let request = audit_db
+            .llm_request(&broker_request_id)
+            .expect("main audit lookup")
+            .expect("main audit row");
+        assert_eq!(request.chat_id.as_deref(), Some("chat-ssh-wire"));
+        assert_eq!(request.request_kind, "chat completion");
+        assert_eq!(request.provider_id, "provider-1");
+        assert_eq!(request.final_state, "succeeded");
+        assert_eq!(request.input_tokens, Some(9));
+        assert_eq!(request.output_tokens, Some(3));
+        let request_wire: Value = serde_json::from_str(
+            request
+                .request_body_json
+                .as_deref()
+                .expect("captured provider request wire"),
+        )
+        .expect("provider request wire JSON");
+        assert_eq!(request_wire["format"], "provider_request_v1");
+        assert_eq!(request_wire["method"], "POST");
+        assert_eq!(
+            request_wire["url"]
+                .as_str()
+                .expect("provider request wire URL"),
+            format!("http://{provider_address}/v1/chat/completions")
+        );
+        assert_eq!(
+            request_wire["body"]
+                .as_str()
+                .expect("provider request wire body")
+                .as_bytes(),
+            provider_body.as_slice()
+        );
+        assert_eq!(request_wire["headers"]["authorization"][0], "********");
+        let response_wire: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("captured provider response wire"),
+        )
+        .expect("provider response wire JSON");
+        assert_eq!(response_wire["format"], "provider_final_response_v1");
+        assert_eq!(response_wire["state"], "succeeded");
+        assert_eq!(response_wire["text"], "SSH sidecar wire OK");
+        assert_eq!(response_wire["http"]["status"], 200);
+        assert_eq!(response_wire["http"]["version"], "HTTP/1.1");
+        assert_eq!(
+            response_wire["http"]["headers"]["authorization"][0],
+            "********"
+        );
+        assert_eq!(
+            response_wire["http"]["headers"]["x-ssh-multi"],
+            json!(["alpha", "beta"])
+        );
+        assert_eq!(
+            response_wire["http"]["headers"]["x-api-key"][0],
+            "response-key-visible"
+        );
+        drop(audit_db);
+
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state.clone()),
+            AxumPath((workspace_id.clone(), broker_request_id.clone())),
+        )
+        .await
+        .expect("SSH AI statistics detail");
+        assert_eq!(detail.request.id, broker_request_id);
+        assert_eq!(detail.request.request_detail_status, "captured");
+        assert_eq!(detail.request.response_detail_status, "captured");
+        assert_eq!(
+            detail
+                .request
+                .request_body
+                .as_ref()
+                .and_then(|body| body["format"].as_str()),
+            Some("provider_request_v1")
+        );
+        assert_eq!(
+            detail
+                .request
+                .response_body
+                .as_ref()
+                .and_then(|body| body["format"].as_str()),
+            Some("provider_final_response_v1")
+        );
+        assert_eq!(
+            detail
+                .request
+                .response_body
+                .as_ref()
+                .expect("detail response")["http"]["headers"]["x-ssh-multi"],
+            json!(["alpha", "beta"])
+        );
+
+        let Json(list) = crate::http::chat::ai_statistics(
+            State(state),
+            Query(crate::http::chat::AiStatisticsQuery {
+                workspace_id: Some(workspace_id),
+                request_id: None,
+                request_ids: Some(broker_request_id.clone()),
+                chat_id: Some("chat-ssh-wire".to_string()),
+                request_kind: None,
+                provider_id: None,
+                model_id: None,
+                status: None,
+                started_after: None,
+                started_before: None,
+                page: Some(1),
+                page_size: Some(20),
+                limit: None,
+            }),
+        )
+        .await
+        .expect("SSH AI statistics list");
+        assert_eq!(list.total_count, 1);
+        assert_eq!(list.requests.len(), 1);
+        assert_eq!(list.requests[0].id, broker_request_id);
+        assert_eq!(list.requests[0].final_state, "succeeded");
     }
 
     #[test]

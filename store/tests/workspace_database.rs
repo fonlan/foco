@@ -40,7 +40,7 @@ use foco_store::{
     },
 };
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[test]
 fn creates_workspace_foco_database_and_runs_migrations() {
@@ -5338,35 +5338,46 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     database
         .insert_chat("chat-1", "Audit detail invariants")
         .expect("chat insert");
-    database
-        .insert_llm_request(NewLlmRequest {
-            id: "request-1",
-            workspace_id: "workspace-1",
-            chat_id: Some("chat-1"),
-            request_kind: "chat completion",
-            agent_team_id: None,
-            agent_instance_id: None,
-            agent_task_id: None,
-            agent_attempt_id: None,
-            provider_id: "openai",
-            model_id: "gpt-test",
-            thinking_level: None,
-            request_started_at: "2026-07-13T00:00:00Z",
-            first_token_at: None,
-            completed_at: Some("2026-07-13T00:00:01Z"),
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: None,
-            first_token_latency_ms: None,
-            total_latency_ms: Some(1000),
-            status_code: Some(200),
-            final_state: "succeeded",
-            request_body_json: None,
-            response_body_json: None,
-        })
-        .expect("request insert");
+
+    let insert_request = |database: &mut WorkspaceDatabase, id: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: Some("chat-1"),
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "openai",
+                model_id: "gpt-test",
+                thinking_level: None,
+                request_started_at: "2026-07-13T00:00:00Z",
+                first_token_at: None,
+                completed_at: Some("2026-07-13T00:00:01Z"),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(1000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("request insert");
+    };
+    insert_request(&mut database, "request-1");
+    insert_request(&mut database, "request-empty-object");
+    insert_request(&mut database, "request-neutral");
+    insert_request(&mut database, "request-normalized");
+    insert_request(&mut database, "request-error");
+    insert_request(&mut database, "request-cancelled");
+    insert_request(&mut database, "request-legacy-text");
+    insert_request(&mut database, "request-valid-v1");
 
     let reject = database.update_llm_request_body("request-1", Some(r#"{"text":"legacy"}"#));
     assert!(reject.is_err(), "non-v1 request body must be rejected");
@@ -5375,26 +5386,96 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     {
         let database_path = database.database_path().to_path_buf();
         let connection = rusqlite::Connection::open(&database_path).expect("open raw sqlite");
-        connection
-            .execute(
-                "UPDATE llm_requests SET request_body_json = ?1, response_body_json = ?2 WHERE id = ?3",
-                rusqlite::params![
-                    r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-                    r#"{"text":"normalized","reasoning":null}"#,
-                    "request-1"
-                ],
-            )
-            .expect("plant legacy detail");
+        let plant = |id: &str, request: &str, response: &str| {
+            connection
+                .execute(
+                    "UPDATE llm_requests SET request_body_json = ?1, response_body_json = ?2 WHERE id = ?3",
+                    rusqlite::params![request, response, id],
+                )
+                .expect("plant legacy detail");
+        };
+        plant(
+            "request-1",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"text":"normalized","reasoning":null}"#,
+        );
+        plant(
+            "request-empty-object",
+            "{}",
+            r#"{"requestKind":"chat completion"}"#,
+        );
+        plant(
+            "request-neutral",
+            r#"{"modelId":"m","messages":[],"tools":[]}"#,
+            r#"{"providerCompletions":[]}"#,
+        );
+        plant(
+            "request-normalized",
+            r#"{"format":"legacy_text_v1","version":1,"text":"nope"}"#,
+            r#"{"text":"done","reasoning":null,"providerCompletions":[]}"#,
+        );
+        plant(
+            "request-error",
+            r#"{"error":"request failed"}"#,
+            r#"{"error":"stream failed"}"#,
+        );
+        plant(
+            "request-cancelled",
+            r#"{"cancelled":true}"#,
+            r#"{"cancelled":"chat run cancelled"}"#,
+        );
+        plant(
+            "request-legacy-text",
+            r#"{"format":"legacy_text_v1","body":"x"}"#,
+            r#"{"format":"legacy_text_v1","body":"y"}"#,
+        );
+        plant(
+            "request-valid-v1",
+            r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{"authorization":["********"]},"body":null}"#,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":{"status":200,"version":"HTTP/1.1","headers":{"authorization":["********"],"x-multi":["a","b"]}}}"#,
+        );
     }
     drop(database);
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
-    let request = database
-        .llm_request("request-1")
-        .expect("request read")
-        .expect("request");
-    assert_eq!(request.request_body_json, None);
-    assert_eq!(request.response_body_json, None);
+    for id in [
+        "request-1",
+        "request-empty-object",
+        "request-neutral",
+        "request-normalized",
+        "request-error",
+        "request-cancelled",
+        "request-legacy-text",
+    ] {
+        let request = database
+            .llm_request(id)
+            .expect("request read")
+            .expect("request");
+        assert_eq!(request.request_body_json, None, "{id} request pruned");
+        assert_eq!(request.response_body_json, None, "{id} response pruned");
+    }
+
+    let valid = database
+        .llm_request("request-valid-v1")
+        .expect("valid read")
+        .expect("valid request");
+    let valid_request: serde_json::Value =
+        serde_json::from_str(valid.request_body_json.as_deref().expect("kept request"))
+            .expect("parse kept request");
+    assert_eq!(valid_request["format"], "provider_request_v1");
+    assert_eq!(valid_request["headers"]["authorization"][0], "********");
+    let valid_response: serde_json::Value =
+        serde_json::from_str(valid.response_body_json.as_deref().expect("kept response"))
+            .expect("parse kept response");
+    assert_eq!(valid_response["format"], "provider_final_response_v1");
+    assert_eq!(
+        valid_response["http"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        valid_response["http"]["headers"]["x-multi"],
+        json!(["a", "b"])
+    );
 
     // Valid v1 is retained; later NULL/non-v1 cannot overwrite first capture.
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen mut");

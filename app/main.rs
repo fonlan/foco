@@ -6920,15 +6920,24 @@ pub(crate) fn api_audit_detail_json<'a>(value: &'a str, save_details: bool) -> O
 
 /// Response-body gate for audit persistence.
 ///
-/// Only versioned provider wire dumps may be persisted. Compact cancelled /
-/// normalized error payloads are not accepted; callers should leave detail NULL
-/// when capture did not observe a real provider response.
+/// Only versioned `provider_final_response_v1` dumps may be persisted. Compact
+/// cancelled / normalized error / business completion payloads are rejected even
+/// when detail capture is enabled; callers leave detail NULL when no real wire.
 pub(crate) fn persistable_audit_response_body_json<'a>(
     value: &'a str,
     save_details: bool,
     _final_state: &str,
 ) -> Option<&'a str> {
-    save_details.then_some(value)
+    if !save_details {
+        return None;
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        return None;
+    };
+    let is_v1 = parsed.get("format").and_then(serde_json::Value::as_str)
+        == Some("provider_final_response_v1")
+        && parsed.get("version").and_then(serde_json::Value::as_u64) == Some(1);
+    is_v1.then_some(value)
 }
 
 pub(crate) fn compact_audit_events(

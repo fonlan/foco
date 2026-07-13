@@ -78,6 +78,83 @@ fn local_audited_paths_do_not_serialize_neutral_requests_as_detail_bodies() {
     );
 }
 
+#[test]
+fn production_audit_writers_do_not_store_business_completion_or_neutral_request_dumps() {
+    let app_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // Sidecar mirror must keep detail columns empty (structured metrics only).
+    let remote = fs::read_to_string(app_root.join("remote_workspace.rs")).expect("remote source");
+    let persist_start = remote
+        .find("fn persist_sidecar_llm_audit_for_kind(")
+        .expect("sidecar persist helper");
+    let persist_end = remote[persist_start..]
+        .find("\nfn neutral_role_for_message")
+        .map(|offset| persist_start + offset)
+        .expect("sidecar persist helper end");
+    let persist_source = &remote[persist_start..persist_end];
+    assert!(
+        persist_source.contains("request_body_json: None")
+            && persist_source.contains("response_body_json: None"),
+        "sidecar mirror audit must keep request/response detail NULL"
+    );
+    assert!(
+        !persist_source.contains("serde_json::to_string(&request)")
+            && !persist_source.contains("serde_json::to_string(request)"),
+        "sidecar must not serialize NeutralChatRequest into audit detail columns"
+    );
+    assert!(
+        !persist_source.contains("providerCompletions") && !persist_source.contains(r#""text":"#),
+        "sidecar must not write normalized completion payloads into audit detail columns"
+    );
+
+    // Local cancel/finish path must not reintroduce compact cancelled JSON as detail.
+    let main = fs::read_to_string(app_root.join("main.rs")).expect("main source");
+    let cancel_start = main
+        .find("fn cancelled_audit_outcome(")
+        .expect("cancelled audit outcome");
+    let cancel_end = main[cancel_start..]
+        .find("\nfn chat_run_was_cancelled")
+        .map(|offset| cancel_start + offset)
+        .expect("cancelled audit outcome end");
+    let cancel_source = &main[cancel_start..cancel_end];
+    assert!(
+        cancel_source.contains("response_body_json: None"),
+        "cancelled audit outcome must leave response detail NULL"
+    );
+    assert!(
+        !cancel_source.contains("response_body_json: Some")
+            && !cancel_source.contains("compact_cancelled_audit_response"),
+        "cancelled audit must not assign compact cancelled JSON into response_body_json"
+    );
+
+    // Capture-aware production helpers must not fall back to direct stream_chat.
+    for relative in ["main.rs", "hooks.rs", "prompt/compression.rs"] {
+        let source = fs::read_to_string(app_root.join(relative)).expect("read production source");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+        assert!(
+            !production.contains("stream_chat("),
+            "{relative} must not call stream_chat directly"
+        );
+    }
+    let remote = fs::read_to_string(app_root.join("remote_workspace.rs")).expect("remote source");
+    let remote_production = remote
+        .split("#[cfg(test)]")
+        .next()
+        .expect("remote production");
+    assert!(
+        remote_production.contains("stream_chat_with_capture_observer"),
+        "remote broker must use capture-aware stream helper"
+    );
+    assert_eq!(
+        remote_production.matches("stream_chat(").count(),
+        0,
+        "remote production must not call bare stream_chat("
+    );
+}
+
 fn collect_rust_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).expect("read app directory") {
         let entry = entry.expect("directory entry");

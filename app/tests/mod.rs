@@ -12767,6 +12767,8 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
 fn persistable_audit_response_body_json_only_keeps_details_when_enabled() {
     let compact = r#"{"cancelled":"chat run cancelled"}"#;
     let wire = r#"{"format":"provider_final_response_v1","version":1,"error":{"message":"x"}}"#;
+    let legacy_text = r#"{"text":"normalized completion"}"#;
+    let legacy_error = r#"{"error":"boom"}"#;
     assert_eq!(
         persistable_audit_response_body_json(compact, false, "cancelled"),
         None
@@ -12779,9 +12781,18 @@ fn persistable_audit_response_body_json_only_keeps_details_when_enabled() {
         persistable_audit_response_body_json(wire, true, "failed"),
         Some(wire)
     );
+    // Compact cancelled is never a valid provider dump, even with details on.
     assert_eq!(
         persistable_audit_response_body_json(compact, true, "cancelled"),
-        Some(compact)
+        None
+    );
+    assert_eq!(
+        persistable_audit_response_body_json(legacy_text, true, "succeeded"),
+        None
+    );
+    assert_eq!(
+        persistable_audit_response_body_json(legacy_error, true, "failed"),
+        None
     );
     assert_eq!(
         persistable_audit_response_body_json(wire, false, "cancelled"),
@@ -24692,8 +24703,8 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
     drop(database);
 
     let Json(detail) = crate::http::chat::ai_statistics_detail(
-        State(state),
-        AxumPath((workspace_id, llm_request_id)),
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), llm_request_id.clone())),
     )
     .await
     .expect("AI statistics detail");
@@ -24738,6 +24749,44 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
         detail_response["http"]["headers"]["set-cookie"][0],
         "session=response-cookie"
     );
+
+    // Exactly one real provider turn; no extra run-level normalized summary row.
+    let audit_rows = WorkspaceDatabase::open_or_create(workspace.path())
+        .expect("workspace database")
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            chat_id: Some(chat_id.as_str()),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("chat audit rows");
+    assert_eq!(audit_rows.len(), 1);
+    assert_eq!(audit_rows[0].id, llm_request_id);
+    assert_eq!(audit_rows[0].final_state, "succeeded");
+    assert!(!audit_rows[0].id.starts_with("run-"));
+
+    let Json(list) = crate::http::chat::ai_statistics(
+        State(state),
+        Query(crate::http::chat::AiStatisticsQuery {
+            workspace_id: Some(workspace_id),
+            request_id: None,
+            request_ids: Some(llm_request_id.clone()),
+            chat_id: Some(chat_id),
+            request_kind: None,
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: Some(1),
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("AI statistics list");
+    assert_eq!(list.total_count, 1);
+    assert_eq!(list.requests.len(), 1);
+    assert_eq!(list.requests[0].id, llm_request_id);
+    assert_eq!(list.requests[0].final_state, "succeeded");
 }
 
 #[tokio::test]
