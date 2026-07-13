@@ -1044,6 +1044,180 @@ describe("app agents verification surfaces", () => {
     });
   });
 
+  it("switches composer model when Plan mode uses a configured plan model", async () => {
+    const baseModel = settings.configuredModels[0]!;
+    const settingsWithPlanModel = {
+      ...settings,
+      configuredModels: [
+        baseModel,
+        {
+          ...baseModel,
+          activeProviderId: "anthropic",
+          displayName: "GPT Alt",
+          id: "gpt-alt",
+          providerIds: ["anthropic"],
+          thinkingLevel: null,
+        },
+      ],
+      plan: {
+        ...settings.plan,
+        modeModelId: "gpt-alt",
+      },
+    };
+    const definitionsWithDefaultAgent = {
+      agentDefinitions: agentDefinitionFixtures.agentDefinitions.map((definition) =>
+        definition.id === "agent-definition-default"
+          ? {
+            ...definition,
+            modelId: "gpt-test",
+            modelOptions: { maxOutputTokens: null, thinkingLevel: "low" },
+            providerId: "openai",
+          }
+          : definition,
+      ),
+      defaultRolePrompts: {
+        ...agentDefinitionFixtures.defaultRolePrompts,
+        "agent-definition-default": "Default built-in prompt.",
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/settings") {
+          return jsonResponse(settingsWithPlanModel);
+        }
+        if (path === "/api/agent-definitions") {
+          return jsonResponse(definitionsWithDefaultAgent);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    });
+
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("Anthropic / GPT Alt");
+    });
+
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    });
+  });
+
+  it("keeps a manual model pick after sending while Plan mode stays enabled", async () => {
+    const baseModel = settings.configuredModels[0]!;
+    const settingsWithPlanModel = {
+      ...settings,
+      configuredModels: [
+        baseModel,
+        {
+          ...baseModel,
+          activeProviderId: "anthropic",
+          displayName: "GPT Alt",
+          id: "gpt-alt",
+          providerIds: ["anthropic"],
+          thinkingLevel: null,
+        },
+      ],
+      plan: {
+        ...settings.plan,
+        modeModelId: "gpt-alt",
+      },
+    };
+    const definitionsWithDefaultAgent = {
+      agentDefinitions: agentDefinitionFixtures.agentDefinitions.map((definition) =>
+        definition.id === "agent-definition-default"
+          ? {
+            ...definition,
+            modelId: "gpt-test",
+            modelOptions: { maxOutputTokens: null, thinkingLevel: "low" },
+            providerId: "openai",
+          }
+          : definition,
+      ),
+      defaultRolePrompts: {
+        ...agentDefinitionFixtures.defaultRolePrompts,
+        "agent-definition-default": "Default built-in prompt.",
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/settings") {
+          return jsonResponse(settingsWithPlanModel);
+        }
+        if (path === "/api/agent-definitions") {
+          return jsonResponse(definitionsWithDefaultAgent);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    });
+
+    const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
+    await userEvent.click(planModeToggle);
+    expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("Anthropic / GPT Alt");
+    });
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    });
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "keep manual plan model",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
+        message: "keep manual plan model",
+        modelId: "gpt-test",
+        providerId: "openai",
+        sessionMode: "plan",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    });
+  });
+
   it("lets composer model provider and thinking selections override the default agent", async () => {
     stubDefaultAgentComposerDefaults();
     const fetchMock = vi.mocked(fetch);

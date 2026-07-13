@@ -250,8 +250,8 @@ export const settings = {
     retentionDays: null,
   },
   plan: {
-    mergeAutomationMode: "isolated_auto_once",
-    modeModelId: null,
+    mergeAutomationMode: "isolated_auto_once" as string,
+    modeModelId: null as string | null,
     mergeAutomationModes: [
       { label: "Isolated worktree, auto-merge once", value: "isolated_auto_once" },
     ],
@@ -3796,6 +3796,29 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         llmTimeoutMs: body.llmTimeoutMs,
       },
     });
+  }
+
+  if (path === "/api/settings/plan") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      mergeAutomationMode?: string;
+      modeModelId?: string | null;
+    };
+    const nextSettings = {
+      ...appTestState.settingsResponse,
+      plan: {
+        ...appTestState.settingsResponse.plan,
+        mergeAutomationMode:
+          typeof body.mergeAutomationMode === "string" && body.mergeAutomationMode.trim()
+            ? body.mergeAutomationMode.trim()
+            : appTestState.settingsResponse.plan.mergeAutomationMode,
+        modeModelId:
+          typeof body.modeModelId === "string" && body.modeModelId.trim()
+            ? body.modeModelId.trim()
+            : null,
+      },
+    };
+    appTestState.settingsResponse = nextSettings;
+    return jsonResponse(nextSettings);
   }
 
   if (path === "/api/settings/prompts") {

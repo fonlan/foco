@@ -444,6 +444,7 @@ export function SettingsPanel({
     useState<SpecSettingsFormState>(() => emptySpecSettingsForm());
   const [planMergeAutomationMode, setPlanMergeAutomationMode] =
     useState("isolated_auto_once");
+  const [planModeModelId, setPlanModeModelId] = useState("");
   const [planHistory, setPlanHistory] = useState<Plan[]>([]);
   const [planHistoryPage, setPlanHistoryPage] = useState(1);
   const [planHistoryPageSize, setPlanHistoryPageSize] = useState(20);
@@ -848,6 +849,10 @@ export function SettingsPanel({
       ),
     [configuredModels],
   );
+  const enabledConfiguredModels = useMemo(
+    () => configuredModelsByName.filter((model) => model.enabled),
+    [configuredModelsByName],
+  );
   const passwordInputValue =
     generalForm.password ||
     (settings?.general.webServer.passwordEnabled && !isEditingGeneralPassword
@@ -1029,6 +1034,7 @@ export function SettingsPanel({
     setPlanMergeAutomationMode(
       data.plan.mergeAutomationMode || "isolated_auto_once",
     );
+    setPlanModeModelId(data.plan.modeModelId ?? "");
   }
 
   function syncMemorySettingsForm(data: SettingsResponse) {
@@ -2298,7 +2304,7 @@ export function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings/plan", {
         body: JSON.stringify({
           mergeAutomationMode: planMergeAutomationMode,
-          modeModelId: settings?.plan.modeModelId ?? null,
+          modeModelId: planModeModelId.trim() || null,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -6270,6 +6276,24 @@ export function SettingsPanel({
                     {(settings?.plan.mergeAutomationModes ?? []).map((mode) => (
                       <option key={mode.value} value={mode.value}>
                         {t(mode.label)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="mt-4 block">
+                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    {t("Plan mode model")}
+                  </span>
+                  <select
+                    aria-label={t("Plan mode model")}
+                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    onChange={(event) => setPlanModeModelId(event.target.value)}
+                    value={planModeModelId}
+                  >
+                    <option value="">{t("Default agent model")}</option>
+                    {enabledConfiguredModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.displayName || model.id}
                       </option>
                     ))}
                   </select>

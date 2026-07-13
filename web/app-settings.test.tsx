@@ -283,6 +283,38 @@ describe("app-settings verification surfaces", () => {
     ]);
   });
 
+  it("saves plan mode model from plan settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Plan settings" }));
+
+    const select = await screen.findByLabelText("Plan mode model");
+    const options = Array.from((select as HTMLSelectElement).options).map((option) => ({
+      label: option.textContent,
+      value: option.value,
+    }));
+    expect(options).toEqual([
+      { label: "Default agent model", value: "" },
+      { label: "GPT Test", value: "gpt-test" },
+    ]);
+
+    await userEvent.selectOptions(select, "gpt-test");
+    await userEvent.click(screen.getByRole("button", { name: "Save plan settings" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/plan");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall![1]?.body))).toEqual({
+        mergeAutomationMode: "isolated_auto_once",
+        modeModelId: "gpt-test",
+      });
+    });
+    expect(select).toHaveValue("gpt-test");
+  });
+
   it("toggles a skill location with a location-only request", async () => {
     const fetchMock = vi.mocked(fetch);
     const locationPath = "C:\\Users\\fonla\\.agents\\skills";

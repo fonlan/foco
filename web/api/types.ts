@@ -1627,7 +1627,7 @@ export type PlanMergeAutomationModeSummary = {
 
 export type PlanSettingsSummary = {
   mergeAutomationMode: string;
-  modeModelId?: string | null;
+  modeModelId: string | null;
   mergeAutomationModes: PlanMergeAutomationModeSummary[];
 };
 

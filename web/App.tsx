@@ -5171,15 +5171,57 @@ export function App() {
     return scheduledWorkspaceRuns.filter((run) => run.workspaceId === workspaceId);
   }
 
-  function setActiveWorkspaceChatRefs(workspaceId: string, chatId: string | null) {
+  function setActiveWorkspaceChatRefs(
+    workspaceId: string,
+    chatId: string | null,
+    options: { syncPlanMode?: boolean } = {},
+  ) {
     activeWorkspaceIdRef.current = workspaceId;
     activeChatIdRef.current = chatId;
     activeChatKeyRef.current = chatId ? chatRunKey(workspaceId, chatId) : null;
-    restorePlanModeForChatKey(activeChatKeyRef.current);
+    // Only restore plan/model on real chat navigation. Queue accept and stream
+    // start also update active chat ids and must not rewrite a manual model pick.
+    if (options.syncPlanMode) {
+      restorePlanModeForChatKey(activeChatKeyRef.current);
+    }
   }
 
   function restorePlanModeForChatKey(chatKey: string | null) {
-    setIsPlanModeEnabled(chatKey ? planModeByChatKeyRef.current[chatKey] === true : false);
+    const enabled = chatKey ? planModeByChatKeyRef.current[chatKey] === true : false;
+    setIsPlanModeEnabled(enabled);
+    applyComposerModelForPlanMode(enabled);
+  }
+
+  function applyComposerModelForPlanMode(enabled: boolean) {
+    if (enabled) {
+      const modeModelId = settings?.plan.modeModelId?.trim() || "";
+      if (!modeModelId) {
+        return;
+      }
+      const model = availableModels.find((candidate) => candidate.id === modeModelId);
+      if (!model) {
+        return;
+      }
+      const providerId =
+        model.activeProviderId && model.providerIds.includes(model.activeProviderId)
+          ? model.activeProviderId
+          : model.providerIds[0] ?? "";
+      if (!providerId) {
+        return;
+      }
+      hasManuallySelectedModelRef.current = true;
+      hasManuallySelectedThinkingLevelRef.current = false;
+      setSelectedModelId(model.id);
+      setSelectedProviderId(providerId);
+      setSelectedThinkingLevel(defaultThinkingLevelForModel(model));
+      return;
+    }
+
+    hasManuallySelectedModelRef.current = false;
+    hasManuallySelectedThinkingLevelRef.current = false;
+    setSelectedModelId(defaultComposerSelection.modelId);
+    setSelectedProviderId(defaultComposerSelection.providerId);
+    setSelectedThinkingLevel(defaultComposerSelection.thinkingLevel);
   }
 
   function rememberPlanModeForChatKey(chatKey: string, value: boolean) {
@@ -5498,7 +5540,7 @@ export function App() {
       setActiveChatId(chatId);
       setActiveMainTab({ chatId, type: "chat", workspaceId });
       setExpandedWorkspaceId(workspaceId);
-      setActiveWorkspaceChatRefs(workspaceId, chatId);
+      setActiveWorkspaceChatRefs(workspaceId, chatId, { syncPlanMode: true });
       setMessages(cachedMessages);
       setSelectedDiffPath(null);
       setViewMode("chat");
@@ -5530,7 +5572,7 @@ export function App() {
       setActiveMainTab({ chatId, type: "chat", workspaceId });
       setExpandedWorkspaceId(workspaceId);
       openChatTab(workspaceId, chatId);
-      setActiveWorkspaceChatRefs(workspaceId, chatId);
+      setActiveWorkspaceChatRefs(workspaceId, chatId, { syncPlanMode: true });
       setMessages([]);
       setSelectedDiffPath(null);
       setViewMode("chat");
@@ -5547,7 +5589,7 @@ export function App() {
     setActiveMainTab({ chatId, type: "chat", workspaceId });
     setExpandedWorkspaceId(workspaceId);
     openChatTab(workspaceId, chatId);
-    setActiveWorkspaceChatRefs(workspaceId, chatId);
+    setActiveWorkspaceChatRefs(workspaceId, chatId, { syncPlanMode: true });
     rememberChatCacheAccess(chatKey);
     setMessages(cachedMessages);
     setViewMode("chat");
@@ -5566,7 +5608,7 @@ export function App() {
   ) {
     resetComposerDefaultsForNewChat();
     setExpandedWorkspaceId(workspaceId);
-    setActiveWorkspaceChatRefs(workspaceId, null);
+    setActiveWorkspaceChatRefs(workspaceId, null, { syncPlanMode: true });
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
     setActiveMainTab({ chatId: null, type: "chat", workspaceId });
@@ -5666,7 +5708,7 @@ export function App() {
       workspaceId: tab.workspaceId,
     });
     setExpandedWorkspaceId(tab.workspaceId);
-    setActiveWorkspaceChatRefs(tab.workspaceId, tab.chatId);
+    setActiveWorkspaceChatRefs(tab.workspaceId, tab.chatId, { syncPlanMode: true });
     setMessages(cachedMessages ?? []);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -6229,7 +6271,7 @@ export function App() {
     }
 
     const workspaceId = activeWorkspaceId || anchorTab.workspaceId;
-    setActiveWorkspaceChatRefs(workspaceId, null);
+    setActiveWorkspaceChatRefs(workspaceId, null, { syncPlanMode: true });
     setActiveChatId(null);
     setMessages([]);
     setActiveMainTab({ chatId: null, type: "chat", workspaceId });
@@ -6324,7 +6366,9 @@ export function App() {
       return;
     }
 
-    setActiveWorkspaceChatRefs(activeWorkspaceId || workspaceId, null);
+    setActiveWorkspaceChatRefs(activeWorkspaceId || workspaceId, null, {
+      syncPlanMode: true,
+    });
     setActiveChatId(null);
     setMessages([]);
     setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || workspaceId });
@@ -6442,7 +6486,7 @@ export function App() {
         );
         openChatTabsRef.current = nextOpenChatTabs;
         setOpenChatTabs(nextOpenChatTabs);
-        setActiveWorkspaceChatRefs(workspaceId, null);
+        setActiveWorkspaceChatRefs(workspaceId, null, { syncPlanMode: true });
         setActiveWorkspaceId(workspaceId);
         setActiveChatId(null);
         setActiveMainTab({ chatId: null, type: "chat", workspaceId });
@@ -7030,6 +7074,7 @@ export function App() {
 
   function handlePlanModeEnabledChange(value: boolean) {
     setIsPlanModeEnabled(value);
+    applyComposerModelForPlanMode(value);
     const chatKey = activeChatKeyRef.current;
     if (chatKey) {
       rememberPlanModeForChatKey(chatKey, value);
