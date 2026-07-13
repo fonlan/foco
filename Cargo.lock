@@ -1335,6 +1335,7 @@ dependencies = [
  "foco-store",
  "gix",
  "globset",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

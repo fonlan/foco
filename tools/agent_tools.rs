@@ -1,10 +1,20 @@
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
     AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
     AGENT_WAIT_TASKS_TOOL, ToolDefinition,
 };
+
+/// Matches `foco_agent::validate_agent_id` total length bound.
+const AGENT_ID_MAX_LENGTH: u64 = 128;
+/// Matches `AgentDefinitionId::PREFIX` without importing `foco-agent`.
+const AGENT_DEFINITION_ID_PREFIX: &str = "agent-definition-";
+/// Matches `AgentInstanceId::PREFIX` without importing `foco-agent`.
+const AGENT_INSTANCE_ID_PREFIX: &str = "agent-instance-";
+/// Suffix must be non-empty ascii lowercase / digit / hyphen (same as runtime).
+const AGENT_DEFINITION_ID_PATTERN: &str = "^agent-definition-[a-z0-9-]+$";
+const AGENT_INSTANCE_ID_PATTERN: &str = "^agent-instance-[a-z0-9-]+$";
 
 pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -17,6 +27,34 @@ pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
         agent_transfer_task_definition(),
         agent_create_instances_definition(),
     ]
+}
+
+/// JSON Schema fragment for Agent definition ids.
+/// Kept in `foco-tools` (not `foco-agent`) to avoid a tools→agent dependency cycle.
+fn agent_definition_id_schema(description: &str, nullable: bool) -> Value {
+    agent_id_schema(AGENT_DEFINITION_ID_PATTERN, description, nullable)
+}
+
+/// JSON Schema fragment for Agent instance ids.
+fn agent_instance_id_schema(description: &str, nullable: bool) -> Value {
+    agent_id_schema(AGENT_INSTANCE_ID_PATTERN, description, nullable)
+}
+
+fn agent_id_schema(pattern: &str, description: &str, nullable: bool) -> Value {
+    // `pattern` + `maxLength` mirror runtime validate_agent_id. OpenAI-style strict tool
+    // schemas already accept sibling constraints such as `minimum`; keep both machine-readable
+    // constraints so providers that honor them reject illegal IDs before execution.
+    let type_value = if nullable {
+        json!(["string", "null"])
+    } else {
+        json!("string")
+    };
+    json!({
+        "type": type_value,
+        "pattern": pattern,
+        "maxLength": AGENT_ID_MAX_LENGTH,
+        "description": description
+    })
 }
 
 fn agent_list_definition() -> ToolDefinition {
@@ -104,19 +142,19 @@ fn agent_send_message_definition() -> ToolDefinition {
 fn agent_delegate_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_DELEGATE_TASK_TOOL,
-        description: "Create an asynchronous child task for an existing instance in the current Agent team. Returns immediately with the task id and selected instance id.",
+        description: "Create an asynchronous child task for an existing instance in the current Agent team. Returns immediately with the task id and selected instance id. Copy IDs exactly from agent_list.definitions[].id or agent_list.instances[].id; never use display names, role names, or hand-constructed IDs. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null). targetDefinitionId only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "targetInstanceId": {
-                    "type": ["string", "null"],
-                    "description": "Exact target Agent instance id. Provide exactly one of targetInstanceId or targetDefinitionId."
-                },
-                "targetDefinitionId": {
-                    "type": ["string", "null"],
-                    "description": "Target Agent definition id. Uses an existing instance only; no instance is auto-created. Provide exactly one of targetInstanceId or targetDefinitionId."
-                },
+                "targetInstanceId": agent_instance_id_schema(
+                    "Exact target Agent instance id. Must use the agent-instance- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.instances[].id. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null).",
+                    true,
+                ),
+                "targetDefinitionId": agent_definition_id_schema(
+                    "Target Agent definition id. Must use the agent-definition- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.definitions[].id. Routes only to an existing runnable instance in the current team; does not auto-create instances. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null).",
+                    true,
+                ),
                 "input": {
                     "type": "object",
                     "additionalProperties": false,
@@ -204,7 +242,7 @@ fn agent_wait_tasks_definition() -> ToolDefinition {
 fn agent_transfer_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_TRANSFER_TASK_TOOL,
-        description: "Transfer a queued Agent task to another existing instance in the current team. Running, waiting, and terminal tasks are rejected.",
+        description: "Transfer a queued Agent task to another existing instance in the current team. Running, waiting, and terminal tasks are rejected. Copy targetInstanceId from agent_list.instances[].id; never use display names or hand-constructed IDs.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -213,10 +251,10 @@ fn agent_transfer_task_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "Queued Agent task id to transfer."
                 },
-                "targetInstanceId": {
-                    "type": "string",
-                    "description": "Existing target Agent instance id in the same team."
-                },
+                "targetInstanceId": agent_instance_id_schema(
+                    "Existing target Agent instance id in the same team. Must use the agent-instance- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.instances[].id.",
+                    false,
+                ),
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
@@ -231,15 +269,15 @@ fn agent_transfer_task_definition() -> ToolDefinition {
 fn agent_create_instances_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_CREATE_INSTANCES_TOOL,
-        description: "Create one or more worker Agent instances for an allowed definition in the current team. Creation is atomic and never routes work implicitly.",
+        description: "Create one or more worker Agent instances for an allowed definition in the current team. Creation is atomic and never routes work implicitly. Copy definitionId from agent_list.definitions[].id; never use display names or hand-constructed IDs.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "definitionId": {
-                    "type": "string",
-                    "description": "Agent definition id to instantiate. Must be allowed by the caller permissions."
-                },
+                "definitionId": agent_definition_id_schema(
+                    "Agent definition id to instantiate. Must use the agent-definition- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.definitions[].id. Must be allowed by the caller permissions.",
+                    false,
+                ),
                 "count": {
                     "type": "integer",
                     "minimum": 1,
@@ -264,6 +302,7 @@ fn agent_create_instances_definition() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
     use std::collections::BTreeSet;
 
     #[test]
@@ -323,6 +362,219 @@ mod tests {
             }
             assert_strict_schema_children(&definition.name, &definition.input_schema);
         }
+    }
+
+    #[test]
+    fn agent_id_schemas_match_runtime_format_contract() {
+        let definitions = agent_tool_definitions();
+        let by_name = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+        };
+
+        let delegate = by_name(AGENT_DELEGATE_TASK_TOOL);
+        assert_agent_id_property(
+            &delegate.input_schema["properties"]["targetDefinitionId"],
+            AGENT_DEFINITION_ID_PATTERN,
+            true,
+        );
+        assert_agent_id_property(
+            &delegate.input_schema["properties"]["targetInstanceId"],
+            AGENT_INSTANCE_ID_PATTERN,
+            true,
+        );
+
+        let transfer = by_name(AGENT_TRANSFER_TASK_TOOL);
+        assert_agent_id_property(
+            &transfer.input_schema["properties"]["targetInstanceId"],
+            AGENT_INSTANCE_ID_PATTERN,
+            false,
+        );
+
+        let create = by_name(AGENT_CREATE_INSTANCES_TOOL);
+        assert_agent_id_property(
+            &create.input_schema["properties"]["definitionId"],
+            AGENT_DEFINITION_ID_PATTERN,
+            false,
+        );
+
+        // Fixed degradation policy: keep both pattern and maxLength as public machine
+        // constraints (same family as existing `minimum` on integer fields). Do not drop
+        // either without updating this test and provider strict-schema guidance.
+        for schema in [
+            &delegate.input_schema["properties"]["targetDefinitionId"],
+            &delegate.input_schema["properties"]["targetInstanceId"],
+            &transfer.input_schema["properties"]["targetInstanceId"],
+            &create.input_schema["properties"]["definitionId"],
+        ] {
+            assert_eq!(
+                schema.get("maxLength").and_then(|value| value.as_u64()),
+                Some(AGENT_ID_MAX_LENGTH)
+            );
+            assert!(
+                schema
+                    .get("pattern")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_id_schema_patterns_accept_runtime_valid_ids_and_reject_invalid() {
+        // Compile the published schema pattern strings with a real regex engine so a
+        // typo or over-broad pattern cannot pass by mapping to parallel hand logic.
+        let definition_re =
+            Regex::new(AGENT_DEFINITION_ID_PATTERN).expect("definition id pattern compiles");
+        let instance_re =
+            Regex::new(AGENT_INSTANCE_ID_PATTERN).expect("instance id pattern compiles");
+
+        for valid in [
+            "agent-definition-1",
+            "agent-definition-worker",
+            "agent-definition-1700000000000-1",
+            "agent-definition-a-b-c",
+        ] {
+            assert!(
+                definition_re.is_match(valid) && valid.len() <= AGENT_ID_MAX_LENGTH as usize,
+                "expected valid definition id: {valid}"
+            );
+            assert!(valid.starts_with(AGENT_DEFINITION_ID_PREFIX));
+            assert!(
+                matches_runtime_agent_id(valid, AGENT_DEFINITION_ID_PREFIX),
+                "schema-valid definition id must also satisfy runtime rules: {valid}"
+            );
+        }
+        for invalid in [
+            "definition-1",
+            "agent-definition-",
+            "agent-definition-UPPER",
+            "agent-definition-with_underscore",
+            "agent-instance-1",
+            "Agent-definition-1",
+            "agent-definition-.*",
+        ] {
+            assert!(
+                !definition_re.is_match(invalid),
+                "expected invalid definition id: {invalid}"
+            );
+        }
+
+        for valid in [
+            "agent-instance-1",
+            "agent-instance-review",
+            "agent-instance-1782058615186-10",
+        ] {
+            assert!(
+                instance_re.is_match(valid) && valid.len() <= AGENT_ID_MAX_LENGTH as usize,
+                "expected valid instance id: {valid}"
+            );
+            assert!(valid.starts_with(AGENT_INSTANCE_ID_PREFIX));
+            assert!(
+                matches_runtime_agent_id(valid, AGENT_INSTANCE_ID_PREFIX),
+                "schema-valid instance id must also satisfy runtime rules: {valid}"
+            );
+        }
+        for invalid in [
+            "instance-1",
+            "agent-instance-",
+            "agent-instance-UPPER",
+            "agent-instance-with_underscore",
+            "agent-definition-1",
+        ] {
+            assert!(
+                !instance_re.is_match(invalid),
+                "expected invalid instance id: {invalid}"
+            );
+        }
+
+        // Pattern allows suffix charset only; total length is maxLength (and runtime).
+        let too_long_definition = format!(
+            "{AGENT_DEFINITION_ID_PREFIX}{}",
+            "a".repeat(AGENT_ID_MAX_LENGTH as usize)
+        );
+        assert!(too_long_definition.len() > AGENT_ID_MAX_LENGTH as usize);
+        assert!(definition_re.is_match(&too_long_definition));
+        assert!(!matches_runtime_agent_id(
+            &too_long_definition,
+            AGENT_DEFINITION_ID_PREFIX
+        ));
+    }
+
+    #[test]
+    fn agent_delegate_task_description_documents_id_source_and_no_auto_create() {
+        let description = agent_delegate_task_definition().description;
+        for fragment in [
+            "agent_list.definitions[].id",
+            "agent_list.instances[].id",
+            "exactly one of targetInstanceId or targetDefinitionId",
+            "never auto-creates",
+            "agent_create_instances",
+            "display names",
+        ] {
+            assert!(
+                description.contains(fragment),
+                "delegate description missing `{fragment}`: {description}"
+            );
+        }
+
+        let schema = agent_delegate_task_definition().input_schema;
+        let target_instance = schema["properties"]["targetInstanceId"]["description"]
+            .as_str()
+            .expect("targetInstanceId description");
+        let target_definition = schema["properties"]["targetDefinitionId"]["description"]
+            .as_str()
+            .expect("targetDefinitionId description");
+        assert!(target_instance.contains("exactly one of targetInstanceId or targetDefinitionId"));
+        assert!(
+            target_definition.contains("exactly one of targetInstanceId or targetDefinitionId")
+        );
+        assert!(target_definition.contains("does not auto-create"));
+        assert!(target_instance.contains("agent_list.instances[].id"));
+        assert!(target_definition.contains("agent_list.definitions[].id"));
+
+        let create_description = agent_create_instances_definition().description;
+        assert!(create_description.contains("agent_list.definitions[].id"));
+        let transfer_description = agent_transfer_task_definition().description;
+        assert!(transfer_description.contains("agent_list.instances[].id"));
+    }
+
+    fn assert_agent_id_property(schema: &Value, expected_pattern: &str, nullable: bool) {
+        if nullable {
+            assert_eq!(schema["type"], json!(["string", "null"]));
+        } else {
+            assert_eq!(schema["type"], json!("string"));
+        }
+        assert_eq!(
+            schema.get("pattern").and_then(|value| value.as_str()),
+            Some(expected_pattern)
+        );
+        assert_eq!(
+            schema.get("maxLength").and_then(|value| value.as_u64()),
+            Some(AGENT_ID_MAX_LENGTH)
+        );
+        assert!(
+            schema
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| !text.is_empty())
+        );
+    }
+
+    /// Runtime-aligned id rules (mirrors `foco_agent::validate_agent_id` without a crate edge).
+    fn matches_runtime_agent_id(value: &str, prefix: &str) -> bool {
+        let Some(suffix) = value
+            .strip_prefix(prefix)
+            .filter(|suffix| !suffix.is_empty())
+        else {
+            return false;
+        };
+        value.len() <= AGENT_ID_MAX_LENGTH as usize
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     }
 
     fn assert_strict_schema_object(tool_name: &str, schema: &serde_json::Value) {
