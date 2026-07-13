@@ -8744,7 +8744,7 @@ async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
     let state = test_app_state(config, profile_dir.clone());
     let response = timeout(
         Duration::from_millis(200),
-        crate::http::chat::team_chat_task_sse(&state, &workspace, &queued_task_id),
+        crate::http::chat::team_chat_task_sse(&state, &workspace, &queued_task_id, -1),
     )
     .await
     .expect("queued Coordinator stream should not wait for task start")
@@ -12065,7 +12065,7 @@ async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
     };
 
     let state = test_app_state(config, profile_dir.clone());
-    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id, -1)
         .await
         .expect("waiting Coordinator stream response");
     let body = response.into_response().into_body();
@@ -12137,7 +12137,7 @@ async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting()
     };
 
     let state = test_app_state(config, profile_dir.clone());
-    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id, -1)
         .await
         .expect("waiting Coordinator stream response");
     let mut stream = response.into_response().into_body().into_data_stream();
@@ -12262,7 +12262,7 @@ async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
     };
 
     let state = test_app_state(config, profile_dir.clone());
-    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id, -1)
         .await
         .expect("interrupted waiting Coordinator stream response");
     let body = response.into_response().into_body();
@@ -12272,6 +12272,298 @@ async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
         completed.is_err(),
         "interrupted Coordinator with wait dependencies should stay open for recovery"
     );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn subscribe_chat_run_keeps_waiting_coordinator_stream_open_and_resumes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-subscribe-waiting-resume-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-subscribe-waiting-resume-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-subscribe-waiting-resume";
+    let user_message_id = "user-subscribe-waiting-resume";
+    let assistant_message_id = "assistant-subscribe-waiting-resume";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Subscribe waiting resume")
+            .expect("chat insert");
+        let task_id = insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            user_message_id,
+            "subscribe-waiting-resume",
+        );
+        let run_id = task_id.to_string();
+        let start = ChatSseEvent::Start {
+            chat_id: chat_id.to_string(),
+            user_message_id: user_message_id.to_string(),
+            assistant_message_id: assistant_message_id.to_string(),
+            llm_request_id: run_id.clone(),
+            memories_used: Vec::new(),
+        };
+        let captured = captured_event(&start);
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("{run_id}-event-0"),
+                chat_id,
+                run_id: &run_id,
+                sequence: 0,
+                event_type: &captured.event_type,
+                payload_json: &captured.normalized_event_json,
+            })
+            .expect("run event insert");
+        task_id
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let response = crate::http::chat::subscribe_chat_run(
+        State(state.clone()),
+        AxumPath((workspace.id.clone(), task_id.to_string())),
+        Query(crate::http::chat::ChatRunStreamQuery {
+            after_sequence: Some(0),
+        }),
+    )
+    .await
+    .expect("waiting coordinator reattach response");
+    let mut stream = response.into_response().into_body().into_data_stream();
+
+    let early = timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(
+        early.is_err(),
+        "waiting coordinator reattach should stay open without streamEnd or replaying sequence 0"
+    );
+
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = state
+        .active_chat_runs
+        .register(
+            task_id.to_string(),
+            workspace.id.clone(),
+            chat_id.to_string(),
+            assistant_message_id.to_string(),
+            1,
+            Vec::new(),
+            true,
+            1,
+            guidance_tx,
+        )
+        .expect("register recovered attempt");
+    registration
+        .record_event(
+            &workspace_dir,
+            chat_id,
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: assistant_message_id.to_string(),
+                delta: "Resumed after wait.".to_string(),
+                reasoning_duration_ms: None,
+            },
+        )
+        .expect("record resumed text");
+
+    let mut body = String::new();
+    let resumed = timeout(Duration::from_millis(500), stream.next())
+        .await
+        .expect("resumed event should arrive on original subscription")
+        .expect("resumed event chunk")
+        .expect("resumed event body");
+    body.push_str(&String::from_utf8_lossy(&resumed));
+    assert!(body.contains("id: 1"), "{body}");
+    assert!(body.contains("Resumed after wait."), "{body}");
+    assert!(!body.contains("id: 0"), "{body}");
+    assert!(!body.contains(r#""type":"streamEnd""#), "{body}");
+
+    registration.finish();
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task read")
+            .expect("task");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Waiting,
+                transition: foco_agent::AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(r#"{"message":"test terminal"}"#),
+                interruption_reason: None,
+            })
+            .expect("fail waiting task");
+    }
+
+    let mut saw_stream_end = false;
+    for _ in 0..20 {
+        let chunk = timeout(Duration::from_millis(300), stream.next())
+            .await
+            .expect("terminal events should arrive")
+            .expect("terminal event chunk")
+            .expect("terminal event body");
+        let text = String::from_utf8_lossy(&chunk);
+        body.push_str(&text);
+        if text.contains(r#""type":"streamEnd""#) {
+            saw_stream_end = true;
+            break;
+        }
+    }
+    assert!(saw_stream_end, "expected streamEnd once: {body}");
+    assert_eq!(
+        body.matches(r#""type":"streamEnd""#).count(),
+        1,
+        "streamEnd should be sent only once: {body}"
+    );
+
+    drop(stream);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn subscribe_chat_run_uses_registry_for_non_agent_and_worker_runs() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-subscribe-non-agent-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-subscribe-non-agent-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-subscribe-non-agent";
+    let worker_task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Subscribe non agent")
+            .expect("chat insert");
+        let coordinator_task_id = insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            "user-subscribe-non-agent",
+            "subscribe-non-agent",
+        );
+        let task = database
+            .agent_task(&coordinator_task_id)
+            .expect("task read")
+            .expect("task");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-subscribe-non-agent-worker")
+                .expect("worker id");
+        let worker_definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-subscribe-non-agent-worker")
+                .expect("definition id"),
+            revision: 1,
+            name: "Worker".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Work.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_instances_with_limits(
+                &[foco_store::workspace::NewAgentInstance {
+                    id: &worker_id,
+                    team_id: &task.team_id,
+                    definition: &worker_definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                2,
+                1,
+            )
+            .expect("worker create");
+        let worker_task_id =
+            foco_agent::AgentTaskId::new("agent-task-subscribe-non-agent-worker").expect("task id");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &worker_task_id,
+                team_id: &task.team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&task.owner_instance_id),
+                parent_task_id: Some(&coordinator_task_id),
+                input_json: r#"{"goal":"work"}"#,
+            })
+            .expect("worker task enqueue");
+        worker_task_id
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let worker_error = crate::http::chat::subscribe_chat_run(
+        State(state.clone()),
+        AxumPath((workspace.id.clone(), worker_task_id.to_string())),
+        Query(crate::http::chat::ChatRunStreamQuery {
+            after_sequence: None,
+        }),
+    )
+    .await
+    .expect_err("worker task must not upgrade to coordinator team stream");
+    assert!(
+        worker_error
+            .message
+            .contains("active chat run was not found"),
+        "{}",
+        worker_error.message
+    );
+
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = state
+        .active_chat_runs
+        .register(
+            "run-ordinary".to_string(),
+            workspace.id.clone(),
+            chat_id.to_string(),
+            "assistant-ordinary".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register ordinary run");
+    registration
+        .record_event(
+            &workspace_dir,
+            chat_id,
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-ordinary".to_string(),
+                delta: "ordinary".to_string(),
+                reasoning_duration_ms: None,
+            },
+        )
+        .expect("record ordinary event");
+
+    let response = crate::http::chat::subscribe_chat_run(
+        State(state),
+        AxumPath((workspace.id.clone(), "run-ordinary".to_string())),
+        Query(crate::http::chat::ChatRunStreamQuery {
+            after_sequence: Some(-1),
+        }),
+    )
+    .await
+    .expect("ordinary active run should use registry stream");
+    let mut stream = response.into_response().into_body().into_data_stream();
+    let chunk = timeout(Duration::from_millis(200), stream.next())
+        .await
+        .expect("ordinary event")
+        .expect("ordinary chunk")
+        .expect("ordinary body");
+    let body = String::from_utf8_lossy(&chunk);
+    assert!(body.contains("ordinary"), "{body}");
+    registration.finish();
+    drop(stream);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

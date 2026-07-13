@@ -143,7 +143,7 @@ pub(crate) struct EditChatUserMessageResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatRunStreamQuery {
-    after_sequence: Option<i64>,
+    pub(crate) after_sequence: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1482,7 +1482,7 @@ pub(crate) async fn stream_chat_response(
                 })?;
             drop(database);
             state.agent_scheduler.wake()?;
-            return team_chat_task_sse(&state, workspace, &task.id).await;
+            return team_chat_task_sse(&state, workspace, &task.id, -1).await;
         }
     }
     let chat_context = prepare_chat_context(&state, &config, &workspace_id, request).await?;
@@ -1525,8 +1525,14 @@ pub(crate) async fn team_chat_task_sse(
     state: &AppState,
     workspace: &WorkspaceConfig,
     task_id: &foco_agent::AgentTaskId,
+    after_sequence: i64,
 ) -> Result<BoxedChatSse, ApiError> {
-    let stream = team_chat_task_event_stream(state.clone(), workspace.clone(), task_id.clone());
+    let stream = team_chat_task_event_stream(
+        state.clone(),
+        workspace.clone(),
+        task_id.clone(),
+        after_sequence,
+    );
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(10))
@@ -1538,11 +1544,12 @@ fn team_chat_task_event_stream(
     state: AppState,
     workspace: WorkspaceConfig,
     task_id: foco_agent::AgentTaskId,
+    after_sequence: i64,
 ) -> BoxedChatEventStream {
     let stream = async_stream::stream! {
         // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
         let mut last_agent_event_sequence: Option<i64> = None;
-        let mut last_run_event_sequence: i64 = -1;
+        let mut last_run_event_sequence: i64 = after_sequence;
         loop {
             let mut streamed_active_run = false;
             if let Ok(subscription) =
@@ -1782,13 +1789,44 @@ pub(crate) async fn subscribe_chat_run(
     State(state): State<AppState>,
     AxumPath((workspace_id, run_id)): AxumPath<(String, String)>,
     Query(query): Query<ChatRunStreamQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<BoxedChatSse, ApiError> {
+    let after_sequence = query.after_sequence.unwrap_or(-1);
+    if let Ok(task_id) = foco_agent::AgentTaskId::new(run_id.as_str()) {
+        let config = config_snapshot(&state)?;
+        let workspace = workspace_by_id(&config, &workspace_id)?;
+        if let Some(task_id) = coordinator_task_id_for_run(&workspace.path, &task_id)? {
+            return team_chat_task_sse(&state, workspace, &task_id, after_sequence).await;
+        }
+    }
+
     let subscription =
         state
             .active_chat_runs
-            .subscribe(&workspace_id, &run_id, query.after_sequence)?;
+            .subscribe(&workspace_id, &run_id, Some(after_sequence))?;
+    Ok(boxed_chat_run_sse(subscription))
+}
 
-    Ok(chat_run_sse(subscription))
+fn coordinator_task_id_for_run(
+    workspace_path: &Path,
+    task_id: &foco_agent::AgentTaskId,
+) -> Result<Option<foco_agent::AgentTaskId>, ApiError> {
+    let database = open_workspace_database(workspace_path)?;
+    let Some(task) = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(None);
+    };
+    let Some(instance) = database
+        .agent_instance(&task.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(None);
+    };
+    if instance.role != foco_agent::AgentRole::Coordinator {
+        return Ok(None);
+    }
+    Ok(Some(task_id.clone()))
 }
 
 pub(crate) async fn cancel_chat_run(
@@ -1798,16 +1836,6 @@ pub(crate) async fn cancel_chat_run(
     state.active_chat_runs.cancel(&workspace_id, &run_id)?;
 
     Ok(Json(CancelChatRunResponse { ok: true, run_id }))
-}
-
-pub(crate) fn chat_run_sse(
-    subscription: ActiveChatRunSubscription,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(chat_run_subscription_stream(subscription)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(10))
-            .text("keep-alive"),
-    )
 }
 
 pub(crate) async fn add_chat_guidance(
