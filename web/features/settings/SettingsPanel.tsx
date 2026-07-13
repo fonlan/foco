@@ -2298,6 +2298,7 @@ export function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings/plan", {
         body: JSON.stringify({
           mergeAutomationMode: planMergeAutomationMode,
+          modeModelId: settings?.plan.modeModelId ?? null,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",

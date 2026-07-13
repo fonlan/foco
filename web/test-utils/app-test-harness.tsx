@@ -251,6 +251,7 @@ export const settings = {
   },
   plan: {
     mergeAutomationMode: "isolated_auto_once",
+    modeModelId: null,
     mergeAutomationModes: [
       { label: "Isolated worktree, auto-merge once", value: "isolated_auto_once" },
     ],

@@ -408,7 +408,7 @@ impl GlobalConfig {
         validate_prompt_settings(config_path, &self.prompts)?;
         validate_web_search_settings(config_path, &self.web_search)?;
         validate_spec_settings(config_path, &self.spec, &self.models, &self.providers)?;
-        validate_plan_settings(config_path, &self.plan)?;
+        validate_plan_settings(config_path, &self.plan, &self.models, &self.providers)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut remote_server_ids = HashSet::new();
@@ -1016,12 +1016,15 @@ impl Default for SpecSettings {
 pub struct PlanSettings {
     #[serde(default = "default_plan_merge_automation_mode")]
     pub merge_automation_mode: String,
+    #[serde(default)]
+    pub mode_model_id: Option<String>,
 }
 
 impl Default for PlanSettings {
     fn default() -> Self {
         Self {
             merge_automation_mode: default_plan_merge_automation_mode(),
+            mode_model_id: None,
         }
     }
 }
@@ -2640,6 +2643,8 @@ fn validate_spec_system_prompt(
 fn validate_plan_settings(
     config_path: Option<&Path>,
     settings: &PlanSettings,
+    models: &[ModelSettings],
+    providers: &[ProviderSettings],
 ) -> Result<(), ConfigError> {
     if !SUPPORTED_PLAN_MERGE_AUTOMATION_MODES.contains(&settings.merge_automation_mode.as_str()) {
         return invalid_config(
@@ -2649,6 +2654,24 @@ fn validate_plan_settings(
                 SUPPORTED_PLAN_MERGE_AUTOMATION_MODES.join(", ")
             ),
         );
+    }
+
+    if let Some(model_id) = &settings.mode_model_id {
+        require_non_empty(config_path, "plan.mode_model_id", model_id)?;
+
+        let model = models.iter().find(|model| model.id == *model_id);
+        let active_provider_enabled = model
+            .and_then(|model| model.active_provider_id.as_deref())
+            .and_then(|provider_id| providers.iter().find(|provider| provider.id == provider_id))
+            .is_some_and(|provider| provider.enabled);
+        if !model.is_some_and(|model| model.enabled) || !active_provider_enabled {
+            return invalid_config(
+                config_path,
+                format!(
+                    "plan.mode_model_id references missing, disabled, or providerless model '{model_id}'"
+                ),
+            );
+        }
     }
 
     Ok(())
@@ -4299,6 +4322,55 @@ mod tests {
             .expect_err("bad plan merge mode should fail");
 
         assert!(error.to_string().contains("plan.merge_automation_mode"));
+
+        loaded.config.plan.merge_automation_mode = default_plan_merge_automation_mode();
+        loaded.config.plan.mode_model_id = Some("missing-model".to_string());
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("missing plan mode model should fail");
+        assert!(error.to_string().contains("plan.mode_model_id"));
+
+        add_enabled_spec_model(&mut loaded.config, "plan-mode-model");
+        loaded.config.plan.mode_model_id = Some("plan-mode-model".to_string());
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("valid plan mode model should save");
+        let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
+        assert_eq!(
+            reloaded.plan.mode_model_id.as_deref(),
+            Some("plan-mode-model")
+        );
+
+        loaded.config.models.iter_mut().for_each(|model| {
+            if model.id == "plan-mode-model" {
+                model.enabled = false;
+            }
+        });
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("disabled plan mode model should fail");
+        assert!(error.to_string().contains("plan.mode_model_id"));
+    }
+
+    #[test]
+    fn plan_mode_model_id_defaults_for_old_configs() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        let config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        let mut json = serde_json::to_value(&config).expect("config json");
+        let plan = json
+            .get_mut("plan")
+            .and_then(Value::as_object_mut)
+            .expect("plan object");
+        plan.remove("modeModelId");
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&json).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("old config should load");
+        assert_eq!(loaded.plan.mode_model_id, None);
     }
 
     #[test]

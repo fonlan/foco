@@ -169,6 +169,7 @@ pub(crate) async fn settings_response(
         },
         plan: PlanSettingsSummary {
             merge_automation_mode: config.plan.merge_automation_mode.clone(),
+            mode_model_id: config.plan.mode_model_id.clone(),
             merge_automation_modes: vec![
                 PlanMergeAutomationModeSummary {
                     value: PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,

@@ -161,6 +161,7 @@ pub(crate) struct ManualSpecSettingsRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManualPlanSettingsRequest {
     pub(crate) merge_automation_mode: String,
+    pub(crate) mode_model_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -457,6 +458,7 @@ pub(crate) struct SpecSettingsSummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PlanSettingsSummary {
     pub(crate) merge_automation_mode: String,
+    pub(crate) mode_model_id: Option<String>,
     pub(crate) merge_automation_modes: Vec<PlanMergeAutomationModeSummary>,
 }
 
@@ -1606,6 +1608,7 @@ pub(crate) async fn save_plan_settings(
     let mut config = config_snapshot(&state)?;
     config.plan = PlanSettings {
         merge_automation_mode: request.merge_automation_mode.trim().to_string(),
+        mode_model_id: optional_trimmed_string(request.mode_model_id),
     };
     config
         .validate(Some(&state.config_file))
