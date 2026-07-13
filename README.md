@@ -134,9 +134,11 @@ This builds the web assets and then runs `cargo build --release -p foco-app`. On
 
 ### Remote Sidecar Release Artifacts
 
-Remote SSH workspaces use Linux sidecars bundled with the desktop release. The CI release workflow builds `linux-x64` and `linux-arm64` sidecars with `cross`, writes `sidecars/manifest.json`, and records the `sha256` for each binary. macOS packaging copies verified sidecars into `Foco.app/Contents/Resources/sidecars/`; the Windows NSIS installer copies them into `resources\sidecars\` under the install directory.
+Remote SSH workspaces use Linux sidecars bundled with the desktop release. The CI release workflow builds `linux-x64` and `linux-arm64` sidecars with `cross`, writes `sidecars/manifest.json`, and records the `sha256` for each binary. macOS packaging copies verified sidecars into `Foco.app/Contents/Resources/sidecars/`; the Windows NSIS installer copies them into `resources\\sidecars\\` under the install directory.
 
-Users only need to install local Foco. On first connection to a remote workspace, Foco selects the packaged sidecar for the server target, verifies the manifest hash, and uploads it over SSH stdin to `~/.foco/sidecars/<version>/<target>/foco`. Advanced server profiles can set `focoCommand` to skip upload and use an existing Foco command on the remote server. Remote cleanup keeps the latest two sidecar versions and removes older versions after a newer sidecar starts successfully.
+Users only need to install local Foco. The main process uses a pure-Rust SSH client (`russh`): password or public-key/SSH-agent auth, OpenSSH-compatible `known_hosts`, remote command exec, stdin sidecar upload, keepalive, and `direct-tcpip` forward to the remote loopback sidecar. It does **not** require system `ssh`/`scp`/`sftp` or askpass. On first connection, Foco selects the packaged sidecar for the server target, verifies the manifest hash, and uploads it over SSH stdin to `~/.foco/sidecars/<version>/<target>/foco`. Advanced server profiles can set `focoCommand` to skip upload and use an existing Foco command on the remote server. Remote cleanup keeps the latest two sidecar versions and removes older versions after a newer sidecar starts successfully.
+
+Supported OpenSSH config fields (profile overrides config): HostName, User, Port, IdentityFile, UserKnownHostsFile, StrictHostKeyChecking. `ProxyCommand` and `ProxyJump` are rejected (not silently ignored). Login passwords may be stored in local global config only; API summaries expose `passwordConfigured` without the secret. Unknown host keys require fingerprint confirmation; changed host keys hard-fail until known_hosts is fixed out-of-band.
 
 ### macOS Pre-Support
 

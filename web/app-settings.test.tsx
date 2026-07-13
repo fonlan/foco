@@ -7,6 +7,7 @@ import type {
   ConfiguredProviderSummary,
   ConfiguredSkillSummary,
   MemoryDreamJobSummary,
+  RemoteServerSummary,
 } from "./api/types";
 import {
   activeMemory,
@@ -3252,6 +3253,233 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     expect(await screen.findByText("Image generation agent")).toBeInTheDocument();
+  });
+
+  it("remote server dialog uses hostname label, root/~, auth tabs, and password payload without echo", async () => {
+    const createdServer: RemoteServerSummary = {
+      id: "srv-1",
+      name: "Lab",
+      hostAlias: "10.0.0.8",
+      user: "root",
+      port: null,
+      identityFile: null,
+      authMethod: "password",
+      passwordConfigured: true,
+      defaultRemoteRoot: "~",
+      focoCommand: null,
+      terminalShell: null,
+      connectTimeoutMs: 10000,
+      status: "unknown",
+      lastError: null,
+      lastKnownTarget: null,
+      sidecarVersion: null,
+      sidecarInstallState: "not_installed",
+      workspaceCount: 0,
+      lastCheckedAt: null,
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+      if (path === "/api/remote-servers/create") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        expect(body).toMatchObject({
+          name: "Lab",
+          hostAlias: "10.0.0.8",
+          user: "root",
+          authMethod: "password",
+          password: "s3cret",
+          defaultRemoteRoot: "~",
+        });
+        expect(body).not.toHaveProperty("passwordConfigured");
+        appTestState.settingsResponse = {
+          ...appTestState.settingsResponse,
+          remoteServers: [createdServer],
+        };
+        return jsonResponse({ server: createdServer });
+      }
+      if (path === "/api/remote-servers/srv-1/connect") {
+        return jsonResponse({
+          server: createdServer,
+          result: {
+            ok: true,
+            errorKind: null,
+            message: "ok",
+            stages: [],
+          },
+        });
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Remote Servers" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Add remote server" }));
+    expect(screen.getByLabelText("SSH hostname / IP")).toBeInTheDocument();
+    expect(screen.getByLabelText("SSH user")).toHaveValue("root");
+    expect(screen.getByLabelText("Default remote root")).toHaveValue("~");
+    expect(screen.getByRole("tab", { name: "Key" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByLabelText("SSH password")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("tab", { name: "Password" }));
+    expect(screen.getByRole("tab", { name: "Password" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByPlaceholderText("~/.ssh/id_ed25519")).not.toBeInTheDocument();
+    const passwordField = screen.getByLabelText("SSH password");
+    expect(passwordField).toHaveAttribute("type", "password");
+    expect(passwordField).toHaveValue("");
+
+    await userEvent.type(screen.getByLabelText("Server name"), "Lab");
+    await userEvent.type(screen.getByLabelText("SSH hostname / IP"), "10.0.0.8");
+    await userEvent.type(passwordField, "s3cret");
+    await userEvent.click(screen.getByRole("button", { name: "Save remote server" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([url]) => url === "/api/remote-servers/create"),
+      ).toBe(true);
+    });
+  });
+
+  it("remote server identity browse and host-key unknown/changed interactions", async () => {
+    const existingServer: RemoteServerSummary = {
+      id: "srv-key",
+      name: "KeyBox",
+      hostAlias: "box.example",
+      user: "root",
+      port: 22,
+      identityFile: "/tmp/old-key",
+      authMethod: "key",
+      passwordConfigured: false,
+      defaultRemoteRoot: "~",
+      focoCommand: null,
+      terminalShell: null,
+      connectTimeoutMs: 10000,
+      status: "unknown",
+      lastError: null,
+      lastKnownTarget: null,
+      sidecarVersion: null,
+      sidecarInstallState: "not_installed",
+      workspaceCount: 0,
+      lastCheckedAt: null,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      remoteServers: [existingServer],
+    };
+
+    let trustCalled = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+      if (path === "/api/remote-servers/srv-key/test") {
+        if (trustCalled) {
+          return jsonResponse({
+            server: existingServer,
+            result: { ok: true, errorKind: null, message: "ok", stages: [] },
+          });
+        }
+        return jsonResponse({
+          server: existingServer,
+          result: {
+            ok: false,
+            errorKind: "host_key_unknown",
+            message: "unknown host key",
+            hostKeyVerificationRequired: true,
+            hostKey: {
+              host: "box.example",
+              port: 22,
+              algorithm: "ssh-ed25519",
+              fingerprintSha256: "SHA256:abcdef",
+            },
+            stages: [],
+          },
+        });
+      }
+      if (path === "/api/remote-servers/srv-key/trust-host-key") {
+        trustCalled = true;
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        expect(body).toMatchObject({ fingerprintSha256: "SHA256:abcdef" });
+        return jsonResponse({ trusted: true, server: existingServer });
+      }
+      if (path === "/api/file-picker/list") {
+        return jsonResponse({
+          entries: [
+            {
+              name: "id_ed25519",
+              path: "/home/user/.ssh/id_ed25519",
+              isDirectory: false,
+              isSymlink: false,
+            },
+          ],
+          path: "/home/user/.ssh",
+          parentPath: "/home/user",
+        });
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Remote Servers" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit remote server" }));
+    expect(screen.getByDisplayValue("/tmp/old-key")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Browse for private key" }));
+    // File picker dialog should open for local identity selection and fill back.
+    expect(await screen.findByText("Select private key file")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: /id_ed25519/i }));
+    await userEvent.click(screen.getByRole("button", { name: "Select" }));
+    expect(await screen.findByDisplayValue("/home/user/.ssh/id_ed25519")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Close remote server configuration" }));
+    await userEvent.click(screen.getByRole("button", { name: "Test remote server" }));
+
+    expect(await screen.findByRole("dialog", { name: /Unknown SSH host key/i })).toBeInTheDocument();
+    expect(screen.getByText("SHA256:abcdef")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Confirm and continue" }));
+    await waitFor(() => {
+      expect(trustCalled).toBe(true);
+      expect(screen.queryByRole("dialog", { name: /Unknown SSH host key/i })).not.toBeInTheDocument();
+    });
+
+    // Changed host key shows hard-fail messaging, not trust dialog.
+    const fetchMockChanged = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+      if (path === "/api/remote-servers/srv-key/test") {
+        return jsonResponse({
+          server: existingServer,
+          result: {
+            ok: false,
+            errorKind: "host_key_changed",
+            message: "host key changed",
+            hostKeyVerificationRequired: false,
+            hostKey: {
+              host: "box.example",
+              port: 22,
+              algorithm: "ssh-ed25519",
+              fingerprintSha256: "SHA256:newkey",
+            },
+            stages: [],
+          },
+        });
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMockChanged);
+    await userEvent.click(screen.getByRole("button", { name: "Test remote server" }));
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Host key changed — manual known_hosts fix required/i),
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("dialog", { name: /Unknown SSH host key/i })).not.toBeInTheDocument();
   });
 
 });

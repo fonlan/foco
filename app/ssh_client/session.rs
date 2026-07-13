@@ -260,9 +260,10 @@ impl client::Handler for ClientHandler {
                 server_public_key,
                 &self.known_hosts_path,
             );
-            let matches = info
-                .fingerprint_sha256
-                .eq_ignore_ascii_case(expected.trim());
+            let matches = super::known_hosts::fingerprints_equal(
+                &info.fingerprint_sha256,
+                expected,
+            );
             if !matches {
                 let err = SshError::with_host_key(
                     SshErrorKind::HostKeyChanged,
@@ -339,6 +340,7 @@ impl SshSession {
         connect_with_optional_trust(profile, None).await
     }
 
+    #[allow(dead_code)] // Used by diagnostics / future reconnect paths.
     pub fn profile(&self) -> &ResolvedSshProfile {
         &self.profile
     }
@@ -1076,10 +1078,18 @@ mod source_guards {
     fn production_rust_sources() -> Vec<PathBuf> {
         let mut roots = vec![
             PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("store"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("agent"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tools"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("providers"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("store"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("agent"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tools"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("providers"),
         ];
         let mut files = Vec::new();
         while let Some(root) = roots.pop() {

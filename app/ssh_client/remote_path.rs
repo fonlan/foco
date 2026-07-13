@@ -58,10 +58,7 @@ pub fn expand_command(input: &str) -> Result<String, SshError> {
 /// Expand `~` / `~/...` via an authenticated session.
 ///
 /// Absolute paths are returned as-is after validation (no remote round-trip).
-pub async fn expand_remote_path(
-    session: &SshSession,
-    input: &str,
-) -> Result<String, SshError> {
+pub async fn expand_remote_path(session: &SshSession, input: &str) -> Result<String, SshError> {
     let input = input.trim();
     validate_remote_path_input(input)?;
 

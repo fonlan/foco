@@ -812,9 +812,8 @@ fn validate_remote_workspace_path(path: &str) -> Result<(), ApiError> {
             "remote workspace remotePath must not be empty",
         ));
     }
-    crate::ssh_client::validate_remote_path_input(path).map_err(|err| {
-        ApiError::bad_request(err.message().to_string())
-    })
+    crate::ssh_client::validate_remote_path_input(path)
+        .map_err(|err| ApiError::bad_request(err.message().to_string()))
 }
 
 /// Expand home shorthand to an absolute POSIX path via authenticated russh session.

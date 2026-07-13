@@ -11,6 +11,7 @@ import type {
   ModelTestResponse,
   Plan,
   QuestionRequestSummary,
+  RemoteServerSummary,
   SettingsWorkspaceSpecJobSummary,
   UpdateStatusSummary,
   WorkspaceSpecJobSummary,
@@ -395,7 +396,7 @@ export const settings = {
       warnings: [],
     },
   ],
-  remoteServers: [],
+  remoteServers: [] as RemoteServerSummary[],
   skills: {
     detected: [
       {

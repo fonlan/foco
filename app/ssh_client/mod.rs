@@ -11,6 +11,9 @@ mod known_hosts;
 mod remote_path;
 mod session;
 
+#[cfg(test)]
+mod e2e_server;
+
 // Re-exports form the stable remote SSH API; some are reserved for Phase 4 UI trust flows.
 #[allow(unused_imports)]
 pub use config::{

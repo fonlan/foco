@@ -37,6 +37,7 @@ pub fn host_key_info(
 }
 
 /// Check `server_key` against the profile known_hosts file.
+#[allow(dead_code)] // Public API for handlers that hold ResolvedSshProfile.
 pub fn verify_server_key(
     profile: &ResolvedSshProfile,
     server_key: &russh::keys::PublicKey,
@@ -78,6 +79,11 @@ pub fn verify_server_key_path(
             }
         },
         Err(keys::Error::KeyChanged { line }) => {
+            // Classification for callers that want status-first APIs; hard-fail path maps to error.
+            let status = HostKeyStatus::Changed { info };
+            let HostKeyStatus::Changed { info } = status else {
+                unreachable!("just constructed Changed")
+            };
             let message = format!(
                 "REMOTE HOST IDENTIFICATION HAS CHANGED for {host}:{port} (known_hosts line {line}). Refusing to connect; remove the stale entry only after you verify the new key out-of-band"
             );
@@ -152,7 +158,8 @@ fn learn_known_hosts_path(
     )
 }
 
-fn fingerprints_equal(left: &str, right: &str) -> bool {
+/// Compare SHA-256 fingerprint strings (trim + case-insensitive).
+pub(crate) fn fingerprints_equal(left: &str, right: &str) -> bool {
     normalize_fingerprint(left) == normalize_fingerprint(right)
 }
 

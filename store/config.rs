@@ -1529,10 +1529,7 @@ impl fmt::Debug for RemoteServerProfile {
             .field("port", &self.port)
             .field("identity_file", &self.identity_file)
             .field("auth_method", &self.auth_method)
-            .field(
-                "password",
-                &self.password.as_ref().map(|_| REDACTED_SECRET),
-            )
+            .field("password", &self.password.as_ref().map(|_| REDACTED_SECRET))
             .field("default_remote_root", &self.default_remote_root)
             .field("foco_command", &self.foco_command)
             .field("terminal_shell", &self.terminal_shell)
@@ -1967,7 +1964,11 @@ fn validate_remote_server_profile(
             }
         }
         RemoteAuthMethod::Key => {
-            if server.password.as_ref().is_some_and(|value| !value.is_empty()) {
+            if server
+                .password
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            {
                 // Allow accidental leftover empty? Reject any password material in key mode
                 // so secrets are not retained after switching auth methods.
                 return invalid_config(
@@ -2076,9 +2077,7 @@ fn require_remote_default_root_path(
     }
     invalid_config(
         config_path,
-        format!(
-            "{field} must be an absolute remote path or home shorthand (~ or ~/...): {value}"
-        ),
+        format!("{field} must be an absolute remote path or home shorthand (~ or ~/...): {value}"),
     )
 }
 
@@ -3511,7 +3510,9 @@ mod tests {
             connect_timeout_ms: DEFAULT_REMOTE_CONNECT_TIMEOUT_MS,
             ..RemoteServerProfile::default()
         });
-        config.validate(None).expect("home + password config validates");
+        config
+            .validate(None)
+            .expect("home + password config validates");
 
         let debug = format!("{:?}", config.remote_servers[0]);
         assert!(debug.contains(REDACTED_SECRET));
@@ -3522,9 +3523,7 @@ mod tests {
         assert!(!log_json.contains("s3cret"));
 
         config.remote_servers[0].default_remote_root = Some("~other/path".to_string());
-        let err = config
-            .validate(None)
-            .expect_err("~other should fail");
+        let err = config.validate(None).expect_err("~other should fail");
         assert!(err.to_string().contains("home shorthand"));
 
         config.remote_servers[0].default_remote_root = Some("~/ok".to_string());

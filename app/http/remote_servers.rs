@@ -296,9 +296,7 @@ pub(crate) async fn trust_remote_server_host_key(
 ) -> Result<Json<TrustHostKeyResponse>, ApiError> {
     let fingerprint = request.fingerprint_sha256.trim();
     if fingerprint.is_empty() {
-        return Err(ApiError::bad_request(
-            "fingerprintSha256 must not be empty",
-        ));
+        return Err(ApiError::bad_request("fingerprintSha256 must not be empty"));
     }
 
     let config = config_snapshot(&state)?;
@@ -326,10 +324,9 @@ pub(crate) async fn trust_remote_server_host_key(
                     "SSH host key changed or fingerprint no longer matches: {}. Remove the old entry from known_hosts and try again.",
                     err.message()
                 ),
-                crate::ssh_client::SshErrorKind::HostKeyUnknown => format!(
-                    "SSH host key could not be trusted: {}",
-                    err.message()
-                ),
+                crate::ssh_client::SshErrorKind::HostKeyUnknown => {
+                    format!("SSH host key could not be trusted: {}", err.message())
+                }
                 _ => format!("Failed to trust SSH host key: {}", err.message()),
             };
             Err(ApiError::bad_request(message))
@@ -594,28 +591,26 @@ async fn test_remote_server_connection(
     }
 
     let target = match session.exec("uname -s && uname -m").await {
-        Ok(result) if result.success() => {
-            match normalize_target(&result.stdout_lossy()) {
-                Ok(target) => {
-                    stages[1] = success_stage(
-                        "target",
-                        format!("Detected target {target}"),
-                        Some(result.details()),
-                    );
-                    target
-                }
-                Err(message) => {
-                    stages[1] = failed_stage(
-                        "target",
-                        "target_unsupported",
-                        message,
-                        Some(result.details()),
-                    );
-                    let _ = session.disconnect().await;
-                    return diagnostic_result(stages);
-                }
+        Ok(result) if result.success() => match normalize_target(&result.stdout_lossy()) {
+            Ok(target) => {
+                stages[1] = success_stage(
+                    "target",
+                    format!("Detected target {target}"),
+                    Some(result.details()),
+                );
+                target
             }
-        }
+            Err(message) => {
+                stages[1] = failed_stage(
+                    "target",
+                    "target_unsupported",
+                    message,
+                    Some(result.details()),
+                );
+                let _ = session.disconnect().await;
+                return diagnostic_result(stages);
+            }
+        },
         Ok(result) => {
             stages[1] = failed_stage(
                 "target",
@@ -862,9 +857,11 @@ fn remote_server_from_input(
     }
 
     let is_create = existing.is_none();
-    let auth_method = input
-        .auth_method
-        .unwrap_or_else(|| existing.map(|server| server.auth_method).unwrap_or_default());
+    let auth_method = input.auth_method.unwrap_or_else(|| {
+        existing
+            .map(|server| server.auth_method)
+            .unwrap_or_default()
+    });
 
     let user = match optional_non_empty(input.user) {
         Some(user) => Some(user),
@@ -883,7 +880,9 @@ fn remote_server_from_input(
             let incoming = optional_non_empty(input.password);
             match (incoming, existing) {
                 (Some(password), _) => Some(password),
-                (None, Some(existing)) if existing.password_configured() => existing.password.clone(),
+                (None, Some(existing)) if existing.password_configured() => {
+                    existing.password.clone()
+                }
                 (None, _) => {
                     return Err(ApiError::bad_request(
                         "remote server password is required when authMethod is password",

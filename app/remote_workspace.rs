@@ -1303,10 +1303,7 @@ impl RemoteWorkspaceManager {
             .await?;
             partial.sidecar = Some(sidecar);
             let bootstrap = read_bootstrap(
-                partial
-                    .sidecar
-                    .as_mut()
-                    .expect("sidecar set after launch"),
+                partial.sidecar.as_mut().expect("sidecar set after launch"),
                 server_id,
                 workspace_id,
             )
@@ -1690,7 +1687,9 @@ impl PartialRemoteConnect {
     }
 
     fn ssh_ref(&self) -> &Arc<SshSession> {
-        self.ssh.as_ref().expect("ssh session present on partial connect")
+        self.ssh
+            .as_ref()
+            .expect("ssh session present on partial connect")
     }
 
     async fn abort(mut self) {
@@ -1722,7 +1721,9 @@ impl PartialRemoteConnect {
         JoinHandle<()>,
     ) {
         (
-            self.ssh.take().expect("ssh session for ready remote workspace"),
+            self.ssh
+                .take()
+                .expect("ssh session for ready remote workspace"),
             self.sidecar
                 .take()
                 .expect("sidecar for ready remote workspace"),
@@ -3018,13 +3019,7 @@ async fn detect_or_cached_target(
     {
         return Ok(target.to_string());
     }
-    let output = run_ssh_output(
-        server,
-        "uname -s && uname -m",
-        server_id,
-        workspace_id,
-    )
-    .await?;
+    let output = run_ssh_output(server, "uname -s && uname -m", server_id, workspace_id).await?;
     if !output.success() {
         return Err(remote_error(
             server_id,
@@ -3401,13 +3396,7 @@ async fn stop_stale_remote_sidecars(
     remote_path: &str,
 ) -> Result<(), ApiError> {
     let script = stale_remote_sidecar_cleanup_script(server_id, workspace_id, remote_path);
-    let output = run_ssh_output(
-        server,
-        &script,
-        server_id,
-        Some(workspace_id),
-    )
-    .await?;
+    let output = run_ssh_output(server, &script, server_id, Some(workspace_id)).await?;
     if !output.success() {
         return Err(remote_error(
             server_id,
@@ -5992,7 +5981,11 @@ async fn run_ssh_with_stdin(
             workspace_id,
             format!("failed to run remote command with stdin: {}", err.message()),
         )),
-        Err(_) => Err(remote_error(server_id, workspace_id, "ssh upload timed out")),
+        Err(_) => Err(remote_error(
+            server_id,
+            workspace_id,
+            "ssh upload timed out",
+        )),
     }
 }
 
@@ -14318,9 +14311,7 @@ mod tests {
                 runtime_config_sync: true,
             },
         };
-        assert!(
-            validate_bootstrap(&bootstrap, "server", "workspace", "token", &expected).is_err()
-        );
+        assert!(validate_bootstrap(&bootstrap, "server", "workspace", "token", &expected).is_err());
     }
 
     #[test]
