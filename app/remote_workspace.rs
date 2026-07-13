@@ -6302,6 +6302,192 @@ fn remote_chat_parts(content: &str, reasoning: Option<&str>) -> Vec<Value> {
     parts
 }
 
+fn remote_context_compression_part_id(
+    detail: &RemoteSidecarContextCompressionEventDetail,
+) -> String {
+    detail.snapshot_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            detail.kind,
+            detail.started_at.as_deref().unwrap_or("pending")
+        )
+    })
+}
+
+fn remote_context_compression_part(detail: &RemoteSidecarContextCompressionEventDetail) -> Value {
+    json!({
+        "type": "contextCompression",
+        "id": remote_context_compression_part_id(detail),
+        "status": detail.status,
+        "kind": detail.kind,
+        "detail": {
+            "status": detail.status,
+            "kind": detail.kind,
+            "snapshotId": detail.snapshot_id,
+            "originalTokenCount": detail.original_token_count,
+            "summaryTokenCount": detail.summary_token_count,
+            "startedAt": detail.started_at,
+            "completedAt": detail.completed_at,
+            "providerId": detail.provider_id,
+            "modelId": detail.model_id,
+        }
+    })
+}
+
+fn remote_context_compression_parts_match(current: &Value, next: &Value) -> bool {
+    if current.get("type").and_then(Value::as_str) != Some("contextCompression")
+        || next.get("type").and_then(Value::as_str) != Some("contextCompression")
+    {
+        return false;
+    }
+    let current_id = current.get("id").and_then(Value::as_str);
+    let next_id = next.get("id").and_then(Value::as_str);
+    if current_id.is_some() && current_id == next_id {
+        return true;
+    }
+    let current_kind = current.get("kind").and_then(Value::as_str);
+    let next_kind = next.get("kind").and_then(Value::as_str);
+    let current_started = current
+        .get("detail")
+        .and_then(|detail| detail.get("startedAt"))
+        .and_then(Value::as_str);
+    let next_started = next
+        .get("detail")
+        .and_then(|detail| detail.get("startedAt"))
+        .and_then(Value::as_str);
+    if current_kind == next_kind && current_started.is_some() && current_started == next_started {
+        return true;
+    }
+    let current_status = current.get("status").and_then(Value::as_str);
+    let next_status = next.get("status").and_then(Value::as_str);
+    let current_snapshot = current
+        .get("detail")
+        .and_then(|detail| detail.get("snapshotId"))
+        .filter(|value| !value.is_null());
+    current_kind == next_kind
+        && current_status == Some("start")
+        && next_status == Some("completed")
+        && current_snapshot.is_none()
+}
+
+fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
+    let Some(current_object) = current.as_object_mut() else {
+        return;
+    };
+    let Some(next_object) = next.as_object() else {
+        return;
+    };
+    let next_status = next_object
+        .get("status")
+        .cloned()
+        .unwrap_or(Value::String("completed".to_string()));
+    let next_kind = next_object
+        .get("kind")
+        .cloned()
+        .unwrap_or(Value::String(CONTEXT_COMPRESSION_KIND_LLM.to_string()));
+    let next_detail = next_object.get("detail").cloned().unwrap_or(Value::Null);
+    let next_id = next_object
+        .get("id")
+        .cloned()
+        .unwrap_or(Value::String("pending".to_string()));
+
+    let mut detail = current_object
+        .get("detail")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let (Some(detail_object), Some(next_detail_object)) =
+        (detail.as_object_mut(), next_detail.as_object())
+    {
+        for key in [
+            "snapshotId",
+            "originalTokenCount",
+            "summaryTokenCount",
+            "startedAt",
+            "completedAt",
+        ] {
+            if let Some(value) = next_detail_object.get(key).filter(|value| !value.is_null()) {
+                detail_object.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(provider_id) = next_detail_object
+            .get("providerId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            detail_object.insert(
+                "providerId".to_string(),
+                Value::String(provider_id.to_string()),
+            );
+        }
+        if let Some(model_id) = next_detail_object
+            .get("modelId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            detail_object.insert("modelId".to_string(), Value::String(model_id.to_string()));
+        }
+        detail_object.insert("status".to_string(), next_status.clone());
+        detail_object.insert("kind".to_string(), next_kind.clone());
+    }
+
+    let id = detail
+        .get("snapshotId")
+        .and_then(Value::as_str)
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(next_id);
+    current_object.insert("id".to_string(), id);
+    current_object.insert("status".to_string(), next_status);
+    current_object.insert("kind".to_string(), next_kind);
+    current_object.insert("detail".to_string(), detail);
+}
+
+fn remote_push_context_compression_part(
+    parts: &mut Vec<Value>,
+    detail: &RemoteSidecarContextCompressionEventDetail,
+) {
+    let next_part = remote_context_compression_part(detail);
+    if let Some(existing) = parts
+        .iter_mut()
+        .find(|part| remote_context_compression_parts_match(part, &next_part))
+    {
+        remote_merge_context_compression_part(existing, next_part);
+        return;
+    }
+    parts.push(next_part);
+}
+
+/// Build assistant `metadata.parts` including compression blocks for history reload.
+/// start+completed for the same compression collapse into one completed part (local parity).
+fn remote_chat_parts_with_context_compression(
+    content: &str,
+    reasoning: Option<&str>,
+    compression_events: &[RemoteSidecarContextCompressionEventDetail],
+) -> Vec<Value> {
+    let mut parts = Vec::new();
+    for detail in compression_events {
+        remote_push_context_compression_part(&mut parts, detail);
+    }
+    parts.extend(remote_chat_parts(content, reasoning));
+    parts
+}
+
+fn remote_sidecar_persist_context_compression_run_event(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    sequence: i64,
+    payload: &Value,
+) {
+    let _ = database.insert_run_event(NewRunEvent {
+        id: &unique_id("run-event"),
+        chat_id,
+        run_id,
+        sequence,
+        event_type: "context_compression",
+        payload_json: &payload.to_string(),
+    });
+}
+
 fn remote_chat_parts_with_attachments(
     content: &str,
     reasoning: Option<&str>,
@@ -6416,7 +6602,7 @@ fn remote_message_summary(
         .then(|| remote_message_attachments(&metadata))
         .unwrap_or_default();
     let parts = if message.role == "assistant" {
-        remote_message_parts(&message.content, reasoning, &tool_calls)
+        remote_assistant_message_parts(&metadata, &message.content, reasoning, &tool_calls)
     } else {
         remote_chat_parts_with_attachments(&message.content, reasoning, &attachments)
     };
@@ -6465,6 +6651,23 @@ fn remote_message_parts(
         })
     }));
     parts
+}
+
+/// Prefer persisted `metadata.parts` (includes contextCompression) for history reload.
+fn remote_assistant_message_parts(
+    metadata: &Value,
+    content: &str,
+    reasoning: Option<&str>,
+    tool_calls: &[Value],
+) -> Vec<Value> {
+    if let Some(parts) = metadata
+        .get("parts")
+        .and_then(Value::as_array)
+        .filter(|parts| !parts.is_empty())
+    {
+        return parts.clone();
+    }
+    remote_message_parts(content, reasoning, tool_calls)
 }
 
 fn remote_chat_active_run(state: &RemoteSidecarState, chat_id: &str) -> Option<Value> {
@@ -9410,6 +9613,7 @@ async fn remote_sidecar_run_broker_llm_turn(
     reasoning: &mut String,
     run_metrics: &mut RemoteSidecarRunMetrics,
     sequence: &mut i64,
+    compression_events: &[RemoteSidecarContextCompressionEventDetail],
 ) -> Result<(Option<Vec<NeutralToolCall>>, String), ()> {
     let mut broker_rx =
         remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
@@ -9555,7 +9759,11 @@ async fn remote_sidecar_run_broker_llm_turn(
                         );
                         let metadata = json!({
                             "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                            "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                            "parts": remote_chat_parts_with_context_compression(
+                                text,
+                                (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                                compression_events,
+                            ),
                             "metrics": metrics,
                         });
                         let assistant_sequence = database
@@ -9727,7 +9935,11 @@ async fn remote_sidecar_run_broker_llm_turn(
                 let usage = run_metrics.usage_value();
                 let metadata = json!({
                     "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                    "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                    "parts": remote_chat_parts_with_context_compression(
+                        text,
+                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                        compression_events,
+                    ),
                     "metrics": metrics,
                 });
                 let assistant_sequence = database
@@ -10780,6 +10992,9 @@ async fn remote_sidecar_chat_stream(
         let mut current_request = initial_provider_request;
         let mut runtime_tool_state = initial_runtime_tool_state;
         let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
+        // Accumulates start+completed compression details for this run so final
+        // assistant metadata.parts can include history-reload bubbles.
+        let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "start",
             "chatId": chat_id,
@@ -10837,12 +11052,22 @@ async fn remote_sidecar_chat_stream(
                     break;
                 }
             };
-            for detail in compression_events {
+            for detail in &compression_events {
                 sequence += 1;
+                let payload =
+                    remote_sidecar_context_compression_sse_event(&assistant_message_id, detail);
+                remote_sidecar_persist_context_compression_run_event(
+                    &mut database,
+                    &chat_id,
+                    &run_id,
+                    sequence,
+                    &payload,
+                );
+                run_compression_events.push(detail.clone());
                 yield Ok(remote_sidecar_record_run_event(
                     &run_stream,
                     sequence,
-                    remote_sidecar_context_compression_sse_event(&assistant_message_id, &detail),
+                    payload,
                 ));
                 last_yielded_sequence = sequence;
             }
@@ -10878,6 +11103,7 @@ async fn remote_sidecar_chat_stream(
                 &mut reasoning,
                 &mut run_metrics,
                 &mut sequence,
+                &run_compression_events,
             ).await;
             let mut reached_terminal_event = false;
             for (event, terminal) in remote_sidecar_snapshot_run_events(&run_stream, &mut last_yielded_sequence) {
@@ -17226,6 +17452,7 @@ mod tests {
             &mut reasoning,
             &mut run_metrics,
             &mut sequence,
+            &[],
         )
         .await;
         broker.await.expect("broker task");
@@ -17386,6 +17613,7 @@ mod tests {
             &mut reasoning,
             &mut run_metrics,
             &mut sequence,
+            &[],
         )
         .await;
         broker.await.expect("broker task");
@@ -17553,6 +17781,7 @@ mod tests {
             &mut reasoning,
             &mut run_metrics,
             &mut sequence,
+            &[],
         )
         .await
         .expect("llm turn should succeed");
@@ -19383,6 +19612,148 @@ mod tests {
         assert_eq!(
             detail.get("originalTokenCount").and_then(Value::as_i64),
             Some(1200)
+        );
+    }
+
+    #[test]
+    fn remote_chat_parts_with_context_compression_merges_start_and_completed() {
+        let events = vec![
+            RemoteSidecarContextCompressionEventDetail {
+                status: "start".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: None,
+                original_token_count: Some(1200),
+                summary_token_count: None,
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: None,
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-1".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        ];
+        let parts = remote_chat_parts_with_context_compression("Done.", None, &events);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].get("type").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        assert_eq!(
+            parts[0].get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(parts[0].get("kind").and_then(Value::as_str), Some("llm"));
+        assert_eq!(parts[0].get("id").and_then(Value::as_str), Some("ctx-1"));
+        assert_eq!(
+            parts[0]
+                .get("detail")
+                .and_then(|detail| detail.get("summaryTokenCount"))
+                .and_then(Value::as_i64),
+            Some(80)
+        );
+        assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("Done."));
+    }
+
+    #[test]
+    fn remote_chat_parts_with_context_compression_keeps_multiple_completed() {
+        let events = vec![
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-1".to_string()),
+                original_token_count: Some(1000),
+                summary_token_count: Some(100),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-2".to_string()),
+                original_token_count: Some(900),
+                summary_token_count: Some(90),
+                started_at: Some("2026-07-12T00:01:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:01:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        ];
+        let parts =
+            remote_chat_parts_with_context_compression("After tools.", Some("think"), &events);
+        assert_eq!(parts.len(), 4);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(
+                    |part| part.get("type").and_then(Value::as_str) == Some("contextCompression")
+                )
+                .count(),
+            2
+        );
+        assert_eq!(parts[0].get("id").and_then(Value::as_str), Some("ctx-1"));
+        assert_eq!(parts[1].get("id").and_then(Value::as_str), Some("ctx-2"));
+        assert_eq!(
+            parts[2].get("type").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(parts[3].get("type").and_then(Value::as_str), Some("text"));
+    }
+
+    #[test]
+    fn remote_sidecar_persist_context_compression_run_event_writes_extractable_payload() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("open db");
+        database.insert_chat("chat-1", "Chat").expect("insert chat");
+        let payload = remote_sidecar_context_compression_sse_event(
+            "assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-1".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        remote_sidecar_persist_context_compression_run_event(
+            &mut database,
+            "chat-1",
+            "remote-run-1",
+            3,
+            &payload,
+        );
+        let events = database
+            .history_run_events_for_chat_messages("chat-1", &["assistant-1".to_string()])
+            .expect("history events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "context_compression");
+        let stored: Value = serde_json::from_str(&events[0].payload_json).expect("payload json");
+        assert_eq!(
+            stored.get("assistantMessageId").and_then(Value::as_str),
+            Some("assistant-1")
+        );
+        assert_eq!(
+            stored.get("type").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        assert_eq!(
+            stored.get("status").and_then(Value::as_str),
+            Some("completed")
         );
     }
 
