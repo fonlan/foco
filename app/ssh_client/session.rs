@@ -260,10 +260,8 @@ impl client::Handler for ClientHandler {
                 server_public_key,
                 &self.known_hosts_path,
             );
-            let matches = super::known_hosts::fingerprints_equal(
-                &info.fingerprint_sha256,
-                expected,
-            );
+            let matches =
+                super::known_hosts::fingerprints_equal(&info.fingerprint_sha256, expected);
             if !matches {
                 let err = SshError::with_host_key(
                     SshErrorKind::HostKeyChanged,

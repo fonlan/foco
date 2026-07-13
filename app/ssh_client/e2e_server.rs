@@ -715,7 +715,10 @@ async fn idle_session_survives_server_keepalive() {
     let profile = fixture.profile_password();
     let session = SshSession::connect(&profile).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert!(!session.is_closed(), "idle session closed before client keepalive max");
+    assert!(
+        !session.is_closed(),
+        "idle session closed before client keepalive max"
+    );
     let result = tokio::time::timeout(Duration::from_secs(3), session.exec("still-alive"))
         .await
         .expect("exec after idle timed out")

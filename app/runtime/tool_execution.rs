@@ -1140,12 +1140,20 @@ struct AgentSendMessageInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentDelegateTaskInput {
-    target_instance_id: Option<AgentInstanceId>,
-    target_definition_id: Option<AgentDefinitionId>,
+    /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
+    target_instance_id: Option<String>,
+    /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
+    target_definition_id: Option<String>,
     input: Value,
     correlation_id: Option<String>,
     #[serde(rename = "timeoutMs")]
     _timeout_ms: Option<u64>,
+}
+
+/// Strongly typed targets after field-level id validation.
+struct ResolvedAgentDelegateTargets {
+    target_instance_id: Option<AgentInstanceId>,
+    target_definition_id: Option<AgentDefinitionId>,
 }
 
 #[derive(Deserialize)]
@@ -1170,7 +1178,8 @@ struct AgentWaitTasksInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentTransferTaskInput {
     task_id: AgentTaskId,
-    target_instance_id: AgentInstanceId,
+    /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
+    target_instance_id: String,
     #[serde(rename = "timeoutMs")]
     _timeout_ms: Option<u64>,
 }
@@ -1178,7 +1187,8 @@ struct AgentTransferTaskInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentCreateInstancesInput {
-    definition_id: AgentDefinitionId,
+    /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
+    definition_id: String,
     count: u32,
     execution_workspace_mode: AgentExecutionWorkspaceMode,
     #[serde(rename = "timeoutMs")]
@@ -1412,6 +1422,7 @@ fn execute_agent_delegate_task(
             format!("agent_delegate_task arguments do not match schema: {source}"),
         )
     })?;
+    let targets = resolve_agent_delegate_targets(&input)?;
     context
         .permissions
         .authorize_collaboration_tool(
@@ -1419,7 +1430,7 @@ fn execute_agent_delegate_task(
             agent_tool_instance_id(context)?.clone(),
         )
         .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
-    let target_instance_id = select_delegate_target_instance(context, workspace_path, &input)?;
+    let target_instance_id = select_delegate_target_instance(context, workspace_path, &targets)?;
     let team_id = agent_tool_team_id(context)?;
     let origin_instance_id = agent_tool_instance_id(context)?;
     let parent_task_id = agent_tool_task_id(context)?;
@@ -1462,7 +1473,7 @@ fn execute_agent_delegate_task(
         json!({
             "childTaskId": child.id.to_string(),
             "targetInstanceId": child.owner_instance_id.to_string(),
-            "targetDefinitionId": input.target_definition_id.as_ref().map(ToString::to_string),
+            "targetDefinitionId": targets.target_definition_id.as_ref().map(ToString::to_string),
             "correlationId": input.correlation_id,
         }),
     )?;
@@ -1726,6 +1737,11 @@ fn execute_agent_transfer_task(
             format!("agent_transfer_task arguments do not match schema: {source}"),
         )
     })?;
+    let target_instance_id = parse_required_agent_instance_id(
+        AGENT_TRANSFER_TASK_TOOL,
+        "targetInstanceId",
+        &input.target_instance_id,
+    )?;
     context
         .permissions
         .authorize_collaboration_tool(
@@ -1762,23 +1778,19 @@ fn execute_agent_transfer_task(
         ));
     }
     let target = database
-        .agent_instance(&input.target_instance_id)
+        .agent_instance(&target_instance_id)
         .map_err(agent_store_error)?
         .ok_or_else(|| {
             agent_tool_error(
                 "not_found",
-                format!(
-                    "Agent target instance '{}' was not found",
-                    input.target_instance_id
-                ),
+                format!("Agent target instance '{target_instance_id}' was not found"),
             )
         })?;
     if target.team_id != *team_id {
         return Err(agent_tool_error(
             "cross_team_reference",
             format!(
-                "Agent target instance '{}' does not belong to team '{team_id}'",
-                input.target_instance_id
+                "Agent target instance '{target_instance_id}' does not belong to team '{team_id}'"
             ),
         ));
     }
@@ -1835,12 +1847,14 @@ fn execute_agent_create_instances(
                 format!("agent_create_instances arguments do not match schema: {source}"),
             )
         })?;
+    let definition_id = parse_required_agent_definition_id(
+        AGENT_CREATE_INSTANCES_TOOL,
+        "definitionId",
+        &input.definition_id,
+    )?;
     context
         .permissions
-        .authorize_instance_definition(
-            &input.definition_id,
-            agent_tool_instance_id(context)?.clone(),
-        )
+        .authorize_instance_definition(&definition_id, agent_tool_instance_id(context)?.clone())
         .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
     if input.count == 0 {
         return Err(agent_tool_error(
@@ -1859,11 +1873,11 @@ fn execute_agent_create_instances(
     let definition = context
         .agent_definitions
         .iter()
-        .find(|definition| definition.id == input.definition_id)
+        .find(|definition| definition.id == definition_id)
         .ok_or_else(|| {
             agent_tool_error(
                 "not_found",
-                format!("Agent definition '{}' was not found", input.definition_id),
+                format!("Agent definition '{definition_id}' was not found"),
             )
         })?;
     let team_id = agent_tool_team_id(context)?;
@@ -1969,7 +1983,7 @@ fn execute_agent_create_instances(
     }
     Ok(json!({
         "instances": created.iter().map(agent_instance_value).collect::<Vec<_>>(),
-        "definitionId": input.definition_id.to_string(),
+        "definitionId": definition_id.to_string(),
         "definitionRevision": definition.revision,
         "count": created.len(),
     }))
@@ -2062,12 +2076,102 @@ fn agent_tool_task_id(context: &AgentToolContext) -> Result<&AgentTaskId, String
         .ok_or_else(|| "Agent tool requires a task association".to_string())
 }
 
+fn resolve_agent_delegate_targets(
+    input: &AgentDelegateTaskInput,
+) -> Result<ResolvedAgentDelegateTargets, String> {
+    Ok(ResolvedAgentDelegateTargets {
+        target_instance_id: parse_optional_agent_instance_id(
+            AGENT_DELEGATE_TASK_TOOL,
+            "targetInstanceId",
+            input.target_instance_id.as_deref(),
+        )?,
+        target_definition_id: parse_optional_agent_definition_id(
+            AGENT_DELEGATE_TASK_TOOL,
+            "targetDefinitionId",
+            input.target_definition_id.as_deref(),
+        )?,
+    })
+}
+
+fn parse_optional_agent_definition_id(
+    tool: &str,
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<AgentDefinitionId>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) => parse_required_agent_definition_id(tool, field, value).map(Some),
+    }
+}
+
+fn parse_optional_agent_instance_id(
+    tool: &str,
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<AgentInstanceId>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) => parse_required_agent_instance_id(tool, field, value).map(Some),
+    }
+}
+
+fn parse_required_agent_definition_id(
+    tool: &str,
+    field: &str,
+    value: &str,
+) -> Result<AgentDefinitionId, String> {
+    AgentDefinitionId::new(value).map_err(|_| {
+        agent_invalid_id_error(
+            tool,
+            field,
+            AgentDefinitionId::PREFIX,
+            "definitions[].id",
+            value,
+        )
+    })
+}
+
+fn parse_required_agent_instance_id(
+    tool: &str,
+    field: &str,
+    value: &str,
+) -> Result<AgentInstanceId, String> {
+    AgentInstanceId::new(value).map_err(|_| {
+        agent_invalid_id_error(
+            tool,
+            field,
+            AgentInstanceId::PREFIX,
+            "instances[].id",
+            value,
+        )
+    })
+}
+
+/// Stable, recoverable invalid-id hint for collaboration tools when providers bypass schema.
+fn agent_invalid_id_error(
+    tool: &str,
+    field: &str,
+    prefix: &str,
+    agent_list_path: &str,
+    value: &str,
+) -> String {
+    agent_tool_error(
+        "invalid_arguments",
+        format!(
+            "{tool} {field} is not a valid Agent id (got {value:?}). \
+Must start with '{prefix}', use only lowercase ASCII letters/digits/hyphens after the prefix, \
+and be at most 128 characters total. \
+Copy the exact id from agent_list.{agent_list_path}; do not invent ids or use display names."
+        ),
+    )
+}
+
 fn select_delegate_target_instance(
     context: &AgentToolContext,
     workspace_path: &Path,
-    input: &AgentDelegateTaskInput,
+    targets: &ResolvedAgentDelegateTargets,
 ) -> Result<AgentInstanceId, String> {
-    match (&input.target_instance_id, &input.target_definition_id) {
+    match (&targets.target_instance_id, &targets.target_definition_id) {
         (Some(_), Some(_)) | (None, None) => {
             return Err(agent_tool_error(
                 "invalid_arguments",
@@ -2117,14 +2221,19 @@ fn select_delegate_target_instance(
                 .route_agent_instance_for_definition(agent_tool_team_id(context)?, definition_id)
                 .map_err(agent_store_error)?;
             let instance = instance.ok_or_else(|| {
-                    agent_tool_error(
-                        "not_found",
-                        format!(
-                            "Agent definition '{definition_id}' has no existing runnable instance in team '{}'",
-                            agent_tool_team_id(context).map(ToString::to_string).unwrap_or_default()
-                        ),
-                    )
-                })?;
+                agent_tool_error(
+                    "not_found",
+                    format!(
+                        "Agent definition '{definition_id}' has no existing runnable instance in team '{}'. \
+Call agent_list, then agent_create_instances when allowed, then agent_delegate_task \
+with a returned instance id (or a definition that already has an instance). \
+targetDefinitionId never auto-creates instances.",
+                        agent_tool_team_id(context)
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    ),
+                )
+            })?;
             Ok(instance.id)
         }
     }
@@ -4548,9 +4657,17 @@ mod tests {
             }),
         )
         .expect_err("definition without instance must fail");
-        assert_eq!(
-            agent_tool_error_output(&no_instance_error)["code"],
-            "not_found"
+        let no_instance_output = agent_tool_error_output(&no_instance_error);
+        assert_eq!(no_instance_output["code"], "not_found");
+        let no_instance_message = no_instance_output["error"].as_str().expect("error text");
+        assert!(
+            no_instance_message.contains("no existing runnable instance"),
+            "expected missing-instance guidance, got {no_instance_message}"
+        );
+        assert!(
+            no_instance_message.contains("agent_create_instances")
+                && no_instance_message.contains("never auto-creates"),
+            "expected create-instance recovery path, got {no_instance_message}"
         );
 
         let oversized_input_error = execute_agent_tool(
@@ -4606,6 +4723,138 @@ mod tests {
         assert_eq!(
             agent_tool_error_output(&child_limit_error)["code"],
             "limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn agent_collaboration_tools_recover_from_illegal_ids() {
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids: Vec::new(),
+        };
+        let (workspace, context, _team_id, _instance_id, _task_id) =
+            create_agent_tool_fixture(permissions);
+
+        let illegal_definition = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-illegal-definition",
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": "Review",
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("display-name definition id must fail");
+        let illegal_definition_output = agent_tool_error_output(&illegal_definition);
+        assert_eq!(illegal_definition_output["code"], "invalid_arguments");
+        let illegal_definition_message = illegal_definition_output["error"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            illegal_definition_message.contains("targetDefinitionId")
+                && illegal_definition_message.contains("agent-definition-")
+                && illegal_definition_message.contains("agent_list")
+                && illegal_definition_message.contains("definitions[].id"),
+            "expected recoverable definition id guidance, got {illegal_definition_message}"
+        );
+
+        let illegal_instance = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-illegal-instance",
+            json!({
+                "targetInstanceId": "worker-1",
+                "targetDefinitionId": null,
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("hand-constructed instance id must fail");
+        let illegal_instance_output = agent_tool_error_output(&illegal_instance);
+        assert_eq!(illegal_instance_output["code"], "invalid_arguments");
+        let illegal_instance_message = illegal_instance_output["error"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            illegal_instance_message.contains("targetInstanceId")
+                && illegal_instance_message.contains("agent-instance-")
+                && illegal_instance_message.contains("agent_list")
+                && illegal_instance_message.contains("instances[].id"),
+            "expected recoverable instance id guidance, got {illegal_instance_message}"
+        );
+
+        let illegal_create = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-illegal-create",
+            json!({
+                "definitionId": "Review",
+                "count": 1,
+                "executionWorkspaceMode": "shared",
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("create with display-name definition id must fail");
+        let illegal_create_output = agent_tool_error_output(&illegal_create);
+        assert_eq!(illegal_create_output["code"], "invalid_arguments");
+        let illegal_create_message = illegal_create_output["error"].as_str().expect("error text");
+        assert!(
+            illegal_create_message.contains("definitionId")
+                && illegal_create_message.contains("agent-definition-")
+                && illegal_create_message.contains("agent_list"),
+            "expected recoverable create definition guidance, got {illegal_create_message}"
+        );
+
+        let illegal_transfer = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_TRANSFER_TASK_TOOL,
+            "call-illegal-transfer",
+            json!({
+                "taskId": "agent-task-tool-test-parent",
+                "targetInstanceId": "Review Worker",
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("transfer with illegal instance id must fail");
+        let illegal_transfer_output = agent_tool_error_output(&illegal_transfer);
+        assert_eq!(illegal_transfer_output["code"], "invalid_arguments");
+        let illegal_transfer_message = illegal_transfer_output["error"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            illegal_transfer_message.contains("targetInstanceId")
+                && illegal_transfer_message.contains("agent-instance-")
+                && illegal_transfer_message.contains("agent_list"),
+            "expected recoverable transfer instance guidance, got {illegal_transfer_message}"
+        );
+
+        // Well-formed but missing id stays not_found, not invalid_arguments.
+        let missing_well_formed = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-missing-well-formed",
+            json!({
+                "targetInstanceId": "agent-instance-does-not-exist",
+                "targetDefinitionId": null,
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("missing well-formed instance must fail");
+        assert_eq!(
+            agent_tool_error_output(&missing_well_formed)["code"],
+            "not_found"
         );
     }
 }
