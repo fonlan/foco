@@ -65,6 +65,13 @@ export type AiStatsColumnId = (typeof AI_STATS_COLUMN_IDS)[number];
 export const AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY = "foco.aiStats.visibleColumns";
 export const PLAN_AUTO_RUN_ENABLED_STORAGE_KEY = "foco.planAutoRun.enabled";
 export const MODEL_ROUTING_EXPANDED_STORAGE_KEY = "foco.modelRouting.expanded";
+export const MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY =
+  "foco.modelRouting.heightRatio";
+/** Default share of the flexible sidebar stack (workspace-nav + model routing). */
+export const DEFAULT_MODEL_ROUTING_HEIGHT_RATIO = 0.42;
+export const MODEL_ROUTING_PANEL_MIN_HEIGHT_PX = 120;
+export const WORKSPACE_NAV_MIN_HEIGHT_PX = 120;
+export const MODEL_ROUTING_RESIZE_STEP_PX = 24;
 export function planAutoRunEnabledStorageKey(workspaceId: string) {
   return `${PLAN_AUTO_RUN_ENABLED_STORAGE_KEY}.${encodeURIComponent(workspaceId)}`;
 }

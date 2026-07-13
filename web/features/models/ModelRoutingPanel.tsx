@@ -8,17 +8,77 @@ import {
   Route,
   Server,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
+import {
+  MODEL_ROUTING_RESIZE_STEP_PX,
+} from "../../app/constants";
 import type {
   ConfiguredModelSummary,
   ConfiguredProviderSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
 import {
+  clampModelRoutingPanelHeight,
+  modelRoutingPanelHeightBounds,
+  panelHeightFromRatio,
+  ratioFromPanelHeight,
   readModelRoutingExpanded,
+  readModelRoutingHeightRatio,
   writeModelRoutingExpanded,
+  writeModelRoutingHeightRatio,
 } from "./model-routing-preferences";
+
+type ResizeDragSnapshot = {
+  availableHeight: number;
+  startHeight: number;
+  startY: number;
+};
+
+function findWorkspaceNavSibling(panel: HTMLElement | null): HTMLElement | null {
+  if (!panel) {
+    return null;
+  }
+  const previous = panel.previousElementSibling;
+  if (previous instanceof HTMLElement && previous.classList.contains("workspace-nav")) {
+    return previous;
+  }
+  return null;
+}
+
+function measureFlexibleStack(panel: HTMLElement | null): {
+  availableHeight: number;
+  panelHeight: number;
+} | null {
+  if (!panel) {
+    return null;
+  }
+  const nav = findWorkspaceNavSibling(panel);
+  const panelHeight = panel.getBoundingClientRect().height;
+  if (nav) {
+    const navHeight = nav.getBoundingClientRect().height;
+    return {
+      availableHeight: navHeight + panelHeight,
+      panelHeight,
+    };
+  }
+  // Fallback when sibling layout is missing (tests/isolated mounts).
+  const parentHeight = panel.parentElement?.getBoundingClientRect().height ?? panelHeight;
+  return {
+    availableHeight: Math.max(panelHeight, parentHeight),
+    panelHeight,
+  };
+}
 
 export function ModelRoutingPanel({
   models,
@@ -33,7 +93,15 @@ export function ModelRoutingPanel({
   providers: ConfiguredProviderSummary[];
 }) {
   const { t } = useI18n();
+  const panelRef = useRef<HTMLElement | null>(null);
+  const resizeDragRef = useRef<ResizeDragSnapshot | null>(null);
+  const heightRatioRef = useRef(readModelRoutingHeightRatio());
+
   const [expanded, setExpanded] = useState(() => readModelRoutingExpanded(false));
+  const [heightRatio, setHeightRatio] = useState(() => readModelRoutingHeightRatio());
+  const [panelHeightPx, setPanelHeightPx] = useState<number | null>(null);
+  const [availableHeightPx, setAvailableHeightPx] = useState(0);
+  const [isResizing, setIsResizing] = useState(false);
   const [expandedModelIds, setExpandedModelIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -43,6 +111,8 @@ export function ModelRoutingPanel({
     Record<string, string>
   >({});
   const [error, setError] = useState<string | null>(null);
+
+  heightRatioRef.current = heightRatio;
 
   const providerById = useMemo(
     () => new Map(providers.map((provider) => [provider.id, provider])),
@@ -56,6 +126,107 @@ export function ModelRoutingPanel({
       ),
     [models],
   );
+
+  const applyHeightFromRatio = useCallback((ratio: number) => {
+    const measured = measureFlexibleStack(panelRef.current);
+    if (!measured || measured.availableHeight <= 0) {
+      return;
+    }
+    const nextHeight = panelHeightFromRatio(ratio, measured.availableHeight);
+    setAvailableHeightPx(measured.availableHeight);
+    setPanelHeightPx(nextHeight);
+  }, []);
+
+  const commitPanelHeight = useCallback(
+    (nextHeight: number, availableHeight: number) => {
+      const clamped = clampModelRoutingPanelHeight(nextHeight, availableHeight);
+      const nextRatio = ratioFromPanelHeight(clamped, availableHeight);
+      setAvailableHeightPx(availableHeight);
+      setPanelHeightPx(clamped);
+      setHeightRatio(nextRatio);
+      writeModelRoutingHeightRatio(nextRatio);
+    },
+    [],
+  );
+
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setPanelHeightPx(null);
+      return;
+    }
+    applyHeightFromRatio(heightRatioRef.current);
+  }, [applyHeightFromRatio, expanded]);
+
+  useEffect(() => {
+    if (!expanded) {
+      return;
+    }
+
+    function recompute() {
+      // Drag freezes availableHeight; skip RO feedback while the pointer is active.
+      if (resizeDragRef.current) {
+        return;
+      }
+      applyHeightFromRatio(heightRatioRef.current);
+    }
+
+    const panel = panelRef.current;
+    const parent = panel?.parentElement ?? null;
+    const nav = findWorkspaceNavSibling(panel);
+    const observer = new ResizeObserver(recompute);
+    if (parent) {
+      observer.observe(parent);
+    }
+    if (nav) {
+      observer.observe(nav);
+    }
+    // Do not observe the panel itself: height commits would re-enter recompute.
+    window.addEventListener("resize", recompute);
+    window.addEventListener("orientationchange", recompute);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", recompute);
+      window.removeEventListener("orientationchange", recompute);
+    };
+  }, [applyHeightFromRatio, expanded]);
+
+  useEffect(() => {
+    if (!isResizing) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const drag = resizeDragRef.current;
+      if (!drag) {
+        return;
+      }
+      const nextHeight =
+        drag.startHeight + (drag.startY - event.clientY);
+      commitPanelHeight(nextHeight, drag.availableHeight);
+    }
+
+    function handlePointerUp() {
+      resizeDragRef.current = null;
+      setIsResizing(false);
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, [commitPanelHeight, isResizing]);
 
   function effectiveActiveProviderId(model: ConfiguredModelSummary) {
     return optimisticRoutes[model.id] ?? model.activeProviderId;
@@ -118,12 +289,91 @@ export function ModelRoutingPanel({
     }
   }
 
+  function handleResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const measured = measureFlexibleStack(panelRef.current);
+    if (!measured || measured.availableHeight <= 0) {
+      return;
+    }
+    const startHeight = clampModelRoutingPanelHeight(
+      measured.panelHeight || panelHeightPx || panelHeightFromRatio(
+        heightRatio,
+        measured.availableHeight,
+      ),
+      measured.availableHeight,
+    );
+    resizeDragRef.current = {
+      availableHeight: measured.availableHeight,
+      startHeight,
+      startY: event.clientY,
+    };
+    setAvailableHeightPx(measured.availableHeight);
+    setPanelHeightPx(startHeight);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsResizing(true);
+  }
+
+  function handleResizeKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
+      return;
+    }
+    event.preventDefault();
+    const measured = measureFlexibleStack(panelRef.current);
+    if (!measured || measured.availableHeight <= 0) {
+      return;
+    }
+    const currentHeight =
+      panelHeightPx ??
+      panelHeightFromRatio(heightRatio, measured.availableHeight);
+    const delta =
+      event.key === "ArrowUp"
+        ? MODEL_ROUTING_RESIZE_STEP_PX
+        : -MODEL_ROUTING_RESIZE_STEP_PX;
+    commitPanelHeight(currentHeight + delta, measured.availableHeight);
+  }
+
+  const heightBounds = modelRoutingPanelHeightBounds(availableHeightPx);
+  const ariaValueMin = heightBounds.min;
+  const ariaValueMax = heightBounds.max;
+  const ariaValueNow =
+    panelHeightPx ??
+    (availableHeightPx > 0
+      ? panelHeightFromRatio(heightRatio, availableHeightPx)
+      : ariaValueMin);
+
+  const panelStyle = (
+    expanded && panelHeightPx != null
+      ? {
+          "--model-routing-panel-height": `${panelHeightPx}px`,
+        }
+      : undefined
+  ) as CSSProperties | undefined;
+
   return (
     <section
       aria-label={t("Model routing")}
       className={`model-routing-panel ${expanded ? "model-routing-panel-expanded" : ""}`}
       data-expanded={expanded ? "true" : "false"}
+      ref={panelRef}
+      style={panelStyle}
     >
+      {expanded ? (
+        <div
+          aria-label={t("Resize model routing panel")}
+          aria-orientation="horizontal"
+          aria-valuemax={ariaValueMax}
+          aria-valuemin={ariaValueMin}
+          aria-valuenow={ariaValueNow}
+          className={`model-routing-resize-splitter ${
+            isResizing ? "model-routing-resize-splitter-active" : ""
+          }`}
+          onKeyDown={handleResizeKeyDown}
+          onPointerDown={handleResizePointerDown}
+          role="separator"
+          tabIndex={0}
+        />
+      ) : null}
+
       <button
         aria-controls="model-routing-tree"
         aria-expanded={expanded}

@@ -1566,6 +1566,7 @@ body,
 
 .workspace-nav {
   padding: 0.625rem;
+  min-height: 7.5rem;
 }
 
 .model-routing-panel {
@@ -1578,8 +1579,48 @@ body,
 }
 
 .model-routing-panel-expanded {
-  flex: 0 1 42%;
-  max-height: 48%;
+  flex: 0 0 var(--model-routing-panel-height, 42%);
+  height: var(--model-routing-panel-height, 42%);
+  max-height: none;
+}
+
+.model-routing-resize-splitter {
+  position: relative;
+  z-index: 10;
+  flex: 0 0 0.75rem;
+  height: 0.75rem;
+  margin-top: -1px;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+  background: transparent;
+}
+
+.model-routing-resize-splitter::before {
+  position: absolute;
+  top: 0.3125rem;
+  right: 0.75rem;
+  left: 0.75rem;
+  height: 1px;
+  content: "";
+  background: var(--foco-border-strong);
+  transition:
+    background 120ms ease,
+    height 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.model-routing-resize-splitter:hover::before,
+.model-routing-resize-splitter:focus-visible::before,
+.model-routing-resize-splitter-active::before {
+  height: 2px;
+  background: var(--foco-accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--foco-accent) 25%, transparent);
+}
+
+.model-routing-resize-splitter:focus-visible {
+  outline: 2px solid var(--foco-accent);
+  outline-offset: -2px;
 }
 
 .model-routing-header {

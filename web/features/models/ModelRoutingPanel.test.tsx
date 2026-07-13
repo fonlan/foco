@@ -5,9 +5,24 @@ import type {
   ConfiguredModelSummary,
   ConfiguredProviderSummary,
 } from "../../api/types";
-import { MODEL_ROUTING_EXPANDED_STORAGE_KEY } from "../../app/constants";
+import {
+  DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+  MODEL_ROUTING_EXPANDED_STORAGE_KEY,
+  MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY,
+  MODEL_ROUTING_PANEL_MIN_HEIGHT_PX,
+  MODEL_ROUTING_RESIZE_STEP_PX,
+  WORKSPACE_NAV_MIN_HEIGHT_PX,
+} from "../../app/constants";
 import { I18nContext } from "../../shared/i18n";
 import { ModelRoutingPanel } from "./ModelRoutingPanel";
+import {
+  clampModelRoutingPanelHeight,
+  modelRoutingPanelHeightBounds,
+  normalizeModelRoutingHeightRatio,
+  panelHeightFromRatio,
+  ratioFromPanelHeight,
+  readModelRoutingHeightRatio,
+} from "./model-routing-preferences";
 
 const models: ConfiguredModelSummary[] = [
   {
@@ -126,6 +141,51 @@ const providers: ConfiguredProviderSummary[] = [
   },
 ];
 
+function mockRect(height: number, top = 0): DOMRect {
+  return {
+    bottom: top + height,
+    height,
+    left: 0,
+    right: 320,
+    toJSON: () => ({}),
+    top,
+    width: 320,
+    x: 0,
+    y: top,
+  } as DOMRect;
+}
+
+function mockFlexibleStackLayout(
+  container: HTMLElement,
+  {
+    availableHeight = 500,
+    panelHeight,
+  }: {
+    availableHeight?: number;
+    panelHeight?: number;
+  } = {},
+) {
+  const panel = container.querySelector(
+    ".model-routing-panel",
+  ) as HTMLElement | null;
+  const nav = container.querySelector(".workspace-nav") as HTMLElement | null;
+  if (!panel || !nav) {
+    throw new Error("Expected workspace-nav sibling and model-routing-panel");
+  }
+
+  const resolvedPanelHeight =
+    panelHeight ??
+    panelHeightFromRatio(DEFAULT_MODEL_ROUTING_HEIGHT_RATIO, availableHeight);
+  const navHeight = availableHeight - resolvedPanelHeight;
+
+  vi.spyOn(nav, "getBoundingClientRect").mockReturnValue(mockRect(navHeight, 0));
+  vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(
+    mockRect(resolvedPanelHeight, navHeight),
+  );
+
+  return { nav, panel, panelHeight: resolvedPanelHeight, availableHeight };
+}
+
 function renderPanel(
   onRouteChange = vi.fn(async () => ({ ok: true as const })),
 ) {
@@ -136,14 +196,77 @@ function renderPanel(
         t: (key) => key,
       }}
     >
-      <ModelRoutingPanel
-        models={models}
-        onRouteChange={onRouteChange}
-        providers={providers}
-      />
+      <div className="flex h-full min-h-0 flex-col" style={{ height: 600 }}>
+        <nav
+          aria-label="Workspace list"
+          className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto"
+        />
+        <ModelRoutingPanel
+          models={models}
+          onRouteChange={onRouteChange}
+          providers={providers}
+        />
+      </div>
     </I18nContext.Provider>,
   );
 }
+
+describe("model-routing-preferences height ratio", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("falls back to the default ratio for invalid storage values", () => {
+    expect(normalizeModelRoutingHeightRatio(Number.NaN)).toBe(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+    );
+    expect(normalizeModelRoutingHeightRatio(-0.2)).toBe(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+    );
+    expect(normalizeModelRoutingHeightRatio(0)).toBe(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+    );
+    expect(normalizeModelRoutingHeightRatio(1.1)).toBe(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+    );
+    expect(normalizeModelRoutingHeightRatio("nope")).toBe(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+    );
+    expect(normalizeModelRoutingHeightRatio(0.55)).toBe(0.55);
+    // Full-stack share is a legitimate extreme, not invalid input.
+    expect(normalizeModelRoutingHeightRatio(1)).toBe(1);
+
+    window.localStorage.setItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY, "abc");
+    expect(readModelRoutingHeightRatio()).toBe(DEFAULT_MODEL_ROUTING_HEIGHT_RATIO);
+  });
+
+  it("clamps panel height against both flexible-stack mins", () => {
+    expect(clampModelRoutingPanelHeight(50, 500)).toBe(
+      MODEL_ROUTING_PANEL_MIN_HEIGHT_PX,
+    );
+    expect(clampModelRoutingPanelHeight(480, 500)).toBe(
+      500 - WORKSPACE_NAV_MIN_HEIGHT_PX,
+    );
+    expect(clampModelRoutingPanelHeight(200, 500)).toBe(200);
+  });
+
+  it("does not force panel min when the flexible stack is shorter than both mins", () => {
+    // available=200 < 120+120: reserve nav min, panel max becomes 80 (no overflow).
+    expect(clampModelRoutingPanelHeight(120, 200)).toBe(80);
+    expect(clampModelRoutingPanelHeight(50, 200)).toBe(80);
+    expect(modelRoutingPanelHeightBounds(200)).toEqual({ min: 80, max: 80 });
+
+    // available=100: nav takes all remaining, panel collapses to 0.
+    expect(clampModelRoutingPanelHeight(50, 100)).toBe(0);
+    expect(modelRoutingPanelHeightBounds(100)).toEqual({ min: 0, max: 0 });
+  });
+
+  it("keeps extreme panel shares as durable ratios instead of snapping to default", () => {
+    expect(ratioFromPanelHeight(200, 200)).toBe(1);
+    expect(ratioFromPanelHeight(80, 200)).toBeCloseTo(0.4, 5);
+    expect(ratioFromPanelHeight(120, 500)).toBeCloseTo(0.24, 5);
+  });
+});
 
 describe("ModelRoutingPanel", () => {
   beforeEach(() => {
@@ -152,13 +275,21 @@ describe("ModelRoutingPanel", () => {
 
   afterEach(() => {
     cleanup();
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   });
 
   it("keeps only the header when collapsed and expands the tree", () => {
     renderPanel();
     expect(screen.queryByRole("tree")).toBeNull();
+    expect(
+      screen.queryByRole("separator", { name: "Resize model routing panel" }),
+    ).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Model routing" }));
     expect(screen.getByRole("tree")).toBeTruthy();
+    expect(
+      screen.getByRole("separator", { name: "Resize model routing panel" }),
+    ).toBeTruthy();
     expect(window.localStorage.getItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY)).toBe(
       "1",
     );
@@ -291,5 +422,282 @@ describe("ModelRoutingPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /Claude/ }));
     const anthropic = screen.getByRole("radio", { name: /Anthropic/ });
     expect(anthropic).toBeDisabled();
+  });
+
+  it("resizes with mouse pointer events and persists the height ratio", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const { container } = renderPanel();
+    const availableHeight = 500;
+    const startPanelHeight = 210;
+    const { panel } = mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: startPanelHeight,
+    });
+
+    // Force layout recompute with mocked rects.
+    fireEvent(window, new Event("resize"));
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize model routing panel",
+    });
+
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${startPanelHeight}px`,
+      );
+    });
+
+    fireEvent.pointerDown(splitter, {
+      clientY: 300,
+      pointerId: 1,
+      pointerType: "mouse",
+    });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("row-resize");
+      expect(document.body.style.userSelect).toBe("none");
+    });
+
+    // Drag up by 40px → panel grows by 40.
+    fireEvent.pointerMove(window, { clientY: 260, pointerId: 1 });
+
+    const expectedHeight = startPanelHeight + 40;
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${expectedHeight}px`,
+      );
+      expect(splitter).toHaveAttribute("aria-valuenow", String(expectedHeight));
+    });
+
+    fireEvent.pointerUp(window, { pointerId: 1 });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+    });
+
+    const savedRatio = Number(
+      window.localStorage.getItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY),
+    );
+    expect(savedRatio).toBeCloseTo(expectedHeight / availableHeight, 5);
+  });
+
+  it("supports touch pointer drag and cleans up on pointercancel", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const { container } = renderPanel();
+    const availableHeight = 500;
+    const startPanelHeight = 200;
+    const { panel } = mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: startPanelHeight,
+    });
+    fireEvent(window, new Event("resize"));
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize model routing panel",
+    });
+
+    fireEvent.pointerDown(splitter, {
+      clientY: 400,
+      pointerId: 7,
+      pointerType: "touch",
+    });
+    fireEvent.pointerMove(window, {
+      clientY: 360,
+      pointerId: 7,
+      pointerType: "touch",
+    });
+
+    const expectedHeight = startPanelHeight + 40;
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${expectedHeight}px`,
+      );
+      expect(document.body.style.cursor).toBe("row-resize");
+    });
+
+    fireEvent.pointerCancel(window, { pointerId: 7, pointerType: "touch" });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+    });
+
+    // Last applied ratio is kept after cancel.
+    expect(
+      Number(window.localStorage.getItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY)),
+    ).toBeCloseTo(expectedHeight / availableHeight, 5);
+    expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+      `${expectedHeight}px`,
+    );
+  });
+
+  it("clamps drag against workspace-nav and model-routing mins", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const { container } = renderPanel();
+    const availableHeight = 500;
+    const startPanelHeight = 200;
+    const { panel } = mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: startPanelHeight,
+    });
+    fireEvent(window, new Event("resize"));
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize model routing panel",
+    });
+
+    fireEvent.pointerDown(splitter, { clientY: 300, pointerId: 1 });
+    // Drag far up → hit nav min (max panel = available - navMin).
+    fireEvent.pointerMove(window, { clientY: -500, pointerId: 1 });
+
+    const maxPanel = availableHeight - WORKSPACE_NAV_MIN_HEIGHT_PX;
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${maxPanel}px`,
+      );
+    });
+
+    // Drag far down → hit panel min.
+    fireEvent.pointerMove(window, { clientY: 2000, pointerId: 1 });
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${MODEL_ROUTING_PANEL_MIN_HEIGHT_PX}px`,
+      );
+    });
+    fireEvent.pointerUp(window, { pointerId: 1 });
+  });
+
+  it("resizes with keyboard arrows and updates aria values", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const { container } = renderPanel();
+    const availableHeight = 500;
+    const startPanelHeight = panelHeightFromRatio(
+      DEFAULT_MODEL_ROUTING_HEIGHT_RATIO,
+      availableHeight,
+    );
+    const { panel } = mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: startPanelHeight,
+    });
+    fireEvent(window, new Event("resize"));
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize model routing panel",
+    });
+
+    await waitFor(() => {
+      expect(splitter).toHaveAttribute(
+        "aria-valuenow",
+        String(startPanelHeight),
+      );
+    });
+
+    fireEvent.keyDown(splitter, { key: "ArrowUp" });
+    const upHeight = startPanelHeight + MODEL_ROUTING_RESIZE_STEP_PX;
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${upHeight}px`,
+      );
+      expect(splitter).toHaveAttribute("aria-valuenow", String(upHeight));
+    });
+
+    fireEvent.keyDown(splitter, { key: "ArrowDown" });
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        `${startPanelHeight}px`,
+      );
+    });
+  });
+
+  it("keeps the height ratio when collapsing and restores it on expand", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    window.localStorage.setItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY, "0.5");
+    const { container } = renderPanel();
+    const availableHeight = 500;
+    const { panel } = mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: 250,
+    });
+    fireEvent(window, new Event("resize"));
+
+    await waitFor(() => {
+      expect(panel.style.getPropertyValue("--model-routing-panel-height")).toBe(
+        "250px",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Model routing" }));
+    expect(
+      screen.queryByRole("separator", { name: "Resize model routing panel" }),
+    ).toBeNull();
+    expect(window.localStorage.getItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY)).toBe(
+      "0.5",
+    );
+    expect(window.localStorage.getItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY)).toBe(
+      "0",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Model routing" }));
+    mockFlexibleStackLayout(container, {
+      availableHeight,
+      panelHeight: 250,
+    });
+    fireEvent(window, new Event("resize"));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("separator", { name: "Resize model routing panel" }),
+      ).toBeTruthy();
+      expect(
+        (container.querySelector(".model-routing-panel") as HTMLElement).style
+          .getPropertyValue("--model-routing-panel-height"),
+      ).toBe("250px");
+    });
+    expect(window.localStorage.getItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY)).toBe(
+      "0.5",
+    );
+  });
+
+  it("restores the saved ratio after remount and scales with a new stack height", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    window.localStorage.setItem(MODEL_ROUTING_HEIGHT_RATIO_STORAGE_KEY, "0.4");
+
+    const first = renderPanel();
+    mockFlexibleStackLayout(first.container, {
+      availableHeight: 500,
+      panelHeight: 200,
+    });
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => {
+      expect(
+        (first.container.querySelector(".model-routing-panel") as HTMLElement)
+          .style.getPropertyValue("--model-routing-panel-height"),
+      ).toBe("200px");
+    });
+    cleanup();
+
+    const second = renderPanel();
+    mockFlexibleStackLayout(second.container, {
+      availableHeight: 800,
+      panelHeight: 320,
+    });
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => {
+      expect(
+        (second.container.querySelector(".model-routing-panel") as HTMLElement)
+          .style.getPropertyValue("--model-routing-panel-height"),
+      ).toBe("320px");
+    });
+  });
+
+  it("uses the default ratio when localStorage is unavailable", () => {
+    const getItem = vi
+      .spyOn(Storage.prototype, "getItem")
+      .mockImplementation(() => {
+        throw new Error("blocked");
+      });
+    expect(readModelRoutingHeightRatio()).toBe(DEFAULT_MODEL_ROUTING_HEIGHT_RATIO);
+    getItem.mockRestore();
   });
 });
