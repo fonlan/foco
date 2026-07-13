@@ -176,6 +176,7 @@ mod scheduled_tasks;
 mod settings_runtime;
 mod skills;
 mod spec_runtime;
+mod ssh_client;
 mod terminal;
 mod update_runtime;
 #[cfg(test)]
