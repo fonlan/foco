@@ -682,6 +682,7 @@ fn test_prepared_chat_context(
             safety_tokens: 0,
             available_message_tokens,
         },
+        live_config: None,
         global_config: GlobalConfig::first_run(workspace_dir),
         memory_settings: MemorySettings::default(),
         memories_used: Vec::new(),
@@ -2054,27 +2055,50 @@ fn chat_title_generation_model_selection_uses_configured_model_or_current_chat_m
     title_model.active_provider_id = Some("title-provider".to_string());
     config.models.push(title_model);
 
-    let selected =
-        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
-            .expect("current chat selection")
-            .expect("not disabled");
+    let selected = crate::http::chat::chat_title_generation_model_selection(&config, "model")
+        .expect("current chat selection")
+        .expect("not disabled");
     assert_eq!(selected.0, "model");
     assert_eq!(selected.1, "provider");
 
     config.app.chat_title_generation_model_id = Some("title-model".to_string());
-    let selected =
-        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
-            .expect("configured model selection")
-            .expect("not disabled");
+    let selected = crate::http::chat::chat_title_generation_model_selection(&config, "model")
+        .expect("configured model selection")
+        .expect("not disabled");
     assert_eq!(selected.0, "title-model");
     assert_eq!(selected.1, "title-provider");
 
     config.app.chat_title_generation_model_id = Some("disabled".to_string());
     assert!(
-        crate::http::chat::chat_title_generation_model_selection(&config, "model", "provider")
+        crate::http::chat::chat_title_generation_model_selection(&config, "model")
             .expect("disabled selection")
             .is_none()
     );
+}
+
+#[test]
+fn chat_title_generation_model_selection_follows_live_active_provider() {
+    let mut config = prompt_test_config(env::temp_dir());
+    let mut alternate_provider = config.providers[0].clone();
+    alternate_provider.id = "provider-current".to_string();
+    alternate_provider.name = "Current Provider".to_string();
+    config.providers.push(alternate_provider);
+    config.models[0]
+        .provider_ids
+        .push("provider-current".to_string());
+    config.models[0].active_provider_id = Some("provider".to_string());
+
+    let selected = crate::http::chat::chat_title_generation_model_selection(&config, "model")
+        .expect("initial selection")
+        .expect("not disabled");
+    assert_eq!(selected.1, "provider");
+
+    config.models[0].active_provider_id = Some("provider-current".to_string());
+    let selected = crate::http::chat::chat_title_generation_model_selection(&config, "model")
+        .expect("switched selection")
+        .expect("not disabled");
+    assert_eq!(selected.0, "model");
+    assert_eq!(selected.1, "provider-current");
 }
 
 #[test]
@@ -10897,6 +10921,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             safety_tokens: 0,
             available_message_tokens: 984,
         },
+        live_config: None,
         global_config: GlobalConfig::first_run(workspace_dir.clone()),
         memory_settings: MemorySettings {
             enabled: true,
@@ -12410,6 +12435,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             safety_tokens: 0,
             available_message_tokens: 984,
         },
+        live_config: None,
         global_config: GlobalConfig::first_run(workspace_dir.clone()),
         memory_settings: MemorySettings {
             enabled: false,
@@ -12838,6 +12864,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
             safety_tokens: 0,
             available_message_tokens: 984,
         },
+        live_config: None,
         global_config: GlobalConfig::first_run(workspace_dir.clone()),
         memory_settings: MemorySettings {
             enabled: false,
@@ -17740,6 +17767,219 @@ Use the existing product UI conventions.
     }
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_routes_legacy_provider_requests_to_current_active_provider() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-current-route-prompt-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-current-route-prompt-profile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    let mut alternate_provider = config.providers[0].clone();
+    alternate_provider.id = "provider-current".to_string();
+    alternate_provider.name = "Current Provider".to_string();
+    config.providers.push(alternate_provider);
+    config.models[0]
+        .provider_ids
+        .push("provider-current".to_string());
+    config.models[0].active_provider_id = Some("provider-current".to_string());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: Some("use the current route".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("prompt context");
+
+    assert_eq!(context.model_id, "model");
+    assert_eq!(context.provider_id, "provider-current");
+
+    drop(context);
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn refresh_model_route_picks_up_route_switch_before_next_provider_request() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-refresh-route-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-refresh-route-profile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    let mut alternate_provider = config.providers[0].clone();
+    alternate_provider.id = "provider-current".to_string();
+    alternate_provider.name = "Current Provider".to_string();
+    config.providers.push(alternate_provider);
+    config.models[0]
+        .provider_ids
+        .push("provider-current".to_string());
+    config.models[0].active_provider_id = Some("provider".to_string());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let mut context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider-legacy".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "refresh the route later".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+
+    assert_eq!(context.provider_id, "provider");
+    let previous_cache_key = context.provider_request.prompt_cache_key.clone();
+    {
+        let mut live = state.config.lock().expect("config lock");
+        live.models[0].active_provider_id = Some("provider-current".to_string());
+    }
+
+    context.refresh_model_route().expect("refresh model route");
+
+    assert_eq!(context.model_id, "model");
+    assert_eq!(context.provider_id, "provider-current");
+    assert_eq!(
+        context
+            .global_config
+            .models
+            .iter()
+            .find(|model| model.id == "model")
+            .and_then(|model| model.active_provider_id.as_deref()),
+        Some("provider-current"),
+        "refresh must keep the live GlobalConfig snapshot for deferred work"
+    );
+    assert_ne!(
+        context.provider_request.prompt_cache_key, previous_cache_key,
+        "prompt cache key must include the resolved provider"
+    );
+
+    drop(context);
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn refresh_model_route_updates_deferred_memory_retrieval_config() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-refresh-memory-route-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-refresh-memory-route-profile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    let mut alternate_provider = config.providers[0].clone();
+    alternate_provider.id = "provider-current".to_string();
+    alternate_provider.name = "Current Provider".to_string();
+    config.providers.push(alternate_provider);
+    config.models[0]
+        .provider_ids
+        .push("provider-current".to_string());
+    config.models[0].active_provider_id = Some("provider".to_string());
+    config.memory.enabled = true;
+    config.memory.retrieval_mode = "fts".to_string();
+    config.memory.retrieval_model_id = Some("model".to_string());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let mut context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider-legacy".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "refresh memory route later".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+
+    assert!(context.pending_memory_retrieval.is_some());
+    assert_eq!(
+        context
+            .pending_memory_retrieval
+            .as_ref()
+            .map(|pending| pending.chat_provider.id.as_str()),
+        Some("provider")
+    );
+    {
+        let mut live = state.config.lock().expect("config lock");
+        live.models[0].active_provider_id = Some("provider-current".to_string());
+    }
+
+    context.refresh_model_route().expect("refresh model route");
+
+    assert_eq!(context.provider_id, "provider-current");
+    assert_eq!(
+        context
+            .global_config
+            .models
+            .iter()
+            .find(|model| model.id == "model")
+            .and_then(|model| model.active_provider_id.as_deref()),
+        Some("provider-current")
+    );
+    let pending = context
+        .pending_memory_retrieval
+        .as_ref()
+        .expect("pending memory retrieval");
+    assert_eq!(pending.chat_provider.id, "provider-current");
+    assert_eq!(
+        context.global_config.memory.retrieval_model_id.as_deref(),
+        Some("model")
+    );
+    assert_eq!(
+        context
+            .global_config
+            .models
+            .iter()
+            .find(|model| model.id == "model")
+            .and_then(|model| model.active_provider_id.as_deref()),
+        Some("provider-current"),
+        "deferred memory retrieval must read the refreshed live active_provider_id"
+    );
+
+    drop(context);
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
     remove_dir_if_exists(&profile_dir);
 }
 
@@ -25435,7 +25675,7 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
 
-    let mut config = GlobalConfig::first_run(workspace_dir);
+    let mut config = prompt_test_config(workspace_dir);
     config
         .remote_servers
         .push(foco_store::config::RemoteServerProfile {
@@ -25550,8 +25790,8 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
 
     let context_usage_payload = json!({
         "chatId": "chat-1",
-        "modelId": "model-1",
-        "providerId": "provider-1",
+        "modelId": "model",
+        "providerId": "provider-legacy",
         "skillIds": ["workspace:workspace:workspace-demo"],
         "assistantDraft": "draft",
         "assistantDraftReasoning": "reasoning",
@@ -25787,8 +26027,8 @@ async fn serve_fake_sidecar_proxy_fixture(
                         || payload
                             != json!({
                                 "chatId": "chat-1",
-                                "modelId": "model-1",
-                                "providerId": "provider-1",
+                                "modelId": "model",
+                                "providerId": "provider",
                                 "skillIds": ["workspace:workspace:workspace-demo"],
                                 "assistantDraft": "draft",
                                 "assistantDraftReasoning": "reasoning",

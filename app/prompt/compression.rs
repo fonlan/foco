@@ -116,6 +116,9 @@ fn validate_prompt_context_lengths(
 pub(crate) async fn ensure_context_compression(
     context: &mut PreparedChatContext,
 ) -> Result<ContextCompressionResult, ApiError> {
+    // Runtime tool-state and LLM compression can themselves issue an LLM request. Resolve
+    // the model's active provider at that boundary instead of reusing a queued run snapshot.
+    context.refresh_model_route()?;
     validate_prompt_context_lengths(
         &context.provider_request.messages,
         &context.message_source_sequences,

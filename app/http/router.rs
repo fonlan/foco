@@ -10,6 +10,8 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 
+use serde_json::Value;
+
 use crate::{
     AppState, CHAT_ATTACHMENT_BODY_LIMIT_BYTES, WORKSPACE_LOGO_BODY_LIMIT_BYTES,
     http::assets::static_asset,
@@ -703,7 +705,7 @@ async fn remote_workspace_proxy_middleware(
     // Read the request body
     let method = request.method().clone();
     let forwarded_headers = request.headers().clone();
-    let bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+    let mut bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
             return Response::builder()
@@ -712,6 +714,12 @@ async fn remote_workspace_proxy_middleware(
                 .expect("valid response");
         }
     };
+    if suffix == "context-usage" {
+        bytes = match normalize_remote_context_usage_request(&state, &bytes) {
+            Ok(body) => body.into(),
+            Err(error) => return error.into_response(),
+        };
+    }
 
     // Proxy to sidecar
     let client = reqwest::Client::new();
@@ -767,6 +775,36 @@ async fn remote_workspace_proxy_middleware(
             .body(Body::from(format!("sidecar proxy failed: {source}")))
             .expect("valid error response"),
     }
+}
+
+fn normalize_remote_context_usage_request(
+    state: &AppState,
+    body: &[u8],
+) -> Result<Vec<u8>, crate::ApiError> {
+    let mut payload = serde_json::from_slice::<Value>(body).map_err(|source| {
+        crate::ApiError::bad_request(format!("invalid context usage request JSON: {source}"))
+    })?;
+    let model_id = payload
+        .get("modelId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .ok_or_else(|| crate::ApiError::bad_request("model id must not be empty"))?
+        .to_string();
+    let config = crate::config_snapshot(state)?;
+    let (_, provider) = config
+        .resolve_active_model_provider(&model_id)
+        .map_err(|error| crate::ApiError::bad_request(error.to_string()))?;
+    let provider_id = provider.id.clone();
+    let payload = payload.as_object_mut().ok_or_else(|| {
+        crate::ApiError::bad_request("context usage request must be a JSON object")
+    })?;
+    payload.insert("providerId".to_string(), Value::String(provider_id));
+    serde_json::to_vec(&payload).map_err(|source| {
+        crate::ApiError::internal(format!(
+            "failed to normalize context usage request: {source}"
+        ))
+    })
 }
 
 fn is_proxy_sse_path(suffix: &str) -> bool {

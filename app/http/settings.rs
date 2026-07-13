@@ -928,24 +928,10 @@ fn image_agent_runner_selection_valid(
     config: &GlobalConfig,
     definition: &AgentDefinitionSettings,
 ) -> bool {
-    let Some(model) = config
-        .models
-        .iter()
-        .find(|model| model.id == definition.model_id)
-    else {
+    let Ok((model, provider)) = config.resolve_active_model_provider(&definition.model_id) else {
         return false;
     };
-    model.enabled
-        && model.limits.is_some()
-        && model_outputs_text(model)
-        && model
-            .provider_ids
-            .iter()
-            .any(|provider_id| provider_id == &definition.provider_id)
-        && config
-            .providers
-            .iter()
-            .any(|provider| provider.enabled && provider.id == definition.provider_id)
+    model.limits.is_some() && model_outputs_text(model) && provider.enabled
 }
 
 async fn refresh_builtin_agent_definitions(

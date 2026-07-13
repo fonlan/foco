@@ -20,7 +20,9 @@ pub(crate) async fn prepare_prompt_context(
 ) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
     let model_id = request.model_id.trim();
-    let requested_provider_id = optional_trimmed_string(request.provider_id);
+    // `providerId` remains accepted in persisted/legacy request payloads, but model routing
+    // is resolved only from the current global configuration at request preparation time.
+    let _legacy_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
     let session_mode = optional_trimmed_string(request.session_mode);
@@ -58,18 +60,9 @@ pub(crate) async fn prepare_prompt_context(
     if purpose.allows_code_graph_initialization() {
         spawn_code_graph_workspace_initialization_if_needed(state, workspace);
     }
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
-
-    if !model.enabled {
-        return Err(ApiError::bad_request(format!(
-            "model '{}' is disabled",
-            model.id
-        )));
-    }
+    let (model, provider) = config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
     let limits = model.limits.as_ref().ok_or_else(|| {
         ApiError::bad_request(format!("enabled model '{}' is missing limits", model.id))
@@ -80,42 +73,6 @@ pub(crate) async fn prepare_prompt_context(
             model.id, limits.max_output_tokens
         ))
     })?;
-    let active_provider_id = requested_provider_id
-        .as_deref()
-        .or(model.active_provider_id.as_deref())
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "model '{}' has no active provider selected",
-                model.id
-            ))
-        })?;
-
-    if !model
-        .provider_ids
-        .iter()
-        .any(|provider_id| provider_id == active_provider_id)
-    {
-        return Err(ApiError::bad_request(format!(
-            "provider '{}' is not associated with model '{}'",
-            active_provider_id, model.id
-        )));
-    }
-
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == active_provider_id)
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("provider '{}' was not found", active_provider_id))
-        })?;
-
-    if !provider.enabled {
-        return Err(ApiError::bad_request(format!(
-            "provider '{}' is disabled",
-            provider.id
-        )));
-    }
-
     let provider_config = provider_connection_config(provider)?;
     sync_mcp_workspace(&state.mcp_registry, workspace, config)
         .await

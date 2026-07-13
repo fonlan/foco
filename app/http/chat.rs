@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -1073,7 +1074,7 @@ pub(crate) async fn queue_chat_message_internal(
     }
     if should_generate_chat_title {
         spawn_chat_title_generation(ChatTitleGenerationInput {
-            config: config.clone(),
+            live_config: state.config.clone(),
             app_language: config.app.language.clone(),
             workspace_id: prompt_context.workspace_id.clone(),
             workspace_path: prompt_context.workspace_path.clone(),
@@ -1086,7 +1087,6 @@ pub(crate) async fn queue_chat_message_internal(
                 .map(|attachment| attachment.name.clone())
                 .collect(),
             request_model_id: prompt_context.model_id.clone(),
-            request_provider_id: prompt_context.provider_id.clone(),
         });
     }
     let chat = database
@@ -1111,7 +1111,7 @@ pub(crate) async fn queue_chat_message_internal(
 
 #[derive(Clone)]
 struct ChatTitleGenerationInput {
-    config: GlobalConfig,
+    live_config: Arc<Mutex<GlobalConfig>>,
     app_language: String,
     workspace_id: String,
     workspace_path: PathBuf,
@@ -1119,8 +1119,9 @@ struct ChatTitleGenerationInput {
     placeholder_title: String,
     user_message: String,
     attachment_names: Vec<String>,
+    // Fallback chat model when title generation is set to "current chat model".
+    // Provider is resolved from live config at request start, not at queue time.
     request_model_id: String,
-    request_provider_id: String,
 }
 
 pub(crate) fn should_queue_chat_title_generation(
@@ -1152,11 +1153,13 @@ fn spawn_chat_title_generation(input: ChatTitleGenerationInput) {
 }
 
 async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<(), ApiError> {
-    let Some((model_id, provider_id, provider_config)) = chat_title_generation_model_selection(
-        &input.config,
-        &input.request_model_id,
-        &input.request_provider_id,
-    )?
+    let config = input
+        .live_config
+        .lock()
+        .map_err(|_| ApiError::internal("global config lock is poisoned"))?
+        .clone();
+    let Some((model_id, provider_id, provider_config)) =
+        chat_title_generation_model_selection(&config, &input.request_model_id)?
     else {
         return Ok(());
     };
@@ -1176,7 +1179,7 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         CHAT_TITLE_GENERATION_REQUEST_KIND,
         CHAT_TITLE_GENERATION_TIMEOUT_MS,
         0,
-        api_audit_save_details(&input.config),
+        api_audit_save_details(&config),
     )
     .await?;
     let Some(title) = clean_generated_chat_title(&title_text) else {
@@ -1196,7 +1199,6 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
 pub(crate) fn chat_title_generation_model_selection(
     config: &GlobalConfig,
     request_model_id: &str,
-    request_provider_id: &str,
 ) -> Result<Option<(String, String, foco_providers::ProviderConnectionConfig)>, ApiError> {
     let configured = config
         .app
@@ -1207,56 +1209,23 @@ pub(crate) fn chat_title_generation_model_selection(
         return Ok(None);
     }
 
-    let (model_id, provider_id) = if configured == CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL {
-        (request_model_id, request_provider_id)
+    let model_id = if configured == CHAT_TITLE_GENERATION_CURRENT_CHAT_MODEL {
+        request_model_id
     } else {
-        let model = config
-            .models
-            .iter()
-            .find(|model| model.id == configured)
-            .ok_or_else(|| ApiError::bad_request("chat title generation model was not found"))?;
-        if !chat_title_generation_model_available(config, model) {
-            return Err(ApiError::bad_request(
-                "chat title generation model is disabled or unavailable",
-            ));
-        }
-        let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
-            ApiError::bad_request("chat title generation model has no active provider")
-        })?;
-        (model.id.as_str(), provider_id)
+        configured
     };
-
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .ok_or_else(|| {
-            ApiError::bad_request("chat title generation request model was not found")
-        })?;
-    if !model.enabled || !model_outputs_text_for_chat_title(model) {
+    let (model, provider) = config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if !chat_title_generation_model_available(config, model) {
         return Err(ApiError::bad_request(
-            "chat title generation request model is disabled or does not output text",
-        ));
-    }
-    if !model.provider_ids.iter().any(|id| id == provider_id) {
-        return Err(ApiError::bad_request(
-            "chat title generation provider is not available for the model",
-        ));
-    }
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| ApiError::bad_request("chat title generation provider was not found"))?;
-    if !provider.enabled {
-        return Err(ApiError::bad_request(
-            "chat title generation provider is disabled",
+            "chat title generation model is disabled or unavailable",
         ));
     }
 
     Ok(Some((
-        model_id.to_string(),
-        provider_id.to_string(),
+        model.id.clone(),
+        provider.id.clone(),
         provider_connection_config(provider)?,
     )))
 }

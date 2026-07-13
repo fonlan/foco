@@ -629,11 +629,9 @@ fn scheduled_queue_input(
                         "scheduled agent prompt must specify modelId or agentDefinitionId",
                     )
                 })?;
-            let provider_id = provider_id.or_else(|| {
-                definition
-                    .as_ref()
-                    .map(|definition| definition.provider_id.clone())
-            });
+            // providerId is legacy input only. Do not derive a provider from the Agent
+            // definition: the queued request resolves the active route when it starts.
+            let _legacy_provider_id = provider_id;
             let thinking_level = thinking_level.or_else(|| {
                 definition
                     .as_ref()
@@ -644,7 +642,7 @@ fn scheduled_queue_input(
                 chat_id,
                 chat_title_override: None,
                 model_id,
-                provider_id,
+                provider_id: None,
                 thinking_level,
                 skill_ids: Some(skill_ids),
                 session_mode: None,
@@ -936,5 +934,62 @@ mod tests {
             scheduled_task_scan_delay(now, Some(now - ChronoDuration::seconds(1))),
             Duration::from_millis(SCHEDULED_TASK_MIN_SCAN_DELAY_MS)
         );
+    }
+    #[test]
+    fn scheduled_queue_input_drops_legacy_provider_id() {
+        let config = foco_store::config::GlobalConfig::first_run(std::env::temp_dir());
+        let action_json = serde_json::to_string(&ScheduledAction::AgentPrompt {
+            prompt: "Run the scheduled task.".to_string(),
+            session_mode: ScheduledSessionMode::CreateNewChat,
+            agent_definition_id: None,
+            model_id: Some("model-current".to_string()),
+            provider_id: Some("provider-legacy".to_string()),
+            thinking_level: Some("high".to_string()),
+            skill_ids: Vec::new(),
+            collaboration_tools_enabled: true,
+        })
+        .expect("serialize action");
+        let task = ScheduledTaskRecord {
+            id: "scheduled-task-1".to_string(),
+            title: "Scheduled task".to_string(),
+            description: None,
+            schedule_json: "{}".to_string(),
+            action_json,
+            status: STATUS_ENABLED.to_string(),
+            next_run_at: None,
+            last_run_at: None,
+            created_at: "2026-07-13T00:00:00Z".to_string(),
+            updated_at: "2026-07-13T00:00:00Z".to_string(),
+            metadata_json: "{}".to_string(),
+        };
+        let run = ScheduledTaskRunRecord {
+            id: "scheduled-run-1".to_string(),
+            task_id: task.id.clone(),
+            trigger_reason: TRIGGER_REASON_SCHEDULED.to_string(),
+            status: RUN_STATUS_PENDING.to_string(),
+            scheduled_at: "2026-07-13T00:00:00Z".to_string(),
+            queued_at: None,
+            started_at: None,
+            completed_at: None,
+            chat_id: None,
+            user_message_id: None,
+            assistant_message_id: None,
+            agent_team_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            active_run_id: None,
+            error_message: None,
+            output_summary: None,
+            created_at: "2026-07-13T00:00:00Z".to_string(),
+            updated_at: "2026-07-13T00:00:00Z".to_string(),
+            metadata_json: "{}".to_string(),
+        };
+
+        let queued = scheduled_queue_input(&config, &task, &run, TRIGGER_REASON_SCHEDULED)
+            .expect("scheduled queue input");
+
+        assert_eq!(queued.model_id, "model-current");
+        assert_eq!(queued.provider_id, None);
+        assert_eq!(queued.thinking_level.as_deref(), Some("high"));
     }
 }

@@ -52,15 +52,10 @@ pub(crate) struct PlanPhaseRetryRequest {
 
 impl PlanPhaseRetryRequest {
     fn has_override(&self) -> bool {
-        self.provider_id
+        self.model_id
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
-            || self
-                .model_id
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty())
             || self
                 .thinking_level
                 .as_deref()
@@ -1206,13 +1201,12 @@ fn plan_runner_model_selection(
             ApiError::bad_request("plan runner requires the default agent definition")
         })?;
     let mut selection =
-        validate_plan_model_selection(config, &definition.provider_id, &definition.model_id)
-            .map_err(|error| {
-                ApiError::bad_request(format!(
-                    "plan runner default agent model selection is unavailable: {}",
-                    error.message()
-                ))
-            })?;
+        resolve_plan_model_selection(config, &definition.model_id).map_err(|error| {
+            ApiError::bad_request(format!(
+                "plan runner default agent model selection is unavailable: {}",
+                error.message()
+            ))
+        })?;
     selection.thinking_level = definition.model_options.thinking_level.clone();
     validate_plan_selection_thinking_level(config, model_metadata_file, &selection)?;
     Ok(selection)
@@ -1224,31 +1218,19 @@ fn plan_retry_model_selection(
     phase: &PlanPhaseRecord,
     request: &PlanPhaseRetryRequest,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
-    let requested_provider_id = trimmed_non_empty(request.provider_id.as_deref());
+    // Keep accepting the historical providerId field, but route the selected model at
+    // dispatch time so a retry cannot pin a provider from an older attempt.
+    let _legacy_provider_id = trimmed_non_empty(request.provider_id.as_deref());
     let requested_model_id = trimmed_non_empty(request.model_id.as_deref());
-    if requested_provider_id.is_some() != requested_model_id.is_some() {
-        return Err(ApiError::bad_request(
-            "plan phase retry providerId and modelId must be provided together",
-        ));
-    }
 
-    let base = match (requested_provider_id, requested_model_id) {
-        (Some(provider_id), Some(model_id)) => {
-            validate_plan_model_selection(config, provider_id, model_id)?
-        }
-        _ => phase
+    let base = match requested_model_id {
+        Some(model_id) => resolve_plan_model_selection(config, model_id)?,
+        None => phase
             .attempts
             .iter()
             .rev()
-            .find_map(|attempt| {
-                Some((
-                    attempt.provider_id.as_deref()?,
-                    attempt.model_id.as_deref()?,
-                ))
-            })
-            .map(|(provider_id, model_id)| {
-                validate_plan_model_selection(config, provider_id, model_id)
-            })
+            .find_map(|attempt| attempt.model_id.as_deref())
+            .map(|model_id| resolve_plan_model_selection(config, model_id))
             .transpose()?
             .unwrap_or(plan_runner_model_selection(config, model_metadata_file)?),
     };
@@ -1275,41 +1257,17 @@ fn plan_retry_model_selection(
     Ok(selection)
 }
 
-fn validate_plan_model_selection(
+fn resolve_plan_model_selection(
     config: &GlobalConfig,
-    provider_id: &str,
     model_id: &str,
 ) -> Result<PlanRunnerModelSelection, ApiError> {
-    let provider_id = provider_id.trim();
     let model_id = model_id.trim();
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| ApiError::bad_request(format!("provider was not found: {provider_id}")))?;
-    if !provider.enabled {
-        return Err(ApiError::bad_request(format!(
-            "provider '{provider_id}' is disabled"
-        )));
-    }
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
-    if !model.enabled {
-        return Err(ApiError::bad_request(format!(
-            "model '{model_id}' is disabled"
-        )));
-    }
+    let (model, provider) = config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     if !model_outputs_text(model) {
         return Err(ApiError::bad_request(format!(
             "model '{model_id}' does not support text output"
-        )));
-    }
-    if !model.provider_ids.iter().any(|id| id == provider_id) {
-        return Err(ApiError::bad_request(format!(
-            "model '{model_id}' is not available from provider '{provider_id}'"
         )));
     }
     Ok(PlanRunnerModelSelection {
@@ -1690,6 +1648,39 @@ mod tests {
     }
 
     #[test]
+    fn retry_model_selection_ignores_legacy_attempt_provider_and_uses_current_route() {
+        let mut config = retry_selection_config();
+        // Historical attempt metadata kept the previous provider, but the model route moved.
+        config.models[1].provider_ids = vec!["provider-a".to_string(), "provider-b".to_string()];
+        config.models[1].active_provider_id = Some("provider-a".to_string());
+        let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
+            &mut config,
+            &["low"],
+            &["low", "medium", "high", "xhigh"],
+        );
+        let mut phase = phase_record_for_prompt();
+        phase.status = "failed".to_string();
+        phase.attempts.push(attempt_record_for_selection(
+            0,
+            "provider-b",
+            "model-b",
+            Some("high"),
+        ));
+
+        let selection = plan_retry_model_selection(
+            &config,
+            &metadata_file,
+            &phase,
+            &PlanPhaseRetryRequest::default(),
+        )
+        .expect("selection");
+
+        assert_eq!(selection.model_id, "model-b");
+        assert_eq!(selection.provider_id, "provider-a");
+        assert_eq!(selection.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn retry_model_selection_reuses_last_attempt_by_default() {
         let mut config = retry_selection_config();
         let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
@@ -1827,6 +1818,8 @@ mod tests {
     #[test]
     fn plan_runner_model_selection_uses_default_agent_definition_not_model_order() {
         let mut config = retry_selection_config();
+        // Existing snapshots may retain a provider that is no longer the model route.
+        config.agent_definitions[0].provider_id = "provider-a".to_string();
         let (_metadata_dir, metadata_file) = write_retry_selection_metadata(
             &mut config,
             &["low"],
@@ -1860,11 +1853,8 @@ mod tests {
 
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(error.message().contains("plan runner default agent"));
-        assert!(
-            error
-                .message()
-                .contains("provider 'provider-b' is disabled")
-        );
+        assert!(error.message().contains("active provider 'provider-b'"));
+        assert!(error.message().contains("is disabled"));
     }
 
     #[test]

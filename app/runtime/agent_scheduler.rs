@@ -105,7 +105,6 @@ pub(crate) struct CoordinatorTaskInput {
 
 struct AgentTaskModelSelection {
     model_id: String,
-    provider_id: Option<String>,
     thinking_level: Option<String>,
 }
 
@@ -740,7 +739,7 @@ async fn run_coordinator_task_inner(
             visible_assistant_message_id: task_input.visible_assistant_message_id.clone(),
             visible_assistant_sequence: task_input.visible_assistant_sequence,
             model_id: model_selection.model_id,
-            provider_id: model_selection.provider_id,
+            provider_id: None,
             thinking_level: model_selection.thinking_level,
             skill_ids: Some(task_input.skill_ids.clone()),
             session_mode: task_input.session_mode.clone(),
@@ -1149,14 +1148,14 @@ fn agent_task_model_selection(
     };
 
     Ok(match queued_run {
+        // Legacy queuedRun.providerId is deliberately not carried into the request. The current
+        // model route is resolved by prepare_prompt_context immediately before execution.
         Some(queued_run) => AgentTaskModelSelection {
             model_id: queued_run.model_id,
-            provider_id: queued_run.provider_id,
             thinking_level: queued_run.thinking_level,
         },
         None => AgentTaskModelSelection {
             model_id: instance.definition_snapshot.model_id.clone(),
-            provider_id: Some(instance.definition_snapshot.provider_id.clone()),
             thinking_level: instance
                 .definition_snapshot
                 .model_options
@@ -2552,14 +2551,11 @@ pub(crate) fn validate_agent_snapshot_for_workspace(
             workspace.path.display()
         )));
     }
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.id == definition.model_id && model.enabled)
-        .ok_or_else(|| {
+    let (model, _) = config
+        .resolve_active_model_provider(&definition.model_id)
+        .map_err(|error| {
             ApiError::bad_request(format!(
-                "Agent definition snapshot references unavailable model '{}'",
-                definition.model_id
+                "Agent definition snapshot model route is unavailable: {error}"
             ))
         })?;
     let limits = model.limits.as_ref().ok_or_else(|| {
@@ -2576,26 +2572,6 @@ pub(crate) fn validate_agent_snapshot_for_workspace(
         return Err(ApiError::bad_request(format!(
             "Agent definition snapshot max output tokens exceed model '{}' limits",
             definition.model_id
-        )));
-    }
-    if !model
-        .provider_ids
-        .iter()
-        .any(|provider_id| provider_id == &definition.provider_id)
-    {
-        return Err(ApiError::bad_request(format!(
-            "Agent definition snapshot provider '{}' is not associated with model '{}'",
-            definition.provider_id, definition.model_id
-        )));
-    }
-    if !config
-        .providers
-        .iter()
-        .any(|provider| provider.id == definition.provider_id && provider.enabled)
-    {
-        return Err(ApiError::bad_request(format!(
-            "Agent definition snapshot references unavailable provider '{}'",
-            definition.provider_id
         )));
     }
     Ok(())
@@ -3404,7 +3380,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_task_model_selection_uses_queued_user_message_override() {
+    fn agent_task_model_selection_uses_queued_model_without_pinning_legacy_provider() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut database = open_workspace_database_critical(workspace.path()).expect("database");
         let team_id = foco_agent::AgentTeamId::new("agent-team-model-selection").expect("team id");
@@ -3466,7 +3442,6 @@ mod tests {
             .expect("selection");
 
         assert_eq!(selection.model_id, "queued-model");
-        assert_eq!(selection.provider_id.as_deref(), Some("queued-provider"));
         assert_eq!(selection.thinking_level.as_deref(), Some("queued-thinking"));
     }
 

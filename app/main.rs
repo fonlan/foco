@@ -2283,6 +2283,9 @@ struct PreparedChatContext {
     tool_resource_locks: ToolResourceLockRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
+    /// Live global config used to resolve the active provider immediately before every
+    /// real local provider request. Test-only handcrafted contexts may omit this.
+    live_config: Option<Arc<Mutex<GlobalConfig>>>,
     global_config: GlobalConfig,
     memory_settings: MemorySettings,
     memories_used: Vec<ChatMemoryUsedSummary>,
@@ -2764,7 +2767,69 @@ fn persist_completed_llm_request(
     Ok(())
 }
 
+fn resolve_active_model_route(
+    config: GlobalConfig,
+    model_id: &str,
+) -> Result<
+    (
+        GlobalConfig,
+        ModelSettings,
+        ProviderSettings,
+        ProviderConnectionConfig,
+    ),
+    ApiError,
+> {
+    let (model, provider) = config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let model = model.clone();
+    let provider = provider.clone();
+    let provider_config = provider_connection_config(&provider)?;
+
+    Ok((config, model, provider, provider_config))
+}
+
 impl PreparedChatContext {
+    pub(crate) fn refresh_model_route(&mut self) -> Result<(), ApiError> {
+        let Some(live_config) = &self.live_config else {
+            // Handcrafted unit-test contexts do not have an AppState-backed config. Every
+            // production context is constructed with a live config handle.
+            return Ok(());
+        };
+        let config = live_config
+            .lock()
+            .map_err(|_| ApiError::internal("global config lock is poisoned"))?
+            .clone();
+        let (config, model, provider, provider_config) =
+            resolve_active_model_route(config, &self.model_id)?;
+
+        // Keep the full live snapshot so deferred memory retrieval, hooks, audit
+        // detail flags, and other config-derived work see the same route as the
+        // next chat provider request.
+        self.global_config = config;
+        self.memory_settings = self.global_config.memory.clone();
+        self.model_id = model.id.clone();
+        self.provider_id = provider.id.clone();
+        self.provider_config = provider_config;
+        self.provider_request.model_id = model.id.clone();
+        if let Some(pending) = self.pending_memory_retrieval.as_mut() {
+            pending.chat_model = model;
+            pending.chat_provider = provider;
+        }
+        self.provider_request.prompt_cache_key = Some(prompt_cache_key(
+            &self.workspace_id,
+            &self.chat_id,
+            &self.provider_id,
+            &self.model_id,
+            &self.provider_request,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+        )?);
+        self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
+
+        Ok(())
+    }
+
     fn capture_cancelled_llm_request(
         &mut self,
         capture: &ProviderAuditCapture,
@@ -2870,6 +2935,37 @@ impl PreparedChatContext {
                     let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
                     yield start_event;
+                    if let Err(error) = self.refresh_model_route() {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+                        if let Err(persist_error) = persist_chat_result(
+                            &self,
+                            &request_started_at,
+                            outcome,
+                            &events,
+                            None,
+                            None,
+                            &executed_tool_calls,
+                        ) {
+                            yield ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                        } else {
+                            yield event;
+                        }
+                        return;
+                    }
                     if let Some(event) = agent_team_refresh_event_for_context(
                         &self,
                         "agent_run_started",
@@ -3060,6 +3156,37 @@ impl PreparedChatContext {
                             };
                             events.push(captured_event(&event));
                             yield event;
+                        }
+                        if let Err(error) = self.refresh_model_route() {
+                            let message = error.message;
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_chat_audit_outcome(
+                                &self,
+                                started_at,
+                                &mut events,
+                                &message,
+                                None,
+                            )
+                            .await;
+                            if let Err(persist_error) = persist_chat_result(
+                                &self,
+                                &request_started_at,
+                                outcome,
+                                &events,
+                                None,
+                                None,
+                                &executed_tool_calls,
+                            ) {
+                                yield ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                            } else {
+                                yield event;
+                            }
+                            return;
                         }
                         let packed_messages = match pack_neutral_messages(
                             self.provider_request.messages.clone(),
@@ -4952,6 +5079,7 @@ async fn prepare_chat_context_for_output(
         tool_resource_locks: state.tool_resource_locks.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
+        live_config: Some(state.config.clone()),
         global_config: config.clone(),
         memory_settings: config.memory.clone(),
         memories_used: prompt_context.memories_used,
