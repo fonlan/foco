@@ -6654,6 +6654,7 @@ fn remote_message_parts(
 }
 
 /// Prefer persisted `metadata.parts` (includes contextCompression) for history reload.
+/// Tool call display fields are always filled from the `tool_calls` table.
 fn remote_assistant_message_parts(
     metadata: &Value,
     content: &str,
@@ -6665,9 +6666,346 @@ fn remote_assistant_message_parts(
         .and_then(Value::as_array)
         .filter(|parts| !parts.is_empty())
     {
-        return parts.clone();
+        return remote_hydrate_assistant_parts(parts, tool_calls);
     }
     remote_message_parts(content, reasoning, tool_calls)
+}
+
+fn remote_assistant_has_usable_parts(metadata: &Value) -> bool {
+    metadata
+        .get("parts")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| !parts.is_empty())
+}
+
+fn remote_tool_call_part_id(part: &Value) -> Option<&str> {
+    if part.get("type").and_then(Value::as_str) != Some("toolCall") {
+        return None;
+    }
+    part.get("toolCall")
+        .and_then(|tool_call| {
+            tool_call
+                .get("id")
+                .or_else(|| tool_call.get("callId"))
+                .or_else(|| tool_call.get("call_id"))
+        })
+        .and_then(Value::as_str)
+        .or_else(|| part.get("toolCallId").and_then(Value::as_str))
+        .or_else(|| part.get("tool_call_id").and_then(Value::as_str))
+}
+
+/// Rewrite toolCall parts with live `tool_calls` table rows; append missing tool calls.
+fn remote_hydrate_assistant_parts(parts: &[Value], tool_calls: &[Value]) -> Vec<Value> {
+    let tool_calls_by_id = tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id, tool_call))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen_tool_call_ids = HashSet::new();
+    let mut hydrated = Vec::with_capacity(parts.len() + tool_calls.len());
+    for part in parts {
+        if let Some(tool_call_id) = remote_tool_call_part_id(part) {
+            seen_tool_call_ids.insert(tool_call_id.to_string());
+            if let Some(tool_call) = tool_calls_by_id.get(tool_call_id) {
+                hydrated.push(json!({
+                    "type": "toolCall",
+                    "toolCall": (*tool_call).clone(),
+                }));
+                continue;
+            }
+        }
+        hydrated.push(part.clone());
+    }
+    for tool_call in tool_calls {
+        let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen_tool_call_ids.insert(tool_call_id.to_string()) {
+            hydrated.push(json!({
+                "type": "toolCall",
+                "toolCall": tool_call.clone(),
+            }));
+        }
+    }
+    hydrated
+}
+
+fn remote_context_compression_part_from_event_payload(value: &Value) -> Option<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("contextCompression")
+        && value.get("kind").is_none()
+        && value.get("status").is_none()
+    {
+        return None;
+    }
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or(CONTEXT_COMPRESSION_KIND_LLM);
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let mut detail = value.get("detail").cloned().unwrap_or_else(|| json!({}));
+    if let Some(detail_object) = detail.as_object_mut() {
+        detail_object
+            .entry("status".to_string())
+            .or_insert_with(|| Value::String(status.to_string()));
+        detail_object
+            .entry("kind".to_string())
+            .or_insert_with(|| Value::String(kind.to_string()));
+        if !detail_object.contains_key("snapshotId")
+            && let Some(snapshot_id) = value
+                .get("snapshotId")
+                .or_else(|| value.get("snapshot_id"))
+                .filter(|v| !v.is_null())
+        {
+            detail_object.insert("snapshotId".to_string(), snapshot_id.clone());
+        }
+    }
+    let snapshot_id = detail
+        .get("snapshotId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("snapshotId")
+                .or_else(|| value.get("snapshot_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let id = snapshot_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            kind,
+            detail
+                .get("startedAt")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+        )
+    });
+    Some(json!({
+        "type": "contextCompression",
+        "id": id,
+        "status": status,
+        "kind": kind,
+        "detail": detail,
+    }))
+}
+
+fn remote_push_context_compression_part_value(parts: &mut Vec<Value>, next_part: Value) {
+    if let Some(existing) = parts
+        .iter_mut()
+        .find(|part| remote_context_compression_parts_match(part, &next_part))
+    {
+        remote_merge_context_compression_part(existing, next_part);
+        return;
+    }
+    parts.push(next_part);
+}
+
+fn remote_append_text_or_reasoning_part(parts: &mut Vec<Value>, part_type: &str, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if let Some(last) = parts.last_mut()
+        && last.get("type").and_then(Value::as_str) == Some(part_type)
+        && let Some(text) = last.get("text").and_then(Value::as_str)
+    {
+        let next_text = format!("{text}{delta}");
+        if let Some(object) = last.as_object_mut() {
+            object.insert("text".to_string(), Value::String(next_text));
+        }
+        return;
+    }
+    parts.push(json!({
+        "type": part_type,
+        "text": delta,
+    }));
+}
+
+/// Materialize missing assistant `metadata.parts` from `run_events` (includes
+/// `context_compression`) so history reload can show compression blocks for
+/// older messages that only have events.
+fn remote_materialize_missing_assistant_parts(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    messages: &mut [foco_store::workspace::MessageRecord],
+    tool_calls: &[foco_store::workspace::ToolCallWithResultRecord],
+) -> Result<(), WorkspaceDatabaseError> {
+    let missing_message_ids = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter(|message| {
+            let metadata =
+                serde_json::from_str::<Value>(&message.metadata_json).unwrap_or_else(|_| json!({}));
+            !remote_assistant_has_usable_parts(&metadata)
+        })
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    if missing_message_ids.is_empty() {
+        return Ok(());
+    }
+
+    let events = database.history_run_events_for_chat_messages(chat_id, &missing_message_ids)?;
+    let mut event_parts_by_message = HashMap::<String, Vec<Value>>::new();
+    let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
+    let mut had_stream_parts_by_message = HashMap::<String, bool>::new();
+
+    for event in &events {
+        let Ok(value) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        let Some(message_id) = value
+            .get("assistantMessageId")
+            .or_else(|| value.get("assistant_message_id"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !missing_message_ids.iter().any(|id| id == message_id) {
+            continue;
+        }
+
+        match event.event_type.as_str() {
+            "text_delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    *had_stream_parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default() = true;
+                    remote_append_text_or_reasoning_part(
+                        event_parts_by_message
+                            .entry(message_id.to_string())
+                            .or_default(),
+                        "text",
+                        delta,
+                    );
+                }
+            }
+            "reasoning_delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    *had_stream_parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default() = true;
+                    remote_append_text_or_reasoning_part(
+                        event_parts_by_message
+                            .entry(message_id.to_string())
+                            .or_default(),
+                        "reasoning",
+                        delta,
+                    );
+                }
+            }
+            "tool_call" => {
+                let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
+                else {
+                    continue;
+                };
+                let Some(tool_call_id) = tool_call
+                    .get("id")
+                    .or_else(|| tool_call.get("callId"))
+                    .or_else(|| tool_call.get("call_id"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if !seen_tool_call_ids_by_message
+                    .entry(message_id.to_string())
+                    .or_default()
+                    .insert(tool_call_id.to_string())
+                {
+                    continue;
+                }
+                *had_stream_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default() = true;
+                let summary = tool_calls
+                    .iter()
+                    .find(|row| row.id == tool_call_id)
+                    .map(remote_tool_call_summary)
+                    .unwrap_or_else(|| tool_call.clone());
+                event_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default()
+                    .push(json!({
+                        "type": "toolCall",
+                        "toolCall": summary,
+                    }));
+            }
+            "context_compression" => {
+                if let Some(next_part) = remote_context_compression_part_from_event_payload(&value)
+                {
+                    remote_push_context_compression_part_value(
+                        event_parts_by_message
+                            .entry(message_id.to_string())
+                            .or_default(),
+                        next_part,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == "assistant")
+        .filter(|message| missing_message_ids.iter().any(|id| id == &message.id))
+    {
+        let Some(mut event_parts) = event_parts_by_message.remove(&message.id) else {
+            continue;
+        };
+        if event_parts.is_empty() {
+            continue;
+        }
+
+        let metadata =
+            serde_json::from_str::<Value>(&message.metadata_json).unwrap_or_else(|_| json!({}));
+        let reasoning = metadata.get("reasoning").and_then(Value::as_str);
+        let message_tool_calls = tool_calls
+            .iter()
+            .filter(|tool_call| tool_call.message_id.as_deref() == Some(message.id.as_str()))
+            .map(remote_tool_call_summary)
+            .collect::<Vec<_>>();
+
+        let had_stream_parts = had_stream_parts_by_message
+            .get(&message.id)
+            .copied()
+            .unwrap_or(false);
+        if !had_stream_parts {
+            // Compression-only events: keep compression blocks first, then
+            // content/reasoning/toolCalls (same shape as live complete).
+            event_parts.extend(remote_message_parts(
+                &message.content,
+                reasoning,
+                &message_tool_calls,
+            ));
+        } else {
+            event_parts = remote_hydrate_assistant_parts(&event_parts, &message_tool_calls);
+        }
+
+        let mut metadata = metadata;
+        let Some(metadata_object) = metadata.as_object_mut() else {
+            continue;
+        };
+        metadata_object.insert("parts".to_string(), json!(event_parts));
+        metadata_object.insert(
+            "partsVersion".to_string(),
+            Value::Number(serde_json::Number::from(4)),
+        );
+        metadata_object.insert(
+            "partsSource".to_string(),
+            Value::String("run_events".to_string()),
+        );
+        let metadata_json = metadata.to_string();
+        database.update_message_metadata(&message.id, &metadata_json)?;
+        message.metadata_json = metadata_json;
+    }
+
+    Ok(())
 }
 
 fn remote_chat_active_run(state: &RemoteSidecarState, chat_id: &str) -> Option<Value> {
@@ -6745,7 +7083,7 @@ async fn remote_sidecar_chat_messages(
     let before = query
         .get("beforeSequence")
         .and_then(|value| value.parse::<i64>().ok());
-    let database = sidecar_workspace_database(&state)?;
+    let mut database = sidecar_workspace_database(&state)?;
     let chat = database
         .chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
@@ -6755,9 +7093,17 @@ async fn remote_sidecar_chat_messages(
     let tool_calls = database
         .tool_calls_for_chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let messages = database
+    let mut messages = database
         .messages_for_chat_page(&chat_id, before, limit)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    // Best-effort: materialize compression/text/tool parts from run_events for
+    // assistants that still lack metadata.parts (legacy or partial complete).
+    let _ = remote_materialize_missing_assistant_parts(
+        &mut database,
+        &chat_id,
+        &mut messages,
+        &tool_calls,
+    );
     let has_more_before = messages.len() == limit;
     let next_before_sequence = messages.first().map(|message| message.sequence);
     Ok(Json(json!({
@@ -19755,6 +20101,356 @@ mod tests {
             stored.get("status").and_then(Value::as_str),
             Some("completed")
         );
+    }
+
+    #[test]
+    fn remote_assistant_message_parts_prefers_metadata_parts_and_hydrates_tool_calls() {
+        let metadata = json!({
+            "parts": [
+                {
+                    "type": "contextCompression",
+                    "id": "ctx-1",
+                    "status": "completed",
+                    "kind": "llm",
+                    "detail": {
+                        "status": "completed",
+                        "kind": "llm",
+                        "snapshotId": "ctx-1",
+                        "originalTokenCount": 1200,
+                        "summaryTokenCount": 80
+                    }
+                },
+                { "type": "text", "text": "done" },
+                {
+                    "type": "toolCall",
+                    "toolCall": { "id": "call-1", "name": "read_file", "status": "running" }
+                }
+            ]
+        });
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "name": "read_file",
+            "status": "completed",
+            "input": { "path": "Cargo.toml" },
+            "output": { "content": "[package]" },
+            "isError": false,
+            "startedAt": "2026-07-13T00:00:00Z",
+            "completedAt": "2026-07-13T00:00:01Z"
+        })];
+        let parts = remote_assistant_message_parts(
+            &metadata,
+            "ignored content",
+            Some("ignored"),
+            &tool_calls,
+        );
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0].get("type").and_then(Value::as_str),
+            Some("contextCompression")
+        );
+        assert_eq!(parts[0].get("id").and_then(Value::as_str), Some("ctx-1"));
+        assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("done"));
+        assert_eq!(
+            parts[2].get("type").and_then(Value::as_str),
+            Some("toolCall")
+        );
+        assert_eq!(
+            parts[2]
+                .get("toolCall")
+                .and_then(|tool_call| tool_call.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            parts[2]
+                .get("toolCall")
+                .and_then(|tool_call| tool_call.get("output"))
+                .and_then(|output| output.get("content"))
+                .and_then(Value::as_str),
+            Some("[package]")
+        );
+    }
+
+    #[test]
+    fn remote_assistant_message_parts_falls_back_without_metadata_parts() {
+        let metadata = json!({ "reasoning": "think" });
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "name": "read_file",
+            "status": "completed",
+            "input": {},
+            "output": null,
+            "isError": false,
+            "startedAt": "2026-07-13T00:00:00Z",
+            "completedAt": "2026-07-13T00:00:01Z"
+        })];
+        let parts = remote_assistant_message_parts(&metadata, "hello", Some("think"), &tool_calls);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0].get("type").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(parts[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            parts[2].get("type").and_then(Value::as_str),
+            Some("toolCall")
+        );
+    }
+
+    #[test]
+    fn remote_materialize_missing_assistant_parts_from_run_events_is_idempotent() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("open db");
+        database.insert_chat("chat-1", "Chat").expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "final answer",
+                sequence: 1,
+                metadata_json: Some(r#"{"reasoning":"thinking"}"#),
+            })
+            .expect("insert assistant");
+        let payload = remote_sidecar_context_compression_sse_event(
+            "assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-1".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        remote_sidecar_persist_context_compression_run_event(
+            &mut database,
+            "chat-1",
+            "remote-run-1",
+            1,
+            &payload,
+        );
+
+        let tool_calls = database.tool_calls_for_chat("chat-1").expect("tool calls");
+        let mut messages = database
+            .messages_for_chat_page("chat-1", None, 50)
+            .expect("messages");
+        remote_materialize_missing_assistant_parts(
+            &mut database,
+            "chat-1",
+            &mut messages,
+            &tool_calls,
+        )
+        .expect("materialize");
+        let assistant = messages
+            .iter()
+            .find(|message| message.id == "assistant-1")
+            .expect("assistant message");
+        let metadata: Value =
+            serde_json::from_str(&assistant.metadata_json).expect("metadata json");
+        assert_eq!(
+            metadata.get("partsSource").and_then(Value::as_str),
+            Some("run_events")
+        );
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("parts");
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("contextCompression"))
+        );
+        assert!(parts.iter().any(
+            |part| part.get("type").and_then(Value::as_str) == Some("text")
+                && part.get("text").and_then(Value::as_str) == Some("final answer")
+        ));
+
+        // Second pass must be a no-op (parts already present).
+        let before = assistant.metadata_json.clone();
+        let mut messages_again = database
+            .messages_for_chat_page("chat-1", None, 50)
+            .expect("messages again");
+        remote_materialize_missing_assistant_parts(
+            &mut database,
+            "chat-1",
+            &mut messages_again,
+            &tool_calls,
+        )
+        .expect("materialize again");
+        let assistant_again = messages_again
+            .iter()
+            .find(|message| message.id == "assistant-1")
+            .expect("assistant again");
+        assert_eq!(assistant_again.metadata_json, before);
+        let compression_count = serde_json::from_str::<Value>(&assistant_again.metadata_json)
+            .expect("metadata")
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("parts")
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("contextCompression"))
+            .count();
+        assert_eq!(compression_count, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_returns_persisted_context_compression_parts() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "done",
+                sequence: 1,
+                metadata_json: Some(
+                    &json!({
+                        "reasoning": "thinking",
+                        "parts": [
+                            {
+                                "type": "contextCompression",
+                                "id": "ctx-1",
+                                "status": "completed",
+                                "kind": "llm",
+                                "detail": {
+                                    "status": "completed",
+                                    "kind": "llm",
+                                    "snapshotId": "ctx-1",
+                                    "originalTokenCount": 1000,
+                                    "summaryTokenCount": 50,
+                                    "providerId": "provider-1",
+                                    "modelId": "model-1"
+                                }
+                            },
+                            { "type": "reasoning", "text": "thinking" },
+                            { "type": "text", "text": "done" }
+                        ]
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert assistant");
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let response = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath("chat-1".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("chat messages")
+        .0;
+        let messages = response["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        let parts = messages[1]["parts"].as_array().expect("parts");
+        assert_eq!(parts[0]["type"], "contextCompression");
+        assert_eq!(parts[0]["id"], "ctx-1");
+        assert_eq!(parts[0]["status"], "completed");
+        assert_eq!(parts[1]["type"], "reasoning");
+        assert_eq!(parts[2]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_materializes_compression_from_run_events() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "after compression",
+                sequence: 1,
+                metadata_json: Some(r#"{"reasoning":"think"}"#),
+            })
+            .expect("insert assistant");
+        let payload = remote_sidecar_context_compression_sse_event(
+            "msg-assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-legacy".to_string()),
+                original_token_count: Some(900),
+                summary_token_count: Some(90),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        remote_sidecar_persist_context_compression_run_event(
+            &mut database,
+            "chat-1",
+            "run-1",
+            2,
+            &payload,
+        );
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let response = remote_sidecar_chat_messages(
+            State(state.clone()),
+            AxumPath("chat-1".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("chat messages")
+        .0;
+        let messages = response["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1);
+        let parts = messages[0]["parts"].as_array().expect("parts");
+        assert!(
+            parts
+                .iter()
+                .any(|part| part["type"] == "contextCompression" && part["id"] == "ctx-legacy")
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| part["type"] == "text" && part["text"] == "after compression")
+        );
+
+        // Idempotent: reload keeps a single compression part.
+        let response_again = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath("chat-1".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("chat messages again")
+        .0;
+        let compression_count = response_again["messages"][0]["parts"]
+            .as_array()
+            .expect("parts")
+            .iter()
+            .filter(|part| part["type"] == "contextCompression")
+            .count();
+        assert_eq!(compression_count, 1);
     }
 
     #[tokio::test]
