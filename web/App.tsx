@@ -261,6 +261,8 @@ const AgentTranscriptPanel = lazy(() =>
     default: m.AgentTranscriptPanel,
   })),
 );
+import type { AgentTranscriptViewCacheEntry } from "./features/agents/AgentTranscriptPanel";
+
 const SettingsPanel = lazy(() =>
   import("./features/settings/SettingsPanel").then((m) => ({
     default: m.SettingsPanel,
@@ -1023,6 +1025,8 @@ export function App() {
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
   const openChatTabsRef = useRef<OpenChatTab[]>([]);
   const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
+  const openAgentTabsRef = useRef<OpenAgentTab[]>([]);
+  openAgentTabsRef.current = openAgentTabs;
   const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
   const [loadingOlderChatMessageKeys, setLoadingOlderChatMessageKeys] = useState<Set<string>>(
     () => new Set(),
@@ -1125,6 +1129,8 @@ export function App() {
   const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
   const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
   const agentTeamSnapshotChatKeyRef = useRef<string | null>(null);
+  const agentTeamSnapshotCacheRef = useRef(new Map<string, AgentTeamSnapshotResponse>());
+  const agentTranscriptViewCacheRef = useRef(new Map<string, AgentTranscriptViewCacheEntry>());
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
@@ -2230,6 +2236,7 @@ export function App() {
         const data = await requestJson<AgentTeamSnapshotResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/agent-team`,
         );
+        agentTeamSnapshotCacheRef.current.set(requestedChatKey, data);
         if (isCurrentAgentTeamRequest()) {
           agentTeamSnapshotChatKeyRef.current = requestedChatKey;
           setAgentTeamSnapshot(data);
@@ -2298,9 +2305,23 @@ export function App() {
       !activeChatId ||
       isPendingChatId(activeChatId)
     ) {
+      // Leaving chat/agent main tabs must not wipe team snapshot cache; only clear live state.
+      if (activeMainTab.type !== "chat" && activeMainTab.type !== "agent") {
+        return;
+      }
       agentTeamSnapshotChatKeyRef.current = null;
       setAgentTeamSnapshot(null);
       setAgentTeamError(null);
+      return;
+    }
+
+    const requestedChatKey = chatRunKey(activeWorkspaceId, activeChatId);
+    const cachedSnapshot = agentTeamSnapshotCacheRef.current.get(requestedChatKey);
+    if (cachedSnapshot) {
+      agentTeamSnapshotChatKeyRef.current = requestedChatKey;
+      setAgentTeamSnapshot(cachedSnapshot);
+      setAgentTeamError(null);
+      void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, { silent: true });
       return;
     }
 
@@ -3726,6 +3747,13 @@ export function App() {
 
     setOpenAgentTabs((current) => {
       const next = current.filter((tab) => workspaceHasChatTab(workspaces, tab));
+      if (next.length !== current.length) {
+        pruneAgentTabCaches(
+          agentTeamSnapshotCacheRef.current,
+          agentTranscriptViewCacheRef.current,
+          next,
+        );
+      }
       return next.length === current.length ? current : next;
     });
 
@@ -5697,6 +5725,7 @@ export function App() {
   function selectAgentTab(tab: OpenAgentTab) {
     const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
     const cachedMessages = chatMessagesByKeyRef.current[chatKey];
+    const cachedTeamSnapshot = agentTeamSnapshotCacheRef.current.get(chatKey);
 
     setActiveWorkspaceId(tab.workspaceId);
     setActiveChatId(tab.chatId);
@@ -5718,6 +5747,13 @@ export function App() {
       viewMode: "chat",
       workspaceId: tab.workspaceId,
     });
+
+    if (cachedTeamSnapshot) {
+      agentTeamSnapshotChatKeyRef.current = chatKey;
+      setAgentTeamSnapshot(cachedTeamSnapshot);
+      setAgentTeamError(null);
+      setIsLoadingAgentTeam(false);
+    }
 
     if (!cachedMessages) {
       void loadChatMessages(tab.workspaceId, tab.chatId);
@@ -6222,12 +6258,18 @@ export function App() {
     openFileTabsRef.current = nextOpenFileTabs;
     setOpenChatTabs(nextOpenChatTabs);
     setOpenFileTabs(nextOpenFileTabs);
-    setOpenAgentTabs((current) =>
-      current.filter(
+    setOpenAgentTabs((current) => {
+      const next = current.filter(
         (tab) =>
           !closedKeys.has(`agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`),
-      ),
-    );
+      );
+      pruneAgentTabCaches(
+        agentTeamSnapshotCacheRef.current,
+        agentTranscriptViewCacheRef.current,
+        next,
+      );
+      return next;
+    });
 
     for (const tab of tabsToClose) {
       if (tab.type !== "chat") {
@@ -6290,14 +6332,20 @@ export function App() {
         current.chatId === tab.chatId &&
         current.instanceId === tab.instanceId,
     );
-    setOpenAgentTabs((current) =>
-      current.filter(
+    setOpenAgentTabs((current) => {
+      const next = current.filter(
         (current) =>
           current.workspaceId !== tab.workspaceId ||
           current.chatId !== tab.chatId ||
           current.instanceId !== tab.instanceId,
-      ),
-    );
+      );
+      pruneAgentTabCaches(
+        agentTeamSnapshotCacheRef.current,
+        agentTranscriptViewCacheRef.current,
+        next,
+      );
+      return next;
+    });
 
     if (
       activeMainTab.type !== "agent" ||
@@ -11211,6 +11259,12 @@ export function App() {
               ) : activeMainTab.type === "agent" && activeAgentTab ? (
                 <Suspense fallback={<PanelLoadingFallback />}>
                   <AgentTranscriptPanel
+                    key={agentTranscriptViewCacheKey(
+                      activeAgentTab.workspaceId,
+                      activeAgentTab.chatId,
+                      activeAgentTab.instanceId,
+                    )}
+                    chatId={activeAgentTab.chatId}
                     error={agentTeamError}
                     helpers={chatPanelHelpers}
                     instanceId={activeAgentTab.instanceId}
@@ -11225,7 +11279,44 @@ export function App() {
                         { silent: false },
                       );
                     }}
-                    snapshot={agentTeamSnapshot}
+                    readTranscriptCache={() =>
+                      agentTranscriptViewCacheRef.current.get(
+                        agentTranscriptViewCacheKey(
+                          activeAgentTab.workspaceId,
+                          activeAgentTab.chatId,
+                          activeAgentTab.instanceId,
+                        ),
+                      ) ?? null
+                    }
+                    snapshot={
+                      agentTeamSnapshot?.team.chatId === activeAgentTab.chatId
+                        ? agentTeamSnapshot
+                        : agentTeamSnapshotCacheRef.current.get(
+                            chatRunKey(
+                              activeAgentTab.workspaceId,
+                              activeAgentTab.chatId,
+                            ),
+                          ) ?? null
+                    }
+                    writeTranscriptCache={(entry) => {
+                      const tabStillOpen = openAgentTabsRef.current.some(
+                        (tab) =>
+                          tab.workspaceId === activeAgentTab.workspaceId &&
+                          tab.chatId === activeAgentTab.chatId &&
+                          tab.instanceId === activeAgentTab.instanceId,
+                      );
+                      if (!tabStillOpen) {
+                        return;
+                      }
+                      agentTranscriptViewCacheRef.current.set(
+                        agentTranscriptViewCacheKey(
+                          activeAgentTab.workspaceId,
+                          activeAgentTab.chatId,
+                          activeAgentTab.instanceId,
+                        ),
+                        entry,
+                      );
+                    }}
                     workspaceId={activeAgentTab.workspaceId}
                   />
                 </Suspense>
@@ -14312,6 +14403,40 @@ function formatChatCreatedAt(value: string) {
 
 function chatRunKey(workspaceId: string, chatId: string) {
   return `${workspaceId}:${chatId}`;
+}
+
+function agentTranscriptViewCacheKey(
+  workspaceId: string,
+  chatId: string,
+  instanceId: string,
+) {
+  return `${workspaceId}:${chatId}:${instanceId}`;
+}
+
+function pruneAgentTabCaches(
+  snapshotCache: Map<string, AgentTeamSnapshotResponse>,
+  transcriptCache: Map<string, AgentTranscriptViewCacheEntry>,
+  openTabs: OpenAgentTab[],
+) {
+  const openChatKeys = new Set(
+    openTabs.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
+  );
+  const openTranscriptKeys = new Set(
+    openTabs.map((tab) =>
+      agentTranscriptViewCacheKey(tab.workspaceId, tab.chatId, tab.instanceId),
+    ),
+  );
+
+  for (const key of snapshotCache.keys()) {
+    if (!openChatKeys.has(key)) {
+      snapshotCache.delete(key);
+    }
+  }
+  for (const key of transcriptCache.keys()) {
+    if (!openTranscriptKeys.has(key)) {
+      transcriptCache.delete(key);
+    }
+  }
 }
 
 function restoredQueuedRunKey(

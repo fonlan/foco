@@ -801,6 +801,208 @@ describe("app agents verification surfaces", () => {
     );
   });
 
+  it("restores cached Worker transcript immediately when switching back while refresh is deferred", async () => {
+    const snapshotRefreshGate = deferred<void>();
+    const transcriptRefreshGate = deferred<void>();
+    let deferBackgroundRefresh = false;
+    let snapshotRequestCount = 0;
+    let transcriptRequestCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          snapshotRequestCount += 1;
+          if (deferBackgroundRefresh && snapshotRequestCount > 1) {
+            await snapshotRefreshGate.promise;
+          }
+          return jsonResponse(agentTeamSnapshot);
+        }
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          transcriptRequestCount += 1;
+          if (deferBackgroundRefresh && transcriptRequestCount > 1) {
+            await transcriptRefreshGate.promise;
+          }
+          return jsonResponse(agentTranscriptResponse);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
+
+    deferBackgroundRefresh = true;
+    const snapshotCountAfterOpen = snapshotRequestCount;
+    const transcriptCountAfterOpen = transcriptRequestCount;
+
+    await userEvent.click(await screen.findByRole("tab", { name: /Tool run/ }));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(screen.queryByText("Worker, inspect the current task.")).not.toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: /Worker/ }));
+
+    expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+
+    const transcriptPanel = screen
+      .getByText("Worker, inspect the current task.")
+      .closest(".chat-panel");
+    expect(transcriptPanel).not.toBeNull();
+    expect(
+      within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
+    ).toBeEnabled();
+
+    await waitFor(() => {
+      expect(snapshotRequestCount).toBeGreaterThan(snapshotCountAfterOpen);
+      expect(transcriptRequestCount).toBeGreaterThan(transcriptCountAfterOpen);
+    });
+
+    expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+
+    await act(async () => {
+      snapshotRefreshGate.resolve();
+      transcriptRefreshGate.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps agent transcript caches isolated across chats and prunes closed tabs", async () => {
+    const chat2Snapshot = {
+      ...agentTeamSnapshot,
+      team: {
+        ...agentTeamSnapshot.team,
+        chatId: "chat-2",
+        id: "agent-team-2",
+      },
+      instances: agentTeamSnapshot.instances.map((instance) => ({
+        ...instance,
+        id:
+          instance.id === "agent-instance-worker"
+            ? "agent-instance-worker-2"
+            : "agent-instance-coordinator-2",
+        teamId: "agent-team-2",
+      })),
+      tasks: agentTeamSnapshot.tasks.map((task) => ({
+        ...task,
+        id: "agent-task-2",
+        ownerInstanceId: "agent-instance-worker-2",
+        originInstanceId: "agent-instance-coordinator-2",
+        teamId: "agent-team-2",
+      })),
+    };
+    const chat2Transcript = {
+      ...agentTranscriptResponse,
+      items: [
+        {
+          ...agentTranscriptResponse.items[0]!,
+          content: "Chat two worker message.",
+          id: "message:agent-message-chat-2",
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "Chat two inspection complete.",
+          id: "task:agent-task-2:run",
+        },
+      ],
+    };
+    let chat1TranscriptRequestCount = 0;
+    let deferChat1Reload = false;
+    const chat1ReloadGate = deferred<void>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+        if (path === "/api/workspaces/workspace-1/chats/chat-2/agent-team") {
+          return jsonResponse(chat2Snapshot);
+        }
+        if (path.includes("/agent-team/instances/agent-instance-worker/transcript")) {
+          chat1TranscriptRequestCount += 1;
+          if (deferChat1Reload && chat1TranscriptRequestCount > 1) {
+            await chat1ReloadGate.promise;
+          }
+          return jsonResponse(agentTranscriptResponse);
+        }
+        if (path.includes("/agent-team/instances/agent-instance-worker-2/transcript")) {
+          return jsonResponse(chat2Transcript);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Chat two worker message.")).toBeInTheDocument();
+    expect(screen.queryByText("Worker, inspect the current task.")).not.toBeInTheDocument();
+
+    deferChat1Reload = true;
+    const workerTabs = screen.getAllByRole("tab", { name: /Worker/ });
+    expect(workerTabs.length).toBeGreaterThanOrEqual(2);
+    const inactiveWorkerTab =
+      workerTabs.find((tab) => tab.getAttribute("aria-selected") !== "true") ??
+      workerTabs[0]!;
+    await userEvent.click(inactiveWorkerTab);
+
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.queryByText("Chat two worker message.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+
+    await act(async () => {
+      chat1ReloadGate.resolve();
+    });
+
+    // Close the currently selected chat-1 Worker tab so its cache is pruned.
+    const selectedWorkerTab =
+      screen.getAllByRole("tab", { name: /Worker/ }).find(
+        (tab) => tab.getAttribute("aria-selected") === "true",
+      ) ?? screen.getAllByRole("tab", { name: /Worker/ })[0]!;
+    await userEvent.click(
+      within(selectedWorkerTab.parentElement as HTMLElement).getByRole("button", {
+        name: "Close chat tab Worker",
+      }),
+    );
+
+    // Re-open Worker for chat-1 from the Agents panel: must hard-load again (cache pruned).
+    await userEvent.click(await screen.findByRole("tab", { name: /Tool run/ }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    const transcriptCountBeforeReopen = chat1TranscriptRequestCount;
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    await waitFor(() => {
+      expect(chat1TranscriptRequestCount).toBeGreaterThan(transcriptCountBeforeReopen);
+    });
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+  });
+
   it("reveals the Agents panel and refreshes when an Agent instance is created", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

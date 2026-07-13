@@ -26,6 +26,15 @@ const AGENT_TRANSCRIPT_PAGE_SIZE = 25;
 const noSelectedSkillPrefix = () => null;
 type AgentTranscriptLoadMode = "append" | "hard" | "refresh" | "soft";
 
+export type AgentTranscriptViewCacheEntry = {
+  hasBaseline: boolean;
+  hasMore: boolean;
+  items: AgentTranscriptItemView[];
+  page: number;
+  scrollTop: number;
+  stickToBottom: boolean;
+};
+
 function normalizeAgentTranscriptPart(
   part: AgentTranscriptWirePart,
   itemId: string,
@@ -50,45 +59,90 @@ function normalizeAgentTranscriptPart(
 }
 
 export function AgentTranscriptPanel({
+  chatId,
   error,
   helpers,
   instanceId,
   isLoading,
   onOpenMainChat,
   onRefresh,
+  readTranscriptCache,
   snapshot,
+  writeTranscriptCache,
   workspaceId,
 }: {
+  chatId: string;
   error: string | null;
   helpers: ChatPanelHelpers;
   instanceId: string;
   isLoading: boolean;
   onOpenMainChat: () => void;
   onRefresh: () => Promise<void>;
+  readTranscriptCache: () => AgentTranscriptViewCacheEntry | null;
   snapshot: AgentTeamSnapshotResponse | null;
+  writeTranscriptCache: (entry: AgentTranscriptViewCacheEntry) => void;
   workspaceId: string;
 }) {
   const { t } = useI18n();
+  const initialCacheRef = useRef<AgentTranscriptViewCacheEntry | null | undefined>(undefined);
+  if (initialCacheRef.current === undefined) {
+    initialCacheRef.current = readTranscriptCache();
+  }
+  const initialCache = initialCacheRef.current;
+
+  const readTranscriptCacheRef = useRef(readTranscriptCache);
+  const writeTranscriptCacheRef = useRef(writeTranscriptCache);
+  readTranscriptCacheRef.current = readTranscriptCache;
+  writeTranscriptCacheRef.current = writeTranscriptCache;
+
   const instance =
     snapshot?.instances.find((current) => current.id === instanceId) ?? null;
-  const [items, setItems] = useState<AgentTranscriptItem[]>([]);
-  const [page, setPage] = useState(1);
-  const [hasMore, setHasMore] = useState(false);
+  const [items, setItems] = useState<AgentTranscriptItem[]>(
+    () => initialCache?.items ?? [],
+  );
+  const [page, setPage] = useState(() => initialCache?.page ?? 1);
+  const [hasMore, setHasMore] = useState(() => initialCache?.hasMore ?? false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
   const activeTranscriptRequestRef = useRef<AbortController | null>(null);
   const transcriptRequestGenerationRef = useRef(0);
-  const hasTranscriptBaselineRef = useRef(false);
+  const hasTranscriptBaselineRef = useRef(initialCache?.hasBaseline ?? false);
   const snapshotRef = useRef(snapshot);
   const lastHandledSnapshotRef = useRef<AgentTeamSnapshotResponse | null>(null);
-  const instanceExists = instance !== null;
+  const itemsRef = useRef(items);
+  const pageRef = useRef(page);
+  const hasMoreRef = useRef(hasMore);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const scrollTopRef = useRef(initialCache?.scrollTop ?? 0);
+  const stickToBottomRef = useRef(initialCache?.stickToBottom ?? true);
+  const identityKey = `${workspaceId}:${chatId}:${instanceId}`;
+  const identityKeyRef = useRef(identityKey);
+  const snapshotMatchesChat = snapshot?.team.chatId === chatId;
+  const instanceExists = instance !== null && snapshotMatchesChat;
 
   snapshotRef.current = snapshot;
+  itemsRef.current = items;
+  pageRef.current = page;
+  hasMoreRef.current = hasMore;
 
   const cancelActiveTranscriptRequest = useCallback(() => {
     activeTranscriptRequestRef.current?.abort();
     activeTranscriptRequestRef.current = null;
     transcriptRequestGenerationRef.current += 1;
+  }, []);
+
+  const persistTranscriptCache = useCallback(() => {
+    if (!hasTranscriptBaselineRef.current && itemsRef.current.length === 0) {
+      return;
+    }
+    writeTranscriptCacheRef.current({
+      hasBaseline: hasTranscriptBaselineRef.current,
+      hasMore: hasMoreRef.current,
+      items: itemsRef.current,
+      page: pageRef.current,
+      scrollTop: scrollContainerRef.current?.scrollTop ?? scrollTopRef.current,
+      stickToBottom: stickToBottomRef.current,
+    });
   }, []);
 
   const loadTranscript = useCallback(
@@ -112,13 +166,21 @@ export function AgentTranscriptPanel({
         if (transcriptRequestGenerationRef.current !== requestGeneration) {
           return;
         }
-        setItems((current) =>
-          mode === "append" ? [...current, ...data.items] : data.items,
-        );
+        const nextItems =
+          mode === "append" ? [...itemsRef.current, ...data.items] : data.items;
+        setItems(nextItems);
         setPage(data.page);
         setHasMore(data.hasMore);
         hasTranscriptBaselineRef.current = true;
         setTranscriptError(null);
+        writeTranscriptCacheRef.current({
+          hasBaseline: true,
+          hasMore: data.hasMore,
+          items: nextItems,
+          page: data.page,
+          scrollTop: scrollContainerRef.current?.scrollTop ?? scrollTopRef.current,
+          stickToBottom: stickToBottomRef.current,
+        });
       } catch (err) {
         if (
           controller.signal.aborted ||
@@ -140,18 +202,60 @@ export function AgentTranscriptPanel({
   );
 
   useEffect(() => {
+    const isIdentityChange = identityKeyRef.current !== identityKey;
+    identityKeyRef.current = identityKey;
+
     cancelActiveTranscriptRequest();
     setIsTranscriptLoading(false);
-    setItems([]);
-    setPage(1);
-    setHasMore(false);
-    setTranscriptError(null);
-    hasTranscriptBaselineRef.current = false;
-    lastHandledSnapshotRef.current = snapshotRef.current;
-    if (instanceExists) {
-      void loadTranscript(1, "hard");
+
+    const cache = isIdentityChange
+      ? readTranscriptCacheRef.current()
+      : initialCacheRef.current;
+    if (cache?.hasBaseline) {
+      setItems(cache.items);
+      setPage(cache.page);
+      setHasMore(cache.hasMore);
+      setTranscriptError(null);
+      hasTranscriptBaselineRef.current = true;
+      scrollTopRef.current = cache.scrollTop;
+      stickToBottomRef.current = cache.stickToBottom;
+      requestAnimationFrame(() => {
+        if (scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTop = cache.scrollTop;
+        }
+      });
+    } else {
+      setItems([]);
+      setPage(1);
+      setHasMore(false);
+      setTranscriptError(null);
+      hasTranscriptBaselineRef.current = false;
+      scrollTopRef.current = 0;
+      stickToBottomRef.current = true;
     }
-  }, [cancelActiveTranscriptRequest, instanceExists, instanceId, loadTranscript, workspaceId]);
+
+    const currentSnapshot = snapshotRef.current;
+    const exists =
+      currentSnapshot?.team.chatId === chatId &&
+      currentSnapshot.instances.some((current) => current.id === instanceId);
+    lastHandledSnapshotRef.current = currentSnapshot;
+    if (exists) {
+      void loadTranscript(1, hasTranscriptBaselineRef.current ? "soft" : "hard");
+    }
+
+    return () => {
+      persistTranscriptCache();
+      cancelActiveTranscriptRequest();
+    };
+  }, [
+    cancelActiveTranscriptRequest,
+    chatId,
+    identityKey,
+    instanceId,
+    loadTranscript,
+    persistTranscriptCache,
+    workspaceId,
+  ]);
 
   useEffect(() => {
     if (lastHandledSnapshotRef.current === snapshot) {
@@ -159,17 +263,42 @@ export function AgentTranscriptPanel({
     }
 
     lastHandledSnapshotRef.current = snapshot;
-    if (instanceExists) {
-      void loadTranscript(1, hasTranscriptBaselineRef.current ? "soft" : "hard");
-    }
-  }, [instanceExists, loadTranscript, snapshot]);
 
-  useEffect(
-    () => () => {
+    // Temporary null or snapshot for another chat must not hard-reset the view.
+    if (!snapshot || snapshot.team.chatId !== chatId) {
+      return;
+    }
+
+    const exists = snapshot.instances.some((current) => current.id === instanceId);
+    if (!exists) {
       cancelActiveTranscriptRequest();
-    },
-    [cancelActiveTranscriptRequest],
-  );
+      setIsTranscriptLoading(false);
+      setItems([]);
+      setPage(1);
+      setHasMore(false);
+      setTranscriptError(null);
+      hasTranscriptBaselineRef.current = false;
+      scrollTopRef.current = 0;
+      stickToBottomRef.current = true;
+      writeTranscriptCacheRef.current({
+        hasBaseline: false,
+        hasMore: false,
+        items: [],
+        page: 1,
+        scrollTop: 0,
+        stickToBottom: true,
+      });
+      return;
+    }
+
+    void loadTranscript(1, hasTranscriptBaselineRef.current ? "soft" : "hard");
+  }, [
+    cancelActiveTranscriptRequest,
+    chatId,
+    instanceId,
+    loadTranscript,
+    snapshot,
+  ]);
 
   const refreshTranscript = useCallback(async () => {
     await onRefresh();
@@ -184,8 +313,26 @@ export function AgentTranscriptPanel({
     }
   }, [hasMore, isTranscriptLoading, loadTranscript, page]);
 
+  const handleScroll = useCallback(() => {
+    const node = scrollContainerRef.current;
+    if (!node) {
+      return;
+    }
+    scrollTopRef.current = node.scrollTop;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= 48;
+  }, []);
+
   const displayError = error ?? transcriptError;
   const loading = isLoading || isTranscriptLoading;
+  const showLoadingEmpty =
+    !items.length && !displayError && !snapshotMatchesChat && loading;
+  const showNoMessagesWhileWaiting =
+    !items.length && !displayError && !snapshotMatchesChat && !loading;
+  const showInstanceMissing =
+    !items.length && snapshotMatchesChat && !instance;
+  const showEmptyTranscript =
+    !items.length && snapshotMatchesChat && instance && !loading;
 
   return (
     <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -238,7 +385,11 @@ export function AgentTranscriptPanel({
         </button>
       </header>
 
-      <div className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
+      <div
+        className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
+        onScroll={handleScroll}
+        ref={scrollContainerRef}
+      >
         <div
           className={`message-stack mx-auto flex w-full flex-col ${
             items.length ? "max-w-5xl gap-4" : "max-w-3xl"
@@ -250,21 +401,19 @@ export function AgentTranscriptPanel({
             </div>
           ) : null}
 
-          {!snapshot && !displayError ? (
-            <AgentTranscriptEmptyState
-              text={
-                loading
-                  ? t("Loading agent messages...")
-                  : t("No agent messages yet.")
-              }
-            />
+          {showLoadingEmpty ? (
+            <AgentTranscriptEmptyState text={t("Loading agent messages...")} />
           ) : null}
 
-          {snapshot && !instance ? (
+          {showNoMessagesWhileWaiting ? (
+            <AgentTranscriptEmptyState text={t("No agent messages yet.")} />
+          ) : null}
+
+          {showInstanceMissing ? (
             <AgentTranscriptEmptyState text={t("Agent instance not found.")} />
           ) : null}
 
-          {snapshot && instance && !items.length && !loading ? (
+          {showEmptyTranscript ? (
             <AgentTranscriptEmptyState text={t("No agent messages yet.")} />
           ) : null}
 
@@ -277,7 +426,7 @@ export function AgentTranscriptPanel({
             />
           ))}
 
-          {snapshot && instance && items.length && hasMore ? (
+          {snapshotMatchesChat && instance && items.length && hasMore ? (
             <div className="flex justify-center pt-1">
               <button
                 className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-300"
@@ -408,17 +557,17 @@ function AgentTranscriptBubble({
 
 function AgentTranscriptEmptyState({ text }: { text: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-stone-200 bg-white px-3 py-10 text-center text-sm text-stone-500">
-      <ListChecks aria-hidden="true" className="mx-auto mb-2 size-5 text-stone-400" />
-      {text}
+    <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-stone-200 bg-stone-50/80 px-6 py-16 text-center">
+      <div className="inline-flex size-12 items-center justify-center rounded-2xl border border-stone-200 bg-white text-stone-500">
+        <ListChecks aria-hidden="true" className="size-5" />
+      </div>
+      <p className="max-w-sm text-sm text-stone-600">{text}</p>
     </div>
   );
 }
 
-
 function formatAgentTimestamp(value: string) {
   const date = new Date(value);
-
   if (Number.isNaN(date.getTime())) {
     return value;
   }
@@ -428,7 +577,5 @@ function formatAgentTimestamp(value: string) {
     hour: "2-digit",
     minute: "2-digit",
     month: "short",
-    second: "2-digit",
-    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
   }).format(date);
 }
