@@ -20453,6 +20453,284 @@ mod tests {
         assert_eq!(compression_count, 1);
     }
 
+    /// Hard regression for dual-source compression UI:
+    /// snapshots (stats) + run_events + metadata.parts (bubble) stay aligned on success,
+    /// and messages API reload still surfaces llm compression completed parts.
+    #[tokio::test]
+    async fn remote_sidecar_llm_compression_ui_persists_snapshot_run_events_and_parts() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let config = remote_test_config(workspace.path());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "long history",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user");
+
+        // Success path: snapshot table is stats truth; completed events feed parts.
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "ctx-active",
+                    chat_id: "chat-1",
+                    run_id: "remote-run-1",
+                    sequence: 1,
+                    summary: "active llm summary",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 0,
+                    original_token_count: 1200,
+                    summary_token_count: 80,
+                    metadata_json: Some(r#"{"kind":"llm","supersedes":"ctx-superseded"}"#),
+                },
+            )
+            .expect("insert active llm snapshot");
+        // Superseded snapshot may still count in stats while bubble only shows completed parts.
+        database
+            .insert_context_compression_snapshot(
+                foco_store::workspace::NewContextCompressionSnapshot {
+                    id: "ctx-superseded",
+                    chat_id: "chat-1",
+                    run_id: "remote-run-1",
+                    sequence: 0,
+                    summary: "old llm summary",
+                    source_message_start_sequence: 0,
+                    source_message_end_sequence: 0,
+                    original_token_count: 1000,
+                    summary_token_count: 100,
+                    metadata_json: Some(r#"{"kind":"llm"}"#),
+                },
+            )
+            .expect("insert superseded llm snapshot");
+
+        let start_payload = remote_sidecar_context_compression_sse_event(
+            "msg-assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "start".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: None,
+                original_token_count: Some(1200),
+                summary_token_count: None,
+                started_at: Some("2026-07-13T00:00:00Z".to_string()),
+                completed_at: None,
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        let completed_payload = remote_sidecar_context_compression_sse_event(
+            "msg-assistant-1",
+            &RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-active".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-13T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-13T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        );
+        remote_sidecar_persist_context_compression_run_event(
+            &mut database,
+            "chat-1",
+            "remote-run-1",
+            1,
+            &start_payload,
+        );
+        remote_sidecar_persist_context_compression_run_event(
+            &mut database,
+            "chat-1",
+            "remote-run-1",
+            2,
+            &completed_payload,
+        );
+
+        let compression_events = vec![
+            RemoteSidecarContextCompressionEventDetail {
+                status: "start".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: None,
+                original_token_count: Some(1200),
+                summary_token_count: None,
+                started_at: Some("2026-07-13T00:00:00Z".to_string()),
+                completed_at: None,
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some("ctx-active".to_string()),
+                original_token_count: Some(1200),
+                summary_token_count: Some(80),
+                started_at: Some("2026-07-13T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-13T00:00:01Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+            },
+        ];
+        let parts = remote_chat_parts_with_context_compression(
+            "compressed answer",
+            None,
+            &compression_events,
+        );
+        let metadata = json!({
+            "parts": parts,
+            "reasoning": null,
+        });
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "compressed answer",
+                sequence: 1,
+                metadata_json: Some(&metadata.to_string()),
+            })
+            .expect("insert assistant with compression parts");
+
+        // 1) run_events path: start + completed persisted extractably.
+        let run_events = database
+            .history_run_events_for_chat_messages("chat-1", &["msg-assistant-1".to_string()])
+            .expect("history run events");
+        assert_eq!(run_events.len(), 2);
+        assert!(
+            run_events
+                .iter()
+                .all(|event| event.event_type == "context_compression")
+        );
+        let statuses = run_events
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<Value>(&event.payload_json)
+                    .expect("payload")
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(statuses.contains(&"start".to_string()));
+        assert!(statuses.contains(&"completed".to_string()));
+
+        // 2) metadata.parts: start+completed merge to one completed llm block.
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("message lookup")
+            .expect("assistant row");
+        let stored_metadata: Value =
+            serde_json::from_str(&assistant.metadata_json).expect("metadata json");
+        let stored_parts = stored_metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("stored parts");
+        let completed_parts = stored_parts
+            .iter()
+            .filter(|part| {
+                part.get("type").and_then(Value::as_str) == Some("contextCompression")
+                    && part.get("status").and_then(Value::as_str) == Some("completed")
+                    && part.get("kind").and_then(Value::as_str) == Some("llm")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed_parts.len(), 1);
+        assert_eq!(
+            completed_parts[0].get("id").and_then(Value::as_str),
+            Some("ctx-active")
+        );
+
+        drop(database);
+
+        // 3) messages API reload still exposes compression in parts (bubble truth).
+        let messages_response = remote_sidecar_chat_messages(
+            State(state.clone()),
+            AxumPath("chat-1".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("chat messages")
+        .0;
+        let messages = messages_response["messages"]
+            .as_array()
+            .expect("messages array");
+        let assistant_parts = messages
+            .iter()
+            .find(|message| message["id"] == "msg-assistant-1")
+            .and_then(|message| message["parts"].as_array())
+            .expect("assistant parts");
+        let reloaded_completed = assistant_parts
+            .iter()
+            .filter(|part| {
+                part["type"] == "contextCompression"
+                    && part["status"] == "completed"
+                    && part["kind"] == "llm"
+            })
+            .count();
+        assert_eq!(reloaded_completed, 1);
+        assert!(
+            assistant_parts
+                .iter()
+                .any(|part| part["type"] == "text" && part["text"] == "compressed answer")
+        );
+
+        // 4) stats truth from snapshots; may be >= visible completed parts when supersede exists.
+        let task_state = state.clone();
+        let statistics_task = tokio::spawn(async move {
+            remote_sidecar_chat_statistics(State(task_state), AxumPath("chat-1".to_string())).await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker statistics request should arrive")
+            .expect("broker request");
+        assert_eq!(
+            request.method.as_deref(),
+            Some("memory.global.createdForRunIds")
+        );
+        let request_id = request.id.expect("broker request id");
+        state
+            .broker_pending
+            .lock()
+            .await
+            .get(&request_id)
+            .expect("pending broker response sender")
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: json!({ "status": "ok", "createdMemories": 0 }),
+                timestamp: None,
+            })
+            .expect("send broker response");
+
+        let Json(statistics) = statistics_task
+            .await
+            .expect("statistics task")
+            .expect("statistics response");
+        assert_eq!(statistics.compression.llm_snapshot_count, 2);
+        assert_eq!(statistics.compression.snapshot_count, 2);
+        assert!(
+            statistics.compression.llm_snapshot_count as usize >= reloaded_completed,
+            "snapshot count may exceed visible completed parts when supersede rows exist"
+        );
+        // Bubble / completed parts remain the UI unit; do not require equality with snapshot rows.
+        assert_eq!(reloaded_completed, 1);
+    }
+
     #[tokio::test]
     async fn remote_control_ws_delivers_terminal_broker_response_without_deadlocking() {
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
