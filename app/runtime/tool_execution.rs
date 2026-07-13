@@ -1016,6 +1016,7 @@ pub(crate) async fn execute_tool(
             question_registry.clone(),
             question_event_tx.clone(),
             workspace_id,
+            workspace_path,
             tool_workspace_path,
             chat_id,
             tool_call_id,
@@ -3086,7 +3087,8 @@ async fn ensure_read_file_external_access(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
-    workspace_path: &Path,
+    shared_workspace_path: &Path,
+    tool_workspace_path: &Path,
     chat_id: &str,
     tool_call_id: &str,
     tool_name: &str,
@@ -3101,12 +3103,21 @@ async fn ensure_read_file_external_access(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| "read_file requires string path".to_string())?;
-    let Some(target_path) = read_file_target_outside_workspace(workspace_path, path)? else {
+    // External-read mode is relative to the execution root (worktree when isolated).
+    let Some(target_path) = read_file_target_outside_workspace(tool_workspace_path, path)? else {
         return Ok(false);
     };
 
+    // Plan/agent isolated worktrees may still read the real shared workspace without
+    // ask_question. Membership uses the canonical target (symlink escapes stay outside).
+    // Checked before Skill/chat grants so shared-root trust is the first fast path.
+    if path_is_within_shared_workspace(&target_path, shared_workspace_path) {
+        return Ok(true);
+    }
+
     // Prefer the run-scoped Skill snapshot from prompt assembly so routing-table
     // visibility and read_file grants stay identical for shared + isolated worktrees.
+    // Global / other non-shared skill roots still use this path.
     if path_is_within_skill_read_roots(&target_path, skill_read_root_dirs)
         || read_file_target_is_configured_skill(global_config, workspace_id, &target_path)
     {
@@ -3145,6 +3156,14 @@ async fn ensure_read_file_external_access(
             target_path.display()
         )),
     }
+}
+
+/// Returns true when `target_path` (already canonical) lies under the current shared workspace root.
+fn path_is_within_shared_workspace(target_path: &Path, shared_workspace_path: &Path) -> bool {
+    let Ok(shared_root) = std::fs::canonicalize(shared_workspace_path) else {
+        return false;
+    };
+    target_path.starts_with(&shared_root)
 }
 
 fn read_file_target_is_configured_skill(
@@ -3612,6 +3631,7 @@ mod tests {
             event_tx,
             "workspace-1",
             workspace.path(),
+            workspace.path(),
             &chat_id,
             "call-1",
             READ_FILE_TOOL,
@@ -3670,6 +3690,7 @@ mod tests {
                 event_tx.clone(),
                 "workspace-1",
                 workspace.path(),
+                workspace.path(),
                 &chat_id,
                 call_id,
                 READ_FILE_TOOL,
@@ -3716,6 +3737,7 @@ mod tests {
             registry,
             event_tx,
             "workspace-1",
+            workspace.path(),
             isolated_worktree.path(),
             &chat_id,
             "call-1",
@@ -3730,9 +3752,213 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Isolated worktree: absolute paths under the shared workspace skip ask_question;
+    /// relative paths still resolve inside the worktree; escaping symlinks and other
+    /// workspaces still prompt.
+    #[tokio::test]
+    async fn read_file_external_access_trusts_shared_workspace_from_isolated_worktree() {
+        let workspace = tempfile::tempdir().expect("shared workspace");
+        let isolated_worktree = tempfile::tempdir().expect("isolated worktree");
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+
+        let shared_file = workspace.path().join("shared-src.txt");
+        fs::write(&shared_file, "shared content").expect("write shared file");
+        let worktree_file = isolated_worktree.path().join("shared-src.txt");
+        fs::write(&worktree_file, "worktree content").expect("write worktree file");
+        let other_file = other_workspace.path().join("other.txt");
+        fs::write(&other_file, "other workspace").expect("write other file");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(outside.path(), "plain outside").expect("write outside");
+
+        // Symlink inside shared workspace that escapes outside → must not auto-allow.
+        let escape_link = workspace.path().join("escape-link.txt");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), &escape_link)
+                .expect("create escape symlink");
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-unix CI, skip symlink escape case by writing a normal shared file
+            // with a distinct name so the loop below still compiles.
+            let _ = &escape_link;
+        }
+
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-shared-workspace-trust-{}", unique_id("case"));
+
+        // Absolute path into shared workspace → allow without question.
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            isolated_worktree.path(),
+            &chat_id,
+            "call-shared",
+            READ_FILE_TOOL,
+            &json!({
+                "path": shared_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("shared workspace absolute path");
+        assert!(allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        // Relative path stays inside tool worktree → no external access flag.
+        let relative_allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            isolated_worktree.path(),
+            &chat_id,
+            "call-relative",
+            READ_FILE_TOOL,
+            &json!({
+                "path": "shared-src.txt",
+                "startLine": null,
+                "endLine": null
+            }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("relative worktree path");
+        assert!(!relative_allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        // End-to-end: authorized external read returns shared content with line numbers.
+        let result = execute_builtin_tool_with_context_and_options(
+            isolated_worktree.path(),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            READ_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["content"], "1\tshared content");
+
+        // Relative path from worktree tool root still reads worktree version.
+        let relative_result = execute_builtin_tool_with_context_and_options(
+            isolated_worktree.path(),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            READ_FILE_TOOL,
+            json!({
+                "path": "shared-src.txt",
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            false,
+        );
+        assert!(!relative_result.is_error, "{:?}", relative_result.output);
+        assert_eq!(relative_result.output["content"], "1\tworktree content");
+
+        // Other workspace + plain outside still prompt.
+        for (call_id, path) in [
+            ("call-other", other_file.as_path()),
+            ("call-plain", outside.path()),
+        ] {
+            let prompted_chat_id = format!("{chat_id}-{call_id}");
+            let arguments = json!({
+                "path": path.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            });
+            let access = ensure_read_file_external_access(
+                &config,
+                &[],
+                registry.clone(),
+                event_tx.clone(),
+                "workspace-1",
+                workspace.path(),
+                isolated_worktree.path(),
+                &prompted_chat_id,
+                call_id,
+                READ_FILE_TOOL,
+                &arguments,
+                ToolCancellationToken::default(),
+            );
+            let (request, denied) = tokio::join!(
+                answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+                access
+            );
+            assert!(
+                request.questions[0]
+                    .question
+                    .contains(&path.display().to_string())
+            );
+            assert!(
+                denied
+                    .expect_err("must prompt")
+                    .contains("user denied read_file access")
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let escape_chat = format!("{chat_id}-escape");
+            let escape_arguments = json!({
+                "path": escape_link.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            });
+            let access = ensure_read_file_external_access(
+                &config,
+                &[],
+                registry.clone(),
+                event_tx.clone(),
+                "workspace-1",
+                workspace.path(),
+                isolated_worktree.path(),
+                &escape_chat,
+                "call-escape",
+                READ_FILE_TOOL,
+                &escape_arguments,
+                ToolCancellationToken::default(),
+            );
+            let (request, denied) = tokio::join!(
+                answer_next_external_read_question(registry, &mut event_rx, "deny"),
+                access
+            );
+            // Canonical target is outside the shared workspace.
+            let outside_display = outside.path().display().to_string();
+            assert!(
+                request.questions[0].question.contains(&outside_display)
+                    || request.questions[0]
+                        .question
+                        .contains(&escape_link.display().to_string()),
+                "escape symlink question should surface outside target"
+            );
+            assert!(
+                denied
+                    .expect_err("escape symlink must not auto-allow")
+                    .contains("user denied read_file access")
+            );
+        }
+    }
+
     /// Plan isolated worktree + live prompt snapshot: `.agents` SKILL.md and
-    /// `.claude` nested references skip ask_question; disabled location, disabled
-    /// skill key, other-workspace skill, and plain external files still prompt.
+    /// `.claude` nested references skip ask_question. Files under the shared
+    /// workspace (including disabled skill paths) are trusted without prompting.
+    /// Other-workspace skills and plain external files still prompt.
     #[tokio::test]
     async fn read_file_external_access_plan_worktree_uses_prompt_skill_snapshot_boundaries() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -3848,6 +4074,7 @@ mod tests {
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
+                workspace.path(),
                 isolated_worktree.path(),
                 &chat_id,
                 call_id,
@@ -3877,9 +4104,45 @@ mod tests {
         assert_eq!(agents_only_snapshot.prompt_entries[0].name, "build");
         assert_eq!(agents_only_snapshot.read_root_dirs.len(), 1);
 
+        // Shared-workspace paths are trusted even when skill snapshot no longer
+        // lists them (disabled skill key / disabled location). Skill grants are
+        // not required for in-workspace files.
         for (call_id, path) in [
             ("call-disabled-skill", disabled_skill_file.as_path()),
             ("call-disabled-loc", claude_reference_file.as_path()),
+        ] {
+            let allowed = ensure_read_file_external_access(
+                &config,
+                &agents_only_snapshot.read_root_dirs,
+                registry.clone(),
+                event_tx.clone(),
+                workspace_id,
+                workspace.path(),
+                isolated_worktree.path(),
+                &format!("{chat_id}-{call_id}"),
+                call_id,
+                READ_FILE_TOOL,
+                &json!({
+                    "path": path.to_string_lossy(),
+                    "startLine": null,
+                    "endLine": null
+                }),
+                ToolCancellationToken::default(),
+            )
+            .await
+            .expect("shared workspace path should not prompt");
+            assert!(
+                allowed,
+                "{call_id} should be granted via shared workspace trust"
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "{call_id} must not emit ask_question"
+            );
+        }
+
+        // Truly external targets still require user confirmation.
+        for (call_id, path) in [
             ("call-other-ws", other_skill_file.as_path()),
             ("call-plain", plain_outside.path()),
         ] {
@@ -3895,6 +4158,7 @@ mod tests {
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
+                workspace.path(),
                 isolated_worktree.path(),
                 &prompted_chat_id,
                 call_id,
@@ -3932,6 +4196,7 @@ mod tests {
             registry,
             event_tx,
             workspace_id,
+            workspace.path(),
             isolated_worktree.path(),
             &format!("{chat_id}-final"),
             "call-final-claude-ref",
@@ -4026,6 +4291,7 @@ mod tests {
             registry.clone(),
             event_tx.clone(),
             workspace_id,
+            workspace.path(),
             isolated_worktree.path(),
             &chat_id,
             "call-1",
@@ -4051,6 +4317,7 @@ mod tests {
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
+                workspace.path(),
                 isolated_worktree.path(),
                 &prompted_chat_id,
                 call_id,
@@ -4093,6 +4360,7 @@ mod tests {
             registry.clone(),
             event_tx,
             "workspace-1",
+            workspace.path(),
             workspace.path(),
             &chat_id,
             "call-1",
@@ -4137,6 +4405,7 @@ mod tests {
             registry.clone(),
             event_tx,
             "workspace-1",
+            workspace.path(),
             workspace.path(),
             &chat_id,
             "call-1",
@@ -4184,6 +4453,7 @@ mod tests {
             event_tx.clone(),
             "workspace-1",
             workspace.path(),
+            workspace.path(),
             &chat_id,
             "call-1",
             READ_FILE_TOOL,
@@ -4210,6 +4480,7 @@ mod tests {
             registry,
             event_tx,
             "workspace-1",
+            workspace.path(),
             workspace.path(),
             &chat_id,
             "call-2",
@@ -4251,6 +4522,7 @@ mod tests {
             event_tx.clone(),
             "workspace-1",
             workspace.path(),
+            workspace.path(),
             &chat_id,
             "call-1",
             READ_FILE_TOOL,
@@ -4264,6 +4536,7 @@ mod tests {
             event_tx.clone(),
             "workspace-1",
             workspace.path(),
+            workspace.path(),
             &chat_id,
             "call-2",
             READ_FILE_TOOL,
@@ -4276,6 +4549,7 @@ mod tests {
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
+            workspace.path(),
             workspace.path(),
             &chat_id,
             "call-3",
