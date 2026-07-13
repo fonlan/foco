@@ -9031,6 +9031,201 @@ Only load this when matched.
 }
 
 #[tokio::test]
+async fn queued_plan_chat_recreates_single_skills_table_with_workspace_paths() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-queued-plan-skills-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-queued-plan-skills-profile-test"));
+    let agents_skill_dir = workspace_dir
+        .join(".agents")
+        .join("skills")
+        .join("planbuild");
+    let claude_skill_dir = workspace_dir
+        .join(".claude")
+        .join("skills")
+        .join("plandeploy");
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&agents_skill_dir).expect("agents skill directory");
+    fs::create_dir_all(&claude_skill_dir).expect("claude skill directory");
+    fs::write(
+        agents_skill_dir.join("SKILL.md"),
+        "---\nname: planbuild\ndescription: Plan build skill.\n---\n\n# PlanBuild\n\nOnly load when matched.\n",
+    )
+    .expect("agents skill write");
+    fs::write(
+        claude_skill_dir.join("SKILL.md"),
+        "---\nname: plandeploy\ndescription: Plan deploy skill.\n---\n\n# PlanDeploy\n\nOnly load when matched.\n",
+    )
+    .expect("claude skill write");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            chat_title_override: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: Some("plan".to_string()),
+            message: "Draft a plan using workspace skills".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+            agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_worktree: None,
+            correlation_id: None,
+            origin: crate::http::chat::QueuedChatMessageOrigin::User,
+        },
+    )
+    .await
+    .expect("queue plan message");
+
+    let scheduler_context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: Some(queued.user_message_id.clone()),
+            run_id_override: Some(queued.agent_task_id.expect("agent task id").to_string()),
+            visible_assistant_message_id: Some(queued.assistant_message_id.clone()),
+            visible_assistant_sequence: Some(1),
+            chat_id: Some(queued.chat_id.clone()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: Some("plan".to_string()),
+            message: "Draft a plan using workspace skills".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("scheduler chat context");
+
+    let skill_messages = scheduler_context
+        .provider_request
+        .messages
+        .iter()
+        .filter(|message| message.content.starts_with("## Skills"))
+        .collect::<Vec<_>>();
+    assert_eq!(skill_messages.len(), 1, "exactly one Skills routing table");
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
+    assert!(
+        skill_messages[0]
+            .content
+            .contains(&agents_skill_dir.join("SKILL.md").display().to_string())
+    );
+    assert!(
+        skill_messages[0]
+            .content
+            .contains(&claude_skill_dir.join("SKILL.md").display().to_string())
+    );
+    assert!(skill_messages[0].content.contains("- Name: \"planbuild\";"));
+    assert!(
+        skill_messages[0]
+            .content
+            .contains("- Name: \"plandeploy\";")
+    );
+    assert!(
+        !skill_messages[0].content.contains("Only load when matched"),
+        "routing table must not embed full skill body"
+    );
+
+    // Same snapshot that built the routing table is carried on the chat context
+    // for tool loops (including Plan isolated worktrees / shared review workers).
+    assert_eq!(scheduler_context.skill_read_root_dirs.len(), 2);
+    let agents_skill_file =
+        fs::canonicalize(agents_skill_dir.join("SKILL.md")).expect("canonicalize agents skill");
+    let claude_skill_file =
+        fs::canonicalize(claude_skill_dir.join("SKILL.md")).expect("canonicalize claude skill");
+    assert!(path_is_within_skill_read_roots(
+        &agents_skill_file,
+        &scheduler_context.skill_read_root_dirs
+    ));
+    assert!(path_is_within_skill_read_roots(
+        &claude_skill_file,
+        &scheduler_context.skill_read_root_dirs
+    ));
+
+    // Tool execution root can be a Plan phase worktree without materializing skills.
+    let phase_worktree = workspace_dir
+        .join(".foco")
+        .join("agent-worktrees")
+        .join("plan-phase");
+    fs::create_dir_all(&phase_worktree).expect("phase worktree");
+    assert!(!phase_worktree.join(".agents").join("skills").exists());
+    assert!(!phase_worktree.join(".claude").join("skills").exists());
+    assert_ne!(
+        scheduler_context.tool_workspace_path, phase_worktree,
+        "baseline prepare_chat_context uses canonical workspace path"
+    );
+    // After scheduler sets worktree execution root, skill grants stay on the snapshot.
+    let mut worktree_context = scheduler_context;
+    worktree_context.tool_workspace_path = phase_worktree.clone();
+    assert_eq!(worktree_context.skill_read_root_dirs.len(), 2);
+    assert!(path_is_within_skill_read_roots(
+        &agents_skill_file,
+        &worktree_context.skill_read_root_dirs
+    ));
+
+    drop(worktree_context);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn plan_worktree_shared_worker_skill_roots_match_prompt_snapshot() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let skill_dir = workspace
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("reviewable");
+    fs::create_dir_all(&skill_dir).expect("skill dir");
+    let skill_file = skill_dir.join("SKILL.md");
+    fs::write(
+        &skill_file,
+        "---\nname: reviewable\ndescription: Review skill.\n---\n\nBody.\n",
+    )
+    .expect("skill file");
+
+    let workspace_id = "workspace-review-skills";
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.workspaces[0].id = workspace_id.to_string();
+    config.workspaces[0].name = "Review Skills".to_string();
+    config.workspaces[0].path = workspace.path().to_path_buf();
+
+    let snapshot = available_skills_snapshot_for_workspace(profile.path(), &config, workspace_id);
+    assert_eq!(snapshot.read_root_dirs.len(), 1);
+
+    let phase_worktree = workspace
+        .path()
+        .join(".foco")
+        .join("agent-worktrees")
+        .join("phase-review");
+    fs::create_dir_all(&phase_worktree).expect("phase worktree");
+    assert!(
+        !phase_worktree.join(".agents").join("skills").exists(),
+        "worktree must not materialize skill directories"
+    );
+
+    let skill_path = fs::canonicalize(&skill_file).expect("canonicalize skill");
+    assert!(path_is_within_skill_read_roots(
+        &skill_path,
+        &snapshot.read_root_dirs
+    ));
+    assert!(!skill_path.starts_with(&phase_worktree));
+}
+
+#[tokio::test]
 async fn queued_new_chat_regenerates_skills_when_memory_is_deferred() {
     let workspace_dir =
         env::temp_dir().join(unique_id("foco-queued-deferred-skills-workspace-test"));

@@ -1108,6 +1108,81 @@ Body.",
     }
 
     #[test]
+    fn available_skills_snapshot_includes_claude_and_honors_disabled_location() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let agents_dir = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("build");
+        fs::create_dir_all(&agents_dir).expect("agents skill dir");
+        fs::write(
+            agents_dir.join("SKILL.md"),
+            "---
+name: build
+description: build helpers
+---
+
+Body.",
+        )
+        .expect("agents skill");
+
+        let claude_dir = workspace
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("deploy");
+        let claude_ref = claude_dir.join("references");
+        fs::create_dir_all(&claude_ref).expect("claude skill dir");
+        fs::write(
+            claude_dir.join("SKILL.md"),
+            "---
+name: deploy
+description: deploy helpers
+---
+
+Body.",
+        )
+        .expect("claude skill");
+        fs::write(claude_ref.join("details.md"), "details").expect("claude ref");
+
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.workspaces[0].id = "workspace-a".to_string();
+        config.workspaces[0].name = "A".to_string();
+        config.workspaces[0].path = workspace.path().to_path_buf();
+
+        let snapshot =
+            available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-a");
+        assert_eq!(snapshot.prompt_entries.len(), 2);
+        assert_eq!(snapshot.read_root_dirs.len(), 2);
+        assert!(
+            snapshot
+                .prompt_entries
+                .iter()
+                .any(|entry| entry.path.contains(".claude"))
+        );
+        assert!(path_is_within_skill_read_roots(
+            &fs::canonicalize(claude_ref.join("details.md")).expect("canon ref"),
+            &snapshot.read_root_dirs,
+        ));
+
+        config
+            .skills
+            .disabled_locations
+            .push("workspace:workspace-a:claude".to_string());
+        let filtered =
+            available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-a");
+        assert_eq!(filtered.prompt_entries.len(), 1);
+        assert_eq!(filtered.prompt_entries[0].name, "build");
+        assert!(!path_is_within_skill_read_roots(
+            &fs::canonicalize(claude_ref.join("details.md")).expect("canon ref"),
+            &filtered.read_root_dirs,
+        ));
+    }
+
+    #[test]
     fn deletable_skill_directory_allows_nested_skill_directory() {
         let profile = tempfile::tempdir().expect("profile");
         let roots = skill_search_roots(profile.path(), &[]);

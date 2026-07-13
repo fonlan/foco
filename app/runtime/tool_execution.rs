@@ -3621,6 +3621,241 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Plan isolated worktree + live prompt snapshot: `.agents` SKILL.md and
+    /// `.claude` nested references skip ask_question; disabled location, disabled
+    /// skill key, other-workspace skill, and plain external files still prompt.
+    #[tokio::test]
+    async fn read_file_external_access_plan_worktree_uses_prompt_skill_snapshot_boundaries() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let isolated_worktree = tempfile::tempdir().expect("isolated worktree");
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+
+        let agents_skill_dir = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("build");
+        let agents_reference_dir = agents_skill_dir.join("references");
+        fs::create_dir_all(&agents_reference_dir).expect("agents skill refs");
+        let agents_skill_file = agents_skill_dir.join("SKILL.md");
+        let agents_reference_file = agents_reference_dir.join("notes.md");
+        fs::write(
+            &agents_skill_file,
+            "---\nname: build\ndescription: build helpers\n---\n\nUse build.",
+        )
+        .expect("write agents skill");
+        fs::write(&agents_reference_file, "agents notes").expect("write agents ref");
+
+        let claude_skill_dir = workspace
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("deploy");
+        let claude_reference_dir = claude_skill_dir.join("references");
+        fs::create_dir_all(&claude_reference_dir).expect("claude skill refs");
+        let claude_skill_file = claude_skill_dir.join("SKILL.md");
+        let claude_reference_file = claude_reference_dir.join("details.md");
+        fs::write(
+            &claude_skill_file,
+            "---\nname: deploy\ndescription: deploy helpers\n---\n\nUse deploy.",
+        )
+        .expect("write claude skill");
+        fs::write(&claude_reference_file, "claude details").expect("write claude ref");
+
+        let disabled_skill_dir = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("legacy");
+        fs::create_dir_all(&disabled_skill_dir).expect("disabled skill dir");
+        let disabled_skill_file = disabled_skill_dir.join("SKILL.md");
+        fs::write(
+            &disabled_skill_file,
+            "---\nname: legacy\ndescription: disabled skill\n---\n\nDo not use.",
+        )
+        .expect("write disabled skill");
+
+        let other_skill_dir = other_workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("foreign");
+        fs::create_dir_all(&other_skill_dir).expect("other skill dir");
+        let other_skill_file = other_skill_dir.join("SKILL.md");
+        fs::write(
+            &other_skill_file,
+            "---\nname: foreign\ndescription: other workspace\n---\n\nForeign.",
+        )
+        .expect("write other skill");
+
+        let plain_outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(plain_outside.path(), "plain outside").expect("write outside");
+
+        let workspace_id = "workspace-plan-skills";
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.workspaces[0].id = workspace_id.to_string();
+        config.workspaces[0].name = "Plan Skills".to_string();
+        config.workspaces[0].path = workspace.path().to_path_buf();
+        // Stale detected list must not authorize; grants come from the snapshot.
+        config.skills.detected.clear();
+
+        let snapshot_with_legacy =
+            available_skills_snapshot_for_workspace(profile.path(), &config, workspace_id);
+        assert!(
+            snapshot_with_legacy
+                .prompt_entries
+                .iter()
+                .any(|entry| entry.name == "legacy"),
+            "legacy skill should be discoverable before disable"
+        );
+        assert_eq!(snapshot_with_legacy.prompt_entries.len(), 3);
+
+        let legacy_key = format!("workspace:{workspace_id}:legacy");
+        config.skills.disabled.push(legacy_key);
+        let snapshot =
+            available_skills_snapshot_for_workspace(profile.path(), &config, workspace_id);
+        assert_eq!(snapshot.prompt_entries.len(), 2);
+        assert!(
+            snapshot
+                .prompt_entries
+                .iter()
+                .all(|entry| entry.name == "build" || entry.name == "deploy")
+        );
+
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-plan-worktree-skill-snapshot-{}", unique_id("case"));
+
+        for (call_id, path) in [
+            ("call-agents-skill", agents_skill_file.as_path()),
+            ("call-agents-ref", agents_reference_file.as_path()),
+            ("call-claude-skill", claude_skill_file.as_path()),
+            ("call-claude-ref", claude_reference_file.as_path()),
+        ] {
+            let allowed = ensure_read_file_external_access(
+                &config,
+                &snapshot.read_root_dirs,
+                registry.clone(),
+                event_tx.clone(),
+                workspace_id,
+                isolated_worktree.path(),
+                &chat_id,
+                call_id,
+                READ_FILE_TOOL,
+                &json!({
+                    "path": path.to_string_lossy(),
+                    "startLine": null,
+                    "endLine": null
+                }),
+                ToolCancellationToken::default(),
+            )
+            .await
+            .expect("granted skill path should not prompt");
+            assert!(allowed, "{call_id} should be granted");
+            assert!(
+                event_rx.try_recv().is_err(),
+                "{call_id} must not emit ask_question"
+            );
+        }
+
+        // Disabled location removes `.claude` roots from the live snapshot.
+        let claude_location_id = format!("workspace:{workspace_id}:claude");
+        config.skills.disabled_locations.push(claude_location_id);
+        let agents_only_snapshot =
+            available_skills_snapshot_for_workspace(profile.path(), &config, workspace_id);
+        assert_eq!(agents_only_snapshot.prompt_entries.len(), 1);
+        assert_eq!(agents_only_snapshot.prompt_entries[0].name, "build");
+        assert_eq!(agents_only_snapshot.read_root_dirs.len(), 1);
+
+        for (call_id, path) in [
+            ("call-disabled-skill", disabled_skill_file.as_path()),
+            ("call-disabled-loc", claude_reference_file.as_path()),
+            ("call-other-ws", other_skill_file.as_path()),
+            ("call-plain", plain_outside.path()),
+        ] {
+            let prompted_chat_id = format!("{chat_id}-{call_id}");
+            let arguments = json!({
+                "path": path.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            });
+            let access = ensure_read_file_external_access(
+                &config,
+                &agents_only_snapshot.read_root_dirs,
+                registry.clone(),
+                event_tx.clone(),
+                workspace_id,
+                isolated_worktree.path(),
+                &prompted_chat_id,
+                call_id,
+                READ_FILE_TOOL,
+                &arguments,
+                ToolCancellationToken::default(),
+            );
+
+            let (request, denied) = tokio::join!(
+                answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+                access
+            );
+            assert!(
+                request.questions[0]
+                    .question
+                    .contains(&path.display().to_string()),
+                "{call_id} question should mention path"
+            );
+            assert!(
+                denied
+                    .expect_err("external path should prompt and deny")
+                    .contains("user denied read_file access"),
+                "{call_id} should be denied after ask_question"
+            );
+        }
+
+        // Nested claude resource is readable under a worktree tool root when
+        // the prompt snapshot still includes that skill.
+        config.skills.disabled_locations.clear();
+        let full_snapshot =
+            available_skills_snapshot_for_workspace(profile.path(), &config, workspace_id);
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &full_snapshot.read_root_dirs,
+            registry,
+            event_tx,
+            workspace_id,
+            isolated_worktree.path(),
+            &format!("{chat_id}-final"),
+            "call-final-claude-ref",
+            READ_FILE_TOOL,
+            &json!({
+                "path": claude_reference_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("re-enabled claude ref");
+        assert!(allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        let result = execute_builtin_tool_with_context_and_options(
+            isolated_worktree.path(),
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            READ_FILE_TOOL,
+            json!({
+                "path": claude_reference_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["content"], "1\tclaude details");
+    }
+
     #[tokio::test]
     async fn read_file_external_access_skips_question_for_current_workspace_skill() {
         let workspace = tempfile::tempdir().expect("workspace");
