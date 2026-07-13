@@ -125,6 +125,7 @@ import type {
   ProviderRequestOverrideValueType,
   ProviderTestResponse,
   ProviderTestState,
+  RemoteAuthMethod,
   RemoteServerDiagnosticResponse,
   RemoteServerResponse,
   RemoteServerSummary,
@@ -358,6 +359,10 @@ type RemoteServerFormState = {
   user: string;
   port: string;
   identityFile: string;
+  authMethod: RemoteAuthMethod;
+  /** Write-only; never populated from API. Empty on edit keeps existing password. */
+  password: string;
+  passwordConfigured: boolean;
   defaultRemoteRoot: string;
   focoCommand: string;
   terminalShell: string;
@@ -12031,7 +12036,7 @@ function RemoteServersSettingsSection({
                   </h3>
                 </div>
                 <div className="mt-1 truncate text-xs text-stone-500">
-                  {form.hostAlias || t("SSH host alias")}
+                  {form.hostAlias || t("SSH hostname / IP")}
                 </div>
               </div>
               <button
@@ -12052,15 +12057,15 @@ function RemoteServersSettingsSection({
                 value={form.name}
               />
               <TextField
-                label={t("SSH host alias")}
+                label={t("SSH hostname / IP")}
                 onChange={(value) => onFormChange((current) => ({ ...current, hostAlias: value }))}
-                placeholder="prod-box"
+                placeholder="192.168.1.10"
                 value={form.hostAlias}
               />
               <TextField
                 label={t("SSH user")}
                 onChange={(value) => onFormChange((current) => ({ ...current, user: value }))}
-                placeholder="deploy"
+                placeholder="root"
                 value={form.user}
               />
               <TextField
@@ -12070,14 +12075,50 @@ function RemoteServersSettingsSection({
                 placeholder="22"
                 value={form.port}
               />
-              <div className="sm:col-span-2">
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Authentication")}
+                </span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) => {
+                    const authMethod =
+                      event.target.value === "password" ? "password" : "key";
+                    onFormChange((current) => ({
+                      ...current,
+                      authMethod,
+                      // Switching to key clears write-only password field; backend clears stored password.
+                      password: authMethod === "key" ? "" : current.password,
+                    }));
+                  }}
+                  value={form.authMethod}
+                >
+                  <option value="key">{t("SSH key / agent")}</option>
+                  <option value="password">{t("Password")}</option>
+                </select>
+              </label>
+              {form.authMethod === "password" ? (
+                <TextField
+                  label={t("SSH password")}
+                  onChange={(value) => onFormChange((current) => ({ ...current, password: value }))}
+                  placeholder={
+                    form.passwordConfigured
+                      ? t("Leave empty to keep saved password")
+                      : t("Required for password auth")
+                  }
+                  type="password"
+                  value={form.password}
+                />
+              ) : (
                 <TextField
                   label={t("Identity file")}
-                  onChange={(value) => onFormChange((current) => ({ ...current, identityFile: value }))}
+                  onChange={(value) =>
+                    onFormChange((current) => ({ ...current, identityFile: value }))
+                  }
                   placeholder="~/.ssh/id_ed25519"
                   value={form.identityFile}
                 />
-              </div>
+              )}
               <TextField
                 label={t("Default remote root")}
                 onChange={(value) => onFormChange((current) => ({ ...current, defaultRemoteRoot: value }))}
@@ -12132,7 +12173,14 @@ function RemoteServersSettingsSection({
               <button
                 aria-label={t("Save remote server")}
                 className="inline-flex size-10 items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                disabled={isSaving || !form.name.trim() || !form.hostAlias.trim()}
+                disabled={
+                  isSaving ||
+                  !form.name.trim() ||
+                  !form.hostAlias.trim() ||
+                  (form.authMethod === "password" &&
+                    !form.password.trim() &&
+                    !form.passwordConfigured)
+                }
                 title={t("Save remote server")}
                 type="submit"
               >
@@ -13148,21 +13196,25 @@ function emptyWorkspaceForm(): WorkspaceFormState {
 
 function emptyRemoteServerForm(): RemoteServerFormState {
   return {
+    authMethod: "key",
     connectTimeoutMs: "10000",
-    defaultRemoteRoot: "",
+    defaultRemoteRoot: "~",
     focoCommand: "",
     hostAlias: "",
     id: "",
     identityFile: "",
     name: "",
+    password: "",
+    passwordConfigured: false,
     port: "",
     terminalShell: "",
-    user: "",
+    user: "root",
   };
 }
 
 function remoteServerFormFromSummary(server: RemoteServerSummary): RemoteServerFormState {
   return {
+    authMethod: server.authMethod ?? "key",
     connectTimeoutMs: String(server.connectTimeoutMs),
     defaultRemoteRoot: server.defaultRemoteRoot ?? "",
     focoCommand: server.focoCommand ?? "",
@@ -13170,6 +13222,8 @@ function remoteServerFormFromSummary(server: RemoteServerSummary): RemoteServerF
     id: server.id,
     identityFile: server.identityFile ?? "",
     name: server.name,
+    password: "",
+    passwordConfigured: server.passwordConfigured,
     port: server.port ? String(server.port) : "",
     terminalShell: server.terminalShell ?? "",
     user: server.user ?? "",
@@ -13179,14 +13233,18 @@ function remoteServerFormFromSummary(server: RemoteServerSummary): RemoteServerF
 function remoteServerFormPayload(form: RemoteServerFormState) {
   const trimmedPort = form.port.trim();
   const trimmedTimeout = form.connectTimeoutMs.trim();
+  const authMethod = form.authMethod === "password" ? "password" : "key";
   return {
+    authMethod,
     connectTimeoutMs: trimmedTimeout ? Number(trimmedTimeout) : undefined,
     defaultRemoteRoot: nullableTrimmed(form.defaultRemoteRoot),
     focoCommand: nullableTrimmed(form.focoCommand),
     hostAlias: form.hostAlias.trim(),
     id: form.id.trim() || undefined,
-    identityFile: nullableTrimmed(form.identityFile),
+    identityFile: authMethod === "key" ? nullableTrimmed(form.identityFile) : null,
     name: form.name.trim(),
+    // Empty password on update keeps existing; create with password mode requires value.
+    password: authMethod === "password" ? form.password : null,
     port: trimmedPort ? Number(trimmedPort) : null,
     terminalShell: nullableTrimmed(form.terminalShell),
     user: nullableTrimmed(form.user),

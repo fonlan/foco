@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use foco_store::config::RemoteServerProfile;
+use foco_store::config::{RemoteAuthMethod, RemoteServerProfile};
 
 use super::error::{SshError, SshErrorKind};
 
@@ -29,20 +29,25 @@ pub enum StrictHostKeyChecking {
 /// Password content is never included in `Debug` output.
 #[derive(Clone)]
 pub struct SshAuthConfig {
+    pub method: RemoteAuthMethod,
     /// Ordered private key paths (profile IdentityFile overrides config list).
     pub identity_files: Vec<PathBuf>,
     /// Optional password (sensitive; not logged).
     pub password: Option<String>,
-    /// Attempt SSH agent when key/password auth is unavailable or fails.
+    /// Attempt SSH agent when key auth is in use.
     pub use_agent: bool,
+    /// When true, also try common `~/.ssh/id_*` after configured identity files.
+    pub try_default_identities: bool,
 }
 
 impl std::fmt::Debug for SshAuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshAuthConfig")
+            .field("method", &self.method)
             .field("identity_files", &self.identity_files)
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
             .field("use_agent", &self.use_agent)
+            .field("try_default_identities", &self.try_default_identities)
             .finish()
     }
 }
@@ -65,9 +70,9 @@ pub struct ResolvedSshProfile {
 /// Optional overrides applied when resolving (e.g. password not yet on profile).
 #[derive(Debug, Clone, Default)]
 pub struct ResolveSshOptions {
-    /// Password supplied by the caller (never persisted by this module).
+    /// Password supplied by the caller (overrides profile password when set).
     pub password: Option<String>,
-    /// Prefer agent authentication when true (default true).
+    /// Prefer agent authentication when true (default true for key auth).
     pub use_agent: Option<bool>,
     /// Custom path to `ssh_config` for tests; `None` uses `~/.ssh/config`.
     pub ssh_config_path: Option<PathBuf>,
@@ -164,17 +169,23 @@ pub fn resolve_ssh_profile(
         })
         .unwrap_or_else(default_ssh_user);
 
-    let identity_files = if let Some(path) = server.identity_file.as_ref() {
-        vec![expand_user_path(path)]
-    } else {
-        file_config
-            .as_ref()
-            .and_then(|cfg| cfg.host_config.identity_file.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|path| expand_user_path(&path))
-            .collect()
-    };
+    // Stable key order: explicit profile IdentityFile → ssh_config IdentityFile →
+    // (agent and defaults applied later in session auth).
+    let mut identity_files = Vec::new();
+    if let Some(path) = server.identity_file.as_ref() {
+        identity_files.push(expand_user_path(path));
+    }
+    if let Some(cfg_paths) = file_config
+        .as_ref()
+        .and_then(|cfg| cfg.host_config.identity_file.clone())
+    {
+        for path in cfg_paths {
+            let expanded = expand_user_path(&path);
+            if !identity_files.iter().any(|existing| existing == &expanded) {
+                identity_files.push(expanded);
+            }
+        }
+    }
 
     let known_hosts_path = file_config
         .as_ref()
@@ -193,6 +204,22 @@ pub fn resolve_ssh_profile(
 
     let connect_timeout = Duration::from_millis(server.connect_timeout_ms.max(1));
 
+    let password = options
+        .password
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            server
+                .password
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
+
+    let method = server.auth_method;
+    let use_agent = match method {
+        RemoteAuthMethod::Password => false,
+        RemoteAuthMethod::Key => options.use_agent.unwrap_or(true),
+    };
+
     Ok(ResolvedSshProfile {
         host_alias: host_alias.to_string(),
         hostname,
@@ -202,9 +229,15 @@ pub fn resolve_ssh_profile(
         known_hosts_path,
         strict_host_key_checking,
         auth: SshAuthConfig {
+            method,
             identity_files,
-            password: options.password.filter(|value| !value.is_empty()),
-            use_agent: options.use_agent.unwrap_or(true),
+            password: match method {
+                RemoteAuthMethod::Password => password,
+                RemoteAuthMethod::Key => None,
+            },
+            use_agent,
+            // Always allow bounded default id_* after configured identities + agent.
+            try_default_identities: true,
         },
     })
 }
@@ -338,8 +371,12 @@ mod tests {
         assert_eq!(resolved.port, 22);
         assert_eq!(
             resolved.auth.identity_files,
-            vec![PathBuf::from("/tmp/from-profile")]
+            vec![
+                PathBuf::from("/tmp/from-profile"),
+                PathBuf::from("/tmp/from-config"),
+            ]
         );
+        assert!(resolved.auth.try_default_identities);
         assert_eq!(resolved.known_hosts_path, PathBuf::from("/tmp/kh"));
         assert_eq!(resolved.strict_host_key_checking, StrictHostKeyChecking::No);
     }
@@ -423,12 +460,33 @@ mod tests {
     #[test]
     fn password_is_redacted_in_debug() {
         let auth = SshAuthConfig {
+            method: RemoteAuthMethod::Password,
             identity_files: vec![],
             password: Some("s3cret".to_string()),
-            use_agent: true,
+            use_agent: false,
+            try_default_identities: false,
         };
         let rendered = format!("{auth:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("s3cret"));
+    }
+
+    #[test]
+    fn password_mode_loads_password_from_profile() {
+        let mut server = profile("203.0.113.10");
+        server.auth_method = RemoteAuthMethod::Password;
+        server.password = Some("s3cret".to_string());
+        let resolved = resolve_ssh_profile(
+            &server,
+            ResolveSshOptions {
+                skip_ssh_config: true,
+                ..Default::default()
+            },
+        )
+        .expect("resolve");
+        assert_eq!(resolved.auth.method, RemoteAuthMethod::Password);
+        assert_eq!(resolved.auth.password.as_deref(), Some("s3cret"));
+        assert!(!resolved.auth.use_agent);
+        assert!(!format!("{:?}", resolved.auth).contains("s3cret"));
     }
 }

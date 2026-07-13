@@ -16,6 +16,7 @@ pub enum SshErrorKind {
     HostKeyChanged,
     ProxyUnsupported,
     Config,
+    RemoteCommandFailed,
 }
 
 impl SshErrorKind {
@@ -30,6 +31,7 @@ impl SshErrorKind {
             Self::HostKeyChanged => "host_key_changed",
             Self::ProxyUnsupported => "proxy_unsupported",
             Self::Config => "config_error",
+            Self::RemoteCommandFailed => "remote_command_failed",
         }
     }
 }

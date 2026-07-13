@@ -11,6 +11,7 @@
 mod config;
 mod error;
 mod known_hosts;
+mod remote_path;
 mod session;
 
 pub use config::{
@@ -21,6 +22,9 @@ pub use error::{HostKeyInfo, SshError, SshErrorKind};
 pub use known_hosts::{
     HostKeyStatus, host_key_info, trust_host_key_if_fingerprint_matches, verify_server_key,
     verify_server_key_path,
+};
+pub use remote_path::{
+    expand_command, expand_remote_path, shell_quote, validate_remote_path_input,
 };
 pub use session::{
     SshCommandResult, SshSession, SshSpawnedExec, connect_with_optional_trust, trust_and_connect,

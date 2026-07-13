@@ -5,7 +5,9 @@ use axum::{
     extract::{Path as AxumPath, State},
 };
 use chrono::{SecondsFormat, Utc};
-use foco_store::config::{DEFAULT_REMOTE_CONNECT_TIMEOUT_MS, RemoteServerProfile};
+use foco_store::config::{
+    DEFAULT_REMOTE_CONNECT_TIMEOUT_MS, RemoteAuthMethod, RemoteServerProfile,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, time::timeout};
@@ -41,6 +43,11 @@ pub(crate) struct RemoteServerInput {
     #[serde(default)]
     identity_file: Option<String>,
     #[serde(default)]
+    auth_method: Option<RemoteAuthMethod>,
+    /// Empty string on update means "keep existing password".
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
     default_remote_root: Option<String>,
     #[serde(default)]
     foco_command: Option<String>,
@@ -65,6 +72,8 @@ pub(crate) struct RemoteServerSummary {
     pub(crate) user: Option<String>,
     pub(crate) port: Option<u16>,
     pub(crate) identity_file: Option<String>,
+    pub(crate) auth_method: RemoteAuthMethod,
+    pub(crate) password_configured: bool,
     pub(crate) default_remote_root: Option<String>,
     pub(crate) foco_command: Option<String>,
     pub(crate) terminal_shell: Option<String>,
@@ -326,6 +335,8 @@ pub(crate) fn remote_server_summary(
             .identity_file
             .as_ref()
             .map(|path| path.display().to_string()),
+        auth_method: server.auth_method,
+        password_configured: server.password_configured(),
         default_remote_root: server.default_remote_root.clone(),
         foco_command: server.foco_command.clone(),
         terminal_shell: server.terminal_shell.clone(),
@@ -729,14 +740,48 @@ fn remote_server_from_input(
         ));
     }
 
+    let is_create = existing.is_none();
+    let auth_method = input
+        .auth_method
+        .unwrap_or_else(|| existing.map(|server| server.auth_method).unwrap_or_default());
+
+    let user = match optional_non_empty(input.user) {
+        Some(user) => Some(user),
+        None if is_create => Some("root".to_string()),
+        None => None,
+    };
+    let default_remote_root = match optional_non_empty(input.default_remote_root) {
+        Some(root) => Some(root),
+        None if is_create => Some("~".to_string()),
+        None => None,
+    };
+
+    let password = match auth_method {
+        RemoteAuthMethod::Key => None,
+        RemoteAuthMethod::Password => {
+            let incoming = optional_non_empty(input.password);
+            match (incoming, existing) {
+                (Some(password), _) => Some(password),
+                (None, Some(existing)) if existing.password_configured() => existing.password.clone(),
+                (None, _) => {
+                    return Err(ApiError::bad_request(
+                        "remote server password is required when authMethod is password",
+                    ));
+                }
+            }
+        }
+    };
+
     Ok(RemoteServerProfile {
         id,
         name,
         host_alias,
-        user: optional_non_empty(input.user),
+        user,
         port: input.port,
         identity_file: optional_non_empty(input.identity_file).map(PathBuf::from),
-        default_remote_root: optional_non_empty(input.default_remote_root),
+        auth_method,
+        password,
+        default_remote_root,
         foco_command: optional_non_empty(input.foco_command),
         terminal_shell: optional_non_empty(input.terminal_shell),
         connect_timeout_ms,
@@ -1194,5 +1239,144 @@ mod tests {
             connected_summary.sidecar_install_state,
             SIDECAR_INSTALL_STATE_AVAILABLE
         );
+    }
+
+    #[test]
+    fn server_summary_exposes_auth_flags_without_password() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Srv".to_string(),
+            host_alias: "srv".to_string(),
+            auth_method: RemoteAuthMethod::Password,
+            password: Some("super-secret-password".to_string()),
+            ..RemoteServerProfile::default()
+        });
+
+        let summary =
+            remote_server_summary(&config, &config.remote_servers[0], &HashSet::new(), None);
+        assert_eq!(summary.auth_method, RemoteAuthMethod::Password);
+        assert!(summary.password_configured);
+        let json = serde_json::to_string(&summary).expect("summary json");
+        assert!(!json.contains("super-secret-password"));
+        assert!(!json.contains("\"password\":"));
+        assert!(json.contains("passwordConfigured"));
+        assert!(json.contains("\"authMethod\":\"password\""));
+    }
+
+    #[test]
+    fn create_applies_root_and_home_defaults() {
+        let server = remote_server_from_input(
+            RemoteServerInput {
+                id: None,
+                name: "Box".to_string(),
+                host_alias: "box.example".to_string(),
+                user: None,
+                port: None,
+                identity_file: None,
+                auth_method: None,
+                password: None,
+                default_remote_root: None,
+                foco_command: None,
+                terminal_shell: None,
+                connect_timeout_ms: None,
+            },
+            None,
+        )
+        .expect("create");
+        assert_eq!(server.user.as_deref(), Some("root"));
+        assert_eq!(server.default_remote_root.as_deref(), Some("~"));
+        assert_eq!(server.auth_method, RemoteAuthMethod::Key);
+        assert!(!server.password_configured());
+    }
+
+    #[test]
+    fn edit_does_not_apply_create_defaults() {
+        let existing = RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Srv".to_string(),
+            host_alias: "old".to_string(),
+            user: Some("deploy".to_string()),
+            default_remote_root: Some("/srv".to_string()),
+            auth_method: RemoteAuthMethod::Password,
+            password: Some("keep-me".to_string()),
+            ..RemoteServerProfile::default()
+        };
+        let updated = remote_server_from_input(
+            RemoteServerInput {
+                id: Some(existing.id.clone()),
+                name: "Srv".to_string(),
+                host_alias: "new".to_string(),
+                user: None,
+                port: None,
+                identity_file: None,
+                auth_method: Some(RemoteAuthMethod::Password),
+                password: None,
+                default_remote_root: None,
+                foco_command: None,
+                terminal_shell: None,
+                connect_timeout_ms: None,
+            },
+            Some(&existing),
+        )
+        .expect("update");
+        assert_eq!(updated.user, None);
+        assert_eq!(updated.default_remote_root, None);
+        assert_eq!(updated.password.as_deref(), Some("keep-me"));
+        assert_ne!(updated.user.as_deref(), Some("root"));
+        assert_ne!(updated.default_remote_root.as_deref(), Some("~"));
+    }
+
+    #[test]
+    fn password_mode_requires_password_on_create_and_clears_on_key() {
+        let err = remote_server_from_input(
+            RemoteServerInput {
+                id: None,
+                name: "Box".to_string(),
+                host_alias: "box".to_string(),
+                user: None,
+                port: None,
+                identity_file: None,
+                auth_method: Some(RemoteAuthMethod::Password),
+                password: None,
+                default_remote_root: None,
+                foco_command: None,
+                terminal_shell: None,
+                connect_timeout_ms: None,
+            },
+            None,
+        )
+        .expect_err("password required");
+        assert!(format!("{err:?}").contains("password is required"));
+
+        let existing = RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Srv".to_string(),
+            host_alias: "box".to_string(),
+            auth_method: RemoteAuthMethod::Password,
+            password: Some("secret".to_string()),
+            ..RemoteServerProfile::default()
+        };
+        let as_key = remote_server_from_input(
+            RemoteServerInput {
+                id: Some(existing.id.clone()),
+                name: existing.name.clone(),
+                host_alias: existing.host_alias.clone(),
+                user: existing.user.clone(),
+                port: existing.port,
+                identity_file: None,
+                auth_method: Some(RemoteAuthMethod::Key),
+                password: Some("should-be-ignored".to_string()),
+                default_remote_root: existing.default_remote_root.clone(),
+                foco_command: None,
+                terminal_shell: None,
+                connect_timeout_ms: Some(existing.connect_timeout_ms),
+            },
+            Some(&existing),
+        )
+        .expect("switch to key");
+        assert_eq!(as_key.auth_method, RemoteAuthMethod::Key);
+        assert!(as_key.password.is_none());
     }
 }

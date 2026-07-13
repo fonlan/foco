@@ -276,20 +276,25 @@ pub async fn connect_with_optional_trust(
         }
     };
 
-    if let Ok(gate) = gate.lock() {
-        if let Some(Err(err)) = gate.decision.clone() {
-            let _ = handle
-                .disconnect(Disconnect::ByApplication, "host key rejected", "")
-                .await;
-            return Err(err);
-        }
+    let host_key_rejection = gate
+        .lock()
+        .ok()
+        .and_then(|guard| match guard.decision.clone() {
+            Some(Err(err)) => Some(err),
+            _ => None,
+        });
+    if let Some(err) = host_key_rejection {
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "host key rejected", "")
+            .await;
+        return Err(err);
     }
 
     if let Some(expected) = expected_fingerprint {
         let presented = gate
             .lock()
             .ok()
-            .and_then(|gate| gate.presented.clone())
+            .and_then(|guard| guard.presented.clone())
             .ok_or_else(|| {
                 SshError::new(
                     SshErrorKind::HostKeyUnknown,
@@ -307,9 +312,13 @@ pub async fn connect_with_optional_trust(
 
     authenticate(&mut handle, profile).await?;
 
+    // Drop secrets after authentication; only endpoint/identity metadata remains.
+    let mut stored = profile.clone();
+    stored.auth.password = None;
+
     Ok(SshSession {
         handle,
-        profile: profile.clone(),
+        profile: stored,
     })
 }
 
@@ -327,39 +336,238 @@ async fn authenticate(
     profile: &ResolvedSshProfile,
 ) -> Result<(), SshError> {
     let user = profile.user.as_str();
+    let auth_timeout = profile.connect_timeout;
 
-    for path in &profile.auth.identity_files {
-        if try_public_key_auth(handle, user, path).await? {
-            return Ok(());
+    let auth_future = async {
+        match profile.auth.method {
+            foco_store::config::RemoteAuthMethod::Password => {
+                authenticate_password(handle, user, &profile.auth).await
+            }
+            foco_store::config::RemoteAuthMethod::Key => {
+                authenticate_public_keys(handle, user, &profile.auth).await
+            }
         }
-    }
+    };
 
-    if let Some(password) = profile.auth.password.as_deref() {
-        let result = handle
-            .authenticate_password(user, password)
-            .await
-            .map_err(map_russh_error)?;
-        if result.success() {
-            return Ok(());
-        }
+    match timeout(auth_timeout, auth_future).await {
+        Ok(result) => result,
+        Err(_) => Err(SshError::new(
+            SshErrorKind::Timeout,
+            format!(
+                "ssh authentication timed out after {}ms for user {user}",
+                auth_timeout.as_millis()
+            ),
+        )),
     }
+}
 
-    if profile.auth.use_agent && try_agent_auth(handle, user).await? {
+async fn authenticate_password(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    auth: &super::config::SshAuthConfig,
+) -> Result<(), SshError> {
+    let password = auth.password.as_deref().filter(|value| !value.is_empty());
+    let Some(password) = password else {
+        return Err(SshError::new(
+            SshErrorKind::AuthenticationFailed,
+            format!("ssh password authentication requires a password for user {user}"),
+        ));
+    };
+
+    // Bounded attempts: password once, then keyboard-interactive once.
+    let password_result = handle
+        .authenticate_password(user, password)
+        .await
+        .map_err(map_russh_error)?;
+    if password_result.success() {
         return Ok(());
     }
 
-    if profile.auth.identity_files.is_empty() {
-        for candidate in default_identity_candidates() {
-            if candidate.is_file() && try_public_key_auth(handle, user, &candidate).await? {
-                return Ok(());
+    if try_keyboard_interactive_password(handle, user, password).await? {
+        return Ok(());
+    }
+
+    Err(SshError::new(
+        SshErrorKind::AuthenticationFailed,
+        format!("ssh password authentication failed for user {user}"),
+    ))
+}
+
+/// Answer keyboard-interactive only when every prompt looks like a password request.
+async fn try_keyboard_interactive_password(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    password: &str,
+) -> Result<bool, SshError> {
+    use russh::client::KeyboardInteractiveAuthResponse;
+
+    let mut response = handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+        .map_err(map_russh_error)?;
+
+    // Cap interactive rounds so a chatty server cannot loop forever.
+    for _ in 0..4 {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                if prompts.is_empty() {
+                    response = handle
+                        .authenticate_keyboard_interactive_respond(Vec::new())
+                        .await
+                        .map_err(map_russh_error)?;
+                    continue;
+                }
+                let mut answers = Vec::with_capacity(prompts.len());
+                for prompt in &prompts {
+                    if !is_password_keyboard_prompt(&prompt.prompt) {
+                        return Err(SshError::new(
+                            SshErrorKind::AuthenticationFailed,
+                            format!(
+                                "ssh keyboard-interactive prompt is not a password prompt (refusing to send login password): {}",
+                                sanitize_prompt_for_error(&prompt.prompt)
+                            ),
+                        ));
+                    }
+                    answers.push(password.to_string());
+                }
+                response = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(map_russh_error)?;
             }
         }
     }
 
     Err(SshError::new(
         SshErrorKind::AuthenticationFailed,
-        format!("ssh authentication failed for user {user}"),
+        "ssh keyboard-interactive authentication exceeded the prompt limit",
     ))
+}
+
+fn is_password_keyboard_prompt(prompt: &str) -> bool {
+    let normalized = prompt.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    // Reject multi-factor / OTP style prompts even if they contain "password".
+    const REJECT: &[&str] = &[
+        "otp",
+        "one-time",
+        "one time",
+        "verification code",
+        "verify code",
+        "authenticator",
+        "2fa",
+        "mfa",
+        "token",
+        "pin",
+        "sms",
+        "duo",
+        "yubi",
+    ];
+    if REJECT.iter().any(|needle| normalized.contains(needle)) {
+        return false;
+    }
+    normalized.contains("password") || normalized.contains("passphrase")
+}
+
+fn sanitize_prompt_for_error(prompt: &str) -> String {
+    prompt.chars().take(80).collect()
+}
+
+async fn authenticate_public_keys(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    auth: &super::config::SshAuthConfig,
+) -> Result<(), SshError> {
+    // Stable order: configured identity files (explicit profile or ssh_config) → agent → defaults.
+    const MAX_KEY_TRIES: usize = 8;
+    let mut attempts = 0usize;
+    let mut saw_encrypted_key = false;
+
+    for path in &auth.identity_files {
+        if attempts >= MAX_KEY_TRIES {
+            break;
+        }
+        attempts += 1;
+        match try_public_key_auth(handle, user, path).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => continue,
+            Err(err) if is_encrypted_key_error(&err) => {
+                saw_encrypted_key = true;
+                warn!(
+                  path = %path.display(),
+                  "skipping encrypted SSH identity (add to SSH Agent or use an unencrypted key)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                  path = %path.display(),
+                  error = %err.message(),
+                  "skipping SSH identity file"
+                );
+            }
+        }
+    }
+
+    if auth.use_agent && attempts < MAX_KEY_TRIES {
+        if try_agent_auth(handle, user).await? {
+            return Ok(());
+        }
+        attempts += 1;
+    }
+
+    if auth.try_default_identities {
+        for candidate in default_identity_candidates() {
+            if attempts >= MAX_KEY_TRIES {
+                break;
+            }
+            if !candidate.is_file() {
+                continue;
+            }
+            if auth.identity_files.iter().any(|path| path == &candidate) {
+                continue;
+            }
+            attempts += 1;
+            match try_public_key_auth(handle, user, &candidate).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(err) if is_encrypted_key_error(&err) => {
+                    saw_encrypted_key = true;
+                    warn!(
+                      path = %candidate.display(),
+                      "skipping encrypted default SSH identity (add to SSH Agent or use an unencrypted key)"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                      path = %candidate.display(),
+                      error = %err.message(),
+                      "skipping default SSH identity file"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut message = format!(
+        "ssh public-key authentication failed for user {user}; ensure an unencrypted private key is configured, or add the key to SSH Agent"
+    );
+    if saw_encrypted_key {
+        message.push_str(
+            " (at least one identity file is encrypted; login password is not used to decrypt private keys)",
+        );
+    }
+    Err(SshError::new(SshErrorKind::AuthenticationFailed, message))
+}
+
+fn is_encrypted_key_error(err: &SshError) -> bool {
+    err.message().contains("encrypted")
+        || err.message().contains("SSH Agent")
+        || err.message().contains("unencrypted")
 }
 
 async fn try_public_key_auth(
@@ -367,17 +575,7 @@ async fn try_public_key_auth(
     user: &str,
     path: &Path,
 ) -> Result<bool, SshError> {
-    let key = match load_private_key(path) {
-        Ok(key) => key,
-        Err(err) => {
-            warn!(
-              path = %path.display(),
-              error = %err.message(),
-              "skipping unreadable SSH identity file"
-            );
-            return Ok(false);
-        }
-    };
+    let key = load_private_key(path)?;
     let hash_alg = handle
         .best_supported_rsa_hash()
         .await
@@ -406,7 +604,8 @@ async fn try_agent_auth(handle: &mut Handle<ClientHandler>, user: &str) -> Resul
         let Ok(identities) = agent.request_identities().await else {
             return Ok(false);
         };
-        for identity in identities {
+        const MAX_AGENT_KEYS: usize = 8;
+        for identity in identities.into_iter().take(MAX_AGENT_KEYS) {
             let pubkey = identity.public_key().into_owned();
             let hash_alg = handle
                 .best_supported_rsa_hash()
@@ -423,20 +622,124 @@ async fn try_agent_auth(handle: &mut Handle<ClientHandler>, user: &str) -> Resul
         }
         Ok(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use russh::keys::agent::client::AgentClient;
+
+        // Order: OpenSSH named pipe (SSH_AUTH_SOCK or default) → Pageant.
+        if let Some(path) = windows_agent_pipe_path() {
+            if let Ok(mut agent) = AgentClient::connect_named_pipe(&path).await {
+                if try_agent_identities_windows_pipe(handle, user, &mut agent).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        if let Ok(mut agent) = AgentClient::connect_pageant().await {
+            if try_agent_identities_pageant(handle, user, &mut agent).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, user);
         Ok(false)
     }
 }
 
+#[cfg(windows)]
+fn windows_agent_pipe_path() -> Option<std::ffi::OsString> {
+    if let Some(path) = std::env::var_os("SSH_AUTH_SOCK") {
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+    // OpenSSH for Windows default agent pipe.
+    Some(std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"))
+}
+
+#[cfg(windows)]
+async fn try_agent_identities_windows_pipe(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    agent: &mut russh::keys::agent::client::AgentClient<
+        tokio::net::windows::named_pipe::NamedPipeClient,
+    >,
+) -> Result<bool, SshError> {
+    try_agent_identities_loop(handle, user, agent).await
+}
+
+#[cfg(windows)]
+async fn try_agent_identities_pageant(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    agent: &mut russh::keys::agent::client::AgentClient<pageant::PageantStream>,
+) -> Result<bool, SshError> {
+    try_agent_identities_loop(handle, user, agent).await
+}
+
+#[cfg(windows)]
+async fn try_agent_identities_loop<S>(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    agent: &mut russh::keys::agent::client::AgentClient<S>,
+) -> Result<bool, SshError>
+where
+    S: russh::keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
+    let Ok(identities) = agent.request_identities().await else {
+        return Ok(false);
+    };
+    const MAX_AGENT_KEYS: usize = 8;
+    for identity in identities.into_iter().take(MAX_AGENT_KEYS) {
+        let pubkey = identity.public_key().into_owned();
+        let hash_alg = handle
+            .best_supported_rsa_hash()
+            .await
+            .map_err(map_russh_error)?
+            .flatten();
+        match handle
+            .authenticate_publickey_with(user, pubkey, hash_alg, agent)
+            .await
+        {
+            Ok(result) if result.success() => return Ok(true),
+            _ => continue,
+        }
+    }
+    Ok(false)
+}
+
 fn load_private_key(path: &Path) -> Result<PrivateKey, SshError> {
-    keys::load_secret_key(path, None).map_err(|source| {
-        SshError::new(
+    match keys::load_secret_key(path, None) {
+        Ok(key) => Ok(key),
+        Err(keys::Error::KeyIsEncrypted) => Err(SshError::new(
             SshErrorKind::AuthenticationFailed,
-            format!("failed to load SSH identity {}: {source}", path.display()),
-        )
-    })
+            format!(
+                "SSH identity {} is encrypted; add it to SSH Agent or use an unencrypted private key (login password is not used to decrypt keys)",
+                path.display()
+            ),
+        )),
+        Err(source) => {
+            let message = source.to_string();
+            if message.to_ascii_lowercase().contains("encrypt")
+                || message.to_ascii_lowercase().contains("passphrase")
+                || message.to_ascii_lowercase().contains("password")
+            {
+                return Err(SshError::new(
+                    SshErrorKind::AuthenticationFailed,
+                    format!(
+                        "SSH identity {} appears encrypted or needs a passphrase; add it to SSH Agent or use an unencrypted private key (login password is not used to decrypt keys)",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(SshError::new(
+                SshErrorKind::AuthenticationFailed,
+                format!("failed to load SSH identity {}: {source}", path.display()),
+            ))
+        }
+    }
 }
 
 fn default_identity_candidates() -> Vec<std::path::PathBuf> {
@@ -457,4 +760,43 @@ fn default_identity_candidates() -> Vec<std::path::PathBuf> {
     .into_iter()
     .map(|name| ssh.join(name))
     .collect()
+}
+
+// Compile-time Send checks for axum handlers that call SshSession::connect.
+const _: () = {
+    fn assert_send<T: Send>(_: T) {}
+    fn check_connect_is_send(profile: ResolvedSshProfile) {
+        assert_send(async move {
+            let _ = SshSession::connect(&profile).await;
+        });
+    }
+    let _ = check_connect_is_send;
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_prompts_accept_password_words() {
+        assert!(is_password_keyboard_prompt("Password:"));
+        assert!(is_password_keyboard_prompt("Enter passphrase for key"));
+        assert!(is_password_keyboard_prompt("user's password"));
+    }
+
+    #[test]
+    fn password_prompts_reject_otp_and_unknown() {
+        assert!(!is_password_keyboard_prompt("OTP code:"));
+        assert!(!is_password_keyboard_prompt("Verification code"));
+        assert!(!is_password_keyboard_prompt("Authenticator PIN"));
+        assert!(!is_password_keyboard_prompt("Enter 2FA token"));
+        assert!(!is_password_keyboard_prompt("Username:"));
+        assert!(!is_password_keyboard_prompt(""));
+    }
+
+    #[test]
+    fn sanitize_prompt_truncates() {
+        let long = "p".repeat(120);
+        assert_eq!(sanitize_prompt_for_error(&long).len(), 80);
+    }
 }

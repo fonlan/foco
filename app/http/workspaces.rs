@@ -710,29 +710,32 @@ async fn add_remote_workspace(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("remote workspace serverId must not be empty"))?;
-    let remote_path = request
+    let remote_path_input = request
         .remote_path
         .as_deref()
         .or(Some(request.path.as_str()))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("remote workspace remotePath must not be empty"))?;
-    validate_remote_workspace_path(remote_path)?;
+    validate_remote_workspace_path(remote_path_input)?;
 
     let mut config = config_update_snapshot(&state).await?;
     let server = config
         .remote_servers
         .iter()
         .find(|server| server.id == server_id)
+        .cloned()
         .ok_or_else(|| {
             ApiError::bad_request(format!("remote server was not found: {server_id}"))
         })?;
-    if !remote_server_is_available(server) {
+    if !remote_server_is_available(&server) {
         return Err(ApiError::bad_request(format!(
             "remote server is not ready yet: {server_id}"
         )));
     }
-    reject_registered_remote_workspace(&config, server_id, remote_path, None)?;
+
+    let remote_path = normalize_remote_workspace_path(&server, remote_path_input).await?;
+    reject_registered_remote_workspace(&config, server_id, &remote_path, None)?;
 
     let terminal_shell = request
         .terminal_shell
@@ -809,13 +812,39 @@ fn validate_remote_workspace_path(path: &str) -> Result<(), ApiError> {
             "remote workspace remotePath must not be empty",
         ));
     }
-    // ponytail: POSIX absolute path check is enough for Phase 4; future Windows remotes need a target-aware parser.
-    if !path.starts_with('/') {
+    crate::ssh_client::validate_remote_path_input(path).map_err(|err| {
+        ApiError::bad_request(err.message().to_string())
+    })
+}
+
+/// Expand home shorthand to an absolute POSIX path via authenticated russh session.
+async fn normalize_remote_workspace_path(
+    server: &foco_store::config::RemoteServerProfile,
+    remote_path: &str,
+) -> Result<String, ApiError> {
+    let remote_path = remote_path.trim();
+    validate_remote_workspace_path(remote_path)?;
+    if remote_path.starts_with('/') {
+        return Ok(remote_path.to_string());
+    }
+
+    let profile = crate::ssh_client::resolve_ssh_profile(
+        server,
+        crate::ssh_client::ResolveSshOptions::default(),
+    )
+    .map_err(|err| ApiError::bad_request(err.message().to_string()))?;
+    let mut session = crate::ssh_client::SshSession::connect(&profile)
+        .await
+        .map_err(|err| ApiError::bad_gateway(err.message().to_string()))?;
+    let expanded = crate::ssh_client::expand_remote_path(&mut session, remote_path)
+        .await
+        .map_err(|err| ApiError::bad_gateway(err.message().to_string()))?;
+    if !expanded.starts_with('/') {
         return Err(ApiError::bad_request(format!(
-            "remote workspace remotePath must be absolute: {path}"
+            "remote workspace remotePath must resolve to an absolute path: {expanded}"
         )));
     }
-    Ok(())
+    Ok(expanded)
 }
 
 fn reject_registered_remote_workspace(
@@ -888,13 +917,15 @@ pub(crate) async fn save_workspace_settings(
             .find(|server| server.id == server_id)
             .ok_or_else(|| {
                 ApiError::bad_request(format!("remote server was not found: {server_id}"))
-            })?;
-        if !remote_server_is_available(server) {
+            })?
+            .clone();
+        if !remote_server_is_available(&server) {
             return Err(ApiError::bad_request(format!(
                 "remote server is not ready yet: {server_id}"
             )));
         }
-        reject_registered_remote_workspace(&config, server_id, remote_path, Some(workspace_id))?;
+        let remote_path = normalize_remote_workspace_path(&server, remote_path).await?;
+        reject_registered_remote_workspace(&config, server_id, &remote_path, Some(workspace_id))?;
         let workspace = config
             .workspaces
             .iter_mut()
@@ -908,7 +939,7 @@ pub(crate) async fn save_workspace_settings(
         }
         workspace.location = WorkspaceLocation::Ssh {
             server_id: server_id.to_string(),
-            remote_path: remote_path.to_string(),
+            remote_path,
         };
         workspace.pinned = request.pinned;
         workspace.terminal_shell = terminal_shell;

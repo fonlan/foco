@@ -956,6 +956,8 @@ export type WorkspaceChatPagination = {
   nextCursor: string | null;
 };
 
+export type RemoteAuthMethod = "key" | "password";
+
 export type RemoteServerSummary = {
   id: string;
   name: string;
@@ -963,6 +965,8 @@ export type RemoteServerSummary = {
   user: string | null;
   port: number | null;
   identityFile: string | null;
+  authMethod: RemoteAuthMethod;
+  passwordConfigured: boolean;
   defaultRemoteRoot: string | null;
   focoCommand: string | null;
   terminalShell: string | null;
@@ -974,6 +978,23 @@ export type RemoteServerSummary = {
   sidecarInstallState: string;
   workspaceCount: number;
   lastCheckedAt: string | null;
+};
+
+/** Create/update remote server request body. Password is never returned by the API. */
+export type RemoteServerInput = {
+  id?: string;
+  name: string;
+  hostAlias: string;
+  user?: string | null;
+  port?: number | null;
+  identityFile?: string | null;
+  authMethod?: RemoteAuthMethod;
+  /** Empty/omitted on update keeps existing password when authMethod is password. */
+  password?: string | null;
+  defaultRemoteRoot?: string | null;
+  focoCommand?: string | null;
+  terminalShell?: string | null;
+  connectTimeoutMs?: number;
 };
 
 export type RemoteServerDiagnosticStage = {

@@ -156,14 +156,31 @@ pub(crate) async fn file_picker_roots(
                 .find(|server| server.id == server_id)
                 .ok_or_else(|| {
                     ApiError::bad_request(format!("remote server not found: {server_id}"))
-                })?;
+                })?
+                .clone();
+            let root_path = server
+                .default_remote_root
+                .clone()
+                .unwrap_or_else(|| "/".to_string());
+            let path = if foco_store::config::needs_remote_home_expansion(&root_path) {
+                let profile = crate::ssh_client::resolve_ssh_profile(
+                    &server,
+                    crate::ssh_client::ResolveSshOptions::default(),
+                )
+                .map_err(|err| ApiError::bad_request(err.message().to_string()))?;
+                let mut session = crate::ssh_client::SshSession::connect(&profile)
+                    .await
+                    .map_err(|err| ApiError::bad_gateway(err.message().to_string()))?;
+                crate::ssh_client::expand_remote_path(&mut session, &root_path)
+                    .await
+                    .map_err(|err| ApiError::bad_gateway(err.message().to_string()))?
+            } else {
+                root_path
+            };
             Ok(Json(FilePickerRootsResponse {
                 roots: vec![FilePickerRoot {
                     label: server.name.clone(),
-                    path: server
-                        .default_remote_root
-                        .clone()
-                        .unwrap_or_else(|| "/".to_string()),
+                    path,
                 }],
             }))
         }

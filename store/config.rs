@@ -778,6 +778,11 @@ impl GlobalConfig {
                 server.url = Some(REDACTED_SECRET.to_string());
             }
         }
+        for server in &mut redacted.remote_servers {
+            if server.password.is_some() {
+                server.password = Some(REDACTED_SECRET.to_string());
+            }
+        }
 
         serde_json::to_string(&redacted)
     }
@@ -1432,7 +1437,19 @@ pub struct SkillSettings {
     pub workspace_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteAuthMethod {
+    #[default]
+    Key,
+    Password,
+}
+
+/// SSH remote server connection profile (global config).
+///
+/// Passwords are sensitive and must never appear in API summaries, logs, or
+/// sidecar bundles. Prefer [`RemoteServerProfile::password_configured`].
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteServerProfile {
     pub id: String,
@@ -1444,6 +1461,12 @@ pub struct RemoteServerProfile {
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_file: Option<PathBuf>,
+    /// Authentication strategy. Missing field in old configs deserializes as `Key`.
+    #[serde(default)]
+    pub auth_method: RemoteAuthMethod,
+    /// Login password for `authMethod=password`. Sensitive; redacted in logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_remote_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1464,6 +1487,14 @@ pub struct RemoteServerProfile {
     pub sidecar_install_state: Option<String>,
 }
 
+impl RemoteServerProfile {
+    pub fn password_configured(&self) -> bool {
+        self.password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
 impl Default for RemoteServerProfile {
     fn default() -> Self {
         Self {
@@ -1473,6 +1504,8 @@ impl Default for RemoteServerProfile {
             user: None,
             port: None,
             identity_file: None,
+            auth_method: RemoteAuthMethod::Key,
+            password: None,
             default_remote_root: None,
             foco_command: None,
             terminal_shell: None,
@@ -1483,6 +1516,33 @@ impl Default for RemoteServerProfile {
             last_error: None,
             sidecar_install_state: None,
         }
+    }
+}
+
+impl fmt::Debug for RemoteServerProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteServerProfile")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("host_alias", &self.host_alias)
+            .field("user", &self.user)
+            .field("port", &self.port)
+            .field("identity_file", &self.identity_file)
+            .field("auth_method", &self.auth_method)
+            .field(
+                "password",
+                &self.password.as_ref().map(|_| REDACTED_SECRET),
+            )
+            .field("default_remote_root", &self.default_remote_root)
+            .field("foco_command", &self.foco_command)
+            .field("terminal_shell", &self.terminal_shell)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("last_known_target", &self.last_known_target)
+            .field("last_sidecar_version", &self.last_sidecar_version)
+            .field("last_checked_at", &self.last_checked_at)
+            .field("last_error", &self.last_error)
+            .field("sidecar_install_state", &self.sidecar_install_state)
+            .finish()
     }
 }
 
@@ -1895,7 +1955,27 @@ fn validate_remote_server_profile(
         return invalid_config(config_path, "remoteServers.port must be greater than 0");
     }
     if let Some(root) = &server.default_remote_root {
-        require_remote_absolute_path(config_path, "remoteServers.defaultRemoteRoot", root)?;
+        require_remote_default_root_path(config_path, "remoteServers.defaultRemoteRoot", root)?;
+    }
+    match server.auth_method {
+        RemoteAuthMethod::Password => {
+            if !server.password_configured() {
+                return invalid_config(
+                    config_path,
+                    "remoteServers.password is required when authMethod is password",
+                );
+            }
+        }
+        RemoteAuthMethod::Key => {
+            if server.password.as_ref().is_some_and(|value| !value.is_empty()) {
+                // Allow accidental leftover empty? Reject any password material in key mode
+                // so secrets are not retained after switching auth methods.
+                return invalid_config(
+                    config_path,
+                    "remoteServers.password must be empty when authMethod is key",
+                );
+            }
+        }
     }
     if let Some(command) = &server.foco_command {
         require_non_empty(config_path, "remoteServers.focoCommand", command)?;
@@ -1978,6 +2058,39 @@ fn require_remote_absolute_path(
     }
 
     Ok(())
+}
+
+/// Default remote root may be an absolute POSIX path or `~` / `~/...`.
+/// Other-user homes (`~other`) and relative paths are rejected.
+fn require_remote_default_root_path(
+    config_path: Option<&Path>,
+    field: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return invalid_config(config_path, format!("{field} must not be empty"));
+    }
+    if is_remote_home_shorthand(value) || value.starts_with('/') {
+        return Ok(());
+    }
+    invalid_config(
+        config_path,
+        format!(
+            "{field} must be an absolute remote path or home shorthand (~ or ~/...): {value}"
+        ),
+    )
+}
+
+/// `~` or `~/...` only — not `~user` or relative segments.
+pub fn is_remote_home_shorthand(value: &str) -> bool {
+    let value = value.trim();
+    value == "~" || value.starts_with("~/")
+}
+
+/// True when the path still needs remote `$HOME` expansion before persistence.
+pub fn needs_remote_home_expansion(value: &str) -> bool {
+    is_remote_home_shorthand(value)
 }
 
 fn require_non_empty(
@@ -3342,6 +3455,8 @@ mod tests {
             user: Some("deploy".to_string()),
             port: Some(22),
             identity_file: None,
+            auth_method: RemoteAuthMethod::Key,
+            password: None,
             default_remote_root: Some("/srv".to_string()),
             foco_command: Some("foco".to_string()),
             terminal_shell: Some("bash".to_string()),
@@ -3374,9 +3489,65 @@ mod tests {
             "Prod:/srv/project"
         );
         let serialized = serde_json::to_string(&config.remote_servers).expect("serialize servers");
-        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("s3cret"));
         assert!(!serialized.contains("privateKey"));
         assert!(!serialized.contains("apiKey"));
+        // Key-mode profiles omit password entirely.
+        assert!(!serialized.contains("\"password\""));
+    }
+
+    #[test]
+    fn remote_server_defaults_accept_home_shorthand_and_password_auth() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "home".to_string(),
+            name: "Home".to_string(),
+            host_alias: "box".to_string(),
+            user: Some("root".to_string()),
+            auth_method: RemoteAuthMethod::Password,
+            password: Some("s3cret".to_string()),
+            default_remote_root: Some("~/projects".to_string()),
+            connect_timeout_ms: DEFAULT_REMOTE_CONNECT_TIMEOUT_MS,
+            ..RemoteServerProfile::default()
+        });
+        config.validate(None).expect("home + password config validates");
+
+        let debug = format!("{:?}", config.remote_servers[0]);
+        assert!(debug.contains(REDACTED_SECRET));
+        assert!(!debug.contains("s3cret"));
+
+        let log_json = config.to_redacted_log_json().expect("redacted json");
+        assert!(log_json.contains(REDACTED_SECRET));
+        assert!(!log_json.contains("s3cret"));
+
+        config.remote_servers[0].default_remote_root = Some("~other/path".to_string());
+        let err = config
+            .validate(None)
+            .expect_err("~other should fail");
+        assert!(err.to_string().contains("home shorthand"));
+
+        config.remote_servers[0].default_remote_root = Some("~/ok".to_string());
+        config.remote_servers[0].password = None;
+        let err = config
+            .validate(None)
+            .expect_err("password auth without password fails");
+        assert!(err.to_string().contains("password is required"));
+    }
+
+    #[test]
+    fn remote_server_missing_auth_method_deserializes_as_key() {
+        let json = r#"{
+            "id": "legacy",
+            "name": "Legacy",
+            "hostAlias": "legacy-box",
+            "connectTimeoutMs": 15000
+        }"#;
+        let profile: RemoteServerProfile =
+            serde_json::from_str(json).expect("legacy profile deserializes");
+        assert_eq!(profile.auth_method, RemoteAuthMethod::Key);
+        assert!(profile.password.is_none());
+        assert!(!profile.password_configured());
     }
 
     #[test]
