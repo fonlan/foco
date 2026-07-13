@@ -4616,8 +4616,8 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             total_latency_ms: Some(2000),
             status_code: Some(200),
             final_state: "succeeded",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("scheduled llm request insert");
     database
@@ -4645,8 +4645,8 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             total_latency_ms: None,
             status_code: Some(500),
             final_state: "failed",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("failed scheduled llm request insert");
     database
@@ -4674,8 +4674,8 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             total_latency_ms: Some(999),
             status_code: Some(200),
             final_state: "succeeded",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("unrelated llm request insert");
 
@@ -5267,8 +5267,8 @@ fn repository_helpers_round_trip_core_records() {
             total_latency_ms: None,
             status_code: Some(200),
             final_state: "completed",
-            request_body_json: Some(r#"{"input":"Hello"}"#),
-            response_body_json: Some(r#"{"output":"Hi"}"#),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("llm request insert");
     let request: LlmRequestRecord = database
@@ -5282,7 +5282,7 @@ fn repository_helpers_round_trip_core_records() {
         .update_llm_request_body(
             "request-1",
             Some(
-                r#"{"format":"provider_request_v1","headers":{"authorization":"Bearer secret"},"body":"actual"}"#,
+                r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{"authorization":"Bearer secret"},"body":"actual"}"#,
             ),
         )
         .expect("llm request body update");
@@ -5298,7 +5298,7 @@ fn repository_helpers_round_trip_core_records() {
     )
     .expect("updated request body json");
     assert_eq!(request_body["format"], "provider_request_v1");
-    assert_eq!(request_body["headers"]["authorization"], "[REDACTED]");
+    assert_eq!(request_body["headers"]["authorization"], "********");
     assert_eq!(request_body["body"], "actual");
     let metrics = database
         .llm_request_metrics_for_chat("chat-1")
@@ -5328,6 +5328,143 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(snapshots[0].summary, "Earlier conversation summary.");
     assert_eq!(snapshots[0].original_token_count, 120);
     assert_eq!(snapshots[0].summary_token_count, 8);
+}
+
+#[test]
+fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Audit detail invariants")
+        .expect("chat insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-13T00:00:00Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-13T00:00:01Z"),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: Some(1000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+
+    let reject = database.update_llm_request_body("request-1", Some(r#"{"text":"legacy"}"#));
+    assert!(reject.is_err(), "non-v1 request body must be rejected");
+
+    // Bypass store validators to plant legacy detail, then reopen to trigger cleanup.
+    {
+        let database_path = database.database_path().to_path_buf();
+        let connection = rusqlite::Connection::open(&database_path).expect("open raw sqlite");
+        connection
+            .execute(
+                "UPDATE llm_requests SET request_body_json = ?1, response_body_json = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    r#"{"text":"normalized","reasoning":null}"#,
+                    "request-1"
+                ],
+            )
+            .expect("plant legacy detail");
+    }
+    drop(database);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+    let request = database
+        .llm_request("request-1")
+        .expect("request read")
+        .expect("request");
+    assert_eq!(request.request_body_json, None);
+    assert_eq!(request.response_body_json, None);
+
+    // Valid v1 is retained; later NULL/non-v1 cannot overwrite first capture.
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen mut");
+    database
+        .update_llm_request_body(
+            "request-1",
+            Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            ),
+        )
+        .expect("v1 request body");
+    database
+        .update_llm_request_outcome(
+            "request-1",
+            UpdateLlmRequestOutcome {
+                first_token_at: None,
+                completed_at: Some("2026-07-13T00:00:01Z"),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(1000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: Some(
+                    r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#,
+                ),
+            },
+        )
+        .expect("v1 response body");
+    database
+        .update_llm_request_body("request-1", None)
+        .expect("null must not clear valid v1 request");
+    database
+        .update_llm_request_outcome(
+            "request-1",
+            UpdateLlmRequestOutcome {
+                first_token_at: None,
+                completed_at: Some("2026-07-13T00:00:01Z"),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(1000),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: None,
+            },
+        )
+        .expect("null must not clear valid v1 response");
+    let request = database
+        .llm_request("request-1")
+        .expect("request read")
+        .expect("request");
+    assert!(
+        request
+            .request_body_json
+            .as_deref()
+            .is_some_and(|value| value.contains("provider_request_v1"))
+    );
+    assert!(
+        request
+            .response_body_json
+            .as_deref()
+            .is_some_and(|value| value.contains("provider_final_response_v1"))
+    );
 }
 
 #[test]
@@ -6164,24 +6301,41 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             final_state: "completed",
             request_body_json: Some(
                 r#"{
+                    "format": "provider_request_v1",
+                    "version": 1,
+                    "method": "POST",
+                    "url": "https://example.test/v1/chat",
                     "headers": {
                         "Authorization": "Bearer secret-token",
                         "OpenAI-Api-Key": "request-key"
                     },
                     "body": {
                         "model": "gpt-audit",
-                        "input": "Hello"
+                        "input": "Hello",
+                        "apiKey": "body-secret"
                     }
                 }"#,
             ),
             response_body_json: Some(
                 r#"{
-                    "status": 200,
-                    "headers": {
-                        "x-api-key": "response-key"
-                    },
-                    "body": {
-                        "output": "Hi"
+                    "format": "provider_final_response_v1",
+                    "version": 1,
+                    "state": "succeeded",
+                    "partial": false,
+                    "text": "Hi",
+                    "reasoning": null,
+                    "toolCalls": [],
+                    "usage": null,
+                    "stopReason": null,
+                    "responseId": null,
+                    "error": null,
+                    "http": {
+                        "status": 200,
+                        "version": "HTTP/1.1",
+                        "headers": {
+                            "authorization": "Bearer response-secret",
+                            "x-api-key": "response-key"
+                        }
                     }
                 }"#,
             ),
@@ -6242,17 +6396,19 @@ fn audits_mocked_llm_request_response_and_stream_events() {
         .request_body_json
         .as_deref()
         .expect("request body json");
-    assert!(request_body.contains(r#""Authorization":"[REDACTED]""#));
-    assert!(request_body.contains(r#""OpenAI-Api-Key":"[REDACTED]""#));
+    assert!(request_body.contains(r#""Authorization":"********""#));
+    assert!(request_body.contains(r#""apiKey":"[REDACTED]""#));
     assert!(!request_body.contains("secret-token"));
-    assert!(!request_body.contains("request-key"));
+    assert!(!request_body.contains("body-secret"));
 
     let response_body = request
         .response_body_json
         .as_deref()
         .expect("response body json");
-    assert!(response_body.contains(r#""x-api-key":"[REDACTED]""#));
-    assert!(!response_body.contains("response-key"));
+    assert!(response_body.contains(r#""authorization":"********""#));
+    assert!(!response_body.contains("response-secret"));
+    // Non-Authorization headers on the HTTP head keep their values for v1 dumps.
+    assert!(response_body.contains("response-key"));
 
     let events = database
         .llm_request_events("request-1")
@@ -6295,8 +6451,8 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             total_latency_ms: Some(250),
             status_code: None,
             final_state: "failed",
-            request_body_json: Some(r#"{"model":"gpt-other"}"#),
-            response_body_json: Some(r#"{"error":"boom"}"#),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("second llm request insert");
     database
@@ -6314,7 +6470,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
                 total_latency_ms: Some(300),
                 status_code: Some(200),
                 final_state: "succeeded",
-                response_body_json: Some(r#"{"ok":true,"apiKey":"secret"}"#),
+                response_body_json: Some(r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"text":null,"reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":{"message":"boom","apiKey":"secret"},"http":null}"#),
             },
         )
         .expect("update llm request outcome");
@@ -6673,15 +6829,15 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             700,
             70,
             "2026-07-06T10:00:05Z",
-            Some(r#"{"requestKind":"workspace spec update"}"#),
+            None,
         ),
         request(
             "legacy-memory-retrieval",
-            "unknown",
+            "memory retrieval",
             600,
             60,
             "2026-07-06T10:00:04Z",
-            Some(r#"{"requestKind":"memory retrieval"}"#),
+            None,
         ),
         request(
             "internal-memory-extraction",
@@ -7442,8 +7598,12 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             total_latency_ms: Some(1000),
             status_code: Some(200),
             final_state: "succeeded",
-            request_body_json: Some(r#"{"input":"large"}"#),
-            response_body_json: Some(r#"{"output":"large"}"#),
+            request_body_json: Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"old"}"#,
+            ),
+            response_body_json: Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"old","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#,
+            ),
         })
         .expect("old request insert");
     database
@@ -7493,7 +7653,9 @@ fn prunes_llm_request_details_without_deleting_statistics() {
             total_latency_ms: None,
             status_code: None,
             final_state: "running",
-            request_body_json: Some(r#"{"input":"keep"}"#),
+            request_body_json: Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"keep"}"#,
+            ),
             response_body_json: None,
         })
         .expect("new request insert");
@@ -7521,10 +7683,15 @@ fn prunes_llm_request_details_without_deleting_statistics() {
         .llm_request("new-request")
         .expect("new request read")
         .expect("new request");
-    assert_eq!(
-        new_request.request_body_json.as_deref(),
-        Some(r#"{"input":"keep"}"#)
-    );
+    let kept_body: serde_json::Value = serde_json::from_str(
+        new_request
+            .request_body_json
+            .as_deref()
+            .expect("kept request body"),
+    )
+    .expect("kept body json");
+    assert_eq!(kept_body["format"], "provider_request_v1");
+    assert_eq!(kept_body["body"], "keep");
 }
 
 #[test]
@@ -7533,7 +7700,9 @@ fn vacuum_reclaims_workspace_database_freelist_pages() {
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
     let large_input = "x".repeat(1024 * 1024);
-    let large_body = format!(r#"{{"input":"{large_input}"}}"#);
+    let large_body = format!(
+        r#"{{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{{}},"body":"{large_input}"}}"#
+    );
 
     database
         .insert_llm_request(NewLlmRequest {
@@ -11239,7 +11408,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             status_code: Some(200),
             final_state: "succeeded",
             request_body_json: None,
-            response_body_json: Some(r#"{"requestKind":"workspace spec update"}"#),
+            response_body_json: None,
         },
         NewLlmRequest {
             id: "request-memory-retrieval-latest",
@@ -11266,7 +11435,7 @@ fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
             status_code: Some(200),
             final_state: "succeeded",
             request_body_json: None,
-            response_body_json: Some(r#"{"requestKind":"memory retrieval"}"#),
+            response_body_json: None,
         },
         NewLlmRequest {
             id: "request-running-latest",

@@ -1433,7 +1433,7 @@ fn captured_test_llm_request(
             reasoning_tokens: None,
             status_code: Some(200),
             final_state: "succeeded",
-            response_body_json: Some("{}".to_string()),
+            response_body_json: None,
         },
     }
 }
@@ -6494,7 +6494,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             reasoning_tokens: None,
             status_code: Some(200),
             final_state: "succeeded",
-            response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+            response_body_json: None,
         },
         &[
             captured_event(&tool_call_event),
@@ -7070,8 +7070,8 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             total_latency_ms: Some(1000),
             status_code: Some(200),
             final_state: "succeeded",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("request insert");
     database
@@ -7284,8 +7284,8 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             total_latency_ms: Some(2_000),
             status_code: Some(200),
             final_state: "succeeded",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("request insert");
     database
@@ -10976,7 +10976,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        response_body_json: None,
     };
     let event = captured_event(&ChatSseEvent::Complete {
         chat_id: "chat-1".to_string(),
@@ -11398,7 +11398,7 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        response_body_json: None,
     };
 
     persist_chat_result(
@@ -11588,7 +11588,7 @@ fn persist_chat_result_keeps_invalidated_rewrite_history_unchanged() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"Stale answer"}"#.to_string()),
+        response_body_json: None,
     };
 
     persist_chat_result(
@@ -12494,7 +12494,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        response_body_json: None,
     };
 
     persist_chat_result(
@@ -12579,7 +12579,7 @@ fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"Private result."}"#.to_string()),
+        response_body_json: None,
     };
 
     persist_chat_result(
@@ -12677,7 +12677,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
         id: "llm-succeeded".to_string(),
         request_kind: "chat completion",
         request_started_at: "2026-06-06T08:59:00Z".to_string(),
-        request_body_json: r#"{"request":"wire"}"#.to_string(),
+        request_body_json: r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":null}"#.to_string(),
         events: Vec::new(),
         outcome: ChatAuditOutcome {
             first_token_at: Some("2026-06-06T08:59:00Z".to_string()),
@@ -12691,7 +12691,9 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
             reasoning_tokens: None,
             status_code: Some(200),
             final_state: "succeeded",
-            response_body_json: Some(r#"{"response":"wire"}"#.to_string()),
+            response_body_json: Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#.to_string(),
+            ),
         },
     });
     let capture = ProviderAuditCapture::new(&workspace_dir, "llm-cancelled", save_details);
@@ -12732,38 +12734,20 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
         .expect("cancelled request lookup")
         .expect("cancelled request");
     assert_eq!(cancelled_request.final_state, "cancelled");
-    let cancelled_response = cancelled_request
-        .response_body_json
-        .as_deref()
-        .expect("cancelled response json must not be NULL");
-    assert!(
-        cancelled_response.contains("chat run cancelled"),
-        "cancelled response should retain cancel reason: {cancelled_response}"
-    );
     if save_details {
-        assert_eq!(
-            succeeded_request.request_body_json.as_deref(),
-            Some(r#"{"request":"wire"}"#)
-        );
-        assert_eq!(
-            succeeded_request.response_body_json.as_deref(),
-            Some(r#"{"response":"wire"}"#)
-        );
-        // Details on: capture may upgrade to versioned failed response; either form is fine.
-        assert!(
-            cancelled_response.contains("chat run cancelled")
-                || cancelled_response.contains("provider_final_response_v1"),
-            "details-enabled cancelled response should keep cancel signal: {cancelled_response}"
-        );
+        assert!(succeeded_request.request_body_json.is_some());
+        assert!(succeeded_request.response_body_json.is_some());
+        // Cancel still uses a versioned failed envelope when details are enabled.
+        let cancelled_body = cancelled_request
+            .response_body_json
+            .as_deref()
+            .expect("cancelled detail");
+        assert!(cancelled_body.contains("provider_final_response_v1"));
+        assert!(!cancelled_body.contains(r#""cancelled""#));
     } else {
         assert!(succeeded_request.request_body_json.is_none());
         assert!(succeeded_request.response_body_json.is_none());
-        let cancelled_value: Value =
-            serde_json::from_str(cancelled_response).expect("compact cancelled json");
-        assert_eq!(
-            cancelled_value.get("cancelled").and_then(Value::as_str),
-            Some("chat run cancelled")
-        );
+        assert_eq!(cancelled_request.response_body_json, None);
     }
     assert_eq!(
         database
@@ -12780,12 +12764,12 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
 }
 
 #[test]
-fn persistable_audit_response_body_json_keeps_compact_cancelled_when_details_off() {
+fn persistable_audit_response_body_json_only_keeps_details_when_enabled() {
     let compact = r#"{"cancelled":"chat run cancelled"}"#;
-    let wire = r#"{"format":"provider_final_response_v1","error":{"message":"x"}}"#;
+    let wire = r#"{"format":"provider_final_response_v1","version":1,"error":{"message":"x"}}"#;
     assert_eq!(
         persistable_audit_response_body_json(compact, false, "cancelled"),
-        Some(compact)
+        None
     );
     assert_eq!(
         persistable_audit_response_body_json(wire, false, "failed"),
@@ -12799,7 +12783,6 @@ fn persistable_audit_response_body_json_keeps_compact_cancelled_when_details_off
         persistable_audit_response_body_json(compact, true, "cancelled"),
         Some(compact)
     );
-    // Non-compact cancelled payloads stay gated when details are off.
     assert_eq!(
         persistable_audit_response_body_json(wire, false, "cancelled"),
         None
@@ -12919,9 +12902,8 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         reasoning_tokens: None,
         status_code: None,
         final_state: "failed",
-        response_body_json: Some(
-            r#"{"error":"agent run exceeded 128 tool continuation rounds"}"#.to_string(),
-        ),
+        // Run-level failures no longer synthesize response detail JSON.
+        response_body_json: None,
     };
     let event = captured_event(&ChatSseEvent::Error {
         message: "agent run exceeded 128 tool continuation rounds".to_string(),
@@ -13082,7 +13064,7 @@ fn persist_chat_result_accepts_complete_input_after_partial_stream_stub() {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state: "succeeded",
-        response_body_json: Some(r#"{"text":"done"}"#.to_string()),
+        response_body_json: None,
     };
 
     persist_chat_result(
@@ -14886,7 +14868,7 @@ fn test_chat_outcome(final_state: &'static str) -> ChatAuditOutcome {
         reasoning_tokens: None,
         status_code: Some(200),
         final_state,
-        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        response_body_json: None,
     }
 }
 
@@ -16301,8 +16283,8 @@ fn chat_message_summary_includes_assistant_reply_metrics() {
             total_latency_ms: Some(2000),
             status_code: None,
             final_state: "succeeded",
-            request_body_json: Some("{}"),
-            response_body_json: Some("{}"),
+            request_body_json: None,
+            response_body_json: None,
         })
         .expect("llm request insert");
     database
@@ -16710,8 +16692,8 @@ fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
                 total_latency_ms: Some(latency_ms),
                 status_code: Some(200),
                 final_state: "succeeded",
-                request_body_json: Some("{}"),
-                response_body_json: Some("{}"),
+                request_body_json: None,
+                response_body_json: None,
             })
             .expect("llm request insert");
         database
@@ -20531,7 +20513,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
                 status_code: Some(200),
                 final_state: "succeeded",
                 request_body_json: None,
-                response_body_json: Some(r#"{"requestKind":"memory retrieval"}"#),
+                response_body_json: None,
             },
             NewLlmRequest {
                 id: "ctx-chat-request",
@@ -26286,8 +26268,17 @@ fn audit_detail_statuses_distinguish_wire_running_malformed_and_partial() {
         "pending"
     );
     let malformed = parse_audit_detail_value(Some("not-json"));
+    assert!(malformed.is_none());
     assert_eq!(
-        audit_request_detail_status("failed", Some("not-json"), malformed.as_ref()),
+        audit_request_detail_status("failed", Some("not-json"), None),
+        "malformed"
+    );
+    assert_eq!(
+        audit_request_detail_status(
+            "failed",
+            Some(r#"{"text":"legacy"}"#),
+            parse_audit_detail_value(Some(r#"{"text":"legacy"}"#)).as_ref()
+        ),
         "malformed"
     );
     assert_eq!(
@@ -26297,6 +26288,7 @@ fn audit_detail_statuses_distinguish_wire_running_malformed_and_partial() {
 
     let partial_response = json!({
         "format": "provider_final_response_v1",
+        "version": 1,
         "state": "failed",
         "partial": true,
     });

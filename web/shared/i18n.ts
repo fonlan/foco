@@ -724,12 +724,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "HTTP version": "HTTP 版本",
     "Request detail is pending or was pruned.": "请求详情尚未就绪或已被清理。",
     "Request detail was not captured or was pruned.": "请求详情未采集或已被清理。",
-    "Stored request detail is malformed legacy text.": "已存储的请求详情是损坏的旧版文本。",
-    "Stored response detail is malformed legacy text.": "已存储的响应详情是损坏的旧版文本。",
-    "Legacy normalized record. Request is not the actual provider payload.":
-      "旧版归一化记录，Request 并非真实的供应商 payload。",
-    "Legacy normalized response record.": "旧版归一化响应记录。",
-    "Compact cancelled response record.": "精简的已取消响应记录。",
+    "Stored request detail is malformed or unsupported.": "已存储的请求详情格式无效或不支持。",
+    "Stored response detail is malformed or unsupported.": "已存储的响应详情格式无效或不支持。",
     "Response head was not captured for this historical record.":
       "此历史记录未采集响应头。",
     "Waiting for the final provider response...": "正在等待供应商最终响应……",

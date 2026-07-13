@@ -4614,9 +4614,9 @@ describe("app-panels-stats verification surfaces", () => {
     );
   });
 
-  it("distinguishes legacy, failed partial, and pruned API request details", async () => {
+  it("distinguishes malformed, failed partial, and pruned API request details", async () => {
     const fetchMock = vi.mocked(fetch);
-    let detailMode: "failed" | "legacy" | "pruned" = "legacy";
+    let detailMode: "failed" | "malformed" | "pruned" = "malformed";
     fetchMock.mockImplementation((input, init) => {
       const rawPath =
         typeof input === "string"
@@ -4628,11 +4628,13 @@ describe("app-panels-stats verification surfaces", () => {
 
       if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
         const request =
-          detailMode === "legacy"
+          detailMode === "malformed"
             ? {
                 ...aiStatisticsDetail.request,
                 requestBody: { messages: [{ content: "legacy" }] },
+                requestDetailStatus: "malformed",
                 responseBody: { text: "legacy response" },
+                responseDetailStatus: "malformed",
               }
             : detailMode === "failed"
               ? {
@@ -4654,6 +4656,7 @@ describe("app-panels-stats verification surfaces", () => {
                     statusCode: 502,
                     version: 1,
                   },
+                  responseDetailStatus: "partial",
                 }
               : {
                   ...aiStatisticsDetail.request,
@@ -4676,11 +4679,12 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     let dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(
-      within(dialog).getByText(
-        "Legacy normalized record. Request is not the actual provider payload.",
-      ),
+      within(dialog).getByText("Stored request detail is malformed or unsupported."),
     ).toBeInTheDocument();
-    expect(within(dialog).getByText("Legacy normalized response record.")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Stored response detail is malformed or unsupported."),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText("legacy response")).not.toBeInTheDocument();
 
     fireEvent.click(dialog.parentElement as HTMLElement);
     detailMode = "failed";
@@ -4720,7 +4724,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows historical response envelopes and compact cancellations without invented response heads", async () => {
+  it("shows historical provider_final_response_v1 envelopes and unavailable cancelled details", async () => {
     const fetchMock = vi.mocked(fetch);
     let responseMode: "cancelled" | "historical" = "historical";
     const historicalResponse = {
@@ -4734,7 +4738,6 @@ describe("app-panels-stats verification surfaces", () => {
       usage: null,
       version: 1,
     };
-    const cancelledResponse = { cancelled: "chat run cancelled" };
 
     fetchMock.mockImplementation((input, init) => {
       const rawPath =
@@ -4752,12 +4755,9 @@ describe("app-panels-stats verification surfaces", () => {
             request: {
               ...aiStatisticsDetail.request,
               finalState: responseMode === "cancelled" ? "cancelled" : "succeeded",
-              responseBody:
-                responseMode === "cancelled"
-                  ? cancelledResponse
-                  : historicalResponse,
+              responseBody: responseMode === "cancelled" ? null : historicalResponse,
               responseDetailStatus:
-                responseMode === "cancelled" ? "legacy" : "captured",
+                responseMode === "cancelled" ? "unavailable" : "captured",
             },
           }),
         );
@@ -4796,30 +4796,12 @@ describe("app-panels-stats verification surfaces", () => {
     );
     dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(
-      within(dialog).getByText("Compact cancelled response record."),
+      within(dialog).getByText("Final response detail is unavailable or was pruned."),
     ).toBeInTheDocument();
     expect(
       within(dialog).queryByText("Response headers"),
     ).not.toBeInTheDocument();
-    const responseBodyBlock = within(dialog)
-      .getByText("Response body")
-      .closest(".audit-json-block");
-    expect(responseBodyBlock).not.toBeNull();
-    const responseBodyViewer = responseBodyBlock as HTMLElement;
-    expect(
-      within(responseBodyViewer).getByText('"cancelled"'),
-    ).toBeInTheDocument();
-    expect(
-      within(responseBodyViewer).getByText('"chat run cancelled"'),
-    ).toBeInTheDocument();
-    await userEvent.click(
-      within(responseBodyViewer).getByRole("button", {
-        name: "Copy Response body",
-      }),
-    );
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
-      JSON.stringify(cancelledResponse, null, 2),
-    );
+    expect(within(dialog).queryByText('"cancelled"')).not.toBeInTheDocument();
   });
 
   it("loads saved API request audit column settings", async () => {

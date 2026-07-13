@@ -2190,8 +2190,6 @@ export type AiRequestAuditDetail = AiRequestAuditSummary & {
   requestDetailStatus?:
     | "captured"
     | "failed"
-    | "legacy"
-    | "legacy_text"
     | "malformed"
     | "partial"
     | "pending"
@@ -2199,8 +2197,6 @@ export type AiRequestAuditDetail = AiRequestAuditSummary & {
   responseDetailStatus?:
     | "captured"
     | "failed"
-    | "legacy"
-    | "legacy_text"
     | "malformed"
     | "partial"
     | "pending"

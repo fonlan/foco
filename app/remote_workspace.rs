@@ -75,8 +75,7 @@ use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
-    compact_cancelled_audit_response_body_json, config_snapshot, config_update_snapshot,
-    estimate_tool_schema_tokens,
+    config_snapshot, config_update_snapshot, estimate_tool_schema_tokens,
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
         PromptHookExecutorRequest, PromptHookFuture,
@@ -1040,38 +1039,28 @@ fn broker_llm_cancellation_audit_outcome(
     request_kind: &str,
     explicit_broker_cancel: bool,
     captured_response_body_json: Option<String>,
-    message: &str,
+    _message: &str,
 ) -> BrokerLlmCancellationAuditOutcome {
     let user_cancel = explicit_broker_cancel && request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND;
     BrokerLlmCancellationAuditOutcome {
         final_state: if user_cancel { "cancelled" } else { "failed" },
-        response_body_json: if user_cancel {
-            captured_response_body_json
-                .or_else(|| Some(compact_cancelled_audit_response_body_json(message)))
-        } else {
-            captured_response_body_json
-        },
+        // Only real provider_final_response_v1 may be stored. Compact cancelled is not a wire dump.
+        response_body_json: captured_response_body_json,
     }
 }
 
 #[derive(Debug, PartialEq)]
 struct RemoteSidecarBrokerErrorAuditOutcome {
     final_state: &'static str,
-    response_body: Value,
 }
 
 fn remote_sidecar_broker_error_audit_outcome(
     payload: &Value,
-    message: &str,
+    _message: &str,
 ) -> RemoteSidecarBrokerErrorAuditOutcome {
     let cancelled = payload.get("code").and_then(Value::as_str) == Some("cancelled");
     RemoteSidecarBrokerErrorAuditOutcome {
         final_state: if cancelled { "cancelled" } else { "failed" },
-        response_body: if cancelled {
-            json!({ "cancelled": message })
-        } else {
-            json!({ "error": { "message": message } })
-        },
     }
 }
 
@@ -3796,28 +3785,30 @@ async fn handle_broker_request(
 /// `messages`/`tools` fields for sidecar compatibility.
 fn broker_llm_audit_context(
     state: &AppState,
-    fallback_workspace_id: &str,
+    workspace_id: &str,
     payload: &Value,
     request_kind: &str,
     request_id: &str,
-) -> Option<BrokerLlmAuditContext> {
-    let workspace_id = payload
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(fallback_workspace_id)
-        .to_string();
-    let config = config_snapshot(state).ok()?;
-    let workspace = workspace_by_id(&config, &workspace_id).ok()?;
-    let audit_path = workspace_audit_path(&state.user_profile_dir, workspace).ok()?;
+) -> Result<BrokerLlmAuditContext, ApiError> {
+    // Control connection workspace identity is authoritative for the main-process audit mirror.
+    // Do not let a mismatched payload workspaceId redirect audit writes.
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "broker llm request id must not be empty",
+        ));
+    }
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let audit_path = workspace_audit_path(&state.user_profile_dir, workspace)?;
     let chat_id = payload
         .get("chatId")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
-    Some(BrokerLlmAuditContext {
+    Ok(BrokerLlmAuditContext {
         audit_path,
-        workspace_id,
+        workspace_id: workspace_id.to_string(),
         chat_id,
         chat_title: payload
             .get("chatTitle")
@@ -3827,7 +3818,6 @@ fn broker_llm_audit_context(
         request_id: request_id.to_string(),
         request_kind: request_kind.to_string(),
     })
-    .filter(|context| !context.request_id.is_empty())
 }
 
 const BROKER_AUDIT_WRITE_RETRY_DELAYS: [Duration; 3] = [
@@ -4221,34 +4211,44 @@ async fn broker_llm_stream(
     // Ensure a nested request cannot disagree with the model selected by the broker payload.
     request.model_id = model_id.clone();
 
-    let audit_context = broker_llm_audit_context(state, workspace_id, &payload, &request_kind, id);
+    let audit_context =
+        match broker_llm_audit_context(state, workspace_id, &payload, &request_kind, id) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = send_broker_error(
+                    write,
+                    Some(id),
+                    "internal_error",
+                    format!(
+                        "failed to establish broker LLM audit context: {}",
+                        error.message()
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
     let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_started_instant = Instant::now();
     let save_details = api_audit_save_details(&config);
-    let audit_writer = audit_context.map(|context| {
-        BrokerLlmAuditWriter::new(
-            context,
-            provider_id.as_str(),
-            model_id.as_str(),
-            request.thinking_level.as_deref(),
-            &request_started_at,
-            save_details,
-        )
-    });
-    if let Some(writer) = audit_writer.as_ref()
-        && let Err(error) = writer.ensure_started()
-    {
+    let audit_writer = BrokerLlmAuditWriter::new(
+        audit_context,
+        provider_id.as_str(),
+        model_id.as_str(),
+        request.thinking_level.as_deref(),
+        &request_started_at,
+        save_details,
+    );
+    if let Err(error) = audit_writer.ensure_started() {
         tracing::warn!(
-            workspace_id = %writer.context.workspace_id,
-            request_id = %writer.context.request_id,
+            workspace_id = %audit_writer.context.workspace_id,
+            request_id = %audit_writer.context.request_id,
             phase = "start",
             error = %error,
             "failed to establish brokered remote LLM audit start"
         );
     }
-    let audit_capture = audit_writer
-        .as_ref()
-        .map(BrokerLlmAuditWriter::detail_capture);
+    let audit_capture = Some(audit_writer.detail_capture());
     let mut audit_events = vec![BrokerLlmAuditEvent {
         event_at: request_started_at.clone(),
         event_type: "start".to_string(),
@@ -4256,10 +4256,7 @@ async fn broker_llm_stream(
             "type": "start",
             "providerId": provider_id.as_str(),
             "modelId": model_id.as_str(),
-            "requestKind": audit_writer
-                .as_ref()
-                .map(|writer| writer.context.request_kind.as_str())
-                .unwrap_or(request_kind.as_str()),
+            "requestKind": audit_writer.context.request_kind.as_str(),
         }),
     }];
 
@@ -4279,7 +4276,7 @@ async fn broker_llm_stream(
     if send_broker_envelope(write, &route).await.is_err() {
         let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         finish_broker_llm_audit(
-            audit_writer.as_ref(),
+            Some(&audit_writer),
             BrokerLlmAuditOutcome {
                 final_state: "failed",
                 first_token_at: None,
@@ -4317,7 +4314,7 @@ async fn broker_llm_stream(
                     captured_response_body_json,
                     "broker request cancelled",
                 );
-                finish_broker_llm_audit(audit_writer.as_ref(), BrokerLlmAuditOutcome {
+                finish_broker_llm_audit(Some(&audit_writer), BrokerLlmAuditOutcome {
                     final_state: cancel_audit.final_state,
                     first_token_at: None,
                     completed_at: &completed_at,
@@ -4342,9 +4339,7 @@ async fn broker_llm_stream(
                 &provider_config,
                 request,
                 save_details,
-                audit_writer
-                    .as_ref()
-                    .and_then(BrokerLlmAuditWriter::observer),
+                audit_writer.observer(),
             ) => result,
         }
     } else {
@@ -4352,20 +4347,16 @@ async fn broker_llm_stream(
             &provider_config,
             request,
             save_details,
-            audit_writer
-                .as_ref()
-                .and_then(BrokerLlmAuditWriter::observer),
+            audit_writer.observer(),
         )
         .await
     } {
         Ok(s) => s,
         Err(failure) => {
-            if let Some(writer) = audit_writer.as_ref()
-                && let Err(error) = writer.persist_request_failure(&failure)
-            {
+            if let Err(error) = audit_writer.persist_request_failure(&failure) {
                 tracing::warn!(
-                    request_id = %writer.context.request_id,
-                    workspace_id = %writer.context.workspace_id,
+                    request_id = %audit_writer.context.request_id,
+                    workspace_id = %audit_writer.context.workspace_id,
                     phase = "request_failure",
                     error = %error.message,
                     "failed to persist brokered provider request failure capture"
@@ -4394,7 +4385,7 @@ async fn broker_llm_stream(
                     .flatten()
             });
             finish_broker_llm_audit(
-                audit_writer.as_ref(),
+                Some(&audit_writer),
                 BrokerLlmAuditOutcome {
                     final_state: "failed",
                     first_token_at: None,
@@ -4447,7 +4438,7 @@ async fn broker_llm_stream(
                         captured_response_body_json,
                         "broker request cancelled",
                     );
-                    finish_broker_llm_audit(audit_writer.as_ref(), BrokerLlmAuditOutcome {
+                    finish_broker_llm_audit(Some(&audit_writer), BrokerLlmAuditOutcome {
                         final_state: cancel_audit.final_state,
                         first_token_at: first_token_at.as_deref(),
                         completed_at: &completed_at,
@@ -4503,7 +4494,7 @@ async fn broker_llm_stream(
                             .flatten()
                     });
                 finish_broker_llm_audit(
-                    audit_writer.as_ref(),
+                    Some(&audit_writer),
                     BrokerLlmAuditOutcome {
                         final_state: "failed",
                         first_token_at: first_token_at.as_deref(),
@@ -4564,7 +4555,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_writer.as_ref(),
+                        Some(&audit_writer),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4609,7 +4600,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_writer.as_ref(),
+                        Some(&audit_writer),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4658,7 +4649,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_writer.as_ref(),
+                        Some(&audit_writer),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4702,7 +4693,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_writer.as_ref(),
+                        Some(&audit_writer),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4770,7 +4761,7 @@ async fn broker_llm_stream(
                             .flatten()
                     });
                 finish_broker_llm_audit(
-                    audit_writer.as_ref(),
+                    Some(&audit_writer),
                     BrokerLlmAuditOutcome {
                         final_state: "failed",
                         first_token_at: first_token_at.as_deref(),
@@ -4834,7 +4825,7 @@ async fn broker_llm_stream(
         });
     }
     finish_broker_llm_audit(
-        audit_writer.as_ref(),
+        Some(&audit_writer),
         BrokerLlmAuditOutcome {
             final_state: broker_llm_final_state(
                 &request_kind,
@@ -8032,7 +8023,9 @@ fn persist_sidecar_llm_audit(
     )
 }
 
-/// Sidecar mirror audit for a single LLM request. Does not mark provider_request_v1 wire dumps.
+/// Sidecar mirror audit for a single LLM request.
+/// Statistics use structured columns only; response detail stays NULL.
+/// Real provider wire lives on the main-process audit mirror (`provider_*_v1`).
 fn persist_sidecar_llm_audit_for_kind(
     database: &mut WorkspaceDatabase,
     workspace_id: &str,
@@ -8045,9 +8038,8 @@ fn persist_sidecar_llm_audit_for_kind(
     completed_at: &str,
     total_latency_ms: i64,
     final_state: &str,
-    response_body: Value,
+    _response_body: Value,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let response_body_json = response_body.to_string();
     if database.llm_request(request_id)?.is_none() {
         database.insert_llm_request(NewLlmRequest {
             id: request_id,
@@ -8074,7 +8066,7 @@ fn persist_sidecar_llm_audit_for_kind(
             status_code: None,
             final_state,
             request_body_json: None,
-            response_body_json: Some(&response_body_json),
+            response_body_json: None,
         })?;
     } else {
         database.update_llm_request_outcome(
@@ -8091,7 +8083,7 @@ fn persist_sidecar_llm_audit_for_kind(
                 total_latency_ms: Some(total_latency_ms),
                 status_code: None,
                 final_state,
-                response_body_json: Some(&response_body_json),
+                response_body_json: None,
             },
         )?;
     }
@@ -10366,7 +10358,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     &completed_at,
                     total_latency_ms,
                     audit_outcome.final_state,
-                    audit_outcome.response_body,
+                    Value::Null,
                 );
                 *sequence += 1;
                 run_stream.record(
@@ -11966,61 +11958,7 @@ fn remote_sidecar_validate_context_preview_model(
     Ok(())
 }
 
-fn parse_remote_audit_detail(value: Option<&str>) -> Option<Value> {
-    value.map(|value| {
-        serde_json::from_str(value).unwrap_or_else(|_| {
-            json!({
-                "format": "legacy_text_v1",
-                "text": value,
-            })
-        })
-    })
-}
-
-fn remote_audit_request_detail_status(final_state: &str, raw: Option<&str>) -> &'static str {
-    let parsed = parse_remote_audit_detail(raw);
-    match (raw, parsed.as_ref()) {
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("provider_request_v1") =>
-        {
-            "captured"
-        }
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
-        {
-            "malformed"
-        }
-        (Some(_), _) => "legacy",
-        (None, _) if final_state == "running" => "pending",
-        (None, _) => "unavailable",
-    }
-}
-
-fn remote_audit_response_detail_status(final_state: &str, raw: Option<&str>) -> &'static str {
-    let parsed = parse_remote_audit_detail(raw);
-    match (raw, parsed.as_ref()) {
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str)
-                == Some("provider_final_response_v1") =>
-        {
-            match value.get("state").and_then(Value::as_str) {
-                Some("failed") if value.get("partial").and_then(Value::as_bool) == Some(true) => {
-                    "partial"
-                }
-                Some("failed") => "failed",
-                _ => "captured",
-            }
-        }
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
-        {
-            "malformed"
-        }
-        (Some(_), _) => "legacy",
-        (None, _) if final_state == "running" => "pending",
-        (None, _) => "unavailable",
-    }
-}
+// Dead helpers removed: sidecar detail is always unavailable; main-process Detail API is the source of truth.
 
 async fn remote_sidecar_ai_statistics_detail(
     State(state): State<RemoteSidecarState>,
@@ -12064,16 +12002,19 @@ async fn remote_sidecar_ai_statistics_detail(
             "totalLatencyMs": request.total_latency_ms,
             "statusCode": request.status_code,
             "finalState": request.final_state,
-            "requestDetailStatus": remote_audit_request_detail_status(
-                &request.final_state,
-                request.request_body_json.as_deref(),
-            ),
-            "responseDetailStatus": remote_audit_response_detail_status(
-                &request.final_state,
-                request.response_body_json.as_deref(),
-            ),
-            "requestBody": parse_remote_audit_detail(request.request_body_json.as_deref()),
-            "responseBody": parse_remote_audit_detail(request.response_body_json.as_deref()),
+            // Sidecar mirror is not a provider detail source. Wire lives on the main process.
+            "requestDetailStatus": if request.final_state == "running" {
+                "pending"
+            } else {
+                "unavailable"
+            },
+            "responseDetailStatus": if request.final_state == "running" {
+                "pending"
+            } else {
+                "unavailable"
+            },
+            "requestBody": null,
+            "responseBody": null,
         },
         "events": events.into_iter().map(|event| json!({
             "id": event.id,
@@ -16996,25 +16937,17 @@ mod tests {
 
     #[test]
     fn broker_llm_cancellation_audit_contract_is_request_kind_and_signal_aware() {
-        let compact = broker_llm_cancellation_audit_outcome(
+        let without_wire = broker_llm_cancellation_audit_outcome(
             BROKER_DEFAULT_LLM_REQUEST_KIND,
             true,
             None,
             "broker request cancelled",
         );
-        assert_eq!(compact.final_state, "cancelled");
-        assert_eq!(
-            serde_json::from_str::<Value>(
-                compact
-                    .response_body_json
-                    .as_deref()
-                    .expect("compact cancelled response"),
-            )
-            .expect("valid compact cancelled response"),
-            json!({ "cancelled": "broker request cancelled" })
-        );
+        assert_eq!(without_wire.final_state, "cancelled");
+        assert_eq!(without_wire.response_body_json, None);
 
-        let captured = r#"{"format":"provider_final_response_v1","partial":true}"#.to_string();
+        let captured =
+            r#"{"format":"provider_final_response_v1","version":1,"partial":true}"#.to_string();
         let detailed = broker_llm_cancellation_audit_outcome(
             BROKER_DEFAULT_LLM_REQUEST_KIND,
             true,
@@ -17131,19 +17064,19 @@ mod tests {
                 .expect("request lookup")
                 .expect("persisted request");
             assert_eq!(request.final_state, "cancelled");
-            let response = serde_json::from_str::<Value>(
-                request
-                    .response_body_json
-                    .as_deref()
-                    .expect("persisted cancelled response"),
-            )
-            .expect("valid cancelled response JSON");
             if let Some(expected_partial) = expected_partial {
+                let response = serde_json::from_str::<Value>(
+                    request
+                        .response_body_json
+                        .as_deref()
+                        .expect("persisted cancelled response"),
+                )
+                .expect("valid cancelled response JSON");
                 assert_eq!(response["format"], "provider_final_response_v1");
                 assert_eq!(response["state"], "failed");
                 assert_eq!(response["partial"], expected_partial);
             } else {
-                assert_eq!(response, json!({ "cancelled": "broker request cancelled" }));
+                assert_eq!(request.response_body_json, None);
             }
         }
     }
@@ -17174,10 +17107,6 @@ mod tests {
             "broker request cancelled",
         );
         assert_eq!(cancelled.final_state, "cancelled");
-        assert_eq!(
-            cancelled.response_body,
-            json!({ "cancelled": "broker request cancelled" })
-        );
 
         for payload in [
             json!({ "code": "provider_error", "message": "provider said cancelled" }),
@@ -17188,10 +17117,6 @@ mod tests {
                 payload["message"].as_str().expect("error message"),
             );
             assert_eq!(failed.final_state, "failed");
-            assert_eq!(
-                failed.response_body,
-                json!({ "error": { "message": payload["message"].clone() } })
-            );
         }
     }
 
@@ -17219,7 +17144,7 @@ mod tests {
                 first_token_latency_ms: Some(1000),
                 total_latency_ms: 2000,
                 status_code: None,
-                response_body_json: Some(r#"{"requestKind":"contextCompression"}"#),
+                response_body_json: None,
             },
             &[],
         );
@@ -17811,16 +17736,7 @@ mod tests {
         assert_eq!(audit.request_kind, BROKER_DEFAULT_LLM_REQUEST_KIND);
         assert_eq!(audit.final_state, "cancelled");
         assert_eq!(audit.provider_id, "provider-current");
-        assert_eq!(
-            serde_json::from_str::<Value>(
-                audit
-                    .response_body_json
-                    .as_deref()
-                    .expect("compact cancelled mirror body"),
-            )
-            .expect("compact cancelled mirror JSON"),
-            json!({ "cancelled": "broker request cancelled" })
-        );
+        assert_eq!(audit.response_body_json, None);
         let events = run_stream.snapshot_after(-1);
         assert_eq!(
             events

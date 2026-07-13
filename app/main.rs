@@ -2929,7 +2929,6 @@ impl PreparedChatContext {
                     let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
                     let mut read_only_tool_progress_detector = ReadOnlyToolProgressDetector::default();
                     let mut executed_tool_calls = Vec::new();
-                    let mut provider_completions = Vec::new();
                     let mut total_usage = NeutralUsage::default();
                     let mut final_usage = None;
                     let mut app_shutdown_rx = self.app_shutdown_rx.clone();
@@ -3710,7 +3709,7 @@ impl PreparedChatContext {
                                     tool_calls,
                                     usage,
                                     stop_reason,
-                                    response_id,
+                                    response_id: _,
                                 } => {
                                     completed_turn = true;
 
@@ -3858,15 +3857,6 @@ impl PreparedChatContext {
                                         return;
                                     }
 
-                                    provider_completions.push(json!({
-                                        "turnIndex": turn_index,
-                                        "text": text.clone(),
-                                        "reasoning": reasoning.clone(),
-                                        "toolCalls": tool_calls.clone(),
-                                        "usage": usage.clone(),
-                                        "stopReason": stop_reason.clone(),
-                                        "responseId": response_id.clone()
-                                    }));
                                     if turn_reasoning.is_empty() {
                                         if let Some(reasoning) = reasoning.as_deref() {
                                             assistant_reasoning.push_str(reasoning);
@@ -4090,14 +4080,9 @@ impl PreparedChatContext {
                                             reasoning_tokens: final_usage.as_ref().and_then(|usage| usage.reasoning_tokens),
                                             status_code: Some(200),
                                             final_state: "succeeded",
-                                            response_body_json: Some(json!({
-                                                "text": assistant_message_text.clone(),
-                                                "reasoning": non_empty_string(&assistant_reasoning),
-                                                "providerCompletions": provider_completions.clone(),
-                                                "toolCalls": executed_tool_calls.clone(),
-                                                "usage": final_usage.clone(),
-                                                "stopReason": stop_reason.clone()
-                                            }).to_string()),
+                                            // Run-level aggregate is not a provider wire dump. Per-turn
+                                            // provider_final_response_v1 is already persisted above.
+                                            response_body_json: None,
                                         };
 
                                         match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
@@ -6628,7 +6613,7 @@ fn add_usage_tokens(total: &mut Option<i64>, next: Option<i64>) {
     }
 }
 
-fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
+fn failed_audit_outcome(started_at: Instant, _message: &str) -> ChatAuditOutcome {
     ChatAuditOutcome {
         first_token_at: None,
         completed_at: utc_timestamp(),
@@ -6641,7 +6626,9 @@ fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome 
         reasoning_tokens: None,
         status_code: None,
         final_state: "failed",
-        response_body_json: Some(json!({ "error": message }).to_string()),
+        // Run-level / non-wire outcomes must not invent detail JSON. Real provider turns
+        // write provider_final_response_v1 via ProviderAuditCapture only.
+        response_body_json: None,
     }
 }
 
@@ -6744,11 +6731,7 @@ fn is_retryable_provider_status(status_code: u16) -> bool {
     matches!(status_code, 408 | 409 | 429 | 500..=599)
 }
 
-fn compact_cancelled_audit_response_body_json(message: &str) -> String {
-    json!({ "cancelled": message }).to_string()
-}
-
-fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
+fn cancelled_audit_outcome(started_at: Instant, _message: &str) -> ChatAuditOutcome {
     ChatAuditOutcome {
         first_token_at: None,
         completed_at: utc_timestamp(),
@@ -6761,7 +6744,9 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
         reasoning_tokens: None,
         status_code: None,
         final_state: "cancelled",
-        response_body_json: Some(compact_cancelled_audit_response_body_json(message)),
+        // Compact `{"cancelled":...}` is no longer a valid response detail. Capture-aware
+        // paths may still attach provider_final_response_v1 when wire was observed.
+        response_body_json: None,
     }
 }
 
@@ -6935,27 +6920,15 @@ pub(crate) fn api_audit_detail_json<'a>(value: &'a str, save_details: bool) -> O
 
 /// Response-body gate for audit persistence.
 ///
-/// Unlike [`api_audit_detail_json`], cancelled finals keep a compact
-/// `{"cancelled": ...}` payload even when request/response detail capture is off.
+/// Only versioned provider wire dumps may be persisted. Compact cancelled /
+/// normalized error payloads are not accepted; callers should leave detail NULL
+/// when capture did not observe a real provider response.
 pub(crate) fn persistable_audit_response_body_json<'a>(
     value: &'a str,
     save_details: bool,
-    final_state: &str,
+    _final_state: &str,
 ) -> Option<&'a str> {
-    if save_details {
-        return Some(value);
-    }
-    if final_state == "cancelled" && is_compact_cancelled_audit_response(value) {
-        return Some(value);
-    }
-    None
-}
-
-fn is_compact_cancelled_audit_response(value: &str) -> bool {
-    match serde_json::from_str::<Value>(value) {
-        Ok(Value::Object(map)) => map.contains_key("cancelled"),
-        _ => false,
-    }
+    save_details.then_some(value)
 }
 
 pub(crate) fn compact_audit_events(
@@ -11988,13 +11961,15 @@ fn chat_tool_call_summary(
 }
 
 fn parse_audit_detail_value(value: Option<&str>) -> Option<Value> {
-    value.map(|value| {
-        serde_json::from_str(value).unwrap_or_else(|_| {
-            json!({
-                "format": "legacy_text_v1",
-                "text": value,
-            })
-        })
+    value.and_then(|raw| {
+        let parsed = serde_json::from_str::<Value>(raw).ok()?;
+        let format = parsed.get("format").and_then(Value::as_str)?;
+        let version = parsed.get("version").and_then(Value::as_u64)?;
+        match (format, version) {
+            ("provider_request_v1" | "provider_final_response_v1", 1) => Some(parsed),
+            // Non-v1 history is not re-emitted; Detail API reports malformed/unavailable instead.
+            _ => None,
+        }
     })
 }
 
@@ -12009,12 +11984,7 @@ fn audit_request_detail_status(
         {
             "captured"
         }
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
-        {
-            "malformed"
-        }
-        (Some(_), _) => "legacy",
+        (Some(_), _) => "malformed",
         (None, _) if final_state == "running" => "pending",
         (None, _) => "unavailable",
     }
@@ -12038,12 +12008,7 @@ fn audit_response_detail_status(
                 _ => "captured",
             }
         }
-        (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("legacy_text_v1") =>
-        {
-            "malformed"
-        }
-        (Some(_), _) => "legacy",
+        (Some(_), _) => "malformed",
         (None, _) if final_state == "running" => "pending",
         (None, _) => "unavailable",
     }

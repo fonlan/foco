@@ -1038,7 +1038,7 @@ function AiRequestDetailDialog({
                   copied={copiedKey === "request"}
                   detailStatus={
                     request.requestDetailStatus ??
-                    (request.requestBody === null ? "pending" : "legacy")
+                    (request.requestBody === null ? "pending" : "malformed")
                   }
                   onCopy={(text) => onCopy("request", text)}
                   requestBody={request.requestBody}
@@ -1051,7 +1051,7 @@ function AiRequestDetailDialog({
                       ? request.finalState === "running"
                         ? "pending"
                         : "unavailable"
-                      : "legacy")
+                      : "malformed")
                   }
                   onCopy={(text) => onCopy("response", text)}
                   responseBody={request.responseBody}
@@ -1085,22 +1085,11 @@ function ProviderRequestDetail({
             ? t("Request detail is pending or was pruned.")
             : detailStatus === "unavailable"
               ? t("Request detail was not captured or was pruned.")
-              : detailStatus === "malformed"
-                ? t("Stored request detail is malformed legacy text.")
-                : t(
-                    "Legacy normalized record. Request is not the actual provider payload.",
-                  )
+              : t("Stored request detail is malformed or unsupported.")
         }
         noticeTone={requestBody === null ? "neutral" : "warning"}
         title={t("Request body")}
-      >
-        <AuditJsonBlock
-          copied={copied}
-          label={t("Request body")}
-          onCopy={() => onCopy(auditJsonText(requestBody))}
-          value={requestBody}
-        />
-      </AuditDetailCard>
+      />
     );
   }
 
@@ -1143,7 +1132,6 @@ function ProviderResponseDetail({
   const { t } = useI18n();
   if (!isProviderFinalResponseDump(responseBody)) {
     const unavailable = detailStatus === "unavailable";
-    const compactCancelled = isCompactCancelledResponse(responseBody);
     return (
       <AuditDetailCard
         notice={
@@ -1151,24 +1139,11 @@ function ProviderResponseDetail({
             ? unavailable
               ? t("Final response detail is unavailable or was pruned.")
               : t("Waiting for the final provider response...")
-            : detailStatus === "malformed"
-              ? t("Stored response detail is malformed legacy text.")
-              : compactCancelled
-                ? t("Compact cancelled response record.")
-                : t("Legacy normalized response record.")
+            : t("Stored response detail is malformed or unsupported.")
         }
         noticeTone={responseBody === null ? "neutral" : "warning"}
         title={t("Final provider response")}
-      >
-        {responseBody !== null ? (
-          <AuditJsonBlock
-            copied={copied}
-            label={t("Response body")}
-            onCopy={() => onCopy(auditJsonText(responseBody))}
-            value={responseBody}
-          />
-        ) : null}
-      </AuditDetailCard>
+      />
     );
   }
 
@@ -1236,7 +1211,7 @@ function AuditDetailCard({
   noticeTone = "neutral",
   title,
 }: {
-  children: ReactNode;
+  children?: ReactNode;
   notice?: string;
   noticeTone?: "error" | "neutral" | "warning";
   title: string;
@@ -1270,10 +1245,6 @@ function isProviderFinalResponseDump(
   value: JsonValue | ProviderFinalResponseDump | null,
 ): value is ProviderFinalResponseDump {
   return isJsonObject(value) && value.format === "provider_final_response_v1";
-}
-
-function isCompactCancelledResponse(value: JsonValue | null): boolean {
-  return isJsonObject(value) && typeof value.cancelled === "string";
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {

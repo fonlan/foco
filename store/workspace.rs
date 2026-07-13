@@ -695,6 +695,7 @@ impl WorkspaceDatabase {
         let mut connection = open_connection(&database_path)?;
         run_migrations(&mut connection, &database_path, database_existed)?;
         enable_write_ahead_logging(&connection, &database_path)?;
+        prune_non_v1_llm_audit_details(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -6462,9 +6463,9 @@ impl WorkspaceDatabase {
         let cache_ratio = calculate_cache_ratio(request.input_tokens, request.cache_read_tokens)?;
         let thinking_level = normalized_optional_text(request.thinking_level);
         let request_body_json =
-            redact_optional_audit_json(request.request_body_json, "request_body_json")?;
+            normalize_audit_detail_for_write(request.request_body_json, "request_body_json")?;
         let response_body_json =
-            redact_optional_audit_json(request.response_body_json, "response_body_json")?;
+            normalize_audit_detail_for_write(request.response_body_json, "response_body_json")?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -6547,18 +6548,33 @@ impl WorkspaceDatabase {
         id: &str,
         request_body_json: Option<&str>,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let request_body_json = redact_optional_audit_json(request_body_json, "request_body_json")?;
-        let updated = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let existing = select_llm_request_record(&transaction, id)
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
+        let request_body_json = merge_audit_detail_for_update(
+            existing.request_body_json.as_deref(),
+            request_body_json,
+            "request_body_json",
+        )?;
+        let updated = transaction
             .execute(
                 "UPDATE llm_requests SET request_body_json = ?2 WHERE id = ?1",
                 params![id, request_body_json],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         if updated == 0 {
             return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
         }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -6577,8 +6593,6 @@ impl WorkspaceDatabase {
         )?;
 
         let cache_ratio = calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)?;
-        let response_body_json =
-            redact_optional_audit_json(outcome.response_body_json, "response_body_json")?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -6587,6 +6601,11 @@ impl WorkspaceDatabase {
         let old_request = select_llm_request_record(&transaction, id)
             .map_err(|source| sqlite_error(&database_path, source))?
             .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
+        let response_body_json = merge_audit_detail_for_update(
+            old_request.response_body_json.as_deref(),
+            outcome.response_body_json,
+            "response_body_json",
+        )?;
 
         let updated = transaction
             .execute(
@@ -13972,14 +13991,10 @@ fn append_llm_request_kind_exclusion_condition(
         return;
     }
     let placeholders = vec!["?"; request_kinds.len()].join(", ");
-    query.push_str(&format!(
-        " AND request_kind NOT IN ({placeholders}) \
-          AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') NOT IN ({placeholders})"
-    ));
+    query.push_str(&format!(" AND request_kind NOT IN ({placeholders})"));
     query_params.extend(
         request_kinds
             .iter()
-            .chain(request_kinds.iter())
             .map(|value| SqlValue::Text((*value).to_string())),
     );
 }
@@ -14008,15 +14023,11 @@ fn append_llm_request_audit_where_clause(
         append_condition(
             query,
             has_where,
-            &format!(
-                "request_kind NOT IN ({placeholders}) \
-                 AND COALESCE(CAST(json_extract(response_body_json, '$.requestKind') AS TEXT), '') NOT IN ({placeholders})"
-            ),
+            &format!("request_kind NOT IN ({placeholders})"),
         );
         query_params.extend(
             request_kinds
                 .iter()
-                .chain(request_kinds.iter())
                 .map(|value| SqlValue::Text((*value).to_string())),
         );
     }
@@ -14639,6 +14650,112 @@ fn redact_optional_audit_json(
     value.map(|json| redact_audit_json(json, field)).transpose()
 }
 
+fn normalize_audit_detail_for_write(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Option<String>, WorkspaceDatabaseError> {
+    match value {
+        None => Ok(None),
+        Some(json) => {
+            validate_audit_detail_format(json, field)?;
+            Ok(Some(redact_audit_json(json, field)?))
+        }
+    }
+}
+
+/// Format-aware CAS for audit detail columns.
+///
+/// - Real v1 may replace NULL / non-v1 legacy values.
+/// - Existing valid v1 is preserved (first capture wins).
+/// - Incoming non-v1 JSON is rejected (callers must not write legacy dumps).
+/// - Incoming NULL does not clear existing valid v1; it clears non-v1 leftovers.
+fn merge_audit_detail_for_update(
+    existing: Option<&str>,
+    incoming: Option<&str>,
+    field: &'static str,
+) -> Result<Option<String>, WorkspaceDatabaseError> {
+    let existing_valid = existing
+        .filter(|value| is_valid_audit_detail_format(value, field))
+        .map(|value| redact_audit_json(value, field))
+        .transpose()?;
+
+    if let Some(existing_valid) = existing_valid {
+        return Ok(Some(existing_valid));
+    }
+
+    match incoming {
+        None => Ok(None),
+        Some(json) => {
+            validate_audit_detail_format(json, field)?;
+            Ok(Some(redact_audit_json(json, field)?))
+        }
+    }
+}
+
+fn prune_non_v1_llm_audit_details(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    if !table_exists(connection, database_path, "llm_requests")? {
+        return Ok(());
+    }
+
+    // Idempotent non-schema cleanup: drop any detail that is not valid provider_*_v1.
+    // Never rewrite legacy JSON into a forged v1 envelope.
+    connection
+        .execute_batch(
+            r#"
+            UPDATE llm_requests
+            SET request_body_json = NULL
+            WHERE request_body_json IS NOT NULL
+              AND (
+                json_valid(request_body_json) = 0
+                OR COALESCE(json_extract(request_body_json, '$.format'), '') <> 'provider_request_v1'
+                OR COALESCE(json_extract(request_body_json, '$.version'), 0) <> 1
+              );
+
+            UPDATE llm_requests
+            SET response_body_json = NULL
+            WHERE response_body_json IS NOT NULL
+              AND (
+                json_valid(response_body_json) = 0
+                OR COALESCE(json_extract(response_body_json, '$.format'), '') <> 'provider_final_response_v1'
+                OR COALESCE(json_extract(response_body_json, '$.version'), 0) <> 1
+              );
+            "#,
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(())
+}
+
+fn is_valid_audit_detail_format(value: &str, field: &'static str) -> bool {
+    validate_audit_detail_format(value, field).is_ok()
+}
+
+fn validate_audit_detail_format(
+    value: &str,
+    field: &'static str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let parsed: Value = serde_json::from_str(value)
+        .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })?;
+    let format = parsed.get("format").and_then(Value::as_str);
+    let version = parsed.get("version").and_then(Value::as_u64);
+    let ok = match field {
+        "request_body_json" => format == Some("provider_request_v1") && version == Some(1),
+        "response_body_json" => format == Some("provider_final_response_v1") && version == Some(1),
+        _ => false,
+    };
+    if !ok {
+        return Err(WorkspaceDatabaseError::InvalidAuditData {
+            message: format!(
+                "{field} must be a versioned provider dump (got format={format:?}, version={version:?})"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn redact_audit_json(value: &str, field: &'static str) -> Result<String, WorkspaceDatabaseError> {
     let mut parsed: Value = serde_json::from_str(value)
         .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })?;
@@ -14652,6 +14769,14 @@ fn redact_audit_json(value: &str, field: &'static str) -> Result<String, Workspa
         ("response_body_json", Some("provider_final_response_v1"), Some(1)) => {
             redact_provider_response_envelope(&mut parsed)
         }
+        ("request_body_json" | "response_body_json", _, _) => {
+            return Err(WorkspaceDatabaseError::InvalidAuditData {
+                message: format!(
+                    "{field} must be a versioned provider dump (got format={format:?}, version={version:?})"
+                ),
+            });
+        }
+        // Event/raw chunk audit JSON still uses recursive secret-key redaction.
         _ => redact_json_value(&mut parsed),
     }
 
