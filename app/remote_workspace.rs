@@ -36,6 +36,7 @@ use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
+    ProviderRequestDumpObserver, ProviderRequestFailure, ProviderWireRequestDump,
     stream_chat_with_capture_observer,
 };
 use foco_store::{
@@ -48,8 +49,8 @@ use foco_store::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
         NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
         TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
-        WorkspaceSpecTriggerType, workspace_database_path,
+        WorkspaceDatabaseError, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -132,6 +133,8 @@ use crate::{
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
 const SIDECAR_BINARY_NAME: &str = "foco";
+const REMOTE_SIDECAR_BOOTSTRAP_VERSION: u32 = 2;
+const SIDECAR_BUILD_ID_PROTOCOL: &str = "foco-sidecar-v2";
 const CONTROL_WS_PATH: &str = "/api/remote/control/ws";
 const SIDECAR_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONTROL_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -1261,7 +1264,7 @@ impl RemoteWorkspaceManager {
             None,
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Installing, None)?;
-        let command =
+        let sidecar_command =
             ensure_sidecar_command(&state, &server, server_id, Some(workspace_id), &target).await?;
         self.set_status(
             server_id,
@@ -1293,12 +1296,17 @@ impl RemoteWorkspaceManager {
             &remote_path,
             &target,
             &token,
-            &command,
+            &sidecar_command.command,
             &session_file,
         )
         .await?;
         let bootstrap = read_bootstrap(&mut sidecar, server_id, workspace_id).await?;
-        validate_bootstrap(&bootstrap, server_id, workspace_id, &target)?;
+        validate_bootstrap(
+            &bootstrap,
+            server_id,
+            workspace_id,
+            &sidecar_command.identity,
+        )?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1690,11 +1698,28 @@ impl RemoteWorkspaceSession {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteSidecarIdentity {
+    version: String,
+    target: String,
+    build_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteSidecarCommand {
+    command: String,
+    identity: RemoteSidecarIdentity,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteSidecarBootstrap {
     version: u32,
+    #[serde(default)]
+    sidecar_version: String,
     target: String,
+    #[serde(default)]
+    build_id: String,
     workspace_id: String,
     workspace_path: String,
     server_id: String,
@@ -1904,6 +1929,10 @@ pub(crate) async fn run_remote_sidecar_command_if_requested() -> AppResult<bool>
             println!("{}", current_sidecar_target()?);
             Ok(true)
         }
+        "--sidecar-build-id" => {
+            println!("{}", current_sidecar_build_id()?);
+            Ok(true)
+        }
         REMOTE_SIDECAR_COMMAND => {
             run_remote_sidecar_server(&args[1..]).await?;
             Ok(true)
@@ -1917,8 +1946,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let port = listener.local_addr()?.port();
     let bootstrap = RemoteSidecarBootstrap {
-        version: 1,
+        version: REMOTE_SIDECAR_BOOTSTRAP_VERSION,
+        sidecar_version: env!("CARGO_PKG_VERSION").to_string(),
         target: options.target.clone(),
+        build_id: current_sidecar_build_id()?,
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         server_id: options.server_id.clone(),
@@ -2773,6 +2804,30 @@ fn current_sidecar_target() -> io::Result<String> {
     }
 }
 
+fn sidecar_build_id_from_sha256(sha256: &str) -> String {
+    format!("{SIDECAR_BUILD_ID_PROTOCOL}:sha256:{sha256}")
+}
+
+fn current_sidecar_build_id() -> io::Result<String> {
+    let executable = std::env::current_exe()?;
+    let bytes = fs::read(executable)?;
+    Ok(sidecar_build_id_from_sha256(&format!(
+        "{:x}",
+        Sha256::digest(bytes)
+    )))
+}
+
+fn has_compatible_sidecar_build_id(build_id: &str) -> bool {
+    let Some(sha256) = build_id.strip_prefix(&format!("{SIDECAR_BUILD_ID_PROTOCOL}:sha256:"))
+    else {
+        return false;
+    };
+    sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn workspace_remote_path(workspace: &WorkspaceConfig, server_id: &str) -> Result<String, ApiError> {
     match &workspace.location {
         WorkspaceLocation::Ssh {
@@ -2878,7 +2933,7 @@ pub(crate) async fn run_remote_file_picker_command(
         .ok_or_else(|| remote_error(server_id, None, "remote server was not found"))?;
     let target = detect_or_cached_target(&server, server_id, None).await?;
     let sidecar_command = ensure_sidecar_command(state, &server, server_id, None, &target).await?;
-    let script = format!("{sidecar_command} {}", shell_quote(command));
+    let script = format!("{} {}", sidecar_command.command, shell_quote(command));
     let input = serde_json::to_vec(&payload).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize remote file picker payload: {source}"
@@ -2903,19 +2958,28 @@ async fn ensure_sidecar_command(
     server_id: &str,
     workspace_id: Option<&str>,
     target: &str,
-) -> Result<String, ApiError> {
+) -> Result<RemoteSidecarCommand, ApiError> {
     if let Some(command) = server
         .foco_command
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        verify_remote_command(server, command, target, server_id, workspace_id).await?;
-        return Ok(command.to_string());
+        let identity =
+            verify_remote_command(server, command, target, None, server_id, workspace_id).await?;
+        return Ok(RemoteSidecarCommand {
+            command: command.to_string(),
+            identity,
+        });
     }
 
     let asset = select_sidecar_asset(target)
         .map_err(|message| remote_error(server_id, workspace_id, message))?;
+    let identity = RemoteSidecarIdentity {
+        version: asset.version.clone(),
+        target: asset.target.clone(),
+        build_id: sidecar_build_id_from_sha256(&asset.sha256),
+    };
     let remote_dir = remote_home_shell_path(&format!(
         ".foco/sidecars/{}/{}",
         asset.version, asset.target
@@ -2924,42 +2988,38 @@ async fn ensure_sidecar_command(
         ".foco/sidecars/{}/{}/{}",
         asset.version, asset.target, SIDECAR_BINARY_NAME
     ));
-    if remote_sidecar_matches(
-        server,
-        &remote_bin,
-        &asset.version,
-        target,
-        server_id,
-        workspace_id,
-    )
-    .await?
-    {
+    if remote_sidecar_matches(server, &remote_bin, &identity, server_id, workspace_id).await? {
         update_sidecar_cache(state, server_id, target, &asset.version, None)?;
-        return Ok(remote_bin);
+        return Ok(RemoteSidecarCommand {
+            command: remote_bin,
+            identity,
+        });
     }
 
     let install_key = sidecar_install_key(server_id, target, &asset.version);
     let install_lock = state
         .remote_workspace_manager
         .sidecar_install_lock(&install_key)?;
-    let result: Result<String, ApiError> = {
+    let result: Result<RemoteSidecarCommand, ApiError> = {
         let _install_guard = install_lock.lock().await;
         async {
             if remote_sidecar_matches(
                 server,
                 &remote_bin,
-                &asset.version,
-                target,
+                &identity,
                 server_id,
                 workspace_id,
             )
             .await?
             {
                 update_sidecar_cache(state, server_id, target, &asset.version, None)?;
-                return Ok(remote_bin.clone());
+                return Ok(RemoteSidecarCommand {
+                    command: remote_bin.clone(),
+                    identity: identity.clone(),
+                });
             }
 
-            let bytes = std::fs::read(&asset.path).map_err(|source| {
+            let bytes = fs::read(&asset.path).map_err(|source| {
                 remote_error(
                     server_id,
                     workspace_id,
@@ -2970,7 +3030,7 @@ async fn ensure_sidecar_command(
                 )
             })?;
             let install_script = format!(
-                "set -e; dir={dir}; bin={bin}; tmp=\"$bin.tmp.$$\"; mkdir -p \"$dir\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; chmod +x \"$tmp\"; mv -f \"$tmp\" \"$bin\"; trap - EXIT; \"$bin\" --version; \"$bin\" --sidecar-target",
+                "set -e; dir={dir}; bin={bin}; tmp=\"$bin.tmp.$$\"; mkdir -p \"$dir\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; chmod +x \"$tmp\"; mv -f \"$tmp\" \"$bin\"; trap - EXIT; \"$bin\" --version; \"$bin\" --sidecar-target; \"$bin\" --sidecar-build-id",
                 dir = remote_dir,
                 bin = remote_bin,
             );
@@ -2989,9 +3049,20 @@ async fn ensure_sidecar_command(
                     format!("sidecar upload/install failed: {}", output_text(&output)),
                 ));
             }
-            verify_remote_command(server, &remote_bin, target, server_id, workspace_id).await?;
+            verify_remote_command(
+                server,
+                &remote_bin,
+                target,
+                Some(&identity),
+                server_id,
+                workspace_id,
+            )
+            .await?;
             update_sidecar_cache(state, server_id, target, &asset.version, None)?;
-            Ok(remote_bin.clone())
+            Ok(RemoteSidecarCommand {
+                command: remote_bin.clone(),
+                identity: identity.clone(),
+            })
         }
         .await
     };
@@ -3001,16 +3072,35 @@ async fn ensure_sidecar_command(
     result
 }
 
+fn parse_remote_sidecar_identity(stdout: &str) -> Option<RemoteSidecarIdentity> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let identity = RemoteSidecarIdentity {
+        version: lines.next()?.to_string(),
+        target: lines.next()?.to_string(),
+        build_id: lines.next()?.to_string(),
+    };
+    lines.next().is_none().then_some(identity)
+}
+
+fn remote_sidecar_identity_matches(
+    stdout: &str,
+    expected_identity: &RemoteSidecarIdentity,
+) -> bool {
+    parse_remote_sidecar_identity(stdout).is_some_and(|identity| &identity == expected_identity)
+}
+
 async fn remote_sidecar_matches(
     server: &RemoteServerProfile,
     remote_bin: &str,
-    version: &str,
-    target: &str,
+    expected_identity: &RemoteSidecarIdentity,
     server_id: &str,
     workspace_id: Option<&str>,
 ) -> Result<bool, ApiError> {
     let command = format!(
-        "test -x {bin} && {bin} --version && {bin} --sidecar-target",
+        "test -x {bin} && {bin} --version && {bin} --sidecar-target && {bin} --sidecar-build-id",
         bin = remote_bin
     );
     let output = run_ssh_output(server, &[command.as_str()], true, server_id, workspace_id).await?;
@@ -3018,22 +3108,19 @@ async fn remote_sidecar_matches(
         return Ok(false);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    Ok(lines.next() == Some(version) && lines.next() == Some(target))
+    Ok(remote_sidecar_identity_matches(&stdout, expected_identity))
 }
 
 async fn verify_remote_command(
     server: &RemoteServerProfile,
     command: &str,
     target: &str,
+    expected_identity: Option<&RemoteSidecarIdentity>,
     server_id: &str,
     workspace_id: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<RemoteSidecarIdentity, ApiError> {
     let check = format!(
-        "{command} --version && {command} --sidecar-target",
+        "{command} --version && {command} --sidecar-target && {command} --sidecar-build-id",
         command = command
     );
     let output = run_ssh_output(server, &[check.as_str()], true, server_id, workspace_id).await?;
@@ -3048,14 +3135,47 @@ async fn verify_remote_command(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.lines().map(str::trim).any(|line| line == target) {
+    let identity = parse_remote_sidecar_identity(&stdout).ok_or_else(|| {
+        remote_error(
+            server_id,
+            workspace_id,
+            "remote sidecar command must report exactly version, target, and build identity",
+        )
+    })?;
+    let expected_version = expected_identity
+        .map(|identity| identity.version.as_str())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    if identity.version != expected_version {
+        return Err(remote_error(
+            server_id,
+            workspace_id,
+            format!("remote sidecar command did not report version {expected_version}"),
+        ));
+    }
+    if identity.target != target {
         return Err(remote_error(
             server_id,
             workspace_id,
             format!("remote sidecar command did not report target {target}"),
         ));
     }
-    Ok(())
+    if !has_compatible_sidecar_build_id(&identity.build_id) {
+        return Err(remote_error(
+            server_id,
+            workspace_id,
+            "remote sidecar command did not report a compatible build identity",
+        ));
+    }
+    if let Some(expected_identity) = expected_identity
+        && identity.build_id != expected_identity.build_id
+    {
+        return Err(remote_error(
+            server_id,
+            workspace_id,
+            "remote sidecar command build identity did not match the verified packaged asset",
+        ));
+    }
+    Ok(identity)
 }
 
 async fn ensure_remote_session_file(
@@ -3292,12 +3412,14 @@ fn validate_bootstrap(
     bootstrap: &RemoteSidecarBootstrap,
     server_id: &str,
     workspace_id: &str,
-    target: &str,
+    expected_identity: &RemoteSidecarIdentity,
 ) -> Result<(), ApiError> {
-    if bootstrap.version != 1
+    if bootstrap.version != REMOTE_SIDECAR_BOOTSTRAP_VERSION
+        || bootstrap.sidecar_version != expected_identity.version
         || bootstrap.server_id != server_id
         || bootstrap.workspace_id != workspace_id
-        || bootstrap.target != target
+        || bootstrap.target != expected_identity.target
+        || bootstrap.build_id != expected_identity.build_id
         || bootstrap.port == 0
         || bootstrap.token.is_empty()
         || !bootstrap.capabilities.runtime_config_sync
@@ -3306,7 +3428,7 @@ fn validate_bootstrap(
         return Err(remote_error(
             server_id,
             Some(workspace_id),
-            "remote sidecar bootstrap did not match the requested session",
+            "remote sidecar bootstrap did not match the requested session or build identity",
         ));
     }
     Ok(())
@@ -3663,6 +3785,7 @@ fn broker_llm_audit_context(
     fallback_workspace_id: &str,
     payload: &Value,
     request_kind: &str,
+    request_id: &str,
 ) -> Option<BrokerLlmAuditContext> {
     let workspace_id = payload
         .get("workspaceId")
@@ -3687,89 +3810,279 @@ fn broker_llm_audit_context(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string),
-        request_id: payload
-            .get("runId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                payload
-                    .get("requestId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-            })
-            .to_string(),
+        request_id: request_id.to_string(),
         request_kind: request_kind.to_string(),
     })
     .filter(|context| !context.request_id.is_empty())
 }
 
-fn insert_broker_llm_audit_start(
-    context: &BrokerLlmAuditContext,
-    provider_id: &str,
-    model_id: &str,
-    thinking_level: Option<&str>,
-    request_started_at: &str,
-) {
-    if let Err(error) = insert_broker_llm_audit_start_inner(
-        context,
-        provider_id,
-        model_id,
-        thinking_level,
-        request_started_at,
-    ) {
-        tracing::warn!(
-            request_id = %context.request_id,
-            workspace_id = %context.workspace_id,
-            error = %error,
-            "failed to insert brokered remote LLM audit start"
-        );
+const BROKER_AUDIT_WRITE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(25),
+    Duration::from_millis(75),
+    Duration::from_millis(150),
+];
+
+fn broker_audit_write_is_retryable(error: &WorkspaceDatabaseError) -> bool {
+    matches!(error, WorkspaceDatabaseError::MissingLlmRequest { .. })
+        || matches!(
+            error,
+            WorkspaceDatabaseError::Sqlite { source, .. }
+                if source.sqlite_error().is_some_and(|sqlite| {
+                    matches!(
+                        format!("{:?}", sqlite.code).as_str(),
+                        "DatabaseBusy" | "DatabaseLocked"
+                    )
+                })
+        )
+}
+
+#[derive(Clone)]
+struct BrokerLlmAuditWriter {
+    context: BrokerLlmAuditContext,
+    provider_id: String,
+    model_id: String,
+    thinking_level: Option<String>,
+    request_started_at: String,
+    save_details: bool,
+}
+
+impl BrokerLlmAuditWriter {
+    fn new(
+        context: BrokerLlmAuditContext,
+        provider_id: &str,
+        model_id: &str,
+        thinking_level: Option<&str>,
+        request_started_at: &str,
+        save_details: bool,
+    ) -> Self {
+        Self {
+            context,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            thinking_level: thinking_level.map(str::to_string),
+            request_started_at: request_started_at.to_string(),
+            save_details,
+        }
+    }
+
+    fn detail_capture(&self) -> ProviderAuditCapture {
+        ProviderAuditCapture::new(
+            &self.context.audit_path,
+            self.context.request_id.clone(),
+            self.save_details,
+        )
+    }
+
+    fn observer(&self) -> Option<ProviderRequestDumpObserver> {
+        self.save_details.then(|| {
+            let writer = self.clone();
+            Arc::new(move |dump: &ProviderWireRequestDump| {
+                if let Err(error) = writer.persist_request_dump(dump) {
+                    tracing::warn!(
+                        workspace_id = %writer.context.workspace_id,
+                        request_id = %writer.context.request_id,
+                        phase = "request_wire",
+                        error = %error.message,
+                        "failed to persist captured brokered provider request dump"
+                    );
+                }
+            }) as ProviderRequestDumpObserver
+        })
+    }
+
+    fn persist_request_failure(&self, failure: &ProviderRequestFailure) -> Result<(), ApiError> {
+        if let Some(dump) = failure.request_dump.as_ref() {
+            self.persist_request_dump(dump)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_started(&self) -> Result<(), WorkspaceDatabaseError> {
+        self.write_with_retry("start", || self.open_ensured_database().map(|_| ()))
+    }
+
+    fn persist_request_dump(&self, dump: &ProviderWireRequestDump) -> Result<(), ApiError> {
+        let Some(request_body_json) = self.detail_capture().request_json(Some(dump))? else {
+            return Ok(());
+        };
+        self.write_with_retry("request_wire", || {
+            let mut database = self.open_ensured_database()?;
+            if database
+                .llm_request(&self.context.request_id)?
+                .and_then(|request| request.request_body_json)
+                .is_some()
+            {
+                return Ok(());
+            }
+            database.update_llm_request_body(&self.context.request_id, Some(&request_body_json))
+        })
+        .map_err(ApiError::from_workspace_error)
+    }
+
+    fn finish(
+        &self,
+        outcome: BrokerLlmAuditOutcome<'_>,
+        events: &[BrokerLlmAuditEvent],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        self.write_with_retry("finish", || {
+            let mut database = self.open_ensured_database()?;
+            let existing_response_body_json = database
+                .llm_request(&self.context.request_id)?
+                .and_then(|request| request.response_body_json);
+            let response_body_json = existing_response_body_json
+                .as_deref()
+                .or(outcome.response_body_json);
+            database.update_llm_request_outcome(
+                &self.context.request_id,
+                UpdateLlmRequestOutcome {
+                    first_token_at: outcome.first_token_at,
+                    completed_at: Some(outcome.completed_at),
+                    input_tokens: outcome.usage.and_then(|usage| usage.input_tokens),
+                    output_tokens: outcome.usage.and_then(|usage| usage.output_tokens),
+                    cache_read_tokens: outcome.usage.and_then(|usage| usage.cache_read_tokens),
+                    cache_write_tokens: outcome.usage.and_then(|usage| usage.cache_write_tokens),
+                    reasoning_tokens: outcome.usage.and_then(|usage| usage.reasoning_tokens),
+                    first_token_latency_ms: outcome.first_token_latency_ms,
+                    total_latency_ms: Some(outcome.total_latency_ms),
+                    status_code: outcome.status_code,
+                    final_state: outcome.final_state,
+                    response_body_json,
+                },
+            )?;
+            self.insert_missing_events(&mut database, events)
+        })
+    }
+
+    fn write_with_retry<T>(
+        &self,
+        phase: &str,
+        mut operation: impl FnMut() -> Result<T, WorkspaceDatabaseError>,
+    ) -> Result<T, WorkspaceDatabaseError> {
+        let mut attempt = 0usize;
+        loop {
+            match operation() {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if broker_audit_write_is_retryable(&error)
+                        && attempt < BROKER_AUDIT_WRITE_RETRY_DELAYS.len() =>
+                {
+                    let delay = BROKER_AUDIT_WRITE_RETRY_DELAYS[attempt];
+                    attempt += 1;
+                    tracing::warn!(
+                        workspace_id = %self.context.workspace_id,
+                        request_id = %self.context.request_id,
+                        phase,
+                        attempt,
+                        retry_delay_ms = delay.as_millis(),
+                        error = %error,
+                        "retrying brokered LLM audit write"
+                    );
+                    std::thread::sleep(delay);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn open_ensured_database(&self) -> Result<WorkspaceDatabase, WorkspaceDatabaseError> {
+        let mut database = WorkspaceDatabase::open_or_create(&self.context.audit_path)?;
+        if let (Some(chat_id), Some(title)) = (
+            self.context.chat_id.as_deref(),
+            self.context.chat_title.as_deref(),
+        ) && database.chat(chat_id)?.is_none()
+        {
+            if let Err(error) = database.insert_chat_with_metadata(chat_id, title, "{}")
+                && database.chat(chat_id)?.is_none()
+            {
+                return Err(error);
+            }
+        }
+        if database.llm_request(&self.context.request_id)?.is_none() {
+            let insert = database.insert_llm_request(NewLlmRequest {
+                id: &self.context.request_id,
+                workspace_id: &self.context.workspace_id,
+                chat_id: self.context.chat_id.as_deref(),
+                request_kind: &self.context.request_kind,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: &self.provider_id,
+                model_id: &self.model_id,
+                thinking_level: self.thinking_level.as_deref(),
+                request_started_at: &self.request_started_at,
+                first_token_at: None,
+                completed_at: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: None,
+                status_code: None,
+                final_state: "running",
+                request_body_json: None,
+                response_body_json: None,
+            });
+            if let Err(error) = insert
+                && database.llm_request(&self.context.request_id)?.is_none()
+            {
+                return Err(error);
+            }
+        }
+        Ok(database)
+    }
+
+    fn insert_missing_events(
+        &self,
+        database: &mut WorkspaceDatabase,
+        events: &[BrokerLlmAuditEvent],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let existing_sequences = database
+            .llm_request_events(&self.context.request_id)?
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect::<HashSet<_>>();
+        for (index, event) in events.iter().enumerate() {
+            let sequence = index as i64;
+            if existing_sequences.contains(&sequence) {
+                continue;
+            }
+            let event_id = format!("{}-event-{sequence}", self.context.request_id);
+            let normalized_event_json = event.normalized_event.to_string();
+            database.insert_llm_request_event(NewLlmRequestEvent {
+                id: &event_id,
+                llm_request_id: &self.context.request_id,
+                sequence,
+                event_at: &event.event_at,
+                event_type: &event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &normalized_event_json,
+            })?;
+        }
+        Ok(())
     }
 }
 
-fn insert_broker_llm_audit_start_inner(
+#[cfg(test)]
+fn broker_llm_audit_writer_for_test(
     context: &BrokerLlmAuditContext,
     provider_id: &str,
     model_id: &str,
     thinking_level: Option<&str>,
     request_started_at: &str,
-) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let mut database = WorkspaceDatabase::open_or_create(&context.audit_path)?;
-    if let (Some(chat_id), Some(title)) =
-        (context.chat_id.as_deref(), context.chat_title.as_deref())
-        && database.chat(chat_id)?.is_none()
-    {
-        database.insert_chat_with_metadata(chat_id, title, "{}")?;
-    }
-    if database.llm_request(&context.request_id)?.is_some() {
-        return Ok(());
-    }
-    database.insert_llm_request(NewLlmRequest {
-        id: &context.request_id,
-        workspace_id: &context.workspace_id,
-        chat_id: context.chat_id.as_deref(),
-        request_kind: &context.request_kind,
-        agent_team_id: None,
-        agent_instance_id: None,
-        agent_task_id: None,
-        agent_attempt_id: None,
+) -> BrokerLlmAuditWriter {
+    let writer = BrokerLlmAuditWriter::new(
+        context.clone(),
         provider_id,
         model_id,
         thinking_level,
         request_started_at,
-        first_token_at: None,
-        completed_at: None,
-        input_tokens: None,
-        output_tokens: None,
-        cache_read_tokens: None,
-        cache_write_tokens: None,
-        reasoning_tokens: None,
-        first_token_latency_ms: None,
-        total_latency_ms: None,
-        status_code: None,
-        final_state: "running",
-        request_body_json: None,
-        response_body_json: None,
-    })
+        false,
+    );
+    writer.ensure_started().expect("start broker LLM audit");
+    writer
 }
 
 struct BrokerLlmAuditOutcome<'a> {
@@ -3784,59 +4097,22 @@ struct BrokerLlmAuditOutcome<'a> {
 }
 
 fn finish_broker_llm_audit(
-    context: Option<&BrokerLlmAuditContext>,
+    writer: Option<&BrokerLlmAuditWriter>,
     outcome: BrokerLlmAuditOutcome<'_>,
     events: &[BrokerLlmAuditEvent],
 ) {
-    let Some(context) = context else {
+    let Some(writer) = writer else {
         return;
     };
-    if let Err(error) = finish_broker_llm_audit_inner(context, outcome, events) {
+    if let Err(error) = writer.finish(outcome, events) {
         tracing::warn!(
-            request_id = %context.request_id,
-            workspace_id = %context.workspace_id,
+            request_id = %writer.context.request_id,
+            workspace_id = %writer.context.workspace_id,
+            phase = "finish",
             error = %error,
             "failed to finish brokered remote LLM audit"
         );
     }
-}
-
-fn finish_broker_llm_audit_inner(
-    context: &BrokerLlmAuditContext,
-    outcome: BrokerLlmAuditOutcome<'_>,
-    events: &[BrokerLlmAuditEvent],
-) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let mut database = WorkspaceDatabase::open_or_create(&context.audit_path)?;
-    database.update_llm_request_outcome(
-        &context.request_id,
-        UpdateLlmRequestOutcome {
-            first_token_at: outcome.first_token_at,
-            completed_at: Some(outcome.completed_at),
-            input_tokens: outcome.usage.and_then(|usage| usage.input_tokens),
-            output_tokens: outcome.usage.and_then(|usage| usage.output_tokens),
-            cache_read_tokens: outcome.usage.and_then(|usage| usage.cache_read_tokens),
-            cache_write_tokens: outcome.usage.and_then(|usage| usage.cache_write_tokens),
-            reasoning_tokens: outcome.usage.and_then(|usage| usage.reasoning_tokens),
-            first_token_latency_ms: outcome.first_token_latency_ms,
-            total_latency_ms: Some(outcome.total_latency_ms),
-            status_code: outcome.status_code,
-            final_state: outcome.final_state,
-            response_body_json: outcome.response_body_json,
-        },
-    )?;
-    for (index, event) in events.iter().enumerate() {
-        let normalized_event_json = event.normalized_event.to_string();
-        database.insert_llm_request_event(NewLlmRequestEvent {
-            id: &unique_id("llm-event"),
-            llm_request_id: &context.request_id,
-            sequence: index as i64,
-            event_at: &event.event_at,
-            event_type: &event.event_type,
-            raw_chunk_json: None,
-            normalized_event_json: &normalized_event_json,
-        })?;
-    }
-    Ok(())
 }
 
 async fn broker_llm_stream(
@@ -3935,32 +4211,34 @@ async fn broker_llm_stream(
             }
         });
 
-    let audit_context = broker_llm_audit_context(state, workspace_id, &payload, &request_kind).map(
-        |mut context| {
-            // Broker RPC id is the durable audit request id (1:1 with the control message).
-            context.request_id = id.to_string();
-            context
-        },
-    );
+    let audit_context = broker_llm_audit_context(state, workspace_id, &payload, &request_kind, id);
     let request_started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let request_started_instant = Instant::now();
-    if let Some(context) = audit_context.as_ref() {
-        insert_broker_llm_audit_start(
+    let save_details = api_audit_save_details(&config);
+    let audit_writer = audit_context.map(|context| {
+        BrokerLlmAuditWriter::new(
             context,
             provider_id,
             model_id,
             request.thinking_level.as_deref(),
             &request_started_at,
-        );
-    }
-    let save_details = api_audit_save_details(&config);
-    let audit_capture = audit_context.as_ref().map(|context| {
-        ProviderAuditCapture::new(
-            &context.audit_path,
-            context.request_id.clone(),
             save_details,
         )
     });
+    if let Some(writer) = audit_writer.as_ref()
+        && let Err(error) = writer.ensure_started()
+    {
+        tracing::warn!(
+            workspace_id = %writer.context.workspace_id,
+            request_id = %writer.context.request_id,
+            phase = "start",
+            error = %error,
+            "failed to establish brokered remote LLM audit start"
+        );
+    }
+    let audit_capture = audit_writer
+        .as_ref()
+        .map(BrokerLlmAuditWriter::detail_capture);
     let mut audit_events = vec![BrokerLlmAuditEvent {
         event_at: request_started_at.clone(),
         event_type: "start".to_string(),
@@ -3968,9 +4246,9 @@ async fn broker_llm_stream(
             "type": "start",
             "providerId": provider_id,
             "modelId": model_id,
-            "requestKind": audit_context
+            "requestKind": audit_writer
                 .as_ref()
-                .map(|context| context.request_kind.as_str())
+                .map(|writer| writer.context.request_kind.as_str())
                 .unwrap_or(request_kind.as_str()),
         }),
     }];
@@ -3997,7 +4275,7 @@ async fn broker_llm_stream(
                     captured_response_body_json,
                     "broker request cancelled",
                 );
-                finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
+                finish_broker_llm_audit(audit_writer.as_ref(), BrokerLlmAuditOutcome {
                     final_state: cancel_audit.final_state,
                     first_token_at: None,
                     completed_at: &completed_at,
@@ -4014,7 +4292,9 @@ async fn broker_llm_stream(
                 &provider_config,
                 request,
                 save_details,
-                audit_capture.as_ref().and_then(ProviderAuditCapture::observer),
+                audit_writer
+                    .as_ref()
+                    .and_then(BrokerLlmAuditWriter::observer),
             ) => result,
         }
     } else {
@@ -4022,20 +4302,21 @@ async fn broker_llm_stream(
             &provider_config,
             request,
             save_details,
-            audit_capture
+            audit_writer
                 .as_ref()
-                .and_then(ProviderAuditCapture::observer),
+                .and_then(BrokerLlmAuditWriter::observer),
         )
         .await
     } {
         Ok(s) => s,
         Err(failure) => {
-            if let Some(capture) = audit_capture.as_ref()
-                && let Err(error) = capture.persist_request_failure(&failure)
+            if let Some(writer) = audit_writer.as_ref()
+                && let Err(error) = writer.persist_request_failure(&failure)
             {
                 tracing::warn!(
-                    request_id = %id,
-                    workspace_id,
+                    request_id = %writer.context.request_id,
+                    workspace_id = %writer.context.workspace_id,
+                    phase = "request_failure",
                     error = %error.message,
                     "failed to persist brokered provider request failure capture"
                 );
@@ -4063,7 +4344,7 @@ async fn broker_llm_stream(
                     .flatten()
             });
             finish_broker_llm_audit(
-                audit_context.as_ref(),
+                audit_writer.as_ref(),
                 BrokerLlmAuditOutcome {
                     final_state: "failed",
                     first_token_at: None,
@@ -4108,7 +4389,7 @@ async fn broker_llm_stream(
                         captured_response_body_json,
                         "broker request cancelled",
                     );
-                    finish_broker_llm_audit(audit_context.as_ref(), BrokerLlmAuditOutcome {
+                    finish_broker_llm_audit(audit_writer.as_ref(), BrokerLlmAuditOutcome {
                         final_state: cancel_audit.final_state,
                         first_token_at: first_token_at.as_deref(),
                         completed_at: &completed_at,
@@ -4156,7 +4437,7 @@ async fn broker_llm_stream(
                             .flatten()
                     });
                 finish_broker_llm_audit(
-                    audit_context.as_ref(),
+                    audit_writer.as_ref(),
                     BrokerLlmAuditOutcome {
                         final_state: "failed",
                         first_token_at: first_token_at.as_deref(),
@@ -4209,7 +4490,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_context.as_ref(),
+                        audit_writer.as_ref(),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4254,7 +4535,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_context.as_ref(),
+                        audit_writer.as_ref(),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4303,7 +4584,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_context.as_ref(),
+                        audit_writer.as_ref(),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4347,7 +4628,7 @@ async fn broker_llm_stream(
                                 .flatten()
                         });
                     finish_broker_llm_audit(
-                        audit_context.as_ref(),
+                        audit_writer.as_ref(),
                         BrokerLlmAuditOutcome {
                             final_state: "failed",
                             first_token_at: first_token_at.as_deref(),
@@ -4415,7 +4696,7 @@ async fn broker_llm_stream(
                             .flatten()
                     });
                 finish_broker_llm_audit(
-                    audit_context.as_ref(),
+                    audit_writer.as_ref(),
                     BrokerLlmAuditOutcome {
                         final_state: "failed",
                         first_token_at: first_token_at.as_deref(),
@@ -4471,7 +4752,7 @@ async fn broker_llm_stream(
         });
     }
     finish_broker_llm_audit(
-        audit_context.as_ref(),
+        audit_writer.as_ref(),
         BrokerLlmAuditOutcome {
             final_state: broker_llm_final_state(
                 &request_kind,
@@ -6997,6 +7278,7 @@ struct RemoteSidecarRunMetrics {
     first_token_at: Option<String>,
     first_token_latency_ms: Option<i64>,
     usage: NeutralUsage,
+    llm_request_ids: Vec<String>,
 }
 
 impl RemoteSidecarRunMetrics {
@@ -7007,6 +7289,7 @@ impl RemoteSidecarRunMetrics {
             first_token_at: None,
             first_token_latency_ms: None,
             usage: NeutralUsage::default(),
+            llm_request_ids: Vec::new(),
         }
     }
 
@@ -7024,6 +7307,17 @@ impl RemoteSidecarRunMetrics {
         merge_remote_usage(&mut self.usage, &next);
     }
 
+    fn record_llm_request_id(&mut self, request_id: &str) {
+        if !request_id.is_empty()
+            && !self
+                .llm_request_ids
+                .iter()
+                .any(|existing| existing == request_id)
+        {
+            self.llm_request_ids.push(request_id.to_string());
+        }
+    }
+
     fn total_latency_ms(&self) -> i64 {
         remote_elapsed_millis(self.started_at).max(1)
     }
@@ -7036,7 +7330,6 @@ impl RemoteSidecarRunMetrics {
 fn remote_chat_metrics(
     model_id: &str,
     provider_id: &str,
-    run_id: &str,
     run_metrics: &RemoteSidecarRunMetrics,
     total_latency_ms: i64,
 ) -> Value {
@@ -7046,7 +7339,7 @@ fn remote_chat_metrics(
         "totalLatencyMs": total_latency_ms,
         "firstTokenLatencyMs": run_metrics.first_token_latency_ms,
         "outputTokens": run_metrics.usage.output_tokens,
-        "llmRequestIds": [run_id],
+        "llmRequestIds": &run_metrics.llm_request_ids,
     })
 }
 
@@ -9000,25 +9293,61 @@ async fn remote_sidecar_run_broker_llm_turn(
         remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
             .await
             .map_err(|_| ())?;
+    run_metrics.record_llm_request_id(broker_request_id);
+    let mut turn_metrics = RemoteSidecarRunMetrics::new();
+
     let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
+    let mut emitted_attempt_start = false;
+    let mut saw_usage_delta = false;
     let mut reasoning_loop_detector = ReasoningLoopDetector::default();
     loop {
         let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
             Ok(Some(envelope)) => envelope,
-            Ok(None) => return Ok(None),
-            Err(_) => {
-                let message =
-                    "remote broker request timed out; retry to resume from persisted messages";
+            Ok(None) => {
+                let message = "remote broker closed before completion; retry to resume from persisted messages";
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                let total_latency_ms = run_metrics.total_latency_ms();
+                let total_latency_ms = turn_metrics.total_latency_ms();
+                state.broker_pending.lock().await.remove(broker_request_id);
                 let _ = persist_sidecar_llm_audit(
                     database,
                     &state.workspace_id,
                     chat_id,
-                    run_id,
+                    broker_request_id,
                     provider_id,
                     model_id,
-                    run_metrics,
+                    &turn_metrics,
+                    &completed_at,
+                    total_latency_ms,
+                    "failed",
+                    json!({ "error": { "message": message } }),
+                );
+                *sequence += 1;
+                run_stream.record(
+                    *sequence,
+                    json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                );
+                *sequence += 1;
+                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                return Err(());
+            }
+            Err(_) => {
+                let message =
+                    "remote broker request timed out; retry to resume from persisted messages";
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = turn_metrics.total_latency_ms();
+                remote_sidecar_cancel_broker_request_id(state, broker_request_id);
+                state.broker_pending.lock().await.remove(broker_request_id);
+                let _ = persist_sidecar_llm_audit(
+                    database,
+                    &state.workspace_id,
+                    chat_id,
+                    broker_request_id,
+                    provider_id,
+                    model_id,
+                    &turn_metrics,
                     &completed_at,
                     total_latency_ms,
                     "failed",
@@ -9037,6 +9366,18 @@ async fn remote_sidecar_run_broker_llm_turn(
                 return Err(());
             }
         };
+        if !emitted_attempt_start {
+            *sequence += 1;
+            run_stream.record(
+                *sequence,
+                json!({
+                    "type": "streamAttemptStart",
+                    "assistantMessageId": assistant_message_id,
+                    "llmRequestId": broker_request_id,
+                }),
+            );
+            emitted_attempt_start = true;
+        }
         match envelope.message_type.as_str() {
             "stream" => {
                 let kind = envelope
@@ -9051,6 +9392,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .unwrap_or("");
                 if kind == "textDelta" {
                     run_metrics.capture_first_output();
+                    turn_metrics.capture_first_output();
                     text.push_str(delta);
                     *sequence += 1;
                     run_stream.record(
@@ -9063,6 +9405,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     );
                 } else if kind == "reasoningDelta" {
                     run_metrics.capture_first_output();
+                    turn_metrics.capture_first_output();
                     let loop_detection = reasoning_loop_detector.push_delta(delta);
                     reasoning.push_str(delta);
                     *sequence += 1;
@@ -9082,7 +9425,6 @@ async fn remote_sidecar_run_broker_llm_turn(
                         let metrics = remote_chat_metrics(
                             model_id,
                             provider_id,
-                            broker_request_id,
                             run_metrics,
                             total_latency_ms,
                         );
@@ -9109,6 +9451,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                             sequence: assistant_sequence,
                             metadata_json: Some(&metadata.to_string()),
                         });
+                        let turn_total_latency_ms = turn_metrics.total_latency_ms();
                         let _ = persist_sidecar_llm_audit(
                             database,
                             &state.workspace_id,
@@ -9116,9 +9459,9 @@ async fn remote_sidecar_run_broker_llm_turn(
                             broker_request_id,
                             provider_id,
                             model_id,
-                            run_metrics,
+                            &turn_metrics,
                             &completed_at,
-                            total_latency_ms,
+                            turn_total_latency_ms,
                             "failed",
                             json!({
                                 "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
@@ -9139,12 +9482,20 @@ async fn remote_sidecar_run_broker_llm_turn(
                         return Err(());
                     }
                 } else if kind == "usageDelta" {
+                    let usage = envelope
+                        .payload
+                        .get("usage")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    run_metrics.merge_usage_value(&usage);
+                    turn_metrics.merge_usage_value(&usage);
+                    saw_usage_delta = true;
                     *sequence += 1;
                     run_stream.record(
                         *sequence,
                         json!({
                             "type": "usage",
-                            "usage": envelope.payload.get("usage").cloned().unwrap_or(Value::Null),
+                            "usage": usage,
                         }),
                     );
                 } else if kind == "toolCall" {
@@ -9157,6 +9508,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         continue;
                     };
                     run_metrics.capture_first_output();
+                    turn_metrics.capture_first_output();
                     // ponytail: stream toolCall chunks may have partial arguments; only merge
                     // in memory and persist/emit after the broker response with full args.
                     collected_tool_calls = merge_remote_tool_calls(
@@ -9177,17 +9529,27 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
             }
             "response" => {
-                let audit_request_id = envelope
+                if let Some(response_request_id) = envelope
                     .payload
                     .get("llmRequestId")
                     .and_then(Value::as_str)
-                    .unwrap_or(broker_request_id);
+                    .filter(|response_request_id| *response_request_id != broker_request_id)
+                {
+                    tracing::warn!(
+                        broker_request_id,
+                        response_request_id,
+                        "broker response LLM request id differed from the RPC id; preserving the RPC id"
+                    );
+                }
                 let usage = envelope
                     .payload
                     .get("usage")
                     .cloned()
                     .unwrap_or(Value::Null);
-                run_metrics.merge_usage_value(&usage);
+                if !saw_usage_delta {
+                    run_metrics.merge_usage_value(&usage);
+                    turn_metrics.merge_usage_value(&usage);
+                }
                 let response_tool_calls = envelope
                     .payload
                     .get("toolCalls")
@@ -9203,78 +9565,94 @@ async fn remote_sidecar_run_broker_llm_turn(
                 };
                 if !tool_calls.is_empty() {
                     run_metrics.capture_first_output();
-                }
-                if tool_calls.is_empty() {
+                    turn_metrics.capture_first_output();
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    let total_latency_ms = run_metrics.total_latency_ms();
-                    let metrics = remote_chat_metrics(
-                        model_id,
-                        provider_id,
-                        audit_request_id,
-                        run_metrics,
-                        total_latency_ms,
-                    );
-                    let usage = run_metrics.usage_value();
-                    let metadata = json!({
-                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                        "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
-                        "metrics": metrics,
-                    });
-                    let assistant_sequence = database
-                        .message(assistant_message_id)
-                        .ok()
-                        .flatten()
-                        .map(|message| message.sequence)
-                        .unwrap_or_else(|| {
-                            database
-                                .next_message_sequence_for_chat(chat_id)
-                                .unwrap_or(0)
-                        });
-                    let _ = database.upsert_message_content(NewMessage {
-                        id: assistant_message_id,
-                        chat_id,
-                        role: "assistant",
-                        content: text,
-                        sequence: assistant_sequence,
-                        metadata_json: Some(&metadata.to_string()),
-                    });
-                    let _ = remote_clear_message_queued_run(database, queued_user_message_id);
-                    let completion_payload = remote_chat_completion_event(
-                        chat_id,
-                        assistant_message_id,
-                        text,
-                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
-                        usage.clone(),
-                        metrics.clone(),
-                    );
+                    let total_latency_ms = turn_metrics.total_latency_ms();
                     let _ = persist_sidecar_llm_audit(
                         database,
                         &state.workspace_id,
                         chat_id,
-                        audit_request_id,
+                        broker_request_id,
                         provider_id,
                         model_id,
-                        run_metrics,
+                        &turn_metrics,
                         &completed_at,
                         total_latency_ms,
                         "succeeded",
-                        completion_payload.clone(),
+                        json!({
+                            "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
+                            "status": "ok",
+                            "usage": usage,
+                            "toolCalls": tool_calls.clone(),
+                        }),
                     );
-                    let _ = database.insert_run_event(NewRunEvent {
-                        id: &unique_id("run-event"),
-                        chat_id,
-                        run_id,
-                        sequence: *sequence,
-                        event_type: "completion",
-                        payload_json: &completion_payload.to_string(),
-                    });
-                    *sequence += 1;
-                    run_stream.record(*sequence, completion_payload);
-                    *sequence += 1;
-                    run_stream.record(*sequence, json!({ "type": "streamEnd" }));
-                    return Ok(None);
+                    return Ok(Some(tool_calls));
                 }
-                return Ok(Some(tool_calls));
+
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                let total_latency_ms = run_metrics.total_latency_ms();
+                let metrics =
+                    remote_chat_metrics(model_id, provider_id, run_metrics, total_latency_ms);
+                let usage = run_metrics.usage_value();
+                let metadata = json!({
+                    "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                    "parts": remote_chat_parts(text, (!reasoning.is_empty()).then_some(reasoning.as_str())),
+                    "metrics": metrics,
+                });
+                let assistant_sequence = database
+                    .message(assistant_message_id)
+                    .ok()
+                    .flatten()
+                    .map(|message| message.sequence)
+                    .unwrap_or_else(|| {
+                        database
+                            .next_message_sequence_for_chat(chat_id)
+                            .unwrap_or(0)
+                    });
+                let _ = database.upsert_message_content(NewMessage {
+                    id: assistant_message_id,
+                    chat_id,
+                    role: "assistant",
+                    content: text,
+                    sequence: assistant_sequence,
+                    metadata_json: Some(&metadata.to_string()),
+                });
+                let _ = remote_clear_message_queued_run(database, queued_user_message_id);
+                let completion_payload = remote_chat_completion_event(
+                    chat_id,
+                    assistant_message_id,
+                    text,
+                    (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                    usage.clone(),
+                    metrics.clone(),
+                );
+                let turn_total_latency_ms = turn_metrics.total_latency_ms();
+                let _ = persist_sidecar_llm_audit(
+                    database,
+                    &state.workspace_id,
+                    chat_id,
+                    broker_request_id,
+                    provider_id,
+                    model_id,
+                    &turn_metrics,
+                    &completed_at,
+                    turn_total_latency_ms,
+                    "succeeded",
+                    completion_payload.clone(),
+                );
+                let _ = database.insert_run_event(NewRunEvent {
+                    id: &unique_id("run-event"),
+                    chat_id,
+                    run_id,
+                    sequence: *sequence,
+                    event_type: "completion",
+                    payload_json: &completion_payload.to_string(),
+                });
+                *sequence += 1;
+                run_stream.record(*sequence, completion_payload);
+                *sequence += 1;
+                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                return Ok(None);
             }
             "error" => {
                 let message = envelope
@@ -9285,15 +9663,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                 let audit_outcome =
                     remote_sidecar_broker_error_audit_outcome(&envelope.payload, message);
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                let total_latency_ms = run_metrics.total_latency_ms();
+                let total_latency_ms = turn_metrics.total_latency_ms();
                 let _ = persist_sidecar_llm_audit(
                     database,
                     &state.workspace_id,
                     chat_id,
-                    run_id,
+                    broker_request_id,
                     provider_id,
                     model_id,
-                    run_metrics,
+                    &turn_metrics,
                     &completed_at,
                     total_latency_ms,
                     audit_outcome.final_state,
@@ -10265,7 +10643,6 @@ async fn remote_sidecar_chat_stream(
             "chatId": chat_id,
             "userMessageId": queued_user_message_id,
             "assistantMessageId": assistant_message_id,
-            "llmRequestId": run_id,
             "memoriesUsed": [],
         })));
         sequence += 1;
@@ -10306,21 +10683,6 @@ async fn remote_sidecar_chat_stream(
                 Ok(result) => result,
                 Err(error) => {
                     let message = error.message;
-                    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    let total_latency_ms = run_metrics.total_latency_ms();
-                    let _ = persist_sidecar_llm_audit(
-                        &mut database,
-                        &stream_state.workspace_id,
-                        &chat_id,
-                        &run_id,
-                        &provider_id,
-                        &model_id,
-                        &run_metrics,
-                        &completed_at,
-                        total_latency_ms,
-                        "failed",
-                        json!({ "error": { "message": message } }),
-                    );
                     sequence += 1;
                     yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                         "type": "error",
@@ -10399,22 +10761,6 @@ async fn remote_sidecar_chat_stream(
                         break;
                     }
                     if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
-                        let completed_at =
-                            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                        let total_latency_ms = run_metrics.total_latency_ms();
-                        let _ = persist_sidecar_llm_audit(
-                            &mut database,
-                            &stream_state.workspace_id,
-                            &chat_id,
-                            &run_id,
-                            &provider_id,
-                            &model_id,
-                            &run_metrics,
-                            &completed_at,
-                            total_latency_ms,
-                            "failed",
-                            json!({ "error": { "message": message } }),
-                        );
                         sequence += 1;
                         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "error",
@@ -10465,22 +10811,6 @@ async fn remote_sidecar_chat_stream(
                             tool_loop_guard.reset_after_compression();
                             continue;
                         }
-                        let completed_at =
-                            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                        let total_latency_ms = run_metrics.total_latency_ms();
-                        let _ = persist_sidecar_llm_audit(
-                            &mut database,
-                            &stream_state.workspace_id,
-                            &chat_id,
-                            &run_id,
-                            &provider_id,
-                            &model_id,
-                            &run_metrics,
-                            &completed_at,
-                            total_latency_ms,
-                            "failed",
-                            json!({ "error": { "message": message } }),
-                        );
                         sequence += 1;
                         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                             "type": "error",
@@ -13119,6 +13449,96 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_identity_match_requires_manifest_digest() {
+        let expected = RemoteSidecarIdentity {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            target: "linux-x64".to_string(),
+            build_id: sidecar_build_id_from_sha256(&"a".repeat(64)),
+        };
+        let matching = format!(
+            "{}\n{}\n{}\n",
+            expected.version, expected.target, expected.build_id
+        );
+        let stale = format!(
+            "{}\n{}\n{}\n",
+            expected.version,
+            expected.target,
+            sidecar_build_id_from_sha256(&"b".repeat(64))
+        );
+
+        assert_eq!(
+            (
+                remote_sidecar_identity_matches(&matching, &expected),
+                remote_sidecar_identity_matches(&stale, &expected),
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn current_sidecar_build_id_has_compatible_protocol_and_digest() {
+        let build_id = current_sidecar_build_id().expect("current executable build identity");
+
+        assert!(has_compatible_sidecar_build_id(&build_id));
+    }
+
+    #[test]
+    fn remote_sidecar_bootstrap_rejects_missing_build_identity() {
+        let expected = RemoteSidecarIdentity {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            target: "linux-x64".to_string(),
+            build_id: sidecar_build_id_from_sha256(&"a".repeat(64)),
+        };
+        let bootstrap = RemoteSidecarBootstrap {
+            version: REMOTE_SIDECAR_BOOTSTRAP_VERSION,
+            sidecar_version: expected.version.clone(),
+            target: expected.target.clone(),
+            build_id: expected.build_id.clone(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: "/workspace".to_string(),
+            server_id: "server".to_string(),
+            port: 3210,
+            token: "token".to_string(),
+            capabilities: RemoteSidecarCapabilities {
+                http_proxy: true,
+                control_broker: true,
+                terminal_pty: true,
+                git: true,
+                code_graph: true,
+                workspace_database: true,
+                runtime_config_sync: true,
+            },
+        };
+        let legacy_bootstrap = serde_json::from_value::<RemoteSidecarBootstrap>(json!({
+            "version": REMOTE_SIDECAR_BOOTSTRAP_VERSION,
+            "target": expected.target,
+            "workspaceId": "workspace",
+            "workspacePath": "/workspace",
+            "serverId": "server",
+            "port": 3210,
+            "token": "token",
+            "capabilities": {
+                "httpProxy": true,
+                "controlBroker": true,
+                "terminalPty": true,
+                "git": true,
+                "codeGraph": true,
+                "workspaceDatabase": true,
+                "runtimeConfigSync": true,
+            },
+        }))
+        .expect("legacy bootstrap parses with defaulted identity fields");
+
+        assert_eq!(
+            (
+                validate_bootstrap(&bootstrap, "server", "workspace", &expected).is_ok(),
+                validate_bootstrap(&legacy_bootstrap, "server", "workspace", &expected).is_err(),
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn remote_sidecar_runtime_state_reads_compression_and_budget_from_synced_bundle() {
         let profile = tempfile::tempdir().expect("profile tempdir");
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -15177,6 +15597,158 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_run_metrics_keep_each_chat_completion_broker_id_once() {
+        let mut metrics = RemoteSidecarRunMetrics::new();
+        metrics.record_llm_request_id("broker-request-1");
+        metrics.record_llm_request_id("broker-request-2");
+        metrics.record_llm_request_id("broker-request-1");
+
+        assert_eq!(
+            metrics.llm_request_ids,
+            vec!["broker-request-1", "broker-request-2"]
+        );
+    }
+
+    #[test]
+    fn broker_audit_writer_self_heals_missing_start_and_preserves_wire_details() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = BrokerLlmAuditContext {
+            audit_path: workspace.path().to_path_buf(),
+            workspace_id: "remote-ws".to_string(),
+            chat_id: Some("chat-1".to_string()),
+            chat_title: Some("Remote chat".to_string()),
+            request_id: "broker-request-1".to_string(),
+            request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
+        };
+        let writer = BrokerLlmAuditWriter::new(
+            context,
+            "provider-1",
+            "model-1",
+            None,
+            "2026-07-13T00:00:00Z",
+            true,
+        );
+        let first_request = foco_providers::ProviderWireRequestDump {
+            format: "provider_request_v1".to_string(),
+            version: 1,
+            method: "POST".to_string(),
+            url: "https://provider.test/v1/chat".to_string(),
+            headers: BTreeMap::new(),
+            body: Some(r#"{"model":"first"}"#.to_string()),
+            body_encoding: Some("utf8".to_string()),
+        };
+        writer
+            .persist_request_dump(&first_request)
+            .expect("request observer self-heals a missing start row");
+        writer
+            .persist_request_dump(&foco_providers::ProviderWireRequestDump {
+                body: Some(r#"{"model":"second"}"#.to_string()),
+                ..first_request
+            })
+            .expect("duplicate observer notification");
+
+        let response_body_json = serde_json::to_string(
+            &foco_providers::ProviderFinalResponseDump::failed("provider failed", Some(502), false),
+        )
+        .expect("serialize captured response");
+        let usage = NeutralUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            cache_read_tokens: Some(2),
+            cache_write_tokens: Some(1),
+            reasoning_tokens: None,
+        };
+        let events = [
+            BrokerLlmAuditEvent {
+                event_at: "2026-07-13T00:00:00Z".to_string(),
+                event_type: "start".to_string(),
+                normalized_event: json!({ "type": "start" }),
+            },
+            BrokerLlmAuditEvent {
+                event_at: "2026-07-13T00:00:01Z".to_string(),
+                event_type: "error".to_string(),
+                normalized_event: json!({ "type": "error", "statusCode": 502 }),
+            },
+        ];
+        writer
+            .finish(
+                BrokerLlmAuditOutcome {
+                    final_state: "failed",
+                    first_token_at: None,
+                    completed_at: "2026-07-13T00:00:01Z",
+                    usage: Some(&usage),
+                    first_token_latency_ms: None,
+                    total_latency_ms: 1000,
+                    status_code: Some(502),
+                    response_body_json: Some(&response_body_json),
+                },
+                &events,
+            )
+            .expect("finish missing-start audit");
+        writer
+            .finish(
+                BrokerLlmAuditOutcome {
+                    final_state: "failed",
+                    first_token_at: None,
+                    completed_at: "2026-07-13T00:00:01Z",
+                    usage: Some(&usage),
+                    first_token_latency_ms: None,
+                    total_latency_ms: 1000,
+                    status_code: Some(502),
+                    response_body_json: None,
+                },
+                &events,
+            )
+            .expect("idempotent finish");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit db");
+        let request = database
+            .llm_request("broker-request-1")
+            .expect("request lookup")
+            .expect("self-healed audit row");
+        let request_body = serde_json::from_str::<Value>(
+            request
+                .request_body_json
+                .as_deref()
+                .expect("captured provider request"),
+        )
+        .expect("valid provider request JSON");
+        assert_eq!(request_body["format"], "provider_request_v1");
+        assert_eq!(request_body["body"], r#"{"model":"first"}"#);
+        let response_body = serde_json::from_str::<Value>(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("captured provider response"),
+        )
+        .expect("valid provider response JSON");
+        assert_eq!(response_body["format"], "provider_final_response_v1");
+        assert_eq!(request.final_state, "failed");
+        assert_eq!(request.input_tokens, Some(7));
+        assert_eq!(request.output_tokens, Some(3));
+        assert_eq!(
+            database
+                .llm_request_events("broker-request-1")
+                .expect("audit events")
+                .into_iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let rollup = database
+            .llm_request_usage_rollup_summary(foco_store::workspace::LlmRequestUsageRollupFilters {
+                workspace_id: Some("remote-ws"),
+                ..Default::default()
+            })
+            .expect("audit usage rollup");
+        assert_eq!(rollup.total_requests, 1);
+        assert_eq!(rollup.failed_requests, 1);
+        assert_eq!(rollup.total_input_tokens, 7);
+        assert_eq!(rollup.total_output_tokens, 3);
+        assert_eq!(rollup.total_tokens, 10);
+    }
+
+    #[test]
     fn brokered_llm_audit_is_readable_by_chat_statistics_filters() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let context = BrokerLlmAuditContext {
@@ -15188,7 +15760,8 @@ mod tests {
             request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
         };
         let started_at = "2026-07-08T00:00:00Z";
-        insert_broker_llm_audit_start(&context, "provider-1", "model-1", None, started_at);
+        let audit_writer =
+            broker_llm_audit_writer_for_test(&context, "provider-1", "model-1", None, started_at);
         let capture = ProviderAuditCapture::new(workspace.path(), "remote-run-1", true);
         let request_body_json = capture
             .request_json(Some(&foco_providers::ProviderWireRequestDump {
@@ -15218,7 +15791,7 @@ mod tests {
         )
         .expect("serialize response");
         finish_broker_llm_audit(
-            Some(&context),
+            Some(&audit_writer),
             BrokerLlmAuditOutcome {
                 final_state: "succeeded",
                 first_token_at: Some("2026-07-08T00:00:01Z"),
@@ -15255,6 +15828,360 @@ mod tests {
                 .expect("events")
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_control_llm_stream_persists_real_provider_wire_and_exposes_same_request_id_to_detail_api()
+     {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let provider_requests = provider_requests.clone();
+                move |
+                    method: axum::http::Method,
+                    uri: axum::http::Uri,
+                    headers: axum::http::HeaderMap,
+                    body: axum::body::Bytes,
+                | {
+                    let provider_requests = provider_requests.clone();
+                    async move {
+                        provider_requests
+                            .lock()
+                            .expect("provider request capture")
+                            .push((method, uri.path().to_string(), headers, body.to_vec()));
+                        let mut response = axum::response::Response::new(
+                            axum::body::Body::from(concat!(
+                                "data: {\"id\":\"broker-wire-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Remote broker wire OK\"}}]}\n\n",
+                                "data: {\"id\":\"broker-wire-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
+                                "data: [DONE]\n\n"
+                            )),
+                        );
+                        let headers = response.headers_mut();
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_static("text/event-stream"),
+                        );
+                        headers.insert(
+                            header::AUTHORIZATION,
+                            header::HeaderValue::from_static("Bearer response-secret"),
+                        );
+                        headers.insert(
+                            header::HeaderName::from_static("x-api-key"),
+                            header::HeaderValue::from_static("response-key-visible"),
+                        );
+                        headers.append(
+                            header::HeaderName::from_static("x-broker-multi"),
+                            header::HeaderValue::from_static("first"),
+                        );
+                        headers.append(
+                            header::HeaderName::from_static("x-broker-multi"),
+                            header::HeaderValue::from_static("second"),
+                        );
+                        response
+                    }
+                }
+            }),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        let broker_request_id = "broker-request-real-wire".to_string();
+        let provider_request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Capture the actual brokered provider wire.".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let broker_payload = json!({
+            "workspaceId": workspace_id,
+            "chatId": "chat-broker-wire",
+            "chatTitle": "Broker wire",
+            "providerId": "provider-1",
+            "modelId": "model-1",
+            "requestKind": "chat completion",
+            "request": provider_request,
+        });
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_request_id = broker_request_id.clone();
+        let control_task = tokio::spawn(async move {
+            let (stream, _) = control_listener
+                .accept()
+                .await
+                .expect("accept control connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept control websocket");
+            let config_message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("config sync timeout")
+                .expect("config sync message")
+                .expect("config sync websocket result");
+            let tungstenite::Message::Text(config_text) = config_message else {
+                panic!("expected config sync text frame");
+            };
+            let config_envelope: ControlEnvelope =
+                serde_json::from_str(config_text.as_str()).expect("config sync envelope");
+            assert_eq!(config_envelope.message_type, "config");
+            assert_eq!(config_envelope.method.as_deref(), Some("config.sync"));
+            let config_id = config_envelope.id.expect("config sync id");
+            let config_response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(config_id),
+                method: None,
+                payload: json!({ "status": "ok" }),
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&config_response)
+                        .expect("serialize config response")
+                        .into(),
+                ))
+                .await
+                .expect("send config response");
+            let request = ControlEnvelope {
+                version: 1,
+                message_type: "request".to_string(),
+                id: Some(control_request_id.clone()),
+                method: Some("llm.stream".to_string()),
+                payload: broker_payload,
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("serialize broker request")
+                        .into(),
+                ))
+                .await
+                .expect("send broker request");
+
+            let mut streamed_text = String::new();
+            loop {
+                let message = timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("broker response timeout")
+                    .expect("broker response message")
+                    .expect("broker response websocket result");
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let envelope: ControlEnvelope =
+                    serde_json::from_str(text.as_str()).expect("broker response envelope");
+                if envelope.id.as_deref() != Some(control_request_id.as_str()) {
+                    continue;
+                }
+                match envelope.message_type.as_str() {
+                    "stream" if envelope.payload["kind"] == "textDelta" => {
+                        streamed_text
+                            .push_str(envelope.payload["delta"].as_str().expect("text delta"));
+                    }
+                    "response" => return (envelope, streamed_text),
+                    "error" => panic!("brokered LLM request failed: {}", envelope.payload),
+                    _ => {}
+                }
+            }
+        });
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .expect("connect main-process control websocket");
+        let (broker_response, streamed_text) = timeout(Duration::from_secs(5), control_task)
+            .await
+            .expect("control fixture completion timeout")
+            .expect("control fixture task");
+        connection_task.abort();
+        let _ = connection_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        assert_eq!(streamed_text, "Remote broker wire OK");
+        assert_eq!(broker_response.payload["status"], "ok");
+        assert_eq!(broker_response.payload["llmRequestId"], broker_request_id);
+        assert_eq!(broker_response.payload["text"], "Remote broker wire OK");
+        let provider_body = {
+            let provider_requests = provider_requests.lock().expect("provider requests");
+            assert_eq!(provider_requests.len(), 1);
+            let (method, path, headers, provider_body) = &provider_requests[0];
+            assert_eq!(*method, axum::http::Method::POST);
+            assert_eq!(path, "/v1/chat/completions");
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer remote-provider-test-key")
+            );
+            provider_body.clone()
+        };
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit database");
+        let request = database
+            .llm_request(&broker_request_id)
+            .expect("broker audit lookup")
+            .expect("broker audit row");
+        assert_eq!(request.chat_id.as_deref(), Some("chat-broker-wire"));
+        assert_eq!(request.request_kind, "chat completion");
+        assert_eq!(request.final_state, "succeeded");
+        assert_eq!(request.input_tokens, Some(11));
+        assert_eq!(request.output_tokens, Some(4));
+        let request_wire: Value = serde_json::from_str(
+            request
+                .request_body_json
+                .as_deref()
+                .expect("captured provider request wire"),
+        )
+        .expect("provider request wire JSON");
+        assert_eq!(request_wire["format"], "provider_request_v1");
+        assert_eq!(request_wire["method"], "POST");
+        assert_eq!(
+            request_wire["url"]
+                .as_str()
+                .expect("provider request wire URL"),
+            format!("http://{provider_address}/v1/chat/completions")
+        );
+        assert_eq!(
+            request_wire["body"]
+                .as_str()
+                .expect("provider request wire body")
+                .as_bytes(),
+            provider_body.as_slice()
+        );
+        assert_eq!(request_wire["headers"]["authorization"][0], "********");
+        assert_eq!(
+            request_wire["headers"]["content-type"][0],
+            "application/json"
+        );
+        let response_wire: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("captured provider response wire"),
+        )
+        .expect("provider response wire JSON");
+        assert_eq!(response_wire["format"], "provider_final_response_v1");
+        assert_eq!(response_wire["state"], "succeeded");
+        assert_eq!(response_wire["text"], "Remote broker wire OK");
+        assert_eq!(response_wire["http"]["status"], 200);
+        assert_eq!(response_wire["http"]["version"], "HTTP/1.1");
+        assert_eq!(
+            response_wire["http"]["headers"]["authorization"][0],
+            "********"
+        );
+        assert_eq!(
+            response_wire["http"]["headers"]["x-broker-multi"],
+            json!(["first", "second"])
+        );
+        assert_eq!(
+            response_wire["http"]["headers"]["x-api-key"][0],
+            "response-key-visible"
+        );
+        assert_eq!(
+            database
+                .llm_request_events(&broker_request_id)
+                .expect("broker audit events")
+                .len(),
+            2
+        );
+        drop(database);
+
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state),
+            AxumPath((workspace_id, broker_request_id)),
+        )
+        .await
+        .expect("broker AI statistics detail");
+        assert_eq!(detail.request.id, "broker-request-real-wire");
+        assert_eq!(detail.request.request_detail_status, "captured");
+        assert_eq!(detail.request.response_detail_status, "captured");
+        assert_eq!(detail.request.request_body.as_ref(), Some(&request_wire));
+        assert_eq!(detail.request.response_body.as_ref(), Some(&response_wire));
+        assert_eq!(
+            detail
+                .request
+                .request_body
+                .as_ref()
+                .and_then(|body| body["format"].as_str()),
+            Some("provider_request_v1")
+        );
+        assert_eq!(
+            detail
+                .request
+                .request_body
+                .as_ref()
+                .expect("detail request body")["headers"]["authorization"][0],
+            "********"
+        );
+        assert_eq!(
+            detail
+                .request
+                .response_body
+                .as_ref()
+                .and_then(|body| body["format"].as_str()),
+            Some("provider_final_response_v1")
+        );
+        assert_eq!(
+            detail
+                .request
+                .response_body
+                .as_ref()
+                .expect("detail response body")["http"]["headers"]["x-broker-multi"],
+            json!(["first", "second"])
         );
     }
 
@@ -15401,7 +16328,7 @@ mod tests {
                 request_id: request_id.to_string(),
                 request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
             };
-            insert_broker_llm_audit_start(
+            let audit_writer = broker_llm_audit_writer_for_test(
                 &context,
                 "provider-1",
                 "model-1",
@@ -15422,7 +16349,7 @@ mod tests {
                 "broker request cancelled",
             );
             finish_broker_llm_audit(
-                Some(&context),
+                Some(&audit_writer),
                 BrokerLlmAuditOutcome {
                     final_state: cancel_audit.final_state,
                     first_token_at: has_first_token.then_some("2026-07-12T00:00:01Z"),
@@ -15518,9 +16445,10 @@ mod tests {
             request_kind: BROKER_CONTEXT_COMPRESSION_REQUEST_KIND.to_string(),
         };
         let started_at = "2026-07-08T00:00:00Z";
-        insert_broker_llm_audit_start(&context, "provider-1", "model-1", None, started_at);
+        let audit_writer =
+            broker_llm_audit_writer_for_test(&context, "provider-1", "model-1", None, started_at);
         finish_broker_llm_audit(
-            Some(&context),
+            Some(&audit_writer),
             BrokerLlmAuditOutcome {
                 final_state: "succeeded",
                 first_token_at: Some("2026-07-08T00:00:01Z"),
@@ -15898,7 +16826,7 @@ mod tests {
                 .send(ControlEnvelope {
                     version: 1,
                     message_type: "response".to_string(),
-                    id: Some(first_id),
+                    id: Some(first_id.clone()),
                     method: None,
                     payload: json!({
                         "usage": { "inputTokens": 4, "outputTokens": 2 },
@@ -15955,7 +16883,7 @@ mod tests {
                 .send(ControlEnvelope {
                     version: 1,
                     message_type: "response".to_string(),
-                    id: Some(second_id),
+                    id: Some(second_id.clone()),
                     method: None,
                     payload: json!({
                         "usage": { "inputTokens": 6, "outputTokens": 3 },
@@ -15964,6 +16892,7 @@ mod tests {
                     timestamp: None,
                 })
                 .expect("send final response");
+            (first_id, second_id)
         });
 
         let bytes = tokio::time::timeout(
@@ -15973,7 +16902,8 @@ mod tests {
         .await
         .expect("tool followup SSE body should finish")
         .expect("SSE bytes");
-        broker.await.expect("broker task");
+        let (first_broker_request_id, second_broker_request_id) =
+            broker.await.expect("broker task");
         let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
         assert!(text.contains("\"type\":\"toolResult\""));
         assert!(text.contains("\"type\":\"complete\""));
@@ -15993,23 +16923,36 @@ mod tests {
         assert!(total_latency_ms > 0);
         assert!(metadata["metrics"]["firstTokenLatencyMs"].is_number());
         assert_eq!(metadata["metrics"]["outputTokens"], 5);
+        assert_eq!(
+            metadata["metrics"]["llmRequestIds"],
+            json!([&first_broker_request_id, &second_broker_request_id])
+        );
 
-        let audit = database
+        let audit_rows = database
             .llm_request_audit_rows(LlmRequestAuditFilters {
                 chat_id: Some("chat-1"),
                 ..LlmRequestAuditFilters::default()
             })
-            .expect("audit rows")
-            .into_iter()
-            .next()
-            .expect("audit row");
-        assert_eq!(audit.input_tokens, Some(10));
-        assert_eq!(audit.output_tokens, Some(5));
-        assert_eq!(
-            audit.first_token_latency_ms,
-            metadata["metrics"]["firstTokenLatencyMs"].as_i64()
-        );
-        assert_eq!(audit.total_latency_ms, Some(total_latency_ms));
+            .expect("audit rows");
+        assert_eq!(audit_rows.len(), 2);
+
+        let first_audit = database
+            .llm_request(&first_broker_request_id)
+            .expect("first audit lookup")
+            .expect("first broker audit row");
+        assert_eq!(first_audit.input_tokens, Some(4));
+        assert_eq!(first_audit.output_tokens, Some(2));
+        assert!(first_audit.first_token_latency_ms.is_some());
+        assert!(first_audit.total_latency_ms.unwrap_or_default() > 0);
+
+        let second_audit = database
+            .llm_request(&second_broker_request_id)
+            .expect("second audit lookup")
+            .expect("second broker audit row");
+        assert_eq!(second_audit.input_tokens, Some(6));
+        assert_eq!(second_audit.output_tokens, Some(3));
+        assert!(second_audit.first_token_latency_ms.is_some());
+        assert!(second_audit.total_latency_ms.unwrap_or_default() > 0);
     }
 
     #[tokio::test]
@@ -16085,7 +17028,7 @@ mod tests {
 
         assert!(result.is_err());
         let audit = database
-            .llm_request("remote-run-1")
+            .llm_request("broker-request-1")
             .expect("sidecar audit lookup")
             .expect("sidecar audit exists");
         assert_eq!(audit.request_kind, BROKER_DEFAULT_LLM_REQUEST_KIND);

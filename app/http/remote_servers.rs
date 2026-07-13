@@ -584,12 +584,14 @@ async fn test_remote_server_connection(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let version_command = format!("{command} --version");
+        let version_command = format!(
+            "{command} --version && {command} --sidecar-target && {command} --sidecar-build-id"
+        );
         match run_ssh(server, &[version_command.as_str()], true).await {
             Ok(output) if output.status.success() => {
                 stages[4] = success_stage(
                     "focoCommandVersion",
-                    "focoCommand responded to --version",
+                    "focoCommand responded to --version, --sidecar-target, and --sidecar-build-id",
                     output_details(&output),
                 );
             }
@@ -597,7 +599,7 @@ async fn test_remote_server_connection(
                 stages[4] = failed_stage(
                     "focoCommandVersion",
                     "startup_failed",
-                    "focoCommand failed to report a version",
+                    "focoCommand failed to report version, target, and build identity",
                     output_details(&output),
                 );
                 return diagnostic_result(stages);
@@ -609,12 +611,14 @@ async fn test_remote_server_connection(
         }
     } else if let Some(asset) = sidecar {
         let remote_path = format!("~/.foco/sidecars/{}/{}/foco", asset.version, target);
-        let check_command = format!("test -x {remote_path} && {remote_path} --version");
+        let check_command = format!(
+            "test -x {remote_path} && {remote_path} --version && {remote_path} --sidecar-target && {remote_path} --sidecar-build-id"
+        );
         match run_ssh(server, &[check_command.as_str()], true).await {
             Ok(output) if output.status.success() => {
                 stages[4] = success_stage(
                     "focoCommandVersion",
-                    "Installed sidecar responded to --version",
+                    "Installed sidecar responded to version, target, and build identity",
                     output_details(&output),
                 );
             }
@@ -971,6 +975,7 @@ pub(crate) fn normalize_target(uname_output: &str) -> Result<String, String> {
 pub(crate) struct SelectedSidecarAsset {
     pub(crate) version: String,
     pub(crate) target: String,
+    pub(crate) sha256: String,
     pub(crate) path: PathBuf,
 }
 
@@ -1008,6 +1013,7 @@ pub(crate) fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset,
         return Ok(SelectedSidecarAsset {
             version: manifest.version,
             target: target.to_string(),
+            sha256: digest,
             path: asset_path,
         });
     }
