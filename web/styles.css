@@ -2705,7 +2705,7 @@ body,
 
 .context-usage-bar-threshold.is-llm {
   left: 95%;
-  transform: translateX(-100%);
+  transform: translateX(-50%);
 }
 
 .context-usage-bar-copy {
