@@ -60,11 +60,11 @@ use crate::http::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
         DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
         ManualPromptSettingsRequest, ManualSkillsRequest, TestModelRequest,
-        UpdateAgentDefinitionRequest, associate_provider_with_local_models,
-        can_save_new_provider_after_model_list_error, default_plan_mode_system_prompt,
-        filter_provider_model_ids, model_test_execution_options, model_test_probe,
-        model_test_provider_request, normalize_chat_title_generation_model_id, save_skills,
-        test_model,
+        UpdateAgentDefinitionRequest, UpdateModelRouteRequest,
+        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
+        default_plan_mode_system_prompt, filter_provider_model_ids, model_test_execution_options,
+        model_test_probe, model_test_provider_request, normalize_chat_title_generation_model_id,
+        save_skills, test_model,
     },
     skill_store::{
         GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES, GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES,
@@ -2911,7 +2911,7 @@ fn test_agent_definition_input() -> AgentDefinitionInput {
     AgentDefinitionInput {
         name: "Coordinator".to_string(),
         description: "Coordinates work.".to_string(),
-        provider_id: "provider".to_string(),
+        _provider_id: None,
         model_id: "model".to_string(),
         model_options: AgentModelOptions {
             thinking_level: None,
@@ -2948,6 +2948,7 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
         .expect("created definition");
     let definition_id = definition.id.clone();
     assert_eq!(definition.revision, AGENT_DEFINITION_INITIAL_REVISION);
+    assert_eq!(definition.provider_id, "provider");
     let response_json = serde_json::to_string(&created).expect("serialize response");
     assert!(!response_json.contains("secret-agent-api-key"));
     assert!(!response_json.contains("apiKey"));
@@ -3554,7 +3555,6 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
 
     let mut custom_input = agent_definition_input_from_settings(image_definition);
     custom_input.model_id = "gpt-alt".to_string();
-    custom_input.provider_id = "provider".to_string();
     custom_input.model_options = AgentModelOptions {
         thinking_level: None,
         max_output_tokens: Some(800),
@@ -3647,6 +3647,311 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
     assert_eq!(stored_image_definition.model_id, "gpt-alt");
 }
 
+fn model_route_test_provider(id: &str, enabled: bool) -> ProviderSettings {
+    ProviderSettings {
+        id: id.to_string(),
+        name: id.to_string(),
+        kind: OPENAI_RESPONSES_KIND.to_string(),
+        enabled,
+        base_url: None,
+        api_key: Some("secret".to_string()),
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    }
+}
+
+#[tokio::test]
+async fn model_route_update_switches_active_provider_and_returns_model_summary() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("provider-2", true));
+        config.models[0].provider_ids.push("provider-2".to_string());
+    });
+    let state = fixture.state;
+
+    let response = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "provider-2".to_string(),
+        }),
+    )
+    .await
+    .expect("switch route")
+    .0;
+    let summary = response
+        .configured_models
+        .iter()
+        .find(|model| model.id == "model")
+        .expect("model summary");
+    assert_eq!(summary.active_provider_id.as_deref(), Some("provider-2"));
+
+    let _ = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "provider-2".to_string(),
+        }),
+    )
+    .await
+    .expect("no-op route update succeeds");
+
+    let memory_config = state.config.lock().expect("config lock").clone();
+    let disk_config: GlobalConfig =
+        serde_json::from_str(&fs::read_to_string(&state.config_file).expect("saved config"))
+            .expect("parse saved config");
+    assert_eq!(memory_config, disk_config);
+    assert_eq!(
+        disk_config.models[0].active_provider_id.as_deref(),
+        Some("provider-2")
+    );
+}
+
+#[tokio::test]
+async fn model_route_update_rejects_invalid_routes_without_mutating_config() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("provider-disabled", false));
+        config.models[0]
+            .provider_ids
+            .push("provider-disabled".to_string());
+    });
+    let state = fixture.state;
+    let original = state.config.lock().expect("config lock").clone();
+
+    let unknown_model = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "missing".to_string(),
+            provider_id: "provider".to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("unknown model");
+    assert_eq!(unknown_model.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_model.message, "model was not found: missing");
+
+    let unassociated = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "other".to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("unassociated provider");
+    assert_eq!(unassociated.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unassociated.message,
+        "active provider 'other' is not associated with model 'model'"
+    );
+
+    let disabled_provider = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "provider-disabled".to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("disabled provider");
+    assert_eq!(disabled_provider.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        disabled_provider.message,
+        "active provider 'provider-disabled' for model 'model' is disabled"
+    );
+
+    {
+        let mut config = state.config.lock().expect("config lock");
+        config.models[0].enabled = false;
+    }
+    let disabled_model = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "provider".to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("disabled model");
+    assert_eq!(disabled_model.status, StatusCode::BAD_REQUEST);
+    assert_eq!(disabled_model.message, "model 'model' is disabled");
+
+    let mut expected = original;
+    expected.models[0].enabled = false;
+    assert_eq!(*state.config.lock().expect("config lock"), expected);
+    assert!(!state.config_file.exists());
+}
+
+#[tokio::test]
+async fn model_route_save_failure_keeps_in_memory_route_unchanged() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("provider-2", true));
+        config.models[0].provider_ids.push("provider-2".to_string());
+    });
+    let state = fixture.state;
+    fs::create_dir_all(&state.config_file).expect("blocking config path directory");
+
+    let error = crate::http::settings::update_model_route(
+        State(state.clone()),
+        Json(UpdateModelRouteRequest {
+            model_id: "model".to_string(),
+            provider_id: "provider-2".to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("save should fail");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state.config.lock().expect("config lock").models[0]
+            .active_provider_id
+            .as_deref(),
+        Some("provider")
+    );
+    assert!(state.config_file.is_dir());
+}
+
+#[tokio::test]
+async fn concurrent_model_edit_and_route_update_preserve_both_changes() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("provider-2", true));
+        config.models[0].provider_ids.push("provider-2".to_string());
+    });
+    let state = fixture.state;
+    let route_state = state.clone();
+    let edit_state = state.clone();
+
+    let (route_result, edit_result) = tokio::join!(
+        crate::http::settings::update_model_route(
+            State(route_state),
+            Json(UpdateModelRouteRequest {
+                model_id: "model".to_string(),
+                provider_id: "provider-2".to_string(),
+            }),
+        ),
+        crate::http::settings::save_manual_model(
+            State(edit_state),
+            Json(ManualModelRequest {
+                model_id: "model".to_string(),
+                display_name: "Edited Model".to_string(),
+                enabled: true,
+                metadata_key: None,
+                context_window: Some(128_000),
+                max_output_tokens: Some(16_384),
+                provider_ids: None,
+                active_provider_id: None,
+                input_modalities: None,
+                output_modalities: None,
+                thinking_level: None,
+                clear_thinking_level: None,
+                system_prompt_name: None,
+            }),
+        )
+    );
+    let _ = route_result.expect("route update");
+    let _ = edit_result.expect("model edit");
+
+    let memory_config = state.config.lock().expect("config lock").clone();
+    let disk_config: GlobalConfig =
+        serde_json::from_str(&fs::read_to_string(&state.config_file).expect("saved config"))
+            .expect("parse saved config");
+    assert_eq!(memory_config, disk_config);
+    assert_eq!(memory_config.models[0].display_name, "Edited Model");
+    assert_eq!(
+        memory_config.models[0].active_provider_id.as_deref(),
+        Some("provider-2")
+    );
+}
+
+#[tokio::test]
+async fn global_config_updates_are_serialized_before_snapshot() {
+    let fixture = prompt_state_fixture(|_| {});
+    let state = fixture.state;
+    let mut first_update = crate::config_update_snapshot(&state)
+        .await
+        .expect("first config update");
+    first_update.app.auto_update_check_enabled = !first_update.app.auto_update_check_enabled;
+    let expected_auto_update = first_update.app.auto_update_check_enabled;
+
+    let contender_state = state.clone();
+    let contender = tokio::spawn(async move {
+        crate::config_update_snapshot(&contender_state)
+            .await
+            .expect("contending config update")
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !contender.is_finished(),
+        "a second writer must wait before taking its snapshot"
+    );
+
+    crate::save_config(&state, &mut first_update).expect("save first config update");
+    let second_update = tokio::time::timeout(Duration::from_secs(1), contender)
+        .await
+        .expect("contending writer unblocks")
+        .expect("contending writer task");
+    assert_eq!(
+        second_update.app.auto_update_check_enabled,
+        expected_auto_update
+    );
+}
+
+#[tokio::test]
+async fn model_route_endpoint_is_wired_through_the_http_router() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("provider-2", true));
+        config.models[0].provider_ids.push("provider-2".to_string());
+    });
+    let state = fixture.state;
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind model route fixture");
+    let addr = listener.local_addr().expect("model route fixture address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/models/route"))
+        .json(&json!({
+            "modelId": "model",
+            "providerId": "provider-2"
+        }))
+        .send()
+        .await
+        .expect("model route request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("model route response");
+    let configured_model = body["configuredModels"]
+        .as_array()
+        .expect("configured model list")
+        .iter()
+        .find(|model| model["id"] == "model")
+        .expect("configured model response");
+    assert_eq!(configured_model["activeProviderId"], "provider-2");
+
+    app_task.abort();
+}
+
 #[tokio::test]
 async fn image_output_model_can_be_saved_without_text_limits() {
     let fixture = prompt_state_fixture(|_| {});
@@ -3692,7 +3997,7 @@ fn agent_definition_input_from_settings(
     AgentDefinitionInput {
         name: definition.name.clone(),
         description: definition.description.clone(),
-        provider_id: definition.provider_id.clone(),
+        _provider_id: Some(definition.provider_id.clone()),
         model_id: definition.model_id.clone(),
         model_options: definition.model_options.clone(),
         system_prompt: definition.system_prompt.clone(),
@@ -24928,6 +25233,7 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 3210)),
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
         update_install_lock: Arc::new(AsyncMutex::new(())),
+        config_write_lock: Arc::new(AsyncMutex::new(())),
         update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(detect_ripgrep(&foco_root_dir))),
         user_profile_dir,

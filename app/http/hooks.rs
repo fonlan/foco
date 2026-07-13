@@ -26,7 +26,7 @@ pub(crate) async fn save_global_hooks(
     State(state): State<AppState>,
     Json(request): Json<SaveGlobalHooksRequest>,
 ) -> Result<Json<HooksSettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let audit_enabled = config.hooks.audit_enabled;
 
     config.hooks = request.config;
@@ -34,7 +34,7 @@ pub(crate) async fn save_global_hooks(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     hooks_settings_response(&state, &config, None).await
 }
@@ -61,7 +61,7 @@ pub(crate) async fn import_claude_hooks(
     State(state): State<AppState>,
     Json(request): Json<ImportClaudeHooksRequest>,
 ) -> Result<Json<ImportClaudeHooksResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let target = request.target.trim();
     if target != "global" && target != "workspace" {
         return Err(ApiError::bad_request(
@@ -131,7 +131,7 @@ pub(crate) async fn import_claude_hooks(
 
     if target == "global" {
         config.hooks = imported.clone();
-        save_config(&state, config)?;
+        save_config(&state, &mut config)?;
     } else {
         let workspace = workspace
             .as_ref()

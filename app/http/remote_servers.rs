@@ -158,7 +158,7 @@ pub(crate) async fn create_remote_server(
     State(state): State<AppState>,
     Json(input): Json<RemoteServerInput>,
 ) -> Result<Json<RemoteServerResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let mut server = remote_server_from_input(input, None)?;
     if config
         .remote_servers
@@ -169,7 +169,7 @@ pub(crate) async fn create_remote_server(
     }
     reject_duplicate_remote_server(&config, &server, None)?;
     config.remote_servers.push(server.clone());
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
         server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
@@ -180,7 +180,7 @@ pub(crate) async fn update_remote_server(
     State(state): State<AppState>,
     Json(input): Json<RemoteServerInput>,
 ) -> Result<Json<RemoteServerResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = input
         .id
         .as_deref()
@@ -202,7 +202,7 @@ pub(crate) async fn update_remote_server(
         .position(|item| item.id == id)
         .expect("remote server existed above");
     config.remote_servers[index] = server.clone();
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     let connected_ids = connected_remote_server_ids(&state)?;
     Ok(Json(RemoteServerResponse {
         server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
@@ -213,7 +213,7 @@ pub(crate) async fn delete_remote_server(
     State(state): State<AppState>,
     Json(request): Json<RemoteServerIdRequest>,
 ) -> Result<Json<DeleteRemoteServerResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
     let references = remote_server_workspace_references(&config, id);
     if !references.is_empty() {
@@ -236,7 +236,7 @@ pub(crate) async fn delete_remote_server(
             "remote server was not found: {id}"
         )));
     }
-    save_config(&state, config)?;
+    save_config(&state, &mut config)?;
     disconnect_remote_server_id(&state, id)?;
     state.remote_workspace_manager.disconnect_server(id).await?;
     Ok(Json(DeleteRemoteServerResponse {
@@ -400,20 +400,20 @@ async fn run_remote_server_diagnostic_api(
     let server = remote_server_by_id(&config, &server_id)?.clone();
     let mut result = test_remote_server_connection(&server).await;
 
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let mut updated = update_remote_server_diagnostic_cache(&mut config, &server_id, &result)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     if mark_connected && result.ok {
         state
             .remote_workspace_manager
             .ensure_server_sidecar(state.clone(), &server_id)
             .await?;
-        config = config_snapshot(&state)?;
+        config = config_update_snapshot(&state).await?;
         updated = remote_server_by_id(&config, &server_id)?.clone();
         result = test_remote_server_connection(&updated).await;
         updated = update_remote_server_diagnostic_cache(&mut config, &server_id, &result)?;
-        save_config(&state, config.clone())?;
+        save_config(&state, &mut config)?;
         let mut connections = state
             .remote_server_connections
             .lock()

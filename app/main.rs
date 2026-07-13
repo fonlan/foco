@@ -85,7 +85,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch,
+};
 use tokio::time::timeout;
 
 use crate::http::assets::verify_frontend_assets;
@@ -384,6 +386,7 @@ pub(crate) struct AppState {
     listen_addr: SocketAddr,
     ripgrep_install_lock: Arc<AsyncMutex<()>>,
     update_install_lock: Arc<AsyncMutex<()>>,
+    config_write_lock: Arc<AsyncMutex<()>>,
     update_state: Arc<Mutex<crate::update_runtime::UpdateState>>,
     ripgrep_status: Arc<Mutex<RipgrepStatus>>,
     user_profile_dir: PathBuf,
@@ -895,6 +898,7 @@ async fn run_server_until_shutdown(
         listen_addr: addr,
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
         update_install_lock: Arc::new(AsyncMutex::new(())),
+        config_write_lock: Arc::new(AsyncMutex::new(())),
         update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
         ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
         user_profile_dir: loaded_config.paths.user_profile_dir,
@@ -7520,14 +7524,67 @@ pub(crate) fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError
     Ok(config.clone())
 }
 
-pub(crate) fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
-    save_global_config(&state.config_file, &config).map_err(ApiError::from_config_error)?;
+pub(crate) struct ConfigUpdate {
+    write_guard: Option<OwnedMutexGuard<()>>,
+    original: GlobalConfig,
+    config: GlobalConfig,
+}
 
-    let mut stored_config = state
-        .config
-        .lock()
-        .map_err(|_| ApiError::internal("global config lock is poisoned"))?;
-    *stored_config = config;
+impl std::ops::Deref for ConfigUpdate {
+    type Target = GlobalConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for ConfigUpdate {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
+impl ConfigUpdate {
+    pub(crate) fn into_config(self) -> GlobalConfig {
+        self.config
+    }
+}
+
+pub(crate) async fn config_update_snapshot(state: &AppState) -> Result<ConfigUpdate, ApiError> {
+    let write_guard = state.config_write_lock.clone().lock_owned().await;
+    let original = config_snapshot(state)?;
+    Ok(ConfigUpdate {
+        write_guard: Some(write_guard),
+        config: original.clone(),
+        original,
+    })
+}
+
+pub(crate) fn save_config(state: &AppState, update: &mut ConfigUpdate) -> Result<(), ApiError> {
+    if update.write_guard.is_none() {
+        return Err(ApiError::internal("global config update was already saved"));
+    }
+    {
+        let stored_config = state
+            .config
+            .lock()
+            .map_err(|_| ApiError::internal("global config lock is poisoned"))?;
+        if *stored_config != update.original {
+            return Err(ApiError::conflict(
+                "global config changed while saving; retry the request",
+            ));
+        }
+    }
+
+    save_global_config(&state.config_file, &update.config).map_err(ApiError::from_config_error)?;
+    {
+        let mut stored_config = state
+            .config
+            .lock()
+            .map_err(|_| ApiError::internal("global config lock is poisoned"))?;
+        *stored_config = update.config.clone();
+    }
+    update.write_guard.take();
 
     Ok(())
 }

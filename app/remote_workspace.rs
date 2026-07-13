@@ -75,7 +75,8 @@ use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
-    compact_cancelled_audit_response_body_json, config_snapshot, estimate_tool_schema_tokens,
+    compact_cancelled_audit_response_body_json, config_snapshot, config_update_snapshot,
+    estimate_tool_schema_tokens,
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
         PromptHookExecutorRequest, PromptHookFuture,
@@ -2995,7 +2996,7 @@ async fn ensure_sidecar_command(
         asset.version, asset.target, SIDECAR_BINARY_NAME
     ));
     if remote_sidecar_matches(server, &remote_bin, &identity, server_id, workspace_id).await? {
-        update_sidecar_cache(state, server_id, target, &asset.version, None)?;
+        update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
         return Ok(RemoteSidecarCommand {
             command: remote_bin,
             identity,
@@ -3018,7 +3019,7 @@ async fn ensure_sidecar_command(
             )
             .await?
             {
-                update_sidecar_cache(state, server_id, target, &asset.version, None)?;
+                update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
                 return Ok(RemoteSidecarCommand {
                     command: remote_bin.clone(),
                     identity: identity.clone(),
@@ -3064,7 +3065,7 @@ async fn ensure_sidecar_command(
                 workspace_id,
             )
             .await?;
-            update_sidecar_cache(state, server_id, target, &asset.version, None)?;
+            update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
             Ok(RemoteSidecarCommand {
                 command: remote_bin.clone(),
                 identity: identity.clone(),
@@ -3305,14 +3306,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn update_sidecar_cache(
+async fn update_sidecar_cache(
     state: &AppState,
     server_id: &str,
     target: &str,
     version: &str,
     error: Option<String>,
 ) -> Result<(), ApiError> {
-    let mut config = config_snapshot(state)?;
+    let mut config = config_update_snapshot(state).await?;
     let server = config
         .remote_servers
         .iter_mut()
@@ -3323,7 +3324,7 @@ fn update_sidecar_cache(
     server.sidecar_install_state = Some("available".to_string());
     server.last_checked_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     server.last_error = error;
-    save_config(state, config)
+    save_config(state, &mut config)
 }
 
 async fn launch_remote_sidecar(

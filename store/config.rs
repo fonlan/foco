@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env, fmt, fs, io,
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
 };
@@ -284,21 +285,31 @@ pub fn save_global_config(
         path: path.to_path_buf(),
         source,
     })?;
-    let temp_file = path.with_extension("json.tmp");
-
-    fs::write(&temp_file, content).map_err(|source| ConfigError::Io {
-        path: temp_file.clone(),
-        source,
+    let parent = path.parent().ok_or_else(|| ConfigError::Validation {
+        path: Some(path.to_path_buf()),
+        message: "global config path has no parent directory".to_string(),
     })?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
+    let mut temp_file =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
             source,
         })?;
-    }
-    fs::rename(&temp_file, path).map_err(|source| ConfigError::Io {
+    temp_file
+        .write_all(content.as_bytes())
+        .map_err(|source| ConfigError::Io {
+            path: temp_file.path().to_path_buf(),
+            source,
+        })?;
+    temp_file
+        .as_file()
+        .sync_all()
+        .map_err(|source| ConfigError::Io {
+            path: temp_file.path().to_path_buf(),
+            source,
+        })?;
+    temp_file.persist(path).map_err(|error| ConfigError::Io {
         path: path.to_path_buf(),
-        source,
+        source: error.error,
     })?;
 
     Ok(())
@@ -380,6 +391,52 @@ impl GlobalConfig {
                 common_commands: Vec::new(),
             }],
         }
+    }
+
+    pub fn resolve_active_model_provider(
+        &self,
+        model_id: &str,
+    ) -> Result<(&ModelSettings, &ProviderSettings), ModelRouteError> {
+        let model = self
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .ok_or_else(|| ModelRouteError::ModelNotFound(model_id.to_string()))?;
+        if !model.enabled {
+            return Err(ModelRouteError::ModelDisabled(model.id.clone()));
+        }
+
+        let active_provider_id = model
+            .active_provider_id
+            .as_deref()
+            .ok_or_else(|| ModelRouteError::ActiveProviderMissing(model.id.clone()))?;
+        if !model
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == active_provider_id)
+        {
+            return Err(ModelRouteError::ActiveProviderNotAssociated {
+                model_id: model.id.clone(),
+                provider_id: active_provider_id.to_string(),
+            });
+        }
+
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == active_provider_id)
+            .ok_or_else(|| ModelRouteError::ActiveProviderNotFound {
+                model_id: model.id.clone(),
+                provider_id: active_provider_id.to_string(),
+            })?;
+        if !provider.enabled {
+            return Err(ModelRouteError::ActiveProviderDisabled {
+                model_id: model.id.clone(),
+                provider_id: provider.id.clone(),
+            });
+        }
+
+        Ok((model, provider))
     }
 
     pub fn validate(&self, config_path: Option<&Path>) -> Result<(), ConfigError> {
@@ -1559,6 +1616,60 @@ pub struct WorkspaceCommonCommand {
     pub command: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelRouteError {
+    ModelNotFound(String),
+    ModelDisabled(String),
+    ActiveProviderMissing(String),
+    ActiveProviderNotAssociated {
+        model_id: String,
+        provider_id: String,
+    },
+    ActiveProviderNotFound {
+        model_id: String,
+        provider_id: String,
+    },
+    ActiveProviderDisabled {
+        model_id: String,
+        provider_id: String,
+    },
+}
+
+impl fmt::Display for ModelRouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModelNotFound(model_id) => write!(formatter, "model was not found: {model_id}"),
+            Self::ModelDisabled(model_id) => write!(formatter, "model '{model_id}' is disabled"),
+            Self::ActiveProviderMissing(model_id) => {
+                write!(formatter, "model '{model_id}' has no active provider")
+            }
+            Self::ActiveProviderNotAssociated {
+                model_id,
+                provider_id,
+            } => write!(
+                formatter,
+                "active provider '{provider_id}' is not associated with model '{model_id}'"
+            ),
+            Self::ActiveProviderNotFound {
+                model_id,
+                provider_id,
+            } => write!(
+                formatter,
+                "active provider '{provider_id}' for model '{model_id}' was not found"
+            ),
+            Self::ActiveProviderDisabled {
+                model_id,
+                provider_id,
+            } => write!(
+                formatter,
+                "active provider '{provider_id}' for model '{model_id}' is disabled"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelRouteError {}
+
 #[derive(Debug)]
 pub enum ConfigError {
     EmptyConfigDir,
@@ -2106,25 +2217,11 @@ fn validate_agent_definitions(
             );
         }
 
-        let provider = providers
-            .iter()
-            .find(|provider| provider.id == definition.provider_id)
-            .ok_or_else(|| ConfigError::Validation {
-                path: config_path.map(Path::to_path_buf),
-                message: format!(
-                    "{field}.providerId references missing provider '{}'",
-                    definition.provider_id
-                ),
-            })?;
-        if !provider.enabled {
-            return invalid_config(
-                config_path,
-                format!(
-                    "{field}.providerId references disabled provider '{}'",
-                    provider.id
-                ),
-            );
-        }
+        validate_id(
+            config_path,
+            &format!("{field}.providerId"),
+            &definition.provider_id,
+        )?;
 
         let model = models
             .iter()
@@ -2142,16 +2239,33 @@ fn validate_agent_definitions(
                 format!("{field}.modelId references disabled model '{}'", model.id),
             );
         }
-        if !model
-            .provider_ids
+        let active_provider_id =
+            model
+                .active_provider_id
+                .as_deref()
+                .ok_or_else(|| ConfigError::Validation {
+                    path: config_path.map(Path::to_path_buf),
+                    message: format!(
+                        "{field}.modelId references model '{}' without an active provider",
+                        model.id
+                    ),
+                })?;
+        let active_provider = providers
             .iter()
-            .any(|provider_id| provider_id == &provider.id)
-        {
+            .find(|provider| provider.id == active_provider_id)
+            .ok_or_else(|| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: format!(
+                    "{field}.modelId references model '{}' with missing active provider '{}'",
+                    model.id, active_provider_id
+                ),
+            })?;
+        if !active_provider.enabled {
             return invalid_config(
                 config_path,
                 format!(
-                    "provider '{}' is not associated with model '{}' for {field}",
-                    provider.id, model.id
+                    "{field}.modelId references model '{}' with disabled active provider '{}'",
+                    model.id, active_provider.id
                 ),
             );
         }
@@ -4673,6 +4787,117 @@ mod tests {
     }
 
     #[test]
+    fn active_model_provider_route_reports_stable_errors() {
+        let config = config_with_valid_agent_definition();
+        let (model, provider) = config
+            .resolve_active_model_provider("model-1")
+            .expect("active route");
+        assert_eq!(model.id, "model-1");
+        assert_eq!(provider.id, "provider-1");
+        assert_eq!(
+            config
+                .resolve_active_model_provider("missing")
+                .expect_err("missing model")
+                .to_string(),
+            "model was not found: missing"
+        );
+
+        let mut disabled_model = config.clone();
+        disabled_model.models[0].enabled = false;
+        assert_eq!(
+            disabled_model
+                .resolve_active_model_provider("model-1")
+                .expect_err("disabled model")
+                .to_string(),
+            "model 'model-1' is disabled"
+        );
+
+        let mut missing_route = config.clone();
+        missing_route.models[0].active_provider_id = None;
+        assert_eq!(
+            missing_route
+                .resolve_active_model_provider("model-1")
+                .expect_err("missing active provider")
+                .to_string(),
+            "model 'model-1' has no active provider"
+        );
+
+        let mut unassociated = config.clone();
+        unassociated.models[0].active_provider_id = Some("other".to_string());
+        assert_eq!(
+            unassociated
+                .resolve_active_model_provider("model-1")
+                .expect_err("unassociated provider")
+                .to_string(),
+            "active provider 'other' is not associated with model 'model-1'"
+        );
+
+        let mut missing_provider = config.clone();
+        missing_provider.models[0]
+            .provider_ids
+            .push("missing-provider".to_string());
+        missing_provider.models[0].active_provider_id = Some("missing-provider".to_string());
+        assert_eq!(
+            missing_provider
+                .resolve_active_model_provider("model-1")
+                .expect_err("missing provider")
+                .to_string(),
+            "active provider 'missing-provider' for model 'model-1' was not found"
+        );
+
+        let mut disabled_provider = config;
+        disabled_provider.providers[0].enabled = false;
+        assert_eq!(
+            disabled_provider
+                .resolve_active_model_provider("model-1")
+                .expect_err("disabled provider")
+                .to_string(),
+            "active provider 'provider-1' for model 'model-1' is disabled"
+        );
+    }
+
+    #[test]
+    fn agent_provider_id_remains_compatible_when_model_route_changes() {
+        let mut config = config_with_valid_agent_definition();
+        config.providers.push(ProviderSettings {
+            id: "provider-2".to_string(),
+            name: "Provider 2".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: Some("secret-key-2".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models[0].provider_ids.push("provider-2".to_string());
+        config.models[0].active_provider_id = Some("provider-2".to_string());
+        config
+            .providers
+            .retain(|provider| provider.id != "provider-1");
+        config.models[0]
+            .provider_ids
+            .retain(|provider_id| provider_id != "provider-1");
+
+        config
+            .validate(None)
+            .expect("stale legacy agent provider remains a compatibility field");
+        let json = serde_json::to_string(&config).expect("serialize config");
+        let loaded: GlobalConfig = serde_json::from_str(&json).expect("load legacy providerId");
+        assert_eq!(loaded.agent_definitions[0].provider_id, "provider-1");
+        assert_eq!(
+            loaded
+                .resolve_active_model_provider("model-1")
+                .expect("current route")
+                .1
+                .id,
+            "provider-2"
+        );
+    }
+
+    #[test]
     fn agent_definition_round_trips_with_strict_schema() {
         let config = config_with_valid_agent_definition();
         config.validate(None).expect("valid agent definition");
@@ -4726,15 +4951,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_definition_rejects_invalid_provider_model_and_options() {
+    fn agent_definition_rejects_invalid_model_and_options() {
         let mut config = config_with_valid_agent_definition();
-        config.agent_definitions[0].provider_id = "missing".to_string();
+        config.agent_definitions[0].provider_id = "invalid provider".to_string();
         assert!(
             config
                 .validate(None)
-                .expect_err("missing provider")
+                .expect_err("invalid legacy provider id")
                 .to_string()
-                .contains("missing provider")
+                .contains("must not contain whitespace")
         );
 
         let mut config = config_with_valid_agent_definition();

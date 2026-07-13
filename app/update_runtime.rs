@@ -14,7 +14,7 @@ use foco_store::config::GlobalConfig;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, sync::watch};
 
-use crate::{ApiError, AppState, config_snapshot, save_config};
+use crate::{ApiError, AppState, config_snapshot, config_update_snapshot, save_config};
 
 const UPDATE_RELEASE_API_URL: &str = "https://api.github.com/repos/fonlan/foco/releases/latest";
 const UPDATE_CHECK_STARTUP_DELAY_SECS: u64 = 30;
@@ -158,13 +158,13 @@ pub(crate) async fn check_for_updates(
     Ok(status_summary_from_state(&update_state, &config))
 }
 
-pub(crate) fn save_update_settings(
+pub(crate) async fn save_update_settings(
     state: &AppState,
     auto_check_enabled: bool,
 ) -> Result<UpdateStatusSummary, ApiError> {
-    let mut config = config_snapshot(state)?;
+    let mut config = config_update_snapshot(state).await?;
     config.app.auto_update_check_enabled = auto_check_enabled;
-    save_config(state, config.clone())?;
+    save_config(state, &mut config)?;
     update_status_summary(state, &config)
 }
 

@@ -193,7 +193,8 @@ pub(crate) struct ManualApiProxySettingsRequest {
 pub(crate) struct AgentDefinitionInput {
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) provider_id: String,
+    #[serde(default, rename = "providerId")]
+    pub(crate) _provider_id: Option<String>,
     pub(crate) model_id: String,
     pub(crate) model_options: AgentModelOptions,
     pub(crate) system_prompt: String,
@@ -293,6 +294,13 @@ pub(crate) struct TestProviderRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TestModelRequest {
     pub(crate) model_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateModelRouteRequest {
+    pub(crate) model_id: String,
+    pub(crate) provider_id: String,
 }
 
 #[derive(Deserialize)]
@@ -755,7 +763,7 @@ pub(crate) async fn agent_definitions(
 }
 
 async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfig, ApiError> {
-    let mut config = config_snapshot(state)?;
+    let mut config = config_update_snapshot(state).await?;
     let mut changed = false;
     let default_id = default_agent_definition_id()?;
 
@@ -778,9 +786,9 @@ async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfi
 
     if changed {
         validate_agent_definition_update(state, &config).await?;
-        save_config(state, config.clone())?;
+        save_config(state, &mut config)?;
     }
-    Ok(config)
+    Ok(config.into_config())
 }
 
 fn default_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
@@ -1155,17 +1163,19 @@ pub(crate) async fn create_agent_definition(
     State(state): State<AppState>,
     Json(request): Json<CreateAgentDefinitionRequest>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = AgentDefinitionId::new(unique_id("agent-definition"))
         .map_err(|error| ApiError::internal(error.message().to_string()))?;
-    config.agent_definitions.push(agent_definition_from_input(
+    let definition = agent_definition_from_input(
+        &config,
         id,
         AGENT_DEFINITION_INITIAL_REVISION,
         request.definition,
-    ));
+    )?;
+    config.agent_definitions.push(definition);
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
 }
@@ -1174,7 +1184,7 @@ pub(crate) async fn update_agent_definition(
     State(state): State<AppState>,
     Json(request): Json<UpdateAgentDefinitionRequest>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let image_id = image_agent_definition_id()?;
     let updates_image_agent = request.id == image_id;
     let stored_index = config
@@ -1188,8 +1198,9 @@ pub(crate) async fn update_agent_definition(
         .revision
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("agent definition revision overflow"))?;
-    config.agent_definitions[stored_index] =
-        agent_definition_from_input(request.id, revision, request.definition);
+    let definition =
+        agent_definition_from_input(&config, request.id, revision, request.definition)?;
+    config.agent_definitions[stored_index] = definition;
     if updates_image_agent
         && !image_agent_runner_selection_valid(&config, &config.agent_definitions[stored_index])
     {
@@ -1199,7 +1210,7 @@ pub(crate) async fn update_agent_definition(
     }
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
 }
@@ -1208,7 +1219,7 @@ pub(crate) async fn delete_agent_definition(
     State(state): State<AppState>,
     Json(request): Json<DeleteAgentDefinitionRequest>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let default_id = default_agent_definition_id()?;
     let review_id = review_agent_definition_id()?;
     let image_id = image_agent_definition_id()?;
@@ -1253,30 +1264,39 @@ pub(crate) async fn delete_agent_definition(
     }
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     validate_agent_definition_update(&state, &config).await?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
 }
 
 fn agent_definition_from_input(
+    config: &GlobalConfig,
     id: AgentDefinitionId,
     revision: u64,
     input: AgentDefinitionInput,
-) -> AgentDefinitionSettings {
-    AgentDefinitionSettings {
+) -> Result<AgentDefinitionSettings, ApiError> {
+    let model_id = input.model_id.trim().to_string();
+    let provider_id = config
+        .resolve_active_model_provider(&model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?
+        .1
+        .id
+        .clone();
+
+    Ok(AgentDefinitionSettings {
         id,
         revision,
         name: input.name,
         description: input.description,
-        provider_id: input.provider_id,
-        model_id: input.model_id,
+        provider_id,
+        model_id,
         model_options: input.model_options,
         system_prompt: input.system_prompt,
         allowed_tools: input.allowed_tools,
         max_instances: input.max_instances,
         allowed_execution_workspace_modes: input.allowed_execution_workspace_modes,
         permissions: input.permissions,
-    }
+    })
 }
 
 async fn validate_agent_definition_update(
@@ -1434,7 +1454,7 @@ pub(crate) async fn save_general_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualGeneralSettingsRequest>,
 ) -> Result<Response, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let current_language = config.app.language.clone();
     let should_set_auth_cookie = request
         .password
@@ -1470,9 +1490,9 @@ pub(crate) async fn save_general_settings(
     }
     validate_tray_menu_language(&config.app.language)?;
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     if config.app.api_audit != previous_api_audit {
-        spawn_api_audit_cleanup_once(state.clone(), config.clone());
+        spawn_api_audit_cleanup_once(state.clone(), (*config).clone());
     }
     notify_tray_menu_language_change(&state, &current_language, &config.app.language)?;
 
@@ -1497,7 +1517,7 @@ pub(crate) async fn save_web_search_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualWebSearchSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let active_provider = request.active_provider.trim();
 
     if !SUPPORTED_WEB_SEARCH_PROVIDERS.contains(&active_provider) {
@@ -1523,7 +1543,7 @@ pub(crate) async fn save_web_search_settings(
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1544,7 +1564,7 @@ pub(crate) async fn save_memory_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualMemorySettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let extraction_model_id = request
         .extraction_model_id
         .as_deref()
@@ -1576,7 +1596,7 @@ pub(crate) async fn save_memory_settings(
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1585,7 +1605,7 @@ pub(crate) async fn save_spec_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualSpecSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     config.spec = SpecSettings {
         auto_enabled: request.auto_enabled,
         generation_model_id: optional_trimmed_string(request.generation_model_id),
@@ -1596,7 +1616,7 @@ pub(crate) async fn save_spec_settings(
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1605,7 +1625,7 @@ pub(crate) async fn save_plan_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualPlanSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     config.plan = PlanSettings {
         merge_automation_mode: request.merge_automation_mode.trim().to_string(),
         mode_model_id: optional_trimmed_string(request.mode_model_id),
@@ -1613,7 +1633,7 @@ pub(crate) async fn save_plan_settings(
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1652,7 +1672,7 @@ pub(crate) async fn save_prompt_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualPromptSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let system_prompts = normalize_system_prompt_requests(
         request.system_prompts,
         request.system_prompt,
@@ -1674,7 +1694,7 @@ pub(crate) async fn save_prompt_settings(
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1756,7 +1776,7 @@ pub(crate) async fn save_manual_provider(
     State(state): State<AppState>,
     Json(request): Json<ManualProviderRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
     let name = request.name.trim();
     let kind = request.kind.trim();
@@ -1846,7 +1866,7 @@ pub(crate) async fn save_manual_provider(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -1885,14 +1905,14 @@ pub(crate) fn can_save_new_provider_after_model_list_error(error: &ProviderConfi
 pub(crate) async fn refresh_provider_models(
     State(state): State<AppState>,
 ) -> Result<Json<ProviderModelsRefreshResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let providers = config.providers.clone();
     let refreshed_providers = sync_provider_model_associations(&mut config, providers).await?;
 
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     let Json(settings) = settings_response(&state, &config).await?;
     Ok(Json(ProviderModelsRefreshResponse {
@@ -1902,7 +1922,7 @@ pub(crate) async fn refresh_provider_models(
 }
 
 pub(crate) async fn sync_auto_provider_models_once(state: &AppState) -> Result<usize, ApiError> {
-    let mut config = config_snapshot(state)?;
+    let mut config = config_update_snapshot(state).await?;
     let providers = config
         .providers
         .iter()
@@ -1924,7 +1944,7 @@ pub(crate) async fn sync_auto_provider_models_once(state: &AppState) -> Result<u
         config
             .validate(Some(&state.config_file))
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        save_config(state, config)?;
+        save_config(state, &mut config)?;
     }
 
     Ok(provider_count)
@@ -2028,7 +2048,7 @@ pub(crate) async fn delete_provider(
     State(state): State<AppState>,
     Json(request): Json<DeleteSettingsItemRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
 
     if id.is_empty() {
@@ -2067,7 +2087,7 @@ pub(crate) async fn delete_provider(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -2076,7 +2096,7 @@ pub(crate) async fn save_mcp_server(
     State(state): State<AppState>,
     Json(request): Json<ManualMcpServerRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
     let name = request.name.trim();
     let transport = request.transport.trim();
@@ -2114,7 +2134,7 @@ pub(crate) async fn save_mcp_server(
         config.mcp.servers.push(server);
     }
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
@@ -2126,7 +2146,7 @@ pub(crate) async fn delete_mcp_server(
     State(state): State<AppState>,
     Json(request): Json<DeleteSettingsItemRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
 
     if id.is_empty() {
@@ -2142,7 +2162,7 @@ pub(crate) async fn delete_mcp_server(
         )));
     }
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
@@ -2154,7 +2174,7 @@ pub(crate) async fn save_skills(
     State(state): State<AppState>,
     Json(request): Json<ManualSkillsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let ManualSkillsRequest {
         disabled,
         enabled,
@@ -2222,7 +2242,7 @@ pub(crate) async fn save_skills(
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -2230,7 +2250,7 @@ pub(crate) async fn save_skills(
 pub(crate) async fn refresh_skills(
     State(state): State<AppState>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let discovery = discover_skills(&state.user_profile_dir, &config);
 
     config.skills.detected = discovery.skills;
@@ -2245,7 +2265,7 @@ pub(crate) async fn refresh_skills(
     refresh_derived_enabled_skills(&mut config, &state.user_profile_dir);
     config.skills.disabled = disabled;
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -2254,7 +2274,7 @@ pub(crate) async fn delete_skill(
     State(state): State<AppState>,
     Json(request): Json<DeleteSettingsItemRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
 
     if id.is_empty() {
@@ -2293,7 +2313,7 @@ pub(crate) async fn delete_skill(
     refresh_derived_enabled_skills(&mut config, &state.user_profile_dir);
     config.skills.disabled = disabled;
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -2618,11 +2638,50 @@ async fn fetch_and_write_model_metadata_cache_from_url(
     Ok(cache)
 }
 
+pub(crate) async fn update_model_route(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateModelRouteRequest>,
+) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let mut config = config_update_snapshot(&state).await?;
+    let model_id = request.model_id.trim();
+    let provider_id = request.provider_id.trim();
+
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+
+    let model = config
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    model.active_provider_id = Some(provider_id.to_string());
+
+    config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let cache = read_model_metadata_cache(&state.model_metadata_file)
+        .map_err(ApiError::from_model_metadata_error)?;
+    save_config(&state, &mut config)?;
+
+    Ok(Json(model_metadata_response(
+        cache,
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
 pub(crate) async fn save_manual_model(
     State(state): State<AppState>,
     Json(request): Json<ManualModelRequest>,
 ) -> Result<Json<ModelMetadataResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let model_id = request.model_id.trim();
     let display_name = request.display_name.trim();
     let context_window = request.context_window.filter(|value| *value > 0);
@@ -2785,7 +2844,7 @@ pub(crate) async fn save_manual_model(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     let cache = read_model_metadata_cache(&state.model_metadata_file)
         .map_err(ApiError::from_model_metadata_error)?;
@@ -2801,7 +2860,7 @@ pub(crate) async fn delete_model(
     State(state): State<AppState>,
     Json(request): Json<DeleteSettingsItemRequest>,
 ) -> Result<Json<ModelMetadataResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let id = request.id.trim();
 
     if id.is_empty() {
@@ -2831,7 +2890,7 @@ pub(crate) async fn delete_model(
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     let cache = read_model_metadata_cache(&state.model_metadata_file)
         .map_err(ApiError::from_model_metadata_error)?;

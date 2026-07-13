@@ -21,10 +21,10 @@ use serde_json::{Value, json};
 
 use crate::{
     ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
-    discover_skills, markdown_code_block, merge_disabled_skill_keys, neutral_text_message,
-    preserve_disabled_skill_keys_for_hidden_locations, provider_connection_config,
-    refresh_derived_enabled_skills, save_config, settings_response, skills::parse_skill_markdown,
-    unique_id, workspace_by_id,
+    config_update_snapshot, discover_skills, markdown_code_block, merge_disabled_skill_keys,
+    neutral_text_message, preserve_disabled_skill_keys_for_hidden_locations,
+    provider_connection_config, refresh_derived_enabled_skills, save_config, settings_response,
+    skills::parse_skill_markdown, unique_id, workspace_by_id,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -1070,7 +1070,7 @@ pub(crate) async fn skill_store_install(
     validate_skill_markdown_matches_slug(&skill_id, &files)?;
     let source = source.as_deref().map(validate_github_source).transpose()?;
 
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let target = request.target.trim().to_string();
     if target == SKILL_SCOPE_WORKSPACE {
         let workspace_id = request.workspace_id.as_deref().ok_or_else(|| {
@@ -1112,7 +1112,7 @@ pub(crate) async fn skill_store_install(
     }
 
     let discovery = refresh_skill_discovery(&state, &mut config)?;
-    save_config(&state, config)?;
+    save_config(&state, &mut config)?;
 
     Ok(Json(SkillStoreInstallResponse {
         target,
@@ -1126,7 +1126,7 @@ pub(crate) async fn skill_store_update(
     State(state): State<AppState>,
     Json(request): Json<SkillStoreUpdateRequest>,
 ) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let discovery = discover_skills(&state.user_profile_dir, &config);
     let skill = discovery
         .skills
@@ -1142,7 +1142,7 @@ pub(crate) async fn skill_store_update(
     let path =
         update_skill_from_store_metadata(&SkillStoreClient::from_env(), skill, &metadata).await?;
     refresh_skill_discovery(&state, &mut config)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     let Json(settings) = settings_response(&state, &config).await?;
 
     Ok(Json(SkillStoreUpdateResponse {
@@ -1159,7 +1159,7 @@ pub(crate) async fn skill_store_update(
 pub(crate) async fn skill_store_update_all(
     State(state): State<AppState>,
 ) -> Result<Json<SkillStoreUpdateResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let discovery = discover_skills(&state.user_profile_dir, &config);
     let client = SkillStoreClient::from_env();
     let mut results = Vec::new();
@@ -1186,7 +1186,7 @@ pub(crate) async fn skill_store_update_all(
     }
 
     refresh_skill_discovery(&state, &mut config)?;
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     let Json(settings) = settings_response(&state, &config).await?;
 
     Ok(Json(SkillStoreUpdateResponse { results, settings }))

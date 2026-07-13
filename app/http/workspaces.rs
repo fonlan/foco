@@ -662,7 +662,7 @@ pub(crate) async fn add_workspace(
     }
 
     let path = canonical_workspace_path(&requested_path)?;
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
 
     reject_registered_workspace_path(&config, &path, None)?;
     WorkspaceDatabase::open_or_create(&path).map_err(ApiError::from_workspace_error)?;
@@ -684,7 +684,7 @@ pub(crate) async fn add_workspace(
             common_commands: Vec::new(),
         },
     );
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
@@ -719,7 +719,7 @@ async fn add_remote_workspace(
         .ok_or_else(|| ApiError::bad_request("remote workspace remotePath must not be empty"))?;
     validate_remote_workspace_path(remote_path)?;
 
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let server = config
         .remote_servers
         .iter()
@@ -784,7 +784,7 @@ async fn add_remote_workspace(
             common_commands: Vec::new(),
         },
     );
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
@@ -843,7 +843,7 @@ pub(crate) async fn save_workspace_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualWorkspaceRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let workspace_id = request.id.trim();
     let name = request.name.trim();
     let terminal_shell = normalize_terminal_shell(&request.terminal_shell)?;
@@ -915,7 +915,7 @@ pub(crate) async fn save_workspace_settings(
         workspace.common_commands = common_commands;
         group_pinned_workspaces(&mut config.workspaces);
         promote_pinned_workspace(&mut config.workspaces, workspace_id);
-        save_config(&state, config.clone())?;
+        save_config(&state, &mut config)?;
         return settings_response(&state, &config).await;
     }
 
@@ -955,7 +955,7 @@ pub(crate) async fn save_workspace_settings(
     group_pinned_workspaces(&mut config.workspaces);
     promote_pinned_workspace(&mut config.workspaces, workspace_id);
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }
@@ -964,11 +964,11 @@ pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
     let removed = delete_configured_workspace(&mut config, &workspace_id)?;
     let remote_server_id = removed.server_id().map(str::to_string);
 
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
     if let Some(server_id) = remote_server_id {
         let _ = state
             .remote_workspace_manager
@@ -986,11 +986,11 @@ pub(crate) async fn save_workspace_order(
     State(state): State<AppState>,
     Json(request): Json<WorkspaceOrderRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let mut config = config_snapshot(&state)?;
+    let mut config = config_update_snapshot(&state).await?;
 
     reorder_workspaces(&mut config.workspaces, request.workspace_ids)?;
     group_pinned_workspaces(&mut config.workspaces);
-    save_config(&state, config.clone())?;
+    save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
 }

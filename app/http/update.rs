@@ -28,7 +28,9 @@ pub(crate) async fn save_update_settings(
     State(state): State<AppState>,
     Json(request): Json<UpdateSettingsRequest>,
 ) -> Result<Json<crate::update_runtime::UpdateStatusSummary>, ApiError> {
-    crate::update_runtime::save_update_settings(&state, request.auto_check_enabled).map(Json)
+    crate::update_runtime::save_update_settings(&state, request.auto_check_enabled)
+        .await
+        .map(Json)
 }
 
 pub(crate) async fn install_update(

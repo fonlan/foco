@@ -460,6 +460,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/models/manual",
             post(crate::http::settings::save_manual_model),
         )
+        .route(
+            "/api/models/route",
+            post(crate::http::settings::update_model_route),
+        )
         .route("/api/models/test", post(crate::http::settings::test_model))
         .route(
             "/api/models/delete",
