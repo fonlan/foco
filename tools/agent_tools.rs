@@ -9,8 +9,11 @@ use crate::{
 /// Matches `foco_agent::validate_agent_id` total length bound.
 const AGENT_ID_MAX_LENGTH: u64 = 128;
 /// Matches `AgentDefinitionId::PREFIX` without importing `foco-agent`.
+/// Also used by unit tests that mirror runtime prefix checks.
+#[cfg_attr(not(test), allow(dead_code))]
 const AGENT_DEFINITION_ID_PREFIX: &str = "agent-definition-";
 /// Matches `AgentInstanceId::PREFIX` without importing `foco-agent`.
+#[cfg_attr(not(test), allow(dead_code))]
 const AGENT_INSTANCE_ID_PREFIX: &str = "agent-instance-";
 /// Suffix must be non-empty ascii lowercase / digit / hyphen (same as runtime).
 const AGENT_DEFINITION_ID_PATTERN: &str = "^agent-definition-[a-z0-9-]+$";
@@ -379,11 +382,13 @@ mod tests {
             &delegate.input_schema["properties"]["targetDefinitionId"],
             AGENT_DEFINITION_ID_PATTERN,
             true,
+            &["agent_list.definitions[].id", "does not auto-create"],
         );
         assert_agent_id_property(
             &delegate.input_schema["properties"]["targetInstanceId"],
             AGENT_INSTANCE_ID_PATTERN,
             true,
+            &["agent_list.instances[].id", "exactly one of"],
         );
 
         let transfer = by_name(AGENT_TRANSFER_TASK_TOOL);
@@ -391,6 +396,7 @@ mod tests {
             &transfer.input_schema["properties"]["targetInstanceId"],
             AGENT_INSTANCE_ID_PATTERN,
             false,
+            &["agent_list.instances[].id"],
         );
 
         let create = by_name(AGENT_CREATE_INSTANCES_TOOL);
@@ -398,6 +404,7 @@ mod tests {
             &create.input_schema["properties"]["definitionId"],
             AGENT_DEFINITION_ID_PATTERN,
             false,
+            &["agent_list.definitions[].id"],
         );
 
         // Fixed degradation policy: keep both pattern and maxLength as public machine
@@ -431,6 +438,7 @@ mod tests {
         let instance_re =
             Regex::new(AGENT_INSTANCE_ID_PATTERN).expect("instance id pattern compiles");
 
+        // Valid ids: short, multi-segment, timestamp-style, hyphenated suffix.
         for valid in [
             "agent-definition-1",
             "agent-definition-worker",
@@ -447,18 +455,25 @@ mod tests {
                 "schema-valid definition id must also satisfy runtime rules: {valid}"
             );
         }
-        for invalid in [
-            "definition-1",
-            "agent-definition-",
-            "agent-definition-UPPER",
-            "agent-definition-with_underscore",
-            "agent-instance-1",
-            "Agent-definition-1",
-            "agent-definition-.*",
+        // Invalid definition ids: missing prefix, empty suffix, uppercase, underscore,
+        // wrong type prefix, leading capital, regex metacharacters.
+        for (label, invalid) in [
+            ("missing_prefix", "definition-1"),
+            ("empty_suffix", "agent-definition-"),
+            ("uppercase", "agent-definition-UPPER"),
+            ("underscore", "agent-definition-with_underscore"),
+            ("wrong_type_prefix", "agent-instance-1"),
+            ("leading_capital_prefix", "Agent-definition-1"),
+            ("regex_metachar", "agent-definition-.*"),
+            ("display_name", "Review"),
         ] {
             assert!(
                 !definition_re.is_match(invalid),
-                "expected invalid definition id: {invalid}"
+                "expected invalid definition id ({label}): {invalid}"
+            );
+            assert!(
+                !matches_runtime_agent_id(invalid, AGENT_DEFINITION_ID_PREFIX),
+                "runtime must reject definition id ({label}): {invalid}"
             );
         }
 
@@ -477,16 +492,21 @@ mod tests {
                 "schema-valid instance id must also satisfy runtime rules: {valid}"
             );
         }
-        for invalid in [
-            "instance-1",
-            "agent-instance-",
-            "agent-instance-UPPER",
-            "agent-instance-with_underscore",
-            "agent-definition-1",
+        for (label, invalid) in [
+            ("missing_prefix", "instance-1"),
+            ("empty_suffix", "agent-instance-"),
+            ("uppercase", "agent-instance-UPPER"),
+            ("underscore", "agent-instance-with_underscore"),
+            ("wrong_type_prefix", "agent-definition-1"),
+            ("display_name", "worker-1"),
         ] {
             assert!(
                 !instance_re.is_match(invalid),
-                "expected invalid instance id: {invalid}"
+                "expected invalid instance id ({label}): {invalid}"
+            );
+            assert!(
+                !matches_runtime_agent_id(invalid, AGENT_INSTANCE_ID_PREFIX),
+                "runtime must reject instance id ({label}): {invalid}"
             );
         }
 
@@ -496,9 +516,35 @@ mod tests {
             "a".repeat(AGENT_ID_MAX_LENGTH as usize)
         );
         assert!(too_long_definition.len() > AGENT_ID_MAX_LENGTH as usize);
-        assert!(definition_re.is_match(&too_long_definition));
+        assert!(
+            definition_re.is_match(&too_long_definition),
+            "pattern alone does not enforce maxLength"
+        );
+        assert!(
+            !matches_runtime_agent_id(&too_long_definition, AGENT_DEFINITION_ID_PREFIX),
+            "runtime rejects oversized definition id"
+        );
+        let too_long_instance = format!(
+            "{AGENT_INSTANCE_ID_PREFIX}{}",
+            "a".repeat(AGENT_ID_MAX_LENGTH as usize)
+        );
+        assert!(too_long_instance.len() > AGENT_ID_MAX_LENGTH as usize);
+        assert!(instance_re.is_match(&too_long_instance));
         assert!(!matches_runtime_agent_id(
-            &too_long_definition,
+            &too_long_instance,
+            AGENT_INSTANCE_ID_PREFIX
+        ));
+
+        // Boundary: exact maxLength remains valid for both schema pattern and runtime.
+        let max_len_suffix_len = AGENT_ID_MAX_LENGTH as usize - AGENT_DEFINITION_ID_PREFIX.len();
+        let max_len_definition = format!(
+            "{AGENT_DEFINITION_ID_PREFIX}{}",
+            "a".repeat(max_len_suffix_len)
+        );
+        assert_eq!(max_len_definition.len(), AGENT_ID_MAX_LENGTH as usize);
+        assert!(definition_re.is_match(&max_len_definition));
+        assert!(matches_runtime_agent_id(
+            &max_len_definition,
             AGENT_DEFINITION_ID_PREFIX
         ));
     }
@@ -541,7 +587,12 @@ mod tests {
         assert!(transfer_description.contains("agent_list.instances[].id"));
     }
 
-    fn assert_agent_id_property(schema: &Value, expected_pattern: &str, nullable: bool) {
+    fn assert_agent_id_property(
+        schema: &Value,
+        expected_pattern: &str,
+        nullable: bool,
+        description_fragments: &[&str],
+    ) {
         if nullable {
             assert_eq!(schema["type"], json!(["string", "null"]));
         } else {
@@ -555,12 +606,17 @@ mod tests {
             schema.get("maxLength").and_then(|value| value.as_u64()),
             Some(AGENT_ID_MAX_LENGTH)
         );
-        assert!(
-            schema
-                .get("description")
-                .and_then(|value| value.as_str())
-                .is_some_and(|text| !text.is_empty())
-        );
+        let description = schema
+            .get("description")
+            .and_then(|value| value.as_str())
+            .expect("agent id property description");
+        assert!(!description.is_empty());
+        for fragment in description_fragments {
+            assert!(
+                description.contains(fragment),
+                "agent id description missing `{fragment}`: {description}"
+            );
+        }
     }
 
     /// Runtime-aligned id rules (mirrors `foco_agent::validate_agent_id` without a crate edge).

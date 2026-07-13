@@ -4348,6 +4348,7 @@ mod tests {
         AgentTeamId,
         AgentInstanceId,
         AgentTaskId,
+        mpsc::Receiver<()>,
     ) {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -4382,7 +4383,8 @@ mod tests {
                 input_json: r#"{"message":"parent"}"#,
             })
             .expect("parent task enqueue");
-        let (_scheduler, _wake_rx) = AgentScheduler::new();
+        // Keep wake_rx alive so successful collaboration tools can call scheduler.wake().
+        let (scheduler, wake_rx) = AgentScheduler::new();
         let context = AgentToolContext {
             workspace_path: workspace.path().to_path_buf(),
             associations: AgentRunAssociations {
@@ -4394,14 +4396,14 @@ mod tests {
             collaboration_tools_enabled: true,
             permissions,
             agent_definitions: Vec::new(),
-            scheduler: _scheduler,
+            scheduler,
         };
-        (workspace, context, team_id, instance_id, task_id)
+        (workspace, context, team_id, instance_id, task_id, wake_rx)
     }
 
     #[test]
     fn phase6_agent_tool_permission_and_payload_errors_have_codes() {
-        let (workspace, context, _team_id, instance_id, _task_id) =
+        let (workspace, context, _team_id, instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(AgentPermissions::default());
 
         let no_delegate_error = execute_agent_tool(
@@ -4451,7 +4453,7 @@ mod tests {
             can_delegate: true,
             allowed_agent_definition_ids: Vec::new(),
         };
-        let (workspace, mut context, _team_id, instance_id, _task_id) =
+        let (workspace, mut context, _team_id, instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
         context.collaboration_tools_enabled = false;
 
@@ -4490,7 +4492,7 @@ mod tests {
             allowed_agent_definition_ids: vec![worker_definition.id.clone()],
             ..AgentPermissions::default()
         };
-        let (workspace, mut context, team_id, _instance_id, _task_id) =
+        let (workspace, mut context, team_id, _instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
         context.agent_definitions = vec![worker_definition.clone()];
 
@@ -4550,7 +4552,7 @@ mod tests {
             allowed_agent_definition_ids: vec![worker_definition.id.clone()],
             ..AgentPermissions::default()
         };
-        let (workspace, mut context, team_id, _instance_id, _task_id) =
+        let (workspace, mut context, team_id, _instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
         context.agent_definitions = vec![worker_definition.clone()];
         let phase_worktree_path = workspace
@@ -4604,7 +4606,7 @@ mod tests {
             allowed_agent_definition_ids: vec![worker_definition.id.clone()],
             ..AgentPermissions::default()
         };
-        let (workspace, mut context, _team_id, _instance_id, _task_id) =
+        let (workspace, mut context, _team_id, _instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
         context.agent_definitions = vec![worker_definition.clone()];
 
@@ -4640,7 +4642,7 @@ mod tests {
             allowed_agent_definition_ids: vec![missing_definition_id.clone()],
             ..AgentPermissions::default()
         };
-        let (workspace, context, team_id, instance_id, parent_task_id) =
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
 
         let no_instance_error = execute_agent_tool(
@@ -4733,62 +4735,102 @@ mod tests {
             can_delegate: true,
             allowed_agent_definition_ids: Vec::new(),
         };
-        let (workspace, context, _team_id, _instance_id, _task_id) =
+        let (workspace, context, team_id, _instance_id, parent_task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
 
-        let illegal_definition = execute_agent_tool(
+        let child_count = || {
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database")
+                .agent_tasks_for_parent(&team_id, &parent_task_id)
+                .expect("child tasks")
+                .len()
+        };
+        assert_eq!(child_count(), 0, "fixture starts with no child tasks");
+
+        // Cover the same illegal shapes the public schema pattern rejects so runtime
+        // recovery stays aligned when a provider bypasses tool schema constraints.
+        for (call_id, target_definition_id, target_instance_id) in [
+            ("call-illegal-display-name", Some("Review"), None),
+            ("call-illegal-missing-prefix", Some("definition-1"), None),
+            ("call-illegal-empty-suffix", Some("agent-definition-"), None),
+            (
+                "call-illegal-uppercase",
+                Some("agent-definition-UPPER"),
+                None,
+            ),
+            (
+                "call-illegal-underscore",
+                Some("agent-definition-with_underscore"),
+                None,
+            ),
+            ("call-illegal-wrong-prefix", Some("agent-instance-1"), None),
+            ("call-illegal-instance-name", None, Some("worker-1")),
+            ("call-illegal-instance-empty", None, Some("agent-instance-")),
+            (
+                "call-illegal-instance-upper",
+                None,
+                Some("agent-instance-UPPER"),
+            ),
+        ] {
+            let error = execute_agent_tool(
+                &context,
+                workspace.path(),
+                AGENT_DELEGATE_TASK_TOOL,
+                call_id,
+                json!({
+                    "targetInstanceId": target_instance_id,
+                    "targetDefinitionId": target_definition_id,
+                    "input": { "message": "child" },
+                    "correlationId": null,
+                    "timeoutMs": null,
+                }),
+            )
+            .expect_err("illegal agent id must fail");
+            let output = agent_tool_error_output(&error);
+            assert_eq!(
+                output["code"], "invalid_arguments",
+                "illegal id {call_id} must use invalid_arguments, got {output}"
+            );
+            let message = output["error"].as_str().expect("error text");
+            assert!(
+                message.contains("agent_list")
+                    && message.contains("do not invent ids")
+                    && (message.contains("targetDefinitionId")
+                        || message.contains("targetInstanceId")),
+                "expected recoverable id guidance for {call_id}, got {message}"
+            );
+            assert_eq!(
+                child_count(),
+                0,
+                "illegal id {call_id} must not enqueue child tasks"
+            );
+        }
+
+        let too_long_definition = format!("agent-definition-{}", "a".repeat(128));
+        assert!(too_long_definition.len() > 128);
+        let oversized = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
-            "call-illegal-definition",
+            "call-illegal-oversized",
             json!({
                 "targetInstanceId": null,
-                "targetDefinitionId": "Review",
+                "targetDefinitionId": too_long_definition,
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("display-name definition id must fail");
-        let illegal_definition_output = agent_tool_error_output(&illegal_definition);
-        assert_eq!(illegal_definition_output["code"], "invalid_arguments");
-        let illegal_definition_message = illegal_definition_output["error"]
-            .as_str()
-            .expect("error text");
+        .expect_err("oversized definition id must fail");
+        let oversized_output = agent_tool_error_output(&oversized);
+        assert_eq!(oversized_output["code"], "invalid_arguments");
         assert!(
-            illegal_definition_message.contains("targetDefinitionId")
-                && illegal_definition_message.contains("agent-definition-")
-                && illegal_definition_message.contains("agent_list")
-                && illegal_definition_message.contains("definitions[].id"),
-            "expected recoverable definition id guidance, got {illegal_definition_message}"
+            oversized_output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("at most 128")
         );
-
-        let illegal_instance = execute_agent_tool(
-            &context,
-            workspace.path(),
-            AGENT_DELEGATE_TASK_TOOL,
-            "call-illegal-instance",
-            json!({
-                "targetInstanceId": "worker-1",
-                "targetDefinitionId": null,
-                "input": { "message": "child" },
-                "correlationId": null,
-                "timeoutMs": null,
-            }),
-        )
-        .expect_err("hand-constructed instance id must fail");
-        let illegal_instance_output = agent_tool_error_output(&illegal_instance);
-        assert_eq!(illegal_instance_output["code"], "invalid_arguments");
-        let illegal_instance_message = illegal_instance_output["error"]
-            .as_str()
-            .expect("error text");
-        assert!(
-            illegal_instance_message.contains("targetInstanceId")
-                && illegal_instance_message.contains("agent-instance-")
-                && illegal_instance_message.contains("agent_list")
-                && illegal_instance_message.contains("instances[].id"),
-            "expected recoverable instance id guidance, got {illegal_instance_message}"
-        );
+        assert_eq!(child_count(), 0);
 
         let illegal_create = execute_agent_tool(
             &context,
@@ -4855,6 +4897,203 @@ mod tests {
         assert_eq!(
             agent_tool_error_output(&missing_well_formed)["code"],
             "not_found"
+        );
+        assert_eq!(child_count(), 0);
+    }
+
+    #[test]
+    fn agent_delegate_task_id_contract_regression() {
+        let mut worker_definition =
+            test_agent_definition("tool-test-delegate-worker", AgentPermissions::default());
+        worker_definition.max_instances = 2;
+        let disallowed_definition_id =
+            AgentDefinitionId::new("agent-definition-tool-test-disallowed")
+                .expect("disallowed definition id");
+        let missing_definition_id =
+            AgentDefinitionId::new("agent-definition-tool-test-missing-instance")
+                .expect("missing-instance definition id");
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids: vec![
+                worker_definition.id.clone(),
+                missing_definition_id.clone(),
+            ],
+        };
+        let (workspace, mut context, team_id, coordinator_instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+        context.agent_definitions = vec![worker_definition.clone()];
+
+        let child_count = || {
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database")
+                .agent_tasks_for_parent(&team_id, &parent_task_id)
+                .expect("child tasks")
+                .len()
+        };
+
+        // Exactly one target field.
+        let both_targets = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-both-targets",
+            json!({
+                "targetInstanceId": coordinator_instance_id.to_string(),
+                "targetDefinitionId": worker_definition.id.to_string(),
+                "input": { "message": "both" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("both targets must fail");
+        assert_eq!(
+            agent_tool_error_output(&both_targets)["code"],
+            "invalid_arguments"
+        );
+        assert!(
+            agent_tool_error_output(&both_targets)["error"]
+                .as_str()
+                .expect("error text")
+                .contains("exactly one of targetInstanceId or targetDefinitionId")
+        );
+        assert_eq!(child_count(), 0);
+
+        let neither_target = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-neither-target",
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": null,
+                "input": { "message": "neither" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("neither target must fail");
+        assert_eq!(
+            agent_tool_error_output(&neither_target)["code"],
+            "invalid_arguments"
+        );
+        assert_eq!(child_count(), 0);
+
+        // Permission denial for a well-formed but disallowed definition.
+        let permission_denied = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-disallowed-definition",
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": disallowed_definition_id.to_string(),
+                "input": { "message": "denied" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("disallowed definition must fail");
+        assert_eq!(
+            agent_tool_error_output(&permission_denied)["code"],
+            "permission_denied"
+        );
+        assert_eq!(child_count(), 0);
+
+        // Definition with no existing runnable instance: not_found + recovery path.
+        let no_instance = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-definition-no-instance",
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": missing_definition_id.to_string(),
+                "input": { "message": "no-instance" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("definition without instance must fail");
+        let no_instance_output = agent_tool_error_output(&no_instance);
+        assert_eq!(no_instance_output["code"], "not_found");
+        let no_instance_message = no_instance_output["error"].as_str().expect("error text");
+        assert!(
+            no_instance_message.contains("never auto-creates")
+                && no_instance_message.contains("agent_create_instances"),
+            "expected create recovery path, got {no_instance_message}"
+        );
+        assert_eq!(child_count(), 0);
+
+        // Legal instance delegate.
+        let instance_delegate = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-legal-instance",
+            json!({
+                "targetInstanceId": coordinator_instance_id.to_string(),
+                "targetDefinitionId": null,
+                "input": { "message": "instance-ok" },
+                "correlationId": "corr-instance",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("legal instance delegate must succeed");
+        assert_eq!(instance_delegate["status"], "queued");
+        assert_eq!(
+            instance_delegate["targetInstanceId"],
+            coordinator_instance_id.to_string()
+        );
+        assert_eq!(instance_delegate["correlationId"], "corr-instance");
+        assert_eq!(child_count(), 1);
+
+        // Create a worker instance, then legal definition routing.
+        let created = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-create-for-delegate",
+            json!({
+                "definitionId": worker_definition.id.to_string(),
+                "count": 1,
+                "executionWorkspaceMode": "shared",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("create worker for definition routing");
+        let worker_instance_id = created["instances"][0]["id"]
+            .as_str()
+            .expect("created instance id")
+            .to_string();
+
+        let definition_delegate = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-legal-definition",
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": worker_definition.id.to_string(),
+                "input": { "message": "definition-ok" },
+                "correlationId": "corr-definition",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("legal definition routing must succeed");
+        assert_eq!(definition_delegate["status"], "queued");
+        assert_eq!(definition_delegate["targetInstanceId"], worker_instance_id);
+        assert_eq!(definition_delegate["correlationId"], "corr-definition");
+        assert_eq!(child_count(), 2);
+
+        let children = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database")
+            .agent_tasks_for_parent(&team_id, &parent_task_id)
+            .expect("child tasks");
+        assert!(
+            children
+                .iter()
+                .any(|task| task.owner_instance_id.to_string() == worker_instance_id)
         );
     }
 }
