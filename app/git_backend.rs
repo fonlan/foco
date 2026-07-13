@@ -598,6 +598,12 @@ pub(super) fn create_agent_worktree(
     checkout_index(&worktree_repo, &mut index)?;
     write_index(index)?;
 
+    // Skill directories are intentionally not materialised here (no
+    // `.agents/skills` / `.claude/skills` symlinks or copies). Plan/isolated
+    // worktrees must stay a pure Git checkout so status/diff/commit/merge stay
+    // clean. Workspace/global Skills are exposed read-only via the run-scoped
+    // `AvailableSkillsSnapshot` / `skill_read_root_dirs` grant in
+    // `ensure_read_file_external_access`, aligned with the prompt routing table.
     Ok(AgentWorktreeInfo {
         root_path,
         base_revision: base_revision.to_string(),

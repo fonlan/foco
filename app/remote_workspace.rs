@@ -9210,6 +9210,7 @@ async fn remote_sidecar_execute_tool_call(
             memory_settings: global_config.memory.clone(),
         },
         None,
+        Vec::new(),
         ToolResourceLockRegistry::default(),
         foco_tools::ToolCancellationToken::default(),
         tool_output_tx.clone(),

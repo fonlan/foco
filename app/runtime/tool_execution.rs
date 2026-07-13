@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -232,6 +231,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
+    skill_read_root_dirs: Vec<PathBuf>,
     workspace_id: &str,
     workspace_path: &Path,
     tool_workspace_path: &Path,
@@ -271,6 +271,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         question_event_tx.clone(),
                         memory_tool_context.clone(),
                         agent_tool_context.clone(),
+                        skill_read_root_dirs.clone(),
                         tool_resource_lock_registry.clone(),
                         cancellation_token.clone(),
                         tool_output_delta_tx.clone(),
@@ -313,6 +314,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let question_event_tx = question_event_tx.clone();
                     let memory_tool_context = memory_tool_context.clone();
                     let agent_tool_context = agent_tool_context.clone();
+                    let skill_read_root_dirs = skill_read_root_dirs.clone();
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
                     let cancellation_token = cancellation_token.clone();
                     let tool_output_delta_tx = tool_output_delta_tx.clone();
@@ -338,6 +340,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 question_event_tx,
                                 memory_tool_context,
                                 agent_tool_context,
+                                skill_read_root_dirs,
                                 tool_resource_lock_registry,
                                 cancellation_token,
                                 tool_output_delta_tx,
@@ -391,6 +394,7 @@ async fn execute_tool_call(
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     mut memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
+    skill_read_root_dirs: Vec<PathBuf>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -420,6 +424,7 @@ async fn execute_tool_call(
         question_event_tx,
         memory_tool_context,
         agent_tool_context,
+        skill_read_root_dirs,
         tool_resource_lock_registry,
         cancellation_token.clone(),
         tool_output_delta_tx,
@@ -529,6 +534,7 @@ pub(crate) async fn execute_tool(
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
+    skill_read_root_dirs: Vec<PathBuf>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -1006,6 +1012,7 @@ pub(crate) async fn execute_tool(
             .unwrap_or(Duration::ZERO);
         let allow_external_read_access = match ensure_read_file_external_access(
             &global_config,
+            &skill_read_root_dirs,
             question_registry.clone(),
             question_event_tx.clone(),
             workspace_id,
@@ -2966,6 +2973,7 @@ enum ReadFileExternalAccessDecision {
 
 async fn ensure_read_file_external_access(
     global_config: &GlobalConfig,
+    skill_read_root_dirs: &[PathBuf],
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
@@ -2988,7 +2996,11 @@ async fn ensure_read_file_external_access(
         return Ok(false);
     };
 
-    if read_file_target_is_configured_skill(global_config, workspace_id, &target_path) {
+    // Prefer the run-scoped Skill snapshot from prompt assembly so routing-table
+    // visibility and read_file grants stay identical for shared + isolated worktrees.
+    if path_is_within_skill_read_roots(&target_path, skill_read_root_dirs)
+        || read_file_target_is_configured_skill(global_config, workspace_id, &target_path)
+    {
         return Ok(true);
     }
 
@@ -3031,18 +3043,22 @@ fn read_file_target_is_configured_skill(
     workspace_id: &str,
     target_path: &Path,
 ) -> bool {
-    config
-        .skills
-        .detected
-        .iter()
-        .filter(|skill| {
-            skill.scope == SKILL_SCOPE_GLOBAL
-                || (skill.scope == SKILL_SCOPE_WORKSPACE
-                    && skill.workspace_id.as_deref() == Some(workspace_id))
-        })
-        .filter_map(|skill| skill.path.parent())
-        .filter_map(|skill_dir| fs::canonicalize(skill_dir).ok())
-        .any(|skill_dir| target_path.starts_with(skill_dir))
+    // Fallback when a call site has no prompt-assembly snapshot (tests, remote
+    // sidecar paths). Prefer skill_read_root_dirs from AvailableSkillsSnapshot.
+    let roots = skill_read_root_dirs_from_settings(
+        &config
+            .skills
+            .detected
+            .iter()
+            .filter(|skill| {
+                skill.scope == SKILL_SCOPE_GLOBAL
+                    || (skill.scope == SKILL_SCOPE_WORKSPACE
+                        && skill.workspace_id.as_deref() == Some(workspace_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    path_is_within_skill_read_roots(target_path, &roots)
 }
 
 async fn ask_read_file_external_access(
@@ -3357,6 +3373,7 @@ mod tests {
                 memory_settings: MemorySettings::default(),
             },
             None,
+            Vec::new(),
             ToolResourceLockRegistry::default(),
             ToolCancellationToken::default(),
             mpsc::unbounded_channel().0,
@@ -3481,6 +3498,7 @@ mod tests {
 
         let allowed = ensure_read_file_external_access(
             &config,
+            &[],
             registry,
             event_tx,
             "workspace-1",
@@ -3538,6 +3556,7 @@ mod tests {
         for (call_id, path) in [("call-1", &skill_file), ("call-2", &reference_file)] {
             let allowed = ensure_read_file_external_access(
                 &config,
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 "workspace-1",
@@ -3565,6 +3584,41 @@ mod tests {
         );
         assert!(!result.is_error);
         assert_eq!(result.output["content"], "1\tdetails");
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_skips_question_for_prompt_skill_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let isolated_worktree = tempfile::tempdir().expect("isolated worktree");
+        let skill_dir = workspace.path().join(".agents").join("skills").join("live");
+        fs::create_dir_all(&skill_dir).expect("skill directory");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "live skill").expect("write skill");
+        // Stale/missing detected list: grant must come from the run snapshot only.
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let skill_root = fs::canonicalize(&skill_dir).expect("canonicalize skill");
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-snapshot-{}", unique_id("case"));
+
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &[skill_root],
+            registry,
+            event_tx,
+            "workspace-1",
+            isolated_worktree.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &json!({ "path": skill_file.to_string_lossy(), "startLine": null, "endLine": null }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("snapshot skill access check");
+
+        assert!(allowed);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3624,7 +3678,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let chat_id = format!("chat-external-access-workspace-skill-{}", unique_id("case"));
         let allowed = ensure_read_file_external_access(
-            &config,
+            &config, &[],
             registry.clone(),
             event_tx.clone(),
             workspace_id,
@@ -3649,6 +3703,7 @@ mod tests {
                 json!({ "path": path.to_string_lossy(), "startLine": null, "endLine": null });
             let access = ensure_read_file_external_access(
                 &config,
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
@@ -3690,6 +3745,7 @@ mod tests {
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx,
             "workspace-1",
@@ -3733,6 +3789,7 @@ mod tests {
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx,
             "workspace-1",
@@ -3778,6 +3835,7 @@ mod tests {
         let first_arguments = json!({ "path": first_path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3804,6 +3862,7 @@ mod tests {
             json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
         let second_allowed = ensure_read_file_external_access(
             &config,
+            &[],
             registry,
             event_tx,
             "workspace-1",
@@ -3843,6 +3902,7 @@ mod tests {
 
         let first_access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3855,6 +3915,7 @@ mod tests {
         );
         let second_access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3867,6 +3928,7 @@ mod tests {
         );
         let third_access = ensure_read_file_external_access(
             &config,
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",

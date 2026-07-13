@@ -927,6 +927,76 @@ fn validate_skill_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One Skill directory the model may `read_file` without an external-access
+/// question. Roots are canonicalized and limited to that Skill folder only
+/// (SKILL.md, references/, scripts/, assets/, …), not the whole workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AvailableSkillsSnapshot {
+    pub(crate) prompt_entries: Vec<SkillPromptEntry>,
+    pub(crate) read_root_dirs: Vec<PathBuf>,
+}
+
+/// Live-discover Skills for this workspace and apply the same filters used by
+/// the `## Skills` routing table: workspace scope, disabled locations (via
+/// discovery), disabled keys, and required-disabled keys.
+pub(crate) fn available_skills_snapshot_for_workspace(
+    user_profile_dir: &Path,
+    config: &GlobalConfig,
+    workspace_id: &str,
+) -> AvailableSkillsSnapshot {
+    let disabled_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let discovery = discover_skills(user_profile_dir, config);
+    let required_disabled_ids = discovery
+        .required_disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    let skills = discovery
+        .skills
+        .into_iter()
+        .filter(|skill| {
+            skill_applies_to_workspace(skill, workspace_id)
+                && !skill_is_disabled(skill, &disabled_ids)
+                && !skill_is_required_disabled(skill, &required_disabled_ids)
+        })
+        .collect::<Vec<_>>();
+
+    AvailableSkillsSnapshot {
+        prompt_entries: skills
+            .iter()
+            .map(skill_prompt_entry_from_settings)
+            .collect(),
+        read_root_dirs: skill_read_root_dirs_from_settings(&skills),
+    }
+}
+
+pub(crate) fn skill_read_root_dirs_from_settings(skills: &[SkillSettings]) -> Vec<PathBuf> {
+    let mut roots = skills
+        .iter()
+        .filter_map(skill_read_root_dir)
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn skill_read_root_dir(skill: &SkillSettings) -> Option<PathBuf> {
+    skill
+        .path
+        .parent()
+        .and_then(|skill_dir| fs::canonicalize(skill_dir).ok())
+}
+
+pub(crate) fn path_is_within_skill_read_roots(target_path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| target_path.starts_with(root))
+}
+
 pub(crate) fn available_skills_routing_message(
     entries: &[SkillPromptEntry],
 ) -> Option<NeutralChatMessage> {
@@ -953,31 +1023,8 @@ pub(crate) fn enabled_skill_frontmatter_messages(
     config: &GlobalConfig,
     workspace_id: &str,
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
-    let disabled_ids = config
-        .skills
-        .disabled
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, config);
-    let required_disabled_ids = discovery
-        .required_disabled
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-
-    let entries = discovery
-        .skills
-        .iter()
-        .filter(|skill| {
-            skill_applies_to_workspace(skill, workspace_id)
-                && !skill_is_disabled(skill, &disabled_ids)
-                && !skill_is_required_disabled(skill, &required_disabled_ids)
-        })
-        .map(skill_prompt_entry_from_settings)
-        .collect::<Vec<_>>();
-
-    Ok(available_skills_routing_message(&entries)
+    let snapshot = available_skills_snapshot_for_workspace(user_profile_dir, config, workspace_id);
+    Ok(available_skills_routing_message(&snapshot.prompt_entries)
         .into_iter()
         .collect())
 }
@@ -1012,6 +1059,53 @@ fn skill_scope_prompt_label(skill: &SkillSettings) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn available_skills_snapshot_filters_disabled_and_workspace() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("build");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---
+name: build
+description: build helpers
+---
+
+Body.",
+        )
+        .expect("skill");
+
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.workspaces[0].id = "workspace-a".to_string();
+        config.workspaces[0].name = "A".to_string();
+        config.workspaces[0].path = workspace.path().to_path_buf();
+
+        let snapshot =
+            available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-a");
+        assert_eq!(snapshot.prompt_entries.len(), 1);
+        assert_eq!(snapshot.prompt_entries[0].name, "build");
+        assert_eq!(snapshot.read_root_dirs.len(), 1);
+        assert!(snapshot.read_root_dirs[0].ends_with("build"));
+
+        config
+            .skills
+            .disabled
+            .push(snapshot.prompt_entries[0].key.clone());
+        let disabled =
+            available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-a");
+        assert!(disabled.prompt_entries.is_empty());
+        assert!(disabled.read_root_dirs.is_empty());
+
+        let other =
+            available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-other");
+        assert!(other.prompt_entries.is_empty());
+    }
 
     #[test]
     fn deletable_skill_directory_allows_nested_skill_directory() {

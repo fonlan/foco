@@ -197,12 +197,14 @@ pub(crate) use skills::discover_skills_in_all_locations;
 #[cfg(test)]
 pub(crate) use skills::parse_skill_markdown;
 pub(crate) use skills::{
-    SkillDiscoveryErrorSummary, deletable_skill_directory_for_path, discover_skills,
+    SkillDiscoveryErrorSummary, available_skills_routing_message,
+    available_skills_snapshot_for_workspace, deletable_skill_directory_for_path, discover_skills,
     enabled_skill_frontmatter_messages, merge_disabled_skill_keys,
     merge_manual_disabled_skill_keys, message_with_selected_skills,
-    normalize_manual_disabled_skill_ids, parse_skill_file,
+    normalize_manual_disabled_skill_ids, parse_skill_file, path_is_within_skill_read_roots,
     preserve_disabled_skill_keys_for_hidden_locations, refresh_derived_enabled_skills,
-    skill_is_disabled, skill_is_required_disabled, skill_search_roots,
+    skill_is_disabled, skill_is_required_disabled, skill_read_root_dirs_from_settings,
+    skill_search_roots,
 };
 #[cfg(test)]
 mod provider_audit_source_guard;
@@ -2293,6 +2295,10 @@ struct PreparedChatContext {
     code_change_baseline: SessionCodeChangeBaselineState,
     code_change_stats: CodeChangeStats,
     pending_memory_retrieval: Option<PendingMemoryRetrieval>,
+    /// Canonical Skill directories from this turn's prompt assembly (same set as
+    /// the `## Skills` routing table). Prefer this over `config.skills.detected`
+    /// so tool read grants stay aligned with live discovery + disable filters.
+    skill_read_root_dirs: Vec<PathBuf>,
 }
 
 struct PreparedPromptContext {
@@ -2321,6 +2327,10 @@ struct PreparedPromptContext {
     pending_context_injections: Vec<PendingPromptContextInjection>,
     pending_memory_retrieval: Option<PendingMemoryRetrieval>,
     pending_spec_snapshot: Option<PendingChatSpecSnapshot>,
+    /// Canonical Skill directories from this turn's `## Skills` routing table.
+    /// Used by `read_file` so Plan isolated worktrees can read the same Skills
+    /// the model was told about without materializing symlinks into the worktree.
+    skill_read_root_dirs: Vec<PathBuf>,
 }
 
 impl PreparedPromptContext {
@@ -4207,6 +4217,7 @@ impl PreparedChatContext {
                                                 memory_settings: self.memory_settings.clone(),
                                             },
                                             self.agent_tool_context.clone(),
+                                            self.skill_read_root_dirs.clone(),
         &self.workspace_id,
                                             &self.workspace_path,
                                             &self.tool_workspace_path,
@@ -4953,6 +4964,7 @@ async fn prepare_chat_context_for_output(
         code_change_baseline,
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval,
+        skill_read_root_dirs: prompt_context.skill_read_root_dirs,
     })
 }
 

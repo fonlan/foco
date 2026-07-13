@@ -700,6 +700,7 @@ fn test_prepared_chat_context(
         },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
+        skill_read_root_dirs: Vec::new(),
     }
 }
 
@@ -1362,6 +1363,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             memory_settings: MemorySettings::default(),
         },
         None,
+        Vec::new(),
         registry,
         ToolCancellationToken::default(),
         mpsc::unbounded_channel().0,
@@ -4897,6 +4899,7 @@ fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
         pending_context_injections: Vec::new(),
         pending_memory_retrieval: None,
         pending_spec_snapshot: None,
+        skill_read_root_dirs: Vec::new(),
     };
     let usage =
         context_usage_response(preview.context_usage_input()).expect("context usage response");
@@ -10422,6 +10425,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
+        skill_read_root_dirs: Vec::new(),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -11938,6 +11942,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
+        skill_read_root_dirs: Vec::new(),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -12361,6 +12366,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
+        skill_read_root_dirs: Vec::new(),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),

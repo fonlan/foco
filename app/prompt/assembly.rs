@@ -308,8 +308,12 @@ pub(crate) async fn prepare_prompt_context(
         .map(|_| build_project_spec_prompt_section());
     let memory_prompt_section = config.memory.enabled.then(build_memory_prompt_section);
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
-    let skill_messages =
-        enabled_skill_frontmatter_messages(&state.user_profile_dir, config, &workspace.id)?;
+    let skills_snapshot =
+        available_skills_snapshot_for_workspace(&state.user_profile_dir, config, &workspace.id);
+    let skill_messages = available_skills_routing_message(&skills_snapshot.prompt_entries)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let skill_read_root_dirs = skills_snapshot.read_root_dirs;
     let skill_prompt_tokens = skill_messages
         .iter()
         .map(|message| estimate_text_tokens(&message.content))
@@ -633,6 +637,7 @@ pub(crate) async fn prepare_prompt_context(
         pending_context_injections,
         pending_memory_retrieval,
         pending_spec_snapshot: project_spec_context.pending_snapshot,
+        skill_read_root_dirs,
     })
 }
 
