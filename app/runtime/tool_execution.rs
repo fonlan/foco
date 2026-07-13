@@ -48,11 +48,12 @@ use crate::*;
 
 use foco_providers::NeutralToolCall;
 use foco_tools::{
-    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL,
-    GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
-    READ_SPEC_TOOL, SEARCH_TEXT_TOOL, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
-    UPDATE_TODO_GRAPH_TOOL,
+    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
+    GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
+    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
+    UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL,
+    WRITE_FILE_TOOL,
 };
 use serde_json::Value;
 
@@ -3095,6 +3096,12 @@ async fn ensure_read_file_external_access(
     arguments: &Value,
     cancellation_token: ToolCancellationToken,
 ) -> Result<bool, String> {
+    // Tool audit: among built-in path tools only `read_file` has ask-before-external-read.
+    // find_files / search_text / graph_* stay on execution-root resolvers; write_file /
+    // edit_file / run_command never receive this auto-grant. Todo/Plan/Spec use the shared
+    // workspace database path via `builtin_tool_uses_workspace_database`, not this helper.
+    // Future external-read tools must reuse shared vs execution-root classification here
+    // rather than inventing a second trust flag.
     if tool_name != READ_FILE_TOOL {
         return Ok(false);
     }
@@ -3953,6 +3960,387 @@ mod tests {
                     .contains("user denied read_file access")
             );
         }
+    }
+
+    /// Audit fixture: only `read_file` participates in external-read confirmation.
+    /// Other path tools always get `allow_external_read_access=false` from this helper.
+    #[tokio::test]
+    async fn only_read_file_tool_enables_external_read_access_helper() {
+        let workspace = tempfile::tempdir().expect("shared workspace");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(outside.path(), "secret").expect("write outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-audit-only-read-file-{}", unique_id("case"));
+        let path = outside.path().to_string_lossy().to_string();
+        let arguments = json!({ "path": path, "startLine": null, "endLine": null });
+
+        for tool_name in [
+            WRITE_FILE_TOOL,
+            EDIT_FILE_TOOL,
+            FIND_FILES_TOOL,
+            SEARCH_TEXT_TOOL,
+            RUN_COMMAND_TOOL,
+            GRAPH_EXPLORE_TOOL,
+            CREATE_TODO_GRAPH_TOOL,
+            READ_SPEC_TOOL,
+        ] {
+            let allowed = ensure_read_file_external_access(
+                &config,
+                &[],
+                registry.clone(),
+                event_tx.clone(),
+                "workspace-1",
+                workspace.path(),
+                workspace.path(),
+                &chat_id,
+                "call-audit",
+                tool_name,
+                &arguments,
+                ToolCancellationToken::default(),
+            )
+            .await
+            .expect("non-read_file tools short-circuit");
+            assert!(
+                !allowed,
+                "{tool_name} must not receive external-read auto-grant"
+            );
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
+    /// Canonical membership: string-prefix lookalikes and `..` escapes are not trusted.
+    #[tokio::test]
+    async fn read_file_external_access_rejects_prefix_lookalike_and_parent_escape() {
+        let parent = tempfile::tempdir().expect("parent");
+        let workspace_name = "shared-ws";
+        let lookalike_name = "shared-ws-evil";
+        let workspace = parent.path().join(workspace_name);
+        let lookalike = parent.path().join(lookalike_name);
+        fs::create_dir_all(&workspace).expect("shared workspace");
+        fs::create_dir_all(&lookalike).expect("lookalike workspace");
+        let nested_worktree = workspace
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("phase-wt");
+        fs::create_dir_all(&nested_worktree).expect("nested worktree");
+
+        let shared_file = workspace.join("inside.txt");
+        fs::write(&shared_file, "inside shared").expect("write shared");
+        let lookalike_file = lookalike.join("evil.txt");
+        fs::write(&lookalike_file, "lookalike").expect("write lookalike");
+        let outside = parent.path().join("plain-outside.txt");
+        fs::write(&outside, "plain outside").expect("write outside");
+
+        let config = GlobalConfig::first_run(workspace.clone());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-prefix-boundary-{}", unique_id("case"));
+
+        // True shared path still auto-allows.
+        let shared_allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            &workspace,
+            &nested_worktree,
+            &chat_id,
+            "call-shared",
+            READ_FILE_TOOL,
+            &json!({
+                "path": shared_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("shared path");
+        assert!(shared_allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        // Prefix-similar directory name must still prompt (component starts_with, not str prefix).
+        let lookalike_chat = format!("{chat_id}-lookalike");
+        let lookalike_arguments = json!({
+            "path": lookalike_file.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let lookalike_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            &workspace,
+            &nested_worktree,
+            &lookalike_chat,
+            "call-lookalike",
+            READ_FILE_TOOL,
+            &lookalike_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (request, denied) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+            lookalike_access
+        );
+        assert!(
+            request.questions[0]
+                .question
+                .contains(&lookalike_file.display().to_string())
+        );
+        assert!(
+            denied
+                .expect_err("lookalike must prompt")
+                .contains("user denied read_file access")
+        );
+
+        // Absolute path with `..` that lands outside shared after canonicalize still prompts.
+        let escaped_via_parent = workspace.join("..").join("plain-outside.txt");
+        let escape_chat = format!("{chat_id}-parent");
+        let escape_arguments = json!({
+            "path": escaped_via_parent.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let escape_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            &workspace,
+            &nested_worktree,
+            &escape_chat,
+            "call-parent",
+            READ_FILE_TOOL,
+            &escape_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (request, denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            escape_access
+        );
+        let outside_display = outside.display().to_string();
+        assert!(
+            request.questions[0].question.contains(&outside_display)
+                || request.questions[0]
+                    .question
+                    .contains(&escaped_via_parent.display().to_string()),
+            "parent-escape question should surface outside target"
+        );
+        assert!(
+            denied
+                .expect_err(".. escape must not auto-allow")
+                .contains("user denied read_file access")
+        );
+    }
+
+    /// Full execute_tool chain: shared absolute path from isolated worktree, no questionRequest.
+    #[tokio::test]
+    async fn execute_tool_reads_shared_workspace_from_isolated_worktree_without_question() {
+        let workspace = tempfile::tempdir().expect("shared workspace");
+        let worktree_dir = workspace
+            .path()
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("exec-wt");
+        fs::create_dir_all(&worktree_dir).expect("nested worktree");
+        let shared_file = workspace.path().join("shared-note.txt");
+        fs::write(&shared_file, "shared via execute_tool").expect("write shared");
+        fs::write(worktree_dir.join("shared-note.txt"), "worktree shadow").expect("write worktree");
+
+        let chat_id = format!("chat-execute-tool-shared-{}", unique_id("case"));
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let output = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &HookConfig::default(),
+            true,
+            &GlobalConfig::first_run(workspace.path().to_path_buf()),
+            Some(&ProviderConnectionConfig {
+                kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+                    .expect("provider kind"),
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+                request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
+            }),
+            &WebSearchSettings::default(),
+            registry,
+            event_tx,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-shared-read".to_string(),
+                tool_call_id: "call-shared-read".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            &worktree_dir,
+            &chat_id,
+            None,
+            "run-shared-read",
+            "model-1",
+            "provider-1",
+            0,
+            "call-shared-read",
+            READ_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": 5000
+            }),
+        )
+        .await;
+
+        assert!(!output.execution.is_error, "{:?}", output.execution.output);
+        assert_eq!(
+            output.execution.output["content"],
+            "1\tshared via execute_tool"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "shared workspace read must not emit questionRequest"
+        );
+
+        // Relative path still resolves under the worktree execution root.
+        let relative = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            READ_FILE_TOOL,
+            json!({
+                "path": "shared-note.txt",
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            false,
+        );
+        assert!(!relative.is_error, "{:?}", relative.output);
+        assert_eq!(relative.output["content"], "1\tworktree shadow");
+    }
+
+    /// Isolation: write/edit/run from a worktree root cannot modify shared via absolute/parent paths.
+    /// `allow_external_read_access=true` must not become a write grant.
+    #[tokio::test]
+    async fn isolated_worktree_write_edit_run_cannot_escape_to_shared_workspace() {
+        let workspace = tempfile::tempdir().expect("shared workspace");
+        let worktree_dir = workspace
+            .path()
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("write-wt");
+        fs::create_dir_all(&worktree_dir).expect("nested worktree");
+        let shared_file = workspace.path().join("protected.txt");
+        fs::write(&shared_file, "do not touch").expect("write shared");
+        fs::write(worktree_dir.join("local.txt"), "worktree local").expect("write worktree");
+        let chat_id = format!("chat-write-isolation-{}", unique_id("case"));
+
+        // Even with external-read flag true (mis-set), write_file stays on execution root.
+        let write_absolute = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            WRITE_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "content": "hacked absolute",
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(write_absolute.is_error, "{:?}", write_absolute.output);
+
+        let write_parent = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            WRITE_FILE_TOOL,
+            json!({
+                "path": "../../../protected.txt",
+                "content": "hacked parent",
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(write_parent.is_error, "{:?}", write_parent.output);
+
+        let edit_absolute = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            EDIT_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "oldStr": "do not touch",
+                "newStr": "edited absolute",
+                "replaceAll": false
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(edit_absolute.is_error, "{:?}", edit_absolute.output);
+
+        let run_escape = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "true",
+                "args": [],
+                "cwd": workspace.path().to_string_lossy(),
+                "timeoutMs": 5000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(run_escape.is_error, "{:?}", run_escape.output);
+
+        let find_escape = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            FIND_FILES_TOOL,
+            json!({
+                "path": workspace.path().to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(find_escape.is_error, "{:?}", find_escape.output);
+
+        assert_eq!(
+            fs::read_to_string(&shared_file).expect("read shared after attempts"),
+            "do not touch",
+            "shared file must remain unmodified"
+        );
     }
 
     /// Plan isolated worktree + live prompt snapshot: `.agents` SKILL.md and

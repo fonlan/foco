@@ -365,6 +365,11 @@ fn execute_builtin_tool_inner(
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
     output_sink: Option<&dyn ToolOutputSink>,
+    // Audit (2026-07): only `read_file` has an ask-before-external-read flow. This flag must
+    // never gate write/edit/run/find/search/graph path resolution — those stay on the
+    // execution-root resolvers (`resolve_workspace_path` / `resolve_workspace_write_path`).
+    // Shared-workspace auto-trust for Plan worktrees lives in app
+    // `ensure_read_file_external_access`, not in these resolvers.
     allow_external_read_access: bool,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
@@ -682,6 +687,9 @@ pub(crate) fn resolve_workspace_path(
     workspace_path: &Path,
     input: &str,
 ) -> Result<PathBuf, ToolRuntimeError> {
+    // Execution-root boundary only. Do not auto-trust a separate shared workspace root here:
+    // write_file / edit_file / find_files / search_text / run_command / graph source reads all
+    // share this resolver. Shared-root read trust is read_file-only via allow_external_read_access.
     let trimmed = normalize_workspace_path_text(input)?;
     let requested = Path::new(&trimmed);
 
@@ -2516,6 +2524,102 @@ mod tests {
                 .expect("error")
                 .contains("escapes the workspace")
         );
+    }
+
+    /// Path-tool isolation under a nested worktree execution root: absolute shared paths and
+    /// parent escapes stay rejected even when `allow_external_read_access` is true. That flag is
+    /// read_file-only and must never become a write/search grant.
+    #[test]
+    fn nested_worktree_path_tools_stay_on_execution_root_despite_external_read_flag() {
+        let shared = tempfile::tempdir().expect("shared");
+        let worktree = shared
+            .path()
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("iso-wt");
+        fs::create_dir_all(&worktree).expect("worktree");
+        let shared_file = shared.path().join("secret.txt");
+        fs::write(&shared_file, "shared secret").expect("write shared");
+        fs::write(worktree.join("local.txt"), "local").expect("write local");
+
+        let write = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            &worktree,
+            Some("chat-path-isolation"),
+            WRITE_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "content": "nope",
+                "startLine": null,
+                "endLine": null
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(write.is_error, "{:?}", write.output);
+
+        let edit = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            &worktree,
+            Some("chat-path-isolation"),
+            EDIT_FILE_TOOL,
+            json!({
+                "path": shared_file.to_string_lossy(),
+                "oldStr": "shared secret",
+                "newStr": "edited",
+                "replaceAll": false
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(edit.is_error, "{:?}", edit.output);
+
+        let find = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            &worktree,
+            Some("chat-path-isolation"),
+            FIND_FILES_TOOL,
+            json!({
+                "path": shared.path().to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(find.is_error, "{:?}", find.output);
+
+        let parent_write =
+            execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                &worktree,
+                Some("chat-path-isolation"),
+                WRITE_FILE_TOOL,
+                json!({
+                    "path": "../../../secret.txt",
+                    "content": "via parent",
+                    "startLine": null,
+                    "endLine": null
+                }),
+                None,
+                None,
+                true,
+            );
+        assert!(parent_write.is_error, "{:?}", parent_write.output);
+
+        assert_eq!(
+            fs::read_to_string(&shared_file).expect("shared content"),
+            "shared secret"
+        );
+
+        // Relative path under the worktree still works.
+        let local_read = execute_builtin_tool(
+            &worktree,
+            READ_FILE_TOOL,
+            json!({ "path": "local.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!local_read.is_error, "{:?}", local_read.output);
+        assert_eq!(local_read.output["content"], "1\tlocal");
     }
 
     #[test]
