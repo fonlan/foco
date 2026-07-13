@@ -25,9 +25,206 @@ pub struct SshCommandResult {
     pub exit_status: Option<u32>,
 }
 
+impl SshCommandResult {
+    pub fn success(&self) -> bool {
+        self.exit_status == Some(0)
+    }
+
+    pub fn stdout_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    pub fn stderr_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
+    /// Compact multi-line details for diagnostics (no secrets expected).
+    pub fn details(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!(
+            "exitStatus: {}",
+            self.exit_status
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        let stdout = self.stdout_lossy();
+        let stderr = self.stderr_lossy();
+        if !stdout.trim().is_empty() {
+            parts.push(format!("stdout:\n{}", stdout.trim()));
+        }
+        if !stderr.trim().is_empty() {
+            parts.push(format!("stderr:\n{}", stderr.trim()));
+        }
+        parts.join("\n")
+    }
+}
+
+/// Bound for diagnostic stderr retained from a long-lived remote process.
+const SPAWNED_STDERR_CAP: usize = 8 * 1024;
+
 /// Long-lived exec channel (e.g. sidecar process).
+///
+/// After `read_line`, call `start_stdout_drain` so the channel is not back-pressured.
 pub struct SshSpawnedExec {
-    pub channel: Channel<client::Msg>,
+    channel: Option<Channel<client::Msg>>,
+    line_buf: Vec<u8>,
+    drain: Option<tokio::task::JoinHandle<()>>,
+    /// Bounded stderr captured during bootstrap and drain (diagnostic only).
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for SshSpawnedExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshSpawnedExec")
+            .field("has_channel", &self.channel.is_some())
+            .field("draining", &self.drain.is_some())
+            .finish()
+    }
+}
+
+impl SshSpawnedExec {
+    fn new(channel: Channel<client::Msg>) -> Self {
+        Self {
+            channel: Some(channel),
+            line_buf: Vec::new(),
+            drain: None,
+            stderr: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Read the first newline-terminated line (bootstrap JSON), with timeout.
+    pub async fn read_line(&mut self, max_wait: Duration) -> Result<String, SshError> {
+        if self.channel.is_none() {
+            return Err(SshError::new(
+                SshErrorKind::RemoteCommandFailed,
+                "remote exec channel is already draining or closed",
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            if let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
+                let line = self.line_buf.drain(..=pos).collect::<Vec<_>>();
+                let text = String::from_utf8_lossy(&line).trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                return Ok(text);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SshError::new(
+                    SshErrorKind::Timeout,
+                    "timed out waiting for remote process stdout line",
+                ));
+            }
+            let channel = self.channel.as_mut().expect("channel present");
+            let msg = timeout(remaining, channel.wait())
+                .await
+                .map_err(|_| {
+                    SshError::new(
+                        SshErrorKind::Timeout,
+                        "timed out waiting for remote process stdout line",
+                    )
+                })?
+                .ok_or_else(|| {
+                    SshError::new(
+                        SshErrorKind::RemoteCommandFailed,
+                        "remote process closed stdout before producing a line",
+                    )
+                })?;
+            match msg {
+                ChannelMsg::Data { ref data } => self.line_buf.extend_from_slice(data),
+                ChannelMsg::ExtendedData { ref data, ext } if ext == 1 => {
+                    append_bounded(&self.stderr, data, SPAWNED_STDERR_CAP);
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    return Err(SshError::new(
+                        SshErrorKind::RemoteCommandFailed,
+                        format!(
+                            "remote process exited with status {exit_status} before writing a line"
+                        ),
+                    ));
+                }
+                ChannelMsg::ExitSignal {
+                    ref signal_name,
+                    ref error_message,
+                    ..
+                } => {
+                    return Err(SshError::new(
+                        SshErrorKind::RemoteCommandFailed,
+                        format!(
+                            "remote process killed by signal {signal_name:?}: {}",
+                            error_message.trim()
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drain remaining stdout forever; keep a bounded stderr ring for diagnostics.
+    pub fn start_stdout_drain(&mut self) {
+        if self.drain.is_some() {
+            return;
+        }
+        let Some(mut channel) = self.channel.take() else {
+            return;
+        };
+        let stderr = Arc::clone(&self.stderr);
+        // Flush any leftover bootstrap bytes into the void (already consumed line).
+        self.line_buf.clear();
+        self.drain = Some(tokio::spawn(async move {
+            loop {
+                match channel.wait().await {
+                    None => break,
+                    Some(ChannelMsg::Data { .. }) => {}
+                    Some(ChannelMsg::ExtendedData { ref data, ext }) if ext == 1 => {
+                        append_bounded(&stderr, data, SPAWNED_STDERR_CAP);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }));
+    }
+
+    /// Best-effort close of the remote channel (idempotent).
+    pub async fn close(&mut self) {
+        if let Some(channel) = self.channel.as_ref() {
+            let _ = channel.close().await;
+        }
+        if let Some(handle) = self.drain.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        self.channel = None;
+    }
+
+    pub fn diagnostic_stderr(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for SshSpawnedExec {
+    fn drop(&mut self) {
+        if let Some(handle) = self.drain.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn append_bounded(buf: &Arc<Mutex<Vec<u8>>>, data: &[u8], cap: usize) {
+    let Ok(mut guard) = buf.lock() else {
+        return;
+    };
+    if guard.len() >= cap {
+        return;
+    }
+    let room = cap - guard.len();
+    guard.extend_from_slice(&data[..data.len().min(room)]);
 }
 
 #[derive(Default)]
@@ -127,6 +324,15 @@ pub struct SshSession {
     profile: ResolvedSshProfile,
 }
 
+impl std::fmt::Debug for SshSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshSession")
+            .field("profile", &self.profile)
+            .field("closed", &self.handle.is_closed())
+            .finish()
+    }
+}
+
 impl SshSession {
     /// TCP connect + host-key check + authenticate.
     pub async fn connect(profile: &ResolvedSshProfile) -> Result<Self, SshError> {
@@ -138,13 +344,13 @@ impl SshSession {
     }
 
     /// Run a remote command to completion, capturing stdout/stderr/exit.
-    pub async fn exec(&mut self, command: &str) -> Result<SshCommandResult, SshError> {
+    pub async fn exec(&self, command: &str) -> Result<SshCommandResult, SshError> {
         self.exec_with_stdin(command, &[]).await
     }
 
     /// Run a remote command with stdin bytes (used for sidecar binary upload).
     pub async fn exec_with_stdin(
-        &mut self,
+        &self,
         command: &str,
         stdin: &[u8],
     ) -> Result<SshCommandResult, SshError> {
@@ -156,7 +362,10 @@ impl SshSession {
         channel.exec(true, command).await.map_err(map_russh_error)?;
         if !stdin.is_empty() {
             for chunk in stdin.chunks(32 * 1024) {
-                channel.data(&chunk[..]).await.map_err(map_russh_error)?;
+                channel
+                    .data(std::io::Cursor::new(chunk))
+                    .await
+                    .map_err(map_russh_error)?;
             }
         }
         channel.eof().await.map_err(map_russh_error)?;
@@ -185,19 +394,19 @@ impl SshSession {
     }
 
     /// Open an exec channel without draining it (long-running sidecar).
-    pub async fn spawn_exec(&mut self, command: &str) -> Result<SshSpawnedExec, SshError> {
+    pub async fn spawn_exec(&self, command: &str) -> Result<SshSpawnedExec, SshError> {
         let channel = self
             .handle
             .channel_open_session()
             .await
             .map_err(map_russh_error)?;
         channel.exec(true, command).await.map_err(map_russh_error)?;
-        Ok(SshSpawnedExec { channel })
+        Ok(SshSpawnedExec::new(channel))
     }
 
     /// Open a `direct-tcpip` channel (local port-forward style).
     pub async fn open_direct_tcpip(
-        &mut self,
+        &self,
         host_to_connect: &str,
         port_to_connect: u16,
         originator_address: &str,
@@ -214,7 +423,13 @@ impl SshSession {
             .map_err(map_russh_error)
     }
 
-    pub async fn disconnect(self) -> Result<(), SshError> {
+    /// Whether the underlying SSH transport has closed.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+
+    /// Request disconnect; safe to call multiple times / while shared via `Arc`.
+    pub async fn disconnect(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "foco disconnect", "")
             .await
@@ -798,5 +1013,98 @@ mod tests {
     fn sanitize_prompt_truncates() {
         let long = "p".repeat(120);
         assert_eq!(sanitize_prompt_for_error(&long).len(), 80);
+    }
+
+    #[test]
+    fn command_result_success_and_details() {
+        let ok = SshCommandResult {
+            stdout: b"hi\n".to_vec(),
+            stderr: Vec::new(),
+            exit_status: Some(0),
+        };
+        assert!(ok.success());
+        assert!(ok.details().contains("exitStatus: 0"));
+        assert!(ok.details().contains("stdout:"));
+
+        let fail = SshCommandResult {
+            stdout: Vec::new(),
+            stderr: b"nope".to_vec(),
+            exit_status: Some(1),
+        };
+        assert!(!fail.success());
+    }
+}
+
+#[cfg(test)]
+mod source_guards {
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn production_rust_sources() -> Vec<PathBuf> {
+        let mut roots = vec![
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("store"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("agent"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tools"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("providers"),
+        ];
+        let mut files = Vec::new();
+        while let Some(root) = roots.pop() {
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if matches!(name, "target" | "node_modules" | ".git" | ".foco") {
+                        continue;
+                    }
+                    roots.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn production_rust_does_not_spawn_system_ssh() {
+        // Built from parts so this test file does not contain the banned literals.
+        let forbidden = [
+            format!("Command::new(\"{}\")", "ssh"),
+            format!("Command::new(\"{}\")", "scp"),
+            format!("Command::new(\"{}\")", "sftp"),
+            format!("{}={}", "BatchMode", "yes"),
+            format!("{}=", "ServerAliveInterval"),
+            format!("{}=", "ExitOnForwardFailure"),
+            ["SSH_", "ASKPASS"].concat(),
+            ["remote_server_", "ssh_args"].concat(),
+        ];
+        let mut violations = Vec::new();
+        for path in production_rust_sources() {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // Strip this module so the guard source is not a self-hit.
+            let scan = if path.ends_with("session.rs") {
+                text.split("mod source_guards")
+                    .next()
+                    .unwrap_or(text.as_str())
+            } else {
+                text.as_str()
+            };
+            for needle in &forbidden {
+                if scan.contains(needle) {
+                    violations.push(format!("{} contains {needle}", path.display()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "system OpenSSH spawn/options must not return:\n{}",
+            violations.join("\n")
+        );
     }
 }

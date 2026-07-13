@@ -23,7 +23,7 @@ const workspaceDialogTsx = await readFile(
 const appTsx = await readFile(path.join(repoRoot, "web/App.tsx"), "utf8");
 const i18nTs = await readFile(path.join(repoRoot, "web/shared/i18n.ts"), "utf8");
 const ensureSidecarCommand = remoteWorkspaceRs.match(
-  /async fn ensure_sidecar_command[\s\S]*?\n}\n\nasync fn remote_sidecar_matches/,
+  /async fn ensure_sidecar_command[\s\S]*?\n}\n\nfn parse_remote_sidecar_identity/,
 )?.[0];
 assert.ok(ensureSidecarCommand, "ensure_sidecar_command source exists");
 
@@ -46,14 +46,22 @@ const requiredErrorKinds = [
   "sidecar_asset_missing",
   "startup_failed",
 ];
+const sshClientErrorRs = await readFile(
+  path.join(repoRoot, "app/ssh_client/error.rs"),
+  "utf8",
+);
+const errorKindCorpus = `${remoteServersRs}\n${sshClientErrorRs}`;
 for (const kind of requiredErrorKinds) {
-  assert.match(remoteServersRs, new RegExp(`"${kind}"`), `${kind} diagnostic kind exists`);
+  assert.match(errorKindCorpus, new RegExp(`"${kind}"`), `${kind} diagnostic kind exists`);
 }
 
 assert.match(remoteServersRs, /select_sidecar_asset\(&target\)/, "diagnostics select packaged sidecar by target");
 assert.match(remoteServersRs, /Sha256::digest\(&bytes\)/, "sidecar selection verifies sha256");
 assert.match(remoteServersRs, /sidecar asset sha256 mismatch/, "sha256 mismatch is reported");
-assert.match(remoteServersRs, /BatchMode=yes/, "SSH diagnostics use BatchMode");
+assert.match(remoteServersRs, /SshSession::connect/, "SSH diagnostics use pure-Rust SshSession connect");
+assert.match(remoteServersRs, /resolve_ssh_profile/, "SSH diagnostics resolve profile via russh config");
+assert.doesNotMatch(remoteServersRs, /Command::new\("ssh"\)/, "SSH diagnostics do not spawn system ssh");
+assert.doesNotMatch(remoteServersRs, /BatchMode=yes/, "SSH diagnostics no longer depend on OpenSSH BatchMode");
 assert.match(remoteServersRs, /mkdir -p ~\/\.foco\/sidecars && test -w ~\/\.foco\/sidecars/, "install dir writability is checked");
 assert.match(remoteServersRs, /remote_server_summary_sidecar_install_state/, "summary derives sidecar install state");
 assert.match(remoteServersRs, /server_summary_treats_ready_version_as_available_sidecar/, "stale notInstalled with version is covered");
@@ -64,7 +72,11 @@ assert.match(remoteWorkspaceRs, /sidecar_install_locks: Arc<Mutex<HashMap<String
 assert.match(remoteWorkspaceRs, /fn sidecar_install_key\(server_id: &str, target: &str, version: &str\)/, "sidecar install lock key includes server, target, and version inputs");
 assert.match(ensureSidecarCommand, /sidecar_install_key\(server_id, target, &asset\.version\)/, "sidecar install lock key uses server, target, and asset version");
 assert.match(ensureSidecarCommand, /\.sidecar_install_lock\(&install_key\)/, "packaged sidecar install path gets keyed lock");
-assert.doesNotMatch(ensureSidecarCommand.match(/if let Some\(command\)[\s\S]*?return Ok\(command\.to_string\(\)\);/)?.[0] ?? "", /sidecar_install_lock/, "custom focoCommand verify path skips install lock");
+assert.doesNotMatch(
+  ensureSidecarCommand.match(/if let Some\(command\)[\s\S]*?return Ok\(RemoteSidecarCommand \{/)?.[0] ?? "",
+  /sidecar_install_lock/,
+  "custom focoCommand verify path skips install lock",
+);
 assert.ok((ensureSidecarCommand.match(/remote_sidecar_matches\(/g) ?? []).length >= 2, "ensure path rechecks remote sidecar after taking install lock");
 assert.match(remoteWorkspaceRs, /format!\("\\\"\$HOME\\\"\/\{\}"/, "remote home path keeps $HOME expandable");
 assert.doesNotMatch(remoteWorkspaceRs, /format!\(\s*"~\/\.foco\/sidecars/, "sidecar install path does not use literal tilde");

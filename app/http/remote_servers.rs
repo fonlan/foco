@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, path::PathBuf, process::Output, time::Duration};
+use std::{collections::HashSet, fs, path::PathBuf};
 
 use axum::{
     Json,
@@ -10,10 +10,6 @@ use foco_store::config::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, time::timeout};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use crate::*;
 
@@ -26,8 +22,6 @@ const SIDECAR_INSTALL_STATE_NOT_INSTALLED: &str = "notInstalled";
 const SIDECAR_INSTALL_STATE_CUSTOM_COMMAND: &str = "customCommand";
 const SIDECAR_INSTALL_STATE_AVAILABLE: &str = "available";
 const SIDECAR_INSTALL_STATE_MISSING_ASSET: &str = "missingAsset";
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -453,56 +447,84 @@ async fn test_remote_server_connection(
         pending_stage("focoCommandVersion"),
     ];
 
-    match run_ssh(server, &["-G", server.host_alias.as_str()], false).await {
-        Ok(output) if output.status.success() => {
+    let profile = match crate::ssh_client::resolve_ssh_profile(
+        server,
+        crate::ssh_client::ResolveSshOptions::default(),
+    ) {
+        Ok(profile) => profile,
+        Err(err) => {
+            stages[0] = failed_stage(
+                "ssh",
+                err.kind_str(),
+                format!("SSH configuration could not be resolved: {}", err.message()),
+                None,
+            );
+            return diagnostic_result(stages);
+        }
+    };
+
+    let session = match crate::ssh_client::SshSession::connect(&profile).await {
+        Ok(session) => session,
+        Err(err) => {
+            stages[0] = failed_stage(
+                "ssh",
+                err.kind_str(),
+                format!("SSH connection failed: {}", err.message()),
+                err.host_key.as_ref().map(|key| {
+                    format!(
+                        "host={} port={} algorithm={} fingerprint={}",
+                        key.host, key.port, key.algorithm, key.fingerprint_sha256
+                    )
+                }),
+            );
+            return diagnostic_result(stages);
+        }
+    };
+
+    match session.exec("true").await {
+        Ok(result) if result.success() => {
             stages[0] = success_stage(
                 "ssh",
-                "OpenSSH configuration parsed and BatchMode login verified",
-                output_details(&output),
+                format!(
+                    "Rust SSH connected to {}@{}:{} and verified login",
+                    profile.user, profile.hostname, profile.port
+                ),
+                Some(format!(
+                    "resolved hostAlias={} hostname={} port={} user={}",
+                    profile.host_alias, profile.hostname, profile.port, profile.user
+                )),
             );
         }
-        Ok(output) => {
-            let kind = classify_ssh_failure(&output);
+        Ok(result) => {
             stages[0] = failed_stage(
                 "ssh",
-                kind,
-                "OpenSSH could not resolve this server",
-                output_details(&output),
+                "remote_command_failed",
+                "SSH login succeeded but remote `true` returned non-zero",
+                Some(result.details()),
             );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
-        Err(message) => {
-            stages[0] = failed_stage("ssh", "startup_failed", message, None);
+        Err(err) => {
+            stages[0] = failed_stage(
+                "ssh",
+                err.kind_str(),
+                format!("SSH login failed: {}", err.message()),
+                None,
+            );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
     }
 
-    match run_ssh(server, &["true"], true).await {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let kind = classify_ssh_failure(&output);
-            stages[0] = failed_stage(
-                "ssh",
-                kind,
-                "SSH BatchMode login failed",
-                output_details(&output),
-            );
-            return diagnostic_result(stages);
-        }
-        Err(message) => {
-            stages[0] = failed_stage("ssh", "startup_failed", message, None);
-            return diagnostic_result(stages);
-        }
-    }
-
-    let target = match run_ssh(server, &["uname -s && uname -m"], true).await {
-        Ok(output) if output.status.success() => {
-            match normalize_target(&String::from_utf8_lossy(&output.stdout)) {
+    let target = match session.exec("uname -s && uname -m").await {
+        Ok(result) if result.success() => {
+            match normalize_target(&result.stdout_lossy()) {
                 Ok(target) => {
                     stages[1] = success_stage(
                         "target",
                         format!("Detected target {target}"),
-                        output_details(&output),
+                        Some(result.details()),
                     );
                     target
                 }
@@ -511,24 +533,31 @@ async fn test_remote_server_connection(
                         "target",
                         "target_unsupported",
                         message,
-                        output_details(&output),
+                        Some(result.details()),
                     );
+                    let _ = session.disconnect().await;
                     return diagnostic_result(stages);
                 }
             }
         }
-        Ok(output) => {
-            let kind = classify_ssh_failure(&output);
+        Ok(result) => {
             stages[1] = failed_stage(
                 "target",
-                kind,
+                "remote_command_failed",
                 "Failed to run uname on remote server",
-                output_details(&output),
+                Some(result.details()),
             );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
-        Err(message) => {
-            stages[1] = failed_stage("target", "startup_failed", message, None);
+        Err(err) => {
+            stages[1] = failed_stage(
+                "target",
+                err.kind_str(),
+                format!("Failed to run uname on remote server: {}", err.message()),
+                None,
+            );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
     };
@@ -556,35 +585,43 @@ async fn test_remote_server_connection(
         }
         Err(message) => {
             stages[2] = failed_stage("sidecarAsset", "sidecar_asset_missing", message, None);
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
     };
 
-    match run_ssh(
-        server,
-        &["mkdir -p ~/.foco/sidecars && test -w ~/.foco/sidecars"],
-        true,
-    )
-    .await
+    match session
+        .exec("mkdir -p ~/.foco/sidecars && test -w ~/.foco/sidecars")
+        .await
     {
-        Ok(output) if output.status.success() => {
+        Ok(result) if result.success() => {
             stages[3] = success_stage(
                 "remoteInstallDirWritable",
                 "Remote install directory is writable",
-                output_details(&output),
+                Some(result.details()),
             );
         }
-        Ok(output) => {
+        Ok(result) => {
             stages[3] = failed_stage(
                 "remoteInstallDirWritable",
                 "permission_denied",
                 "Remote sidecar install directory is not writable",
-                output_details(&output),
+                Some(result.details()),
             );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
-        Err(message) => {
-            stages[3] = failed_stage("remoteInstallDirWritable", "startup_failed", message, None);
+        Err(err) => {
+            stages[3] = failed_stage(
+                "remoteInstallDirWritable",
+                err.kind_str(),
+                format!(
+                    "Remote sidecar install directory check failed: {}",
+                    err.message()
+                ),
+                None,
+            );
+            let _ = session.disconnect().await;
             return diagnostic_result(stages);
         }
     }
@@ -598,25 +635,32 @@ async fn test_remote_server_connection(
         let version_command = format!(
             "{command} --version && {command} --sidecar-target && {command} --sidecar-build-id"
         );
-        match run_ssh(server, &[version_command.as_str()], true).await {
-            Ok(output) if output.status.success() => {
+        match session.exec(&version_command).await {
+            Ok(result) if result.success() => {
                 stages[4] = success_stage(
                     "focoCommandVersion",
                     "focoCommand responded to --version, --sidecar-target, and --sidecar-build-id",
-                    output_details(&output),
+                    Some(result.details()),
                 );
             }
-            Ok(output) => {
+            Ok(result) => {
                 stages[4] = failed_stage(
                     "focoCommandVersion",
                     "startup_failed",
                     "focoCommand failed to report version, target, and build identity",
-                    output_details(&output),
+                    Some(result.details()),
                 );
+                let _ = session.disconnect().await;
                 return diagnostic_result(stages);
             }
-            Err(message) => {
-                stages[4] = failed_stage("focoCommandVersion", "startup_failed", message, None);
+            Err(err) => {
+                stages[4] = failed_stage(
+                    "focoCommandVersion",
+                    err.kind_str(),
+                    format!("focoCommand check failed: {}", err.message()),
+                    None,
+                );
+                let _ = session.disconnect().await;
                 return diagnostic_result(stages);
             }
         }
@@ -625,31 +669,32 @@ async fn test_remote_server_connection(
         let check_command = format!(
             "test -x {remote_path} && {remote_path} --version && {remote_path} --sidecar-target && {remote_path} --sidecar-build-id"
         );
-        match run_ssh(server, &[check_command.as_str()], true).await {
-            Ok(output) if output.status.success() => {
+        match session.exec(&check_command).await {
+            Ok(result) if result.success() => {
                 stages[4] = success_stage(
                     "focoCommandVersion",
                     "Installed sidecar responded to version, target, and build identity",
-                    output_details(&output),
+                    Some(result.details()),
                 );
             }
-            Ok(output) => {
+            Ok(result) => {
                 stages[4] = skipped_stage(
                     "focoCommandVersion",
                     format!("Packaged sidecar is available but {remote_path} is not installed yet"),
                 );
-                let mut details = output_details(&output).unwrap_or_default();
+                let mut details = result.details();
                 if !details.is_empty() {
                     details.insert_str(0, "Remote version check output:\n");
                     stages[4].details = Some(details);
                 }
             }
-            Err(message) => {
-                stages[4] = skipped_stage("focoCommandVersion", message);
+            Err(err) => {
+                stages[4] = skipped_stage("focoCommandVersion", err.message().to_string());
             }
         }
     }
 
+    let _ = session.disconnect().await;
     diagnostic_result(stages)
 }
 
@@ -895,105 +940,6 @@ fn disconnect_remote_server_id(state: &AppState, server_id: &str) -> Result<(), 
     Ok(())
 }
 
-async fn run_ssh(
-    server: &RemoteServerProfile,
-    extra_args: &[&str],
-    batch_mode: bool,
-) -> Result<Output, String> {
-    let timeout_ms = server.connect_timeout_ms.max(1);
-    let args = remote_server_ssh_args(server, extra_args, batch_mode);
-
-    let child = ssh_command().args(&args).output();
-    timeout(Duration::from_millis(timeout_ms + 1_000), child)
-        .await
-        .map_err(|_| format!("ssh command timed out after {timeout_ms}ms"))?
-        .map_err(|source| format!("failed to run ssh: {source}"))
-}
-
-fn ssh_command() -> Command {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("ssh");
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new("ssh")
-    }
-}
-
-pub(crate) fn remote_server_ssh_args(
-    server: &RemoteServerProfile,
-    extra_args: &[&str],
-    batch_mode: bool,
-) -> Vec<String> {
-    let timeout_ms = server.connect_timeout_ms.max(1);
-    let mut args = Vec::new();
-    if batch_mode {
-        args.push("-o".to_string());
-        args.push("BatchMode=yes".to_string());
-    }
-    args.push("-o".to_string());
-    args.push("ServerAliveInterval=15".to_string());
-    args.push("-o".to_string());
-    args.push("ServerAliveCountMax=3".to_string());
-    args.push("-o".to_string());
-    args.push(format!("ConnectTimeout={}", timeout_ms.div_ceil(1_000)));
-    if let Some(user) = server
-        .user
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        args.push("-l".to_string());
-        args.push(user.to_string());
-    }
-    if let Some(port) = server.port {
-        args.push("-p".to_string());
-        args.push(port.to_string());
-    }
-    if let Some(identity_file) = &server.identity_file {
-        args.push("-i".to_string());
-        args.push(identity_file.display().to_string());
-    }
-    if extra_args.first() == Some(&"-G") {
-        args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
-    } else {
-        args.push(server.host_alias.clone());
-        args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
-    }
-    args
-}
-
-fn classify_ssh_failure(output: &Output) -> &'static str {
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .to_ascii_lowercase();
-    if text.contains("permission denied")
-        || text.contains("authentication failed")
-        || text.contains("publickey")
-        || text.contains("too many authentication failures")
-    {
-        "authentication_failed"
-    } else if text.contains("could not resolve hostname")
-        || text.contains("name or service not known")
-        || text.contains("connection timed out")
-        || text.contains("operation timed out")
-        || text.contains("connection refused")
-        || text.contains("no route to host")
-        || text.contains("network is unreachable")
-        || text.contains("host key verification failed")
-    {
-        "host_unreachable"
-    } else {
-        "startup_failed"
-    }
-}
-
 pub(crate) fn normalize_target(uname_output: &str) -> Result<String, String> {
     let mut lines = uname_output
         .lines()
@@ -1141,20 +1087,6 @@ fn failed_stage(
         message: message.into(),
         details,
     }
-}
-
-fn output_details(output: &Output) -> Option<String> {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let mut details = Vec::new();
-    details.push(format!("exitStatus: {}", output.status));
-    if !stdout.is_empty() {
-        details.push(format!("stdout:\n{stdout}"));
-    }
-    if !stderr.is_empty() {
-        details.push(format!("stderr:\n{stderr}"));
-    }
-    Some(details.join("\n"))
 }
 
 #[cfg(test)]

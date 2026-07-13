@@ -4,7 +4,6 @@ use std::{
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -58,18 +57,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    process::{Child, Command},
+    process::Command,
     sync::{Mutex as AsyncMutex, mpsc, oneshot},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use tokio_tungstenite::connect_async;
 use tungstenite::client::IntoClientRequest;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
@@ -82,7 +77,7 @@ use crate::{
     },
     http::{
         chat::{ContextUsageRequest, ContextUsageResponse},
-        remote_servers::{normalize_target, remote_server_ssh_args, select_sidecar_asset},
+        remote_servers::{normalize_target, select_sidecar_asset},
         spec::{
             SaveWorkspaceSpecRequest, WorkspaceSpecResponse, WorkspaceSpecSettingsRequest,
             workspace_spec_response,
@@ -128,6 +123,9 @@ use crate::{
         prepare_remote_workspace_spec_generation_job,
         recover_stale_running_workspace_spec_job_for_path,
     },
+    ssh_client::{
+        ResolveSshOptions, SshCommandResult, SshSession, SshSpawnedExec, resolve_ssh_profile,
+    },
     todo_graph_context_message, unique_id, utc_timestamp, workspace_by_id,
 };
 
@@ -152,8 +150,7 @@ const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] =
 const BROKER_DEFAULT_LLM_REQUEST_KIND: &str = "chat completion";
 const BROKER_CONTEXT_COMPRESSION_REQUEST_KIND: &str = "contextCompression";
 const BROKER_PROMPT_HOOK_REQUEST_KIND: &str = "prompt hook";
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const SIDECAR_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct RemoteSidecarToolLoopGuard {
@@ -956,19 +953,6 @@ impl RemoteConnectionState {
     }
 }
 
-fn ssh_command() -> Command {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("ssh");
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new("ssh")
-    }
-}
-
 #[derive(Clone, Debug)]
 struct RemoteSessionStatus {
     state: RemoteConnectionState,
@@ -1292,66 +1276,118 @@ impl RemoteWorkspaceManager {
             RemoteConnectionState::Starting,
             None,
         )?;
-        let mut sidecar = launch_remote_sidecar(
-            &server,
-            server_id,
-            workspace_id,
-            &remote_path,
-            &target,
-            &token,
-            &sidecar_command.command,
-            &session_file,
-        )
-        .await?;
-        let bootstrap = read_bootstrap(&mut sidecar, server_id, workspace_id).await?;
-        validate_bootstrap(
-            &bootstrap,
-            server_id,
-            workspace_id,
-            &sidecar_command.identity,
-        )?;
-        self.set_status(
-            server_id,
-            Some(workspace_id),
-            RemoteConnectionState::Tunneling,
-            None,
-        )?;
-        let (local_port, tunnel) =
-            start_local_forward(&server, bootstrap.port, server_id, workspace_id).await?;
-        let bundle = build_sidecar_runtime_config_bundle(
-            &state.user_profile_dir,
-            &config,
-            Utc::now().timestamp_millis().max(0) as u64,
-        )?;
-        let active_runs = Arc::new(Mutex::new(Vec::new()));
-        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
-            RemoteConnectionState::BrokerConnecting,
-            None,
-        )));
-        self.set_status(
-            server_id,
-            Some(workspace_id),
-            RemoteConnectionState::BrokerConnecting,
-            None,
-        )?;
-        self.set_status(
-            server_id,
-            None,
-            RemoteConnectionState::BrokerConnecting,
-            None,
-        )?;
-        let control_task = connect_control_ws(
-            state.clone(),
-            local_port,
-            &token,
-            bundle,
-            server_id,
-            workspace_id,
-            active_runs.clone(),
-            status.clone(),
-        )
-        .await?;
+        // Long-lived SSH/sidecar/forward resources must be aborted explicitly on any
+        // mid-connect failure; russh Handle Drop does not send Disconnect.
+        let mut partial = PartialRemoteConnect::with_ssh(
+            open_remote_ssh_session(&server, server_id, Some(workspace_id)).await?,
+        );
+        let finish: Result<
+            (
+                RemoteSidecarBootstrap,
+                u16,
+                Arc<Mutex<RemoteSessionStatus>>,
+                Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
+            ),
+            ApiError,
+        > = async {
+            let sidecar = launch_remote_sidecar(
+                partial.ssh_ref(),
+                server_id,
+                workspace_id,
+                &remote_path,
+                &target,
+                &token,
+                &sidecar_command.command,
+                &session_file,
+            )
+            .await?;
+            partial.sidecar = Some(sidecar);
+            let bootstrap = read_bootstrap(
+                partial
+                    .sidecar
+                    .as_mut()
+                    .expect("sidecar set after launch"),
+                server_id,
+                workspace_id,
+            )
+            .await?;
+            validate_bootstrap(
+                &bootstrap,
+                server_id,
+                workspace_id,
+                &token,
+                &sidecar_command.identity,
+            )?;
+            self.set_status(
+                server_id,
+                Some(workspace_id),
+                RemoteConnectionState::Tunneling,
+                None,
+            )?;
+            let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::BrokerConnecting,
+                None,
+            )));
+            let (local_port, forward_stop, forward_task) = start_direct_tcpip_forward(
+                Arc::clone(partial.ssh_ref()),
+                bootstrap.port,
+                server_id,
+                workspace_id,
+                status.clone(),
+            )
+            .await?;
+            partial.forward_stop = Some(forward_stop);
+            partial.forward_task = Some(forward_task);
+            let bundle = build_sidecar_runtime_config_bundle(
+                &state.user_profile_dir,
+                &config,
+                Utc::now().timestamp_millis().max(0) as u64,
+            )?;
+            let active_runs = Arc::new(Mutex::new(Vec::new()));
+            self.set_status(
+                server_id,
+                Some(workspace_id),
+                RemoteConnectionState::BrokerConnecting,
+                None,
+            )?;
+            self.set_status(
+                server_id,
+                None,
+                RemoteConnectionState::BrokerConnecting,
+                None,
+            )?;
+            let control_task = connect_control_ws(
+                state.clone(),
+                local_port,
+                &token,
+                bundle,
+                server_id,
+                workspace_id,
+                active_runs.clone(),
+                status.clone(),
+            )
+            .await?;
+            partial.control_task = Some(control_task);
+            Ok((bootstrap, local_port, status, active_runs))
+        }
+        .await;
 
+        let (bootstrap, local_port, status, active_runs) = match finish {
+            Ok(ok) => ok,
+            Err(err) => {
+                partial.abort().await;
+                let _ = self.set_status(
+                    server_id,
+                    Some(workspace_id),
+                    RemoteConnectionState::Offline,
+                    Some(err.message().to_string()),
+                );
+                return Err(err);
+            }
+        };
+
+        let (ssh_session, sidecar, forward_stop, forward_task, control_task) =
+            partial.take_into_session();
         let session = Arc::new(RemoteWorkspaceSession {
             server_id: server_id.to_string(),
             workspace_id: workspace_id.to_string(),
@@ -1361,8 +1397,10 @@ impl RemoteWorkspaceManager {
             remote_port: bootstrap.port,
             token: token.clone(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            ssh: AsyncMutex::new(Some(ssh_session)),
             sidecar: AsyncMutex::new(Some(sidecar)),
-            tunnel: AsyncMutex::new(Some(tunnel)),
+            forward_stop: AsyncMutex::new(Some(forward_stop)),
+            forward_task: AsyncMutex::new(Some(forward_task)),
             control_task: AsyncMutex::new(Some(control_task)),
             health_task: AsyncMutex::new(Some(start_sidecar_health_ping(
                 local_port,
@@ -1545,8 +1583,10 @@ impl RemoteWorkspaceManager {
             remote_port: local_port,
             token: token.to_string(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            ssh: AsyncMutex::new(None),
             sidecar: AsyncMutex::new(None),
-            tunnel: AsyncMutex::new(None),
+            forward_stop: AsyncMutex::new(None),
+            forward_task: AsyncMutex::new(None),
             control_task: AsyncMutex::new(None),
             health_task: AsyncMutex::new(None),
             status: Arc::new(Mutex::new(RemoteSessionStatus::new(
@@ -1630,8 +1670,78 @@ pub(crate) async fn remote_workspace_sessions(
 }
 
 #[derive(Debug)]
+struct PartialRemoteConnect {
+    ssh: Option<Arc<SshSession>>,
+    sidecar: Option<SshSpawnedExec>,
+    forward_stop: Option<oneshot::Sender<()>>,
+    forward_task: Option<JoinHandle<()>>,
+    control_task: Option<JoinHandle<()>>,
+}
+
+impl PartialRemoteConnect {
+    fn with_ssh(ssh: Arc<SshSession>) -> Self {
+        Self {
+            ssh: Some(ssh),
+            sidecar: None,
+            forward_stop: None,
+            forward_task: None,
+            control_task: None,
+        }
+    }
+
+    fn ssh_ref(&self) -> &Arc<SshSession> {
+        self.ssh.as_ref().expect("ssh session present on partial connect")
+    }
+
+    async fn abort(mut self) {
+        if let Some(task) = self.control_task.take() {
+            task.abort();
+        }
+        if let Some(stop) = self.forward_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.forward_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(mut sidecar) = self.sidecar.take() {
+            sidecar.close().await;
+        }
+        if let Some(session) = self.ssh.take() {
+            let _ = session.disconnect().await;
+        }
+    }
+
+    fn take_into_session(
+        mut self,
+    ) -> (
+        Arc<SshSession>,
+        SshSpawnedExec,
+        oneshot::Sender<()>,
+        JoinHandle<()>,
+        JoinHandle<()>,
+    ) {
+        (
+            self.ssh.take().expect("ssh session for ready remote workspace"),
+            self.sidecar
+                .take()
+                .expect("sidecar for ready remote workspace"),
+            self.forward_stop
+                .take()
+                .expect("forward stop for ready remote workspace"),
+            self.forward_task
+                .take()
+                .expect("forward task for ready remote workspace"),
+            self.control_task
+                .take()
+                .expect("control task for ready remote workspace"),
+        )
+    }
+}
+
+#[derive(Debug)]
 struct RemoteWorkspaceSession {
-    // ponytail: v1 keeps one sidecar and one SSH tunnel per remote workspace; pool later if session counts make this noisy.
+    // ponytail: one russh transport + sidecar exec + direct-tcpip bridges per remote workspace.
     server_id: String,
     workspace_id: String,
     remote_path: String,
@@ -1640,8 +1750,10 @@ struct RemoteWorkspaceSession {
     remote_port: u16,
     token: String,
     started_at: String,
-    sidecar: AsyncMutex<Option<Child>>,
-    tunnel: AsyncMutex<Option<Child>>,
+    ssh: AsyncMutex<Option<Arc<SshSession>>>,
+    sidecar: AsyncMutex<Option<SshSpawnedExec>>,
+    forward_stop: AsyncMutex<Option<oneshot::Sender<()>>>,
+    forward_task: AsyncMutex<Option<JoinHandle<()>>>,
     control_task: AsyncMutex<Option<JoinHandle<()>>>,
     health_task: AsyncMutex<Option<JoinHandle<()>>>,
     status: Arc<Mutex<RemoteSessionStatus>>,
@@ -1692,11 +1804,24 @@ impl RemoteWorkspaceSession {
             task.abort();
         }
         let _ = shutdown_remote_sidecar(self.local_port, &self.token).await;
-        if let Some(mut tunnel) = self.tunnel.lock().await.take() {
-            let _ = tunnel.kill().await;
+        if let Some(stop) = self.forward_stop.lock().await.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.forward_task.lock().await.take() {
+            // Allow the forward loop to abort bridge tasks on stop_rx before hard abort.
+            let abort = task.abort_handle();
+            match timeout(Duration::from_secs(2), task).await {
+                Ok(_) => {}
+                Err(_) => {
+                    abort.abort();
+                }
+            }
         }
         if let Some(mut sidecar) = self.sidecar.lock().await.take() {
-            let _ = sidecar.kill().await;
+            sidecar.close().await;
+        }
+        if let Some(session) = self.ssh.lock().await.take() {
+            let _ = session.disconnect().await;
         }
     }
 }
@@ -2895,20 +3020,19 @@ async fn detect_or_cached_target(
     }
     let output = run_ssh_output(
         server,
-        &["uname -s && uname -m"],
-        true,
+        "uname -s && uname -m",
         server_id,
         workspace_id,
     )
     .await?;
-    if !output.status.success() {
+    if !output.success() {
         return Err(remote_error(
             server_id,
             workspace_id,
             format!("target probe failed: {}", output_text(&output)),
         ));
     }
-    normalize_target(&String::from_utf8_lossy(&output.stdout))
+    normalize_target(&output.stdout_lossy())
         .map_err(|message| remote_error(server_id, workspace_id, message))
 }
 
@@ -2942,8 +3066,8 @@ pub(crate) async fn run_remote_file_picker_command(
             "failed to serialize remote file picker payload: {source}"
         ))
     })?;
-    let output = run_ssh_with_stdin(&server, &[script.as_str()], &input, server_id, None).await?;
-    if !output.status.success() {
+    let output = run_ssh_with_stdin(&server, &script, &input, server_id, None).await?;
+    if !output.success() {
         return Err(remote_error(
             server_id,
             None,
@@ -3039,13 +3163,13 @@ async fn ensure_sidecar_command(
             );
             let output = run_ssh_with_stdin(
                 server,
-                &[install_script.as_str()],
+                &install_script,
                 &bytes,
                 server_id,
                 workspace_id,
             )
             .await?;
-            if !output.status.success() {
+            if !output.success() {
                 return Err(remote_error(
                     server_id,
                     workspace_id,
@@ -3106,11 +3230,11 @@ async fn remote_sidecar_matches(
         "test -x {bin} && {bin} --version && {bin} --sidecar-target && {bin} --sidecar-build-id",
         bin = remote_bin
     );
-    let output = run_ssh_output(server, &[command.as_str()], true, server_id, workspace_id).await?;
-    if !output.status.success() {
+    let output = run_ssh_output(server, &command, server_id, workspace_id).await?;
+    if !output.success() {
         return Ok(false);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_lossy();
     Ok(remote_sidecar_identity_matches(&stdout, expected_identity))
 }
 
@@ -3126,8 +3250,8 @@ async fn verify_remote_command(
         "{command} --version && {command} --sidecar-target && {command} --sidecar-build-id",
         command = command
     );
-    let output = run_ssh_output(server, &[check.as_str()], true, server_id, workspace_id).await?;
-    if !output.status.success() {
+    let output = run_ssh_output(server, &check, server_id, workspace_id).await?;
+    if !output.success() {
         return Err(remote_error(
             server_id,
             workspace_id,
@@ -3137,7 +3261,7 @@ async fn verify_remote_command(
             ),
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_lossy();
     let identity = parse_remote_sidecar_identity(&stdout).ok_or_else(|| {
         remote_error(
             server_id,
@@ -3213,13 +3337,13 @@ async fn ensure_remote_session_file(
     );
     let output = run_ssh_with_stdin(
         server,
-        &[script.as_str()],
+        &script,
         session_payload.as_bytes(),
         server_id,
         Some(workspace_id),
     )
     .await?;
-    if !output.status.success() {
+    if !output.success() {
         return Err(remote_error(
             server_id,
             Some(workspace_id),
@@ -3229,7 +3353,7 @@ async fn ensure_remote_session_file(
             ),
         ));
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let path = output.stdout_lossy().trim().to_string();
     if path.is_empty() {
         return Err(remote_error(
             server_id,
@@ -3279,13 +3403,12 @@ async fn stop_stale_remote_sidecars(
     let script = stale_remote_sidecar_cleanup_script(server_id, workspace_id, remote_path);
     let output = run_ssh_output(
         server,
-        &[script.as_str()],
-        true,
+        &script,
         server_id,
         Some(workspace_id),
     )
     .await?;
-    if !output.status.success() {
+    if !output.success() {
         return Err(remote_error(
             server_id,
             Some(workspace_id),
@@ -3324,7 +3447,7 @@ async fn update_sidecar_cache(
 }
 
 async fn launch_remote_sidecar(
-    server: &RemoteServerProfile,
+    session: &SshSession,
     server_id: &str,
     workspace_id: &str,
     remote_path: &str,
@@ -3332,7 +3455,7 @@ async fn launch_remote_sidecar(
     token: &str,
     command: &str,
     session_file: &str,
-) -> Result<Child, ApiError> {
+) -> Result<SshSpawnedExec, ApiError> {
     let remote_command = format!(
         "{command} {sidecar} --server-id {server_id} --workspace-id {workspace_id} --workspace-path {workspace_path} --target {target} --token {token} --session-file {session_file}",
         command = command,
@@ -3344,64 +3467,37 @@ async fn launch_remote_sidecar(
         token = shell_quote(token),
         session_file = shell_quote(session_file),
     );
-    let args = remote_server_ssh_args(server, &[remote_command.as_str()], true);
-    let child = ssh_command()
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| {
-            remote_error(
-                server_id,
-                Some(workspace_id),
-                format!("failed to start remote sidecar over ssh: {source}"),
-            )
-        })?;
-    Ok(child)
-}
-
-async fn read_bootstrap(
-    child: &mut Child,
-    server_id: &str,
-    workspace_id: &str,
-) -> Result<RemoteSidecarBootstrap, ApiError> {
-    let stdout = child.stdout.take().ok_or_else(|| {
+    session.spawn_exec(&remote_command).await.map_err(|err| {
         remote_error(
             server_id,
             Some(workspace_id),
-            "remote sidecar stdout was not captured",
+            format!("failed to start remote sidecar over SSH: {}", err.message()),
         )
-    })?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let read = timeout(Duration::from_secs(10), reader.read_line(&mut line))
+    })
+}
+
+async fn read_bootstrap(
+    sidecar: &mut SshSpawnedExec,
+    server_id: &str,
+    workspace_id: &str,
+) -> Result<RemoteSidecarBootstrap, ApiError> {
+    let line = sidecar
+        .read_line(SIDECAR_BOOTSTRAP_TIMEOUT)
         .await
-        .map_err(|_| {
-            remote_error(
-                server_id,
-                Some(workspace_id),
-                "timed out waiting for sidecar bootstrap",
-            )
-        })?
-        .map_err(|source| {
-            remote_error(
-                server_id,
-                Some(workspace_id),
-                format!("failed to read sidecar bootstrap: {source}"),
-            )
+        .map_err(|err| {
+            let details = sidecar.diagnostic_stderr();
+            let message = if details.trim().is_empty() {
+                format!("failed to read sidecar bootstrap: {}", err.message())
+            } else {
+                format!(
+                    "failed to read sidecar bootstrap: {}; stderr={}",
+                    err.message(),
+                    details.chars().take(500).collect::<String>()
+                )
+            };
+            remote_error(server_id, Some(workspace_id), message)
         })?;
-    if read == 0 {
-        return Err(remote_error(
-            server_id,
-            Some(workspace_id),
-            "remote sidecar exited before writing bootstrap",
-        ));
-    }
-    tokio::spawn(async move {
-        let mut sink = tokio::io::sink();
-        let _ = tokio::io::copy(&mut reader, &mut sink).await;
-    });
+    sidecar.start_stdout_drain();
     serde_json::from_str(&line).map_err(|source| {
         remote_error(
             server_id,
@@ -3415,6 +3511,7 @@ fn validate_bootstrap(
     bootstrap: &RemoteSidecarBootstrap,
     server_id: &str,
     workspace_id: &str,
+    expected_token: &str,
     expected_identity: &RemoteSidecarIdentity,
 ) -> Result<(), ApiError> {
     if bootstrap.version != REMOTE_SIDECAR_BOOTSTRAP_VERSION
@@ -3425,6 +3522,7 @@ fn validate_bootstrap(
         || bootstrap.build_id != expected_identity.build_id
         || bootstrap.port == 0
         || bootstrap.token.is_empty()
+        || bootstrap.token != expected_token
         || !bootstrap.capabilities.runtime_config_sync
         || !bootstrap.capabilities.control_broker
     {
@@ -3437,13 +3535,14 @@ fn validate_bootstrap(
     Ok(())
 }
 
-async fn start_local_forward(
-    server: &RemoteServerProfile,
+async fn start_direct_tcpip_forward(
+    session: Arc<SshSession>,
     remote_port: u16,
     server_id: &str,
     workspace_id: &str,
-) -> Result<(u16, Child), ApiError> {
-    let probe = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+    status: Arc<Mutex<RemoteSessionStatus>>,
+) -> Result<(u16, oneshot::Sender<()>, JoinHandle<()>), ApiError> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .map_err(|source| {
             remote_error(
@@ -3452,7 +3551,7 @@ async fn start_local_forward(
                 format!("failed to reserve local tunnel port: {source}"),
             )
         })?;
-    let local_port = probe
+    let local_port = listener
         .local_addr()
         .map_err(|source| {
             remote_error(
@@ -3462,34 +3561,122 @@ async fn start_local_forward(
             )
         })?
         .port();
-    drop(probe);
 
-    let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
-    let args = remote_server_ssh_args(
-        server,
-        &[
-            "-N",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            forward.as_str(),
-        ],
-        true,
-    );
-    let child = ssh_command()
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| {
-            remote_error(
-                server_id,
-                Some(workspace_id),
-                format!("failed to start SSH local port forward: {source}"),
-            )
-        })?;
-    Ok((local_port, child))
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut bridges: Vec<JoinHandle<()>> = Vec::new();
+        loop {
+            // Drop finished bridge tasks so the registry does not grow without bound.
+            bridges.retain(|task| !task.is_finished());
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((tcp, peer)) => {
+                            if session.is_closed() {
+                                set_session_status(
+                                    &status,
+                                    RemoteConnectionState::Offline,
+                                    Some("SSH transport closed during local forward".to_string()),
+                                );
+                                break;
+                            }
+                            let session = Arc::clone(&session);
+                            let status = Arc::clone(&status);
+                            let origin = peer.ip().to_string();
+                            let origin_port = peer.port();
+                            bridges.push(tokio::spawn(async move {
+                                if let Err(err) = bridge_direct_tcpip(
+                                    session,
+                                    tcp,
+                                    remote_port,
+                                    &origin,
+                                    origin_port,
+                                )
+                                .await
+                                {
+                                    // Transport-level failure: mark offline so managers stop
+                                    // treating the half-dead tunnel as reconnectable-only.
+                                    if err.contains("closed") || err.contains("disconnect") {
+                                        set_session_status(
+                                            &status,
+                                            RemoteConnectionState::Offline,
+                                            Some(format!("direct-tcpip bridge failed: {err}")),
+                                        );
+                                    } else {
+                                        set_session_status(
+                                            &status,
+                                            RemoteConnectionState::Degraded,
+                                            Some(format!("direct-tcpip bridge failed: {err}")),
+                                        );
+                                    }
+                                }
+                            }));
+                        }
+                        Err(err) => {
+                            set_session_status(
+                                &status,
+                                RemoteConnectionState::Offline,
+                                Some(format!("local forward listener failed: {err}")),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for task in bridges {
+            task.abort();
+        }
+    });
+    Ok((local_port, stop_tx, handle))
+}
+
+async fn bridge_direct_tcpip(
+    session: Arc<SshSession>,
+    mut tcp: tokio::net::TcpStream,
+    remote_port: u16,
+    originator_address: &str,
+    originator_port: u16,
+) -> Result<(), String> {
+    let channel = session
+        .open_direct_tcpip(
+            "127.0.0.1",
+            remote_port,
+            originator_address,
+            originator_port,
+        )
+        .await
+        .map_err(|err| err.message().to_string())?;
+    let mut stream = channel.into_stream();
+    match tokio::io::copy_bidirectional(&mut tcp, &mut stream).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn open_remote_ssh_session(
+    server: &RemoteServerProfile,
+    server_id: &str,
+    workspace_id: Option<&str>,
+) -> Result<Arc<SshSession>, ApiError> {
+    let profile = resolve_ssh_profile(server, ResolveSshOptions::default()).map_err(|err| {
+        remote_error(
+            server_id,
+            workspace_id,
+            format!("SSH config resolve failed: {}", err.message()),
+        )
+    })?;
+    let session = SshSession::connect(&profile).await.map_err(|err| {
+        remote_error(
+            server_id,
+            workspace_id,
+            format!("SSH connect failed: {}", err.message()),
+        )
+    })?;
+    Ok(Arc::new(session))
 }
 
 async fn connect_control_ws(
@@ -5759,88 +5946,54 @@ async fn connect_control_ws_once(
 
 async fn run_ssh_output(
     server: &RemoteServerProfile,
-    extra_args: &[&str],
-    batch_mode: bool,
+    command: &str,
     server_id: &str,
     workspace_id: Option<&str>,
-) -> Result<std::process::Output, ApiError> {
+) -> Result<SshCommandResult, ApiError> {
     let timeout_ms = server.connect_timeout_ms.max(1);
-    let args = remote_server_ssh_args(server, extra_args, batch_mode);
-    timeout(
+    let session = open_remote_ssh_session(server, server_id, workspace_id).await?;
+    let timed = timeout(
         Duration::from_millis(timeout_ms + 1_000),
-        ssh_command().args(&args).output(),
+        session.exec(command),
     )
-    .await
-    .map_err(|_| {
-        remote_error(
+    .await;
+    let _ = session.disconnect().await;
+    match timed {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(err)) => Err(remote_error(
+            server_id,
+            workspace_id,
+            format!("failed to run remote command: {}", err.message()),
+        )),
+        Err(_) => Err(remote_error(
             server_id,
             workspace_id,
             format!("ssh command timed out after {timeout_ms}ms"),
-        )
-    })?
-    .map_err(|source| {
-        remote_error(
-            server_id,
-            workspace_id,
-            format!("failed to run ssh: {source}"),
-        )
-    })
+        )),
+    }
 }
 
 async fn run_ssh_with_stdin(
     server: &RemoteServerProfile,
-    extra_args: &[&str],
+    command: &str,
     stdin: &[u8],
     server_id: &str,
     workspace_id: Option<&str>,
-) -> Result<std::process::Output, ApiError> {
+) -> Result<SshCommandResult, ApiError> {
     let timeout_ms = server.connect_timeout_ms.max(1);
     let upload_timeout = Duration::from_millis(timeout_ms + 30_000);
-    let args = remote_server_ssh_args(server, extra_args, true);
-    let mut child = ssh_command()
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| {
-            remote_error(
-                server_id,
-                workspace_id,
-                format!("failed to run ssh: {source}"),
-            )
-        })?;
-    if let Some(mut child_stdin) = child.stdin.take() {
-        match timeout(upload_timeout, child_stdin.write_all(stdin)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => {
-                let _ = child.kill().await;
-                return Err(remote_error(
-                    server_id,
-                    workspace_id,
-                    format!("failed to upload sidecar over ssh stdin: {source}"),
-                ));
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                return Err(remote_error(
-                    server_id,
-                    workspace_id,
-                    "ssh upload timed out",
-                ));
-            }
-        }
+    let session = open_remote_ssh_session(server, server_id, workspace_id).await?;
+    let timed = timeout(upload_timeout, session.exec_with_stdin(command, stdin)).await;
+    let _ = session.disconnect().await;
+    match timed {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(err)) => Err(remote_error(
+            server_id,
+            workspace_id,
+            format!("failed to run remote command with stdin: {}", err.message()),
+        )),
+        Err(_) => Err(remote_error(server_id, workspace_id, "ssh upload timed out")),
     }
-    timeout(upload_timeout, child.wait_with_output())
-        .await
-        .map_err(|_| remote_error(server_id, workspace_id, "ssh upload timed out"))?
-        .map_err(|source| {
-            remote_error(
-                server_id,
-                workspace_id,
-                format!("failed to finish ssh upload: {source}"),
-            )
-        })
 }
 
 fn session_key(server_id: &str, workspace_id: &str) -> String {
@@ -5979,14 +6132,20 @@ fn is_auth_error_message(message: &str) -> bool {
         || lower.contains("failedauth")
 }
 
-fn output_text(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn output_text(output: &SshCommandResult) -> String {
+    let stdout = output.stdout_lossy().trim().to_string();
+    let stderr = output.stderr_lossy().trim().to_string();
     match (stdout.is_empty(), stderr.is_empty()) {
         (false, false) => format!("stdout: {stdout}; stderr: {stderr}"),
         (false, true) => stdout,
         (true, false) => stderr,
-        (true, true) => format!("exit status: {}", output.status),
+        (true, true) => format!(
+            "exit status: {}",
+            output
+                .exit_status
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
     }
 }
 
@@ -14133,6 +14292,38 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_bootstrap_rejects_token_mismatch() {
+        let expected = RemoteSidecarIdentity {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            target: "linux-x64".to_string(),
+            build_id: sidecar_build_id_from_sha256(&"a".repeat(64)),
+        };
+        let bootstrap = RemoteSidecarBootstrap {
+            version: REMOTE_SIDECAR_BOOTSTRAP_VERSION,
+            sidecar_version: expected.version.clone(),
+            target: expected.target.clone(),
+            build_id: expected.build_id.clone(),
+            workspace_id: "workspace".to_string(),
+            workspace_path: "/workspace".to_string(),
+            server_id: "server".to_string(),
+            port: 3210,
+            token: "other-token".to_string(),
+            capabilities: RemoteSidecarCapabilities {
+                http_proxy: true,
+                control_broker: true,
+                terminal_pty: true,
+                git: true,
+                code_graph: true,
+                workspace_database: true,
+                runtime_config_sync: true,
+            },
+        };
+        assert!(
+            validate_bootstrap(&bootstrap, "server", "workspace", "token", &expected).is_err()
+        );
+    }
+
+    #[test]
     fn remote_sidecar_bootstrap_rejects_missing_build_identity() {
         let expected = RemoteSidecarIdentity {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -14181,8 +14372,9 @@ mod tests {
 
         assert_eq!(
             (
-                validate_bootstrap(&bootstrap, "server", "workspace", &expected).is_ok(),
-                validate_bootstrap(&legacy_bootstrap, "server", "workspace", &expected).is_err(),
+                validate_bootstrap(&bootstrap, "server", "workspace", "token", &expected).is_ok(),
+                validate_bootstrap(&legacy_bootstrap, "server", "workspace", "token", &expected)
+                    .is_err(),
             ),
             (true, true)
         );

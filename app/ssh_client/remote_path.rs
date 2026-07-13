@@ -59,7 +59,7 @@ pub fn expand_command(input: &str) -> Result<String, SshError> {
 ///
 /// Absolute paths are returned as-is after validation (no remote round-trip).
 pub async fn expand_remote_path(
-    session: &mut SshSession,
+    session: &SshSession,
     input: &str,
 ) -> Result<String, SshError> {
     let input = input.trim();
