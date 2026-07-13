@@ -100,6 +100,19 @@ fn validate_prompt_context_lengths(
     Ok(())
 }
 
+/// Ensure runtime tool-state + optional LLM compression before the next provider request.
+///
+/// Overflow matrix for `runtime_tool_state_compression_enabled`:
+///
+/// | switch | 80% force=false | required overflow force | RequiredOverflow LLM |
+/// | --- | --- | --- | --- |
+/// | OFF | skip | skip (force does not bypass switch) | try directly if still over budget |
+/// | ON | may trigger | force local tool-state first | LLM only if still over budget after force |
+///
+/// When the switch is OFF, raw `RuntimeToolState` remains outside the LLM candidate set; if overflow
+/// is mostly live tool text, LLM compression may have no candidates or still overflow (accepted
+/// trade-off to protect prompt-cache prefixes). Tool-round-cap recovery via
+/// `compress_all_runtime_tool_state` is not gated by this switch.
 pub(crate) async fn ensure_context_compression(
     context: &mut PreparedChatContext,
 ) -> Result<ContextCompressionResult, ApiError> {
@@ -140,6 +153,9 @@ pub(crate) async fn ensure_context_compression(
 
     let mut breakdown = context_token_breakdown(&message_groups);
     if breakdown.required_tokens > context.context_budget.available_message_tokens {
+        // force=true only bypasses the 80%/threshold trigger when the switch is ON; when OFF this
+        // call is a no-op so overflow goes straight to RequiredOverflow LLM without a tool-state
+        // prefix rewrite (avoids stacked prompt-cache invalidation).
         if !runtime_tool_state_compressed {
             runtime_tool_state_compressed |=
                 compress_runtime_tool_state_with_events_if_needed(context, true, &mut events)?;
@@ -1050,6 +1066,11 @@ pub(crate) fn compress_runtime_tool_state_if_needed(
     )
 }
 
+/// Compress older in-run tool batches into a local `RuntimeToolStateSnapshot`.
+///
+/// `compression_enabled` is a hard gate: when false, both proactive (80%) and required-overflow
+/// `force=true` paths no-op. `force` only skips the usage-threshold check when the switch is on.
+/// Round-cap recovery uses `compress_all_runtime_tool_state_messages` and is not gated here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_runtime_tool_state_messages_if_needed(
     messages: &mut Vec<NeutralChatMessage>,
@@ -1061,7 +1082,7 @@ pub(crate) fn compress_runtime_tool_state_messages_if_needed(
     compression_enabled: bool,
     force: bool,
 ) -> Result<bool, ApiError> {
-    if !force && !compression_enabled {
+    if !compression_enabled {
         return Ok(false);
     }
 

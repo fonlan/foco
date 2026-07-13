@@ -4315,6 +4315,10 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
         80,
     );
     context.active_tool_start_index = context.provider_request.messages.len();
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
 
     for batch_index in 0..4 {
         let call_id = format!("call-{batch_index}");
@@ -4481,6 +4485,10 @@ fn compress_runtime_tool_state_stops_after_three_successes() {
         80,
     );
     context.active_tool_start_index = context.provider_request.messages.len();
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
     context.runtime_tool_state_compression_count =
         CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS;
 
@@ -4578,7 +4586,7 @@ fn runtime_tool_state_compression_uses_total_context_threshold() {
 }
 
 #[test]
-fn runtime_tool_state_compression_disabled_skips_non_forced_compression() {
+fn runtime_tool_state_compression_disabled_skips_all_runtime_tool_state_compression() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-disabled-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut context = test_prepared_chat_context(
@@ -4593,6 +4601,12 @@ fn runtime_tool_state_compression_disabled_skips_non_forced_compression() {
     );
     context.context_budget.system_prompt_tokens = 620;
     context.active_tool_start_index = context.provider_request.messages.len();
+    assert!(
+        !context
+            .global_config
+            .app
+            .runtime_tool_state_compression_enabled
+    );
 
     for batch_index in 0..4 {
         append_test_runtime_tool_batch(&mut context, batch_index, 600);
@@ -4601,9 +4615,18 @@ fn runtime_tool_state_compression_disabled_skips_non_forced_compression() {
     assert!(prepared_context_total_used_tokens(&context) >= 800);
     assert!(
         !compress_runtime_tool_state_if_needed(&mut context, false)
-            .expect("disabled runtime compression")
+            .expect("disabled proactive compression")
     );
-    assert!(compress_runtime_tool_state_if_needed(&mut context, true).expect("forced compression"));
+    assert!(
+        !compress_runtime_tool_state_if_needed(&mut context, true)
+            .expect("force must not bypass disabled switch")
+    );
+    assert!(
+        context
+            .message_context_sources
+            .iter()
+            .all(|source| !matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -4909,6 +4932,10 @@ async fn ensure_context_compression_required_overflow_adds_runtime_events_before
         700,
     );
     context.context_budget.context_window = 10_000;
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
     context.active_tool_start_index = context.provider_request.messages.len();
 
     for batch_index in 0..4 {
@@ -4942,6 +4969,67 @@ async fn ensure_context_compression_required_overflow_adds_runtime_events_before
             ("runtimeToolState", "start"),
             ("runtimeToolState", "completed"),
         ]
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn ensure_context_compression_disabled_overflow_skips_runtime_tool_state_events() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-required-overflow-disabled-runtime-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        700,
+    );
+    context.context_budget.context_window = 10_000;
+    context.active_tool_start_index = context.provider_request.messages.len();
+    assert!(
+        !context
+            .global_config
+            .app
+            .runtime_tool_state_compression_enabled
+    );
+
+    for batch_index in 0..4 {
+        append_test_runtime_tool_batch(&mut context, batch_index, 600);
+    }
+
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )
+    .expect("context groups");
+    let breakdown = context_token_breakdown(&message_groups);
+    assert!(breakdown.required_tokens > context.context_budget.available_message_tokens);
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!(total_used_context_tokens < 9_500);
+
+    let result = ensure_context_compression(&mut context)
+        .await
+        .expect("disabled switch should skip runtime tool-state and not hard-fail ensure");
+
+    assert!(!result.runtime_tool_state_compressed);
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|detail| detail.kind != "runtimeToolState")
+    );
+    assert!(
+        context
+            .message_context_sources
+            .iter()
+            .all(|source| !matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

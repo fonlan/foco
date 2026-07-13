@@ -344,6 +344,10 @@ impl RemoteSidecarRuntimeToolState {
 
     /// Ensure runtime tool-state + optional LLM compression, then pack for the next broker request.
     /// Returns packed messages and compression events for the stream to emit before broker dispatch.
+    ///
+    /// Same overflow matrix as local `ensure_context_compression`: when
+    /// `runtime_tool_state_compression_enabled` is OFF, required-overflow `force=true` is a no-op
+    /// and overflow goes to RequiredOverflow LLM only (no stacked tool-state prefix rewrite).
     #[allow(clippy::too_many_arguments)]
     async fn ensure_compression_then_pack(
         &mut self,
@@ -451,6 +455,7 @@ impl RemoteSidecarRuntimeToolState {
 
         let mut breakdown = context_token_breakdown(&message_groups);
         if breakdown.required_tokens > self.context_budget.available_message_tokens {
+            // force=true only bypasses thresholds when compression_enabled; switch OFF skips here.
             if !runtime_tool_state_compressed {
                 runtime_tool_state_compressed |= self.compress_runtime_tool_state_with_events(
                     messages,
@@ -779,6 +784,7 @@ impl RemoteSidecarRuntimeToolState {
         messages: &mut Vec<NeutralChatMessage>,
     ) -> Result<Vec<NeutralChatMessage>, ApiError> {
         // Synchronous path used by unit tests; production chat loop uses ensure_compression_then_pack.
+        // compress_if_needed(..., true) still respects compression_enabled (force cannot bypass switch).
         self.compress_if_needed(messages, false)?;
         match pack_neutral_messages(
             messages.clone(),
@@ -10654,7 +10660,7 @@ async fn remote_sidecar_chat_stream(
 
         'run: loop {
             // Before every brokered chat completion request (first turn and tool follow-ups):
-            // runtime tool-state compression, then 95%/overflow LLM compression, then pack.
+            // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
             let compression_result = runtime_tool_state
                 .ensure_compression_then_pack(
                     &mut current_request.messages,
@@ -13773,7 +13779,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_sidecar_required_overflow_forces_compression_when_setting_is_disabled() {
+    fn remote_sidecar_required_overflow_skips_runtime_compression_when_setting_is_disabled() {
         let mut messages = vec![neutral_text_message(
             NeutralChatRole::User,
             "inspect the workspace".to_string(),
@@ -13792,10 +13798,26 @@ mod tests {
                 .compress_if_needed(&mut messages, false)
                 .expect("disabled normal compression")
         );
-        runtime_tool_state
+        assert!(
+            !runtime_tool_state
+                .compress_if_needed(&mut messages, true)
+                .expect("force must not bypass disabled switch")
+        );
+        let error = runtime_tool_state
             .packed_messages_for_request(&mut messages)
-            .expect("required overflow should force runtime compression");
-        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 1);
+            .expect_err("required overflow without tool-state compression should fail pack");
+        assert!(
+            error.message().contains("exceeds the model input budget"),
+            "unexpected overflow error: {}",
+            error.message()
+        );
+        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 0);
+        assert!(
+            runtime_tool_state
+                .message_context_sources
+                .iter()
+                .all(|source| !matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+        );
     }
 
     #[test]
