@@ -13821,6 +13821,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_required_overflow_forces_runtime_compression_when_setting_is_enabled() {
+        let mut messages = vec![neutral_text_message(
+            NeutralChatRole::User,
+            "inspect the workspace".to_string(),
+        )];
+        let mut runtime_tool_state =
+            test_remote_runtime_tool_state(&messages, 100_000, 2_500, true);
+        for batch_index in 0..4 {
+            runtime_tool_state.append_runtime_tool_batch(
+                &mut messages,
+                test_remote_tool_batch(batch_index, 4_000),
+            );
+        }
+
+        let packed = runtime_tool_state
+            .packed_messages_for_request(&mut messages)
+            .expect("enabled overflow should force runtime tool-state before pack");
+
+        assert_eq!(runtime_tool_state.runtime_tool_state_compression_count, 1);
+        assert!(
+            runtime_tool_state
+                .message_context_sources
+                .iter()
+                .any(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+        );
+        assert!(packed.iter().any(|message| {
+            message
+                .content
+                .contains("Runtime tool-state compression snapshot")
+        }));
+    }
+
+    #[test]
     fn remote_sidecar_round_cap_recovers_once_and_fails_without_new_tool_state() {
         const TEST_MAX_TOOL_ROUNDS: usize = 2;
         let mut messages = vec![neutral_text_message(

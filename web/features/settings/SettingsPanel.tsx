@@ -4976,7 +4976,7 @@ export function SettingsPanel({
                         </p>
                         <p className="mt-1 max-w-3xl text-xs leading-5 text-stone-500">
                           {t(
-                            "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost.",
+                            "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost. When disabled, required overflow does not force tool-state compression and goes straight to LLM compression; when enabled, local tool-state compression still runs first on overflow to help later summarization.",
                           )}
                         </p>
                       </div>
