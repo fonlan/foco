@@ -1457,7 +1457,8 @@ describe("app-shell verification surfaces", () => {
       expect(screen.getByLabelText("Agent")).toHaveValue("agent-definition-coordinator"),
     );
     expect(screen.getByLabelText("Model")).toHaveValue("gpt-test");
-    expect(screen.getByLabelText("Provider")).toHaveValue("openai");
+    // Provider is chosen by global model routing, not the scheduled-task form.
+    expect(screen.queryByLabelText("Provider")).toBeNull();
     expect(screen.getByRole("checkbox", { name: "Enable Team mode" })).toBeChecked();
 
     const unitSelect = screen.getByLabelText("Unit");
@@ -1489,8 +1490,9 @@ describe("app-shell verification surfaces", () => {
       agent_definition_id: "agent-definition-coordinator",
       collaboration_tools_enabled: true,
       model_id: "gpt-test",
-      provider_id: "openai",
     });
+    // Provider is resolved from the model route when the task runs.
+    expect(createBody.action.provider_id).toBeUndefined();
 
     await userEvent.click(screen.getByRole("button", { name: "Pause task" }));
     expect(await screen.findAllByText("Paused")).not.toHaveLength(0);

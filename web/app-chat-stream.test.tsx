@@ -2025,7 +2025,9 @@ describe("app-chat-stream verification surfaces", () => {
     expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
       chatId: "chat-1",
       message: "next task",
-      providerId: "anthropic",
+      modelId: "gpt-test",
+      // Composer derives provider from the model's active route (openai in harness).
+      providerId: "openai",
       thinkingLevel: "high",
     });
     const effectiveQueuedMessage = screen.getByText("next task");
@@ -2975,7 +2977,9 @@ describe("app-chat-stream verification surfaces", () => {
           }),
         ],
         message: "Review it",
-        providerId: "anthropic",
+        modelId: "gpt-test",
+        // Composer derives provider from the model's active route (openai in harness).
+        providerId: "openai",
       }),
     );
 

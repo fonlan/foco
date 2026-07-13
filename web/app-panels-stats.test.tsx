@@ -1252,7 +1252,8 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.getByRole("dialog", { name: "Retry with another model" }),
     ).toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("Provider"), "anthropic");
+    // Provider is derived from the selected model's active route.
+    expect(screen.queryByLabelText("Provider")).toBeNull();
     await user.selectOptions(screen.getByLabelText("Thinking level"), "high");
     await user.click(screen.getByRole("button", { name: "Retry" }));
 
@@ -1262,7 +1263,7 @@ describe("app-panels-stats verification surfaces", () => {
         expect.objectContaining({
           body: JSON.stringify({
             modelId: "gpt-test",
-            providerId: "anthropic",
+            providerId: "openai",
             thinkingLevel: "high",
           }),
           method: "POST",

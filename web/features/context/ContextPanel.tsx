@@ -1396,14 +1396,15 @@ function PlanPhaseRetryDialog({
     () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
     [selectedModel, thinkingLevels],
   );
-  const providerOptions = selectedModel
-    ? selectedModel.providerIds.filter((providerId) =>
-        providers.some((provider) => provider.id === providerId && provider.enabled),
-      )
-    : [];
-  const [providerId, setProviderId] = useState(() =>
-    defaultPlanPhaseRetryProviderId(phase, selectedModel, providers),
-  );
+  const resolvedProviderId =
+    selectedModel?.activeProviderId &&
+    providers.some(
+      (provider) => provider.id === selectedModel.activeProviderId && provider.enabled,
+    )
+      ? selectedModel.activeProviderId
+      : selectedModel?.providerIds.find((id) =>
+          providers.some((provider) => provider.id === id && provider.enabled),
+        ) ?? "";
   const supportsThinking = thinkingOptions.length > 0;
   const [thinkingLevel, setThinkingLevel] = useState(() =>
     defaultThinkingLevelForModel(selectedModel),
@@ -1417,19 +1418,10 @@ function PlanPhaseRetryDialog({
       setModelId(fallbackModelId);
       return;
     }
-
-    const enabledProviderIds = nextModel.providerIds.filter((id) =>
-      providers.some((provider) => provider.id === id && provider.enabled),
-    );
-    if (!enabledProviderIds.includes(providerId)) {
-      setProviderId(nextModel.activeProviderId && enabledProviderIds.includes(nextModel.activeProviderId)
-        ? nextModel.activeProviderId
-        : enabledProviderIds[0] ?? "");
-    }
     if (thinkingLevel && !isModelThinkingLevelSupported(nextModel, thinkingLevel)) {
       setThinkingLevel(defaultThinkingLevelForModel(nextModel));
     }
-  }, [modelId, phase, providerId, providers, selectableModels, thinkingLevel]);
+  }, [modelId, phase, selectableModels, thinkingLevel]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1444,13 +1436,13 @@ function PlanPhaseRetryDialog({
 
   const submitRetry = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!modelId || !providerId) {
+    if (!modelId || !resolvedProviderId) {
       setFormError(t("Select an enabled model before retrying."));
       return;
     }
     onSubmit({
       modelId,
-      providerId,
+      providerId: resolvedProviderId,
       thinkingLevel: isModelThinkingLevelSupported(selectedModel, thinkingLevel)
         ? thinkingLevel
         : null,
@@ -1502,7 +1494,6 @@ function PlanPhaseRetryDialog({
               const nextModel = selectableModels.find((model) => model.id === value) ?? null;
               setModelId(value);
               setFormError(null);
-              setProviderId(defaultPlanPhaseRetryProviderId(phase, nextModel, providers));
               setThinkingLevel(defaultThinkingLevelForModel(nextModel));
             }}
             value={modelId}
@@ -1511,22 +1502,6 @@ function PlanPhaseRetryDialog({
             {selectableModels.map((model) => (
               <option key={model.id} value={model.id}>
                 {model.displayName}
-              </option>
-            ))}
-          </PlanRetrySelect>
-          <PlanRetrySelect
-            disabled={isSubmitting || providerOptions.length === 0}
-            label={t("Provider")}
-            onChange={(value) => {
-              setProviderId(value);
-              setFormError(null);
-            }}
-            value={providerId}
-          >
-            <option value="">{t("Select provider")}</option>
-            {providerOptions.map((id) => (
-              <option key={id} value={id}>
-                {providerDisplayName(id, providers)}
               </option>
             ))}
           </PlanRetrySelect>
@@ -1563,7 +1538,7 @@ function PlanPhaseRetryDialog({
             </button>
             <button
               className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-teal-700 bg-teal-700 px-3 text-xs font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-200 disabled:text-stone-500"
-              disabled={isSubmitting || !modelId || !providerId}
+              disabled={isSubmitting || !modelId || !resolvedProviderId}
               type="submit"
             >
               {isSubmitting ? (
@@ -1624,35 +1599,6 @@ function defaultPlanPhaseRetryModelId(
     return lastModelId;
   }
   return models[0]?.id ?? "";
-}
-
-function defaultPlanPhaseRetryProviderId(
-  phase: PlanPhase,
-  model: ConfiguredModelSummary | null,
-  providers: ConfiguredProviderSummary[],
-) {
-  if (!model) {
-    return "";
-  }
-  const enabledProviderIds = model.providerIds.filter((id) =>
-    providers.some((provider) => provider.id === id && provider.enabled),
-  );
-  const lastProviderId = [...phase.attempts]
-    .reverse()
-    .find((attempt) => attempt.providerId)?.providerId;
-  if (lastProviderId && enabledProviderIds.includes(lastProviderId)) {
-    return lastProviderId;
-  }
-  return model.activeProviderId && enabledProviderIds.includes(model.activeProviderId)
-    ? model.activeProviderId
-    : enabledProviderIds[0] ?? "";
-}
-
-function providerDisplayName(
-  providerId: string,
-  providers: ConfiguredProviderSummary[],
-) {
-  return providers.find((provider) => provider.id === providerId)?.name ?? providerId;
 }
 
 function PlanWorktreeAuditPanel({

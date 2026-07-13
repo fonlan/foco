@@ -301,12 +301,17 @@ describe("app agents verification surfaces", () => {
       );
       expect(saveCall).toBeDefined();
       const body = JSON.parse(saveCall![1]?.body as string) as {
-        definition: { modelId: string; providerId: string; systemPrompt: string };
+        definition: {
+          modelId: string;
+          providerId?: string;
+          systemPrompt: string;
+        };
         id: string;
       };
       expect(body.id).toBe("agent-definition-image-gen");
       expect(body.definition.modelId).toBe("gpt-test");
-      expect(body.definition.providerId).toBe("openai");
+      // Provider is derived server-side from model routing; the form no longer posts it.
+      expect(body.definition.providerId).toBeUndefined();
       expect(body.definition.systemPrompt).toContain("## Tool Defaults");
       expect(body.definition.systemPrompt).toContain("gpt-image-2");
     });
