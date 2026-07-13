@@ -111,7 +111,7 @@ import type {
   MemoryFactRecord,
   MemoryListResponse,
   MemoryMutationResponse,
-  ModelMetadataResponse,
+  UpdateModelRouteResponse,
   OpenChatTab,
   Plan,
   PlanAutoRunResponse,
@@ -2148,7 +2148,7 @@ export function App() {
   const updateModelRoute = useCallback(
     async (modelId: string, providerId: string) => {
       try {
-        const data = await requestJson<ModelMetadataResponse>("/api/models/route", {
+        const data = await requestJson<UpdateModelRouteResponse>("/api/models/route", {
           body: JSON.stringify({ modelId, providerId }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -2157,7 +2157,13 @@ export function App() {
           current
             ? {
                 ...current,
-                configuredModels: data.configuredModels,
+                // Prefer patching the routed model so metadata-derived fields
+                // (e.g. supportedThinkingLevels from /settings) stay intact.
+                configuredModels: current.configuredModels.map((model) =>
+                  model.id === data.modelId
+                    ? { ...model, activeProviderId: data.activeProviderId }
+                    : model,
+                ),
               }
             : current,
         );

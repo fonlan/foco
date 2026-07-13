@@ -3707,6 +3707,8 @@ async fn model_route_update_switches_active_provider_and_returns_model_summary()
     .await
     .expect("switch route")
     .0;
+    assert_eq!(response.model_id, "model");
+    assert_eq!(response.active_provider_id, "provider-2");
     let summary = response
         .configured_models
         .iter()
@@ -3965,6 +3967,16 @@ async fn model_route_endpoint_is_wired_through_the_http_router() {
         .json::<Value>()
         .await
         .expect("model route response");
+    assert!(
+        body.get("models").is_none(),
+        "route response must not include models.dev catalog"
+    );
+    assert!(
+        body.get("sourceUrl").is_none() && body.get("cachePath").is_none(),
+        "route response must not include metadata cache envelope fields"
+    );
+    assert_eq!(body["modelId"], "model");
+    assert_eq!(body["activeProviderId"], "provider-2");
     let configured_model = body["configuredModels"]
         .as_array()
         .expect("configured model list")

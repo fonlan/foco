@@ -303,6 +303,16 @@ pub(crate) struct UpdateModelRouteRequest {
     pub(crate) provider_id: String,
 }
 
+/// Lightweight success body for `POST /api/models/route`.
+/// Omits the models.dev catalog so route switches avoid multi-MB JSON.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateModelRouteResponse {
+    pub(crate) model_id: String,
+    pub(crate) active_provider_id: String,
+    pub(crate) configured_models: Vec<ConfiguredModelSummary>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RevealProviderApiKeyRequest {
@@ -2627,7 +2637,7 @@ async fn fetch_and_write_model_metadata_cache_from_url(
 pub(crate) async fn update_model_route(
     State(state): State<AppState>,
     Json(request): Json<UpdateModelRouteRequest>,
-) -> Result<Json<ModelMetadataResponse>, ApiError> {
+) -> Result<Json<UpdateModelRouteResponse>, ApiError> {
     let mut config = config_update_snapshot(&state).await?;
     let model_id = request.model_id.trim();
     let provider_id = request.provider_id.trim();
@@ -2646,21 +2656,24 @@ pub(crate) async fn update_model_route(
         .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
     model.active_provider_id = Some(provider_id.to_string());
 
+    // Route-specific checks with stable bad_request messages. Full GlobalConfig
+    // validation still runs inside save_global_config (via save_config).
     config
         .resolve_active_model_provider(model_id)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    config
-        .validate(Some(&state.config_file))
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let cache = read_model_metadata_cache(&state.model_metadata_file)
-        .map_err(ApiError::from_model_metadata_error)?;
     save_config(&state, &mut config)?;
 
-    Ok(Json(model_metadata_response(
-        cache,
-        &config,
-        &state.model_metadata_file,
-    )))
+    Ok(Json(UpdateModelRouteResponse {
+        model_id: model_id.to_string(),
+        active_provider_id: provider_id.to_string(),
+        configured_models: config
+            .models
+            .iter()
+            .map(|model| {
+                crate::settings_runtime::configured_model_summary_for_config(model, &config)
+            })
+            .collect(),
+    }))
 }
 
 pub(crate) async fn save_manual_model(

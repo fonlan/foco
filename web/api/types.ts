@@ -1151,6 +1151,13 @@ export type ModelMetadataResponse = {
   configuredModels: ConfiguredModelSummary[];
 };
 
+/** Lightweight success body for POST /api/models/route (no models.dev catalog). */
+export type UpdateModelRouteResponse = {
+  modelId: string;
+  activeProviderId: string;
+  configuredModels: ConfiguredModelSummary[];
+};
+
 export type ModelFormState = {
   displayName: string;
   enabled: boolean;
