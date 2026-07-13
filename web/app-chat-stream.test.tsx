@@ -392,7 +392,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.queryByRole("button", { name: "Select skill Other skill" })).not.toBeInTheDocument();
   });
 
-  it("hides disabled providers from the composer model picker", async () => {
+  it("lists enabled models in the flat composer model picker", async () => {
     appTestState.settingsResponse = {
       ...settings,
       providers: settings.providers.map((provider) =>
@@ -404,7 +404,8 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     await userEvent.click(screen.getByLabelText("Model"));
 
-    expect(screen.getByRole("button", { name: "OpenAI: GPT Test" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Model: GPT Test" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "OpenAI: GPT Test" })).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Anthropic: GPT Test" }),
     ).not.toBeInTheDocument();
@@ -1968,7 +1969,7 @@ describe("app-chat-stream verification surfaces", () => {
       "next task",
     );
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Anthropic: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
     await userEvent.click(screen.getByLabelText("Thinking"));
     await userEvent.click(screen.getByRole("button", { name: "Thinking: High" }));
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
@@ -2943,7 +2944,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Anthropic: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 

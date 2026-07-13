@@ -1186,7 +1186,8 @@ export type AgentPermissions = {
 export type AgentDefinitionInput = {
   name: string;
   description: string;
-  providerId: string;
+  /** Legacy/compatible field; new flows omit and resolve provider via model routing. */
+  providerId?: string;
   modelId: string;
   modelOptions: AgentModelOptions;
   systemPrompt: string;
@@ -1199,6 +1200,8 @@ export type AgentDefinitionInput = {
 export type AgentDefinitionSettings = AgentDefinitionInput & {
   id: string;
   revision: number;
+  /** Server may still return a derived/compatible provider id. */
+  providerId: string;
 };
 
 export type AgentDefinitionsResponse = {

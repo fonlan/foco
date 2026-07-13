@@ -5591,7 +5591,6 @@ export function SettingsPanel({
               onDeleteDefinition={onDeleteAgentDefinition}
               onUpdateDefinition={onUpdateAgentDefinition}
               operationKey={agentDefinitionOperationKey}
-              providers={providers}
               thinkingLevels={thinkingLevels}
             />
           ) : null}

@@ -53,7 +53,6 @@ import type {
   ChatToolLiveOutput,
   ComposerAttachment,
   ConfiguredModelSummary,
-  ConfiguredProviderSummary,
   ConfiguredSkillSummary,
   ContextUsageResponse,
   GitBranchesResponse,
@@ -204,7 +203,6 @@ function ChatPanelComponent({
   onLoadMoreMessages,
   onModelChange,
   onOpenMessageApiRequests,
-  onProviderChange,
   onQueueActiveRun,
   onRemoveAttachment,
   onRemoveSkill,
@@ -217,11 +215,9 @@ function ChatPanelComponent({
   onWithdrawQueuedMessage,
   selectedGitBranch,
   selectedModelId,
-  selectedProviderId,
   selectedSkillIds,
   selectedThinkingLevel,
   settings,
-  providers,
   skills,
   queuedMessageIds,
   thinkingLevels,
@@ -272,7 +268,6 @@ function ChatPanelComponent({
   onLoadMoreMessages: () => Promise<void>;
   onModelChange: (value: string) => void;
   onOpenMessageApiRequests: (message: ShellMessage) => void;
-  onProviderChange: (value: string) => void;
   onQueueActiveRun: () => void;
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
@@ -288,11 +283,9 @@ function ChatPanelComponent({
   onWithdrawQueuedMessage: (messageId: string) => void;
   selectedGitBranch: string;
   selectedModelId: string;
-  selectedProviderId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
   settings: SettingsResponse | null;
-  providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
@@ -342,29 +335,16 @@ function ChatPanelComponent({
   const composerPlaceholder = workspaceName
     ? t("Ask Foco anything about {name}...", { name: workspaceName })
     : t("Ask Foco anything...");
-  const modelProviderGroups = useMemo(() => {
-    const providersById = new Map(providers.map((provider) => [provider.id, provider]));
-    const providerIdsForAvailableModels = Array.from(
-      new Set(availableModels.flatMap((model) => model.providerIds)),
-    );
-    return [
-      ...providers
-        .map((provider) => provider.id)
-        .filter((providerId) => providerIdsForAvailableModels.includes(providerId)),
-      ...providerIdsForAvailableModels.filter(
-        (providerId) => !providersById.has(providerId),
-      ),
-    ].map((providerId) => ({
-      providerId,
-      providerLabel: providersById.get(providerId)?.name ?? providerId,
-      models: availableModels
-        .filter((model) => model.providerIds.includes(providerId))
+  const modelOptions = useMemo(
+    () =>
+      [...availableModels]
+        .sort((left, right) => left.displayName.localeCompare(right.displayName))
         .map((model) => ({
           label: model.displayName,
           value: model.id,
         })),
-    }));
-  }, [availableModels, providers]);
+    [availableModels],
+  );
   const selectedModel = useMemo(
     () => availableModels.find((model) => model.id === selectedModelId) ?? null,
     [availableModels, selectedModelId],
@@ -682,12 +662,9 @@ function ChatPanelComponent({
     onGuideActiveRun();
   }
 
-  function handleModelProviderChange(providerId: string, modelId: string) {
+  function handleModelSelect(modelId: string) {
     if (modelId !== selectedModelId) {
       onModelChange(modelId);
-    }
-    if (providerId !== selectedProviderId) {
-      onProviderChange(providerId);
     }
   }
 
@@ -1043,15 +1020,15 @@ function ChatPanelComponent({
                 <ListChecks aria-hidden="true" className="size-3.5 shrink-0" />
                 <span className="composer-team-toggle-label">{t("Plan")}</span>
               </button>
-              <ComposerModelProviderMenu
+              <ComposerSelectMenu
                 ariaLabel={t("Model")}
-                className="composer-model-provider-select max-w-full"
-                disabled={isLoadingSettings || !modelProviderGroups.length}
+                className="composer-model-select max-w-full"
+                disabled={isLoadingSettings || !modelOptions.length}
                 emptyLabel={t("No enabled models")}
-                groups={modelProviderGroups}
-                onChange={handleModelProviderChange}
-                selectedModelId={selectedModelId}
-                selectedProviderId={selectedProviderId}
+                icon={Bot}
+                onChange={handleModelSelect}
+                options={modelOptions}
+                selectedValue={selectedModelId}
               />
               <ComposerSelectMenu
                 ariaLabel={t("Thinking")}
@@ -1600,127 +1577,6 @@ type ComposerSelectOption = {
   label: string;
   value: string;
 };
-
-type ComposerModelProviderGroup = {
-  providerId: string;
-  providerLabel: string;
-  models: ComposerSelectOption[];
-};
-
-function ComposerModelProviderMenu({
-  ariaLabel,
-  className,
-  disabled,
-  emptyLabel,
-  groups,
-  onChange,
-  selectedModelId,
-  selectedProviderId,
-}: {
-  ariaLabel: string;
-  className: string;
-  disabled: boolean;
-  emptyLabel: string;
-  groups: ComposerModelProviderGroup[];
-  onChange: (providerId: string, modelId: string) => void;
-  selectedModelId: string;
-  selectedProviderId: string;
-}) {
-  const selectedProvider =
-    groups.find((group) => group.providerId === selectedProviderId) ?? null;
-  const selectedModel =
-    selectedProvider?.models.find((model) => model.value === selectedModelId) ??
-    groups.flatMap((group) => group.models).find((model) => model.value === selectedModelId) ??
-    null;
-  const selectedLabel =
-    selectedProvider && selectedModel
-      ? `${selectedProvider.providerLabel} / ${selectedModel.label}`
-      : selectedModel?.label ?? emptyLabel;
-  const detailsRef = useCloseDetailsOnOutsidePointerDown();
-
-  function handleSelect(
-    providerId: string,
-    modelId: string,
-    event: ReactMouseEvent<HTMLButtonElement>,
-  ) {
-    event.currentTarget.closest("details")?.removeAttribute("open");
-    detailsRef.current?.removeAttribute("open");
-    onChange(providerId, modelId);
-  }
-
-  return (
-    <details
-      className={`composer-select-menu group relative ${className}`}
-      ref={detailsRef}
-    >
-      <summary
-        aria-disabled={disabled}
-        aria-label={ariaLabel}
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
-          }`}
-        title={selectedLabel}
-      >
-        <Server aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="composer-select-label min-w-0 flex-1 truncate">
-          {selectedLabel}
-        </span>
-        <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
-      </summary>
-      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
-        <div className="panel-scroll max-h-64 overflow-y-auto py-1">
-          {groups.length ? (
-            groups.map((group) => (
-              <details
-                className="composer-model-provider-group"
-                key={group.providerId}
-                open={group.providerId === selectedProviderId}
-              >
-                <summary
-                  className={`composer-model-provider-summary flex min-h-9 w-full cursor-pointer list-none items-center gap-2 px-3 py-2 text-left text-sm font-semibold marker:hidden hover:bg-stone-50 ${group.providerId === selectedProviderId
-                      ? "text-teal-900"
-                      : "text-stone-700"
-                    }`}
-                  title={group.providerLabel}
-                >
-                  <Server aria-hidden="true" className="size-3.5 shrink-0" />
-                  <span className="min-w-0 flex-1 truncate">
-                    {group.providerLabel}
-                  </span>
-                  <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
-                </summary>
-                <div className="composer-model-provider-models border-l border-stone-100 py-1">
-                  {group.models.map((model) => (
-                    <button
-                      aria-label={`${group.providerLabel}: ${model.label}`}
-                      className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 pl-8 text-left text-sm hover:bg-stone-50 ${group.providerId === selectedProviderId && model.value === selectedModelId
-                          ? "font-semibold text-teal-900"
-                          : "text-stone-700"
-                        }`}
-                      key={model.value}
-                      onClick={(event) =>
-                        handleSelect(group.providerId, model.value, event)
-                      }
-                      type="button"
-                    >
-                      <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                      <span className="min-w-0 flex-1 truncate">{model.label}</span>
-                      {group.providerId === selectedProviderId &&
-                        model.value === selectedModelId ? (
-                        <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
-                      ) : null}
-                    </button>
-                  ))}
-                </div>
-              </details>
-            ))
-          ) : (
-            <div className="px-3 py-3 text-sm text-stone-500">{emptyLabel}</div>
-          )}
-        </div>
-      </div>
-    </details>
-  );
-}
 
 function ComposerSelectMenu({
   ariaLabel,

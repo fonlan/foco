@@ -1003,25 +1003,21 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent(
-        "Anthropic / GPT Alt",
-      );
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
     });
     expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
 
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
     await userEvent.click(screen.getByLabelText("Thinking"));
     await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
-    expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     expect(screen.getByLabelText("Thinking")).toHaveTextContent("Low");
 
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Default" }),
     );
-    expect(screen.getByLabelText("Model")).toHaveTextContent(
-      "Anthropic / GPT Alt",
-    );
+    expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
     expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
 
     await userEvent.type(
@@ -1100,20 +1096,20 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     });
 
     const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("Anthropic / GPT Alt");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
     });
 
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     });
   });
 
@@ -1174,20 +1170,20 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     });
 
     const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("Anthropic / GPT Alt");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
     });
 
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     });
 
     await userEvent.type(
@@ -1214,7 +1210,7 @@ describe("app agents verification surfaces", () => {
         "aria-pressed",
         "true",
       );
-      expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
     });
   });
 
@@ -1224,12 +1220,10 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent(
-        "Anthropic / GPT Alt",
-      );
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
     });
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
     await userEvent.click(screen.getByLabelText("Thinking"));
     await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
 

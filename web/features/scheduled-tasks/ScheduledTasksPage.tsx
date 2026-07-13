@@ -26,7 +26,6 @@ import type { LucideIcon } from "lucide-react";
 import type {
   AgentDefinitionSettings,
   ConfiguredModelSummary,
-  ConfiguredProviderSummary,
   JsonValue,
   ScheduledTaskAction,
   ScheduledTaskPreviewNextRunResponse,
@@ -89,7 +88,6 @@ type ScheduledTaskFormState = {
   misfirePolicy: "skip" | "catch_up_once";
   modelId: string;
   prompt: string;
-  providerId: string;
   reuseChatId: string;
   runAt: string;
   scheduleType: ScheduleKind;
@@ -179,7 +177,6 @@ export function ScheduledTasksPage({
       ),
     [settings?.configuredModels],
   );
-  const providers = settings?.providers ?? [];
   const thinkingLevels = settings?.thinkingLevels ?? [];
 
   const selectedTask =
@@ -605,7 +602,6 @@ export function ScheduledTasksPage({
           mode={formMode}
           onClose={() => setFormMode(null)}
           onSaved={(task) => void handleTaskSaved(task)}
-          providers={providers}
           t={t}
           thinkingLevels={thinkingLevels}
           workspaces={workspaces}
@@ -665,7 +661,6 @@ function TaskDetails({
   const action = recordValue(task.action);
   const metadata = recordValue(task.metadata);
   const modelId = stringField(action, "model_id", "modelId");
-  const providerId = stringField(action, "provider_id", "providerId");
   const agentDefinitionId = stringField(action, "agent_definition_id", "agentDefinitionId");
   const thinkingLevel = stringField(action, "thinking_level", "thinkingLevel");
   const usage = task.usage;
@@ -770,7 +765,6 @@ function TaskDetails({
         <DetailBlock title={t("Action")}>
           <KeyValue label={t("Agent")} value={agentDefinitionId ?? t("None")} />
           <KeyValue label={t("Model")} value={modelId ?? t("Model default")} />
-          <KeyValue label={t("Provider")} value={providerId ?? t("Model default")} />
           <KeyValue label={t("Thinking level")} value={thinkingLevel ?? t("None")} />
           <KeyValue
             label={t("Team mode")}
@@ -923,7 +917,6 @@ function ScheduledTaskDrawer({
   mode,
   onClose,
   onSaved,
-  providers,
   t,
   thinkingLevels,
   workspaces,
@@ -934,7 +927,6 @@ function ScheduledTaskDrawer({
   mode: TaskFormMode;
   onClose: () => void;
   onSaved: (task: ScheduledTaskView) => void;
-  providers: ConfiguredProviderSummary[];
   t: Translate;
   thinkingLevels: SettingsResponse["thinkingLevels"];
   workspaces: WorkspaceSummary[];
@@ -963,7 +955,6 @@ function ScheduledTaskDrawer({
         ...current,
         agentDefinitionId: defaults.agentDefinitionId,
         modelId: defaults.modelId,
-        providerId: defaults.providerId,
         thinkingLevel: defaults.thinkingLevel,
       };
     });
@@ -974,16 +965,12 @@ function ScheduledTaskDrawer({
     () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
     [selectedModel, thinkingLevels],
   );
-  const selectableProviders = selectedModel
-    ? providers.filter((provider) => selectedModel.providerIds.includes(provider.id))
-    : [];
 
   function updateModel(modelId: string) {
     const nextModel = enabledModels.find((model) => model.id === modelId) ?? null;
     setForm((current) => ({
       ...current,
       modelId,
-      providerId: nextModel?.activeProviderId ?? nextModel?.providerIds[0] ?? "",
       thinkingLevel: defaultThinkingLevelForModel(nextModel),
     }));
   }
@@ -998,7 +985,6 @@ function ScheduledTaskDrawer({
       ...current,
       agentDefinitionId,
       modelId: definition?.modelId ?? current.modelId,
-      providerId: definition?.providerId ?? current.providerId,
       thinkingLevel: isModelThinkingLevelSupported(
         model,
         definition?.modelOptions.thinkingLevel,
@@ -1340,35 +1326,20 @@ function ScheduledTaskDrawer({
                 ))}
               </SelectField>
               <SelectField
-                disabled={!selectedModel}
-                label={t("Provider")}
-                onChange={(providerId) =>
-                  setForm((current) => ({ ...current, providerId }))
+                label={t("Thinking level")}
+                onChange={(thinkingLevel) =>
+                  setForm((current) => ({ ...current, thinkingLevel }))
                 }
-                value={form.providerId}
+                value={form.thinkingLevel}
               >
-                <option value="">{t("Model default")}</option>
-                {selectableProviders.map((provider) => (
-                  <option key={provider.id} value={provider.id}>
-                    {provider.name}
+                <option value="">{t("None")}</option>
+                {thinkingOptions.map((level) => (
+                  <option key={level.value} value={level.value}>
+                    {t(level.label)}
                   </option>
                 ))}
               </SelectField>
             </div>
-            <SelectField
-              label={t("Thinking level")}
-              onChange={(thinkingLevel) =>
-                setForm((current) => ({ ...current, thinkingLevel }))
-              }
-              value={form.thinkingLevel}
-            >
-              <option value="">{t("None")}</option>
-              {thinkingOptions.map((level) => (
-                <option key={level.value} value={level.value}>
-                  {t(level.label)}
-                </option>
-              ))}
-            </SelectField>
             <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
               <span className="text-sm font-semibold text-stone-700">
                 {t("Enable Team mode")}
@@ -1699,11 +1670,6 @@ function taskFormDefaults(
     misfirePolicy: "catch_up_once",
     modelId: agentDefinition?.modelId ?? model?.id ?? "",
     prompt: "",
-    providerId:
-      agentDefinition?.providerId ??
-      model?.activeProviderId ??
-      model?.providerIds[0] ??
-      "",
     reuseChatId: "",
     runAt: dateTimeLocalFromDate(new Date(Date.now() + 60 * 60 * 1000)),
     scheduleType: "interval",
@@ -1760,7 +1726,6 @@ function taskFormFromTask(task: ScheduledTaskView): ScheduledTaskFormState {
         | null) ?? "catch_up_once",
     modelId: stringField(action, "model_id", "modelId") ?? "",
     prompt: stringField(action, "prompt") ?? "",
-    providerId: stringField(action, "provider_id", "providerId") ?? "",
     reuseChatId,
     runAt: dateTimeLocalFromString(stringField(schedule, "run_at", "runAt")),
     scheduleType,
@@ -1805,7 +1770,6 @@ function taskFormPayload(
     type: "agent_prompt",
     ...(form.agentDefinitionId ? { agent_definition_id: form.agentDefinitionId } : {}),
     ...(form.modelId ? { model_id: form.modelId } : {}),
-    ...(form.modelId && form.providerId ? { provider_id: form.providerId } : {}),
     ...(isModelThinkingLevelSupported(
       form.modelId ? enabledModels.find((model) => model.id === form.modelId) : null,
       form.thinkingLevel,

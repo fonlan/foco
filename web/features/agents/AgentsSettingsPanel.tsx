@@ -14,7 +14,6 @@ import type {
   AgentDefinitionSettings,
   AgentExecutionWorkspaceMode,
   ConfiguredModelSummary,
-  ConfiguredProviderSummary,
   ThinkingLevelSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
@@ -42,7 +41,6 @@ type AgentDefinitionDraft = {
   maxOutputTokens: string;
   modelId: string;
   name: string;
-  providerId: string;
   systemPrompt: string;
   thinkingLevel: string;
   allowedAgentDefinitionIds: string[];
@@ -62,7 +60,6 @@ export function AgentsSettingsPanel({
   onDefaultTeamModeEnabledChange,
   onDeleteDefinition,
   onUpdateDefinition,
-  providers,
   thinkingLevels,
 }: {
   agentTools: string[];
@@ -81,7 +78,6 @@ export function AgentsSettingsPanel({
     id: string,
     definition: AgentDefinitionInput,
   ) => Promise<boolean>;
-  providers: ConfiguredProviderSummary[];
   thinkingLevels: ThinkingLevelSummary[];
 }) {
   const { t } = useI18n();
@@ -96,10 +92,6 @@ export function AgentsSettingsPanel({
           model.providerIds.length > 0,
       ),
     [models],
-  );
-  const providerNameById = useMemo(
-    () => new Map(providers.map((provider) => [provider.id, provider.name])),
-    [providers],
   );
   const modelNameById = useMemo(
     () => new Map(models.map((model) => [model.id, model.displayName])),
@@ -117,9 +109,6 @@ export function AgentsSettingsPanel({
     () => thinkingLevelOptionsForModel(selectedModel, thinkingLevels),
     [selectedModel, thinkingLevels],
   );
-  const selectableProviders = selectedModel
-    ? selectedModel.providerIds
-    : providers.filter((provider) => provider.enabled).map((provider) => provider.id);
   const selectableTools = useMemo(
     () => [...new Set([...agentTools, ...draft.allowedTools])].sort(),
     [agentTools, draft.allowedTools],
@@ -132,7 +121,6 @@ export function AgentsSettingsPanel({
     draft.name.trim().length > 0 &&
     draft.description.trim().length > 0 &&
     draft.modelId.trim().length > 0 &&
-    draft.providerId.trim().length > 0 &&
     draft.systemPrompt.trim().length > 0 &&
     Number.parseInt(draft.maxInstances, 10) > 0 &&
     draft.allowedExecutionWorkspaceModes.length > 0;
@@ -182,7 +170,6 @@ export function AgentsSettingsPanel({
     const model = enabledModels.find((item) => item.id === modelId) ?? null;
     updateDraft({
       modelId,
-      providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
       thinkingLevel: defaultThinkingLevelForModel(model),
     });
   }
@@ -307,7 +294,7 @@ export function AgentsSettingsPanel({
                   <span className="truncate text-xs font-medium text-stone-500">
                     {modelNameById.get(definition.modelId) ?? definition.modelId}
                     <span aria-hidden="true"> · </span>
-                    {providerNameById.get(definition.providerId) ?? definition.providerId}
+                    {t("Resolved by model routing")}
                   </span>
                 </div>
                 <p className="mt-1 text-sm leading-5 text-stone-600">
@@ -429,18 +416,6 @@ export function AgentsSettingsPanel({
                 {enabledModels.map((model) => (
                   <option key={model.id} value={model.id}>
                     {model.displayName}
-                  </option>
-                ))}
-              </AgentSelect>
-              <AgentSelect
-                label={t("Provider")}
-                onChange={(providerId) => updateDraft({ providerId })}
-                value={draft.providerId}
-              >
-                <option value="">{t("Select provider")}</option>
-                {selectableProviders.map((providerId) => (
-                  <option key={providerId} value={providerId}>
-                    {providerNameById.get(providerId) ?? providerId}
                   </option>
                 ))}
               </AgentSelect>
@@ -704,7 +679,6 @@ function emptyAgentDefinitionDraft(
     maxOutputTokens: "",
     modelId: model?.id ?? "",
     name: "",
-    providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
     systemPrompt: "",
     thinkingLevel: defaultThinkingLevelForModel(model),
   };
@@ -739,7 +713,6 @@ function agentDefinitionToDraft(
       : "",
     modelId: definition.modelId,
     name: definition.name,
-    providerId: definition.providerId,
     systemPrompt: definition.systemPrompt,
     thinkingLevel: definition.modelOptions.thinkingLevel ?? "",
   };
@@ -766,7 +739,6 @@ function draftToAgentDefinitionInput(
       canCreateInstances: draft.canCreateInstances,
       canDelegate: draft.canDelegate,
     },
-    providerId: draft.providerId,
     systemPrompt: draft.systemPrompt.trim(),
   };
 }

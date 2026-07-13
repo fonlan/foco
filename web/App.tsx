@@ -111,6 +111,7 @@ import type {
   MemoryFactRecord,
   MemoryListResponse,
   MemoryMutationResponse,
+  ModelMetadataResponse,
   OpenChatTab,
   Plan,
   PlanAutoRunResponse,
@@ -220,6 +221,7 @@ import { FilePickerDialog, type FilePickerSelection } from "./features/file-pick
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
+import { ModelRoutingPanel } from "./features/models/ModelRoutingPanel";
 import {
   activeSkillQuery,
   chatAttachmentPayload,
@@ -1126,7 +1128,6 @@ export function App() {
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
-  const [selectedProviderId, setSelectedProviderId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(null);
@@ -1293,7 +1294,6 @@ export function App() {
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
-  const selectedProviderIdRef = useRef("");
   const selectedThinkingLevelRef = useRef("");
   const activeChatKeyRef = useRef<string | null>(null);
   const activeWorkspaceIdRef = useRef("");
@@ -1678,6 +1678,20 @@ export function App() {
     () => availableModels.find((model) => model.id === selectedModelId) ?? null,
     [availableModels, selectedModelId],
   );
+  const selectedProviderId = useMemo(() => {
+    if (!selectedModel?.providerIds.length) {
+      return "";
+    }
+    if (
+      selectedModel.activeProviderId &&
+      selectedModel.providerIds.includes(selectedModel.activeProviderId)
+    ) {
+      return selectedModel.activeProviderId;
+    }
+    return selectedModel.providerIds[0] ?? "";
+  }, [selectedModel]);
+  const selectedProviderIdRef = useRef(selectedProviderId);
+  selectedProviderIdRef.current = selectedProviderId;
   const unsupportedDraftAttachment = useMemo(
     () =>
       draftAttachments.find((attachment) =>
@@ -1695,14 +1709,17 @@ export function App() {
   const defaultComposerSelection = useMemo<ComposerDefaultSelection>(() => {
     if (defaultAgentDefinition) {
       const agentModel = availableModels.find(
-        (model) =>
-          model.id === defaultAgentDefinition.modelId &&
-          model.providerIds.includes(defaultAgentDefinition.providerId),
+        (model) => model.id === defaultAgentDefinition.modelId,
       );
       if (agentModel) {
+        const providerId =
+          agentModel.activeProviderId &&
+          agentModel.providerIds.includes(agentModel.activeProviderId)
+            ? agentModel.activeProviderId
+            : agentModel.providerIds[0] ?? "";
         return {
           modelId: agentModel.id,
-          providerId: defaultAgentDefinition.providerId,
+          providerId,
           thinkingLevel: isModelThinkingLevelSupported(
             agentModel,
             defaultAgentDefinition.modelOptions.thinkingLevel,
@@ -1915,10 +1932,6 @@ export function App() {
   }, [selectedModelId]);
 
   useLayoutEffect(() => {
-    selectedProviderIdRef.current = selectedProviderId;
-  }, [selectedProviderId]);
-
-  useLayoutEffect(() => {
     selectedThinkingLevelRef.current = isModelThinkingLevelSupported(
       selectedModel,
       selectedRequestThinkingLevel,
@@ -2125,6 +2138,33 @@ export function App() {
       setIsLoadingSettings(false);
     }
   }, []);
+
+  const updateModelRoute = useCallback(
+    async (modelId: string, providerId: string) => {
+      try {
+        const data = await requestJson<ModelMetadataResponse>("/api/models/route", {
+          body: JSON.stringify({ modelId, providerId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+        setSettings((current) =>
+          current
+            ? {
+                ...current,
+                configuredModels: data.configuredModels,
+              }
+            : current,
+        );
+        return { ok: true as const };
+      } catch (requestError) {
+        return {
+          ok: false as const,
+          error: errorMessage(requestError) || t("Failed to update model route"),
+        };
+      }
+    },
+    [t],
+  );
 
   const loadUpdateStatus = useCallback(async () => {
     try {
@@ -3915,45 +3955,6 @@ export function App() {
   ]);
 
   useEffect(() => {
-    const selectedModel = availableModels.find(
-      (model) => model.id === selectedModelId,
-    );
-
-    setSelectedProviderId((current) => {
-      if (!selectedModel?.providerIds.length) {
-        return "";
-      }
-
-      if (
-        !hasManuallySelectedModelRef.current &&
-        selectedModel.id === defaultComposerSelection.modelId &&
-        defaultComposerSelection.providerId &&
-        selectedModel.providerIds.includes(defaultComposerSelection.providerId)
-      ) {
-        return defaultComposerSelection.providerId;
-      }
-
-      if (current && selectedModel.providerIds.includes(current)) {
-        return current;
-      }
-
-      if (
-        selectedModel.activeProviderId &&
-        selectedModel.providerIds.includes(selectedModel.activeProviderId)
-      ) {
-        return selectedModel.activeProviderId;
-      }
-
-      return selectedModel.providerIds[0] ?? "";
-    });
-  }, [
-    availableModels,
-    defaultComposerSelection.modelId,
-    defaultComposerSelection.providerId,
-    selectedModelId,
-  ]);
-
-  useEffect(() => {
     const enabledSkillIds = new Set(
       availableSkills.map((skill) => skill.key),
     );
@@ -5202,17 +5203,18 @@ export function App() {
       if (!model) {
         return;
       }
-      const providerId =
-        model.activeProviderId && model.providerIds.includes(model.activeProviderId)
-          ? model.activeProviderId
-          : model.providerIds[0] ?? "";
-      if (!providerId) {
+      if (
+        !(
+          model.activeProviderId && model.providerIds.includes(model.activeProviderId)
+            ? model.activeProviderId
+            : model.providerIds[0]
+        )
+      ) {
         return;
       }
       hasManuallySelectedModelRef.current = true;
       hasManuallySelectedThinkingLevelRef.current = false;
       setSelectedModelId(model.id);
-      setSelectedProviderId(providerId);
       setSelectedThinkingLevel(defaultThinkingLevelForModel(model));
       return;
     }
@@ -5220,7 +5222,6 @@ export function App() {
     hasManuallySelectedModelRef.current = false;
     hasManuallySelectedThinkingLevelRef.current = false;
     setSelectedModelId(defaultComposerSelection.modelId);
-    setSelectedProviderId(defaultComposerSelection.providerId);
     setSelectedThinkingLevel(defaultComposerSelection.thinkingLevel);
   }
 
@@ -5626,7 +5627,6 @@ export function App() {
     hasManuallySelectedModelRef.current = false;
     hasManuallySelectedThinkingLevelRef.current = false;
     setSelectedModelId(defaultComposerSelection.modelId);
-    setSelectedProviderId(defaultComposerSelection.providerId);
     setSelectedThinkingLevel(defaultComposerSelection.thinkingLevel);
   }
 
@@ -7584,7 +7584,6 @@ export function App() {
     hasManuallySelectedModelRef.current = true;
     hasManuallySelectedThinkingLevelRef.current = true;
     setSelectedModelId(retryRequest.modelId);
-    setSelectedProviderId(retryRequest.providerId);
     setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
     await runChatMessage(retryRequest);
@@ -7594,11 +7593,6 @@ export function App() {
     hasManuallySelectedModelRef.current = true;
     hasManuallySelectedThinkingLevelRef.current = false;
     setSelectedModelId(modelId);
-  }
-
-  function handleChatProviderChange(providerId: string) {
-    hasManuallySelectedModelRef.current = true;
-    setSelectedProviderId(providerId);
   }
 
   function handleChatThinkingLevelChange(thinkingLevel: string) {
@@ -10275,7 +10269,6 @@ export function App() {
     ) => void handleSendMessage(event, options),
   );
   const handleModelChangeForChatPanel = useStableCallback(handleChatModelChange);
-  const handleProviderChangeForChatPanel = useStableCallback(handleChatProviderChange);
   const handleRemoveAttachmentForChatPanel = useStableCallback(handleRemoveDraftAttachment);
   const handleRemoveSkillForChatPanel = useStableCallback(removeSelectedSkill);
   const handleThinkingLevelChangeForChatPanel = useStableCallback(
@@ -11047,6 +11040,11 @@ export function App() {
                     </div>
                   )}
                 </nav>
+                <ModelRoutingPanel
+                  models={settings?.configuredModels ?? []}
+                  onRouteChange={updateModelRoute}
+                  providers={settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS}
+                />
               </div>
             </aside>
 
@@ -11283,7 +11281,6 @@ export function App() {
                   onQueueActiveRun={handleQueueActiveRunForChatPanel}
                   onModelChange={handleModelChangeForChatPanel}
                   onOpenMessageApiRequests={handleOpenMessageApiRequests}
-                  onProviderChange={handleProviderChangeForChatPanel}
                   onRemoveAttachment={handleRemoveAttachmentForChatPanel}
                   onRemoveSkill={handleRemoveSkillForChatPanel}
                   onRetryRun={handleRetryRunForChatPanel}
@@ -11298,11 +11295,9 @@ export function App() {
                   selectedGitBranch={selectedGitBranch}
                   worktreeBranch={activeChatWorktreeBranch}
                   selectedModelId={selectedModelId}
-                  selectedProviderId={selectedProviderId}
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
                   settings={settings}
-                  providers={providersForChatPanel}
                   skills={availableSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}
