@@ -2147,6 +2147,31 @@ export function App() {
 
   const updateModelRoute = useCallback(
     async (modelId: string, providerId: string) => {
+      // Captured once; Strict Mode may invoke the updater twice with the same base state.
+      let previousActiveProviderId: string | null | undefined;
+      setSettings((current) => {
+        if (!current) {
+          return current;
+        }
+        const existing = current.configuredModels.find(
+          (model) => model.id === modelId,
+        );
+        if (previousActiveProviderId === undefined) {
+          previousActiveProviderId = existing?.activeProviderId;
+        }
+        if (!existing || existing.activeProviderId === providerId) {
+          return current;
+        }
+        return {
+          ...current,
+          configuredModels: current.configuredModels.map((model) =>
+            model.id === modelId
+              ? { ...model, activeProviderId: providerId }
+              : model,
+          ),
+        };
+      });
+
       try {
         const data = await requestJson<UpdateModelRouteResponse>("/api/models/route", {
           body: JSON.stringify({ modelId, providerId }),
@@ -2159,6 +2184,8 @@ export function App() {
                 ...current,
                 // Prefer patching the routed model so metadata-derived fields
                 // (e.g. supportedThinkingLevels from /settings) stay intact.
+                // Do not wholesale-replace configuredModels from the light
+                // response (may lack catalog-derived metadata).
                 configuredModels: current.configuredModels.map((model) =>
                   model.id === data.modelId
                     ? { ...model, activeProviderId: data.activeProviderId }
@@ -2169,6 +2196,19 @@ export function App() {
         );
         return { ok: true as const };
       } catch (requestError) {
+        setSettings((current) => {
+          if (!current || previousActiveProviderId === undefined) {
+            return current;
+          }
+          return {
+            ...current,
+            configuredModels: current.configuredModels.map((model) =>
+              model.id === modelId
+                ? { ...model, activeProviderId: previousActiveProviderId ?? null }
+                : model,
+            ),
+          };
+        });
         return {
           ok: false as const,
           error: errorMessage(requestError) || t("Failed to update model route"),

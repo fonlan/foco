@@ -38,6 +38,10 @@ export function ModelRoutingPanel({
     () => new Set(),
   );
   const [routingModelId, setRoutingModelId] = useState<string | null>(null);
+  /** Pending route overrides applied before the network returns. */
+  const [optimisticRoutes, setOptimisticRoutes] = useState<
+    Record<string, string>
+  >({});
   const [error, setError] = useState<string | null>(null);
 
   const providerById = useMemo(
@@ -52,6 +56,21 @@ export function ModelRoutingPanel({
       ),
     [models],
   );
+
+  function effectiveActiveProviderId(model: ConfiguredModelSummary) {
+    return optimisticRoutes[model.id] ?? model.activeProviderId;
+  }
+
+  function clearOptimisticRoute(modelId: string) {
+    setOptimisticRoutes((current) => {
+      if (!(modelId in current)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[modelId];
+      return next;
+    });
+  }
 
   function toggleExpanded() {
     setExpanded((current) => {
@@ -74,7 +93,10 @@ export function ModelRoutingPanel({
   }
 
   async function selectProvider(model: ConfiguredModelSummary, providerId: string) {
-    if (model.activeProviderId === providerId || routingModelId === model.id) {
+    if (
+      effectiveActiveProviderId(model) === providerId ||
+      routingModelId === model.id
+    ) {
       return;
     }
 
@@ -85,8 +107,12 @@ export function ModelRoutingPanel({
 
     setError(null);
     setRoutingModelId(model.id);
+    setOptimisticRoutes((current) => ({ ...current, [model.id]: providerId }));
     const result = await onRouteChange(model.id, providerId);
     setRoutingModelId((current) => (current === model.id ? null : current));
+    // Success: parent settings are the source of truth. Failure: drop the
+    // pending override so the UI rolls back to the previous route.
+    clearOptimisticRoute(model.id);
     if (!result.ok) {
       setError(result.error);
     }
@@ -138,11 +164,12 @@ export function ModelRoutingPanel({
                 const isModelExpanded = expandedModelIds.has(model.id);
                 const isModelBusy = routingModelId === model.id;
                 const modelDisabled = !model.enabled || !model.canEnable;
-                const activeProvider = model.activeProviderId
-                  ? providerById.get(model.activeProviderId)
+                const activeProviderId = effectiveActiveProviderId(model);
+                const activeProvider = activeProviderId
+                  ? providerById.get(activeProviderId)
                   : null;
                 const activeProviderLabel =
-                  activeProvider?.name ?? model.activeProviderId ?? t("No route");
+                  activeProvider?.name ?? activeProviderId ?? t("No route");
 
                 return (
                   <li
@@ -191,7 +218,7 @@ export function ModelRoutingPanel({
                         <span
                           aria-hidden="true"
                           className={`model-routing-route-dot ${
-                            model.activeProviderId ? "model-routing-route-dot-active" : ""
+                            activeProviderId ? "model-routing-route-dot-active" : ""
                           }`}
                         />
                         <Bot aria-hidden="true" className="size-3.5 shrink-0" />
@@ -219,7 +246,7 @@ export function ModelRoutingPanel({
                       >
                         {model.providerIds.map((providerId) => {
                           const provider = providerById.get(providerId);
-                          const isActive = model.activeProviderId === providerId;
+                          const isActive = activeProviderId === providerId;
                           const providerDisabled =
                             modelDisabled || !provider || !provider.enabled;
                           const disabledReason = modelDisabled

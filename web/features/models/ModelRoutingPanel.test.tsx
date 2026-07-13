@@ -181,6 +181,110 @@ describe("ModelRoutingPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("route failed");
   });
 
+  it("optimistically selects the provider before the request settles", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    let resolveRoute: (value: { ok: true } | { ok: false; error: string }) => void =
+      () => undefined;
+    const onRouteChange = vi.fn(
+      () =>
+        new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+          resolveRoute = resolve;
+        }),
+    );
+    renderPanel(onRouteChange);
+
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+
+    await waitFor(() => {
+      expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
+    });
+
+    const azure = screen.getByRole("radio", { name: /Azure/ });
+    expect(azure).toHaveAttribute("aria-checked", "true");
+    expect(azure).toHaveClass("model-routing-provider-active");
+    expect(screen.getByTitle(/GPT-4.1 · Azure/)).toBeTruthy();
+
+    resolveRoute({ ok: true });
+    // Without a parent models update, optimistic overlay clears after settle and
+    // props (openai) reappear — App.tsx owns the durable activeProviderId.
+    await waitFor(() => {
+      expect(screen.getByRole("radio", { name: /OpenAI/ })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+    });
+  });
+
+  it("rolls back optimistic selection when routing fails", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    let resolveRoute: (value: { ok: true } | { ok: false; error: string }) => void =
+      () => undefined;
+    const onRouteChange = vi.fn(
+      () =>
+        new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+          resolveRoute = resolve;
+        }),
+    );
+    renderPanel(onRouteChange);
+
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+    });
+
+    resolveRoute({ ok: false, error: "route failed" });
+
+    await waitFor(() => {
+      expect(screen.getByRole("radio", { name: /OpenAI/ })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+    });
+    expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("route failed");
+  });
+
+  it("ignores concurrent clicks on the same model while routing", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    let resolveRoute: (value: { ok: true } | { ok: false; error: string }) => void =
+      () => undefined;
+    const onRouteChange = vi.fn(
+      () =>
+        new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+          resolveRoute = resolve;
+        }),
+    );
+    renderPanel(onRouteChange);
+
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+    // Second click is ignored while the first request is in flight (busy lock).
+    fireEvent.click(screen.getByRole("radio", { name: /OpenAI/ }));
+
+    await waitFor(() => {
+      expect(onRouteChange).toHaveBeenCalledTimes(1);
+    });
+    expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
+    expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    resolveRoute({ ok: true });
+    await waitFor(() => {
+      expect(onRouteChange).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("disables unavailable providers", () => {
     window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
     renderPanel();
