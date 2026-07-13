@@ -31,4 +31,5 @@ pub use remote_path::{
 #[allow(unused_imports)]
 pub use session::{
     SshCommandResult, SshSession, SshSpawnedExec, connect_with_optional_trust, trust_and_connect,
+    trust_host_key,
 };

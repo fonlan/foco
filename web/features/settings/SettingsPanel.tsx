@@ -127,9 +127,11 @@ import type {
   ProviderTestState,
   RemoteAuthMethod,
   RemoteServerDiagnosticResponse,
+  RemoteServerHostKeyInfo,
   RemoteServerResponse,
   RemoteServerSummary,
   RemoteServerWorkspaceReference,
+  TrustHostKeyResponse,
   RetryWorkspaceSpecJobResponse,
   SettingsResponse,
   SettingsSection,
@@ -371,6 +373,14 @@ type RemoteServerFormState = {
 
 type RemoteServerOperation = "test" | "connect" | "disconnect" | "delete" | "save";
 
+type PendingHostKeyTrust = {
+  hostKey: RemoteServerHostKeyInfo;
+  operation: "test" | "connect";
+  server: RemoteServerSummary;
+  /** When set, trust success re-runs save-then-connect for the form (save path). */
+  retryAfterSave?: boolean;
+};
+
 export function SettingsPanel({
   activeSection,
   activeWorkspaceId,
@@ -426,6 +436,10 @@ export function SettingsPanel({
   const [remoteServerDiagnostics, setRemoteServerDiagnostics] = useState<
     Record<string, RemoteServerDiagnosticResponse["result"]>
   >({});
+  const [pendingHostKeyTrust, setPendingHostKeyTrust] = useState<PendingHostKeyTrust | null>(
+    null,
+  );
+  const [isTrustingHostKey, setIsTrustingHostKey] = useState(false);
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false);
@@ -1904,6 +1918,95 @@ export function SettingsPanel({
     setRemoteServerReferences([]);
   }
 
+  function selectIdentityFile() {
+    const current = remoteServerForm.identityFile.trim();
+    setSettingsFilePickerRequest({
+      initialPath: parentDirectoryPath(current),
+      mode: "file",
+      multiple: false,
+      target: { kind: "local" },
+      title: t("Select private key file"),
+      onSelect: (selection) => {
+        const path = selection[0]?.path;
+        if (!path) {
+          return;
+        }
+        setRemoteServerForm((form) => ({ ...form, identityFile: path }));
+      },
+    });
+  }
+
+  function hostKeyPromptFromDiagnostic(
+    server: RemoteServerSummary,
+    result: RemoteServerDiagnosticResponse["result"],
+    operation: "test" | "connect",
+    retryAfterSave = false,
+  ): boolean {
+    if (result.ok) {
+      return false;
+    }
+    if (result.errorKind === "host_key_changed") {
+      setError(
+        t("Host key changed — manual known_hosts fix required") +
+          " " +
+          t(
+            "This host presented a different key than the one stored in known_hosts. Foco will not overwrite it. Remove or update the entry in your known_hosts file, then try again.",
+          ),
+      );
+      return true;
+    }
+    const hostKey = result.hostKey;
+    const verificationRequired =
+      result.hostKeyVerificationRequired === true ||
+      (result.errorKind === "host_key_unknown" && Boolean(hostKey));
+    if (verificationRequired && hostKey) {
+      setPendingHostKeyTrust({
+        hostKey,
+        operation,
+        retryAfterSave,
+        server,
+      });
+      setError(null);
+      return true;
+    }
+    return false;
+  }
+
+  async function confirmHostKeyTrust() {
+    if (!pendingHostKeyTrust) {
+      return;
+    }
+    const pending = pendingHostKeyTrust;
+    setIsTrustingHostKey(true);
+    setError(null);
+    try {
+      await requestJson<TrustHostKeyResponse>(
+        `/api/remote-servers/${encodeURIComponent(pending.server.id)}/trust-host-key`,
+        {
+          body: JSON.stringify({
+            fingerprintSha256: pending.hostKey.fingerprintSha256,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setPendingHostKeyTrust(null);
+      const retryOk = await runRemoteServerOperation(pending.server, pending.operation);
+      // Only close the editor when the post-save connect actually succeeded.
+      if (pending.retryAfterSave && retryOk) {
+        setIsRemoteServerDialogOpen(false);
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsTrustingHostKey(false);
+    }
+  }
+
+  function cancelHostKeyTrust() {
+    setPendingHostKeyTrust(null);
+  }
+
   async function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
     setError(null);
     setWorkspaceForm({
@@ -3271,6 +3374,14 @@ export function SettingsPanel({
 
   async function saveRemoteServer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (
+      remoteServerForm.authMethod === "password" &&
+      !remoteServerForm.password.trim() &&
+      !remoteServerForm.passwordConfigured
+    ) {
+      setError(t("Password is required for password authentication"));
+      return;
+    }
     const operation = operationKey("save", remoteServerForm.id || "new");
     setRemoteServerOperationKey(operation);
     setError(null);
@@ -3286,19 +3397,39 @@ export function SettingsPanel({
       );
       setRemoteServerForm(remoteServerFormFromSummary(data.server));
       try {
-        await requestJson<RemoteServerDiagnosticResponse>(
+        const connectResponse = await requestJson<RemoteServerDiagnosticResponse>(
           `/api/remote-servers/${encodeURIComponent(data.server.id)}/connect`,
           { method: "POST" },
         );
+        setRemoteServerDiagnostics((current) => ({
+          ...current,
+          [data.server.id]: connectResponse.result,
+        }));
+        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        setSettings(nextSettings);
+        onSettingsChange(nextSettings);
+        if (
+          hostKeyPromptFromDiagnostic(
+            data.server,
+            connectResponse.result,
+            "connect",
+            true,
+          )
+        ) {
+          return;
+        }
+        if (!connectResponse.result.ok) {
+          if (connectResponse.result.message) {
+            setError(connectResponse.result.message);
+          }
+          return;
+        }
       } catch (connectError) {
         const nextSettings = await requestJson<SettingsResponse>("/api/settings");
         setSettings(nextSettings);
         onSettingsChange(nextSettings);
         throw connectError;
       }
-      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
-      setSettings(nextSettings);
-      onSettingsChange(nextSettings);
       setIsRemoteServerDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -3310,7 +3441,7 @@ export function SettingsPanel({
   async function runRemoteServerOperation(
     server: RemoteServerSummary,
     operation: Exclude<RemoteServerOperation, "save">,
-  ) {
+  ): Promise<boolean> {
     const key = operationKey(operation, server.id);
     setRemoteServerOperationKey(key);
     setRemoteServerReferences([]);
@@ -3340,6 +3471,19 @@ export function SettingsPanel({
           ...current,
           [server.id]: response.result,
         }));
+        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        setSettings(nextSettings);
+        onSettingsChange(nextSettings);
+        if (hostKeyPromptFromDiagnostic(server, response.result, operation)) {
+          return false;
+        }
+        if (!response.result.ok) {
+          if (response.result.message) {
+            setError(response.result.message);
+          }
+          return false;
+        }
+        return true;
       }
 
       const nextSettings = await requestJson<SettingsResponse>("/api/settings");
@@ -3348,12 +3492,14 @@ export function SettingsPanel({
       if (operation === "delete") {
         setIsRemoteServerDialogOpen(false);
       }
+      return true;
     } catch (requestError) {
       const message = errorMessage(requestError);
       setError(message);
       if (operation === "delete") {
         setRemoteServerReferences(remoteServerReferencesForMessage(message, workspaces));
       }
+      return false;
     } finally {
       setRemoteServerOperationKey(null);
     }
@@ -8325,13 +8471,18 @@ export function SettingsPanel({
               diagnostics={remoteServerDiagnostics}
               form={remoteServerForm}
               isDialogOpen={isRemoteServerDialogOpen}
+              isTrustingHostKey={isTrustingHostKey}
+              onCancelHostKeyTrust={cancelHostKeyTrust}
               onCloseDialog={closeRemoteServerDialog}
+              onConfirmHostKeyTrust={() => void confirmHostKeyTrust()}
               onEdit={editConfiguredRemoteServer}
               onFormChange={setRemoteServerForm}
               onRunOperation={runRemoteServerOperation}
               onSave={saveRemoteServer}
+              onSelectIdentityFile={selectIdentityFile}
               onStartAdding={startAddingRemoteServer}
               operationKey={remoteServerOperationKey}
+              pendingHostKeyTrust={pendingHostKeyTrust}
               references={remoteServerReferences}
               servers={remoteServers}
               t={t}
@@ -11982,13 +12133,18 @@ function RemoteServersSettingsSection({
   diagnostics,
   form,
   isDialogOpen,
+  isTrustingHostKey,
+  onCancelHostKeyTrust,
   onCloseDialog,
+  onConfirmHostKeyTrust,
   onEdit,
   onFormChange,
   onRunOperation,
   onSave,
+  onSelectIdentityFile,
   onStartAdding,
   operationKey: activeOperationKey,
+  pendingHostKeyTrust,
   references,
   servers,
   t,
@@ -11996,24 +12152,112 @@ function RemoteServersSettingsSection({
   diagnostics: Record<string, RemoteServerDiagnosticResponse["result"]>;
   form: RemoteServerFormState;
   isDialogOpen: boolean;
+  isTrustingHostKey: boolean;
+  onCancelHostKeyTrust: () => void;
   onCloseDialog: () => void;
+  onConfirmHostKeyTrust: () => void;
   onEdit: (server: RemoteServerSummary) => void;
   onFormChange: (updater: (current: RemoteServerFormState) => RemoteServerFormState) => void;
   onRunOperation: (
     server: RemoteServerSummary,
     operation: Exclude<RemoteServerOperation, "save">,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   onSave: (event: FormEvent<HTMLFormElement>) => void;
+  onSelectIdentityFile: () => void;
   onStartAdding: () => void;
   operationKey: string | null;
+  pendingHostKeyTrust: PendingHostKeyTrust | null;
   references: RemoteServerWorkspaceReference[];
   servers: RemoteServerSummary[];
   t: Translate;
 }) {
   const isSaving = activeOperationKey === operationKeyForFormSave(form);
+  const passwordTabId = "remote-server-auth-password";
+  const keyTabId = "remote-server-auth-key";
+  const passwordPanelId = "remote-server-auth-password-panel";
+  const keyPanelId = "remote-server-auth-key-panel";
 
   return (
     <section className="grid gap-4">
+      {pendingHostKeyTrust ? (
+        <>
+          <button
+            aria-label={t("Close host key confirmation")}
+            className="fixed inset-0 z-[60] bg-stone-950/40 backdrop-blur-sm"
+            onClick={onCancelHostKeyTrust}
+            type="button"
+          />
+          <div
+            aria-labelledby="remote-server-host-key-title"
+            aria-modal="true"
+            className="panel-scroll fixed left-1/2 top-1/2 z-[70] w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-amber-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.32)]"
+            role="dialog"
+          >
+            <div className="mb-3 flex items-start gap-2">
+              <KeyRound aria-hidden="true" className="mt-0.5 size-5 shrink-0 text-amber-700" />
+              <div className="min-w-0">
+                <h3
+                  className="text-sm font-semibold text-stone-950"
+                  id="remote-server-host-key-title"
+                >
+                  {t("Unknown SSH host key")}
+                </h3>
+                <p className="mt-1 text-xs text-stone-600">
+                  {t(
+                    "Trust this host and retry the connection? Only confirm if you trust this server.",
+                  )}
+                </p>
+              </div>
+            </div>
+            <dl className="grid gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-800">
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 font-semibold text-stone-500">{t("SSH hostname / IP")}</dt>
+                <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.host}</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 font-semibold text-stone-500">{t("SSH port")}</dt>
+                <dd className="font-mono">{pendingHostKeyTrust.hostKey.port}</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 font-semibold text-stone-500">{t("Host key algorithm")}</dt>
+                <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.algorithm}</dd>
+              </div>
+              <div className="grid gap-1">
+                <dt className="font-semibold text-stone-500">{t("SHA-256 fingerprint")}</dt>
+                <dd className="break-all font-mono text-[11px] leading-relaxed">
+                  {pendingHostKeyTrust.hostKey.fingerprintSha256}
+                </dd>
+              </div>
+            </dl>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                aria-label={t("Cancel host key trust")}
+                className="inline-flex h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                disabled={isTrustingHostKey}
+                onClick={onCancelHostKeyTrust}
+                type="button"
+              >
+                {t("Cancel")}
+              </button>
+              <button
+                aria-label={t("Confirm and continue")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-amber-700 px-3 text-sm font-semibold text-white hover:bg-amber-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={isTrustingHostKey}
+                onClick={onConfirmHostKeyTrust}
+                type="button"
+              >
+                {isTrustingHostKey ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                {t("Confirm and continue")}
+              </button>
+            </div>
+          </div>
+        </>
+      ) : null}
+
       {isDialogOpen ? (
         <>
           <button
@@ -12075,50 +12319,114 @@ function RemoteServersSettingsSection({
                 placeholder="22"
                 value={form.port}
               />
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              <div className="sm:col-span-2">
+                <div className="mb-1.5 text-xs font-semibold text-stone-600">
                   {t("Authentication")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => {
-                    const authMethod =
-                      event.target.value === "password" ? "password" : "key";
-                    onFormChange((current) => ({
-                      ...current,
-                      authMethod,
-                      // Switching to key clears write-only password field; backend clears stored password.
-                      password: authMethod === "key" ? "" : current.password,
-                    }));
-                  }}
-                  value={form.authMethod}
+                </div>
+                <div
+                  aria-label={t("Authentication")}
+                  className="mb-3 inline-flex rounded-lg border border-stone-200 bg-stone-50 p-0.5"
+                  role="tablist"
                 >
-                  <option value="key">{t("SSH key / agent")}</option>
-                  <option value="password">{t("Password")}</option>
-                </select>
-              </label>
-              {form.authMethod === "password" ? (
-                <TextField
-                  label={t("SSH password")}
-                  onChange={(value) => onFormChange((current) => ({ ...current, password: value }))}
-                  placeholder={
-                    form.passwordConfigured
-                      ? t("Leave empty to keep saved password")
-                      : t("Required for password auth")
-                  }
-                  type="password"
-                  value={form.password}
-                />
-              ) : (
-                <TextField
-                  label={t("Identity file")}
-                  onChange={(value) =>
-                    onFormChange((current) => ({ ...current, identityFile: value }))
-                  }
-                  placeholder="~/.ssh/id_ed25519"
-                  value={form.identityFile}
-                />
-              )}
+                  <button
+                    aria-controls={keyPanelId}
+                    aria-selected={form.authMethod === "key"}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+                      form.authMethod === "key"
+                        ? "bg-white text-stone-950 shadow-sm"
+                        : "text-stone-500 hover:text-stone-800"
+                    }`}
+                    id={keyTabId}
+                    onClick={() =>
+                      onFormChange((current) => ({
+                        ...current,
+                        authMethod: "key",
+                      }))
+                    }
+                    role="tab"
+                    tabIndex={form.authMethod === "key" ? 0 : -1}
+                    type="button"
+                  >
+                    {t("Key")}
+                  </button>
+                  <button
+                    aria-controls={passwordPanelId}
+                    aria-selected={form.authMethod === "password"}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+                      form.authMethod === "password"
+                        ? "bg-white text-stone-950 shadow-sm"
+                        : "text-stone-500 hover:text-stone-800"
+                    }`}
+                    id={passwordTabId}
+                    onClick={() =>
+                      onFormChange((current) => ({
+                        ...current,
+                        authMethod: "password",
+                      }))
+                    }
+                    role="tab"
+                    tabIndex={form.authMethod === "password" ? 0 : -1}
+                    type="button"
+                  >
+                    {t("Password")}
+                  </button>
+                </div>
+                {form.authMethod === "password" ? (
+                  <div
+                    aria-labelledby={passwordTabId}
+                    id={passwordPanelId}
+                    role="tabpanel"
+                  >
+                    <TextField
+                      autoComplete="current-password"
+                      label={t("SSH password")}
+                      onChange={(value) =>
+                        onFormChange((current) => ({ ...current, password: value }))
+                      }
+                      placeholder={
+                        form.passwordConfigured
+                          ? t("Leave empty to keep saved password")
+                          : t("Required for password auth")
+                      }
+                      type="password"
+                      value={form.password}
+                    />
+                  </div>
+                ) : (
+                  <div aria-labelledby={keyTabId} id={keyPanelId} role="tabpanel">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Identity file")}
+                      </span>
+                      <div className="flex gap-2">
+                        <input
+                          autoComplete="off"
+                          className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          name="identity-file"
+                          onChange={(event) =>
+                            onFormChange((current) => ({
+                              ...current,
+                              identityFile: event.target.value,
+                            }))
+                          }
+                          placeholder="~/.ssh/id_ed25519"
+                          type="text"
+                          value={form.identityFile}
+                        />
+                        <button
+                          aria-label={t("Browse for private key")}
+                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          onClick={onSelectIdentityFile}
+                          title={t("Browse for private key")}
+                          type="button"
+                        >
+                          <FolderSearch aria-hidden="true" className="size-4" />
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+                )}
+              </div>
               <TextField
                 label={t("Default remote root")}
                 onChange={(value) => onFormChange((current) => ({ ...current, defaultRemoteRoot: value }))}
@@ -12635,6 +12943,7 @@ function SettingsNavButton({
 }
 
 function TextField({
+  autoComplete = "off",
   inputMode,
   label,
   onChange,
@@ -12642,6 +12951,7 @@ function TextField({
   type = "text",
   value,
 }: {
+  autoComplete?: string;
   inputMode?: "numeric";
   label: string;
   onChange: (value: string) => void;
@@ -12655,7 +12965,7 @@ function TextField({
         {label}
       </span>
       <input
-        autoComplete="off"
+        autoComplete={autoComplete}
         className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
         inputMode={inputMode}
         name={label.toLowerCase().replace(/\s+/g, "-")}
@@ -13264,6 +13574,20 @@ function remoteServerDisplayTarget(server: RemoteServerSummary) {
   const user = server.user ? `${server.user}@` : "";
   const port = server.port ? `:${server.port}` : "";
   return `${user}${server.hostAlias}${port}`;
+}
+
+/** Parent directory for FilePicker initialPath; null when empty/unknown. */
+function parentDirectoryPath(path: string): string | null {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.replace(/\\/g, "/");
+  const lastSlash = normalized.lastIndexOf("/");
+  if (lastSlash <= 0) {
+    return null;
+  }
+  return normalized.slice(0, lastSlash);
 }
 
 function emptyMcpServerForm(): McpServerFormState {

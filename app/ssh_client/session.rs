@@ -443,6 +443,41 @@ pub async fn connect_with_optional_trust(
     profile: &ResolvedSshProfile,
     expected_fingerprint: Option<&str>,
 ) -> Result<SshSession, SshError> {
+    connect_with_optional_trust_inner(profile, expected_fingerprint, true).await
+}
+
+/// Public helper for UI trust confirmation: reconnect, write known_hosts when the
+/// live fingerprint still matches the user-confirmed value, then disconnect.
+///
+/// Does **not** authenticate — callers must retry test/connect afterwards so auth
+/// failures are not mislabeled as trust failures after known_hosts is written.
+pub async fn trust_host_key(
+    profile: &ResolvedSshProfile,
+    expected_fingerprint_sha256: &str,
+) -> Result<(), SshError> {
+    let session =
+        connect_with_optional_trust_inner(profile, Some(expected_fingerprint_sha256), false)
+            .await?;
+    let _ = session.disconnect().await;
+    Ok(())
+}
+
+/// Reconnect with fingerprint check + known_hosts write, then authenticate.
+/// Prefer [`trust_host_key`] for the trust API; this remains for callers that
+/// want a fully authenticated session after confirming the host key.
+#[allow(dead_code)]
+pub async fn trust_and_connect(
+    profile: &ResolvedSshProfile,
+    expected_fingerprint_sha256: &str,
+) -> Result<SshSession, SshError> {
+    connect_with_optional_trust_inner(profile, Some(expected_fingerprint_sha256), true).await
+}
+
+async fn connect_with_optional_trust_inner(
+    profile: &ResolvedSshProfile,
+    expected_fingerprint: Option<&str>,
+    do_authenticate: bool,
+) -> Result<SshSession, SshError> {
     let gate = Arc::new(Mutex::new(HostKeyGate::default()));
     let handler = ClientHandler {
         hostname: profile.hostname.clone(),
@@ -525,25 +560,23 @@ pub async fn connect_with_optional_trust(
         )?;
     }
 
-    authenticate(&mut handle, profile).await?;
-
-    // Drop secrets after authentication; only endpoint/identity metadata remains.
+    // Drop secrets from the retained profile regardless of authentication.
     let mut stored = profile.clone();
     stored.auth.password = None;
+
+    if !do_authenticate {
+        return Ok(SshSession {
+            handle,
+            profile: stored,
+        });
+    }
+
+    authenticate(&mut handle, profile).await?;
 
     Ok(SshSession {
         handle,
         profile: stored,
     })
-}
-
-/// Public helper for UI trust confirmation: reconnect and write known_hosts only
-/// when the live fingerprint still matches the user-confirmed value.
-pub async fn trust_and_connect(
-    profile: &ResolvedSshProfile,
-    expected_fingerprint_sha256: &str,
-) -> Result<SshSession, SshError> {
-    connect_with_optional_trust(profile, Some(expected_fingerprint_sha256)).await
 }
 
 async fn authenticate(

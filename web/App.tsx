@@ -4122,6 +4122,26 @@ export function App() {
       ]);
       const nextSettings = await requestJson<SettingsResponse>("/api/settings");
       setSettings(nextSettings);
+      if (
+        response.result.hostKeyVerificationRequired ||
+        response.result.errorKind === "host_key_unknown"
+      ) {
+        setError(
+          t(
+            "Host key verification required. Confirm the fingerprint in Remote Servers settings, or retry after trusting the host.",
+          ),
+        );
+      } else if (response.result.errorKind === "host_key_changed") {
+        setError(
+          t("Host key changed — manual known_hosts fix required") +
+            " " +
+            t(
+              "This host presented a different key than the one stored in known_hosts. Foco will not overwrite it. Remove or update the entry in your known_hosts file, then try again.",
+            ),
+        );
+      } else if (!response.result.ok && response.result.message) {
+        setError(response.result.message);
+      }
     } catch (requestError) {
       setError(errorMessage(requestError));
       setWorkspaceTestStages((current) => [
@@ -4158,23 +4178,49 @@ export function App() {
         method: "POST",
       });
       try {
-        await requestJson<RemoteServerDiagnosticResponse>(
+        const connectResponse = await requestJson<RemoteServerDiagnosticResponse>(
           `/api/remote-servers/${encodeURIComponent(response.server.id)}/connect`,
           { method: "POST" },
         );
+        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        setSettings(nextSettings);
+        setWorkspaceServerId(response.server.id);
+        if (!workspacePath.trim() && response.server.defaultRemoteRoot) {
+          setWorkspaceRemotePath(response.server.defaultRemoteRoot);
+        }
+        setInlineRemoteServerName("");
+        setInlineRemoteServerHost("");
+        if (
+          connectResponse.result.hostKeyVerificationRequired ||
+          connectResponse.result.errorKind === "host_key_unknown"
+        ) {
+          setError(
+            t(
+              "Host key verification required. Confirm the fingerprint in Remote Servers settings, or retry after trusting the host.",
+            ),
+          );
+          return;
+        }
+        if (connectResponse.result.errorKind === "host_key_changed") {
+          setError(
+            t("Host key changed — manual known_hosts fix required") +
+              " " +
+              t(
+                "This host presented a different key than the one stored in known_hosts. Foco will not overwrite it. Remove or update the entry in your known_hosts file, then try again.",
+              ),
+          );
+          return;
+        }
+        if (!connectResponse.result.ok && connectResponse.result.message) {
+          setError(connectResponse.result.message);
+          return;
+        }
       } catch (connectError) {
         const nextSettings = await requestJson<SettingsResponse>("/api/settings");
         setSettings(nextSettings);
+        setWorkspaceServerId(response.server.id);
         throw connectError;
       }
-      const nextSettings = await requestJson<SettingsResponse>("/api/settings");
-      setSettings(nextSettings);
-      setWorkspaceServerId(response.server.id);
-      if (!workspacePath.trim() && response.server.defaultRemoteRoot) {
-        setWorkspaceRemotePath(response.server.defaultRemoteRoot);
-      }
-      setInlineRemoteServerName("");
-      setInlineRemoteServerHost("");
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {

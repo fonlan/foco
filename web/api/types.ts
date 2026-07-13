@@ -1005,11 +1005,22 @@ export type RemoteServerDiagnosticStage = {
   details: string | null;
 };
 
+/** Structured SSH host key from diagnostics (no raw key material). */
+export type RemoteServerHostKeyInfo = {
+  host: string;
+  port: number;
+  algorithm: string;
+  fingerprintSha256: string;
+};
+
 export type RemoteServerDiagnosticResult = {
   ok: boolean;
   errorKind: string | null;
   message: string | null;
   stages: RemoteServerDiagnosticStage[];
+  hostKey?: RemoteServerHostKeyInfo | null;
+  /** True when the UI may prompt the user to trust an unknown host key. */
+  hostKeyVerificationRequired?: boolean;
 };
 
 export type RemoteServerResponse = {
@@ -1018,6 +1029,11 @@ export type RemoteServerResponse = {
 
 export type RemoteServerDiagnosticResponse = RemoteServerResponse & {
   result: RemoteServerDiagnosticResult;
+};
+
+export type TrustHostKeyResponse = {
+  trusted: boolean;
+  server: RemoteServerSummary;
 };
 
 export type RemoteServerWorkspaceReference = {

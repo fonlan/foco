@@ -71,6 +71,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             post(crate::http::remote_servers::connect_remote_server),
         )
         .route(
+            "/api/remote-servers/{server_id}/trust-host-key",
+            post(crate::http::remote_servers::trust_remote_server_host_key),
+        )
+        .route(
             "/api/remote-servers/{server_id}/disconnect",
             post(crate::http::remote_servers::disconnect_remote_server),
         )

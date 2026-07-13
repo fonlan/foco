@@ -192,7 +192,7 @@ export function WorkspaceDialog({
                     autoComplete="off"
                     className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                     onChange={(event) => onInlineServerHostChange(event.target.value)}
-                    placeholder={t("SSH host alias")}
+                    placeholder={t("SSH hostname / IP")}
                     value={inlineServerHost}
                   />
                   <button

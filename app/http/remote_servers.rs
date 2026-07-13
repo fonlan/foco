@@ -117,11 +117,25 @@ pub(crate) struct RemoteServerDiagnosticResponse {
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteServerHostKeyInfo {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) algorithm: String,
+    pub(crate) fingerprint_sha256: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteServerDiagnosticResult {
     pub(crate) ok: bool,
     pub(crate) error_kind: Option<String>,
     pub(crate) message: Option<String>,
     pub(crate) stages: Vec<RemoteServerDiagnosticStage>,
+    /// Structured host key when verification is required or the key has changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host_key: Option<RemoteServerHostKeyInfo>,
+    /// True only for unknown keys that the UI may confirm via trust-host-key.
+    pub(crate) host_key_verification_required: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -132,6 +146,19 @@ pub(crate) struct RemoteServerDiagnosticStage {
     pub(crate) error_kind: Option<String>,
     pub(crate) message: String,
     pub(crate) details: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TrustHostKeyRequest {
+    fingerprint_sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrustHostKeyResponse {
+    trusted: bool,
+    server: RemoteServerSummary,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +287,54 @@ pub(crate) async fn connect_remote_server(
     AxumPath(server_id): AxumPath<String>,
 ) -> Result<Json<RemoteServerDiagnosticResponse>, ApiError> {
     run_remote_server_diagnostic_api(state, server_id, true).await
+}
+
+pub(crate) async fn trust_remote_server_host_key(
+    State(state): State<AppState>,
+    AxumPath(server_id): AxumPath<String>,
+    Json(request): Json<TrustHostKeyRequest>,
+) -> Result<Json<TrustHostKeyResponse>, ApiError> {
+    let fingerprint = request.fingerprint_sha256.trim();
+    if fingerprint.is_empty() {
+        return Err(ApiError::bad_request(
+            "fingerprintSha256 must not be empty",
+        ));
+    }
+
+    let config = config_snapshot(&state)?;
+    let server = remote_server_by_id(&config, &server_id)?.clone();
+    let profile = crate::ssh_client::resolve_ssh_profile(
+        &server,
+        crate::ssh_client::ResolveSshOptions::default(),
+    )
+    .map_err(|err| ApiError::bad_request(format!("SSH configuration error: {}", err.message())))?;
+
+    // Trust only persists known_hosts after fingerprint rematch. Authentication
+    // is left to the subsequent test/connect retry so auth failures are not
+    // reported as trust failures after the host key was already written.
+    match crate::ssh_client::trust_host_key(&profile, fingerprint).await {
+        Ok(()) => {
+            let connected_ids = connected_remote_server_ids(&state)?;
+            Ok(Json(TrustHostKeyResponse {
+                trusted: true,
+                server: remote_server_summary(&config, &server, &connected_ids, Some(&state)),
+            }))
+        }
+        Err(err) => {
+            let message = match err.kind {
+                crate::ssh_client::SshErrorKind::HostKeyChanged => format!(
+                    "SSH host key changed or fingerprint no longer matches: {}. Remove the old entry from known_hosts and try again.",
+                    err.message()
+                ),
+                crate::ssh_client::SshErrorKind::HostKeyUnknown => format!(
+                    "SSH host key could not be trusted: {}",
+                    err.message()
+                ),
+                _ => format!("Failed to trust SSH host key: {}", err.message()),
+            };
+            Err(ApiError::bad_request(message))
+        }
+    }
 }
 
 pub(crate) async fn disconnect_remote_server(
@@ -466,6 +541,7 @@ async fn test_remote_server_connection(
     let session = match crate::ssh_client::SshSession::connect(&profile).await {
         Ok(session) => session,
         Err(err) => {
+            let host_key = err.host_key.as_ref().map(host_key_info_payload);
             stages[0] = failed_stage(
                 "ssh",
                 err.kind_str(),
@@ -477,7 +553,7 @@ async fn test_remote_server_connection(
                     )
                 }),
             );
-            return diagnostic_result(stages);
+            return diagnostic_result_with_host_key(stages, host_key);
         }
     };
 
@@ -1031,12 +1107,33 @@ fn sidecar_roots() -> Vec<PathBuf> {
 }
 
 fn diagnostic_result(stages: Vec<RemoteServerDiagnosticStage>) -> RemoteServerDiagnosticResult {
+    diagnostic_result_with_host_key(stages, None)
+}
+
+fn diagnostic_result_with_host_key(
+    stages: Vec<RemoteServerDiagnosticStage>,
+    host_key: Option<RemoteServerHostKeyInfo>,
+) -> RemoteServerDiagnosticResult {
     let failed = stages.iter().find(|stage| stage.status == "failed");
+    let error_kind = failed.and_then(|stage| stage.error_kind.clone());
+    let host_key_verification_required =
+        error_kind.as_deref() == Some("host_key_unknown") && host_key.is_some();
     RemoteServerDiagnosticResult {
         ok: failed.is_none(),
-        error_kind: failed.and_then(|stage| stage.error_kind.clone()),
+        error_kind,
         message: failed.map(|stage| stage.message.clone()),
         stages,
+        host_key,
+        host_key_verification_required,
+    }
+}
+
+fn host_key_info_payload(info: &crate::ssh_client::HostKeyInfo) -> RemoteServerHostKeyInfo {
+    RemoteServerHostKeyInfo {
+        host: info.host.clone(),
+        port: info.port,
+        algorithm: info.algorithm.clone(),
+        fingerprint_sha256: info.fingerprint_sha256.clone(),
     }
 }
 
@@ -1097,6 +1194,48 @@ mod tests {
     fn normalizes_supported_linux_targets() {
         assert_eq!(normalize_target("Linux\nx86_64\n").unwrap(), "linux-x64");
         assert_eq!(normalize_target("Linux\naarch64\n").unwrap(), "linux-arm64");
+    }
+
+    #[test]
+    fn diagnostic_marks_unknown_host_key_verification_required() {
+        let stages = vec![failed_stage(
+            "ssh",
+            "host_key_unknown",
+            "SSH connection failed: unknown host key",
+            Some("fingerprint=SHA256:abc".into()),
+        )];
+        let host_key = RemoteServerHostKeyInfo {
+            host: "10.0.0.1".into(),
+            port: 22,
+            algorithm: "ssh-ed25519".into(),
+            fingerprint_sha256: "SHA256:abc".into(),
+        };
+        let result = diagnostic_result_with_host_key(stages, Some(host_key.clone()));
+        assert!(!result.ok);
+        assert_eq!(result.error_kind.as_deref(), Some("host_key_unknown"));
+        assert!(result.host_key_verification_required);
+        assert_eq!(result.host_key.as_ref(), Some(&host_key));
+    }
+
+    #[test]
+    fn diagnostic_changed_host_key_is_not_verification_required() {
+        let stages = vec![failed_stage(
+            "ssh",
+            "host_key_changed",
+            "SSH host key changed",
+            None,
+        )];
+        let host_key = RemoteServerHostKeyInfo {
+            host: "10.0.0.1".into(),
+            port: 22,
+            algorithm: "ssh-ed25519".into(),
+            fingerprint_sha256: "SHA256:new".into(),
+        };
+        let result = diagnostic_result_with_host_key(stages, Some(host_key));
+        assert!(!result.ok);
+        assert_eq!(result.error_kind.as_deref(), Some("host_key_changed"));
+        assert!(!result.host_key_verification_required);
+        assert!(result.host_key.is_some());
     }
 
     #[test]
