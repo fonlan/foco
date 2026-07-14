@@ -2406,6 +2406,11 @@ export type ShellMessage = {
   extractedMemories: ChatExtractedMemorySummary[];
   specUpdates: ChatSpecUpdateSummary[];
   runBadges?: ChatRunBadge[];
+  /**
+   * Synthetic user bubble source (e.g. reasoningLoopGuard / expanded history
+   * interruption). Marks non-editable virtual messages; layout stays normal.
+   */
+  syntheticSource?: string;
 };
 
 // Chat Tab types

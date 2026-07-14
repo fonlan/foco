@@ -1503,6 +1503,243 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("shows reasoning-loop recovery as a user bubble without error UI", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "thinking in a loop ",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        content: "repeated reasoning loop, check and continue",
+        id: "reasoning-loop-1",
+        interruptedAssistantId: "message-assistant-stream",
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1500,
+        },
+        parts: [],
+        source: "reasoningLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    const recoveryText = await screen.findByText(
+      "repeated reasoning loop, check and continue",
+    );
+    const recoveryRow = recoveryText.closest(".message-row") as HTMLElement | null;
+    expect(recoveryRow).not.toBeNull();
+    expect(recoveryRow?.className).toContain("message-row-user");
+    expect(
+      within(recoveryRow as HTMLElement).queryByText("Guidance pending"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(recoveryRow as HTMLElement).queryByText("Queued"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(recoveryRow as HTMLElement).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Recovered answer.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-after-recovery",
+          input: {},
+          isError: false,
+          name: "noop",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const recoveredAnswer = await screen.findByText("Recovered answer.");
+    const recoveredRow = recoveredAnswer.closest(".message-row") as HTMLElement | null;
+    expect(recoveredRow).not.toBeNull();
+    expect(recoveredRow).not.toBe(recoveryRow);
+    expect(
+      recoveryText.compareDocumentPosition(recoveredAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      within(recoveredRow as HTMLElement).getByText(/noop/),
+    ).toBeInTheDocument();
+
+    const interruptedRow = screen
+      .getByText("thinking in a loop")
+      .closest(".message-row") as HTMLElement | null;
+    expect(interruptedRow).not.toBeNull();
+    expect(
+      within(interruptedRow as HTMLElement).queryByText("Recovered answer."),
+    ).not.toBeInTheDocument();
+    expect(
+      within(interruptedRow as HTMLElement).queryByText(/noop/),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("expands history userInterruption parts into stable non-editable user bubbles", async () => {
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": {
+        ...chatMessages,
+        messages: [
+          {
+            content: "trigger loop",
+            createdAt: "2026-06-10T08:00:00.000Z",
+            extractedMemories: [],
+            id: "message-user-loop",
+            memoriesUsed: [],
+            metrics: null,
+            parts: [{ text: "trigger loop", type: "text" }],
+            reasoning: null,
+            role: "user",
+            toolCalls: [],
+          },
+          {
+            content: "partial final answer",
+            createdAt: "2026-06-10T08:00:02.000Z",
+            extractedMemories: [],
+            id: "message-assistant-loop",
+            memoriesUsed: [],
+            metrics: {
+              firstTokenLatencyMs: 200,
+              llmRequestIds: ["req-final"],
+              modelId: "gpt-test",
+              outputTokens: 20,
+              providerId: "openai",
+              totalLatencyMs: 4000,
+            },
+            parts: [
+              { text: "looping reasoning", type: "reasoning" },
+              {
+                content: "repeated reasoning loop, check and continue",
+                id: "interrupt-hist-1",
+                interruptedAssistantMetrics: {
+                  firstTokenLatencyMs: 100,
+                  llmRequestIds: ["req-1"],
+                  modelId: "gpt-test",
+                  outputTokens: 5,
+                  providerId: "openai",
+                  totalLatencyMs: 1200,
+                },
+                source: "reasoningLoopGuard",
+                type: "userInterruption",
+              },
+              { text: "final answer", type: "text" },
+              {
+                content: "repeated reasoning loop, check and continue",
+                id: "interrupt-hist-2",
+                interruptedAssistantMetrics: {
+                  firstTokenLatencyMs: 150,
+                  llmRequestIds: ["req-2"],
+                  modelId: "gpt-test",
+                  outputTokens: 8,
+                  providerId: "openai",
+                  totalLatencyMs: 2000,
+                },
+                source: "reasoningLoopGuard",
+                type: "userInterruption",
+              },
+              { text: "after second recovery", type: "text" },
+            ],
+            reasoning: "looping reasoning",
+            role: "assistant",
+            toolCalls: [],
+          },
+        ] as typeof chatMessages.messages,
+        pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+      },
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const recoveryBubbles = await screen.findAllByText(
+      "repeated reasoning loop, check and continue",
+    );
+    expect(recoveryBubbles).toHaveLength(2);
+
+    const firstRecoveryRow = recoveryBubbles[0].closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    const secondRecoveryRow = recoveryBubbles[1].closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(firstRecoveryRow?.className).toContain("message-row-user");
+    expect(secondRecoveryRow?.className).toContain("message-row-user");
+    expect(
+      within(firstRecoveryRow as HTMLElement).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(secondRecoveryRow as HTMLElement).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+
+    const realUserRow = screen
+      .getByText("trigger loop")
+      .closest(".message-row") as HTMLElement | null;
+    expect(
+      within(realUserRow as HTMLElement).getByRole("button", {
+        name: "Edit message",
+      }),
+    ).toBeInTheDocument();
+
+    const firstAnswer = screen.getByText("final answer");
+    const secondAnswer = screen.getByText("after second recovery");
+    expect(
+      recoveryBubbles[0].compareDocumentPosition(firstAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      firstAnswer.compareDocumentPosition(recoveryBubbles[1]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recoveryBubbles[1].compareDocumentPosition(secondAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // Final metrics on last assistant segment only.
+    const secondAnswerRow = secondAnswer.closest(".message-row") as HTMLElement;
+    expect(
+      within(secondAnswerRow).getByText("Total time: 4 sec"),
+    ).toBeInTheDocument();
+    const firstAnswerRow = firstAnswer.closest(".message-row") as HTMLElement;
+    expect(
+      within(firstAnswerRow).getByText("Total time: 2 sec"),
+    ).toBeInTheDocument();
+  });
+
   it("keeps updating a pre-guidance tool block after guidance is applied", async () => {
     renderApp();
 

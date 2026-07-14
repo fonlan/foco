@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveChatRunSummary, ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
@@ -224,5 +224,180 @@ describe("preserveCachedReasoningDurations", () => {
       { text: "Second thought", type: "reasoning" },
     ]);
     expect(result[0].parts).not.toBe(originalRefreshedParts);
+  });
+});
+
+describe("expandMessagesWithUserInterruptions", () => {
+  const interruptedMetrics = {
+    firstTokenLatencyMs: 100,
+    llmRequestIds: [] as string[],
+    modelId: "gpt-test",
+    outputTokens: 5,
+    providerId: "openai",
+    totalLatencyMs: 1000,
+  };
+  const finalMetrics = {
+    firstTokenLatencyMs: 200,
+    llmRequestIds: ["req-final"] as string[],
+    modelId: "gpt-test",
+    outputTokens: 20,
+    providerId: "openai",
+    totalLatencyMs: 3000,
+  };
+
+  it("expands a single userInterruption into stable virtual bubbles", () => {
+    const toolCall = {
+      id: "call-1",
+      input: {},
+      isError: false,
+      name: "read_file",
+      output: null,
+      status: "completed" as const,
+    };
+    const assistant: ShellMessage = {
+      ...message("msg-assistant-1"),
+      content: "before after",
+      metrics: finalMetrics,
+      parts: [
+        { text: "looping…", type: "reasoning" },
+        { text: "before", type: "text" },
+        {
+          content: "repeated reasoning loop, check and continue",
+          id: "interrupt-1",
+          interruptedAssistantMetrics: interruptedMetrics,
+          source: "reasoningLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "after", type: "text" },
+        { toolCall, type: "toolCall" },
+      ],
+      toolCalls: [toolCall],
+    };
+
+    const expanded = expandMessagesWithUserInterruptions([
+      {
+        ...message("user-1"),
+        content: "hello",
+        parts: [{ text: "hello", type: "text" }],
+        role: "user",
+      },
+      assistant,
+    ]);
+
+    expect(expanded.map((item) => item.id)).toEqual([
+      "user-1",
+      "msg-assistant-1",
+      "interrupt-1",
+      "interrupt-1-assistant",
+    ]);
+    expect(expanded[1]).toMatchObject({
+      content: "before",
+      id: "msg-assistant-1",
+      metrics: interruptedMetrics,
+      reasoning: "looping…",
+      role: "assistant",
+    });
+    expect(expanded[1].parts.map((part) => part.type)).toEqual(["reasoning", "text"]);
+    expect(expanded[2]).toMatchObject({
+      content: "repeated reasoning loop, check and continue",
+      id: "interrupt-1",
+      role: "user",
+      syntheticSource: "reasoningLoopGuard",
+    });
+    expect(expanded[2].pendingMode).toBeUndefined();
+    expect(expanded[3]).toMatchObject({
+      content: "after",
+      id: "interrupt-1-assistant",
+      metrics: finalMetrics,
+      role: "assistant",
+    });
+    expect(expanded[3].parts.map((part) => part.type)).toEqual(["text", "toolCall"]);
+    expect(expanded[3].toolCalls).toEqual([toolCall]);
+  });
+
+  it("keeps stable ids across multiple interruptions", () => {
+    const assistant: ShellMessage = {
+      ...message("msg-assistant-root"),
+      metrics: finalMetrics,
+      parts: [
+        { text: "r1", type: "reasoning" },
+        {
+          content: "repeated reasoning loop, check and continue",
+          id: "interrupt-a",
+          interruptedAssistantMetrics: interruptedMetrics,
+          source: "reasoningLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "mid", type: "text" },
+        {
+          content: "repeated reasoning loop, check and continue",
+          id: "interrupt-b",
+          interruptedAssistantMetrics: {
+            ...interruptedMetrics,
+            totalLatencyMs: 1500,
+          },
+          source: "reasoningLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "final", type: "text" },
+      ],
+    };
+
+    const expanded = expandMessagesWithUserInterruptions([assistant]);
+    expect(expanded.map((item) => item.id)).toEqual([
+      "msg-assistant-root",
+      "interrupt-a",
+      "interrupt-a-assistant",
+      "interrupt-b",
+      "interrupt-b-assistant",
+    ]);
+    expect(expanded[0].metrics).toEqual(interruptedMetrics);
+    expect(expanded[2].metrics).toEqual({
+      ...interruptedMetrics,
+      totalLatencyMs: 1500,
+    });
+    expect(expanded[4].metrics).toEqual(finalMetrics);
+    expect(expanded[1].syntheticSource).toBe("reasoningLoopGuard");
+    expect(expanded[3].syntheticSource).toBe("reasoningLoopGuard");
+  });
+
+  it("leaves messages without interruptions unchanged", () => {
+    const messages = [message("a"), message("b")];
+    expect(expandMessagesWithUserInterruptions(messages)).toBe(messages);
+  });
+
+  it("normalizes and expands userInterruption from API-shaped parts", () => {
+    const summary: ChatMessageSummary = {
+      content: "partial final",
+      createdAt: "2026-01-01T00:00:00Z",
+      extractedMemories: [],
+      id: "assistant-hist",
+      memoriesUsed: [],
+      metrics: finalMetrics,
+      parts: [
+        { text: "partial", type: "text" },
+        {
+          content: "repeated reasoning loop, check and continue",
+          id: "hist-interrupt",
+          interruptedAssistantMetrics: interruptedMetrics,
+          source: "reasoningLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "final", type: "text" },
+      ],
+      reasoning: null,
+      role: "assistant",
+      specUpdates: [],
+      toolCalls: [],
+    };
+    const expanded = expandMessagesWithUserInterruptions([
+      normalizeChatMessageSummary(summary),
+    ]);
+    expect(expanded.map((item) => item.id)).toEqual([
+      "assistant-hist",
+      "hist-interrupt",
+      "hist-interrupt-assistant",
+    ]);
+    expect(expanded[1].syntheticSource).toBe("reasoningLoopGuard");
   });
 });

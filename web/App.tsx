@@ -526,6 +526,128 @@ export function preserveCachedReasoningDurations(
   return changed ? nextMessages : messages;
 }
 
+/** Stable UI expansion of assistant ordered parts that contain user interruptions. */
+export function expandMessagesWithUserInterruptions(
+  messages: ShellMessage[],
+): ShellMessage[] {
+  let changed = false;
+  const expanded: ShellMessage[] = [];
+  for (const message of messages) {
+    if (
+      message.role !== "assistant" ||
+      !message.parts.some((part) => part.type === "userInterruption")
+    ) {
+      expanded.push(message);
+      continue;
+    }
+    changed = true;
+    expanded.push(...expandAssistantMessageWithInterruptions(message));
+  }
+  return changed ? expanded : messages;
+}
+
+function expandAssistantMessageWithInterruptions(
+  message: ShellMessage,
+): ShellMessage[] {
+  const result: ShellMessage[] = [];
+  let segmentParts: ChatMessagePart[] = [];
+  let segmentId = message.id;
+
+  const flushAssistantSegment = (
+    metrics: ChatReplyMetrics | null | undefined,
+    isLast: boolean,
+  ) => {
+    if (segmentParts.length === 0 && !isLast) {
+      return;
+    }
+    // Skip trailing empty segment after the last interruption unless it is the
+    // only way to place final metrics (prefer last non-empty when empty).
+    if (segmentParts.length === 0 && isLast && result.length > 0) {
+      const last = result[result.length - 1];
+      if (last?.role === "assistant") {
+        result[result.length - 1] = {
+          ...last,
+          metrics: message.metrics,
+          memoriesUsed: message.memoriesUsed,
+          extractedMemories: message.extractedMemories,
+          specUpdates: message.specUpdates,
+          status: message.status,
+          runBadges: message.runBadges,
+        };
+        return;
+      }
+    }
+
+    const toolCalls = segmentParts
+      .filter(
+        (part): part is Extract<ChatMessagePart, { type: "toolCall" }> =>
+          part.type === "toolCall",
+      )
+      .map((part) => part.toolCall);
+    const content = segmentParts
+      .filter(
+        (part): part is Extract<ChatMessagePart, { type: "text" | "error" }> =>
+          part.type === "text" || part.type === "error",
+      )
+      .map((part) => part.text)
+      .join("");
+    const reasoningText = segmentParts
+      .filter(
+        (part): part is Extract<ChatMessagePart, { type: "reasoning" }> =>
+          part.type === "reasoning",
+      )
+      .map((part) => part.text)
+      .join("");
+
+    result.push({
+      ...message,
+      id: segmentId,
+      content,
+      reasoning: reasoningText || null,
+      parts: segmentParts,
+      toolCalls,
+      metrics: isLast ? message.metrics : metrics ?? null,
+      memoriesUsed: isLast ? message.memoriesUsed : [],
+      extractedMemories: isLast ? message.extractedMemories : [],
+      specUpdates: isLast ? message.specUpdates : [],
+      status: isLast ? message.status : undefined,
+      runBadges: isLast ? message.runBadges : undefined,
+      syntheticSource: undefined,
+    });
+  };
+
+  for (const part of message.parts) {
+    if (part.type === "userInterruption") {
+      flushAssistantSegment(part.interruptedAssistantMetrics ?? null, false);
+      result.push({
+        id: part.id,
+        role: "user",
+        content: part.content,
+        createdAt: message.createdAt,
+        reasoning: null,
+        status: undefined,
+        sessionMode: undefined,
+        runConfig: undefined,
+        pendingMode: undefined,
+        queuedRun: null,
+        toolCalls: [],
+        parts: [{ type: "text", text: part.content }],
+        metrics: null,
+        memoriesUsed: [],
+        extractedMemories: [],
+        specUpdates: [],
+        syntheticSource: part.source ?? "userInterruption",
+      });
+      segmentParts = [];
+      segmentId = `${part.id}-assistant`;
+      continue;
+    }
+    segmentParts = [...segmentParts, part];
+  }
+
+  flushAssistantSegment(null, true);
+  return result.length > 0 ? result : [message];
+}
 
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
@@ -5462,7 +5584,9 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_PAGE_LIMIT}`,
         { signal: controller.signal },
       );
-      const normalizedMessages = data.messages.map(normalizeChatMessageSummary);
+      const normalizedMessages = expandMessagesWithUserInterruptions(
+        data.messages.map(normalizeChatMessageSummary),
+      );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
       const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
       const mergedMessages = mergeLoadedMessagesWithStreamingPlaceholders(
@@ -5554,7 +5678,9 @@ export function App() {
       const data = await requestJson<ChatMessagesResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?${params}`,
       );
-      const olderMessages = data.messages.map(normalizeChatMessageSummary);
+      const olderMessages = expandMessagesWithUserInterruptions(
+        data.messages.map(normalizeChatMessageSummary),
+      );
       const nextPagination = normalizeChatMessagesPagination(data.pagination);
       let nextMessagesForChat = chatMessagesByKeyRef.current[chatKey] ?? [];
 
@@ -8005,6 +8131,7 @@ export function App() {
       content: string;
       parts: ChatMessagePart[];
       interruptedAssistantMetrics: ChatReplyMetrics | null;
+      source?: string;
     },
     assistantId: string,
     previousAssistantId: string,
@@ -8012,6 +8139,10 @@ export function App() {
     const pendingGuidanceMessageId =
       pendingGuidanceMessageIdsRef.current.get(guidance.id) ?? null;
     pendingGuidanceMessageIdsRef.current.delete(guidance.id);
+    const syntheticSource =
+      guidance.source === "reasoningLoopGuard"
+        ? "reasoningLoopGuard"
+        : undefined;
     setMessagesForChatKey(chatKey, (current) => {
       if (current.some((message) => message.id === assistantId)) {
         return current;
@@ -8043,6 +8174,7 @@ export function App() {
               id: guidance.id,
               content: guidance.content,
               pendingMode: undefined,
+              syntheticSource,
               parts: guidance.parts.length
                 ? [{ type: "text" as const, text: guidance.content }, ...guidance.parts]
                 : [{ type: "text" as const, text: guidance.content }],
@@ -8081,6 +8213,7 @@ export function App() {
               memoriesUsed: [],
               extractedMemories: [],
         specUpdates: [],
+              syntheticSource,
             },
           ]),
         {

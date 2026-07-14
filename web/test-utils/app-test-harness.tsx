@@ -4235,7 +4235,9 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-    return jsonResponse({ ...chatMessages, activeRun: null });
+    const override =
+      appTestState.chatMessagesResponsesByChatKey["workspace-1/chat-1"];
+    return jsonResponse({ ...(override ?? chatMessages), activeRun: null });
   }
 
   if (path === "/api/workspaces/workspace-1/chats/dream-transcript-chat-1/messages") {

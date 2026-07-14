@@ -813,7 +813,8 @@ function ChatPanelComponent({
                     !readOnly &&
                     !isSendingMessage &&
                     !message.pendingMode &&
-                    message.role === "user"
+                    message.role === "user" &&
+                    !message.syntheticSource
                   }
                   editingAttachments={editingAttachments}
                   editingSkillIds={editingSkillIds}
