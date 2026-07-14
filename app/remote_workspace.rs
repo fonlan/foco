@@ -119,7 +119,8 @@ use crate::{
     },
     spec_runtime::{
         apply_workspace_spec_job_output, claim_next_workspace_spec_job_for_path,
-        log_workspace_spec_job_status, mark_workspace_spec_job_failed, parse_workspace_spec_output,
+        compact_oversized_workspace_spec_markdown, log_workspace_spec_job_status,
+        mark_workspace_spec_job_failed, parse_workspace_spec_output,
         prepare_remote_workspace_spec_generation_job,
         recover_stale_running_workspace_spec_job_for_path,
     },
@@ -13141,6 +13142,7 @@ async fn run_remote_sidecar_spec_job(
         return Ok(());
     };
 
+    let max_output_tokens = prepared.request.max_output_tokens;
     let content_markdown = remote_sidecar_broker_workspace_spec_tool_request(
         state,
         &prepared.provider_id,
@@ -13150,15 +13152,35 @@ async fn run_remote_sidecar_spec_job(
         payload.spec.llm_timeout_ms,
     )
     .await?;
-    // ponytail: remote skips LLM compaction for oversized specs; fail loudly instead of
-    // silently truncating. Upgrade path: reuse local compaction via a second broker turn.
-    if content_markdown.len() > foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
-        return Err(ApiError::bad_request(format!(
-            "workspace spec generation exceeded {} bytes ({} bytes). Shorten the project or regenerate later.",
-            foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-            content_markdown.len()
-        )));
-    }
+    let content_markdown = {
+        let provider_id = prepared.provider_id.clone();
+        let model_id = prepared.model_id.clone();
+        let chat_id = prepared.chat_id.clone();
+        let timeout_ms = payload.spec.llm_timeout_ms;
+        compact_oversized_workspace_spec_markdown(
+            &prepared.model_id,
+            max_output_tokens,
+            &content_markdown,
+            |request| {
+                let provider_id = provider_id.clone();
+                let model_id = model_id.clone();
+                let chat_id = chat_id.clone();
+                async move {
+                    remote_sidecar_broker_workspace_spec_tool_request(
+                        state,
+                        &provider_id,
+                        &model_id,
+                        request,
+                        chat_id.as_deref(),
+                        timeout_ms,
+                    )
+                    .await
+                    .map(|content| json!({ "contentMarkdown": content }))
+                }
+            },
+        )
+        .await?
+    };
     apply_workspace_spec_job_output(
         &prepared.workspace_path,
         &prepared.job_id,

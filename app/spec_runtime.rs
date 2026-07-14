@@ -30,6 +30,12 @@ const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
 const WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS: i64 = 30 * 60 * 1000;
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
 const WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES: usize = 56 * 1024;
+// ponytail: multi-pass LLM compaction; raise attempts only if models keep missing the budget.
+const WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS: u32 = 3;
+const WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES: usize = 48 * 1024;
+const WORKSPACE_SPEC_COMPACTION_EMERGENCY_TARGET_BYTES: usize = 40 * 1024;
+// Compaction must rewrite a near-limit document; generation's 4k cap is too small for full rewrites.
+const WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS: u32 = 16_384;
 const WORKSPACE_SPEC_FILE_SUMMARY_LIMIT: i64 = 24;
 const WORKSPACE_SPEC_SYMBOL_LIMIT: i64 = 48;
 const WORKSPACE_SPEC_MEMORY_PROFILE_LIMIT: u32 = 4;
@@ -1163,70 +1169,171 @@ async fn ensure_workspace_spec_markdown_fits_limit(
     content_markdown: &str,
     chat_id: Option<&str>,
 ) -> Result<String, ApiError> {
+    compact_oversized_workspace_spec_markdown(
+        model_id,
+        max_output_tokens,
+        content_markdown,
+        |request| {
+            let workspace_path = workspace_path.to_path_buf();
+            let workspace_id = workspace_id.to_string();
+            let chat_id = chat_id.map(str::to_string);
+            let provider_id = provider_id.to_string();
+            let provider_config = provider_config.clone();
+            let timeout_ms = config.spec.llm_timeout_ms;
+            let retry_count = config.app.llm_request_retry_count;
+            let save_details = api_audit_save_details(config);
+            async move {
+                audited_provider_tool_request(
+                    &workspace_path,
+                    &workspace_id,
+                    chat_id.as_deref(),
+                    &provider_id,
+                    &provider_config,
+                    request,
+                    "workspace spec compaction",
+                    WORKSPACE_SPEC_TOOL_NAME,
+                    "submit compacted workspace spec tool",
+                    timeout_ms,
+                    retry_count,
+                    save_details,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
+/// Multi-round LLM compaction when Spec Markdown exceeds the hard store limit.
+///
+/// Shared by local and remote Spec jobs so both paths refine oversized output before write.
+pub(crate) async fn compact_oversized_workspace_spec_markdown<F, Fut>(
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+    mut invoke_compaction: F,
+) -> Result<String, ApiError>
+where
+    F: FnMut(NeutralChatRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, ApiError>>,
+{
     if content_markdown.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
         return Ok(content_markdown.to_string());
     }
 
     let original_bytes = content_markdown.len();
-    tracing::warn!(
-        workspace_id = %workspace_id,
-        content_bytes = original_bytes,
-        max_bytes = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        target_bytes = WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES,
-        "workspace spec exceeded size limit; requesting compaction"
-    );
+    let mut current = content_markdown.to_string();
+    let mut last_compacted_bytes = None;
+    let compaction_max_output_tokens = compaction_max_output_tokens(max_output_tokens);
 
-    let request =
-        workspace_spec_compaction_provider_request(model_id, max_output_tokens, content_markdown);
-    let tool_arguments = audited_provider_tool_request(
-        workspace_path,
-        workspace_id,
-        chat_id,
-        provider_id,
-        provider_config,
-        request,
-        "workspace spec compaction",
-        WORKSPACE_SPEC_TOOL_NAME,
-        "submit compacted workspace spec tool",
-        config.spec.llm_timeout_ms,
-        config.app.llm_request_retry_count,
-        api_audit_save_details(config),
-    )
-    .await?;
-    let compacted = parse_workspace_spec_output(tool_arguments)?;
-    if compacted.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
-        return Ok(compacted);
+    for attempt in 1..=WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS {
+        let target_bytes = workspace_spec_compaction_target_bytes(attempt);
+        let required_cut_percent = required_cut_percent(current.len(), target_bytes);
+        tracing::warn!(
+            content_bytes = current.len(),
+            original_bytes,
+            max_bytes = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+            target_bytes,
+            attempt,
+            max_attempts = WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS,
+            required_cut_percent,
+            "workspace spec exceeded size limit; requesting LLM compaction"
+        );
+
+        let request = workspace_spec_compaction_provider_request(
+            model_id,
+            compaction_max_output_tokens,
+            &current,
+            attempt,
+            target_bytes,
+        );
+        let tool_arguments = invoke_compaction(request).await?;
+        let compacted = parse_workspace_spec_output(tool_arguments)?;
+        last_compacted_bytes = Some(compacted.len());
+
+        if compacted.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+            tracing::info!(
+                original_bytes,
+                compacted_bytes = compacted.len(),
+                attempt,
+                "workspace spec compaction succeeded"
+            );
+            return Ok(compacted);
+        }
+
+        // Feed the shorter candidate into the next round; ignore expansions.
+        if compacted.len() < current.len() {
+            current = compacted;
+        }
     }
 
     Err(ApiError::bad_request(workspace_spec_markdown_limit_error(
         original_bytes,
-        Some(compacted.len()),
+        last_compacted_bytes,
     )))
 }
 
-fn workspace_spec_compaction_provider_request(
+fn compaction_max_output_tokens(base: Option<u32>) -> Option<u32> {
+    Some(
+        base.unwrap_or(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS)
+            .max(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS),
+    )
+}
+
+fn workspace_spec_compaction_target_bytes(attempt: u32) -> usize {
+    match attempt {
+        1 => WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES,
+        2 => WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES,
+        _ => WORKSPACE_SPEC_COMPACTION_EMERGENCY_TARGET_BYTES,
+    }
+}
+
+fn required_cut_percent(current_bytes: usize, target_bytes: usize) -> u32 {
+    if current_bytes <= target_bytes {
+        return 0;
+    }
+    let overage = current_bytes - target_bytes;
+    ((overage * 100) / current_bytes.max(1)).max(1) as u32
+}
+
+pub(crate) fn workspace_spec_compaction_provider_request(
     model_id: &str,
     max_output_tokens: Option<u32>,
     content_markdown: &str,
+    attempt: u32,
+    target_bytes: usize,
 ) -> NeutralChatRequest {
+    let current_bytes = content_markdown.len();
+    let cut_percent = required_cut_percent(current_bytes, target_bytes);
+    let aggression = match attempt {
+        1 => "Prefer deletion over paraphrasing. Merge duplicate local/remote or repeated facts.",
+        2 => "Be aggressive: delete whole low-value subsections, collapse long matrices into short bullets, keep only durable contracts.",
+        _ => "Emergency cut: keep Purpose, Architecture, key contracts, and Open Questions; ruthlessly drop examples, tables, and repeated operational prose.",
+    };
     let system_prompt = format!(
         "Compress the provided Project Spec Markdown into a complete replacement document. \
+Your ONLY success criterion is that contentMarkdown UTF-8 length is STRICTLY under {target_bytes} bytes \
+(hard store limit {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES}). \
 Preserve the existing language and section shape. Preserve durable product behavior, architecture, runtime flows, data contracts, commands, settings, UI contracts, agent/tool contracts, operational constraints, and open questions. \
-Omit low-value details such as long file lists, exhaustive symbol lists, repeated facts, transient task history, implementation blow-by-blow notes, and UI copy minutiae unless they define a contract. \
-Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
+{aggression} \
+Omit low-value details such as long file lists, exhaustive symbol lists, repeated facts, transient task history, implementation blow-by-blow notes, verbose local-vs-SSH dual write-ups, and UI copy minutiae unless they define a contract. \
+Do not invent facts. Use the submit_workspace_spec tool exactly once."
+    );
+    let user_prompt = format!(
+        "SIZE BUDGET (UTF-8 bytes):\n\
+- current: {current_bytes}\n\
+- hard_limit: {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES}\n\
+- target: {target_bytes}\n\
+- required_cut: ~{cut_percent}%\n\
+- attempt: {attempt}/{WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS}\n\n\
+Submit a substantially shorter complete Project Spec. contentMarkdown MUST be under {target_bytes} bytes.\n\n{}",
+        markdown_code_block("markdown", content_markdown)
     );
     NeutralChatRequest {
         model_id: model_id.to_string(),
         messages: vec![
             neutral_text_message(NeutralChatRole::System, system_prompt),
-            neutral_text_message(
-                NeutralChatRole::User,
-                format!(
-                    "Current Project Spec Markdown is {} bytes. Compact it below the target.\n\n{}",
-                    content_markdown.len(),
-                    markdown_code_block("markdown", content_markdown)
-                ),
-            ),
+            neutral_text_message(NeutralChatRole::User, user_prompt),
         ],
         tools: vec![workspace_spec_tool_definition()],
         thinking_level: None,
@@ -1236,14 +1343,17 @@ Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSP
     }
 }
 
-fn workspace_spec_markdown_limit_error(
+pub(crate) fn workspace_spec_markdown_limit_error(
     original_bytes: usize,
     compacted_bytes: Option<usize>,
 ) -> String {
     match compacted_bytes {
         Some(compacted_bytes) => format!(
-            "workspace spec generation exceeded {} bytes after compression retry (initial {} bytes, compressed {} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
-            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, original_bytes, compacted_bytes
+            "workspace spec generation exceeded {} bytes after {} compression attempts (initial {} bytes, last compressed {} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+            WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS,
+            original_bytes,
+            compacted_bytes
         ),
         None => format!(
             "workspace spec generation exceeded {} bytes ({} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
@@ -1924,8 +2034,138 @@ mod tests {
 
         assert!(message.contains("65536 bytes"));
         assert!(message.contains("initial 67826 bytes"));
-        assert!(message.contains("compressed 66000 bytes"));
+        assert!(message.contains("last compressed 66000 bytes"));
+        assert!(message.contains("3 compression attempts"));
         assert!(message.contains("low-value implementation details"));
+    }
+
+    #[test]
+    fn workspace_spec_compaction_prompt_includes_size_budget() {
+        let request = workspace_spec_compaction_provider_request(
+            "model-1",
+            Some(8_000),
+            &"x".repeat(70_000),
+            2,
+            WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES,
+        );
+
+        let system = request.messages[0].content.as_str();
+        let user = request.messages[1].content.as_str();
+        assert!(system.contains(&WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES.to_string()));
+        assert!(system.contains("STRICTLY under"));
+        assert!(system.contains("Be aggressive"));
+        assert!(user.contains("SIZE BUDGET"));
+        assert!(user.contains("70000"));
+        assert!(user.contains("attempt: 2/3"));
+        assert_eq!(
+            request.max_output_tokens,
+            Some(8_000)
+        );
+    }
+
+    #[test]
+    fn workspace_spec_compaction_targets_tighten_by_attempt() {
+        assert_eq!(
+            workspace_spec_compaction_target_bytes(1),
+            WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES
+        );
+        assert_eq!(
+            workspace_spec_compaction_target_bytes(2),
+            WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES
+        );
+        assert_eq!(
+            workspace_spec_compaction_target_bytes(3),
+            WORKSPACE_SPEC_COMPACTION_EMERGENCY_TARGET_BYTES
+        );
+    }
+
+    #[test]
+    fn compaction_max_output_tokens_raises_generation_cap() {
+        assert_eq!(
+            compaction_max_output_tokens(Some(4_000)),
+            Some(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            compaction_max_output_tokens(Some(32_000)),
+            Some(32_000)
+        );
+        assert_eq!(
+            compaction_max_output_tokens(None),
+            Some(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_retries_until_under_limit() {
+        let oversized = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000);
+        let mut attempts = 0_u32;
+        let result = compact_oversized_workspace_spec_markdown(
+            "model-1",
+            Some(4_000),
+            &oversized,
+            |_request| {
+                attempts += 1;
+                let body = if attempts < 3 {
+                    "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+                } else {
+                    "z".repeat(WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES - 100)
+                };
+                async move { Ok(json!({ "contentMarkdown": body })) }
+            },
+        )
+        .await
+        .expect("compaction should succeed on third attempt");
+
+        assert_eq!(attempts, 3);
+        assert_eq!(result.len(), WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES - 100);
+        assert!(result.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_fails_after_max_attempts() {
+        let oversized = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 2_000);
+        let mut attempts = 0_u32;
+        let error = compact_oversized_workspace_spec_markdown(
+            "model-1",
+            None,
+            &oversized,
+            |_request| {
+                attempts += 1;
+                let body = "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_500);
+                async move { Ok(json!({ "contentMarkdown": body })) }
+            },
+        )
+        .await
+        .expect_err("should fail when every attempt stays over limit");
+
+        assert_eq!(attempts, WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS);
+        let message = error.message();
+        assert!(message.contains("3 compression attempts"));
+        assert!(message.contains(&format!("initial {} bytes", oversized.len())));
+        assert!(message.contains(&format!(
+            "last compressed {} bytes",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_500
+        )));
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_returns_unchanged_when_within_limit() {
+        let content = "short enough".to_string();
+        let mut attempts = 0_u32;
+        let result = compact_oversized_workspace_spec_markdown(
+            "model-1",
+            None,
+            &content,
+            |_request| {
+                attempts += 1;
+                async move { Ok(json!({ "contentMarkdown": "should not run" })) }
+            },
+        )
+        .await
+        .expect("under-limit content should pass through");
+
+        assert_eq!(attempts, 0);
+        assert_eq!(result, content);
     }
 
     #[test]
