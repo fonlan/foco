@@ -2327,6 +2327,11 @@ fn merge_llm_request_audit_request_kinds(
     }
 }
 
+/// Workspace-scoped AI Statistics dump detail.
+///
+/// For SSH workspaces this must run on the main process (not remote-proxied):
+/// real `provider_*_v1` wire is only in the profile remote-workspace-audit
+/// mirror. Sidecar detail columns stay NULL by contract.
 pub(crate) async fn ai_statistics_detail(
     State(state): State<AppState>,
     AxumPath((workspace_id, request_id)): AxumPath<(String, String)>,

@@ -45,3 +45,6 @@ Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 s
 - Request 与 Response 的版本化 HTTP headers 仅把 `Authorization` 写为 `********`。`X-API-Key`、Cookie、Set-Cookie、签名与 token 命名 header 会原样进入本地 workspace SQLite 和详情 UI；这是有意放宽的本地审计安全边界。
 - Response UI 仅渲染真实 `provider_*_v1`：status/version、headers JSON 和一个完整最终 response-envelope JSON；不再拆分最终文本、推理、工具调用或 usage 卡片，也不保存原始 SSE/chunk。非 v1 / 已清理详情 → `malformed`/`unavailable`，**不**回显 legacy 正文，**无** `legacy_text_v1` fallback。
 - 主进程真实 wire 为唯一详情真源；SSH sidecar 镜像不可替代主进程 dump。
+- **远程代理例外（HTTP 路由）**：workspace 代理中间件不得转发 `ai-statistics`。全局列表 `GET /api/ai-statistics` 与 workspace 详情 `GET /api/workspaces/{id}/ai-statistics/{request_id}` 均留在主进程，经 `workspace_audit_path` 读 `profile/.foco/remote-workspace-audit/<workspaceId>`（SSH）或本地 workspace SQLite。Sidecar 的 `/api/remote/workspace/ai-statistics/{request_id}` 可继续返回结构化镜像，但 detail 恒 NULL，**不得**当作 dump 真源。若把详情路由误代理到 sidecar，UI 会恒显示 unavailable（即使主进程 mirror 已有 v1 wire）。
+- **历史与开关语义**：修复后仅当主进程已捕获合法 `provider_request_v1` / `provider_final_response_v1` 时详情为 `captured`。历史上未捕获、`save_request_response_details=false`、保留期清理后 detail 为 NULL、或非 v1 被 open 清掉的记录仍正确 `unavailable`/`malformed`，**禁止**用 sidecar normalized 镜像事后伪造恢复。
+- 回归：`proxy_workspace_route_path_keeps_ai_statistics_on_main_process`、`remote_ai_statistics_detail_http_reads_main_process_audit_mirror`（真实 App Router，fake sidecar hit=0）。

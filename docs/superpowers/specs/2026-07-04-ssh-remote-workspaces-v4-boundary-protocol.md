@@ -97,7 +97,7 @@ These APIs are workspace-scoped because they use remote source files, remote `.f
 | Skills | workspace skill discovery/install into workspace | remote sidecar for workspace files; global skill store/marketplace remains local main and can be sent read-only in runtime config. |
 | MCP | MCP server runtime/tool calls | route by `executionHost`: workspace-host in remote sidecar, local-host as brokered local service, merged definitions for UI/agent prompts. |
 | Code graph | graph indexer startup/watchers and graph tools | remote sidecar; local main must not watch remote paths. |
-| AI statistics | `/api/ai-statistics`, `/ai-statistics/{request_id}`, chat statistics | merged view for global pages; remote sidecar for remote workspace details. Broker transport audit stays local-only and should not duplicate user-visible stats. |
+| AI statistics | `/api/ai-statistics`, `/api/workspaces/{id}/ai-statistics/{request_id}`, chat statistics | List and dump detail stay on local main (SSH reads profile remote-workspace-audit mirror). Chat statistics may still use remote sidecar for message/runtime metrics. Sidecar structured audit mirrors keep detail NULL and must not be the wire dump source of truth; never dual-count brokered requests across main + sidecar. |
 
 Server-scoped APIs such as `Remote Servers list/create/update/delete/test/connect/disconnect/status` must not be mounted under `/api/workspaces/{workspace_id}`. They operate on `RemoteServerProfile` and aggregate workspace references.
 
