@@ -380,7 +380,7 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         .expect("claim task");
     for (sequence, payload) in [
         json!({ "type": "reasoningDelta", "delta": "Think. " }),
-        json!({ "type": "textDelta", "delta": "Read. " }),
+        json!({ "type": "textDelta", "delta": "Read. ", "reasoningDurationMs": 1500 }),
         json!({ "type": "toolCall", "toolCall": { "id": "tool-1", "name": "read_file", "status": "running", "input": { "path": "notes.md" }, "output": null, "isError": false } }),
         json!({ "type": "toolOutputDelta", "toolCallId": "tool-1", "stream": "stdout", "delta": "chunk" }),
         json!({ "type": "toolResult", "toolCallId": "tool-1", "output": { "content": "done" }, "isError": false, "startedAt": "2026-07-03T08:00:00Z", "completedAt": "2026-07-03T08:00:01Z" }),
@@ -452,9 +452,16 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         .expect("run item");
     assert_eq!(run_item.content, "Read. Done.");
     assert!(matches!(
-        run_item.parts[0],
-        ChatMessagePart::Reasoning { .. }
+        &run_item.parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(1500)
+        } if text == "Think. "
     ));
+    let serialized_reasoning =
+        serde_json::to_value(&run_item.parts[0]).expect("serialize reasoning part");
+    assert_eq!(serialized_reasoning["duration_ms"], json!(1500));
+    assert_eq!(serialized_reasoning["type"], json!("reasoning"));
     assert!(matches!(run_item.parts[1], ChatMessagePart::Text { .. }));
     let tool_call = match &run_item.parts[2] {
         ChatMessagePart::ToolCall { tool_call } => tool_call,
@@ -492,6 +499,325 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
     assert_eq!(failed_output.kind, "Task error");
     assert_eq!(failed_output.content, "boom");
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+fn sample_agent_task_record(
+    status: foco_agent::AgentTaskStatus,
+) -> foco_store::workspace::AgentTaskRecord {
+    foco_store::workspace::AgentTaskRecord {
+        id: foco_agent::AgentTaskId::new("agent-task-reasoning-duration").expect("task id"),
+        team_id: foco_agent::AgentTeamId::new("agent-team-reasoning-duration").expect("team id"),
+        owner_instance_id: foco_agent::AgentInstanceId::new("agent-instance-reasoning-duration")
+            .expect("instance id"),
+        origin_instance_id: None,
+        parent_task_id: None,
+        sequence: 1,
+        status,
+        input_json: r#"{"message":"test"}"#.to_string(),
+        result_json: None,
+        error_json: None,
+        created_at: "2026-07-03T08:00:00Z".to_string(),
+        updated_at: "2026-07-03T08:00:10Z".to_string(),
+        started_at: Some("2026-07-03T08:00:00Z".to_string()),
+        completed_at: None,
+    }
+}
+
+fn sample_run_event(
+    sequence: i64,
+    created_at: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> foco_store::workspace::RunEventRecord {
+    foco_store::workspace::RunEventRecord {
+        id: format!("event-{sequence}"),
+        chat_id: "chat-reasoning-duration".to_string(),
+        run_id: "agent-task-reasoning-duration".to_string(),
+        sequence,
+        event_type: event_type.to_string(),
+        payload_json: payload.to_string(),
+        created_at: created_at.to_string(),
+    }
+}
+
+#[test]
+fn agent_task_run_transcript_item_rebuilds_reasoning_durations() {
+    use crate::http::agents::agent_task_run_transcript_item;
+
+    // reasoningDelta → textDelta with camelCase exact duration.
+    let text_boundary = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Completed),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "Think A. " }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:02Z",
+                "textDelta",
+                json!({
+                    "type": "textDelta",
+                    "delta": "Answer A.",
+                    "reasoningDurationMs": 1800
+                }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:03Z",
+                "complete",
+                json!({ "type": "complete", "text": "Answer A.", "metrics": { "modelId": "m", "providerId": "p", "totalLatencyMs": null, "firstTokenLatencyMs": null, "outputTokens": null, "llmRequestIds": [] } }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:05Z",
+    )
+    .expect("text boundary")
+    .expect("item");
+    assert!(matches!(
+        &text_boundary.parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(1800)
+        } if text == "Think A. "
+    ));
+    let serialized = serde_json::to_value(&text_boundary.parts[0]).expect("serialize");
+    assert_eq!(serialized["duration_ms"], json!(1800));
+    assert_eq!(serialized["type"], json!("reasoning"));
+
+    // reasoningDelta → toolCall with snake_case exact duration.
+    let tool_boundary = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Completed),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "reasoning_delta",
+                json!({ "type": "reasoning_delta", "delta": "Plan tool." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "tool_call",
+                json!({
+                    "type": "tool_call",
+                    "reasoning_duration_ms": 900,
+                    "tool_call": {
+                        "id": "tool-1",
+                        "name": "read_file",
+                        "status": "running",
+                        "input": { "path": "a.md" },
+                        "output": null,
+                        "isError": false
+                    }
+                }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:02Z",
+                "complete",
+                json!({ "type": "complete", "text": "", "metrics": { "modelId": "m", "providerId": "p", "totalLatencyMs": null, "firstTokenLatencyMs": null, "outputTokens": null, "llmRequestIds": [] } }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:05Z",
+    )
+    .expect("tool boundary")
+    .expect("item");
+    assert!(matches!(
+        &tool_boundary.parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(900)
+        } if text == "Plan tool."
+    ));
+
+    // reasoningDelta → complete with timestamp fallback when duration payload missing.
+    let complete_boundary = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Completed),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00.000Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "Only think." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01.250Z",
+                "complete",
+                json!({ "type": "complete", "text": "Done.", "metrics": { "modelId": "m", "providerId": "p", "totalLatencyMs": null, "firstTokenLatencyMs": null, "outputTokens": null, "llmRequestIds": [] } }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:05Z",
+    )
+    .expect("complete boundary")
+    .expect("item");
+    assert!(matches!(
+        &complete_boundary.parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(1250)
+        } if text == "Only think."
+    ));
+
+    // Multiple independent reasoning blocks.
+    let multi = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Completed),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "First." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "Mid. ", "reasoningDurationMs": 500 }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:02Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "Second." }),
+            ),
+            sample_run_event(
+                3,
+                "2026-07-03T08:00:04Z",
+                "complete",
+                json!({ "type": "complete", "text": "Mid. End.", "reasoningDurationMs": 2000 }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:10Z",
+    )
+    .expect("multi")
+    .expect("item");
+    let reasoning_parts = multi
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatMessagePart::Reasoning { text, duration_ms } => Some((text.as_str(), *duration_ms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasoning_parts,
+        vec![("First.", Some(500)), ("Second.", Some(2000))]
+    );
+
+    // streamReset clears failed-attempt active start (no leak into next block).
+    let reset = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Completed),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "Failed attempt." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:05Z",
+                "streamReset",
+                json!({ "type": "streamReset", "text": "", "reasoning": null, "toolCalls": [] }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:06Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "Recovered." }),
+            ),
+            sample_run_event(
+                3,
+                "2026-07-03T08:00:07Z",
+                "complete",
+                json!({ "type": "complete", "text": "ok", "reasoningDurationMs": 400 }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:10Z",
+    )
+    .expect("reset")
+    .expect("item");
+    assert!(matches!(
+        &reset.parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(400)
+        } if text == "Recovered."
+    ));
+
+    // Running open reasoning uses injected now; later now grows elapsed; terminal freezes.
+    let running_events = [
+        sample_run_event(
+            0,
+            "2026-07-03T08:00:00Z",
+            "reasoningDelta",
+            json!({ "type": "reasoningDelta", "delta": "Still thinking..." }),
+        ),
+        sample_run_event(
+            1,
+            "2026-07-03T08:00:00.500Z",
+            "reasoningDelta",
+            json!({ "type": "reasoningDelta", "delta": " more" }),
+        ),
+    ];
+    let early = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &running_events,
+        "Worker",
+        "2026-07-03T08:00:01.000Z",
+    )
+    .expect("early")
+    .expect("item");
+    let late = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &running_events,
+        "Worker",
+        "2026-07-03T08:00:03.000Z",
+    )
+    .expect("late")
+    .expect("item");
+    let early_ms = match &early.parts[0] {
+        ChatMessagePart::Reasoning {
+            duration_ms: Some(ms),
+            ..
+        } => *ms,
+        other => panic!("expected early reasoning duration, got {other:?}"),
+    };
+    let late_ms = match &late.parts[0] {
+        ChatMessagePart::Reasoning {
+            duration_ms: Some(ms),
+            ..
+        } => *ms,
+        other => panic!("expected late reasoning duration, got {other:?}"),
+    };
+    assert_eq!(early_ms, 1000);
+    assert_eq!(late_ms, 3000);
+    assert!(late_ms > early_ms);
+
+    let frozen = agent_task_run_transcript_item(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Failed),
+        &running_events,
+        "Worker",
+        "2026-07-03T08:00:30.000Z",
+    )
+    .expect("frozen")
+    .expect("item");
+    // Terminal without boundary freezes at last event time (0.5s), not response `now`.
+    assert!(matches!(
+        &frozen.parts[0],
+        ChatMessagePart::Reasoning {
+            duration_ms: Some(500),
+            ..
+        }
+    ));
 }
 
 struct FixtureAgentRunTask {

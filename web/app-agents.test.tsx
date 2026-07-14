@@ -904,7 +904,11 @@ describe("app agents verification surfaces", () => {
           content: "",
           kind: "Task run",
           parts: [
-            { type: "reasoning" as const, text: "Checking workspace state." },
+            {
+              type: "reasoning" as const,
+              text: "Checking workspace state.",
+              durationMs: 1200,
+            },
             {
               type: "toolCall" as const,
               toolCall: {
@@ -932,7 +936,12 @@ describe("app agents verification surfaces", () => {
           ...firstTranscriptResponse.items[0]!,
           content: "Still inspecting.",
           parts: [
-            ...firstTranscriptResponse.items[0]!.parts,
+            {
+              type: "reasoning" as const,
+              text: "Checking workspace state.",
+              durationMs: 3500,
+            },
+            firstTranscriptResponse.items[0]!.parts[1]!,
             { type: "text" as const, text: "Still inspecting." },
           ],
         },
@@ -983,6 +992,8 @@ describe("app agents verification surfaces", () => {
 
     expect(await screen.findByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.getByText("1.2 s")).toBeInTheDocument();
+    expect(screen.queryByText("n/a")).not.toBeInTheDocument();
     expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
 
     const snapshotRequestsBeforeRefresh = snapshotRequestCount;
@@ -1009,6 +1020,7 @@ describe("app agents verification surfaces", () => {
     expect(transcriptPanel).not.toBeNull();
     expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.getByText("1.2 s")).toBeInTheDocument();
     expect(
       within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
     ).toBeEnabled();
@@ -1022,6 +1034,7 @@ describe("app agents verification surfaces", () => {
     );
     expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.getByText("1.2 s")).toBeInTheDocument();
     expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1031,6 +1044,9 @@ describe("app agents verification surfaces", () => {
       () => expect(screen.getByText("Still inspecting.")).toBeInTheDocument(),
       { timeout: 2500 },
     );
+    expect(screen.getByText("3.5 s")).toBeInTheDocument();
+    expect(screen.queryByText("1.2 s")).not.toBeInTheDocument();
+    expect(screen.queryByText("n/a")).not.toBeInTheDocument();
   });
 
   it("restores cached Worker transcript immediately when switching back while refresh is deferred", async () => {

@@ -11724,10 +11724,22 @@ fn timestamp_duration_ms(started_at: &str, ended_at: &str) -> Option<i64> {
 }
 
 fn finish_reasoning_part_duration(parts: &mut [ChatMessagePart], started_at: &str, ended_at: &str) {
-    if let Some(ChatMessagePart::Reasoning { duration_ms, .. }) = parts.last_mut()
-        && duration_ms.is_none()
-    {
-        *duration_ms = timestamp_duration_ms(started_at, ended_at);
+    apply_reasoning_part_duration(parts, timestamp_duration_ms(started_at, ended_at));
+}
+
+fn apply_reasoning_part_duration(parts: &mut [ChatMessagePart], duration_ms: Option<i64>) {
+    let Some(duration_ms) = duration_ms else {
+        return;
+    };
+    let Some(ChatMessagePart::Reasoning {
+        duration_ms: existing,
+        ..
+    }) = parts.last_mut()
+    else {
+        return;
+    };
+    if existing.is_none() {
+        *existing = Some(duration_ms.max(0));
     }
 }
 

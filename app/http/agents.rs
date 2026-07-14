@@ -1371,9 +1371,12 @@ pub(crate) fn agent_instance_transcript_items(
         let events = database
             .run_events_for_run(task.id.as_str())
             .map_err(ApiError::from_workspace_error)?;
-        if let Some(run_item) =
-            agent_task_run_transcript_item(task, &events, &instance.definition_snapshot.name)?
-        {
+        if let Some(run_item) = agent_task_run_transcript_item(
+            task,
+            &events,
+            &instance.definition_snapshot.name,
+            &utc_timestamp(),
+        )? {
             items.push(run_item);
         } else if let Some(output) = agent_task_output_content(task)? {
             items.push(AgentTranscriptItemView {
@@ -1445,10 +1448,11 @@ struct AgentTaskOutputContent {
     content: String,
 }
 
-fn agent_task_run_transcript_item(
+pub(crate) fn agent_task_run_transcript_item(
     task: &AgentTaskRecord,
     events: &[RunEventRecord],
     author: &str,
+    now: &str,
 ) -> Result<Option<AgentTranscriptItemView>, ApiError> {
     if events.is_empty() {
         if task.status != AgentTaskStatus::Running {
@@ -1483,6 +1487,7 @@ fn agent_task_run_transcript_item(
     let mut metrics = None;
     let mut status =
         (task.status == AgentTaskStatus::Running).then_some(AgentTranscriptItemStatus::Streaming);
+    let mut reasoning_started_at = None::<String>;
 
     for event in &sorted_events {
         let payload = parse_json_value(&event.payload_json, "Agent run event payload")?;
@@ -1490,6 +1495,12 @@ fn agent_task_run_transcript_item(
             string_json_field(&payload, "type", "type").unwrap_or(event.event_type.as_str());
         match event_type {
             "textDelta" | "text_delta" => {
+                finish_agent_reasoning_part(
+                    &mut parts,
+                    &mut reasoning_started_at,
+                    &event.created_at,
+                    &payload,
+                );
                 if let Some(delta) = string_json_field(&payload, "delta", "delta") {
                     content.push_str(delta);
                     push_text_part(&mut parts, delta);
@@ -1498,11 +1509,20 @@ fn agent_task_run_transcript_item(
             }
             "reasoningDelta" | "reasoning_delta" => {
                 if let Some(delta) = string_json_field(&payload, "delta", "delta") {
+                    if reasoning_started_at.is_none() {
+                        reasoning_started_at = Some(event.created_at.clone());
+                    }
                     push_reasoning_part(&mut parts, delta);
                     status.get_or_insert(AgentTranscriptItemStatus::Streaming);
                 }
             }
             "toolCall" | "tool_call" => {
+                finish_agent_reasoning_part(
+                    &mut parts,
+                    &mut reasoning_started_at,
+                    &event.created_at,
+                    &payload,
+                );
                 if let Some(tool_call) = payload
                     .get("toolCall")
                     .or_else(|| payload.get("tool_call"))
@@ -1536,6 +1556,8 @@ fn agent_task_run_transcript_item(
                 }
             }
             "streamReset" | "stream_reset" => {
+                // Drop failed-attempt active timing so retries do not inherit it.
+                reasoning_started_at = None;
                 content = string_json_field(&payload, "text", "text")
                     .unwrap_or_default()
                     .to_string();
@@ -1554,10 +1576,21 @@ fn agent_task_run_transcript_item(
                 status = Some(AgentTranscriptItemStatus::Streaming);
             }
             "complete" | "completion" => {
+                finish_agent_reasoning_part(
+                    &mut parts,
+                    &mut reasoning_started_at,
+                    &event.created_at,
+                    &payload,
+                );
                 let final_text = string_json_field(&payload, "text", "text").unwrap_or(&content);
                 append_missing_reasoning(
                     &mut parts,
                     nullable_string_json_field(&payload, "reasoning", "reasoning"),
+                );
+                // complete may only carry final reasoning text without prior deltas.
+                apply_reasoning_part_duration(
+                    &mut parts,
+                    agent_event_reasoning_duration_ms(&payload),
                 );
                 append_missing_text(&mut parts, &content, final_text);
                 content = final_text.to_string();
@@ -1567,6 +1600,12 @@ fn agent_task_run_transcript_item(
                 status = None;
             }
             "error" => {
+                finish_agent_reasoning_part(
+                    &mut parts,
+                    &mut reasoning_started_at,
+                    &event.created_at,
+                    &payload,
+                );
                 push_error_part(
                     &mut parts,
                     string_json_field(&payload, "message", "message").unwrap_or("Unknown error"),
@@ -1575,6 +1614,18 @@ fn agent_task_run_transcript_item(
             }
             _ => {}
         }
+    }
+
+    if let Some(started_at) = reasoning_started_at.take() {
+        let ended_at = if task.status == AgentTaskStatus::Running {
+            now
+        } else {
+            sorted_events
+                .last()
+                .map(|event| event.created_at.as_str())
+                .unwrap_or(started_at.as_str())
+        };
+        finish_reasoning_part_duration(&mut parts, &started_at, ended_at);
     }
 
     let terminal_output = if task.status == AgentTaskStatus::Running {
@@ -1627,6 +1678,25 @@ fn agent_task_run_transcript_item(
         metrics,
         status,
     }))
+}
+
+fn agent_event_reasoning_duration_ms(payload: &Value) -> Option<i64> {
+    i64_json_field(payload, "reasoningDurationMs", "reasoning_duration_ms")
+}
+
+fn finish_agent_reasoning_part(
+    parts: &mut [ChatMessagePart],
+    reasoning_started_at: &mut Option<String>,
+    ended_at: &str,
+    payload: &Value,
+) {
+    let Some(started_at) = reasoning_started_at.take() else {
+        apply_reasoning_part_duration(parts, agent_event_reasoning_duration_ms(payload));
+        return;
+    };
+    let duration_ms = agent_event_reasoning_duration_ms(payload)
+        .or_else(|| timestamp_duration_ms(&started_at, ended_at));
+    apply_reasoning_part_duration(parts, duration_ms);
 }
 
 fn agent_task_input_content(input: &Value) -> String {
