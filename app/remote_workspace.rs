@@ -7256,11 +7256,18 @@ fn remote_materialize_missing_assistant_parts(
         let Ok(value) = serde_json::from_str::<Value>(&event.payload_json) else {
             continue;
         };
-        let Some(message_id) = value
-            .get("assistantMessageId")
-            .or_else(|| value.get("assistant_message_id"))
-            .and_then(Value::as_str)
-        else {
+        let message_id = if event.event_type == "guidance_applied" {
+            value
+                .get("interruptedAssistantId")
+                .or_else(|| value.get("interrupted_assistant_id"))
+                .and_then(Value::as_str)
+        } else {
+            value
+                .get("assistantMessageId")
+                .or_else(|| value.get("assistant_message_id"))
+                .and_then(Value::as_str)
+        };
+        let Some(message_id) = message_id else {
             continue;
         };
         if !missing_message_ids.iter().any(|id| id == message_id) {
@@ -7343,6 +7350,40 @@ fn remote_materialize_missing_assistant_parts(
                     );
                 }
             }
+            "guidance_applied" => {
+                let Some(id) = value.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(content) = value.get("content").and_then(Value::as_str) else {
+                    continue;
+                };
+                let source = value
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or(crate::runtime::MANUAL_GUIDANCE_SOURCE);
+                let interrupted_metrics = value
+                    .get("interruptedAssistantMetrics")
+                    .or_else(|| value.get("interrupted_assistant_metrics"))
+                    .cloned();
+                *had_stream_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default() = true;
+                let mut part = json!({
+                    "type": "userInterruption",
+                    "id": id,
+                    "content": content,
+                    "source": source,
+                });
+                if let Some(metrics) = interrupted_metrics {
+                    if let Some(object) = part.as_object_mut() {
+                        object.insert("interruptedAssistantMetrics".to_string(), metrics);
+                    }
+                }
+                event_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default()
+                    .push(part);
+            }
             _ => {}
         }
     }
@@ -7391,7 +7432,7 @@ fn remote_materialize_missing_assistant_parts(
         metadata_object.insert("parts".to_string(), json!(event_parts));
         metadata_object.insert(
             "partsVersion".to_string(),
-            Value::Number(serde_json::Number::from(4)),
+            Value::Number(serde_json::Number::from(5)),
         );
         metadata_object.insert(
             "partsSource".to_string(),
@@ -9549,6 +9590,29 @@ fn remote_sidecar_chat_messages_for_request(
                             sequences.push(sequence);
                         }
                         crate::StoredChatMessagePart::ContextCompression { .. } => {}
+                        crate::StoredChatMessagePart::UserInterruption {
+                            content, source, ..
+                        } => {
+                            let provider_content = if source
+                                == crate::runtime::REASONING_LOOP_GUARD_SOURCE
+                            {
+                                content
+                            } else {
+                                format!(
+                                    "User guidance for the current in-progress run:\n\n{content}"
+                                )
+                            };
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::User,
+                                content: provider_content,
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_name: None,
+                            });
+                            sequences.push(sequence);
+                        }
                     }
                 }
                 continue;

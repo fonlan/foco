@@ -6239,13 +6239,21 @@ impl WorkspaceDatabase {
              FROM run_events
              WHERE chat_id = ?1
                AND event_type IN
-                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset', 'context_compression')
-               AND CAST(
-                   COALESCE(
-                       json_extract(payload_json, '$.assistantMessageId'),
-                       json_extract(payload_json, '$.assistant_message_id')
-                   ) AS TEXT
-               ) IN ({placeholders})
+                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset', 'context_compression', 'guidance_applied')
+               AND (
+                   CAST(
+                       COALESCE(
+                           json_extract(payload_json, '$.assistantMessageId'),
+                           json_extract(payload_json, '$.assistant_message_id')
+                       ) AS TEXT
+                   ) IN ({placeholders})
+                   OR CAST(
+                       COALESCE(
+                           json_extract(payload_json, '$.interruptedAssistantId'),
+                           json_extract(payload_json, '$.interrupted_assistant_id')
+                       ) AS TEXT
+                   ) IN ({placeholders})
+               )
              ORDER BY created_at ASC, run_id ASC, sequence ASC",
         );
         let mut parameters = Vec::with_capacity(message_ids.len() + 1);

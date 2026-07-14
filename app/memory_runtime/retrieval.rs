@@ -1520,6 +1520,16 @@ fn replay_stored_assistant_parts(
                 )?;
             }
             StoredChatMessagePart::ContextCompression { .. } => {}
+            StoredChatMessagePart::UserInterruption {
+                content, source, ..
+            } => {
+                let provider_content = if source == REASONING_LOOP_GUARD_SOURCE {
+                    content
+                } else {
+                    format!("User guidance for the current in-progress run:\n\n{content}")
+                };
+                messages.push(neutral_user_message(provider_content, Vec::new()));
+            }
         }
     }
 

@@ -111,6 +111,9 @@ pub(crate) struct GuidanceMessage {
     pub(crate) id: String,
     pub(crate) content: String,
     pub(crate) attachments: Vec<NeutralChatAttachment>,
+    /// `manualGuidance` or `reasoningLoopGuard` (and future interruption sources).
+    pub(crate) source: String,
+    pub(crate) interrupted_assistant_id: Option<String>,
 }
 
 impl ActiveChatRunRegistry {
@@ -321,6 +324,8 @@ impl ActiveChatRunRegistry {
             id: unique_id("msg-guidance"),
             content,
             attachments,
+            source: crate::runtime::MANUAL_GUIDANCE_SOURCE.to_string(),
+            interrupted_assistant_id: None,
         };
         let active_run = {
             let runs = self

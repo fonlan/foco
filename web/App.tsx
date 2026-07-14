@@ -13854,13 +13854,19 @@ function messageCopyText(
       ) {
         return part.text;
       }
+      if (part.type === "userInterruption") {
+        return part.content;
+      }
       if (part.type === "attachment") {
         return part.attachment.path ?? part.attachment.name;
       }
       if (part.type === "contextCompression") {
         return `context compression ${part.kind} ${part.status}`.trim();
       }
-      return `${part.toolCall.name} ${part.toolCall.status}`.trim();
+      if (part.type === "toolCall") {
+        return `${part.toolCall.name} ${part.toolCall.status}`.trim();
+      }
+      return "";
     })
     .map((partText) => partText.trim())
     .filter(Boolean)
@@ -15201,12 +15207,23 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       return null;
     }
 
+    const interruptedAssistantId = optionalNullableStringField(
+      value,
+      "interruptedAssistantId",
+      "interrupted_assistant_id",
+    );
+    if (interruptedAssistantId === false) {
+      return null;
+    }
+
     return {
       type: "guidanceApplied",
       id,
       content,
       parts: parts as ChatMessagePart[],
       interruptedAssistantMetrics,
+      source: stringField(value, "source") ?? undefined,
+      interruptedAssistantId: interruptedAssistantId ?? undefined,
     };
   }
 
@@ -16011,6 +16028,34 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       status,
       kind,
       detail: normalizedDetail,
+    };
+  }
+
+  if (part.type === "userInterruption" || part.type === "user_interruption") {
+    const id = stringField(part, "id");
+    const content = stringField(part, "content");
+    if (!id || content === null) {
+      return null;
+    }
+    const source = stringField(part, "source") ?? undefined;
+    const interruptedAssistantMetrics = parseOptionalChatReplyMetrics(
+      fieldValue(
+        part,
+        "interruptedAssistantMetrics",
+        "interrupted_assistant_metrics",
+      ),
+    );
+    if (interruptedAssistantMetrics === false) {
+      return null;
+    }
+    return {
+      type: "userInterruption",
+      id,
+      content,
+      ...(source ? { source } : {}),
+      ...(interruptedAssistantMetrics
+        ? { interruptedAssistantMetrics }
+        : {}),
     };
   }
 

@@ -141,10 +141,12 @@ use crate::runtime::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, ActiveChatRunRegistration, ActiveChatRunRegistry,
     ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, AgentToolContext,
     ChatRunCancellation, CodeGraphIndexState, CoordinatorTaskInput, GuidanceMessage,
-    ProviderAuditCapture, QuestionAnswer, QuestionAnswerResponse, QuestionRegistry,
-    QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    ReasoningLoopDetector, RepeatedToolCallDetector, RipgrepStatus, RipgrepToolSummary,
-    ToolOutputDeltaEvent, ToolResourceLockRegistry, chat_run_subscription_stream, detect_ripgrep,
+    MANUAL_GUIDANCE_SOURCE, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
+    QuestionAnswer, QuestionAnswerResponse, QuestionRegistry, QuestionRequest,
+    REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
+    ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector, RipgrepStatus,
+    RipgrepToolSummary, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+    chat_run_subscription_stream, default_guidance_source, detect_ripgrep,
     execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
     pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
     ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
@@ -1794,6 +1796,15 @@ enum ChatMessagePart {
         kind: String,
         detail: ContextCompressionEventDetail,
     },
+    /// Role boundary inside an assistant message (manual guidance or auto recovery).
+    UserInterruption {
+        id: String,
+        content: String,
+        #[serde(default = "default_guidance_source")]
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1816,10 +1827,18 @@ enum StoredChatMessagePart {
         kind: String,
         detail: ContextCompressionEventDetail,
     },
+    UserInterruption {
+        id: String,
+        content: String,
+        #[serde(default = "default_guidance_source")]
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+    },
 }
 
 // ponytail: invalidate all stored assistant parts instead of a one-off SQL repair; add a targeted migration if parts ever get too large.
-const STORED_CHAT_PARTS_VERSION: i64 = 4;
+const STORED_CHAT_PARTS_VERSION: i64 = 5;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1955,6 +1974,10 @@ enum ChatSseEvent {
         content: String,
         parts: Vec<ChatMessagePart>,
         interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+        #[serde(default = "default_guidance_source")]
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupted_assistant_id: Option<String>,
     },
     GitDiffRefresh {
         workspace_id: String,
@@ -2864,6 +2887,7 @@ impl PreparedChatContext {
                     let mut turn_index = 0usize;
                     let mut tool_rounds_since_last_compression = 0usize;
                     let mut turn_retry_count = 0u32;
+                    let mut reasoning_loop_recovery_count = 0usize;
 
                     'agent_turns: loop {
                         if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
@@ -3438,6 +3462,91 @@ impl PreparedChatContext {
                                     if let Some(detection) = loop_detection {
                                         let message = reasoning_loop_guard_message(detection);
                                         drop(provider_stream);
+                                        self.capture_failed_llm_request(
+                                            &turn_capture,
+                                            turn_llm_request_id.clone(),
+                                            turn_request_started_at.clone(),
+                                            turn_events,
+                                            turn_started_at,
+                                            &message,
+                                            None,
+                                            true,
+                                        );
+
+                                        if reasoning_loop_recovery_count
+                                            < MAX_REASONING_LOOP_RECOVERIES_PER_RUN
+                                        {
+                                            if let Some(failed_request) =
+                                                self.captured_llm_requests.last()
+                                                && let Err(error) = persist_completed_llm_request(
+                                                    &self,
+                                                    failed_request,
+                                                )
+                                            {
+                                                yield ChatSseEvent::Error {
+                                                    message: error.message,
+                                                };
+                                                return;
+                                            }
+                                            reasoning_loop_recovery_count =
+                                                reasoning_loop_recovery_count.saturating_add(1);
+                                            if reasoning_duration_ms.is_none()
+                                                && let Some(started) = reasoning_started_at.take()
+                                            {
+                                                reasoning_duration_ms =
+                                                    Some(elapsed_millis(started));
+                                            }
+                                            let turn_assistant_text =
+                                                assistant_message_text(&turn_text, &[]);
+                                            if !turn_assistant_text.trim().is_empty()
+                                                || !turn_reasoning.trim().is_empty()
+                                            {
+                                                self.provider_request.messages.push(
+                                                    neutral_assistant_message(
+                                                        turn_assistant_text,
+                                                        non_empty_string(&turn_reasoning),
+                                                    ),
+                                                );
+                                                self.message_source_sequences.push(None);
+                                                self.message_context_sources.push(
+                                                    PromptContextSource::RuntimeAssistant,
+                                                );
+                                            }
+                                            let turn_total_latency_ms =
+                                                elapsed_millis(turn_started_at);
+                                            let turn_metrics = turn_reply_metrics(
+                                                &self.model_id,
+                                                &self.provider_id,
+                                                turn_total_latency_ms,
+                                                turn_first_token_latency_ms,
+                                                None,
+                                                vec![turn_llm_request_id],
+                                            );
+                                            let recovery_guidance = GuidanceMessage {
+                                                id: unique_id("msg-guidance"),
+                                                content: REASONING_LOOP_RECOVERY_USER_TEXT
+                                                    .to_string(),
+                                                attachments: Vec::new(),
+                                                source: REASONING_LOOP_GUARD_SOURCE.to_string(),
+                                                interrupted_assistant_id: Some(
+                                                    self.assistant_message_id.clone(),
+                                                ),
+                                            };
+                                            for event in append_guidance_events(
+                                                &mut self.provider_request.messages,
+                                                &mut self.message_source_sequences,
+                                                &mut self.message_context_sources,
+                                                &mut events,
+                                                vec![recovery_guidance],
+                                                Some(turn_metrics),
+                                            ) {
+                                                yield event;
+                                            }
+                                            turn_retry_count = 0;
+                                            turn_index = turn_index.saturating_add(1);
+                                            continue 'agent_turns;
+                                        }
+
                                         let event = ChatSseEvent::Error {
                                             message: message.clone(),
                                         };
@@ -3450,17 +3559,8 @@ impl PreparedChatContext {
                                             None,
                                         )
                                         .await;
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id,
-                                            turn_request_started_at,
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            None,
-                                            true,
-                                        );
-                                        let persisted_reasoning = non_empty_string(&assistant_reasoning);
+                                        let persisted_reasoning =
+                                            non_empty_string(&assistant_reasoning);
                                         if let Err(persist_error) = persist_chat_result(
                                             &self,
                                             &request_started_at,
@@ -6163,13 +6263,16 @@ fn append_guidance_message(
     message_context_sources: &mut Vec<PromptContextSource>,
     guidance: &GuidanceMessage,
 ) {
-    messages.push(neutral_user_message(
+    let content = if guidance.source == REASONING_LOOP_GUARD_SOURCE {
+        // Recovery text is already the provider-facing control message.
+        guidance.content.clone()
+    } else {
         format!(
             "User guidance for the current in-progress run:\n\n{}",
             guidance.content
-        ),
-        guidance.attachments.clone(),
-    ));
+        )
+    };
+    messages.push(neutral_user_message(content, guidance.attachments.clone()));
     message_source_sequences.push(None);
     message_context_sources.push(PromptContextSource::Guidance);
 }
@@ -6224,6 +6327,8 @@ fn append_guidance_events(
                 content: guidance.content,
                 parts: user_guidance_message_parts(&guidance.attachments),
                 interrupted_assistant_metrics: interrupted_assistant_metrics.take(),
+                source: guidance.source,
+                interrupted_assistant_id: guidance.interrupted_assistant_id,
             };
             events.push(captured_event(&event));
             event
@@ -9766,6 +9871,17 @@ fn assistant_parts_from_metadata(
                 kind,
                 detail,
             }),
+            StoredChatMessagePart::UserInterruption {
+                id,
+                content,
+                source,
+                interrupted_assistant_metrics,
+            } => Ok(ChatMessagePart::UserInterruption {
+                id,
+                content,
+                source,
+                interrupted_assistant_metrics,
+            }),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -10394,9 +10510,12 @@ fn materialize_missing_assistant_parts(
     let mut reasoning_started_at_by_message = HashMap::<String, String>::new();
     for event in &events {
         let value = parse_json_value(&event.payload_json, "chat run event")?;
-        let Some(message_id) =
+        let message_id = if event.event_type == "guidance_applied" {
+            string_json_field(&value, "interruptedAssistantId", "interrupted_assistant_id")
+        } else {
             string_json_field(&value, "assistantMessageId", "assistant_message_id")
-        else {
+        };
+        let Some(message_id) = message_id else {
             continue;
         };
         if !missing_message_ids.contains(message_id) {
@@ -10531,6 +10650,39 @@ fn materialize_missing_assistant_parts(
                     parts_by_message.entry(message_id.to_string()).or_default(),
                     &value,
                 );
+            }
+            "guidance_applied" => {
+                if let Some(started_at) = reasoning_started_at_by_message.remove(message_id) {
+                    finish_reasoning_part_duration(
+                        parts_by_message.entry(message_id.to_string()).or_default(),
+                        &started_at,
+                        &event.created_at,
+                    );
+                }
+                let Some(id) = string_json_field(&value, "id", "id") else {
+                    continue;
+                };
+                let Some(content) = string_json_field(&value, "content", "content") else {
+                    continue;
+                };
+                let source = string_json_field(&value, "source", "source")
+                    .unwrap_or(MANUAL_GUIDANCE_SOURCE)
+                    .to_string();
+                let interrupted_assistant_metrics = value
+                    .get("interruptedAssistantMetrics")
+                    .or_else(|| value.get("interrupted_assistant_metrics"))
+                    .and_then(|metrics| {
+                        serde_json::from_value::<ChatReplyMetrics>(metrics.clone()).ok()
+                    });
+                parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default()
+                    .push(ChatMessagePart::UserInterruption {
+                        id: id.to_string(),
+                        content: content.to_string(),
+                        source,
+                        interrupted_assistant_metrics,
+                    });
             }
             _ => {}
         }
@@ -11504,12 +11656,22 @@ fn finalized_assistant_message_parts(
                 | "context_compression"
                 | "stream_attempt_start"
                 | "stream_reset"
+                | "guidance_applied"
         ) {
             continue;
         }
         let value = parse_json_value(&event.normalized_event_json, "chat history event")?;
-        if !event_matches_assistant_message(&value, assistant_message_id) {
+        let is_guidance_applied = event.event_type == "guidance_applied";
+        if !is_guidance_applied && !event_matches_assistant_message(&value, assistant_message_id) {
             continue;
+        }
+        if is_guidance_applied {
+            if let Some(interrupted_id) =
+                string_json_field(&value, "interruptedAssistantId", "interrupted_assistant_id")
+                && interrupted_id != assistant_message_id
+            {
+                continue;
+            }
         }
 
         match event.event_type.as_str() {
@@ -11547,6 +11709,32 @@ fn finalized_assistant_message_parts(
             }
             "context_compression" => {
                 push_context_compression_part(&mut parts, &value);
+            }
+            "guidance_applied" => {
+                if let Some(started_at) = reasoning_started_at.take() {
+                    finish_reasoning_part_duration(&mut parts, &started_at, &event.event_at);
+                }
+                let Some(id) = string_json_field(&value, "id", "id") else {
+                    continue;
+                };
+                let Some(content) = string_json_field(&value, "content", "content") else {
+                    continue;
+                };
+                let source = string_json_field(&value, "source", "source")
+                    .unwrap_or(MANUAL_GUIDANCE_SOURCE)
+                    .to_string();
+                let interrupted_assistant_metrics = value
+                    .get("interruptedAssistantMetrics")
+                    .or_else(|| value.get("interrupted_assistant_metrics"))
+                    .and_then(|metrics| {
+                        serde_json::from_value::<ChatReplyMetrics>(metrics.clone()).ok()
+                    });
+                parts.push(ChatMessagePart::UserInterruption {
+                    id: id.to_string(),
+                    content: content.to_string(),
+                    source,
+                    interrupted_assistant_metrics,
+                });
             }
             "stream_attempt_start" => {
                 stream_attempt_snapshot = Some((
@@ -11680,6 +11868,17 @@ fn stored_chat_message_parts(
                 status,
                 kind,
                 detail,
+            }),
+            ChatMessagePart::UserInterruption {
+                id,
+                content,
+                source,
+                interrupted_assistant_metrics,
+            } => Ok(StoredChatMessagePart::UserInterruption {
+                id,
+                content,
+                source,
+                interrupted_assistant_metrics,
             }),
             ChatMessagePart::Attachment { .. } => Err(ApiError::internal(
                 "assistant message history parts must not contain attachments",

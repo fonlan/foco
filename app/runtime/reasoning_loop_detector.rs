@@ -7,6 +7,16 @@ const MAX_PERIOD_CHARS: usize = 1_024;
 const MIN_REPEAT_COUNT: usize = 4;
 const DETECTION_STRIDE_CHARS: usize = 32;
 
+/// Fixed user-visible recovery text inserted after a bounded reasoning-loop interruption.
+pub(crate) const REASONING_LOOP_RECOVERY_USER_TEXT: &str =
+    "repeated reasoning loop, check and continue";
+/// Source marker for automatic reasoning-loop interruptions (SSE + persisted parts).
+pub(crate) const REASONING_LOOP_GUARD_SOURCE: &str = "reasoningLoopGuard";
+/// Source marker for manually submitted guidance messages.
+pub(crate) const MANUAL_GUIDANCE_SOURCE: &str = "manualGuidance";
+/// Max automatic recoveries per chat run before the guard fails the run.
+pub(crate) const MAX_REASONING_LOOP_RECOVERIES_PER_RUN: usize = 3;
+
 // ponytail: v1 intentionally favors low false positives: it only recognizes exact periodic
 // suffixes after whitespace-run normalization, checks at deterministic character boundaries,
 // and keeps a fixed tail. If production examples require fuzzier matching, upgrade the
@@ -24,6 +34,10 @@ pub(crate) fn reasoning_loop_guard_message(detection: ReasoningLoopDetection) ->
         "Runtime progress guard stopped the provider stream after detecting a repeated reasoning loop (period {} characters, repeated {} times across {} observed characters). Partial reasoning was preserved.",
         detection.period_char_count, detection.repeat_count, detection.observed_char_count
     )
+}
+
+pub(crate) fn default_guidance_source() -> String {
+    MANUAL_GUIDANCE_SOURCE.to_string()
 }
 
 #[derive(Debug)]

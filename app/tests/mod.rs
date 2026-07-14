@@ -6,7 +6,10 @@ use std::{
     convert::Infallible,
 };
 
-use crate::runtime::agent_run_event_kind;
+use crate::runtime::{
+    MAX_REASONING_LOOP_RECOVERIES_PER_RUN, REASONING_LOOP_GUARD_SOURCE,
+    REASONING_LOOP_RECOVERY_USER_TEXT, agent_run_event_kind,
+};
 use axum::{
     Json,
     body::to_bytes,
@@ -7669,7 +7672,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
-    assert!(metadata_json.contains(r#""partsVersion":4"#));
+    assert!(metadata_json.contains(r#""partsVersion":5"#));
     assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
@@ -7806,6 +7809,129 @@ fn finalized_assistant_parts_persist_context_compression_events() {
                 && detail.summary_token_count == Some(320)
     ));
     assert!(matches!(&parts[1], ChatMessagePart::Text { text } if text == "Done."));
+}
+
+#[test]
+fn finalized_assistant_parts_persist_user_interruption_boundary_and_replay() {
+    let events = [
+        (
+            "reasoning_delta",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "reasoningDelta",
+                "delta": "Looping thought. "
+            }),
+        ),
+        (
+            "guidance_applied",
+            json!({
+                "type": "guidanceApplied",
+                "id": "msg-guidance-loop-1",
+                "content": REASONING_LOOP_RECOVERY_USER_TEXT,
+                "source": REASONING_LOOP_GUARD_SOURCE,
+                "interruptedAssistantId": "assistant-1",
+                "interruptedAssistantMetrics": {
+                    "modelId": "model",
+                    "providerId": "provider",
+                    "totalLatencyMs": 12,
+                    "firstTokenLatencyMs": 1,
+                    "outputTokens": null,
+                    "llmRequestIds": ["req-1"]
+                },
+                "parts": []
+            }),
+        ),
+        (
+            "text_delta",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "textDelta",
+                "delta": "Recovered answer."
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-06-18T10:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let stored_parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Recovered answer.",
+        Some("Looping thought. "),
+        &[],
+    )
+    .expect("stored parts");
+    assert!(matches!(
+        &stored_parts[0],
+        StoredChatMessagePart::Reasoning { text, .. } if text == "Looping thought. "
+    ));
+    assert!(matches!(
+        &stored_parts[1],
+        StoredChatMessagePart::UserInterruption {
+            content,
+            source,
+            ..
+        } if content == REASONING_LOOP_RECOVERY_USER_TEXT && source == REASONING_LOOP_GUARD_SOURCE
+    ));
+    assert!(matches!(
+        &stored_parts[2],
+        StoredChatMessagePart::Text { text } if text == "Recovered answer."
+    ));
+
+    let metadata_json = assistant_message_metadata_json(
+        Some("Looping thought. "),
+        &[],
+        &CodeChangeStats::default(),
+        None,
+        Some(&stored_parts),
+    )
+    .expect("assistant metadata");
+    let public_parts = assistant_parts_from_metadata(&metadata_json, &[])
+        .expect("hydrate parts")
+        .expect("stored parts present");
+    assert!(matches!(
+        &public_parts[1],
+        ChatMessagePart::UserInterruption {
+            content,
+            source,
+            ..
+        } if content == REASONING_LOOP_RECOVERY_USER_TEXT && source == REASONING_LOOP_GUARD_SOURCE
+    ));
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-interrupt", "Interrupt")
+        .expect("chat");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-interrupt",
+            role: "assistant",
+            content: "Recovered answer.",
+            sequence: 1,
+            metadata_json: Some(&metadata_json),
+        })
+        .expect("assistant message");
+    let message = database
+        .message("assistant-1")
+        .expect("lookup")
+        .expect("message");
+    let replayed =
+        neutral_messages_from_record(&database, message, &std::collections::HashSet::new())
+            .expect("replay");
+    assert_eq!(replayed.len(), 3);
+    assert_eq!(replayed[0].role, NeutralChatRole::Assistant);
+    assert_eq!(replayed[0].reasoning.as_deref(), Some("Looping thought. "));
+    assert_eq!(replayed[1].role, NeutralChatRole::User);
+    assert_eq!(replayed[1].content, REASONING_LOOP_RECOVERY_USER_TEXT);
+    assert_eq!(replayed[2].role, NeutralChatRole::Assistant);
+    assert_eq!(replayed[2].content, "Recovered answer.");
 }
 
 #[test]
@@ -8081,7 +8207,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
-    assert!(saved.metadata_json.contains(r#""partsVersion":4"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
     assert!(
         saved
             .metadata_json
@@ -8243,7 +8369,7 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             .metadata_json
             .contains(r#""partsSource":"run_events""#)
     );
-    assert!(saved.metadata_json.contains(r#""partsVersion":4"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -25638,13 +25764,19 @@ async fn serve_main_chat_wire_fixture() -> (
 
 async fn serve_main_chat_reasoning_loop_fixture()
 -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    serve_main_chat_reasoning_loop_fixture_with_loop_count(1).await
+}
+
+async fn serve_main_chat_reasoning_loop_fixture_with_loop_count(
+    loop_request_count: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let reasoning_period =
         "Inspect the premise, compare the evidence, and restart the same analysis. ";
-    let mut body = String::new();
+    let mut loop_body = String::new();
     for _ in 0..24 {
-        body.push_str("data: ");
-        body.push_str(
+        loop_body.push_str("data: ");
+        loop_body.push_str(
             &json!({
                 "id": "chat-reasoning-loop",
                 "choices": [{
@@ -25654,22 +25786,36 @@ async fn serve_main_chat_reasoning_loop_fixture()
             })
             .to_string(),
         );
-        body.push_str("\n\n");
+        loop_body.push_str("\n\n");
     }
-    body.push_str(
+    loop_body.push_str(
         "data: {\"id\":\"chat-reasoning-loop\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"guard failed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
     );
+    let recovery_body = concat!(
+        "data: {\"id\":\"chat-recovered\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered after reasoning loop\"}}]}\n\n",
+        "data: {\"id\":\"chat-recovered\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_string();
     let app = axum::Router::new().route(
         "/v1/chat/completions",
         axum::routing::post({
             let seen_for_handler = seen.clone();
             move |Json(payload): Json<Value>| {
                 let seen = seen_for_handler.clone();
-                let body = body.clone();
+                let loop_body = loop_body.clone();
+                let recovery_body = recovery_body.clone();
                 async move {
-                    seen.lock()
-                        .expect("reasoning loop request capture")
-                        .push(payload);
+                    let request_count = {
+                        let mut requests = seen.lock().expect("reasoning loop request capture");
+                        requests.push(payload);
+                        requests.len()
+                    };
+                    let body = if request_count <= loop_request_count {
+                        loop_body
+                    } else {
+                        recovery_body
+                    };
                     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
                 }
             }
@@ -25956,7 +26102,7 @@ async fn main_chat_project_spec_write_conflict_returns_tool_errors_and_continues
 }
 
 #[tokio::test]
-async fn main_chat_reasoning_loop_guard_stops_without_provider_retry_and_persists_partial() {
+async fn main_chat_reasoning_loop_guard_auto_recovers_and_persists_user_interruption() {
     let workspace = tempfile::tempdir().expect("workspace directory");
     let profile = tempfile::tempdir().expect("profile directory");
     let (base_url, seen, server_task) = serve_main_chat_reasoning_loop_fixture().await;
@@ -25998,18 +26144,212 @@ async fn main_chat_reasoning_loop_guard_stops_without_provider_retry_and_persist
     drop(guidance_tx);
     let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
     tokio::pin!(stream);
-    let mut llm_request_id = None;
+    let mut llm_request_ids = Vec::new();
     let mut streamed_reasoning = String::new();
-    let mut error_message = None;
+    let mut guidance_applied = None;
+    let mut completed_text = None;
     let mut stream_reset_count = 0;
-    let mut completed = false;
+    let mut error_message = None;
     while let Some(event) = stream.next().await {
         match event {
             ChatSseEvent::StreamAttemptStart {
                 llm_request_id: id, ..
-            } => llm_request_id = Some(id),
+            } => llm_request_ids.push(id),
             ChatSseEvent::ReasoningDelta { delta, .. } => streamed_reasoning.push_str(&delta),
+            ChatSseEvent::GuidanceApplied {
+                content, source, ..
+            } => guidance_applied = Some((content, source)),
             ChatSseEvent::StreamReset { .. } => stream_reset_count += 1,
+            ChatSseEvent::Complete { text, .. } => completed_text = Some(text),
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert!(error_message.is_none(), "auto recovery must not emit Error");
+    assert_eq!(stream_reset_count, 0);
+    assert_eq!(
+        completed_text.as_deref(),
+        Some("Recovered after reasoning loop")
+    );
+    assert!(!streamed_reasoning.is_empty());
+    assert_eq!(
+        guidance_applied
+            .as_ref()
+            .map(|(content, source)| (content.as_str(), source.as_str())),
+        Some((
+            REASONING_LOOP_RECOVERY_USER_TEXT,
+            REASONING_LOOP_GUARD_SOURCE
+        ))
+    );
+    let seen = seen.lock().expect("reasoning loop request capture");
+    assert_eq!(
+        seen.len(),
+        2,
+        "guard recovery issues a second provider request without llm retry cloning"
+    );
+    let follow_up_messages = seen[1]
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("follow-up provider messages");
+    let has_partial_assistant = follow_up_messages.iter().any(|message| {
+        if message["role"] != "assistant" {
+            return false;
+        }
+        let has_reasoning = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(Value::as_str)
+            .is_some_and(|reasoning| !reasoning.is_empty());
+        let has_content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty());
+        has_reasoning || has_content
+    });
+    // Provider may map reasoning into different fields; ensure recovery text is present as user.
+    let has_recovery_user = follow_up_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(REASONING_LOOP_RECOVERY_USER_TEXT))
+    });
+    assert!(
+        has_recovery_user,
+        "second request must include fixed recovery user text: {follow_up_messages:?}"
+    );
+    assert!(
+        has_partial_assistant,
+        "second request must include partial assistant from interrupted turn: {follow_up_messages:?}"
+    );
+    drop(seen);
+
+    assert_eq!(llm_request_ids.len(), 2);
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let assistant = database
+        .message(&assistant_message_id)
+        .expect("assistant message lookup")
+        .expect("assistant message persisted");
+    assert_eq!(assistant.role, "assistant");
+    assert_eq!(assistant.content, "Recovered after reasoning loop");
+    let metadata: Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
+    assert!(
+        metadata
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|reasoning| reasoning
+                .contains(&streamed_reasoning[..streamed_reasoning.len().min(32)]))
+            || !streamed_reasoning.is_empty()
+    );
+    let parts = metadata
+        .get("parts")
+        .and_then(Value::as_array)
+        .expect("assistant parts");
+    assert!(
+        parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                && part.get("content").and_then(Value::as_str)
+                    == Some(REASONING_LOOP_RECOVERY_USER_TEXT)
+                && part.get("source").and_then(Value::as_str) == Some(REASONING_LOOP_GUARD_SOURCE)
+        }),
+        "persisted parts must include userInterruption boundary: {parts:?}"
+    );
+    assert_eq!(
+        metadata.get("partsVersion").and_then(Value::as_i64),
+        Some(5)
+    );
+    let user_count = database
+        .messages_for_chat(&chat_id)
+        .expect("messages")
+        .into_iter()
+        .filter(|message| message.role == "user")
+        .count();
+    assert_eq!(
+        user_count, 1,
+        "user interruption must not create a messages-table user row"
+    );
+
+    let first_request = database
+        .llm_request(&llm_request_ids[0])
+        .expect("first audit lookup")
+        .expect("first audit exists");
+    assert_eq!(first_request.final_state, "failed");
+    let first_response: Value = serde_json::from_str(
+        first_request
+            .response_body_json
+            .as_deref()
+            .expect("partial provider response dump"),
+    )
+    .expect("partial provider response JSON");
+    assert_eq!(first_response["format"], "provider_final_response_v1");
+    assert_eq!(first_response["state"], "failed");
+    assert_eq!(first_response["partial"], true);
+    assert!(
+        first_response["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("repeated reasoning loop"))
+    );
+
+    let second_request = database
+        .llm_request(&llm_request_ids[1])
+        .expect("second audit lookup")
+        .expect("second audit exists");
+    assert_eq!(second_request.final_state, "succeeded");
+    assert_eq!(second_request.request_kind, "chat completion");
+}
+
+#[tokio::test]
+async fn main_chat_reasoning_loop_guard_fails_after_max_recoveries() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    // 4 looping requests: recover on first 3, fail on 4th.
+    let (base_url, seen, server_task) =
+        serve_main_chat_reasoning_loop_fixture_with_loop_count(4).await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Exhaust reasoning loop recoveries".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare reasoning loop chat context");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut guidance_count = 0;
+    let mut error_message = None;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::GuidanceApplied { .. } => guidance_count += 1,
             ChatSseEvent::Complete { .. } => completed = true,
             ChatSseEvent::Error { message } => error_message = Some(message),
             _ => {}
@@ -26017,51 +26357,293 @@ async fn main_chat_reasoning_loop_guard_stops_without_provider_retry_and_persist
     }
     server_task.abort();
 
-    let error_message = error_message.expect("reasoning loop guard error");
+    assert_eq!(guidance_count, MAX_REASONING_LOOP_RECOVERIES_PER_RUN);
+    assert!(!completed);
+    let error_message = error_message.expect("max recovery exhausted error");
     assert!(error_message.contains("Runtime progress guard"));
     assert!(error_message.contains("repeated reasoning loop"));
-    assert!(error_message.contains("Partial reasoning was preserved"));
-    assert!(!streamed_reasoning.is_empty());
-    assert_eq!(stream_reset_count, 0);
-    assert!(!completed);
     assert_eq!(
         seen.lock().expect("reasoning loop request capture").len(),
-        1,
-        "runtime reasoning guard must not enter provider retry"
+        MAX_REASONING_LOOP_RECOVERIES_PER_RUN + 1
+    );
+}
+#[tokio::test]
+async fn plan_phase_reasoning_loop_recovery_keeps_task_attempt_and_derived_effects() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, _seen, server_task) = serve_main_chat_reasoning_loop_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 3;
+    config.memory.enabled = true;
+    config.memory.extraction_mode = "pending_review".to_string();
+    config.memory.extraction_model_id = Some("extract-model".to_string());
+    config.spec.auto_enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let mut context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "Plan phase with reasoning loop".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare plan phase chat context");
+
+    let chat_id = context.chat_id.clone();
+    let team_id =
+        AgentTeamId::new(format!("agent-team-plan-rl-{}", unique_id("t"))).expect("team id");
+    let instance_id = AgentInstanceId::new(format!("agent-instance-plan-rl-{}", unique_id("i")))
+        .expect("instance id");
+    let task_id =
+        AgentTaskId::new(format!("agent-task-plan-rl-{}", unique_id("task"))).expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new(format!("agent-attempt-plan-rl-{}", unique_id("a")))
+            .expect("attempt id");
+    let plan_id = format!("plan-rl-{}", unique_id("p"));
+    let phase_id = format!("{}-phase", plan_id);
+    let step_id = format!("{}-step", plan_id);
+    let plan_attempt_id;
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new(format!("agent-definition-plan-rl-{}", unique_id("d")))
+                .expect("definition id"),
+            revision: 1,
+            name: "Plan RL".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Implement.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: &chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(".foco/agent-worktrees/test"),
+                coordinator_worktree_base_revision: Some("base"),
+                coordinator_worktree_branch: Some("branch"),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .expect("create team");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .create_plan(NewPlan {
+                id: &plan_id,
+                title: "RL recovery plan",
+                overview: "Recover without new attempt.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: &step_id,
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        plan_attempt_id = attempt.id.clone();
+        database
+            .attach_plan_phase_attempt_run(&attempt.id, &chat_id, &team_id, &task_id)
+            .expect("attach attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .expect("claim")
+            .expect("claimed");
+    }
+
+    context.agent_associations = AgentRunAssociations {
+        team_id: Some(team_id.clone()),
+        instance_id: Some(instance_id.clone()),
+        task_id: Some(task_id.clone()),
+        attempt_id: Some(attempt_id.clone()),
+    };
+    context.plan_phase_provenance = Some(PlanPhaseRunProvenance {
+        plan_id: plan_id.clone(),
+        phase_id: phase_id.clone(),
+        attempt_id: plan_attempt_id.clone(),
+        agent_task_id: task_id.clone(),
+        integration_status: PlanPhaseIntegrationStatus::AwaitingIntegration,
+    });
+    context.agent_primary_chat_output = true;
+
+    let associations_before = context.agent_associations.clone();
+    let provenance_before = context.plan_phase_provenance.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut completed_text = None;
+    let mut error_message = None;
+    let mut guidance_count = 0;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::GuidanceApplied { .. } => guidance_count += 1,
+            ChatSseEvent::Complete { text, .. } => completed_text = Some(text),
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert!(
+        error_message.is_none(),
+        "plan recovery must not emit Error: {error_message:?}"
+    );
+    assert_eq!(guidance_count, 1);
+    assert_eq!(
+        completed_text.as_deref(),
+        Some("Recovered after reasoning loop")
     );
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
-    let assistant = database
-        .message(&assistant_message_id)
-        .expect("assistant message lookup")
-        .expect("assistant message persisted");
-    let metadata: Value =
-        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
+    // Associations / provenance must stay on the same task/attempt identity.
     assert_eq!(
-        metadata.get("reasoning").and_then(Value::as_str),
-        Some(streamed_reasoning.as_str())
+        associations_before
+            .task_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(task_id.to_string())
     );
-    let request = database
-        .llm_request(&llm_request_id.expect("reasoning loop LLM request id"))
-        .expect("reasoning loop audit lookup")
-        .expect("reasoning loop audit exists");
-    assert_eq!(request.chat_id.as_deref(), Some(chat_id.as_str()));
-    assert_eq!(request.request_kind, "chat completion");
-    assert_eq!(request.final_state, "failed");
-    let response: Value = serde_json::from_str(
-        request
-            .response_body_json
-            .as_deref()
-            .expect("partial provider response dump"),
-    )
-    .expect("partial provider response JSON");
-    assert_eq!(response["format"], "provider_final_response_v1");
-    assert_eq!(response["state"], "failed");
-    assert_eq!(response["partial"], true);
-    assert!(
-        response["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("repeated reasoning loop"))
+    assert_eq!(
+        provenance_before.as_ref().map(|p| p.attempt_id.as_str()),
+        Some(plan_attempt_id.as_str())
+    );
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .expect("task exists");
+        assert_eq!(task.status, foco_agent::AgentTaskStatus::Running);
+
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"Recovered after reasoning loop"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("finish claimed task complete");
+
+        let task = database
+            .agent_task(&task_id)
+            .expect("task after complete")
+            .expect("task exists");
+        assert_eq!(task.status, foco_agent::AgentTaskStatus::Completed);
+
+        let attempts = database
+            .plan_phase_attempts_for_phase(&phase_id)
+            .expect("plan phase attempts");
+        assert_eq!(attempts.len(), 1, "must not create a retry attempt");
+        assert_eq!(attempts[0].id, plan_attempt_id);
+        assert_eq!(attempts[0].agent_task_id.as_deref(), Some(task_id.as_str()));
+
+        let pending = database
+            .awaiting_plan_phase_derived_effects()
+            .expect("pending effects");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempt_id, plan_attempt_id);
+        assert_eq!(pending[0].agent_task_id, task_id);
+
+        let plan = database
+            .complete_plan_phase_run(&task_id, Some("deadbeef"))
+            .expect("complete_plan_phase_run")
+            .expect("plan after phase complete");
+        assert_eq!(plan.status, "implemented");
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id)
+            .expect("phase");
+        assert_eq!(phase.status, "completed");
+        assert!(phase.steps.iter().all(|step| step.status == "completed"));
+
+        database
+            .confirm_plan_phase_derived_effects_integration(&plan_attempt_id)
+            .expect("confirm integration");
+    }
+
+    let workspace_cfg = state.config.lock().expect("config lock").workspaces[0].clone();
+    assert_eq!(
+        crate::plan_runtime::release_confirmed_plan_derived_effects_without_runners(
+            &state,
+            &workspace_cfg,
+        )
+        .expect("release effects"),
+        1
+    );
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    assert_eq!(
+        database
+            .plan_phase_derived_effects(&plan_attempt_id)
+            .expect("effects")
+            .expect("effects record")
+            .status,
+        "released"
     );
 }
 

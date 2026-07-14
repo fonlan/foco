@@ -1973,6 +1973,22 @@ function MessagePartBlockComponent({
     return <ErrorMessagePart text={part.text} />;
   }
 
+  if (part.type === "userInterruption") {
+    // Role boundary inside assistant parts (guidance / reasoning-loop recovery).
+    // Render as a user-styled block so history matches live guidance bubbles.
+    return (
+      <div className="message-user-interruption my-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
+        <MarkdownContent
+          content={part.content}
+          isError={false}
+          isUser
+          renderMode="full"
+          selectedSkillPrefix={helpers.selectedSkillPrefix}
+        />
+      </div>
+    );
+  }
+
   return (
     <MarkdownContent
       content={part.text}

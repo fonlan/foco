@@ -490,7 +490,14 @@ export type ChatMessagePart =
     }
   | { type: "attachment"; attachment: ChatAttachmentPartSummary }
   | { type: "toolCall"; toolCall: ChatToolCallSummary }
-  | ChatContextCompressionPart;
+  | ChatContextCompressionPart
+  | {
+      type: "userInterruption";
+      id: string;
+      content: string;
+      source?: string;
+      interruptedAssistantMetrics?: ChatReplyMetrics | null;
+    };
 
 export type ChatAttachmentPayload = {
   id: string;
@@ -750,6 +757,8 @@ export type ChatStreamEvent =
     content: string;
     parts: ChatMessagePart[];
     interruptedAssistantMetrics: ChatReplyMetrics | null;
+    source?: string;
+    interruptedAssistantId?: string | null;
   }
   | {
     type: "gitDiffRefresh";
