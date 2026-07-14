@@ -21,24 +21,24 @@ use foco_store::{
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord,
         LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
-        NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry, NewAgentContextSnapshot,
-        NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
-        NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
-        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
-        NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
-        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch,
-        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
-        MessageMetadataMutation, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
-        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        llm_request_audit_count_sql_for_tests,
+        MessageMetadataMutation, NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry,
+        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
+        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
+        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
+        PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL, RewriteChatFromUserMessage,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -14785,7 +14785,8 @@ fn migration_038_fresh_and_upgrade_share_dropped_redundant_index_set() {
     // Reopen does not recreate dropped indexes.
     let reopened =
         WorkspaceDatabase::open_or_create_ungated(fresh_workspace.path()).expect("reopen");
-    let reopened_connection = Connection::open(reopened.database_path()).expect("reopen connection");
+    let reopened_connection =
+        Connection::open(reopened.database_path()).expect("reopen connection");
     for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
         assert!(
             !named_index_exists(&reopened_connection, index_name),
@@ -14842,7 +14843,8 @@ fn migration_038_fresh_and_upgrade_share_dropped_redundant_index_set() {
     }
     let upgraded =
         WorkspaceDatabase::open_or_create_ungated(upgrade_workspace.path()).expect("upgrade");
-    let upgraded_connection = Connection::open(upgraded.database_path()).expect("upgrade connection");
+    let upgraded_connection =
+        Connection::open(upgraded.database_path()).expect("upgrade connection");
     for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
         assert!(
             !named_index_exists(&upgraded_connection, index_name),
@@ -15218,4 +15220,3 @@ fn global_memory_pragma_optimize_is_throttled_process_local() {
         "process-local throttle should suppress immediate re-run"
     );
 }
-

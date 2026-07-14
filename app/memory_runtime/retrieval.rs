@@ -428,9 +428,8 @@ async fn relevant_memory_facts_llm(
         });
     }
 
-    let mut workspace_memory =
-        MemoryDatabase::open_or_create_workspace(workspace_path)
-            .map_err(ApiError::from_memory_error)?;
+    let mut workspace_memory = MemoryDatabase::open_or_create_workspace(workspace_path)
+        .map_err(ApiError::from_memory_error)?;
     let mut global_memory = MemoryDatabase::open_or_create_global_at(global_memory_database_file)
         .map_err(ApiError::from_memory_error)?;
 

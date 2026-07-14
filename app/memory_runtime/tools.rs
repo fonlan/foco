@@ -264,9 +264,8 @@ pub(crate) fn execute_memory_search_tool(
             )?;
         }
         MemoryToolSearchScope::Workspace => {
-            let mut database =
-                MemoryDatabase::open_or_create_workspace(&context.workspace_path)
-                    .map_err(ApiError::from_memory_error)?;
+            let mut database = MemoryDatabase::open_or_create_workspace(&context.workspace_path)
+                .map_err(ApiError::from_memory_error)?;
             expire_due_memories(&mut database)?;
             collect_memory_search_matches(
                 &mut database,
@@ -280,9 +279,8 @@ pub(crate) fn execute_memory_search_tool(
             )?;
         }
         MemoryToolSearchScope::Chat => {
-            let mut database =
-                MemoryDatabase::open_or_create_workspace(&context.workspace_path)
-                    .map_err(ApiError::from_memory_error)?;
+            let mut database = MemoryDatabase::open_or_create_workspace(&context.workspace_path)
+                .map_err(ApiError::from_memory_error)?;
             expire_due_memories(&mut database)?;
             collect_memory_search_matches(
                 &mut database,
@@ -514,10 +512,10 @@ pub(crate) fn execute_memory_write_tool(
     let reason = normalized_optional_text(input.reason);
     let chat_id = (scope == MemoryScope::Chat).then_some(context.chat_id.as_str());
     let mut database = match scope {
-        MemoryScope::Global => MemoryDatabase::open_or_create_global_at(
-            &context.global_memory_database_file,
-        )
-        .map(foco_store::OpenedMemoryDatabase::from),
+        MemoryScope::Global => {
+            MemoryDatabase::open_or_create_global_at(&context.global_memory_database_file)
+                .map(foco_store::OpenedMemoryDatabase::from)
+        }
         MemoryScope::Workspace | MemoryScope::Chat => {
             MemoryDatabase::open_or_create_workspace(&context.workspace_path)
                 .map(foco_store::OpenedMemoryDatabase::from)

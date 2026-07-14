@@ -110,12 +110,8 @@ pub(crate) struct MemoryDreamTranscriptRequest<'a> {
 /// Async Dream paths must not hold a live connection across provider/network awaits.
 #[derive(Clone, Debug)]
 pub(crate) enum MemoryDreamDatabaseTarget {
-    Global {
-        path: PathBuf,
-    },
-    Workspace {
-        workspace_path: PathBuf,
-    },
+    Global { path: PathBuf },
+    Workspace { workspace_path: PathBuf },
 }
 
 impl MemoryDreamDatabaseTarget {
@@ -531,11 +527,7 @@ pub(crate) fn start_memory_dream_job_with_target(
     let transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
     {
         let mut database = target.open()?;
-        attach_memory_dream_transcript_chat(
-            &mut database,
-            &job_id,
-            transcript.chat_id(),
-        )?;
+        attach_memory_dream_transcript_chat(&mut database, &job_id, transcript.chat_id())?;
         database
             .dream_job(&job_id)
             .map_err(ApiError::from_memory_error)?
@@ -959,9 +951,8 @@ async fn run_memory_dream_job_inner(
                 .map_err(ApiError::from_memory_error)?
         };
         // Workspace reference validation must not nest under a gated Memory permit.
-        let prepared_references =
-            prepare_memory_dream_reference_writes(request, &candidates)
-                .map_err(ApiError::from_memory_error)?;
+        let prepared_references = prepare_memory_dream_reference_writes(request, &candidates)
+            .map_err(ApiError::from_memory_error)?;
         let mut database = target.open()?;
         let reference_validation =
             apply_memory_dream_reference_writes(&mut database, &prepared_references)
@@ -4282,8 +4273,8 @@ mod tests {
         let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
-        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
-            .expect("reopen global memory");
+        let database =
+            MemoryDatabase::open_or_create_global_at(&memory_path).expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -4335,8 +4326,8 @@ mod tests {
         let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
-        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
-            .expect("reopen global memory");
+        let database =
+            MemoryDatabase::open_or_create_global_at(&memory_path).expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -4405,8 +4396,8 @@ mod tests {
         let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
-        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
-            .expect("reopen global memory");
+        let database =
+            MemoryDatabase::open_or_create_global_at(&memory_path).expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -4523,9 +4514,8 @@ mod tests {
         let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Workspace))
             .await
             .expect("dream run");
-        let database =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("reopen workspace memory");
+        let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("reopen workspace memory");
 
         assert_eq!(result.applied_changes, 1);
         let fact = database
@@ -4890,8 +4880,8 @@ mod tests {
             .expect_err("manual dream without planner should fail");
 
         assert!(error.message.contains("requires a configured model"));
-        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
-            .expect("reopen global memory");
+        let database =
+            MemoryDatabase::open_or_create_global_at(&memory_path).expect("reopen global memory");
         let job = database
             .dream_jobs_for_scope(MemoryDreamScope::Global, None, None, 1)
             .expect("dream jobs")
@@ -5138,9 +5128,8 @@ mod tests {
         .await
         .expect("dream run");
 
-        let database =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("reopen workspace memory");
+        let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("reopen workspace memory");
         let references = database
             .references_for_fact_ids(&["fact-references".to_string()], 20)
             .expect("references");
@@ -5253,8 +5242,8 @@ mod tests {
                 .expect("seed workspace memory");
         }
 
-        let external_hold = foco_store::open_workspace_database(&workspace_dir)
-            .expect("hold one ordinary permit");
+        let external_hold =
+            foco_store::open_workspace_database(&workspace_dir).expect("hold one ordinary permit");
 
         let target = MemoryDreamDatabaseTarget::from_scope_paths(
             MemoryDreamScope::Workspace,
@@ -5324,8 +5313,8 @@ mod tests {
         .expect("start with transcript");
         assert!(job.transcript_chat_id.is_some());
 
-        let external_hold = foco_store::open_workspace_database(&workspace_dir)
-            .expect("hold one ordinary permit");
+        let external_hold =
+            foco_store::open_workspace_database(&workspace_dir).expect("hold one ordinary permit");
         let started = prepare_started_memory_dream_job_with_target(
             &target,
             MemoryDreamJobRequest {
@@ -5378,8 +5367,8 @@ mod tests {
             );
         }
 
-        let external_hold = foco_store::open_workspace_database(&workspace_dir)
-            .expect("hold one ordinary permit");
+        let external_hold =
+            foco_store::open_workspace_database(&workspace_dir).expect("hold one ordinary permit");
         let target = MemoryDreamDatabaseTarget::from_scope_paths(
             MemoryDreamScope::Workspace,
             None,
@@ -5441,8 +5430,8 @@ mod tests {
             );
         }
 
-        let external_hold = foco_store::open_workspace_database(&workspace_dir)
-            .expect("hold one ordinary permit");
+        let external_hold =
+            foco_store::open_workspace_database(&workspace_dir).expect("hold one ordinary permit");
         let target = MemoryDreamDatabaseTarget::from_scope_paths(
             MemoryDreamScope::Workspace,
             None,

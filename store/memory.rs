@@ -636,10 +636,7 @@ impl MemoryDatabase {
     /// Workspace Memory reuses the shared workspace gate path; prefer calling
     /// [`crate::workspace::WorkspaceDatabase::maybe_run_pragma_optimize`] on the
     /// workspace DB for durable throttle. Failures must not abort Dream/terminal work.
-    pub fn maybe_run_pragma_optimize(
-        &mut self,
-        force: bool,
-    ) -> Result<bool, MemoryDatabaseError> {
+    pub fn maybe_run_pragma_optimize(&mut self, force: bool) -> Result<bool, MemoryDatabaseError> {
         let throttle = match self.kind {
             MemoryDatabaseKind::Global => {
                 crate::workspace::SqlitePragmaOptimizeThrottle::ProcessLocalOnly
@@ -1553,11 +1550,9 @@ impl MemoryDatabase {
     ) -> Result<(), MemoryDatabaseError> {
         match self.start_dream_job(job)? {
             StartMemoryDreamJobOutcome::Started => Ok(()),
-            StartMemoryDreamJobOutcome::AlreadyActive => {
-                Err(MemoryDatabaseError::AlreadyActive {
-                    message: "memory Dream is already active".to_string(),
-                })
-            }
+            StartMemoryDreamJobOutcome::AlreadyActive => Err(MemoryDatabaseError::AlreadyActive {
+                message: "memory Dream is already active".to_string(),
+            }),
         }
     }
 
@@ -5440,8 +5435,7 @@ mod tests {
         let path_a = path.clone();
         let barrier_a = Arc::clone(&barrier);
         let thread_a = thread::spawn(move || {
-            let mut database =
-                MemoryDatabase::open_or_create_global(&path_a).expect("conn a");
+            let mut database = MemoryDatabase::open_or_create_global(&path_a).expect("conn a");
             barrier_a.wait();
             database
                 .start_dream_job(NewMemoryDreamJob {
@@ -5462,8 +5456,7 @@ mod tests {
         let path_b = path.clone();
         let barrier_b = Arc::clone(&barrier);
         let thread_b = thread::spawn(move || {
-            let mut database =
-                MemoryDatabase::open_or_create_global(&path_b).expect("conn b");
+            let mut database = MemoryDatabase::open_or_create_global(&path_b).expect("conn b");
             barrier_b.wait();
             database
                 .start_dream_job(NewMemoryDreamJob {
@@ -5528,7 +5521,10 @@ mod tests {
                 .expect("running attach"),
             MemoryDreamJobTransitionOutcome::NotApplied
         );
-        let job = database.dream_job("queued-only").expect("load").expect("exists");
+        let job = database
+            .dream_job("queued-only")
+            .expect("load")
+            .expect("exists");
         assert_eq!(job.status, MemoryDreamJobStatus::Queued.as_str());
         assert!(job.transcript_chat_id.is_none());
 
@@ -5550,7 +5546,10 @@ mod tests {
                 .expect("attach after claim"),
             MemoryDreamJobTransitionOutcome::Applied
         );
-        let job = database.dream_job("queued-only").expect("load").expect("exists");
+        let job = database
+            .dream_job("queued-only")
+            .expect("load")
+            .expect("exists");
         assert_eq!(job.status, MemoryDreamJobStatus::Running.as_str());
         assert_eq!(job.transcript_chat_id.as_deref(), Some("chat-1"));
     }
@@ -5618,8 +5617,7 @@ mod tests {
                 .expect("seed global v5 multi-active");
         }
 
-        let database =
-            MemoryDatabase::open_or_create_global(profile.path()).expect("migrate to 6");
+        let database = MemoryDatabase::open_or_create_global(profile.path()).expect("migrate to 6");
         assert_eq!(
             database.schema_version().expect("schema version"),
             GLOBAL_MEMORY_SCHEMA_VERSION
@@ -5657,6 +5655,131 @@ mod tests {
             )
             .expect("singleflight index");
         assert_eq!(singleflight, 1);
+    }
+
+    #[test]
+    fn workspace_memory_dream_start_is_singleflight_across_connections() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().to_path_buf();
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_workspace(&path).expect("workspace memory");
+            assert_eq!(
+                database
+                    .start_dream_job(NewMemoryDreamJob {
+                        id: "ws-dream-a",
+                        scope: MemoryDreamScope::Workspace,
+                        workspace_id: Some("ws-1"),
+                        trigger_type: MemoryDreamTriggerType::Manual,
+                        mode: MemoryDreamRunMode::DeterministicOnly,
+                        status: MemoryDreamJobStatus::Running,
+                        model_id: None,
+                        input_summary_json: "{}",
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("start a"),
+                StartMemoryDreamJobOutcome::Started
+            );
+            assert_eq!(
+                database
+                    .start_dream_job(NewMemoryDreamJob {
+                        id: "ws-dream-b",
+                        scope: MemoryDreamScope::Workspace,
+                        workspace_id: Some("ws-1"),
+                        trigger_type: MemoryDreamTriggerType::Manual,
+                        mode: MemoryDreamRunMode::DeterministicOnly,
+                        status: MemoryDreamJobStatus::Running,
+                        model_id: None,
+                        input_summary_json: "{}",
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("start b"),
+                StartMemoryDreamJobOutcome::AlreadyActive
+            );
+            assert_eq!(
+                database
+                    .finish_dream_job(UpdateMemoryDreamJob {
+                        id: "ws-dream-a",
+                        status: MemoryDreamJobStatus::Completed,
+                        output_summary_json: Some(r#"{"ok":true}"#),
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("complete"),
+                MemoryDreamJobTransitionOutcome::Applied
+            );
+            assert_eq!(
+                database
+                    .finish_dream_job(UpdateMemoryDreamJob {
+                        id: "ws-dream-a",
+                        status: MemoryDreamJobStatus::Failed,
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: Some("late"),
+                    })
+                    .expect("late fail"),
+                MemoryDreamJobTransitionOutcome::NotApplied
+            );
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let path_a = path.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let thread_a = thread::spawn(move || {
+            let mut database = MemoryDatabase::open_or_create_workspace(&path_a).expect("conn a");
+            barrier_a.wait();
+            database
+                .start_dream_job(NewMemoryDreamJob {
+                    id: "ws-concurrent-a",
+                    scope: MemoryDreamScope::Workspace,
+                    workspace_id: Some("ws-1"),
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Running,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("start concurrent a")
+        });
+        let path_b = path.clone();
+        let barrier_b = Arc::clone(&barrier);
+        let thread_b = thread::spawn(move || {
+            let mut database = MemoryDatabase::open_or_create_workspace(&path_b).expect("conn b");
+            barrier_b.wait();
+            database
+                .start_dream_job(NewMemoryDreamJob {
+                    id: "ws-concurrent-b",
+                    scope: MemoryDreamScope::Workspace,
+                    workspace_id: Some("ws-1"),
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Running,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("start concurrent b")
+        });
+        let outcome_a = thread_a.join().expect("join a");
+        let outcome_b = thread_b.join().expect("join b");
+        let started = matches!(outcome_a, StartMemoryDreamJobOutcome::Started) as u8
+            + matches!(outcome_b, StartMemoryDreamJobOutcome::Started) as u8;
+        let blocked = matches!(outcome_a, StartMemoryDreamJobOutcome::AlreadyActive) as u8
+            + matches!(outcome_b, StartMemoryDreamJobOutcome::AlreadyActive) as u8;
+        assert_eq!(started, 1);
+        assert_eq!(blocked, 1);
     }
 
     #[test]

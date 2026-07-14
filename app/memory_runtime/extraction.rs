@@ -145,9 +145,8 @@ fn queue_memory_extraction_job_with_id(
         "providerId": context.provider_id,
     })
     .to_string();
-    let mut memory_database =
-        MemoryDatabase::open_or_create_workspace(&context.workspace_path)
-            .map_err(ApiError::from_memory_error)?;
+    let mut memory_database = MemoryDatabase::open_or_create_workspace(&context.workspace_path)
+        .map_err(ApiError::from_memory_error)?;
     let job_id = job_id
         .map(str::to_string)
         .unwrap_or_else(|| unique_id("memory-extraction"));
@@ -238,9 +237,8 @@ pub(crate) fn queue_integrated_plan_memory_extraction(
         "providerId": context.provider_id,
     })
     .to_string();
-    let mut memory_database =
-        MemoryDatabase::open_or_create_workspace(workspace_path)
-            .map_err(ApiError::from_memory_error)?;
+    let mut memory_database = MemoryDatabase::open_or_create_workspace(workspace_path)
+        .map_err(ApiError::from_memory_error)?;
     memory_database
         .insert_extraction_job_if_absent(NewMemoryExtractionJob {
             id: job_id,
@@ -318,7 +316,7 @@ pub(crate) async fn run_memory_extraction_job(
 ) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
     let mut workspace_memory_database =
         MemoryDatabase::open_or_create_workspace(&task.workspace_path)
-        .map_err(ApiError::from_memory_error)?;
+            .map_err(ApiError::from_memory_error)?;
     // Atomic claim: only one runner can transition queued -> running.
     if !workspace_memory_database
         .mark_extraction_job_running(&task.job_id)
@@ -362,7 +360,7 @@ pub(crate) async fn run_memory_extraction_job(
     };
     let mut workspace_memory_database =
         MemoryDatabase::open_or_create_workspace(&task.workspace_path)
-        .map_err(ApiError::from_memory_error)?;
+            .map_err(ApiError::from_memory_error)?;
     let Some(job) = workspace_memory_database
         .extraction_job(&task.job_id)
         .map_err(ApiError::from_memory_error)?

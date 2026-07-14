@@ -575,8 +575,7 @@ mod tests {
         drop(open_workspace_database(workspace.path()).expect("seed workspace db"));
 
         let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary workspace");
-        let ordinary_2 =
-            open_workspace_memory_database(workspace.path()).expect("ordinary memory");
+        let ordinary_2 = open_workspace_memory_database(workspace.path()).expect("ordinary memory");
 
         let workspace_path = workspace.path().to_path_buf();
         let started_at = Instant::now();
@@ -933,5 +932,40 @@ mod tests {
         // unit test only verifies Drop path runs; warning is best-effort tracing.
         thread::sleep(Duration::from_millis(20));
         drop(handle);
+    }
+
+    #[test]
+    fn canonical_and_relative_workspace_paths_share_one_gate() {
+        let workspace = tempdir().expect("workspace");
+        let canonical = std::fs::canonicalize(workspace.path()).expect("canonicalize");
+        // Seed schema once so both openers hit the same database file.
+        drop(open_workspace_database(&canonical).expect("seed"));
+
+        let ordinary_1 = open_workspace_database(&canonical).expect("ordinary via canonical");
+        let ordinary_2 = open_workspace_memory_database(workspace.path())
+            .expect("ordinary memory via original temp path must share the same gate key");
+
+        let third_path = canonical.clone();
+        let started_at = Instant::now();
+        let error = match open_workspace_database(&third_path) {
+            Ok(_) => panic!("third ordinary open must share capacity across path forms"),
+            Err(error) => error,
+        };
+        assert!(
+            started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+            "shared-gate waiter returned too early"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("workspace database concurrency limit reached"),
+            "{message}"
+        );
+        assert!(message.contains("ordinary=0/2"), "{message}");
+
+        // Drop releases permits before the connection is closed (see Drop impl).
+        drop(ordinary_1);
+        drop(ordinary_2);
+        let reopened = open_workspace_database(&canonical).expect("reopen after shared release");
+        drop(reopened);
     }
 }

@@ -170,7 +170,9 @@ pub struct PreStreamChatFailureClosure<'a> {
 #[derive(Clone, Debug)]
 pub enum MessageMetadataMutation {
     /// Shallow-merge top-level object fields into existing metadata.
-    MergeFields { fields: serde_json::Map<String, Value> },
+    MergeFields {
+        fields: serde_json::Map<String, Value>,
+    },
     /// Replace `parts` / `partsVersion` / `partsSource` without touching other keys.
     SetParts {
         parts: Value,

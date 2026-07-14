@@ -1340,6 +1340,26 @@ DROP INDEX IF EXISTS context_compression_snapshots_chat_sequence_idx;
 DROP INDEX IF EXISTS plan_phases_plan_sequence_idx;
 DROP INDEX IF EXISTS plan_steps_phase_sequence_idx;
 
+-- Ensure Dream job table exists for workspaces that never opened Memory dream schema.
+-- Full dream/change schema is still owned by Memory open; this is only enough for
+-- singleflight migration safety on legacy fixtures.
+CREATE TABLE IF NOT EXISTS memory_dream_jobs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    scope TEXT NOT NULL CHECK (scope = 'workspace'),
+    workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) > 0),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual', 'auto_interval', 'auto_threshold')),
+    mode TEXT NOT NULL CHECK (mode IN ('deterministic_only', 'llm')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'skipped')),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    input_summary_json TEXT NOT NULL DEFAULT '{}',
+    output_summary_json TEXT,
+    transcript_chat_id TEXT CHECK (transcript_chat_id IS NULL OR length(transcript_chat_id) > 0),
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
 -- Deterministic legacy multi-active collapse: keep one recoverable active job
 -- (prefer running, then newest created_at, then id), fail the rest, then unique index.
 UPDATE memory_dream_jobs

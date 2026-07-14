@@ -504,9 +504,9 @@ fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
                 .into());
             }
             (
-                foco_store::OpenedMemoryDatabase::from(
-                    MemoryDatabase::open_or_create_global_at(&paths.memory_database_file)?,
-                ),
+                foco_store::OpenedMemoryDatabase::from(MemoryDatabase::open_or_create_global_at(
+                    &paths.memory_database_file,
+                )?),
                 None,
             )
         }
@@ -532,9 +532,9 @@ fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
                 .into());
             }
             (
-                foco_store::OpenedMemoryDatabase::from(
-                    MemoryDatabase::open_or_create_workspace(&workspace.path)?,
-                ),
+                foco_store::OpenedMemoryDatabase::from(MemoryDatabase::open_or_create_workspace(
+                    &workspace.path,
+                )?),
                 Some(workspace.id.as_str()),
             )
         }
@@ -7632,9 +7632,11 @@ fn open_memory_database(
     workspace_id: Option<&str>,
 ) -> Result<foco_store::OpenedMemoryDatabase, ApiError> {
     match scope {
-        MemoryScope::Global => MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
-            .map(foco_store::OpenedMemoryDatabase::from)
-            .map_err(ApiError::from_memory_error),
+        MemoryScope::Global => {
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .map(foco_store::OpenedMemoryDatabase::from)
+                .map_err(ApiError::from_memory_error)
+        }
         MemoryScope::Workspace | MemoryScope::Chat => {
             let workspace_id = workspace_id.ok_or_else(|| {
                 ApiError::bad_request(format!("{} memory requires workspaceId", scope.as_str()))
@@ -10925,14 +10927,13 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
 
 #[cfg(test)]
 fn chat_message_summaries(
-    database: &mut WorkspaceDatabase,
+    _database: &mut WorkspaceDatabase,
     workspace_path: &Path,
     global_memory_database_file: Option<&Path>,
     chat_id: &str,
     messages: Vec<MessageRecord>,
 ) -> Result<Vec<ChatMessageSummary>, ApiError> {
     chat_message_summaries_for_chat(
-        database,
         workspace_path,
         global_memory_database_file,
         chat_id,
@@ -10942,7 +10943,6 @@ fn chat_message_summaries(
 }
 
 fn chat_message_summaries_for_chat(
-    database: &mut WorkspaceDatabase,
     workspace_path: &Path,
     global_memory_database_file: Option<&Path>,
     chat_id: &str,
@@ -10955,97 +10955,133 @@ fn chat_message_summaries_for_chat(
         .map(|message| message.id.clone())
         .collect::<Vec<_>>();
 
+    // Phase 1: workspace ordinary only (no nested Memory open).
     let mut tool_calls_by_message = HashMap::<String, Vec<ChatToolCallSummary>>::new();
-    for tool_call in database
-        .tool_calls_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-    {
-        let Some(message_id) = tool_call.message_id.clone() else {
-            continue;
-        };
-        tool_calls_by_message
-            .entry(message_id)
-            .or_default()
-            .push(chat_tool_call_summary(tool_call)?);
-    }
-
-    materialize_missing_assistant_parts(database, chat_id, &mut messages, &tool_calls_by_message)?;
-
-    let requests_by_id = database
-        .llm_request_metrics_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-        .into_iter()
-        .map(|request| (request.id.clone(), request))
-        .collect::<HashMap<_, _>>();
-    let mut request_ids_by_message = HashMap::<String, Vec<String>>::new();
-    for event in database
-        .llm_request_start_events_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-    {
-        let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
-        let Some(message_id) =
-            string_json_field(&value, "assistantMessageId", "assistant_message_id")
-        else {
-            continue;
-        };
-        let request_ids = request_ids_by_message
-            .entry(message_id.to_string())
-            .or_default();
-        if !request_ids.contains(&event.llm_request_id) {
-            request_ids.push(event.llm_request_id);
-        }
-    }
     let mut metrics_by_message = HashMap::new();
-    for (message_id, request_ids) in request_ids_by_message {
-        let requests = request_ids
-            .iter()
-            .map(|request_id| {
-                requests_by_id.get(request_id).cloned().ok_or_else(|| {
-                    ApiError::internal(format!(
-                        "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if !requests.is_empty() {
-            metrics_by_message.insert(message_id, chat_reply_metrics_from_requests(&requests));
-        }
-    }
-
-    let mut extracted_memories_by_message =
-        HashMap::<String, Vec<ChatExtractedMemorySummary>>::new();
-    let workspace_memory_database =
-        MemoryDatabase::open_or_create_workspace(workspace_path)
-            .map_err(ApiError::from_memory_error)?;
-    for (message_id, fact) in workspace_memory_database
-        .facts_for_source_references(MemorySourceType::AssistantMessage, &assistant_message_ids)
-        .map_err(ApiError::from_memory_error)?
+    let mut queued_run_by_user_message = HashMap::<String, Option<QueuedMessageRunSummary>>::new();
+    let prompt_injections;
     {
-        extracted_memories_by_message
-            .entry(message_id)
-            .or_default()
-            .push(chat_extracted_memory_summary(fact));
-    }
-    if let Some(global_memory_database_file) = global_memory_database_file {
-        let global_memory_database =
-            MemoryDatabase::open_or_create_global_at(global_memory_database_file)
-                .map_err(ApiError::from_memory_error)?;
-        for (message_id, fact) in global_memory_database
-            .facts_for_source_references(MemorySourceType::AssistantMessage, &assistant_message_ids)
-            .map_err(ApiError::from_memory_error)?
+        let mut database = open_workspace_database(workspace_path)?;
+        for tool_call in database
+            .tool_calls_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
         {
-            extracted_memories_by_message
+            let Some(message_id) = tool_call.message_id.clone() else {
+                continue;
+            };
+            tool_calls_by_message
                 .entry(message_id)
                 .or_default()
-                .push(chat_extracted_memory_summary(fact));
+                .push(chat_tool_call_summary(tool_call)?);
+        }
+
+        materialize_missing_assistant_parts(
+            &mut database,
+            chat_id,
+            &mut messages,
+            &tool_calls_by_message,
+        )?;
+
+        let requests_by_id = database
+            .llm_request_metrics_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .map(|request| (request.id.clone(), request))
+            .collect::<HashMap<_, _>>();
+        let mut request_ids_by_message = HashMap::<String, Vec<String>>::new();
+        for event in database
+            .llm_request_start_events_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+        {
+            let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
+            let Some(message_id) =
+                string_json_field(&value, "assistantMessageId", "assistant_message_id")
+            else {
+                continue;
+            };
+            let request_ids = request_ids_by_message
+                .entry(message_id.to_string())
+                .or_default();
+            if !request_ids.contains(&event.llm_request_id) {
+                request_ids.push(event.llm_request_id);
+            }
+        }
+        for (message_id, request_ids) in request_ids_by_message {
+            let requests = request_ids
+                .iter()
+                .map(|request_id| {
+                    requests_by_id.get(request_id).cloned().ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !requests.is_empty() {
+                metrics_by_message.insert(message_id, chat_reply_metrics_from_requests(&requests));
+            }
+        }
+
+        prompt_injections = database
+            .prompt_context_injections_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?;
+
+        for message in &messages {
+            if message.role == "user" {
+                let queued_run = queued_run_summary_for_message(
+                    &mut database,
+                    chat_id,
+                    &message.id,
+                    &message.metadata_json,
+                )?;
+                queued_run_by_user_message.insert(message.id.clone(), queued_run);
+            }
+        }
+    }
+
+    // Phase 2: workspace Memory + global Memory (separate short opens).
+    let mut extracted_memories_by_message =
+        HashMap::<String, Vec<ChatExtractedMemorySummary>>::new();
+    if !assistant_message_ids.is_empty() {
+        {
+            let workspace_memory_database =
+                MemoryDatabase::open_or_create_workspace(workspace_path)
+                    .map_err(ApiError::from_memory_error)?;
+            for (message_id, fact) in workspace_memory_database
+                .facts_for_source_references(
+                    MemorySourceType::AssistantMessage,
+                    &assistant_message_ids,
+                )
+                .map_err(ApiError::from_memory_error)?
+            {
+                extracted_memories_by_message
+                    .entry(message_id)
+                    .or_default()
+                    .push(chat_extracted_memory_summary(fact));
+            }
+        }
+        if let Some(global_memory_database_file) = global_memory_database_file {
+            let global_memory_database =
+                MemoryDatabase::open_or_create_global_at(global_memory_database_file)
+                    .map_err(ApiError::from_memory_error)?;
+            for (message_id, fact) in global_memory_database
+                .facts_for_source_references(
+                    MemorySourceType::AssistantMessage,
+                    &assistant_message_ids,
+                )
+                .map_err(ApiError::from_memory_error)?
+            {
+                extracted_memories_by_message
+                    .entry(message_id)
+                    .or_default()
+                    .push(chat_extracted_memory_summary(fact));
+            }
         }
     }
 
     let (mut memories_used_by_assistant_sequence, has_prompt_context_memory_summaries) =
         prompt_context_memory_summaries_by_assistant_sequence(
-            &database
-                .prompt_context_injections_for_chat(chat_id)
-                .map_err(ApiError::from_workspace_error)?,
+            &prompt_injections,
             messages
                 .iter()
                 .filter(|message| message.role == "assistant")
@@ -11102,7 +11138,9 @@ fn chat_message_summaries_for_chat(
             fallback_chat_message_parts(&message.content, None, &[])
         };
         let queued_run = if is_user_message {
-            queued_run_summary_for_message(database, chat_id, &message.id, &message.metadata_json)?
+            queued_run_by_user_message
+                .remove(&message.id)
+                .unwrap_or(None)
         } else {
             None
         };

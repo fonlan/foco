@@ -33,11 +33,11 @@ mod workspace_records;
 mod workspace_schema;
 
 pub use crate::workspace_gate::{
-    WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT, WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-    WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, WORKSPACE_DATABASE_TOTAL_CAPACITY, OpenedMemoryDatabase,
-    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, WorkspaceMemoryDatabaseHandle,
-    open_workspace_database, open_workspace_database_critical, open_workspace_memory_database,
-    open_workspace_memory_database_critical,
+    OpenedMemoryDatabase, WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT,
+    WORKSPACE_DATABASE_ORDINARY_CAPACITY, WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+    WORKSPACE_DATABASE_TOTAL_CAPACITY, WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle,
+    WorkspaceMemoryDatabaseHandle, open_workspace_database, open_workspace_database_critical,
+    open_workspace_memory_database, open_workspace_memory_database_critical,
 };
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
@@ -49,24 +49,25 @@ pub use workspace_records::{
     LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
     LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
-    LlmRequestUsageRecord, LlmRequestUsageRollupFilters, MessageRecord, MessageRoleCountRecord,
-    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
-    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
-    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection,
-    PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
-    PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
-    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization, MessageMetadataMutation,
-    PromptContextInjectionRecord, RewriteChatFromUserMessage, RewriteChatFromUserMessageResult,
-    RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord,
-    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    LlmRequestUsageRecord, LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord,
+    MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
+    NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
+    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
+    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
+    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
+    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
+    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
+    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
+    PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+    PreStreamFailureMaterialization, PromptContextInjectionRecord, RewriteChatFromUserMessage,
+    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
+    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -15678,16 +15679,12 @@ fn apply_message_metadata_mutation(
                 "partsVersion".to_string(),
                 Value::Number(parts_version.into()),
             );
-            metadata.insert(
-                "partsSource".to_string(),
-                Value::String(parts_source),
-            );
+            metadata.insert("partsSource".to_string(), Value::String(parts_source));
         }
         MessageMetadataMutation::UpsertSpecUpdate { summary } => {
             let Some(summary_object) = summary.as_object() else {
                 return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: "message metadata.specUpdates entry must be a JSON object"
-                        .to_string(),
+                    message: "message metadata.specUpdates entry must be a JSON object".to_string(),
                 });
             };
             let Some(summary_id) = summary_object.get("id").and_then(Value::as_str) else {
@@ -15697,8 +15694,7 @@ fn apply_message_metadata_mutation(
             };
             if summary_id.trim().is_empty() {
                 return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: "message metadata.specUpdates entry id must not be empty"
-                        .to_string(),
+                    message: "message metadata.specUpdates entry id must not be empty".to_string(),
                 });
             }
             let mut updates = match metadata.get("specUpdates") {

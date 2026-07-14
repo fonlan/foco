@@ -2395,8 +2395,9 @@ pub(crate) async fn chat_messages(
         chat_summary.kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
 
     let (message_records, pagination) = chat_message_records_for_query(&database, chat_id, &query)?;
+    // Drop workspace ordinary before chat_message_summaries opens Memory (shared gate).
+    drop(database);
     let messages = chat_message_summaries_for_chat(
-        &mut database,
         &workspace.path,
         Some(&state.memory_database_file),
         chat_id,
@@ -2410,10 +2411,13 @@ pub(crate) async fn chat_messages(
     let pending_question = state
         .question_registry
         .pending_for_chat(workspace_id, chat_id)?;
-    let latest_response_usage = database
-        .latest_completed_llm_usage_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-        .map(ChatUsageSummary::from);
+    let latest_response_usage = {
+        let database = open_workspace_database(&workspace.path)?;
+        database
+            .latest_completed_llm_usage_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .map(ChatUsageSummary::from)
+    };
 
     Ok(Json(ChatMessagesResponse {
         chat: Some(chat_summary),
@@ -2574,16 +2578,17 @@ pub(crate) async fn chat_statistics(
         .into_iter()
         .map(chat_tool_breakdown)
         .collect();
-    let created_workspace_memories =
-        MemoryDatabase::open_or_create_workspace(&workspace.path)
-            .map_err(ApiError::from_memory_error)?
-            .facts_created_from_chat_sources(chat_id)
-            .map_err(ApiError::from_memory_error)?
-            .len() as i64;
     let run_ids = llm_rows
         .iter()
         .map(|row| row.id.clone())
         .collect::<HashSet<_>>();
+    // Drop workspace ordinary before opening workspace Memory (shared gate; no nesting).
+    drop(database);
+    let created_workspace_memories = MemoryDatabase::open_or_create_workspace(&workspace.path)
+        .map_err(ApiError::from_memory_error)?
+        .facts_created_from_chat_sources(chat_id)
+        .map_err(ApiError::from_memory_error)?
+        .len() as i64;
     let created_global_memories =
         MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
             .map_err(ApiError::from_memory_error)?

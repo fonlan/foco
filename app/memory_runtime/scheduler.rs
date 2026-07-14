@@ -5,17 +5,17 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use foco_store::{
     config::{GlobalConfig, WorkspaceConfig},
     memory::{
-        MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamJobTransitionOutcome,
-        MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
+        MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus,
+        MemoryDreamJobTransitionOutcome, MemoryDreamRunMode, MemoryDreamScope,
+        MemoryDreamTriggerType,
     },
 };
 use tokio::{task::JoinHandle, time};
 
 use crate::memory_runtime::dream::{
-    MemoryDreamJobRequest, MemoryDreamJobResult, MemoryDreamPlannerRequest,
-    MemoryDreamTranscriptRequest, MemoryDreamDatabaseTarget,
-    run_memory_dream_job_with_target, run_started_memory_dream_job_with_target,
-    start_memory_dream_job_with_target,
+    MemoryDreamDatabaseTarget, MemoryDreamJobRequest, MemoryDreamJobResult,
+    MemoryDreamPlannerRequest, MemoryDreamTranscriptRequest, run_memory_dream_job_with_target,
+    run_started_memory_dream_job_with_target, start_memory_dream_job_with_target,
 };
 use crate::*;
 
@@ -679,11 +679,7 @@ fn dream_database_target_for_scope(
                 ApiError::bad_request("workspace memory Dream requires workspaceId")
             })?;
             let workspace = workspace_by_id(config, workspace_id)?;
-            MemoryDreamDatabaseTarget::from_scope_paths(
-                scope,
-                None,
-                Some(workspace.path.as_path()),
-            )
+            MemoryDreamDatabaseTarget::from_scope_paths(scope, None, Some(workspace.path.as_path()))
         }
     }
 }

@@ -7909,13 +7909,12 @@ async fn remote_sidecar_chat_statistics(
         .as_ref()
         .map(|bundle| bundle.payload.models.clone())
         .unwrap_or_default();
-    let created_workspace_memories = MemoryDatabase::open_or_create_workspace(Path::new(
-        &state.workspace_path,
-    ))
-    .map_err(|e| ApiError::from_memory_error(e).into_response())?
-    .facts_created_from_chat_sources(&chat_id)
-    .map_err(|e| ApiError::from_memory_error(e).into_response())?
-    .len() as i64;
+    let created_workspace_memories =
+        MemoryDatabase::open_or_create_workspace(Path::new(&state.workspace_path))
+            .map_err(|e| ApiError::from_memory_error(e).into_response())?
+            .facts_created_from_chat_sources(&chat_id)
+            .map_err(|e| ApiError::from_memory_error(e).into_response())?
+            .len() as i64;
     let created_global_memories =
         remote_sidecar_global_memory_count_for_run_ids(&state, &run_ids).await?;
 
@@ -8293,10 +8292,7 @@ fn remote_mark_message_queued_run_started(
     message_id: &str,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
     let mut fields = serde_json::Map::new();
-    fields.insert(
-        "status".to_string(),
-        Value::String("running".to_string()),
-    );
+    fields.insert("status".to_string(), Value::String("running".to_string()));
     match database.mutate_message_metadata(
         message_id,
         MessageMetadataMutation::MergeNestedObjectFields {
@@ -13466,9 +13462,8 @@ async fn remote_sidecar_memory_list(
         .clamp(1, 200);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let query_text = query.get("query").map(String::as_str);
-    let database =
-        MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
-            .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let database = MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     let total_count = database
         .count_facts_for_scope(chat_id.as_deref(), status, None, query_text)
         .map_err(|e| ApiError::from_memory_error(e).into_response())?;
@@ -13530,9 +13525,8 @@ async fn remote_sidecar_memory_manual(
     if scope == MemoryScope::Chat && chat_id.is_none() {
         return Err(ApiError::bad_request("chat memory requires chatId").into_response());
     }
-    let mut database =
-        MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
-            .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let mut database = MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
+        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     let source_id = unique_id("remote-memory-source");
     let memory_id = unique_id("remote-memory-fact");
     database
