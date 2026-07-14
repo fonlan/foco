@@ -19,7 +19,7 @@ use foco_store::{
         LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
         LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestUsageRecord,
         LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, TodoGraphFilter,
-        WorkspaceDatabase, workspace_database_path,
+        WorkspaceDatabase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -2575,7 +2575,7 @@ pub(crate) async fn chat_statistics(
         .map(chat_tool_breakdown)
         .collect();
     let created_workspace_memories =
-        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+        MemoryDatabase::open_or_create_workspace(&workspace.path)
             .map_err(ApiError::from_memory_error)?
             .facts_created_from_chat_sources(chat_id)
             .map_err(ApiError::from_memory_error)?

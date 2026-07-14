@@ -567,7 +567,34 @@ impl MemoryDatabase {
         Self::open_or_create_global_at(global_memory_database_path(foco_root_dir))
     }
 
-    pub fn open_workspace_at(database_path: impl AsRef<Path>) -> Result<Self, MemoryDatabaseError> {
+    /// Open workspace Memory under the process-local ordinary gate.
+    ///
+    /// Production code must use this (or [`Self::open_or_create_workspace_critical`]).
+    /// The returned handle shares the same ordinary/critical ledger as
+    /// [`crate::workspace::WorkspaceDatabase::open_or_create`].
+    #[track_caller]
+    pub fn open_or_create_workspace(
+        workspace_path: impl AsRef<Path>,
+    ) -> Result<crate::workspace_gate::WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
+        crate::workspace_gate::open_workspace_memory_database(workspace_path)
+    }
+
+    /// Critical open for workspace Memory (total capacity only).
+    #[track_caller]
+    pub fn open_or_create_workspace_critical(
+        workspace_path: impl AsRef<Path>,
+    ) -> Result<crate::workspace_gate::WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
+        crate::workspace_gate::open_workspace_memory_database_critical(workspace_path)
+    }
+
+    /// Ungated workspace Memory open for the gate implementation and controlled tests only.
+    ///
+    /// Production code must use [`Self::open_or_create_workspace`] or
+    /// [`Self::open_or_create_workspace_critical`]. Prefer the workspace root path
+    /// APIs so the shared gate key matches [`crate::workspace::WorkspaceDatabase`].
+    pub fn open_workspace_at_ungated(
+        database_path: impl AsRef<Path>,
+    ) -> Result<Self, MemoryDatabaseError> {
         let database_path = database_path.as_ref().to_path_buf();
         let connection = open_connection(&database_path)?;
         ensure_memory_schema_exists(&connection, &database_path)?;
@@ -577,6 +604,16 @@ impl MemoryDatabase {
             connection,
             kind: MemoryDatabaseKind::Workspace,
         })
+    }
+
+    /// Deprecated alias: use [`Self::open_workspace_at_ungated`] in tests/migrations only.
+    ///
+    /// Production callers must switch to [`Self::open_or_create_workspace`].
+    #[deprecated(
+        note = "use MemoryDatabase::open_or_create_workspace(workspace_path) so the shared gate is applied"
+    )]
+    pub fn open_workspace_at(database_path: impl AsRef<Path>) -> Result<Self, MemoryDatabaseError> {
+        Self::open_workspace_at_ungated(database_path)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -3209,6 +3246,9 @@ impl MemoryDatabase {
 
 #[derive(Debug)]
 pub enum MemoryDatabaseError {
+    ConcurrencyLimit {
+        message: String,
+    },
     InvalidMemoryInput {
         message: String,
     },
@@ -3237,6 +3277,7 @@ pub enum MemoryDatabaseError {
 impl fmt::Display for MemoryDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConcurrencyLimit { message } => write!(formatter, "{message}"),
             Self::InvalidMemoryInput { message } => {
                 write!(formatter, "invalid memory data: {message}")
             }
@@ -3273,7 +3314,8 @@ impl std::error::Error for MemoryDatabaseError {
             Self::InvalidMemoryJson { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
-            Self::InvalidMemoryInput { .. }
+            Self::ConcurrencyLimit { .. }
+            | Self::InvalidMemoryInput { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::UnsupportedSchemaVersion { .. } => None,
         }

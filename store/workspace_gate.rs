@@ -2,8 +2,14 @@
 //!
 //! Production openers acquire permits here so `app`, `tools`, `graph`, and
 //! sidecar share one ordinary/critical capacity model. Raw
-//! [`crate::workspace::WorkspaceDatabase::open_or_create_ungated`] is for the
+//! [`crate::workspace::WorkspaceDatabase::open_or_create_ungated`] and
+//! [`crate::memory::MemoryDatabase::open_workspace_at_ungated`] are for the
 //! gate implementation and controlled tests only.
+//!
+//! Workspace chat DB and workspace-scope Memory share the same per-workspace
+//! gate key (canonical workspace root) and the same ordinary/critical ledger.
+//! Global Memory (`memory.sqlite`) is a separate database and must not use this
+//! gate.
 
 use std::{
     collections::HashMap,
@@ -14,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::memory::{MemoryDatabase, MemoryDatabaseError};
 use crate::workspace::{WorkspaceDatabase, WorkspaceDatabaseError};
 
 pub const WORKSPACE_DATABASE_TOTAL_CAPACITY: usize = 3;
@@ -223,6 +230,188 @@ fn open_workspace_database_with_gate(
     })
 }
 
+/// Gated workspace Memory handle. Drop releases the concurrency permits.
+///
+/// Workspace Memory shares `.foco/foco.sqlite` with [`WorkspaceDatabase`]. Keep
+/// this handle only for the short DB critical section; do not hold it across
+/// provider/network awaits.
+pub struct WorkspaceMemoryDatabaseHandle {
+    database: Option<MemoryDatabase>,
+    _permits: Option<WorkspaceDatabasePermits>,
+    workspace_path: PathBuf,
+    gate_kind: WorkspaceDatabaseGateKind,
+    acquired_at: Instant,
+    caller: &'static Location<'static>,
+}
+
+impl WorkspaceMemoryDatabaseHandle {
+    pub fn gate_kind(&self) -> WorkspaceDatabaseGateKind {
+        self.gate_kind
+    }
+
+    pub fn workspace_path(&self) -> &Path {
+        &self.workspace_path
+    }
+}
+
+impl Deref for WorkspaceMemoryDatabaseHandle {
+    type Target = MemoryDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+            .as_ref()
+            .expect("workspace memory handle already consumed")
+    }
+}
+
+impl DerefMut for WorkspaceMemoryDatabaseHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.database
+            .as_mut()
+            .expect("workspace memory handle already consumed")
+    }
+}
+
+impl Drop for WorkspaceMemoryDatabaseHandle {
+    fn drop(&mut self) {
+        let held_for = self.acquired_at.elapsed();
+        if held_for >= WORKSPACE_DATABASE_LONG_HOLD_WARNING {
+            tracing::warn!(
+                workspace = %self.workspace_path.display(),
+                gate = self.gate_kind.as_str(),
+                held_ms = held_for.as_millis() as u64,
+                source_file = self.caller.file(),
+                source_line = self.caller.line(),
+                source_column = self.caller.column(),
+                "workspace memory database permit held longer than expected"
+            );
+        }
+        // Release permits before closing the SQLite connection so waiters are not
+        // blocked behind a slow connection teardown.
+        self._permits.take();
+        self.database.take();
+    }
+}
+
+/// Owned Memory connection that may be global (ungated) or workspace (gated).
+///
+/// Drop releases any workspace gate permits. Prefer short-lived scopes so
+/// permits are not held across provider/network awaits.
+pub enum OpenedMemoryDatabase {
+    Global(MemoryDatabase),
+    Workspace(WorkspaceMemoryDatabaseHandle),
+}
+
+impl OpenedMemoryDatabase {
+    pub fn is_workspace(&self) -> bool {
+        matches!(self, Self::Workspace(_))
+    }
+}
+
+impl Deref for OpenedMemoryDatabase {
+    type Target = MemoryDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Global(database) => database,
+            Self::Workspace(database) => database,
+        }
+    }
+}
+
+impl DerefMut for OpenedMemoryDatabase {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Global(database) => database,
+            Self::Workspace(database) => database,
+        }
+    }
+}
+
+impl From<MemoryDatabase> for OpenedMemoryDatabase {
+    fn from(database: MemoryDatabase) -> Self {
+        Self::Global(database)
+    }
+}
+
+impl From<WorkspaceMemoryDatabaseHandle> for OpenedMemoryDatabase {
+    fn from(database: WorkspaceMemoryDatabaseHandle) -> Self {
+        Self::Workspace(database)
+    }
+}
+
+/// Open workspace Memory under the ordinary gate (capacity 2, total 3).
+///
+/// Shares the same per-workspace gate ledger as [`open_workspace_database`].
+#[track_caller]
+pub fn open_workspace_memory_database(
+    workspace_path: impl AsRef<Path>,
+) -> Result<WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
+    open_workspace_memory_database_with_gate(
+        workspace_path.as_ref(),
+        WorkspaceDatabaseGateKind::Ordinary,
+        Location::caller(),
+    )
+}
+
+/// Open workspace Memory under the critical gate (uses total capacity only).
+#[track_caller]
+pub fn open_workspace_memory_database_critical(
+    workspace_path: impl AsRef<Path>,
+) -> Result<WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
+    open_workspace_memory_database_with_gate(
+        workspace_path.as_ref(),
+        WorkspaceDatabaseGateKind::Critical,
+        Location::caller(),
+    )
+}
+
+fn open_workspace_memory_database_with_gate(
+    workspace_path: &Path,
+    gate_kind: WorkspaceDatabaseGateKind,
+    caller: &'static Location<'static>,
+) -> Result<WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
+    // Ensure workspace schema exists first under the same gate; Memory tables live
+    // in the same SQLite file and require migrations via WorkspaceDatabase.
+    let (key, permits) = acquire_workspace_database_permits(workspace_path, gate_kind).map_err(
+        |error| match error {
+            WorkspaceDatabaseError::ConcurrencyLimit { message } => {
+                MemoryDatabaseError::ConcurrencyLimit { message }
+            }
+            other => MemoryDatabaseError::InvalidMemoryInput {
+                message: other.to_string(),
+            },
+        },
+    )?;
+    let acquired_at = Instant::now();
+    // Workspace migrations must run before Memory schema is readable. Open
+    // workspace DB first (same file), drop it, then open Memory view.
+    WorkspaceDatabase::open_or_create_ungated(workspace_path).map_err(|error| match error {
+        WorkspaceDatabaseError::ConcurrencyLimit { message } => {
+            MemoryDatabaseError::ConcurrencyLimit { message }
+        }
+        WorkspaceDatabaseError::WorkspaceNotDirectory { path } => {
+            MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("workspace path is not a directory: {}", path.display()),
+            }
+        }
+        other => MemoryDatabaseError::InvalidMemoryInput {
+            message: other.to_string(),
+        },
+    })?;
+    let database = MemoryDatabase::open_workspace_at_ungated(
+        crate::workspace::workspace_database_path(workspace_path),
+    )?;
+    Ok(WorkspaceMemoryDatabaseHandle {
+        database: Some(database),
+        _permits: Some(permits),
+        workspace_path: key,
+        gate_kind,
+        acquired_at,
+        caller,
+    })
+}
+
 fn acquire_workspace_database_permits(
     workspace_path: &Path,
     gate_kind: WorkspaceDatabaseGateKind,
@@ -380,6 +569,54 @@ mod tests {
     }
 
     #[test]
+    fn workspace_memory_shares_ordinary_gate_with_workspace_database() {
+        let workspace = tempdir().expect("workspace");
+        // Ensure schema exists for Memory open.
+        drop(open_workspace_database(workspace.path()).expect("seed workspace db"));
+
+        let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary workspace");
+        let ordinary_2 =
+            open_workspace_memory_database(workspace.path()).expect("ordinary memory");
+
+        let workspace_path = workspace.path().to_path_buf();
+        let started_at = Instant::now();
+        let error = match open_workspace_memory_database(&workspace_path) {
+            Ok(_) => panic!("third ordinary memory open must hit the shared concurrency limit"),
+            Err(error) => error,
+        };
+        assert!(
+            started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+            "memory ordinary waiter returned too early"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("workspace database concurrency limit reached"),
+            "{message}"
+        );
+
+        drop(ordinary_1);
+        drop(ordinary_2);
+        let reopened =
+            open_workspace_memory_database(workspace.path()).expect("memory after release");
+        drop(reopened);
+    }
+
+    #[test]
+    fn global_memory_open_does_not_consume_workspace_gate() {
+        let workspace = tempdir().expect("workspace");
+        let profile = tempdir().expect("profile");
+        let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");
+        let ordinary_2 = open_workspace_database(workspace.path()).expect("ordinary 2");
+
+        // Global Memory must succeed even when the workspace ordinary ledger is full.
+        let global = MemoryDatabase::open_or_create_global(profile.path()).expect("global memory");
+        drop(global);
+
+        drop(ordinary_1);
+        drop(ordinary_2);
+    }
+
+    #[test]
     fn total_capacity_blocks_extra_until_slot_releases() {
         let workspace = tempdir().expect("workspace");
         let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");
@@ -434,11 +671,11 @@ mod tests {
             if !root.exists() {
                 continue;
             }
-            collect_ungated_call_sites(&root, workspace_root, &allowlist, &mut offenders);
+            collect_workspace_db_bypass_sites(&root, workspace_root, &allowlist, &mut offenders);
         }
         assert!(
             offenders.is_empty(),
-            "production code must use gated openers; unexpected open_or_create_ungated sites: {offenders:?}"
+            "production code must use gated openers; unexpected workspace DB bypass sites: {offenders:?}"
         );
     }
 
@@ -518,7 +755,7 @@ mod tests {
         }
     }
 
-    fn collect_ungated_call_sites(
+    fn collect_workspace_db_bypass_sites(
         dir: &Path,
         workspace_root: &Path,
         allowlist: &[&Path],
@@ -538,7 +775,7 @@ mod tests {
                 if matches!(name, "target" | "node_modules" | ".git" | ".foco") {
                     continue;
                 }
-                collect_ungated_call_sites(&path, workspace_root, allowlist, offenders);
+                collect_workspace_db_bypass_sites(&path, workspace_root, allowlist, offenders);
                 continue;
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs") {
@@ -548,11 +785,6 @@ mod tests {
                 Ok(relative) => relative,
                 Err(_) => continue,
             };
-            if allowlist.iter().any(|allowed| relative == *allowed) {
-                // store tests and the gate implementation may open ungated.
-                // Only non-test modules under allowlisted production files need
-                // further filtering below.
-            }
             let is_test_path = relative.components().any(|component| {
                 component.as_os_str() == "tests"
                     || component
@@ -566,32 +798,43 @@ mod tests {
             let Ok(source) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            // Ignore cfg(test) modules roughly by scanning only outside
-            // `#[cfg(test)]` blocks when the whole file is production.
-            if allowlist.iter().any(|allowed| relative == *allowed) {
-                // For store production files, only the gate may call ungated open
-                // outside tests. workspace.rs defines the method; gate implements open.
-                if relative == Path::new("store/workspace_gate.rs")
-                    || relative == Path::new("store/workspace.rs")
-                {
+            let production_source = strip_cfg_test_regions(&source);
+            // Gate / definition modules may define ungated openers.
+            let allow_ungated_symbols = matches!(
+                relative.to_str(),
+                Some("store/workspace.rs" | "store/workspace_gate.rs" | "store/memory.rs")
+            );
+            for (line_no, line) in production_source.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
                     continue;
                 }
-                // schema/memory helper modules should not call ungated in non-test code.
-                if source_has_production_ungated_call(&source) {
-                    offenders.push(relative.display().to_string());
+                let mut hit = None;
+                if !allow_ungated_symbols {
+                    if line.contains("open_or_create_ungated(")
+                        || line.contains("open_workspace_at_ungated(")
+                        || line.contains("MemoryDatabase::open_workspace_at(")
+                    {
+                        hit = Some("ungated_or_raw_memory_open");
+                    }
                 }
-                continue;
-            }
-            if source.contains("open_or_create_ungated") {
-                offenders.push(relative.display().to_string());
+                // Only real call sites, not string literals inside this guard.
+                let connection_open_call = trimmed.starts_with("Connection::open(")
+                    && (line.contains("workspace_database_path")
+                        || line.contains("WORKSPACE_DATABASE_FILE"));
+                if connection_open_call {
+                    hit = Some("Connection::open(workspace_database_path)");
+                }
+                if let Some(kind) = hit {
+                    offenders.push(format!(
+                        "{}:{}: {kind}: {}",
+                        relative.display(),
+                        line_no + 1,
+                        trimmed
+                    ));
+                }
             }
         }
-    }
-
-    fn source_has_production_ungated_call(source: &str) -> bool {
-        // Strip cfg(test) modules / blocks to avoid counting unit-test helpers.
-        let without_cfg_test = strip_cfg_test_regions(source);
-        without_cfg_test.contains("open_or_create_ungated(")
     }
 
     fn strip_cfg_test_regions(source: &str) -> String {

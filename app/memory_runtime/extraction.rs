@@ -11,7 +11,7 @@ use foco_store::{
         MemoryRelationKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryEdge,
         NewMemoryExtractionJob, NewMemoryFact, NewMemorySource,
     },
-    workspace::{WorkspaceDatabase, workspace_database_path},
+    workspace::WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -146,7 +146,7 @@ fn queue_memory_extraction_job_with_id(
     })
     .to_string();
     let mut memory_database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+        MemoryDatabase::open_or_create_workspace(&context.workspace_path)
             .map_err(ApiError::from_memory_error)?;
     let job_id = job_id
         .map(str::to_string)
@@ -239,7 +239,7 @@ pub(crate) fn queue_integrated_plan_memory_extraction(
     })
     .to_string();
     let mut memory_database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+        MemoryDatabase::open_or_create_workspace(workspace_path)
             .map_err(ApiError::from_memory_error)?;
     memory_database
         .insert_extraction_job_if_absent(NewMemoryExtractionJob {
@@ -316,8 +316,8 @@ pub(crate) fn memory_target_status_for_prompt(message: &str) -> MemoryStatus {
 pub(crate) async fn run_memory_extraction_job(
     task: MemoryExtractionTask,
 ) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
-    let workspace_memory_path = workspace_database_path(&task.workspace_path);
-    let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
+    let mut workspace_memory_database =
+        MemoryDatabase::open_or_create_workspace(&task.workspace_path)
         .map_err(ApiError::from_memory_error)?;
     // Atomic claim: only one runner can transition queued -> running.
     if !workspace_memory_database
@@ -360,7 +360,8 @@ pub(crate) async fn run_memory_extraction_job(
         );
         attempt += 1;
     };
-    let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
+    let mut workspace_memory_database =
+        MemoryDatabase::open_or_create_workspace(&task.workspace_path)
         .map_err(ApiError::from_memory_error)?;
     let Some(job) = workspace_memory_database
         .extraction_job(&task.job_id)
@@ -400,25 +401,30 @@ pub(crate) async fn run_memory_extraction_job(
 pub(crate) async fn run_memory_extraction_job_inner(
     task: &MemoryExtractionTask,
 ) -> Result<(String, Vec<ChatExtractedMemorySummary>), ApiError> {
-    let workspace_database = WorkspaceDatabase::open_or_create(&task.workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    let evidence_candidates = memory_extraction_evidence_candidates(
-        &workspace_database,
-        &task.chat_id,
-        &task.run_id,
-        &task.user_message_id,
-        &task.assistant_message_id,
-    )?;
-    let workspace_memory =
-        MemoryDatabase::open_workspace_at(workspace_database_path(&task.workspace_path))
+    // Short critical sections only: never hold workspace/memory handles across provider await.
+    let evidence_candidates = {
+        let workspace_database = WorkspaceDatabase::open_or_create(&task.workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        memory_extraction_evidence_candidates(
+            &workspace_database,
+            &task.chat_id,
+            &task.run_id,
+            &task.user_message_id,
+            &task.assistant_message_id,
+        )?
+    };
+    let existing_memory_candidates = {
+        let workspace_memory = MemoryDatabase::open_or_create_workspace(&task.workspace_path)
             .map_err(ApiError::from_memory_error)?;
-    let global_memory = MemoryDatabase::open_or_create_global_at(&task.global_memory_database_file)
-        .map_err(ApiError::from_memory_error)?;
-    let existing_memory_candidates = memory_extraction_existing_memory_candidates(
-        &global_memory,
-        &workspace_memory,
-        &task.chat_id,
-    )?;
+        let global_memory =
+            MemoryDatabase::open_or_create_global_at(&task.global_memory_database_file)
+                .map_err(ApiError::from_memory_error)?;
+        memory_extraction_existing_memory_candidates(
+            &global_memory,
+            &workspace_memory,
+            &task.chat_id,
+        )?
+    };
     let (provider_id, provider_config, max_output_tokens) =
         extraction_provider_for_model(&task.config, &task.model_id)?;
     let request = memory_extraction_provider_request(
@@ -898,7 +904,7 @@ pub(crate) fn store_extracted_memory_facts(
 
     let mut global_memory_database: Option<MemoryDatabase> = None;
     let mut workspace_memory_database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(&task.workspace_path))
+        MemoryDatabase::open_or_create_workspace(&task.workspace_path)
             .map_err(ApiError::from_memory_error)?;
     let mut summaries = Vec::new();
 

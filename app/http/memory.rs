@@ -498,8 +498,9 @@ pub(crate) async fn retry_memory_extraction_job(
 
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
-    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
-    let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+    // Memory open runs workspace migrations under the shared gate; no separate
+    // WorkspaceDatabase open needed (and would risk nested ordinary permits).
+    let mut database = MemoryDatabase::open_or_create_workspace(&workspace.path)
         .map_err(ApiError::from_memory_error)?;
     let job = database
         .extraction_job(job_id)
@@ -557,8 +558,9 @@ pub(crate) async fn skip_memory_extraction_job(
 
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
-    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
-    let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+    // Memory open runs workspace migrations under the shared gate; no separate
+    // WorkspaceDatabase open needed (and would risk nested ordinary permits).
+    let mut database = MemoryDatabase::open_or_create_workspace(&workspace.path)
         .map_err(ApiError::from_memory_error)?;
     let job = database
         .extraction_job(job_id)
@@ -1249,7 +1251,7 @@ fn open_dream_memory_database(
     config: &GlobalConfig,
     scope: MemoryDreamScope,
     workspace_id: Option<&str>,
-) -> Result<MemoryDatabase, ApiError> {
+) -> Result<foco_store::OpenedMemoryDatabase, ApiError> {
     let memory_scope = match scope {
         MemoryDreamScope::Global => MemoryScope::Global,
         MemoryDreamScope::Workspace => MemoryScope::Workspace,
@@ -1319,7 +1321,7 @@ fn materialize_memory_dream_job_summaries_for_page(
         })?;
 
     let mut global_database = None;
-    let mut workspace_databases: HashMap<String, MemoryDatabase> = HashMap::new();
+    let mut workspace_databases: HashMap<String, foco_store::OpenedMemoryDatabase> = HashMap::new();
     let mut summaries = Vec::with_capacity(page_jobs.len());
 
     for pending in page_jobs {
@@ -1439,7 +1441,7 @@ where
 }
 
 struct LocatedMemoryDreamJob {
-    database: MemoryDatabase,
+    database: foco_store::OpenedMemoryDatabase,
     job: MemoryDreamJobRecord,
     transcript_workspace_id: Option<String>,
 }

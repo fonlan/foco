@@ -503,7 +503,9 @@ fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
                 .into());
             }
             (
-                MemoryDatabase::open_or_create_global_at(&paths.memory_database_file)?,
+                foco_store::OpenedMemoryDatabase::from(
+                    MemoryDatabase::open_or_create_global_at(&paths.memory_database_file)?,
+                ),
                 None,
             )
         }
@@ -529,7 +531,9 @@ fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
                 .into());
             }
             (
-                MemoryDatabase::open_workspace_at(database_path)?,
+                foco_store::OpenedMemoryDatabase::from(
+                    MemoryDatabase::open_or_create_workspace(&workspace.path)?,
+                ),
                 Some(workspace.id.as_str()),
             )
         }
@@ -7070,6 +7074,7 @@ impl ApiError {
         match error {
             MemoryDatabaseError::InvalidMemoryInput { .. }
             | MemoryDatabaseError::InvalidMemoryJson { .. } => Self::bad_request(error.to_string()),
+            MemoryDatabaseError::ConcurrencyLimit { .. } => Self::internal(error.to_string()),
             _ => Self::internal(error.to_string()),
         }
     }
@@ -7623,21 +7628,18 @@ fn open_memory_database(
     config: &GlobalConfig,
     scope: MemoryScope,
     workspace_id: Option<&str>,
-) -> Result<MemoryDatabase, ApiError> {
+) -> Result<foco_store::OpenedMemoryDatabase, ApiError> {
     match scope {
-        MemoryScope::Global => {
-            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
-                .map_err(ApiError::from_memory_error)
-        }
+        MemoryScope::Global => MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+            .map(foco_store::OpenedMemoryDatabase::from)
+            .map_err(ApiError::from_memory_error),
         MemoryScope::Workspace | MemoryScope::Chat => {
             let workspace_id = workspace_id.ok_or_else(|| {
                 ApiError::bad_request(format!("{} memory requires workspaceId", scope.as_str()))
             })?;
             let workspace = workspace_by_id(config, workspace_id)?;
-            WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
-
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+            MemoryDatabase::open_or_create_workspace(&workspace.path)
+                .map(foco_store::OpenedMemoryDatabase::from)
                 .map_err(ApiError::from_memory_error)
         }
     }
@@ -11038,7 +11040,7 @@ fn chat_message_summaries_for_chat(
     let mut extracted_memories_by_message =
         HashMap::<String, Vec<ChatExtractedMemorySummary>>::new();
     let workspace_memory_database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+        MemoryDatabase::open_or_create_workspace(workspace_path)
             .map_err(ApiError::from_memory_error)?;
     for (message_id, fact) in workspace_memory_database
         .facts_for_source_references(MemorySourceType::AssistantMessage, &assistant_message_ids)

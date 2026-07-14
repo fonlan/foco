@@ -8,14 +8,14 @@ use foco_store::{
         MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
         MemoryDreamScope, MemoryDreamTriggerType, UpdateMemoryDreamJob,
     },
-    workspace::{WorkspaceDatabase, workspace_database_path},
 };
 use tokio::{task::JoinHandle, time};
 
 use crate::memory_runtime::dream::{
     MemoryDreamJobRequest, MemoryDreamJobResult, MemoryDreamPlannerRequest,
-    MemoryDreamTranscriptRequest, run_memory_dream_job, run_started_memory_dream_job,
-    start_memory_dream_job,
+    MemoryDreamTranscriptRequest, MemoryDreamDatabaseTarget,
+    run_memory_dream_job_with_target, run_started_memory_dream_job_with_target,
+    start_memory_dream_job_with_target,
 };
 use crate::*;
 
@@ -395,7 +395,6 @@ async fn run_started_memory_dream_guarded(
     mode: MemoryDreamRunMode,
     job_id: String,
 ) -> Result<MemoryDreamJobResult, ApiError> {
-    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
     let needs_runtime_workspace =
         mode == MemoryDreamRunMode::Llm || config.memory.dream.create_transcript_chat;
     let runtime_workspace =
@@ -426,8 +425,10 @@ async fn run_started_memory_dream_guarded(
         None
     };
 
-    run_started_memory_dream_job(
-        &mut database,
+    // Path-driven short opens only; no long-lived connection across the async body.
+    let target = dream_database_target_for_scope(state, config, scope, workspace_id)?;
+    run_started_memory_dream_job_with_target(
+        target,
         MemoryDreamJobRequest {
             scope,
             workspace_id,
@@ -452,8 +453,10 @@ fn start_manual_memory_dream_guarded(
     workspace_id: Option<&str>,
     mode: MemoryDreamRunMode,
 ) -> Result<MemoryDreamJobRecord, ApiError> {
-    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
-    ensure_no_active_memory_dream_run(&database, scope, workspace_id)?;
+    {
+        let database = open_dream_memory_database(state, config, scope, workspace_id)?;
+        ensure_no_active_memory_dream_run(&database, scope, workspace_id)?;
+    }
     let needs_runtime_workspace =
         mode == MemoryDreamRunMode::Llm || config.memory.dream.create_transcript_chat;
     let runtime_workspace =
@@ -484,8 +487,10 @@ fn start_manual_memory_dream_guarded(
         None
     };
 
-    start_memory_dream_job(
-        &mut database,
+    // Path-driven start: never hold Memory permit while creating transcript chat.
+    let target = dream_database_target_for_scope(state, config, scope, workspace_id)?;
+    start_memory_dream_job_with_target(
+        &target,
         MemoryDreamJobRequest {
             scope,
             workspace_id,
@@ -509,8 +514,10 @@ async fn run_memory_dream_guarded(
     trigger_type: MemoryDreamTriggerType,
     mode: MemoryDreamRunMode,
 ) -> Result<MemoryDreamJobResult, ApiError> {
-    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
-    ensure_no_active_memory_dream_run(&database, scope, workspace_id)?;
+    {
+        let database = open_dream_memory_database(state, config, scope, workspace_id)?;
+        ensure_no_active_memory_dream_run(&database, scope, workspace_id)?;
+    }
     let needs_runtime_workspace =
         mode == MemoryDreamRunMode::Llm || config.memory.dream.create_transcript_chat;
     let runtime_workspace =
@@ -541,8 +548,9 @@ async fn run_memory_dream_guarded(
         None
     };
 
-    run_memory_dream_job(
-        &mut database,
+    let target = dream_database_target_for_scope(state, config, scope, workspace_id)?;
+    run_memory_dream_job_with_target(
+        target,
         MemoryDreamJobRequest {
             scope,
             workspace_id,
@@ -588,28 +596,39 @@ fn memory_dream_has_active_job(
     Ok(false)
 }
 
-fn open_dream_memory_database(
+fn dream_database_target_for_scope(
     state: &AppState,
     config: &GlobalConfig,
     scope: MemoryDreamScope,
     workspace_id: Option<&str>,
-) -> Result<MemoryDatabase, ApiError> {
+) -> Result<MemoryDreamDatabaseTarget, ApiError> {
     match scope {
-        MemoryDreamScope::Global => {
-            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
-                .map_err(ApiError::from_memory_error)
-        }
+        MemoryDreamScope::Global => MemoryDreamDatabaseTarget::from_scope_paths(
+            scope,
+            Some(state.memory_database_file.as_path()),
+            None,
+        ),
         MemoryDreamScope::Workspace => {
             let workspace_id = workspace_id.ok_or_else(|| {
                 ApiError::bad_request("workspace memory Dream requires workspaceId")
             })?;
             let workspace = workspace_by_id(config, workspace_id)?;
-            WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
-                .map_err(ApiError::from_memory_error)
+            MemoryDreamDatabaseTarget::from_scope_paths(
+                scope,
+                None,
+                Some(workspace.path.as_path()),
+            )
         }
     }
+}
+
+fn open_dream_memory_database(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+) -> Result<foco_store::OpenedMemoryDatabase, ApiError> {
+    dream_database_target_for_scope(state, config, scope, workspace_id)?.open()
 }
 
 fn memory_dream_runtime_workspace<'a>(

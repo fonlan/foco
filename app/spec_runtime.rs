@@ -1481,7 +1481,7 @@ fn workspace_memory_profiles(
         return Ok(Vec::new());
     }
 
-    let database = MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+    let database = MemoryDatabase::open_or_create_workspace(workspace_path)
         .map_err(ApiError::from_memory_error)?;
     database
         .profiles_for_scope(None, WORKSPACE_SPEC_MEMORY_PROFILE_LIMIT)

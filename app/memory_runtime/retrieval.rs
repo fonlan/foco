@@ -167,10 +167,8 @@ pub(crate) async fn memory_prompt_context(
         });
     }
 
-    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
-    let mut workspace_memory =
-        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
-            .map_err(ApiError::from_memory_error)?;
+    let mut workspace_memory = MemoryDatabase::open_or_create_workspace(&workspace.path)
+        .map_err(ApiError::from_memory_error)?;
     let mut global_memory = MemoryDatabase::open_or_create_global_at(memory_database_file)
         .map_err(ApiError::from_memory_error)?;
 
@@ -431,7 +429,7 @@ async fn relevant_memory_facts_llm(
     }
 
     let mut workspace_memory =
-        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+        MemoryDatabase::open_or_create_workspace(workspace_path)
             .map_err(ApiError::from_memory_error)?;
     let mut global_memory = MemoryDatabase::open_or_create_global_at(global_memory_database_file)
         .map_err(ApiError::from_memory_error)?;

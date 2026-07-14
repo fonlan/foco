@@ -50,7 +50,6 @@ use foco_store::{
         TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
         WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
         WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -7906,8 +7905,8 @@ async fn remote_sidecar_chat_statistics(
         .as_ref()
         .map(|bundle| bundle.payload.models.clone())
         .unwrap_or_default();
-    let created_workspace_memories = MemoryDatabase::open_workspace_at(workspace_database_path(
-        Path::new(&state.workspace_path),
+    let created_workspace_memories = MemoryDatabase::open_or_create_workspace(Path::new(
+        &state.workspace_path,
     ))
     .map_err(|e| ApiError::from_memory_error(e).into_response())?
     .facts_created_from_chat_sources(&chat_id)
@@ -13458,7 +13457,7 @@ async fn remote_sidecar_memory_list(
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let query_text = query.get("query").map(String::as_str);
     let database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(sidecar_workspace_path(&state)))
+        MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     let total_count = database
         .count_facts_for_scope(chat_id.as_deref(), status, None, query_text)
@@ -13522,7 +13521,7 @@ async fn remote_sidecar_memory_manual(
         return Err(ApiError::bad_request("chat memory requires chatId").into_response());
     }
     let mut database =
-        MemoryDatabase::open_workspace_at(workspace_database_path(sidecar_workspace_path(&state)))
+        MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     let source_id = unique_id("remote-memory-source");
     let memory_id = unique_id("remote-memory-fact");

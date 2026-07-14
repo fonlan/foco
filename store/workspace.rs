@@ -34,9 +34,10 @@ mod workspace_schema;
 
 pub use crate::workspace_gate::{
     WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT, WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-    WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, WORKSPACE_DATABASE_TOTAL_CAPACITY,
-    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, open_workspace_database,
-    open_workspace_database_critical,
+    WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, WORKSPACE_DATABASE_TOTAL_CAPACITY, OpenedMemoryDatabase,
+    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, WorkspaceMemoryDatabaseHandle,
+    open_workspace_database, open_workspace_database_critical, open_workspace_memory_database,
+    open_workspace_memory_database_critical,
 };
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,

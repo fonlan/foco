@@ -9,6 +9,29 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+/// Test-only: invoked after Dream drops a short-open Memory handle and before the
+/// next DB/provider step. Used to prove ordinary gate permits are free mid-job.
+#[cfg(test)]
+static DREAM_AFTER_SHORT_OPEN_HOOK: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn invoke_dream_after_short_open_hook() {
+    if let Some(slot) = DREAM_AFTER_SHORT_OPEN_HOOK.get() {
+        if let Ok(guard) = slot.lock() {
+            if let Some(hook) = guard.as_ref() {
+                hook();
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn invoke_dream_after_short_open_hook() {}
+
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use foco_providers::{
     NeutralChatRequest, NeutralChatRole, NeutralToolDefinition, ProviderConnectionConfig,
@@ -24,7 +47,7 @@ use foco_store::{
         MemorySourceType, MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge,
         NewMemoryFact, NewMemoryReference, NewMemorySource, UpdateMemoryDreamJob, UpdateMemoryFact,
     },
-    workspace::{NewMessage, WorkspaceDatabase},
+    workspace::{NewMessage, OpenedMemoryDatabase, WorkspaceDatabase},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,6 +102,88 @@ pub(crate) struct MemoryDreamPlannerRequest<'a> {
 pub(crate) struct MemoryDreamTranscriptRequest<'a> {
     pub(crate) workspace_id: &'a str,
     pub(crate) workspace_path: &'a Path,
+}
+
+/// How to reopen the Dream Memory database for short critical sections.
+///
+/// Async Dream paths must not hold a live connection across provider/network awaits.
+#[derive(Clone, Debug)]
+pub(crate) enum MemoryDreamDatabaseTarget {
+    Global {
+        path: PathBuf,
+    },
+    Workspace {
+        workspace_path: PathBuf,
+    },
+}
+
+impl MemoryDreamDatabaseTarget {
+    pub(crate) fn from_scope_paths(
+        scope: MemoryDreamScope,
+        global_memory_database_file: Option<&Path>,
+        workspace_path: Option<&Path>,
+    ) -> Result<Self, ApiError> {
+        match scope {
+            MemoryDreamScope::Global => {
+                let path = global_memory_database_file
+                    .ok_or_else(|| {
+                        ApiError::internal(
+                            "global memory Dream requires global_memory_database_file",
+                        )
+                    })?
+                    .to_path_buf();
+                Ok(Self::Global { path })
+            }
+            MemoryDreamScope::Workspace => {
+                let workspace_path = workspace_path
+                    .ok_or_else(|| {
+                        ApiError::internal(
+                            "workspace memory Dream requires workspace path for short-open reloads",
+                        )
+                    })?
+                    .to_path_buf();
+                Ok(Self::Workspace { workspace_path })
+            }
+        }
+    }
+
+    pub(crate) fn from_open_database(
+        database: &MemoryDatabase,
+        request: &MemoryDreamJobRequest<'_>,
+    ) -> Result<Self, ApiError> {
+        match request.scope {
+            MemoryDreamScope::Global => Ok(Self::Global {
+                path: database.database_path().to_path_buf(),
+            }),
+            MemoryDreamScope::Workspace => {
+                let db_path = database.database_path();
+                let workspace_path = db_path
+                    .parent()
+                    .and_then(|foco_dir| foco_dir.parent())
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "cannot derive workspace path from memory database {}",
+                            db_path.display()
+                        ))
+                    })?;
+                Ok(Self::Workspace { workspace_path })
+            }
+        }
+    }
+
+    pub(crate) fn open(&self) -> Result<OpenedMemoryDatabase, ApiError> {
+        match self {
+            Self::Global { path } => MemoryDatabase::open_or_create_global_at(path)
+                .map(OpenedMemoryDatabase::from)
+                .map_err(ApiError::from_memory_error),
+            Self::Workspace { workspace_path } => {
+                MemoryDatabase::open_or_create_workspace(workspace_path)
+                    .map(OpenedMemoryDatabase::from)
+                    .map_err(ApiError::from_memory_error)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -370,21 +475,96 @@ fn memory_dream_transcript_content(title: &str, payload: &Value) -> String {
     )
 }
 
+/// Compatibility entry for tests/callers that already opened a Memory handle.
+///
+/// Takes ownership and drops the connection before any path-driven short opens so
+/// a gated workspace handle cannot nest ordinary permits. Prefer
+/// [`run_memory_dream_job_with_target`] in production after dropping any live handle.
 pub(crate) async fn run_memory_dream_job(
-    database: &mut MemoryDatabase,
+    database: MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+) -> Result<MemoryDreamJobResult, ApiError> {
+    let target = MemoryDreamDatabaseTarget::from_open_database(&database, &request)?;
+    drop(database);
+    run_memory_dream_job_with_target(target, request).await
+}
+
+/// Path/id-driven Dream run that never requires a long-lived caller connection.
+pub(crate) async fn run_memory_dream_job_with_target(
+    target: MemoryDreamDatabaseTarget,
     request: MemoryDreamJobRequest<'_>,
 ) -> Result<MemoryDreamJobResult, ApiError> {
     let started_at = Instant::now();
-    let started = start_memory_dream_job(database, request)?;
-    let started = prepare_started_memory_dream_job(database, request, started.id)?;
-
-    finish_memory_dream_job(database, request, started, started_at).await
+    let job_id = start_memory_dream_job_with_target(&target, request)?.id;
+    let started = prepare_started_memory_dream_job_with_target(&target, request, job_id)?;
+    finish_memory_dream_job(&target, request, started, started_at).await
 }
 
-pub(crate) fn start_memory_dream_job(
-    database: &mut MemoryDatabase,
+/// Path-driven start: insert job, create transcript, attach chat id — each as an
+/// independent short open so workspace Memory never holds a permit while opening
+/// WorkspaceDatabase for transcript (same `.foco/foco.sqlite` ledger).
+pub(crate) fn start_memory_dream_job_with_target(
+    target: &MemoryDreamDatabaseTarget,
     request: MemoryDreamJobRequest<'_>,
 ) -> Result<MemoryDreamJobRecord, ApiError> {
+    let StartMemoryDreamPlan {
+        job_id,
+        job_model_id,
+        input_summary_json,
+    } = {
+        let mut database = target.open()?;
+        plan_memory_dream_start(&mut database, request)?
+    };
+    {
+        let mut database = target.open()?;
+        insert_running_memory_dream_job(
+            &mut database,
+            request,
+            &job_id,
+            job_model_id.as_deref(),
+            &input_summary_json,
+        )?;
+    }
+    // Transcript opens WorkspaceDatabase under its own gate permit; Memory must
+    // not hold the workspace ordinary slot here.
+    let transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
+    {
+        let mut database = target.open()?;
+        attach_memory_dream_transcript_chat(
+            &mut database,
+            &job_id,
+            transcript.chat_id(),
+        )?;
+        database
+            .dream_job(&job_id)
+            .map_err(ApiError::from_memory_error)?
+            .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))
+    }
+}
+
+/// Compatibility start for tests that already opened an ungated Memory handle.
+///
+/// Takes ownership and drops before path-driven short opens so transcript creation
+/// never nests against a live gated workspace Memory permit.
+pub(crate) fn start_memory_dream_job(
+    database: MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+) -> Result<MemoryDreamJobRecord, ApiError> {
+    let target = MemoryDreamDatabaseTarget::from_open_database(&database, &request)?;
+    drop(database);
+    start_memory_dream_job_with_target(&target, request)
+}
+
+struct StartMemoryDreamPlan {
+    job_id: String,
+    job_model_id: Option<String>,
+    input_summary_json: String,
+}
+
+fn plan_memory_dream_start(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+) -> Result<StartMemoryDreamPlan, ApiError> {
     let latest_success_at = database
         .latest_successful_dream_time(request.scope, request.workspace_id)
         .map_err(ApiError::from_memory_error)?;
@@ -409,8 +589,8 @@ pub(crate) fn start_memory_dream_job(
     };
     let job_model_id = model_selection
         .as_ref()
-        .map(|selection| selection.model_id.as_str())
-        .or(request.model_id);
+        .map(|selection| selection.model_id.clone())
+        .or_else(|| request.model_id.map(str::to_string));
     let input_summary_json = json!({
         "scope": request.scope.as_str(),
         "workspaceId": request.workspace_id,
@@ -426,17 +606,30 @@ pub(crate) fn start_memory_dream_job(
             .map(|transcript| transcript.workspace_id),
     })
     .to_string();
+    Ok(StartMemoryDreamPlan {
+        job_id,
+        job_model_id,
+        input_summary_json,
+    })
+}
 
+fn insert_running_memory_dream_job(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    job_id: &str,
+    job_model_id: Option<&str>,
+    input_summary_json: &str,
+) -> Result<(), ApiError> {
     database
         .insert_dream_job(NewMemoryDreamJob {
-            id: &job_id,
+            id: job_id,
             scope: request.scope,
             workspace_id: request.workspace_id,
             trigger_type: request.trigger_type,
             mode: request.mode,
             status: MemoryDreamJobStatus::Running,
             model_id: job_model_id,
-            input_summary_json: &input_summary_json,
+            input_summary_json,
             output_summary_json: None,
             transcript_chat_id: None,
             error_message: None,
@@ -451,39 +644,53 @@ pub(crate) fn start_memory_dream_job(
         model_id = job_model_id,
         "Memory Dream job started"
     );
+    Ok(())
+}
 
-    let transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
-    if let Some(transcript_chat_id) = transcript.chat_id() {
-        database
-            .update_dream_job_status(UpdateMemoryDreamJob {
-                id: &job_id,
-                status: MemoryDreamJobStatus::Running,
-                output_summary_json: None,
-                transcript_chat_id: Some(transcript_chat_id),
-                error_message: None,
-            })
-            .map_err(ApiError::from_memory_error)?;
-    }
-
+fn attach_memory_dream_transcript_chat(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    transcript_chat_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(transcript_chat_id) = transcript_chat_id else {
+        return Ok(());
+    };
     database
-        .dream_job(&job_id)
-        .map_err(ApiError::from_memory_error)?
-        .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))
+        .update_dream_job_status(UpdateMemoryDreamJob {
+            id: job_id,
+            status: MemoryDreamJobStatus::Running,
+            output_summary_json: None,
+            transcript_chat_id: Some(transcript_chat_id),
+            error_message: None,
+        })
+        .map_err(ApiError::from_memory_error)?;
+    Ok(())
 }
 
 pub(crate) async fn run_started_memory_dream_job(
-    database: &mut MemoryDatabase,
+    database: MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    job_id: String,
+) -> Result<MemoryDreamJobResult, ApiError> {
+    let target = MemoryDreamDatabaseTarget::from_open_database(&database, &request)?;
+    drop(database);
+    run_started_memory_dream_job_with_target(target, request, job_id).await
+}
+
+pub(crate) async fn run_started_memory_dream_job_with_target(
+    target: MemoryDreamDatabaseTarget,
     request: MemoryDreamJobRequest<'_>,
     job_id: String,
 ) -> Result<MemoryDreamJobResult, ApiError> {
     let started_at = Instant::now();
-    let started = prepare_started_memory_dream_job(database, request, job_id)?;
-
-    finish_memory_dream_job(database, request, started, started_at).await
+    let started = prepare_started_memory_dream_job_with_target(&target, request, job_id)?;
+    finish_memory_dream_job(&target, request, started, started_at).await
 }
 
-fn prepare_started_memory_dream_job(
-    database: &mut MemoryDatabase,
+/// Load job metadata under a short Memory open, then resume transcript only after
+/// the Memory permit is released (WorkspaceDatabase must not nest ordinary).
+fn prepare_started_memory_dream_job_with_target(
+    target: &MemoryDreamDatabaseTarget,
     request: MemoryDreamJobRequest<'_>,
     job_id: String,
 ) -> Result<StartedMemoryDreamJob, ApiError> {
@@ -492,29 +699,37 @@ fn prepare_started_memory_dream_job(
         request.settings.max_changes_per_run as usize,
     )
     .map_err(ApiError::from_memory_error)?;
-    let existing_job = database
-        .dream_job(&job_id)
-        .map_err(ApiError::from_memory_error)?
-        .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))?;
-    let mut model_resolution_error = None;
-    let model_selection = if request.mode == MemoryDreamRunMode::Llm {
-        match request.planner {
-            Some(planner) => resolve_memory_dream_model(
-                planner.config,
-                &planner.config.memory,
-                planner.chat_model_id,
-            )
-            .map(Some)
-            .unwrap_or_else(|error| {
-                model_resolution_error = Some(error.message);
-                None
-            }),
-            None => None,
-        }
-    } else {
-        None
+    let (transcript_chat_id, model_selection, model_resolution_error) = {
+        let database = target.open()?;
+        let existing_job = database
+            .dream_job(&job_id)
+            .map_err(ApiError::from_memory_error)?
+            .ok_or_else(|| ApiError::internal("memory Dream job was not found after start"))?;
+        let mut model_resolution_error = None;
+        let model_selection = if request.mode == MemoryDreamRunMode::Llm {
+            match request.planner {
+                Some(planner) => resolve_memory_dream_model(
+                    planner.config,
+                    &planner.config.memory,
+                    planner.chat_model_id,
+                )
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    model_resolution_error = Some(error.message);
+                    None
+                }),
+                None => None,
+            }
+        } else {
+            None
+        };
+        (
+            existing_job.transcript_chat_id,
+            model_selection,
+            model_resolution_error,
+        )
     };
-    let transcript = if let Some(transcript_chat_id) = existing_job.transcript_chat_id {
+    let transcript = if let Some(transcript_chat_id) = transcript_chat_id {
         MemoryDreamTranscript::resume(request, transcript_chat_id)?
     } else {
         MemoryDreamTranscript::disabled()
@@ -530,14 +745,14 @@ fn prepare_started_memory_dream_job(
 }
 
 async fn finish_memory_dream_job(
-    database: &mut MemoryDatabase,
+    target: &MemoryDreamDatabaseTarget,
     request: MemoryDreamJobRequest<'_>,
     mut started: StartedMemoryDreamJob,
     started_at: Instant,
 ) -> Result<MemoryDreamJobResult, ApiError> {
     let job_id = started.job_id;
     let run_result = run_memory_dream_job_inner(
-        database,
+        target,
         &job_id,
         request,
         started.model_selection,
@@ -549,15 +764,17 @@ async fn finish_memory_dream_job(
     let output_summary_json = match run_result {
         Ok(summary) => {
             let output_summary_json = summary.to_json().to_string();
-            database
-                .update_dream_job_status(UpdateMemoryDreamJob {
+            write_dream_job_status_durably(
+                target,
+                UpdateMemoryDreamJob {
                     id: &job_id,
                     status: MemoryDreamJobStatus::Completed,
                     output_summary_json: Some(&output_summary_json),
                     transcript_chat_id: None,
                     error_message: None,
-                })
-                .map_err(ApiError::from_memory_error)?;
+                },
+            )
+            .await?;
             started.transcript.record_json_best_effort(
                 "final status",
                 json!({
@@ -593,13 +810,27 @@ async fn finish_memory_dream_job(
                     "summary": failure_summary.to_json(),
                 }),
             );
-            let _ = database.update_dream_job_status(UpdateMemoryDreamJob {
-                id: &job_id,
-                status: MemoryDreamJobStatus::Failed,
-                output_summary_json: Some(&output_summary_json),
-                transcript_chat_id: None,
-                error_message: Some(&error_message),
-            });
+            if let Err(status_error) = write_dream_job_status_durably(
+                target,
+                UpdateMemoryDreamJob {
+                    id: &job_id,
+                    status: MemoryDreamJobStatus::Failed,
+                    output_summary_json: Some(&output_summary_json),
+                    transcript_chat_id: None,
+                    error_message: Some(&error_message),
+                },
+            )
+            .await
+            {
+                tracing::error!(
+                    job_id = %job_id,
+                    scope = request.scope.as_str(),
+                    workspace_id = request.workspace_id,
+                    run_error = %error_message,
+                    status_error = %status_error.message(),
+                    "Memory Dream job failed and durable status write also failed; job may remain running"
+                );
+            }
             tracing::error!(
                 job_id = %job_id,
                 scope = request.scope.as_str(),
@@ -613,6 +844,7 @@ async fn finish_memory_dream_job(
         }
     };
 
+    let database = target.open()?;
     let job = database
         .dream_job(&job_id)
         .map_err(ApiError::from_memory_error)?
@@ -633,8 +865,74 @@ async fn finish_memory_dream_job(
     })
 }
 
+/// Persist Dream job terminal status with bounded retries on ordinary gate pressure.
+///
+/// Failure to write a terminal status leaves the job stuck in `running`; concurrency
+/// must not silently drop the update.
+async fn write_dream_job_status_durably(
+    target: &MemoryDreamDatabaseTarget,
+    update: UpdateMemoryDreamJob<'_>,
+) -> Result<(), ApiError> {
+    const INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let started_at = Instant::now();
+    let mut delay = INITIAL_DELAY;
+    let mut attempt = 0_u64;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match target.open() {
+            Ok(mut database) => {
+                match database.update_dream_job_status(UpdateMemoryDreamJob {
+                    id: update.id,
+                    status: update.status,
+                    output_summary_json: update.output_summary_json,
+                    transcript_chat_id: update.transcript_chat_id,
+                    error_message: update.error_message,
+                }) {
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        let api_error = ApiError::from_memory_error(error);
+                        if !api_error
+                            .message
+                            .contains("workspace database concurrency limit reached")
+                            || started_at.elapsed() >= BUDGET
+                        {
+                            return Err(api_error);
+                        }
+                        tracing::warn!(
+                            job_id = %update.id,
+                            attempt,
+                            error = %api_error.message,
+                            "memory Dream terminal status write hit concurrency limit; bounded retry"
+                        );
+                    }
+                }
+            }
+            Err(api_error) => {
+                if !api_error
+                    .message
+                    .contains("workspace database concurrency limit reached")
+                    || started_at.elapsed() >= BUDGET
+                {
+                    return Err(api_error);
+                }
+                tracing::warn!(
+                    job_id = %update.id,
+                    attempt,
+                    error = %api_error.message,
+                    "memory Dream terminal status open hit concurrency limit; bounded retry"
+                );
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(MAX_DELAY);
+    }
+}
+
 async fn run_memory_dream_job_inner(
-    database: &mut MemoryDatabase,
+    target: &MemoryDreamDatabaseTarget,
     job_id: &str,
     request: MemoryDreamJobRequest<'_>,
     model_selection: Option<MemoryDreamModelSelection>,
@@ -642,18 +940,30 @@ async fn run_memory_dream_job_inner(
     policy: &MemoryDreamSafetyPolicy,
     transcript: &mut MemoryDreamTranscript,
 ) -> Result<DreamRunSummary, ApiError> {
-    let candidates = database
-        .dream_candidate_facts(
-            request.scope,
-            request.workspace_id,
-            request.settings.max_facts_per_run,
-        )
-        .map_err(ApiError::from_memory_error)?;
-    let reference_validation =
-        refresh_memory_dream_reference_validation(database, request, &candidates)
+    let (candidates, reference_validation, mut changes) = {
+        let candidates = {
+            let database = target.open()?;
+            database
+                .dream_candidate_facts(
+                    request.scope,
+                    request.workspace_id,
+                    request.settings.max_facts_per_run,
+                )
+                .map_err(ApiError::from_memory_error)?
+        };
+        // Workspace reference validation must not nest under a gated Memory permit.
+        let prepared_references =
+            prepare_memory_dream_reference_writes(request, &candidates)
+                .map_err(ApiError::from_memory_error)?;
+        let mut database = target.open()?;
+        let reference_validation =
+            apply_memory_dream_reference_writes(&mut database, &prepared_references)
+                .map_err(ApiError::from_memory_error)?;
+        let changes = deterministic_changes(&database, request.scope, &candidates, policy)
             .map_err(ApiError::from_memory_error)?;
-    let mut changes = deterministic_changes(database, request.scope, &candidates, policy)
-        .map_err(ApiError::from_memory_error)?;
+        (candidates, reference_validation, changes)
+    };
+    invoke_dream_after_short_open_hook();
     tracing::info!(
         job_id,
         scope = request.scope.as_str(),
@@ -698,10 +1008,16 @@ async fn run_memory_dream_job_inner(
         }),
     );
 
-    let mut apply_summary = apply_deterministic_changes(database, job_id, &mut changes, policy)
-        .map_err(ApiError::from_memory_error)?;
-    let mut profiles_refreshed = refresh_dream_profiles(database, request.scope, &apply_summary)
-        .map_err(ApiError::from_memory_error)?;
+    let mut apply_summary = {
+        let mut database = target.open()?;
+        apply_deterministic_changes(&mut database, job_id, &mut changes, policy)
+            .map_err(ApiError::from_memory_error)?
+    };
+    let mut profiles_refreshed = {
+        let mut database = target.open()?;
+        refresh_dream_profiles(&mut database, request.scope, &apply_summary)
+            .map_err(ApiError::from_memory_error)?
+    };
     tracing::info!(
         job_id,
         scope = request.scope.as_str(),
@@ -730,18 +1046,22 @@ async fn run_memory_dream_job_inner(
     let mut llm_error = None;
 
     if request.mode == MemoryDreamRunMode::Llm {
-        let candidate_fact_ids = candidates
-            .iter()
-            .map(|fact| fact.id.clone())
-            .collect::<Vec<_>>();
-        let candidate_edges = database
-            .edges_for_fact_ids(&candidate_fact_ids, MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS)
-            .map_err(ApiError::from_memory_error)?;
-        let source_summaries = memory_dream_source_summaries(database, &candidates)
-            .map_err(ApiError::from_memory_error)?;
-        let profiles = database
-            .profiles_for_scope(None, 8)
-            .map_err(ApiError::from_memory_error)?;
+        let (candidate_edges, source_summaries, profiles) = {
+            let database = target.open()?;
+            let candidate_fact_ids = candidates
+                .iter()
+                .map(|fact| fact.id.clone())
+                .collect::<Vec<_>>();
+            let candidate_edges = database
+                .edges_for_fact_ids(&candidate_fact_ids, MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS)
+                .map_err(ApiError::from_memory_error)?;
+            let source_summaries = memory_dream_source_summaries(&database, &candidates)
+                .map_err(ApiError::from_memory_error)?;
+            let profiles = database
+                .profiles_for_scope(None, 8)
+                .map_err(ApiError::from_memory_error)?;
+            (candidate_edges, source_summaries, profiles)
+        };
         let llm_result = match (request.planner, model_selection.as_ref()) {
             (Some(planner), Some(selection)) => {
                 run_memory_dream_llm_planner(
@@ -778,15 +1098,18 @@ async fn run_memory_dream_job_inner(
                     llm_changes_proposed,
                     "Memory Dream LLM planning completed"
                 );
-                let llm_apply_summary = apply_llm_changes(
-                    database,
-                    job_id,
-                    &validated_changes,
-                    policy,
-                    request.workspace_id,
-                    request.global_memory_database_file,
-                )
-                .map_err(ApiError::from_memory_error)?;
+                let llm_apply_summary = {
+                    let mut database = target.open()?;
+                    apply_llm_changes(
+                        &mut database,
+                        job_id,
+                        &validated_changes,
+                        policy,
+                        request.workspace_id,
+                        request.global_memory_database_file,
+                    )
+                    .map_err(ApiError::from_memory_error)?
+                };
                 let llm_applied = llm_apply_summary.applied;
                 let llm_failed = llm_apply_summary.failed;
                 apply_summary.applied += llm_apply_summary.applied;
@@ -796,9 +1119,11 @@ async fn run_memory_dream_job_inner(
                         apply_summary.changed_scopes.push(changed_scope);
                     }
                 }
-                profiles_refreshed =
-                    refresh_dream_profiles(database, request.scope, &apply_summary)
-                        .map_err(ApiError::from_memory_error)?;
+                profiles_refreshed = {
+                    let mut database = target.open()?;
+                    refresh_dream_profiles(&mut database, request.scope, &apply_summary)
+                        .map_err(ApiError::from_memory_error)?
+                };
                 transcript.record_json_best_effort(
                     "applied changes summary",
                     json!({
@@ -1071,16 +1396,16 @@ fn memory_dream_source_summaries(
     Ok(summaries)
 }
 
-fn refresh_memory_dream_reference_validation(
-    database: &mut MemoryDatabase,
+fn prepare_memory_dream_reference_writes(
     request: MemoryDreamJobRequest<'_>,
     candidates: &[MemoryFactRecord],
-) -> Result<DreamReferenceValidationSummary, MemoryDatabaseError> {
+) -> Result<Vec<(String, Vec<OwnedMemoryReference>)>, MemoryDatabaseError> {
     if candidates.is_empty() {
-        return Ok(DreamReferenceValidationSummary::default());
+        return Ok(Vec::new());
     }
 
     let workspace = memory_dream_reference_workspace(request);
+    // Open Workspace only while no Memory permit is held (same ordinary ledger).
     let (workspace_database, workspace_database_error) = match workspace {
         Some(workspace) => match WorkspaceDatabase::open_or_create(&workspace.path) {
             Ok(database) => (Some(database), None),
@@ -1090,6 +1415,7 @@ fn refresh_memory_dream_reference_validation(
     };
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
+    let mut prepared = Vec::with_capacity(candidates.len());
     for fact in candidates {
         let owned_references = validated_memory_references_for_fact(
             fact,
@@ -1099,6 +1425,21 @@ fn refresh_memory_dream_reference_validation(
             workspace_database_error.as_deref(),
             &checked_at,
         )?;
+        prepared.push((fact.id.clone(), owned_references));
+    }
+    drop(workspace_database);
+    Ok(prepared)
+}
+
+fn apply_memory_dream_reference_writes(
+    database: &mut MemoryDatabase,
+    prepared: &[(String, Vec<OwnedMemoryReference>)],
+) -> Result<DreamReferenceValidationSummary, MemoryDatabaseError> {
+    if prepared.is_empty() {
+        return Ok(DreamReferenceValidationSummary::default());
+    }
+
+    for (fact_id, owned_references) in prepared {
         let references = owned_references
             .iter()
             .map(|reference| NewMemoryReference {
@@ -1112,12 +1453,12 @@ fn refresh_memory_dream_reference_validation(
                 checked_at: reference.checked_at.as_deref(),
             })
             .collect::<Vec<_>>();
-        database.replace_fact_references(&fact.id, &references)?;
+        database.replace_fact_references(fact_id, &references)?;
     }
 
-    let fact_ids = candidates
+    let fact_ids = prepared
         .iter()
-        .map(|fact| fact.id.clone())
+        .map(|(fact_id, _)| fact_id.clone())
         .collect::<Vec<_>>();
     let references =
         database.references_for_fact_ids(&fact_ids, MEMORY_DREAM_PLANNER_MAX_REFERENCE_RECORDS)?;
@@ -3930,9 +4271,12 @@ mod tests {
             })
             .expect("set expiration");
 
-        let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+        let memory_path = temp_dir.path().join("memory.sqlite");
+        let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
+        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
+            .expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -3980,9 +4324,12 @@ mod tests {
             Some(0.9),
         );
 
-        let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+        let memory_path = temp_dir.path().join("memory.sqlite");
+        let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
+        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
+            .expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -4047,9 +4394,12 @@ mod tests {
             })
             .expect("make stale latest");
 
-        let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+        let memory_path = temp_dir.path().join("memory.sqlite");
+        let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Global))
             .await
             .expect("dream run");
+        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
+            .expect("reopen global memory");
 
         assert_eq!(result.applied_changes, 1);
         assert_eq!(result.failed_changes, 0);
@@ -4163,9 +4513,12 @@ mod tests {
             Some(0.92),
         );
 
-        let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Workspace))
+        let result = run_memory_dream_job(database, test_request(MemoryDreamScope::Workspace))
             .await
             .expect("dream run");
+        let database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("reopen workspace memory");
 
         assert_eq!(result.applied_changes, 1);
         let fact = database
@@ -4496,7 +4849,7 @@ mod tests {
         request.mode = MemoryDreamRunMode::Llm;
         request.trigger_type = MemoryDreamTriggerType::AutoInterval;
 
-        let result = run_memory_dream_job(&mut database, request)
+        let result = run_memory_dream_job(database, request)
             .await
             .expect("auto dream should fall back");
         let output: Value = serde_json::from_str(
@@ -4518,17 +4871,20 @@ mod tests {
     #[tokio::test]
     async fn manual_llm_dream_fails_without_planner_or_deterministic_changes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut database =
+        let database =
             MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
                 .expect("global memory database");
         let mut request = test_request(MemoryDreamScope::Global);
         request.mode = MemoryDreamRunMode::Llm;
 
-        let error = run_memory_dream_job(&mut database, request)
+        let memory_path = temp_dir.path().join("memory.sqlite");
+        let error = run_memory_dream_job(database, request)
             .await
             .expect_err("manual dream without planner should fail");
 
         assert!(error.message.contains("requires a configured model"));
+        let database = MemoryDatabase::open_or_create_global_at(&memory_path)
+            .expect("reopen global memory");
         let job = database
             .dream_jobs_for_scope(MemoryDreamScope::Global, None, None, 1)
             .expect("dream jobs")
@@ -4586,7 +4942,7 @@ mod tests {
         let workspace_dir = temp_dir.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
         WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
-        let mut database =
+        let database =
             MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
                 .expect("global memory database");
         let request = MemoryDreamJobRequest {
@@ -4605,7 +4961,7 @@ mod tests {
             }),
         };
 
-        let result = run_memory_dream_job(&mut database, request)
+        let result = run_memory_dream_job(database, request)
             .await
             .expect("dream run");
         let transcript_chat_id = result
@@ -4758,7 +5114,7 @@ mod tests {
         );
 
         let result = run_memory_dream_job(
-            &mut database,
+            database,
             MemoryDreamJobRequest {
                 scope: MemoryDreamScope::Workspace,
                 workspace_id: Some("workspace-1"),
@@ -4775,6 +5131,9 @@ mod tests {
         .await
         .expect("dream run");
 
+        let database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("reopen workspace memory");
         let references = database
             .references_for_fact_ids(&["fact-references".to_string()], 20)
             .expect("references");
@@ -4811,6 +5170,367 @@ mod tests {
         assert!(summary["referencesExtracted"].as_u64().unwrap() >= 8);
         assert!(summary["referencesInvalid"].as_u64().unwrap() >= 2);
         assert!(summary["referencesAmbiguous"].as_u64().unwrap() >= 2);
+    }
+
+    #[tokio::test]
+    async fn dream_path_driven_job_releases_ordinary_gate_between_short_opens() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_workspace(&workspace_dir).expect("workspace memory");
+            insert_test_fact(
+                &mut database,
+                "fact-hold",
+                MemoryScope::Workspace,
+                None,
+                MemoryStatus::Active,
+                MemoryKind::ProjectFact,
+                "workspace fact for gate release test",
+                Some(0.9),
+            );
+        }
+
+        let mid_job = Arc::new(Barrier::new(2));
+        let mid_job_for_hook = Arc::clone(&mid_job);
+        let workspace_for_hook = workspace_dir.clone();
+        let hook_slot = DREAM_AFTER_SHORT_OPEN_HOOK.get_or_init(|| Mutex::new(None));
+        *hook_slot.lock().expect("hook lock") = Some(Box::new(move || {
+            // Simulate provider/network await: no Memory/Workspace handle is held here.
+            // Ordinary capacity must be fully available to other workspace requests.
+            let held1 = foco_store::open_workspace_database(&workspace_for_hook)
+                .expect("ordinary open 1 during dream short-open gap");
+            let held2 = foco_store::open_workspace_database(&workspace_for_hook)
+                .expect("ordinary open 2 during dream short-open gap");
+            drop(held1);
+            drop(held2);
+            mid_job_for_hook.wait();
+        }));
+
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+
+        let dream = tokio::task::spawn_blocking(move || {
+            // Deterministic path still exercises multiple short opens around the hook.
+            tokio::runtime::Handle::current().block_on(async move {
+                run_memory_dream_job_with_target(target, test_request(MemoryDreamScope::Workspace))
+                    .await
+            })
+        });
+
+        // Wait until Dream has completed the first short open and entered the hook.
+        mid_job.wait();
+        *hook_slot.lock().expect("hook lock") = None;
+
+        let result = dream.await.expect("join dream").expect("dream job");
+        assert_eq!(result.job.status, MemoryDreamJobStatus::Completed.as_str());
+    }
+
+    #[test]
+    fn workspace_dream_start_with_transcript_uses_one_ordinary_slot() {
+        // Regression: Memory gated open + nested WorkspaceDatabase for transcript
+        // must not consume ordinary 2/2. Holding one ordinary elsewhere, start
+        // with create_transcript_chat must still succeed.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        {
+            let _ = MemoryDatabase::open_or_create_workspace(&workspace_dir)
+                .expect("seed workspace memory");
+        }
+
+        let external_hold = foco_store::open_workspace_database(&workspace_dir)
+            .expect("hold one ordinary permit");
+
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+        let job = start_memory_dream_job_with_target(
+            &target,
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(true),
+                config: None,
+                global_memory_database_file: None,
+                planner: None,
+                transcript: Some(MemoryDreamTranscriptRequest {
+                    workspace_id: "workspace-1",
+                    workspace_path: &workspace_dir,
+                }),
+            },
+        )
+        .expect("start with transcript while one ordinary is held");
+
+        assert_eq!(job.status, MemoryDreamJobStatus::Running.as_str());
+        assert!(
+            job.transcript_chat_id.is_some(),
+            "transcript chat should be attached"
+        );
+        drop(external_hold);
+    }
+
+    #[test]
+    fn workspace_dream_prepare_resume_uses_one_ordinary_slot() {
+        // Regression: prepare must drop Memory before transcript resume opens
+        // WorkspaceDatabase, otherwise ordinary capacity nests to 2.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+        let job = start_memory_dream_job_with_target(
+            &target,
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(true),
+                config: None,
+                global_memory_database_file: None,
+                planner: None,
+                transcript: Some(MemoryDreamTranscriptRequest {
+                    workspace_id: "workspace-1",
+                    workspace_path: &workspace_dir,
+                }),
+            },
+        )
+        .expect("start with transcript");
+        assert!(job.transcript_chat_id.is_some());
+
+        let external_hold = foco_store::open_workspace_database(&workspace_dir)
+            .expect("hold one ordinary permit");
+        let started = prepare_started_memory_dream_job_with_target(
+            &target,
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(true),
+                config: None,
+                global_memory_database_file: None,
+                planner: None,
+                transcript: Some(MemoryDreamTranscriptRequest {
+                    workspace_id: "workspace-1",
+                    workspace_path: &workspace_dir,
+                }),
+            },
+            job.id.clone(),
+        )
+        .expect("prepare resume while one ordinary is held");
+        assert_eq!(
+            started.transcript.chat_id(),
+            job.transcript_chat_id.as_deref()
+        );
+        drop(external_hold);
+    }
+
+    #[test]
+    fn workspace_dream_reference_validation_uses_one_ordinary_slot() {
+        // Regression: reference validate must open WorkspaceDatabase only after
+        // Memory is dropped; holding one ordinary elsewhere must still succeed.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("app")).expect("app dir");
+        std::fs::write(workspace_dir.join("app/main.rs"), "fn main() {}\n").expect("file");
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.workspaces[0].id = "workspace-1".to_string();
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_workspace(&workspace_dir).expect("workspace memory");
+            insert_test_fact(
+                &mut database,
+                "fact-ref-slot",
+                MemoryScope::Workspace,
+                None,
+                MemoryStatus::Active,
+                MemoryKind::ProjectFact,
+                "See `app/main.rs` for entry.",
+                Some(0.9),
+            );
+        }
+
+        let external_hold = foco_store::open_workspace_database(&workspace_dir)
+            .expect("hold one ordinary permit");
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+        let candidates = {
+            let database = target.open().expect("open memory");
+            database
+                .dream_candidate_facts(MemoryDreamScope::Workspace, Some("workspace-1"), 10)
+                .expect("candidates")
+        };
+        let prepared = prepare_memory_dream_reference_writes(
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(false),
+                config: Some(&config),
+                global_memory_database_file: None,
+                planner: None,
+                transcript: None,
+            },
+            &candidates,
+        )
+        .expect("prepare references while one ordinary held");
+        let mut database = target.open().expect("reopen memory");
+        let summary = apply_memory_dream_reference_writes(&mut database, &prepared)
+            .expect("apply references");
+        assert!(summary.total >= 1, "expected validated references");
+        drop(external_hold);
+    }
+
+    #[tokio::test]
+    async fn workspace_dream_full_run_with_references_and_transcript_uses_one_ordinary_slot() {
+        // End-to-end: ordinary already 1/2 while full deterministic run opens Memory,
+        // validates references via WorkspaceDatabase, resumes/writes transcript, and
+        // finishes — must never nest ordinary to 2/2.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("app")).expect("app dir");
+        std::fs::write(workspace_dir.join("app/main.rs"), "fn main() {}\n").expect("file");
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.workspaces[0].id = "workspace-1".to_string();
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_workspace(&workspace_dir).expect("workspace memory");
+            insert_test_fact(
+                &mut database,
+                "fact-e2e-slot",
+                MemoryScope::Workspace,
+                None,
+                MemoryStatus::Active,
+                MemoryKind::ProjectFact,
+                "See `app/main.rs` for entry.",
+                Some(0.9),
+            );
+        }
+
+        let external_hold = foco_store::open_workspace_database(&workspace_dir)
+            .expect("hold one ordinary permit");
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+        let result = run_memory_dream_job_with_target(
+            target.clone(),
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(true),
+                config: Some(&config),
+                global_memory_database_file: None,
+                planner: None,
+                transcript: Some(MemoryDreamTranscriptRequest {
+                    workspace_id: "workspace-1",
+                    workspace_path: &workspace_dir,
+                }),
+            },
+        )
+        .await
+        .expect("full dream run while one ordinary is held");
+        assert_eq!(result.job.status, MemoryDreamJobStatus::Completed.as_str());
+        assert!(result.job.transcript_chat_id.is_some());
+        let summary: Value =
+            serde_json::from_str(result.job.output_summary_json.as_deref().unwrap())
+                .expect("summary json");
+        assert!(
+            summary["referencesExtracted"].as_u64().unwrap_or(0) >= 1,
+            "reference validation should run under single ordinary slot"
+        );
+        drop(external_hold);
+    }
+
+    #[tokio::test]
+    async fn dream_failed_status_is_written_after_inner_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_workspace(&workspace_dir).expect("workspace memory");
+            insert_test_fact(
+                &mut database,
+                "fact-fail",
+                MemoryScope::Workspace,
+                None,
+                MemoryStatus::Active,
+                MemoryKind::ProjectFact,
+                "workspace fact",
+                Some(0.9),
+            );
+        }
+
+        // Force LLM mode without planner model resolution so the run fails after start.
+        let target = MemoryDreamDatabaseTarget::from_scope_paths(
+            MemoryDreamScope::Workspace,
+            None,
+            Some(&workspace_dir),
+        )
+        .expect("target");
+        let error = run_memory_dream_job_with_target(
+            target.clone(),
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::Llm,
+                model_id: None,
+                settings: test_settings(false),
+                config: None,
+                global_memory_database_file: None,
+                planner: None,
+                transcript: None,
+            },
+        )
+        .await
+        .expect_err("LLM dream without planner should fail");
+        assert!(!error.message().is_empty());
+
+        let database = target.open().expect("reopen memory");
+        let jobs = database
+            .dream_jobs_for_scope(
+                MemoryDreamScope::Workspace,
+                Some("workspace-1"),
+                Some(MemoryDreamJobStatus::Failed),
+                10,
+            )
+            .expect("list failed jobs");
+        assert_eq!(jobs.len(), 1, "failed terminal status must be durable");
+        assert_eq!(jobs[0].status, MemoryDreamJobStatus::Failed.as_str());
     }
 
     fn test_request(scope: MemoryDreamScope) -> MemoryDreamJobRequest<'static> {
