@@ -4113,16 +4113,34 @@ export function App() {
       setWorkspaceFileContextMenu(null);
     }
 
+    // Only close on scrolls that can move the menu anchor (context panel / window).
+    // Message-list auto-scroll during streaming must not dismiss the file menu.
+    function closeWorkspaceFileContextMenuForScroll(event: Event) {
+      const target = event.target;
+      if (
+        target === document ||
+        target === document.documentElement ||
+        target === document.body ||
+        target === window
+      ) {
+        setWorkspaceFileContextMenu(null);
+        return;
+      }
+      if (target instanceof Element && target.closest(".context-panel")) {
+        setWorkspaceFileContextMenu(null);
+      }
+    }
+
     window.addEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
     window.addEventListener("keydown", closeWorkspaceFileContextMenuForKey);
     window.addEventListener("resize", closeWorkspaceFileContextMenu);
-    window.addEventListener("scroll", closeWorkspaceFileContextMenu, true);
+    window.addEventListener("scroll", closeWorkspaceFileContextMenuForScroll, true);
 
     return () => {
       window.removeEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
       window.removeEventListener("keydown", closeWorkspaceFileContextMenuForKey);
       window.removeEventListener("resize", closeWorkspaceFileContextMenu);
-      window.removeEventListener("scroll", closeWorkspaceFileContextMenu, true);
+      window.removeEventListener("scroll", closeWorkspaceFileContextMenuForScroll, true);
     };
   }, [workspaceFileContextMenu]);
 

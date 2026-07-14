@@ -5086,6 +5086,30 @@ describe("app-panels-stats verification surfaces", () => {
     }
   });
 
+  it("closes the file tree context menu when the context panel scrolls", async () => {
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    const fileRow = (await screen.findByText("README.md")).closest(
+      "div[role='treeitem']",
+    );
+    expect(fileRow).not.toBeNull();
+    fireEvent.contextMenu(fileRow as HTMLElement);
+    expect(await screen.findByRole("menu", { name: "README.md" })).toBeInTheDocument();
+
+    const fileTree = document.querySelector(".workspace-file-tree");
+    const fileScrollContainer = fileTree?.closest(".panel-scroll");
+    if (!(fileScrollContainer instanceof HTMLElement)) {
+      throw new Error("Expected file tree scroll container inside context panel");
+    }
+    expect(fileScrollContainer.closest(".context-panel")).not.toBeNull();
+    fireEvent.scroll(fileScrollContainer);
+
+    expect(screen.queryByRole("menu", { name: "README.md" })).not.toBeInTheDocument();
+  });
+
   it("toggles markdown file preview from the editor toolbar", async () => {
     renderApp();
 
