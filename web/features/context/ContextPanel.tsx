@@ -75,7 +75,7 @@ import {
   CONTEXT_PANEL_MAX_WIDTH,
   CONTEXT_PANEL_MIN_HEIGHT,
   CONTEXT_PANEL_MIN_WIDTH,
-  MOBILE_BREAKPOINT_PX,
+  CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
 } from "../../app/constants";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "../chat/MarkdownContent";
 import { toolDisplayName } from "../chat/chat-helpers";
@@ -984,7 +984,7 @@ function ContextPlanTab({
         ) : null}
         <button
           aria-label={t("Audit plan worktrees")}
-          className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          className="plan-worktree-audit-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
           disabled={isLoadingWorktreeAudit}
           onClick={toggleWorktreeAudit}
           title={t("Audit plan worktrees")}
@@ -995,7 +995,7 @@ function ContextPlanTab({
           ) : (
             <Eye aria-hidden="true" className="size-3.5" />
           )}
-          {t("Audit")}
+          <span className="plan-worktree-audit-button-label">{t("Audit")}</span>
         </button>
       </div>
 
@@ -3120,6 +3120,7 @@ function InlineGitDiffNotice({ children }: { children: ReactNode }) {
 }
 
 type ContextPanelSidebarProps = ComponentProps<typeof ContextPanel> & {
+  contextPanelMobileHeight: number;
   diffPanelWidth: number;
   isResizing: boolean;
   onResizeStart: () => void;
@@ -3128,6 +3129,7 @@ type ContextPanelSidebarProps = ComponentProps<typeof ContextPanel> & {
 };
 
 export function ContextPanelSidebar({
+  contextPanelMobileHeight,
   diffPanelWidth,
   isResizing,
   onResizeStart,
@@ -3136,18 +3138,67 @@ export function ContextPanelSidebar({
   ...panelProps
 }: ContextPanelSidebarProps) {
   const { t } = useI18n();
+  const [isStackedLayout, setIsStackedLayout] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.innerWidth < CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
+  );
+  const [stackedMaxHeight, setStackedMaxHeight] = useState(() =>
+    typeof window !== "undefined"
+      ? Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO)
+      : CONTEXT_PANEL_MIN_HEIGHT,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    function syncStackedLayoutMetrics() {
+      setIsStackedLayout(window.innerWidth < CONTEXT_PANEL_STACKED_BREAKPOINT_PX);
+      setStackedMaxHeight(
+        Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO),
+      );
+    }
+
+    syncStackedLayoutMetrics();
+    window.addEventListener("resize", syncStackedLayoutMetrics);
+    return () => {
+      window.removeEventListener("resize", syncStackedLayoutMetrics);
+    };
+  }, []);
 
   return (
     <aside className="context-sidebar diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
       <div className="relative flex h-full min-h-0 min-w-0 flex-col">
         <div
           aria-label={t("Resize context panel")}
-          aria-orientation="vertical"
-          aria-valuemax={CONTEXT_PANEL_MAX_WIDTH}
-          aria-valuemin={CONTEXT_PANEL_MIN_WIDTH}
-          aria-valuenow={diffPanelWidth}
+          aria-orientation={isStackedLayout ? "horizontal" : "vertical"}
+          aria-valuemax={isStackedLayout ? stackedMaxHeight : CONTEXT_PANEL_MAX_WIDTH}
+          aria-valuemin={isStackedLayout ? CONTEXT_PANEL_MIN_HEIGHT : CONTEXT_PANEL_MIN_WIDTH}
+          aria-valuenow={isStackedLayout ? contextPanelMobileHeight : diffPanelWidth}
           className={`context-sidebar-splitter ${isResizing ? "context-sidebar-splitter-active" : ""}`}
           onKeyDown={(event) => {
+            if (isStackedLayout) {
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setMobileHeight((current) =>
+                  Math.min(
+                    current + 24,
+                    Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO),
+                  ),
+                );
+              }
+
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setMobileHeight((current) =>
+                  Math.max(current - 24, CONTEXT_PANEL_MIN_HEIGHT),
+                );
+              }
+              return;
+            }
+
             if (event.key === "ArrowLeft") {
               event.preventDefault();
               setWidth((current) => Math.min(current + 24, CONTEXT_PANEL_MAX_WIDTH));
@@ -3157,31 +3208,22 @@ export function ContextPanelSidebar({
               event.preventDefault();
               setWidth((current) => Math.max(current - 24, CONTEXT_PANEL_MIN_WIDTH));
             }
-
-            if (event.key === "ArrowUp") {
-              event.preventDefault();
-              setMobileHeight((current) =>
-                Math.min(
-                  current + 24,
-                  Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO),
-                ),
-              );
-            }
-
-            if (event.key === "ArrowDown") {
-              event.preventDefault();
-              setMobileHeight((current) => Math.max(current - 24, CONTEXT_PANEL_MIN_HEIGHT));
-            }
           }}
           onPointerDown={(event) => {
             event.preventDefault();
-            if (window.innerWidth < MOBILE_BREAKPOINT_PX) {
-              const maxHeight = Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO);
+            if (window.innerWidth < CONTEXT_PANEL_STACKED_BREAKPOINT_PX) {
+              const maxHeight = Math.floor(
+                window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO,
+              );
               const nextHeight = window.innerHeight - event.clientY;
-              setMobileHeight(Math.min(Math.max(nextHeight, CONTEXT_PANEL_MIN_HEIGHT), maxHeight));
+              setMobileHeight(
+                Math.min(Math.max(nextHeight, CONTEXT_PANEL_MIN_HEIGHT), maxHeight),
+              );
             } else {
               const nextWidth = window.innerWidth - event.clientX;
-              setWidth(Math.min(Math.max(nextWidth, CONTEXT_PANEL_MIN_WIDTH), CONTEXT_PANEL_MAX_WIDTH));
+              setWidth(
+                Math.min(Math.max(nextWidth, CONTEXT_PANEL_MIN_WIDTH), CONTEXT_PANEL_MAX_WIDTH),
+              );
             }
             event.currentTarget.setPointerCapture(event.pointerId);
             onResizeStart();

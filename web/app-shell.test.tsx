@@ -1,5 +1,6 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -1747,67 +1748,162 @@ describe("app-shell verification surfaces", () => {
   });
 
   it("keeps context panel resize from selecting panel text", async () => {
-    renderApp();
-
-    const splitter = await screen.findByRole("separator", {
-      name: "Resize context panel",
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 1440,
     });
 
-    fireEvent.pointerDown(splitter, { clientX: 900, pointerId: 1 });
+    try {
+      renderApp();
 
-    await waitFor(() => {
-      expect(document.body.style.cursor).toBe("col-resize");
-      expect(document.body.style.userSelect).toBe("none");
-    });
+      const splitter = await screen.findByRole("separator", {
+        name: "Resize context panel",
+      });
 
-    fireEvent.pointerMove(window, { clientX: 880 });
-    fireEvent.pointerUp(window);
+      fireEvent.pointerDown(splitter, { clientX: 900, pointerId: 1 });
 
-    await waitFor(() => {
-      expect(document.body.style.cursor).toBe("");
-      expect(document.body.style.userSelect).toBe("");
-    });
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("col-resize");
+        expect(document.body.style.userSelect).toBe("none");
+      });
+
+      fireEvent.pointerMove(window, { clientX: 880 });
+      fireEvent.pointerUp(window);
+
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("");
+        expect(document.body.style.userSelect).toBe("");
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
   });
 
-  it("resizes the context panel height on mobile browsers", async () => {
+  it.each([
+    { label: "phone portrait", width: 390, height: 844 },
+    { label: "narrow stacked layout", width: 900, height: 844 },
+  ])(
+    "resizes the context panel height on $label ($width px)",
+    async ({ width, height }) => {
+      const originalInnerWidth = window.innerWidth;
+      const originalInnerHeight = window.innerHeight;
+
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: width,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: height,
+      });
+
+      try {
+        renderApp();
+        await screen.findByPlaceholderText(defaultComposerPlaceholder);
+
+        const openButton = screen.queryByRole("button", { name: "Open context panel" });
+        if (openButton) {
+          await userEvent.click(openButton);
+        }
+
+        const splitter = await screen.findByRole("separator", {
+          name: "Resize context panel",
+        });
+        expect(splitter).toHaveAttribute("aria-orientation", "horizontal");
+        const appShell = splitter.closest(".app-shell") as HTMLElement | null;
+        if (!appShell) {
+          throw new Error("Expected context panel splitter inside app shell");
+        }
+
+        const widthBefore = appShell.style.getPropertyValue("--diff-panel-width");
+
+        fireEvent.pointerDown(splitter, { clientY: 620, pointerId: 1 });
+
+        await waitFor(() => {
+          expect(document.body.style.cursor).toBe("row-resize");
+          expect(document.body.style.userSelect).toBe("none");
+          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("224px");
+        });
+
+        fireEvent.pointerMove(window, { clientY: 560 });
+
+        await waitFor(() => {
+          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("284px");
+        });
+
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe(widthBefore);
+
+        fireEvent.pointerUp(window);
+
+        await waitFor(() => {
+          expect(document.body.style.cursor).toBe("");
+          expect(document.body.style.userSelect).toBe("");
+        });
+      } finally {
+        Object.defineProperty(window, "innerWidth", {
+          configurable: true,
+          value: originalInnerWidth,
+        });
+        Object.defineProperty(window, "innerHeight", {
+          configurable: true,
+          value: originalInnerHeight,
+        });
+      }
+    },
+  );
+
+  it("resizes the context panel width on desktop without changing stacked height", async () => {
     const originalInnerWidth = window.innerWidth;
     const originalInnerHeight = window.innerHeight;
 
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
-      value: 390,
+      value: 1440,
     });
     Object.defineProperty(window, "innerHeight", {
       configurable: true,
-      value: 844,
+      value: 900,
     });
 
     try {
       renderApp();
-      await screen.findByPlaceholderText(defaultComposerPlaceholder);
-      await userEvent.click(await screen.findByRole("button", { name: "Open context panel" }));
 
       const splitter = await screen.findByRole("separator", {
         name: "Resize context panel",
       });
+      expect(splitter).toHaveAttribute("aria-orientation", "vertical");
       const appShell = splitter.closest(".app-shell") as HTMLElement | null;
       if (!appShell) {
         throw new Error("Expected context panel splitter inside app shell");
       }
 
-      fireEvent.pointerDown(splitter, { clientY: 620, pointerId: 1 });
+      const heightBefore = appShell.style.getPropertyValue("--context-panel-mobile-height");
+
+      fireEvent.pointerDown(splitter, { clientX: 1100, pointerId: 1 });
 
       await waitFor(() => {
-        expect(document.body.style.cursor).toBe("row-resize");
+        expect(document.body.style.cursor).toBe("col-resize");
         expect(document.body.style.userSelect).toBe("none");
-        expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("224px");
       });
 
-      fireEvent.pointerMove(window, { clientY: 560 });
+      fireEvent.pointerMove(window, { clientX: 1080 });
 
       await waitFor(() => {
-        expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("284px");
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe("360px");
       });
+
+      // 1440 - 1080 = 360, which equals default width; drag further to prove width updates.
+      fireEvent.pointerMove(window, { clientX: 1000 });
+
+      await waitFor(() => {
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe("440px");
+      });
+
+      expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe(heightBefore);
 
       fireEvent.pointerUp(window);
 
@@ -1825,6 +1921,29 @@ describe("app-shell verification surfaces", () => {
         value: originalInnerHeight,
       });
     }
+  });
+
+  it("keeps stacked context panel height and horizontal splitter styles at the 1199px breakpoint", () => {
+    const stylesCss = readFileSync("styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 1199px\)[\s\S]*?--context-panel-mobile-height/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 1199px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?cursor:\s*row-resize/,
+    );
+    expect(stylesCss).not.toMatch(
+      /@media \(max-width: 1199px\)[\s\S]*?grid-template-rows:\s*minmax\(0,\s*1fr\)\s*minmax\(18rem,\s*36dvh\)/,
+    );
+    expect(stylesCss).not.toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?cursor:\s*row-resize[\s\S]*?@media \(max-width: 1199px\)/,
+    );
+
+    // Horizontal splitter must not be exclusive to the phone media query only.
+    const phoneOnlySplitter = stylesCss.match(
+      /@media \(max-width: 767px\)\s*\{[^}]*\.context-sidebar-splitter\s*\{[\s\S]*?cursor:\s*row-resize/,
+    );
+    expect(phoneOnlySplitter).toBeNull();
   });
 
   it("resizes the message composer from the splitter on desktop and mobile browsers", async () => {

@@ -18,7 +18,13 @@ export const CONTEXT_PANEL_MAX_WIDTH = 720;
 export const CONTEXT_PANEL_MIN_HEIGHT = 224;
 export const CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT = 280;
 export const CONTEXT_PANEL_MAX_HEIGHT_RATIO = 0.72;
+/** Phone navigation/UI breakpoint (CSS max-width: 767px). */
 export const MOBILE_BREAKPOINT_PX = 768;
+/**
+ * Context panel stacked (main above panel) layout breakpoint.
+ * Matches CSS `@media (max-width: 1199px)` → JS `innerWidth < 1200`.
+ */
+export const CONTEXT_PANEL_STACKED_BREAKPOINT_PX = 1200;
 export const MAX_CHAT_ATTACHMENTS = 6;
 export const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;

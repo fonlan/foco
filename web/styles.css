@@ -3242,7 +3242,17 @@ body,
       3rem
       var(--sidebar-width, 16.25rem)
       minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) minmax(18rem, 36dvh);
+    grid-template-rows: minmax(0, 1fr) minmax(
+        var(--context-panel-min-height, 14rem),
+        min(var(--context-panel-mobile-height, 36dvh), 72dvh)
+      );
+  }
+
+  .app-shell.app-shell-with-context {
+    grid-template-rows: minmax(0, 1fr) minmax(
+        var(--context-panel-min-height, 14rem),
+        min(var(--context-panel-mobile-height, 36dvh), 72dvh)
+      );
   }
 }
 
@@ -3253,7 +3263,10 @@ body,
       "nav main"
       "nav diff";
     grid-template-columns: 3rem minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) minmax(14rem, 34dvh);
+    grid-template-rows: minmax(0, 1fr) minmax(
+        var(--context-panel-min-height, 14rem),
+        min(var(--context-panel-mobile-height, 34dvh), 72dvh)
+      );
   }
 
   .foco-nav-rail {
@@ -3788,7 +3801,10 @@ body,
       "nav main"
       "nav diff";
     grid-template-columns: 3rem minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) minmax(14rem, 34dvh);
+    grid-template-rows: minmax(0, 1fr) minmax(
+        var(--context-panel-min-height, 14rem),
+        min(var(--context-panel-mobile-height, 34dvh), 72dvh)
+      );
   }
 
   .app-shell.app-shell-workspace-closed .workspace-sidebar {
@@ -4936,29 +4952,12 @@ summary:focus-visible {
   background: transparent;
 }
 
-@media (max-width: 767px) {
+@media (max-width: 1199px) {
   .app-shell.app-shell-with-context {
     grid-template-rows: minmax(0, 1fr) minmax(
         var(--context-panel-min-height),
         min(var(--context-panel-mobile-height), 72dvh)
       );
-  }
-
-  .message-list {
-    padding: 0.625rem;
-  }
-
-  .message-stack {
-    max-width: 100%;
-  }
-
-  .message-bubble {
-    width: 100%;
-    gap: 0;
-  }
-
-  .message-bubble .message-avatar {
-    display: none;
   }
 
   .context-sidebar-splitter {
@@ -4989,5 +4988,45 @@ summary:focus-visible {
   .context-sidebar-splitter-active::before {
     height: 2px;
     background: var(--foco-accent);
+  }
+}
+
+@media (max-width: 767px) {
+  .message-list {
+    padding: 0.625rem;
+  }
+
+  .message-stack {
+    max-width: 100%;
+  }
+
+  .message-bubble {
+    width: 100%;
+    gap: 0;
+  }
+
+  .message-bubble .message-avatar {
+    display: none;
+  }
+
+  .plan-worktree-audit-button {
+    position: relative;
+    width: 2rem;
+    min-width: 2rem;
+    height: 2rem;
+    padding-inline: 0;
+    gap: 0;
+  }
+
+  .plan-worktree-audit-button-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 }

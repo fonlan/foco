@@ -168,6 +168,7 @@ import {
   CONTEXT_PANEL_MAX_WIDTH,
   CONTEXT_PANEL_MIN_HEIGHT,
   CONTEXT_PANEL_MIN_WIDTH,
+  CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
   CREATE_BRANCH_OPTION_VALUE,
   MAX_CHAT_ATTACHMENTS,
   MAX_CHAT_ATTACHMENT_BYTES,
@@ -4090,7 +4091,7 @@ export function App() {
     maxWidth: CONTEXT_PANEL_MAX_WIDTH,
     minHeight: CONTEXT_PANEL_MIN_HEIGHT,
     minWidth: CONTEXT_PANEL_MIN_WIDTH,
-    mobileBreakpoint: MOBILE_BREAKPOINT_PX,
+    stackedBreakpoint: CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
     onResizeEnd: () => setIsResizingDiffPanel(false),
     setHeight: setContextPanelMobileHeight,
     setWidth: setDiffPanelWidth,
@@ -11884,6 +11885,7 @@ export function App() {
                 contextMemoryError={contextMemoryError}
                 diffError={diffError}
                 diffPanelWidth={diffPanelWidth}
+                contextPanelMobileHeight={contextPanelMobileHeight}
                 diffResponse={gitDiff}
                 files={contextPanelFiles}
                 gitCommitMessage={gitCommitMessage}

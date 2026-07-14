@@ -71,7 +71,8 @@ type PanelResizeEffectOptions = {
   maxWidth: number;
   minHeight: number;
   minWidth: number;
-  mobileBreakpoint: number;
+  /** Width below which the panel is stacked under main and resizes by height. */
+  stackedBreakpoint: number;
   onResizeEnd: () => void;
   setHeight: (value: number | ((current: number) => number)) => void;
   setWidth: (value: number | ((current: number) => number)) => void;
@@ -83,7 +84,7 @@ export function useRightPanelResizeEffect({
   maxWidth,
   minHeight,
   minWidth,
-  mobileBreakpoint,
+  stackedBreakpoint,
   onResizeEnd,
   setHeight,
   setWidth,
@@ -93,8 +94,12 @@ export function useRightPanelResizeEffect({
       return;
     }
 
+    // Freeze layout axis for this pointer session so mid-drag viewport
+    // changes cannot flip height/width handling while the cursor stays fixed.
+    const stacked = window.innerWidth < stackedBreakpoint;
+
     function handlePointerMove(event: PointerEvent) {
-      if (window.innerWidth < mobileBreakpoint) {
+      if (stacked) {
         const maxHeight = Math.floor(window.innerHeight * maxHeightRatio);
         const nextHeight = window.innerHeight - event.clientY;
         setHeight(Math.min(Math.max(nextHeight, minHeight), maxHeight));
@@ -111,7 +116,7 @@ export function useRightPanelResizeEffect({
 
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = window.innerWidth < mobileBreakpoint ? "row-resize" : "col-resize";
+    document.body.style.cursor = stacked ? "row-resize" : "col-resize";
     document.body.style.userSelect = "none";
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp);
@@ -130,7 +135,7 @@ export function useRightPanelResizeEffect({
     maxWidth,
     minHeight,
     minWidth,
-    mobileBreakpoint,
+    stackedBreakpoint,
     onResizeEnd,
     setHeight,
     setWidth,

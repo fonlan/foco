@@ -6,6 +6,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Plan } from "./api/types";
@@ -1480,6 +1481,10 @@ describe("app-panels-stats verification surfaces", () => {
     const auditButton = screen.getByRole("button", {
       name: "Audit plan worktrees",
     });
+    expect(auditButton).toHaveClass("plan-worktree-audit-button");
+    expect(auditButton.querySelector(".plan-worktree-audit-button-label")).toHaveTextContent(
+      "Audit",
+    );
     await user.click(auditButton);
 
     expect(await screen.findByText("Legacy worktrees")).toBeInTheDocument();
@@ -1496,6 +1501,21 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.getByText("No active plans for this workspace."),
     ).toBeInTheDocument();
+  });
+
+  it("hides plan worktree audit label only under the phone breakpoint", () => {
+    const stylesCss = readFileSync("styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.plan-worktree-audit-button-label\s*\{[\s\S]*?clip:\s*rect\(0,\s*0,\s*0,\s*0\)/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.plan-worktree-audit-button\s*\{[\s\S]*?width:\s*2rem/,
+    );
+    // Label must remain visible outside the phone breakpoint (no global hide).
+    expect(stylesCss).not.toMatch(
+      /^\.plan-worktree-audit-button-label\s*\{[\s\S]*?clip:\s*rect/m,
+    );
   });
 
   it("loads and toggles backend plan auto-run state", async () => {
