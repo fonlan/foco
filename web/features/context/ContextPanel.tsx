@@ -2275,7 +2275,10 @@ function ContextStatsTab({
         ) : null}
       </div>
 
-      <ContextUsageTimelinePanel contextUsage={contextUsage} />
+      <ContextUsageTimelinePanel
+        contextUsage={contextUsage}
+        runtimeToolStateCompressionEnabled={runtimeToolStateCompressionEnabled}
+      />
 
       <div className="context-stats-metrics">
         <ContextStatMetric
@@ -2376,8 +2379,10 @@ function ContextStatsTab({
 
 function ContextUsageTimelinePanel({
   contextUsage,
+  runtimeToolStateCompressionEnabled,
 }: {
   contextUsage: ContextUsageResponse | null;
+  runtimeToolStateCompressionEnabled: boolean;
 }) {
   const { t } = useI18n();
 
@@ -2396,7 +2401,9 @@ function ContextUsageTimelinePanel({
     contextWindow: contextUsage.contextWindow,
     totalUsedTokens: contextUsage.totalUsedContextTokens,
     segments: contextUsage.segments,
-    toolCompressionTriggerPercent: contextUsage.compressionTriggerPercent,
+    toolCompressionTriggerPercent: runtimeToolStateCompressionEnabled
+      ? contextUsage.compressionTriggerPercent
+      : undefined,
     llmCompressionTriggerPercent: contextUsage.llmCompressionTriggerPercent,
   };
   return (
@@ -2446,9 +2453,13 @@ function ContextUsageBar({
   const { language, t } = useI18n();
   const contextWindow = Math.max(entry.contextWindow, 1);
   const usedPercent = (entry.totalUsedTokens / contextWindow) * 100;
-  const toolCompressionTriggerPercent = entry.toolCompressionTriggerPercent ?? 80;
+  const toolCompressionTriggerPercent =
+    typeof entry.toolCompressionTriggerPercent === "number"
+      ? entry.toolCompressionTriggerPercent
+      : null;
   const llmCompressionTriggerPercent = entry.llmCompressionTriggerPercent ?? 95;
-  const isPastTrigger = usedPercent >= toolCompressionTriggerPercent;
+  const isPastToolTrigger =
+    toolCompressionTriggerPercent != null && usedPercent >= toolCompressionTriggerPercent;
   const displayMeta =
     typeof entry.usagePercent === "number" ? `${entry.usagePercent}%` : entry.meta;
   let usedPercentCursor = 0;
@@ -2470,17 +2481,19 @@ function ContextUsageBar({
   return (
     <div className={`context-usage-bar-row${isCurrent ? " is-current" : ""}`}>
       <div className="context-usage-bar-topline">
-        {isPastTrigger ? (
+        {isPastToolTrigger && toolCompressionTriggerPercent != null ? (
           <strong>
             {t("Past {percent}%", { percent: toolCompressionTriggerPercent })}
           </strong>
         ) : null}
-        <span
-          className="context-usage-bar-threshold is-tool-state"
-          style={{ left: `${toolCompressionTriggerPercent}%` }}
-        >
-          {toolCompressionTriggerPercent}%
-        </span>
+        {toolCompressionTriggerPercent != null ? (
+          <span
+            className="context-usage-bar-threshold is-tool-state"
+            style={{ left: `${toolCompressionTriggerPercent}%` }}
+          >
+            {toolCompressionTriggerPercent}%
+          </span>
+        ) : null}
         <span
           className="context-usage-bar-threshold is-llm"
           style={{ left: `${llmCompressionTriggerPercent}%` }}
@@ -2515,11 +2528,13 @@ function ContextUsageBar({
             style={{ backgroundColor: segment.color, width: `${segment.widthPercent}%` }}
           />
         ))}
-        <span
-          className="context-usage-trigger-marker is-tool-state"
-          aria-hidden="true"
-          style={{ left: `${toolCompressionTriggerPercent}%` }}
-        />
+        {toolCompressionTriggerPercent != null ? (
+          <span
+            className="context-usage-trigger-marker is-tool-state"
+            aria-hidden="true"
+            style={{ left: `${toolCompressionTriggerPercent}%` }}
+          />
+        ) : null}
         <span
           className="context-usage-trigger-marker is-llm"
           aria-hidden="true"

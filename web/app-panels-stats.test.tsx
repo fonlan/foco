@@ -3230,7 +3230,15 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(contextTimeline).queryByText("Past 80%"),
     ).not.toBeInTheDocument();
-    expect(within(contextTimeline).getAllByText("80%")).not.toHaveLength(0);
+    expect(within(contextTimeline).queryByText("80%")).not.toBeInTheDocument();
+    expect(
+      contextTimeline.querySelector(".context-usage-bar-threshold.is-tool-state"),
+    ).toBeNull();
+    expect(
+      contextTimeline.querySelector(
+        ".context-usage-trigger-marker.is-tool-state",
+      ),
+    ).toBeNull();
     expect(within(contextTimeline).getAllByText("95%")).not.toHaveLength(0);
     const contextLegend = within(contextTimeline).getByLabelText(
       "Context usage legend",
@@ -3320,6 +3328,18 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(toolHistoryCompression.parentElement!).getByText("2"),
     ).toBeInTheDocument();
+
+    const contextTimeline = screen.getByLabelText("Context usage timeline");
+    expect(within(contextTimeline).getAllByText("80%")).not.toHaveLength(0);
+    expect(within(contextTimeline).getAllByText("95%")).not.toHaveLength(0);
+    expect(
+      contextTimeline.querySelector(".context-usage-bar-threshold.is-tool-state"),
+    ).not.toBeNull();
+    expect(
+      contextTimeline.querySelector(
+        ".context-usage-trigger-marker.is-tool-state",
+      ),
+    ).not.toBeNull();
   });
 
   it("renders partial active chat statistics and context usage payloads without crashing", async () => {
