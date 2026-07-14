@@ -1306,19 +1306,23 @@ pub(crate) fn workspace_spec_compaction_provider_request(
     let current_bytes = content_markdown.len();
     let cut_percent = required_cut_percent(current_bytes, target_bytes);
     let aggression = match attempt {
-        1 => "Prefer deletion over paraphrasing. Merge duplicate local/remote or repeated facts.",
+        1 => {
+            "Prefer deletion over paraphrasing. Merge duplicate local/remote or repeated facts. Reconcile Open Questions: keep only currently unresolved decisions that affect future work; delete completed work, optional backlog, residual-risk dumps, and verification logs."
+        }
         2 => {
-            "Be aggressive: delete whole low-value subsections, collapse long matrices into short bullets, keep only durable contracts."
+            "Be aggressive: delete whole low-value subsections, collapse long matrices into short bullets, keep only durable contracts and still-unresolved Open Questions. Delete completed tasks, optional backlog, residual-risk dumps, and verification logs from Open Questions."
         }
         _ => {
-            "Emergency cut: keep Purpose, Architecture, key contracts, and Open Questions; ruthlessly drop examples, tables, and repeated operational prose."
+            "Emergency cut: keep Purpose, Architecture, key contracts, and only still-unresolved Open Questions; ruthlessly drop examples, tables, repeated operational prose, completed work, optional backlog, residual-risk dumps, and verification logs."
         }
     };
     let system_prompt = format!(
         "Compress the provided Project Spec Markdown into a complete replacement document. \
 Your ONLY success criterion is that contentMarkdown UTF-8 length is STRICTLY under {target_bytes} bytes \
 (hard store limit {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES}). \
-Preserve the existing language and section shape. Preserve durable product behavior, architecture, runtime flows, data contracts, commands, settings, UI contracts, agent/tool contracts, operational constraints, and open questions. \
+Preserve the existing language and section shape. Preserve durable product behavior, architecture, runtime flows, data contracts, commands, settings, UI contracts, agent/tool contracts, and operational constraints. \
+For Open Questions, reconcile and preserve only currently unresolved decisions or unknowns that still materially affect future product or implementation; do not unconditionally keep historical Open Questions content. \
+If a resolved item still defines current behavior, keep a concise final form in the matching formal section first; delete delivery history, phase status, and verification logs rather than dropping live contracts. \
 {aggression} \
 Omit low-value details such as long file lists, exhaustive symbol lists, repeated facts, transient task history, implementation blow-by-blow notes, verbose local-vs-SSH dual write-ups, and UI copy minutiae unless they define a contract. \
 Do not invent facts. Use the submit_workspace_spec tool exactly once."
@@ -1646,15 +1650,19 @@ pub(crate) fn default_workspace_spec_generation_system_prompt() -> String {
     format!(
         "Generate a concise Project Spec Markdown document from provided evidence. \
 Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
-Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep durable product, architecture, data, command, settings, and operational facts; omit low-value details such as long file lists, exhaustive symbol lists, repeated notes, transient task history, and implementation minutiae that do not guide future work. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
+Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Do not invent product claims. Keep durable product, architecture, data, command, settings, and operational facts; omit low-value details such as long file lists, exhaustive symbol lists, repeated notes, transient task history, and implementation minutiae that do not guide future work. \
+Open Questions is only for currently unresolved decisions or unknowns that will materially affect future product or implementation. Do not use it as a changelog, completed-work ledger, backlog, or residual-risk dump. When evidence is already implemented, decided, explicitly out of scope, or only an optional future optimization, do not put it in Open Questions; place durable final behavior in Architecture, Data And Persistence, Runtime Flows, UI/Agent Contracts, or Operational Constraints instead. If there are no valid unresolved questions, keep the ## Open Questions section and write a short None marker; do not invent questions. \
+Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
     )
 }
 
 pub(crate) fn default_workspace_spec_update_system_prompt() -> String {
     format!(
         "Decide whether the Project Spec needs an update after the latest completed chat turn. \
-If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep durable facts that guide future work, but omit low-value details such as transient task history, implementation blow-by-blow notes, repeated facts, long file lists, exhaustive symbol lists, and UI copy minutiae unless they define a contract. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
+If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, and Open Questions already comply with the rules below, submit updateNeeded=false and contentMarkdown=null. \
+If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Before each full replacement, re-examine every existing Open Questions item (do not only append this turn's changes). \
+Open Questions is only for currently unresolved decisions or unknowns that still materially affect future product or implementation. Items already resolved, implemented, or explicitly decided by the latest chat evidence must leave Open Questions; move durable conclusions into the matching formal section as needed, without Phase numbers, delivered status, test commands, commit records, or implementation logs. Optional follow-ups, refactor opportunities, and optimization ideas with no concrete unresolved decision default to deletion; rewrite as a short question only when a real open choice remains. \
+A chat turn that only reports completion status with no new durable contracts may still set updateNeeded=true to clean stale Open Questions; if the Spec already complies and has no other durable changes, return false. Do not invent product claims. Keep durable facts that guide future work, but omit low-value details such as transient task history, implementation blow-by-blow notes, repeated facts, long file lists, exhaustive symbol lists, and UI copy minutiae unless they define a contract. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
     )
 }
 
@@ -2022,6 +2030,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_spec_generation_prompt_open_questions_are_unresolved_only() {
+        let prompt = default_workspace_spec_generation_system_prompt();
+
+        assert!(prompt.contains("Open Questions is only for currently unresolved"));
+        assert!(prompt.contains("materially affect future product or implementation"));
+        assert!(prompt.contains("changelog"));
+        assert!(prompt.contains("completed-work ledger"));
+        assert!(prompt.contains("backlog"));
+        assert!(prompt.contains("residual-risk dump"));
+        assert!(prompt.contains("do not put it in Open Questions"));
+        assert!(prompt.contains("write a short None marker"));
+        assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
+    }
+
+    #[test]
     fn workspace_spec_update_prompt_omits_low_value_details() {
         let prompt = default_workspace_spec_update_system_prompt();
 
@@ -2030,6 +2054,21 @@ mod tests {
         assert!(prompt.contains("implementation blow-by-blow notes"));
         assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
         assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
+    }
+
+    #[test]
+    fn workspace_spec_update_prompt_reconciles_open_questions() {
+        let prompt = default_workspace_spec_update_system_prompt();
+
+        assert!(prompt.contains("re-examine every existing Open Questions item"));
+        assert!(prompt.contains("do not only append"));
+        assert!(prompt.contains("must leave Open Questions"));
+        assert!(prompt.contains("move durable conclusions into the matching formal section"));
+        assert!(prompt.contains("without Phase numbers"));
+        assert!(prompt.contains("Optional follow-ups"));
+        assert!(prompt.contains("default to deletion"));
+        assert!(prompt.contains("may still set updateNeeded=true to clean stale Open Questions"));
+        assert!(prompt.contains("Open Questions already comply"));
     }
 
     #[test]
@@ -2058,10 +2097,51 @@ mod tests {
         assert!(system.contains(&WORKSPACE_SPEC_COMPACTION_AGGRESSIVE_TARGET_BYTES.to_string()));
         assert!(system.contains("STRICTLY under"));
         assert!(system.contains("Be aggressive"));
+        assert!(system.contains("reconcile and preserve only currently unresolved"));
+        assert!(system.contains("do not unconditionally keep historical Open Questions"));
+        assert!(!system.contains("operational constraints, and open questions"));
+        assert!(system.contains("completed tasks, optional backlog"));
         assert!(user.contains("SIZE BUDGET"));
         assert!(user.contains("70000"));
         assert!(user.contains("attempt: 2/3"));
         assert_eq!(request.max_output_tokens, Some(8_000));
+    }
+
+    #[test]
+    fn workspace_spec_compaction_prompts_reconcile_open_questions_per_attempt() {
+        for attempt in 1..=3 {
+            let request = workspace_spec_compaction_provider_request(
+                "model-1",
+                None,
+                "short",
+                attempt,
+                workspace_spec_compaction_target_bytes(attempt),
+            );
+            let system = request.messages[0].content.as_str();
+            assert!(
+                system.contains("reconcile and preserve only currently unresolved"),
+                "attempt {attempt} missing shared open-questions reconciliation"
+            );
+            assert!(
+                !system.contains("operational constraints, and open questions"),
+                "attempt {attempt} must not unconditionally preserve open questions"
+            );
+            assert!(
+                system.contains("keep a concise final form in the matching formal section"),
+                "attempt {attempt} missing archive-to-formal-section guidance"
+            );
+        }
+
+        let emergency = workspace_spec_compaction_provider_request(
+            "model-1",
+            None,
+            "short",
+            3,
+            WORKSPACE_SPEC_COMPACTION_EMERGENCY_TARGET_BYTES,
+        );
+        let emergency_system = emergency.messages[0].content.as_str();
+        assert!(emergency_system.contains("only still-unresolved Open Questions"));
+        assert!(!emergency_system.contains("key contracts, and Open Questions;"));
     }
 
     #[test]
