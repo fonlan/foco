@@ -4611,6 +4611,14 @@ fn finish_broker_llm_audit(
     }
 }
 
+/// Prefer observer Response-head status; fall back to provider error status when no head.
+fn broker_llm_audit_status_code(
+    observed_http_status: Option<u16>,
+    error_status: Option<u16>,
+) -> Option<i64> {
+    observed_http_status.or(error_status).map(i64::from)
+}
+
 async fn broker_llm_stream(
     state: &AppState,
     write: &SharedBrokerWsWrite,
@@ -4910,6 +4918,8 @@ async fn broker_llm_stream(
     let mut final_text = String::new();
     let mut first_token_at: Option<String> = None;
     let mut first_token_latency_ms: Option<i64> = None;
+    // Completion is stream-semantic, not dump presence: details-off never builds final_response_dump.
+    let mut saw_complete = false;
     loop {
         let event = match if let Some(cancel_rx) = cancel_rx.as_mut() {
             tokio::select! {
@@ -4937,7 +4947,7 @@ async fn broker_llm_stream(
                         usage: final_usage.as_ref(),
                         first_token_latency_ms,
                         total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                        status_code: None,
+                        status_code: broker_llm_audit_status_code(stream.http_status(), None),
                         response_body_json: cancel_audit.response_body_json.as_deref(),
                     }, &audit_events);
                     let _ = send_broker_llm_error(
@@ -4994,7 +5004,10 @@ async fn broker_llm_stream(
                         usage: final_usage.as_ref(),
                         first_token_latency_ms,
                         total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                        status_code: e.status_code().map(i64::from),
+                        status_code: broker_llm_audit_status_code(
+                            stream.http_status(),
+                            e.status_code(),
+                        ),
                         response_body_json: response_body_json.as_deref(),
                     },
                     &audit_events,
@@ -5055,7 +5068,7 @@ async fn broker_llm_stream(
                             usage: final_usage.as_ref(),
                             first_token_latency_ms,
                             total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                            status_code: None,
+                            status_code: broker_llm_audit_status_code(stream.http_status(), None),
                             response_body_json: response_body_json.as_deref(),
                         },
                         &audit_events,
@@ -5100,7 +5113,7 @@ async fn broker_llm_stream(
                             usage: final_usage.as_ref(),
                             first_token_latency_ms,
                             total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                            status_code: None,
+                            status_code: broker_llm_audit_status_code(stream.http_status(), None),
                             response_body_json: response_body_json.as_deref(),
                         },
                         &audit_events,
@@ -5149,7 +5162,7 @@ async fn broker_llm_stream(
                             usage: final_usage.as_ref(),
                             first_token_latency_ms,
                             total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                            status_code: None,
+                            status_code: broker_llm_audit_status_code(stream.http_status(), None),
                             response_body_json: response_body_json.as_deref(),
                         },
                         &audit_events,
@@ -5193,7 +5206,7 @@ async fn broker_llm_stream(
                             usage: final_usage.as_ref(),
                             first_token_latency_ms,
                             total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                            status_code: None,
+                            status_code: broker_llm_audit_status_code(stream.http_status(), None),
                             response_body_json: response_body_json.as_deref(),
                         },
                         &audit_events,
@@ -5209,6 +5222,7 @@ async fn broker_llm_stream(
                 stop_reason: _,
                 response_id: _,
             } => {
+                saw_complete = true;
                 // Prefer stream deltas when present; use Complete text only as a full-body fallback.
                 if final_text.is_empty() && !text.trim().is_empty() {
                     final_text = text;
@@ -5261,7 +5275,7 @@ async fn broker_llm_stream(
                         usage: final_usage.as_ref(),
                         first_token_latency_ms,
                         total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-                        status_code: None,
+                        status_code: broker_llm_audit_status_code(stream.http_status(), None),
                         response_body_json: response_body_json.as_deref(),
                     },
                     &audit_events,
@@ -5301,7 +5315,7 @@ async fn broker_llm_stream(
                         .flatten()
                 })
         });
-    let completed = stream.final_response_dump().is_some();
+    let completed = saw_complete;
     let prompt_hook_tool_call_failure = request_kind == BROKER_PROMPT_HOOK_REQUEST_KIND
         && completed
         && !final_tool_calls.is_empty();
@@ -5329,7 +5343,7 @@ async fn broker_llm_stream(
             usage: final_usage.as_ref(),
             first_token_latency_ms,
             total_latency_ms: request_started_instant.elapsed().as_millis() as i64,
-            status_code: None,
+            status_code: broker_llm_audit_status_code(stream.http_status(), None),
             response_body_json: response_body_json.as_deref(),
         },
         &audit_events,
@@ -18031,6 +18045,7 @@ mod tests {
         assert_eq!(request.request_kind, "chat completion");
         assert_eq!(request.provider_id, "provider-1");
         assert_eq!(request.final_state, "succeeded");
+        assert_eq!(request.status_code, Some(200));
         assert_eq!(request.input_tokens, Some(11));
         assert_eq!(request.output_tokens, Some(4));
         let request_wire: Value = serde_json::from_str(
@@ -18135,6 +18150,226 @@ mod tests {
                 .as_ref()
                 .expect("detail response body")["http"]["headers"]["x-broker-multi"],
             json!(["first", "second"])
+        );
+    }
+
+    /// Details off: structured HTTP status still lands in remote-workspace-audit; wire dumps stay NULL.
+    #[tokio::test]
+    async fn broker_control_llm_stream_persists_status_code_without_request_response_details() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                |method: axum::http::Method,
+                 uri: axum::http::Uri,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    let _ = (method, uri, headers, body);
+                    let mut response = axum::response::Response::new(axum::body::Body::from(
+                        concat!(
+                            "data: {\"id\":\"broker-status-only\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"status only\"}}]}\n\n",
+                            "data: {\"id\":\"broker-status-only\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    ));
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                },
+            ),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(workspace.path());
+        config.app.api_audit.save_request_response_details = false;
+        // Prefer SSH + empty legacy path so audit lands in profile remote-workspace-audit.
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: "/remote/project".to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        let broker_request_id = "broker-request-status-without-details".to_string();
+        let provider_request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Persist status with details off.".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let broker_payload = json!({
+            "workspaceId": workspace_id,
+            "chatId": "chat-broker-status-only",
+            "chatTitle": "Broker status only",
+            "providerId": "provider-legacy",
+            "modelId": "model-1",
+            "requestKind": "chat completion",
+            "request": provider_request,
+        });
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_request_id = broker_request_id.clone();
+        let control_task = tokio::spawn(async move {
+            let (stream, _) = control_listener
+                .accept()
+                .await
+                .expect("accept control connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept control websocket");
+            let config_message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("config sync timeout")
+                .expect("config sync message")
+                .expect("config sync websocket result");
+            let tungstenite::Message::Text(config_text) = config_message else {
+                panic!("expected config sync text frame");
+            };
+            let config_envelope: ControlEnvelope =
+                serde_json::from_str(config_text.as_str()).expect("config sync envelope");
+            assert_eq!(config_envelope.message_type, "config");
+            assert_eq!(config_envelope.method.as_deref(), Some("config.sync"));
+            let config_id = config_envelope.id.expect("config sync id");
+            let config_response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(config_id),
+                method: None,
+                payload: json!({ "status": "ok" }),
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&config_response)
+                        .expect("serialize config response")
+                        .into(),
+                ))
+                .await
+                .expect("send config response");
+            let request = ControlEnvelope {
+                version: 1,
+                message_type: "request".to_string(),
+                id: Some(control_request_id.clone()),
+                method: Some("llm.stream".to_string()),
+                payload: broker_payload,
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("serialize broker request")
+                        .into(),
+                ))
+                .await
+                .expect("send broker request");
+
+            loop {
+                let message = timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("broker response timeout")
+                    .expect("broker response message")
+                    .expect("broker response websocket result");
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let envelope: ControlEnvelope =
+                    serde_json::from_str(text.as_str()).expect("broker response envelope");
+                if envelope.id.as_deref() != Some(control_request_id.as_str()) {
+                    continue;
+                }
+                match envelope.message_type.as_str() {
+                    "response" => return envelope,
+                    "error" => panic!("brokered LLM request failed: {}", envelope.payload),
+                    _ => {}
+                }
+            }
+        });
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .expect("connect main-process control websocket");
+        let broker_response = timeout(Duration::from_secs(5), control_task)
+            .await
+            .expect("control fixture completion timeout")
+            .expect("control fixture task");
+        connection_task.abort();
+        let _ = connection_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        assert_eq!(broker_response.payload["status"], "ok");
+        assert_eq!(broker_response.payload["llmRequestId"], broker_request_id);
+        assert_eq!(broker_response.payload["text"], "status only");
+
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        let database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit database");
+        let request = database
+            .llm_request(&broker_request_id)
+            .expect("broker audit lookup")
+            .expect("broker audit row");
+        assert_eq!(request.chat_id.as_deref(), Some("chat-broker-status-only"));
+        assert_eq!(request.request_kind, "chat completion");
+        assert_eq!(request.provider_id, "provider-1");
+        assert_eq!(request.final_state, "succeeded");
+        assert_eq!(request.status_code, Some(200));
+        assert!(
+            request.request_body_json.is_none(),
+            "details-off must not persist request wire dump"
+        );
+        assert!(
+            request.response_body_json.is_none(),
+            "details-off must not persist response wire dump"
         );
     }
 

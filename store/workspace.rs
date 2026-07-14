@@ -184,6 +184,7 @@ const PLAN_AUTO_RUN_BLOCKED_REASON_KEY: &str = "plan_auto_run_blocked_reason";
 const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
 const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
 const LLM_AUDIT_DETAIL_V1_PRUNED_KEY: &str = "llm_audit_detail_v1_pruned";
+const LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY: &str = "llm_audit_status_code_v1_repaired";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKSPACE_MIGRATION_LOCK_SUFFIX: &str = ".migrate.lock";
 const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
@@ -818,6 +819,7 @@ impl WorkspaceDatabase {
         run_migrations(&mut connection, &database_path, database_existed)?;
         enable_write_ahead_logging(&connection, &database_path)?;
         prune_non_v1_llm_audit_details_once(&mut connection, &database_path)?;
+        repair_llm_request_status_codes_from_v1_once(&mut connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -15201,6 +15203,100 @@ fn prune_non_v1_llm_audit_details_once(
         .map_err(|source| sqlite_error(database_path, source))?;
 
     match prune_result {
+        Ok(()) => Ok(()),
+        Err(source) if is_sqlite_busy_error(&source) => Ok(()),
+        Err(source) => Err(sqlite_error(database_path, source)),
+    }
+}
+
+/// One-shot, idempotent backfill of structured `status_code` from retained
+/// `provider_final_response_v1` wire dumps. Does not invent status from final_state.
+fn repair_llm_request_status_codes_from_v1_once(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    if !table_exists(connection, database_path, "workspace_metadata")?
+        || !table_has_columns(
+            connection,
+            database_path,
+            "llm_requests",
+            &["status_code", "response_body_json", "final_state"],
+        )?
+    {
+        return Ok(());
+    }
+
+    let already_repaired: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_metadata WHERE key = ?1)",
+            params![LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    if already_repaired {
+        return Ok(());
+    }
+
+    connection
+        .busy_timeout(Duration::from_millis(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let repair_result = (|| -> Result<(), rusqlite::Error> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_repaired: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_metadata WHERE key = ?1)",
+            params![LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY],
+            |row| row.get(0),
+        )?;
+        if !already_repaired {
+            // Prefer http.status; only use failed-envelope statusCode when http is absent.
+            // Strict 100–599; never invent 200 from final_state=succeeded.
+            transaction.execute_batch(
+                r#"
+            UPDATE llm_requests
+            SET status_code = CAST(
+              CASE
+                WHEN json_type(json_extract(response_body_json, '$.http.status')) IN ('integer', 'real')
+                  AND CAST(json_extract(response_body_json, '$.http.status') AS INTEGER) BETWEEN 100 AND 599
+                THEN CAST(json_extract(response_body_json, '$.http.status') AS INTEGER)
+                WHEN json_extract(response_body_json, '$.http') IS NULL
+                  AND json_type(json_extract(response_body_json, '$.statusCode')) IN ('integer', 'real')
+                  AND CAST(json_extract(response_body_json, '$.statusCode') AS INTEGER) BETWEEN 100 AND 599
+                THEN CAST(json_extract(response_body_json, '$.statusCode') AS INTEGER)
+                ELSE NULL
+              END AS INTEGER
+            )
+            WHERE status_code IS NULL
+              AND final_state IS NOT NULL
+              AND final_state <> 'running'
+              AND response_body_json IS NOT NULL
+              AND json_valid(response_body_json) = 1
+              AND COALESCE(json_extract(response_body_json, '$.format'), '') = 'provider_final_response_v1'
+              AND COALESCE(json_extract(response_body_json, '$.version'), 0) = 1
+              AND (
+                (
+                  json_type(json_extract(response_body_json, '$.http.status')) IN ('integer', 'real')
+                  AND CAST(json_extract(response_body_json, '$.http.status') AS INTEGER) BETWEEN 100 AND 599
+                )
+                OR (
+                  json_extract(response_body_json, '$.http') IS NULL
+                  AND json_type(json_extract(response_body_json, '$.statusCode')) IN ('integer', 'real')
+                  AND CAST(json_extract(response_body_json, '$.statusCode') AS INTEGER) BETWEEN 100 AND 599
+                )
+              );
+            "#,
+            )?;
+            transaction.execute(
+                "INSERT INTO workspace_metadata (key, value, updated_at) VALUES (?1, 'true', ?2)",
+                params![LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY, now_timestamp()],
+            )?;
+        }
+        transaction.commit()
+    })();
+    connection
+        .busy_timeout(WORKSPACE_DATABASE_BUSY_TIMEOUT)
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    match repair_result {
         Ok(()) => Ok(()),
         Err(source) if is_sqlite_busy_error(&source) => Ok(()),
         Err(source) => Err(sqlite_error(database_path, source)),

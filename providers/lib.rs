@@ -852,6 +852,9 @@ pub struct NeutralChatStream {
     stream: genai::chat::ChatStream,
     error_context: ProviderErrorContext,
     wire_request_dump: Option<ProviderWireRequestDump>,
+    /// Always captured when a real HTTP Response is observed; independent of detail dumps.
+    response_status: Arc<Mutex<Option<u16>>>,
+    /// Full head dump (version/headers) only when `capture_details` is enabled.
     response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
     saw_response_event: bool,
     final_response_dump: Option<ProviderFinalResponseDump>,
@@ -864,6 +867,18 @@ impl NeutralChatStream {
 
     pub fn final_response_dump(&self) -> Option<&ProviderFinalResponseDump> {
         self.final_response_dump.as_ref()
+    }
+
+    /// Observed HTTP response status from the provider Response head, if any.
+    ///
+    /// Independent of `capture_details`: status is recorded whenever a Response exists.
+    /// DNS/TLS/connect failures before a Response remain `None`.
+    pub fn http_status(&self) -> Option<u16> {
+        self.response_status
+            .lock()
+            .ok()
+            .and_then(|status| *status)
+            .or_else(|| self.response_head_dump().map(|head| head.status))
     }
 
     fn response_head_dump(&self) -> Option<ProviderHttpResponseHeadDump> {
@@ -1009,6 +1024,7 @@ pub async fn stream_chat_with_capture_observer(
     })?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
+    let captured_response_status = Arc::new(Mutex::new(None));
     let captured_response_head = capture_details.then(|| Arc::new(Mutex::new(None)));
     let observer = if capture_details || request_observer.is_some() {
         let captured_request = captured_request.clone();
@@ -1026,16 +1042,22 @@ pub async fn stream_chat_with_capture_observer(
     } else {
         None
     };
-    let response_observer = captured_response_head
-        .as_ref()
-        .map(|captured_response_head| {
-            let captured_response_head = captured_response_head.clone();
-            Arc::new(move |response: &Response| {
-                if let Ok(mut slot) = captured_response_head.lock() {
-                    *slot = Some(provider_http_response_head_dump(response));
-                }
-            }) as genai::ResponseHeadObserver
-        });
+    let response_observer = {
+        let captured_response_status = captured_response_status.clone();
+        let captured_response_head = captured_response_head.clone();
+        Some(Arc::new(move |response: &Response| {
+            let status = response.status().as_u16();
+            if let Ok(mut slot) = captured_response_status.lock() {
+                *slot = Some(status);
+            }
+            if let Some(captured_response_head) = captured_response_head.as_ref()
+                && let Ok(mut slot) = captured_response_head.lock()
+            {
+                // Only copy version/headers when detail capture is enabled.
+                *slot = Some(provider_http_response_head_dump(response));
+            }
+        }) as genai::ResponseHeadObserver)
+    };
     let response = client
         .exec_chat_stream_observed_with_response(
             model,
@@ -1055,6 +1077,7 @@ pub async fn stream_chat_with_capture_observer(
         stream: response.stream,
         error_context: error_context.with_phase("reading provider stream"),
         wire_request_dump,
+        response_status: captured_response_status,
         response_head: captured_response_head,
         saw_response_event: false,
         final_response_dump: None,
@@ -3551,6 +3574,7 @@ mod tests {
                 && headers.get("x-fixture-response").and_then(|values| values.first()).map(String::as_str)
                     == Some("response-header-value")
         ));
+        assert_eq!(stream.http_status(), Some(200));
 
         let raw_requests = fixture.await.expect("fixture task");
         assert_eq!(raw_requests.len(), 1);
@@ -3601,6 +3625,7 @@ mod tests {
                 && headers.get("x-api-key").and_then(|values| values.first()).map(String::as_str)
                     == Some("response-api-key")
         ));
+        assert_eq!(stream.http_status(), Some(502));
         assert_eq!(fixture.await.expect("fixture task").len(), 1);
     }
 
@@ -3638,6 +3663,7 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(stream.http_status(), None);
     }
 
     #[tokio::test]
@@ -3668,7 +3694,67 @@ mod tests {
         assert!(stream.wire_request_dump().is_none());
         while stream.next_event().await.is_some() {}
         assert!(stream.final_response_dump().is_none());
+        assert_eq!(stream.http_status(), Some(200));
         let raw_requests = fixture.await.expect("fixture task");
         assert_eq!(raw_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_status_is_captured_without_detail_dumps() {
+        let (fixture_root, fixture) = spawn_raw_http_fixture(
+            "502 Bad Gateway",
+            "application/json",
+            r#"{"error":"upstream unavailable"}"#,
+        )
+        .await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "status without details",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, false)
+            .await
+            .expect("open non-success fixture stream");
+        while stream.next_event().await.is_some() {}
+
+        assert!(stream.wire_request_dump().is_none());
+        assert!(stream.final_response_dump().is_none());
+        assert_eq!(stream.http_status(), Some(502));
+        assert_eq!(fixture.await.expect("fixture task").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_failure_http_status_is_none_without_response() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unused fixture address");
+        let addr = listener.local_addr().expect("unused fixture address");
+        drop(listener);
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "no status without response",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, false)
+            .await
+            .expect("connection failures surface through the stream");
+        while stream.next_event().await.is_some() {}
+        assert_eq!(stream.http_status(), None);
     }
 }

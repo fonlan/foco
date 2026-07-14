@@ -5866,6 +5866,218 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
 }
 
 #[test]
+fn repairs_null_status_code_from_valid_v1_response_wire_once() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Status code repair")
+        .expect("chat insert");
+
+    let insert = |database: &mut WorkspaceDatabase, id: &str, final_state: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: Some("chat-1"),
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "openai",
+                model_id: "gpt-test",
+                thinking_level: None,
+                request_started_at: "2026-07-14T00:00:00Z",
+                first_token_at: None,
+                completed_at: if final_state == "running" {
+                    None
+                } else {
+                    Some("2026-07-14T00:00:01Z")
+                },
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: if final_state == "running" {
+                    None
+                } else {
+                    Some(1000)
+                },
+                status_code: None,
+                final_state,
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("request insert");
+    };
+
+    insert(&mut database, "with-http-status", "succeeded");
+    insert(&mut database, "failed-status-code-only", "failed");
+    insert(&mut database, "no-head-succeeded", "succeeded");
+    insert(&mut database, "running-with-http", "running");
+    insert(&mut database, "invalid-status-range", "failed");
+    insert(&mut database, "non-v1-response", "succeeded");
+    insert(&mut database, "already-has-status", "succeeded");
+
+    {
+        let database_path = database.database_path().to_path_buf();
+        let connection = rusqlite::Connection::open(&database_path).expect("open raw sqlite");
+        let plant = |id: &str, status_code: Option<i64>, response: &str| {
+            connection
+                .execute(
+                    "UPDATE llm_requests SET status_code = ?1, response_body_json = ?2 WHERE id = ?3",
+                    rusqlite::params![status_code, response, id],
+                )
+                .expect("plant audit row");
+        };
+        plant(
+            "with-http-status",
+            None,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+        );
+        plant(
+            "failed-status-code-only",
+            None,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"upstream","statusCode":502,"http":null}"#,
+        );
+        plant(
+            "no-head-succeeded",
+            None,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":null}"#,
+        );
+        plant(
+            "running-with-http",
+            None,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+        );
+        plant(
+            "invalid-status-range",
+            None,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"bad","statusCode":999,"http":null}"#,
+        );
+        plant(
+            "non-v1-response",
+            None,
+            r#"{"text":"normalized","statusCode":200}"#,
+        );
+        plant(
+            "already-has-status",
+            Some(418),
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+        );
+        connection
+            .execute(
+                "DELETE FROM workspace_metadata WHERE key = 'llm_audit_status_code_v1_repaired'",
+                [],
+            )
+            .expect("remove repair marker");
+    }
+    drop(database);
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen for repair");
+    assert_eq!(
+        database
+            .llm_request("with-http-status")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        Some(200)
+    );
+    assert_eq!(
+        database
+            .llm_request("failed-status-code-only")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        Some(502)
+    );
+    assert_eq!(
+        database
+            .llm_request("no-head-succeeded")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        None,
+        "must not invent 200 from final_state"
+    );
+    assert_eq!(
+        database
+            .llm_request("running-with-http")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        None,
+        "running rows stay untouched"
+    );
+    assert_eq!(
+        database
+            .llm_request("invalid-status-range")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        None
+    );
+    assert_eq!(
+        database
+            .llm_request("non-v1-response")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        None
+    );
+    assert_eq!(
+        database
+            .llm_request("already-has-status")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        Some(418),
+        "existing status_code is not overwritten"
+    );
+
+    let repair_marker: String = rusqlite::Connection::open(database.database_path())
+        .expect("open marker database")
+        .query_row(
+            "SELECT value FROM workspace_metadata WHERE key = 'llm_audit_status_code_v1_repaired'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("repair marker");
+    assert_eq!(repair_marker, "true");
+
+    // Marker makes a second open a no-op (already-repaired rows stay put; no re-scan).
+    let status_before = database
+        .llm_request("with-http-status")
+        .expect("read")
+        .expect("row")
+        .status_code;
+    drop(database);
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("second reopen");
+    assert_eq!(
+        database
+            .llm_request("with-http-status")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        status_before
+    );
+    let marker_count: i64 = rusqlite::Connection::open(database.database_path())
+        .expect("open marker database")
+        .query_row(
+            "SELECT COUNT(*) FROM workspace_metadata WHERE key = 'llm_audit_status_code_v1_repaired'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("marker count");
+    assert_eq!(marker_count, 1);
+}
+
+#[test]
 fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let database =
