@@ -370,7 +370,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
 #[cfg(any(windows, all(target_os = "macos", not(debug_assertions)), test))]
-pub(crate) const UPDATED_RESTART_COMMAND: &str = "--updated-restart";
+pub(crate) const UPDATED_RESTART_COMMAND: &str = crate::update_runtime::UPDATED_RESTART_ARG;
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
@@ -793,6 +793,9 @@ async fn run_server_until_shutdown(
     tracing::info!(
         elapsed_ms = logging_started_at.elapsed().as_millis() as u64,
         "initialized logging"
+    );
+    crate::update_runtime::maybe_cleanup_stale_update_assets_after_updated_restart(
+        &loaded_config.paths.user_profile_dir,
     );
     tracing::info!(
         elapsed_ms = load_config_started_at.elapsed().as_millis() as u64,

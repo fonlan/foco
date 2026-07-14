@@ -3,7 +3,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 #[cfg(windows)]
@@ -22,6 +22,10 @@ const UPDATE_CHECK_INTERVAL_SECS: u64 = 12 * 60 * 60;
 const UPDATE_DOWNLOAD_TMP_SUFFIX: &str = ".download.tmp";
 const UPDATE_SHUTDOWN_DELAY_MS: u64 = 250;
 const UPDATE_FORCE_EXIT_DELAY_SECS: u64 = 10;
+/// Keep the current version directory plus one recent historical version under `updates/`.
+const UPDATE_VERSION_DIR_RETAIN_COUNT: usize = 2;
+/// CLI flag used after a successful install to restart and trigger historical update cleanup.
+pub(crate) const UPDATED_RESTART_ARG: &str = "--updated-restart";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -95,6 +99,255 @@ struct PreparedUpdateInstall {
 
 pub(crate) fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Best-effort cleanup of historical update download dirs after a successful install restart.
+///
+/// Only runs when the process was started with `--updated-restart`. Failures are logged and never
+/// abort startup.
+pub(crate) fn maybe_cleanup_stale_update_assets_after_updated_restart(user_profile_dir: &Path) {
+    cleanup_stale_update_assets_if_requested(
+        user_profile_dir,
+        env::args().any(|arg| arg == UPDATED_RESTART_ARG),
+    );
+}
+
+fn cleanup_stale_update_assets_if_requested(user_profile_dir: &Path, requested: bool) {
+    if !requested {
+        return;
+    }
+    let updates_root = user_profile_dir.join(".foco").join("updates");
+    cleanup_stale_update_version_dirs(&updates_root, current_version());
+}
+
+/// Discover version dirs, apply retain policy, and best-effort delete excess directories.
+fn cleanup_stale_update_version_dirs(updates_root: &Path, current_version: &str) {
+    if !updates_root.exists() {
+        return;
+    }
+    let candidates = match discover_update_version_dir_candidates(updates_root) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(
+                updates_root = %updates_root.display(),
+                error = %error,
+                "failed to discover Foco update version directories for cleanup"
+            );
+            return;
+        }
+    };
+    let remove_names = select_update_version_dirs_to_remove(
+        &candidates,
+        current_version,
+        UPDATE_VERSION_DIR_RETAIN_COUNT,
+    );
+    if remove_names.is_empty() {
+        return;
+    }
+    tracing::info!(
+        updates_root = %updates_root.display(),
+        current_version,
+        retain_count = UPDATE_VERSION_DIR_RETAIN_COUNT,
+        remove_count = remove_names.len(),
+        "cleaning historical Foco update version directories"
+    );
+    for name in remove_names {
+        if let Err(error) = remove_update_version_dir(updates_root, &name) {
+            tracing::warn!(
+                updates_root = %updates_root.display(),
+                version_dir = %name,
+                error = %error,
+                "failed to remove historical Foco update version directory"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UpdateVersionDirCandidate {
+    name: String,
+    modified: SystemTime,
+}
+
+fn discover_update_version_dir_candidates(
+    updates_root: &Path,
+) -> Result<Vec<UpdateVersionDirCandidate>, String> {
+    let read_dir = std::fs::read_dir(updates_root).map_err(|source| {
+        format!(
+            "failed to read Foco update directory {}: {source}",
+            updates_root.display()
+        )
+    })?;
+    let mut candidates = Vec::new();
+    for entry in read_dir {
+        // Best-effort: skip unreadable entries so one bad dirent cannot abort the whole cleanup.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                tracing::warn!(
+                    updates_root = %updates_root.display(),
+                    error = %source,
+                    "skipping unreadable Foco update directory entry during cleanup discovery"
+                );
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_valid_update_version_dir_name(name) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %source,
+                    "skipping Foco update entry that could not be inspected during cleanup discovery"
+                );
+                continue;
+            }
+        };
+        // Do not follow symlinks; only real direct child directories are candidates.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %source,
+                    "skipping Foco update entry with unreadable metadata during cleanup discovery"
+                );
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(source) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %source,
+                    "skipping Foco update entry with unreadable mtime during cleanup discovery"
+                );
+                continue;
+            }
+        };
+        candidates.push(UpdateVersionDirCandidate {
+            name: name.to_string(),
+            modified,
+        });
+    }
+    Ok(candidates)
+}
+
+fn is_valid_update_version_dir_name(name: &str) -> bool {
+    safe_update_path_component(name, "version").is_ok()
+}
+
+fn is_protected_update_version_dir(name: &str, current_version: &str) -> bool {
+    normalized_version(name) == normalized_version(current_version)
+}
+
+/// Pure retain policy: always protect the running version; keep at most `retain_count` version
+/// directories total (current + newest remaining by mtime). Equal mtimes sort by name ascending.
+fn select_update_version_dirs_to_remove(
+    candidates: &[UpdateVersionDirCandidate],
+    current_version: &str,
+    retain_count: usize,
+) -> Vec<String> {
+    if retain_count == 0 {
+        return candidates
+            .iter()
+            .filter(|candidate| !is_protected_update_version_dir(&candidate.name, current_version))
+            .map(|candidate| candidate.name.clone())
+            .collect();
+    }
+
+    let mut protected = Vec::new();
+    let mut others = Vec::new();
+    for candidate in candidates {
+        if is_protected_update_version_dir(&candidate.name, current_version) {
+            protected.push(candidate);
+        } else {
+            others.push(candidate);
+        }
+    }
+
+    others.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let keep_other_count = retain_count.saturating_sub(protected.len());
+    others
+        .into_iter()
+        .skip(keep_other_count)
+        .map(|candidate| candidate.name.clone())
+        .collect()
+}
+
+fn remove_update_version_dir(updates_root: &Path, name: &str) -> Result<(), String> {
+    let validated_name = safe_update_path_component(name, "version")
+        .map_err(|error| error.message().to_string())?;
+    let path = updates_root.join(validated_name);
+    if !is_direct_child_path(updates_root, &path, validated_name) {
+        return Err(format!(
+            "refusing to remove path outside Foco update directory: {}",
+            path.display()
+        ));
+    }
+
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(format!(
+                "failed to inspect Foco update version directory {}: {source}",
+                path.display()
+            ));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(format!(
+            "refusing to remove non-directory Foco update path: {}",
+            path.display()
+        ));
+    }
+
+    std::fs::remove_dir_all(&path).map_err(|source| {
+        format!(
+            "failed to remove Foco update version directory {}: {source}",
+            path.display()
+        )
+    })
+}
+
+fn is_direct_child_path(parent: &Path, child: &Path, expected_name: &str) -> bool {
+    if expected_name.is_empty()
+        || expected_name == "."
+        || expected_name == ".."
+        || expected_name.contains('/')
+        || expected_name.contains('\\')
+    {
+        return false;
+    }
+    match child.strip_prefix(parent) {
+        Ok(relative) => {
+            let mut components = relative.components();
+            match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(name)), None) => name == expected_name,
+                _ => false,
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn update_status_summary(
@@ -383,6 +636,8 @@ fn platform_supports_installation() -> bool {
 fn safe_update_path_component<'a>(value: &'a str, label: &str) -> Result<&'a str, ApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || !trimmed
@@ -951,5 +1206,252 @@ mod tests {
             Some(PathBuf::from("/opt/Foco"))
         );
         assert!(current_windows_install_dir_from_exe(Path::new("/opt/Foco/helper.exe")).is_none());
+    }
+
+    fn candidate(name: &str, secs: u64) -> UpdateVersionDirCandidate {
+        UpdateVersionDirCandidate {
+            name: name.to_string(),
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn update_version_dir_selection_keeps_fewer_than_retain_count() {
+        let candidates = vec![candidate("v1.0.0", 1), candidate("v1.1.0", 2)];
+        let remove =
+            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn update_version_dir_selection_removes_excess_by_mtime() {
+        let candidates = vec![
+            candidate("v1.0.0", 1),
+            candidate("v1.1.0", 2),
+            candidate("v1.2.0", 3),
+            candidate("v1.3.0", 4),
+        ];
+        let mut remove =
+            select_update_version_dirs_to_remove(&candidates, "1.3.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        remove.sort();
+        assert_eq!(remove, vec!["v1.0.0".to_string(), "v1.1.0".to_string()]);
+    }
+
+    #[test]
+    fn update_version_dir_selection_protects_current_when_not_newest_mtime() {
+        let candidates = vec![
+            candidate("v1.0.0", 10),
+            candidate("v1.1.0", 1),
+            candidate("v1.2.0", 5),
+        ];
+        // Current v1.1.0 is oldest mtime but must stay; keep one newest history (v1.0.0).
+        let remove =
+            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        assert_eq!(remove, vec!["v1.2.0".to_string()]);
+    }
+
+    #[test]
+    fn update_version_dir_selection_breaks_mtime_ties_by_name() {
+        let same = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+        let candidates = vec![
+            UpdateVersionDirCandidate {
+                name: "v1.0.0".to_string(),
+                modified: same,
+            },
+            UpdateVersionDirCandidate {
+                name: "v1.2.0".to_string(),
+                modified: same,
+            },
+            UpdateVersionDirCandidate {
+                name: "v1.1.0".to_string(),
+                modified: same,
+            },
+        ];
+        // Current is protected. Among equal-mtime others, sort by name ascending and keep one.
+        let remove =
+            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        assert_eq!(remove, vec!["v1.2.0".to_string()]);
+    }
+
+    #[test]
+    fn update_version_dir_name_validation_rejects_illegal_names() {
+        assert!(is_valid_update_version_dir_name("v1.2.3"));
+        assert!(!is_valid_update_version_dir_name("../escape"));
+        assert!(!is_valid_update_version_dir_name("nested/path"));
+        assert!(!is_valid_update_version_dir_name(""));
+        assert!(!is_valid_update_version_dir_name("."));
+        assert!(!is_valid_update_version_dir_name(".."));
+    }
+
+    #[test]
+    fn discover_update_version_dirs_skips_files_symlinks_and_illegal_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let updates = dir.path().join("updates");
+        std::fs::create_dir_all(&updates).expect("updates root");
+        std::fs::create_dir(updates.join("v1.0.0")).expect("version dir");
+        std::fs::create_dir(updates.join("v1.1.0")).expect("version dir");
+        std::fs::write(updates.join("notes.txt"), b"keep").expect("file");
+        std::fs::create_dir(updates.join("not a version")).expect("illegal name dir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(updates.join("v1.0.0"), updates.join("v-link"))
+                .expect("symlink");
+        }
+
+        let candidates = discover_update_version_dir_candidates(&updates).expect("discover");
+        let mut names: Vec<_> = candidates.into_iter().map(|c| c.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["v1.0.0".to_string(), "v1.1.0".to_string()]);
+        assert!(updates.join("notes.txt").is_file());
+        assert!(updates.join("not a version").is_dir());
+    }
+
+    #[test]
+    fn cleanup_update_version_dirs_retains_current_and_one_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let updates = dir.path().join("updates");
+        std::fs::create_dir_all(&updates).expect("updates root");
+        for name in ["v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0"] {
+            std::fs::create_dir(updates.join(name)).expect("version dir");
+        }
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (name, offset) in [
+            ("v1.0.0", 10),
+            ("v1.1.0", 20),
+            ("v1.2.0", 30),
+            ("v1.3.0", 40),
+        ] {
+            let path = updates.join(name);
+            let file = std::fs::File::open(&path).expect("open dir");
+            file.set_modified(base + Duration::from_secs(offset))
+                .expect("set mtime");
+        }
+
+        cleanup_stale_update_version_dirs(&updates, "1.3.0");
+
+        let remaining: Vec<_> = std::fs::read_dir(&updates)
+            .expect("read")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        let mut remaining = remaining;
+        remaining.sort();
+        assert_eq!(remaining, vec!["v1.2.0".to_string(), "v1.3.0".to_string()]);
+    }
+
+    #[test]
+    fn cleanup_does_not_run_when_updated_restart_not_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path();
+        let updates = profile.join(".foco").join("updates");
+        std::fs::create_dir_all(updates.join("v1.0.0")).expect("v1");
+        std::fs::create_dir_all(updates.join("v1.1.0")).expect("v2");
+        std::fs::create_dir_all(updates.join("v1.2.0")).expect("v3");
+
+        cleanup_stale_update_assets_if_requested(profile, false);
+
+        assert!(updates.join("v1.0.0").is_dir());
+        assert!(updates.join("v1.1.0").is_dir());
+        assert!(updates.join("v1.2.0").is_dir());
+    }
+
+    #[test]
+    fn cleanup_runs_when_updated_restart_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path();
+        let updates = profile.join(".foco").join("updates");
+        std::fs::create_dir_all(&updates).expect("updates");
+        for name in ["v1.0.0", "v1.1.0", "v1.2.0"] {
+            std::fs::create_dir(updates.join(name)).expect("version dir");
+        }
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        for (name, offset) in [("v1.0.0", 1), ("v1.1.0", 2), ("v1.2.0", 3)] {
+            let file = std::fs::File::open(updates.join(name)).expect("open");
+            file.set_modified(base + Duration::from_secs(offset))
+                .expect("mtime");
+        }
+
+        // Use current_version() so the protected dir matches the running package version.
+        let current = current_version();
+        let current_dir = format!("v{current}");
+        std::fs::create_dir(updates.join(&current_dir)).expect("current version dir");
+        let file = std::fs::File::open(updates.join(&current_dir)).expect("open current");
+        file.set_modified(base + Duration::from_secs(0))
+            .expect("mtime current");
+
+        cleanup_stale_update_assets_if_requested(profile, true);
+
+        assert!(
+            updates.join(&current_dir).is_dir(),
+            "current version must be protected"
+        );
+        // retain 2: current + newest history among v1.0.0/v1.1.0/v1.2.0 => v1.2.0
+        assert!(updates.join("v1.2.0").is_dir());
+        assert!(!updates.join("v1.0.0").exists());
+        assert!(!updates.join("v1.1.0").exists());
+    }
+
+    #[test]
+    fn remove_update_version_dir_refuses_path_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let updates = dir.path().join("updates");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&updates).expect("updates");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), b"secret").expect("secret");
+
+        let result = remove_update_version_dir(&updates, "../outside");
+        assert!(result.is_err());
+        assert!(outside.join("secret.txt").is_file());
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn remove_update_version_dir_refuses_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let updates = dir.path().join("updates");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&updates).expect("updates");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::write(target.join("keep.txt"), b"keep").expect("keep");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, updates.join("v9.9.9")).expect("symlink");
+            let result = remove_update_version_dir(&updates, "v9.9.9");
+            assert!(result.is_err());
+            assert!(target.join("keep.txt").is_file());
+            assert!(updates.join("v9.9.9").exists());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (updates, target);
+        }
+    }
+
+    #[test]
+    fn cleanup_errors_do_not_panic_or_return() {
+        // Missing root is a quiet no-op.
+        cleanup_stale_update_version_dirs(Path::new("/definitely/missing/foco-updates-xyz"), "1.0.0");
+        // Root that is a file: discovery fails, must not panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_root = dir.path().join("not-a-dir");
+        std::fs::write(&file_root, b"x").expect("file root");
+        cleanup_stale_update_version_dirs(&file_root, "1.0.0");
+    }
+
+    #[test]
+    fn is_direct_child_path_rejects_nested_and_escape() {
+        let parent = Path::new("/home/user/.foco/updates");
+        assert!(is_direct_child_path(
+            parent,
+            &parent.join("v1.2.3"),
+            "v1.2.3"
+        ));
+        assert!(!is_direct_child_path(
+            parent,
+            &parent.join("nested").join("v1.2.3"),
+            "v1.2.3"
+        ));
+        assert!(!is_direct_child_path(parent, Path::new("/tmp/evil"), "evil"));
+        assert!(!is_direct_child_path(parent, &parent.join("v1.2.3"), "../x"));
     }
 }
