@@ -7648,6 +7648,7 @@ async fn remote_sidecar_chat_messages(
         .get("beforeSequence")
         .and_then(|value| value.parse::<i64>().ok());
     let mut database = sidecar_workspace_database(&state)?;
+    let _ = database.materialize_missing_pre_stream_failure_messages(&chat_id);
     let chat = database
         .chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?

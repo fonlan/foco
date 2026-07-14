@@ -1205,15 +1205,19 @@ fn parse_pre_stream_failure(message: &str) -> PreStreamFailureInfo {
                 retryable = value == "true";
             }
         }
-        let (user_message, diagnostic) = if let Some((_, after_message)) = rest.split_once(" message=") {
-            if let Some((user, detail)) = after_message.split_once(" detail=") {
-                (user.to_string(), detail.to_string())
+        let (user_message, diagnostic) =
+            if let Some((_, after_message)) = rest.split_once(" message=") {
+                if let Some((user, detail)) = after_message.split_once(" detail=") {
+                    (user.to_string(), detail.to_string())
+                } else {
+                    (after_message.to_string(), message.to_string())
+                }
             } else {
-                (after_message.to_string(), message.to_string())
-            }
-        } else {
-            (PRE_STREAM_USER_MESSAGE_GENERIC.to_string(), message.to_string())
-        };
+                (
+                    PRE_STREAM_USER_MESSAGE_GENERIC.to_string(),
+                    message.to_string(),
+                )
+            };
         return PreStreamFailureInfo {
             code,
             stage,

@@ -169,6 +169,14 @@ pub enum PreStreamChatFailureClosureResult {
     Skipped { reason: String },
 }
 
+/// One historical pre-stream failure healed into a durable assistant Error bubble.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreStreamFailureMaterialization {
+    pub task_id: AgentTaskId,
+    pub assistant_message_id: String,
+    pub assistant_sequence: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentAttemptRecord {
     pub id: AgentAttemptId,

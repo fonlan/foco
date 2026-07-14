@@ -148,10 +148,10 @@ use crate::runtime::{
     RipgrepToolSummary, ToolOutputDeltaEvent, ToolResourceLockRegistry,
     chat_run_subscription_stream, default_guidance_source, detect_ripgrep,
     execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
-    pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
-    ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
-    spawn_code_graph_index_initialization, open_workspace_database_ordinary_with_pre_stream_retry,
-    validate_agent_snapshot_for_workspace,
+    open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
+    reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
+    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
+    spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
@@ -9617,14 +9617,15 @@ fn assistant_status_from_metadata(metadata_json: &str) -> Result<Option<String>,
             Some("failed") => Some("error".to_string()),
             _ => {
                 // Durable Error parts without streamingState still surface as failed.
-                let has_error_part = metadata
-                    .get("parts")
-                    .and_then(Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            part.get("type").and_then(Value::as_str) == Some("error")
-                        })
-                    });
+                let has_error_part =
+                    metadata
+                        .get("parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("error")
+                            })
+                        });
                 if has_error_part {
                     Some("error".to_string())
                 } else {

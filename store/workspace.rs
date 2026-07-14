@@ -59,13 +59,13 @@ pub use workspace_records::{
     PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
     PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
     PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
-    PreStreamChatFailureClosureResult, PromptContextInjectionRecord, RewriteChatFromUserMessage,
-    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
-    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
+    PromptContextInjectionRecord, RewriteChatFromUserMessage, RewriteChatFromUserMessageResult,
+    RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -5046,7 +5046,10 @@ impl WorkspaceDatabase {
         closure: PreStreamChatFailureClosure<'_>,
     ) -> Result<PreStreamChatFailureClosureResult, WorkspaceDatabaseError> {
         validate_agent_json(closure.error_json, "error_json")?;
-        validate_json_metadata(closure.assistant_metadata_json, "assistant message metadata")?;
+        validate_json_metadata(
+            closure.assistant_metadata_json,
+            "assistant message metadata",
+        )?;
 
         let database_path = self.database_path.clone();
         let transaction = self
@@ -5144,11 +5147,7 @@ impl WorkspaceDatabase {
                 "UPDATE agent_attempts
                  SET status = 'failed', completed_at = ?3
                  WHERE id = ?1 AND task_id = ?2 AND status = 'running'",
-                params![
-                    closure.attempt_id.as_str(),
-                    closure.task_id.as_str(),
-                    now
-                ],
+                params![closure.attempt_id.as_str(), closure.task_id.as_str(), now],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
         if attempt_updated != 1 {
@@ -5174,8 +5173,11 @@ impl WorkspaceDatabase {
 
         // Materialize durable assistant error only when identity still matches.
         if closure.materialize_assistant {
-            let existing_assistant =
-                message_from_transaction(&transaction, &database_path, closure.assistant_message_id)?;
+            let existing_assistant = message_from_transaction(
+                &transaction,
+                &database_path,
+                closure.assistant_message_id,
+            )?;
             let can_write_assistant = match existing_assistant {
                 Some(existing) => {
                     if existing.chat_id != closure.chat_id
@@ -5185,8 +5187,10 @@ impl WorkspaceDatabase {
                         false
                     } else {
                         // Do not overwrite a completed/successful assistant body.
-                        let metadata =
-                            parse_json_object(&existing.metadata_json, "assistant message metadata")?;
+                        let metadata = parse_json_object(
+                            &existing.metadata_json,
+                            "assistant message metadata",
+                        )?;
                         let streaming_state = metadata
                             .get("streamingState")
                             .and_then(Value::as_str)
@@ -5308,13 +5312,9 @@ impl WorkspaceDatabase {
                             .remove(QUEUED_MESSAGE_METADATA_KEY)
                             .is_some()
                     {
-                        let message_metadata_json =
-                            serde_json::to_string(&message_metadata).map_err(|source| {
-                                WorkspaceDatabaseError::InvalidMessageMetadata {
-                                    message: format!(
-                                        "user message metadata is invalid JSON: {source}"
-                                    ),
-                                }
+                        let message_metadata_json = serde_json::to_string(&message_metadata)
+                            .map_err(|source| WorkspaceDatabaseError::InvalidMessageMetadata {
+                                message: format!("user message metadata is invalid JSON: {source}"),
                             })?;
                         transaction
                             .execute(
@@ -5388,6 +5388,338 @@ impl WorkspaceDatabase {
         let _ = self.fail_plan_phase_run(closure.task_id, &phase_error_message)?;
 
         Ok(PreStreamChatFailureClosureResult::Applied)
+    }
+
+    /// Bounded, idempotent healing for coordinator tasks that failed before any
+    /// assistant message was written (legacy concurrency swallow or new
+    /// `stage=pre_stream_prepare` / pre_active_run metadata).
+    ///
+    /// Scoped to a single chat via `agent_teams.chat_id`. Does not re-run the
+    /// task, create attempts, or touch Memory/Spec/provider/tools.
+    pub fn materialize_missing_pre_stream_failure_messages(
+        &mut self,
+        chat_id: &str,
+    ) -> Result<Vec<PreStreamFailureMaterialization>, WorkspaceDatabaseError> {
+        const PRE_STREAM_USER_MESSAGE_DATABASE_BUSY: &str =
+            "Reply has not started: workspace database is busy. Please retry.";
+        const PRE_STREAM_USER_MESSAGE_GENERIC: &str =
+            "Reply has not started: preparation failed. Please retry.";
+        const STORED_CHAT_PARTS_VERSION: i64 = 5;
+
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        // Per-chat coordinator failed tasks with visible assistant identity.
+        let mut candidates = transaction
+            .prepare(
+                "SELECT task.id,
+                        task.error_json,
+                        task.input_json,
+                        task.completed_at,
+                        task.updated_at
+                 FROM agent_tasks AS task
+                 INNER JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE team.chat_id = ?1
+                   AND task.status = 'failed'
+                   AND task.owner_instance_id = team.coordinator_instance_id
+                   AND COALESCE(
+                         json_extract(task.input_json, '$.visibleAssistantMessageId'),
+                         json_extract(task.input_json, '$.visible_assistant_message_id')
+                       ) IS NOT NULL
+                   AND COALESCE(
+                         json_extract(task.input_json, '$.visibleAssistantMessageId'),
+                         json_extract(task.input_json, '$.visible_assistant_message_id')
+                       ) <> ''
+                   AND COALESCE(
+                         json_extract(task.input_json, '$.queuedUserMessageId'),
+                         json_extract(task.input_json, '$.queued_user_message_id')
+                       ) IS NOT NULL
+                   AND COALESCE(
+                         json_extract(task.input_json, '$.visibleAssistantSequence'),
+                         json_extract(task.input_json, '$.visible_assistant_sequence')
+                       ) IS NOT NULL
+                 ORDER BY task.created_at ASC, task.id ASC",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let candidate_rows = candidates
+            .query_map(params![chat_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        drop(candidates);
+
+        let mut materialized = Vec::new();
+
+        for (task_id, error_json, input_json, completed_at, updated_at) in candidate_rows {
+            let input = match serde_json::from_str::<Value>(&input_json) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(user_message_id) = input
+                .get("queuedUserMessageId")
+                .or_else(|| input.get("queued_user_message_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(assistant_message_id) = input
+                .get("visibleAssistantMessageId")
+                .or_else(|| input.get("visible_assistant_message_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(assistant_sequence) = input
+                .get("visibleAssistantSequence")
+                .or_else(|| input.get("visible_assistant_sequence"))
+                .and_then(Value::as_i64)
+            else {
+                continue;
+            };
+            if assistant_sequence < 0 {
+                continue;
+            }
+
+            // Skip when assistant already exists (idempotent + negative matrix).
+            let assistant_exists = transaction
+                .query_row(
+                    "SELECT 1 FROM messages WHERE id = ?1",
+                    params![assistant_message_id],
+                    |_| Ok(1_i64),
+                )
+                .optional()
+                .map_err(|source| sqlite_error(&database_path, source))?
+                .is_some();
+            if assistant_exists {
+                continue;
+            }
+
+            // User must still exist in this chat (edit/truncate safety).
+            let user_message =
+                message_from_transaction(&transaction, &database_path, user_message_id)?;
+            let Some(user_message) = user_message else {
+                continue;
+            };
+            if user_message.chat_id != chat_id || user_message.role != "user" {
+                continue;
+            }
+
+            // Sequence must still be free for this chat.
+            let sequence_taken = transaction
+                .query_row(
+                    "SELECT 1 FROM messages WHERE chat_id = ?1 AND sequence = ?2",
+                    params![chat_id, assistant_sequence],
+                    |_| Ok(1_i64),
+                )
+                .optional()
+                .map_err(|source| sqlite_error(&database_path, source))?
+                .is_some();
+            if sequence_taken {
+                continue;
+            }
+
+            let error_value = error_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .unwrap_or(Value::Null);
+
+            let stage = error_value
+                .get("stage")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let code = error_value
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let diagnostic = error_value
+                .get("diagnostic")
+                .and_then(Value::as_str)
+                .or_else(|| error_value.get("message").and_then(Value::as_str))
+                .unwrap_or("");
+            let error_message_text = error_value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            let is_structured_pre_stream = stage == "pre_stream_prepare"
+                || stage == "pre_active_run"
+                || code == "workspace_database_busy";
+            let is_legacy_concurrency = !is_structured_pre_stream
+                && (error_message_text.contains("workspace database concurrency limit reached")
+                    || diagnostic.contains("workspace database concurrency limit reached"));
+
+            if !is_structured_pre_stream && !is_legacy_concurrency {
+                continue;
+            }
+
+            // Legacy: require no durable start/provider/tool evidence for this task.
+            if is_legacy_concurrency {
+                let has_run_start = transaction
+                    .query_row(
+                        "SELECT 1 FROM run_events
+                         WHERE chat_id = ?1 AND run_id = ?2 AND event_type = 'start'
+                         LIMIT 1",
+                        params![chat_id, task_id],
+                        |_| Ok(1_i64),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(&database_path, source))?
+                    .is_some();
+                if has_run_start {
+                    continue;
+                }
+                let has_llm = transaction
+                    .query_row(
+                        "SELECT 1 FROM llm_requests
+                         WHERE agent_task_id = ?1
+                         LIMIT 1",
+                        params![task_id],
+                        |_| Ok(1_i64),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(&database_path, source))?
+                    .is_some();
+                if has_llm {
+                    continue;
+                }
+                let has_tool = transaction
+                    .query_row(
+                        "SELECT 1 FROM tool_calls
+                         WHERE chat_id = ?1 AND run_id = ?2
+                         LIMIT 1",
+                        params![chat_id, task_id],
+                        |_| Ok(1_i64),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(&database_path, source))?
+                    .is_some();
+                if has_tool {
+                    continue;
+                }
+            }
+
+            let retryable = error_value
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(is_legacy_concurrency || code == "workspace_database_busy");
+            let user_visible = if is_legacy_concurrency
+                || code == "workspace_database_busy"
+                || error_message_text.contains("workspace database is busy")
+                || error_message_text.contains("workspace database concurrency limit reached")
+            {
+                PRE_STREAM_USER_MESSAGE_DATABASE_BUSY
+            } else if !error_message_text.trim().is_empty()
+                && !error_message_text.contains("workspace database concurrency limit reached")
+                && error_message_text.len() < 280
+            {
+                error_message_text
+            } else {
+                PRE_STREAM_USER_MESSAGE_GENERIC
+            };
+            let resolved_code = if code.is_empty() {
+                if is_legacy_concurrency {
+                    "workspace_database_busy"
+                } else {
+                    "pre_stream_error"
+                }
+            } else {
+                code
+            };
+            let resolved_stage = if stage.is_empty() {
+                "pre_stream_prepare"
+            } else {
+                stage
+            };
+
+            let created_at = completed_at
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(updated_at.as_str());
+
+            let run_failure = json!({
+                "code": resolved_code,
+                "stage": resolved_stage,
+                "retryable": retryable,
+                "taskId": task_id,
+                "message": user_visible,
+                "healedFromHistoricalTask": true,
+            });
+            let assistant_metadata = json!({
+                "streamingState": "failed",
+                "runFailure": run_failure,
+                "parts": [{ "type": "error", "text": user_visible }],
+                "partsVersion": STORED_CHAT_PARTS_VERSION,
+                "partsSource": "pre_stream_failure_historical",
+            });
+            let assistant_metadata_json =
+                serde_json::to_string(&assistant_metadata).map_err(|source| {
+                    WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!("assistant message metadata is invalid JSON: {source}"),
+                    }
+                })?;
+            validate_json_metadata(&assistant_metadata_json, "assistant message metadata")?;
+
+            // PK + (chat_id, sequence) unique: concurrent GET loads insert at most once.
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO messages
+                        (id, chat_id, role, content, sequence, created_at, metadata_json)
+                     VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        assistant_message_id,
+                        chat_id,
+                        user_visible,
+                        assistant_sequence,
+                        created_at,
+                        assistant_metadata_json
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+
+            if inserted == 1 {
+                // Keep chat updated_at so list ordering reflects the healed bubble.
+                transaction
+                    .execute(
+                        "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                        params![created_at, chat_id],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+
+                let task_id_parsed = AgentTaskId::new(task_id.clone()).map_err(|source| {
+                    WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: format!("invalid agent task id '{task_id}': {source}"),
+                    }
+                })?;
+                materialized.push(PreStreamFailureMaterialization {
+                    task_id: task_id_parsed,
+                    assistant_message_id: assistant_message_id.to_string(),
+                    assistant_sequence,
+                });
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(materialized)
     }
 
     pub fn clear_chat_queued_run(

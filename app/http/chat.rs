@@ -2380,6 +2380,12 @@ pub(crate) async fn chat_messages(
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
     let mut database = open_workspace_database(&workspace.path)?;
 
+    // Best-effort historical heal: failed coordinator tasks that never wrote an
+    // assistant bubble (pre-stream DB congestion). Idempotent; does not re-run tasks.
+    database
+        .materialize_missing_pre_stream_failure_messages(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+
     let chat = database
         .chat(chat_id)
         .map_err(ApiError::from_workspace_error)?

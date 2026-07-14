@@ -139,6 +139,22 @@ describe("normalizeChatMessageSummary", () => {
       },
     ]);
   });
+
+  it("treats historically healed pre-stream failures as error bubbles", () => {
+    const result = normalizeChatMessageSummary({
+      ...message("assistant-historical-heal"),
+      status: "error",
+      parts: [
+        {
+          type: "error",
+          text: "Reply has not started: workspace database is busy. Please retry.",
+        },
+      ],
+      content: "Reply has not started: workspace database is busy. Please retry.",
+    });
+    expect(result.status).toBe("error");
+    expect(result.parts.some((part) => part.type === "error")).toBe(true);
+  });
 });
 
 describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {

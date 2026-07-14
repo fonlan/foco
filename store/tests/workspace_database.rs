@@ -28,16 +28,17 @@ use foco_store::{
         NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
         NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
-        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL, RewriteChatFromUserMessage,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
+        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch,
+        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
+        RewriteChatFromUserMessage, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
+        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -9615,8 +9616,7 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let chat_id = "chat-prestream-fail";
-    let (team_id, instance_id) =
-        create_test_agent_team(&mut database, chat_id, "prestream-fail");
+    let (team_id, instance_id) = create_test_agent_team(&mut database, chat_id, "prestream-fail");
     let user_id = "user-prestream-fail";
     let assistant_id = "assistant-prestream-fail";
     database
@@ -9730,17 +9730,13 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
     assert!(chat_metadata.get("queuedRun").is_none());
 
     let user = database.message(user_id).expect("user").expect("user");
-    let user_metadata: Value =
-        serde_json::from_str(&user.metadata_json).expect("user metadata");
+    let user_metadata: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
     assert!(user_metadata.get("queuedRun").is_none());
 
-    let events = database
-        .agent_events_after(&team_id, -1)
-        .expect("events");
+    let events = database.agent_events_after(&team_id, -1).expect("events");
     assert!(
-        events
-            .iter()
-            .any(|event| event.event_type == "task_failed" && event.attempt_id.as_ref() == Some(&attempt_id)),
+        events.iter().any(|event| event.event_type == "task_failed"
+            && event.attempt_id.as_ref() == Some(&attempt_id)),
         "task_failed event for attempt"
     );
 }
@@ -9751,8 +9747,7 @@ fn close_pre_stream_chat_failure_skips_when_queued_run_replaced() {
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let chat_id = "chat-prestream-skip";
-    let (team_id, instance_id) =
-        create_test_agent_team(&mut database, chat_id, "prestream-skip");
+    let (team_id, instance_id) = create_test_agent_team(&mut database, chat_id, "prestream-skip");
     let user_id = "user-prestream-skip";
     let assistant_id = "assistant-prestream-skip";
     database
@@ -9843,10 +9838,503 @@ fn close_pre_stream_chat_failure_skips_when_queued_run_replaced() {
     let chat = database.chat(chat_id).expect("chat").expect("chat");
     let chat_metadata: Value = serde_json::from_str(&chat.metadata_json).expect("chat metadata");
     assert_eq!(
-        chat_metadata["queuedRun"]["assistantMessageId"],
-        "assistant-new",
+        chat_metadata["queuedRun"]["assistantMessageId"], "assistant-new",
         "must not clear replaced queuedRun"
     );
+}
+
+#[test]
+fn materialize_missing_pre_stream_failure_heals_legacy_concurrency_once() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let chat_id = "chat-legacy-heal";
+    let (team_id, instance_id) = create_test_agent_team(&mut database, chat_id, "legacy-heal");
+    let user_id = "user-legacy-heal";
+    let assistant_id = "assistant-legacy-heal";
+    database
+        .insert_message(NewMessage {
+            id: user_id,
+            chat_id,
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"runConfig":{"modelId":"model-test","providerId":"provider-test"}}"#,
+            ),
+        })
+        .expect("user insert");
+
+    let task_id = AgentTaskId::new("agent-task-legacy-heal").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: &json!({
+                "queuedUserMessageId": user_id,
+                "visibleAssistantMessageId": assistant_id,
+                "visibleAssistantSequence": 1,
+                "message": "hello",
+            })
+            .to_string(),
+        })
+        .expect("enqueue");
+    let attempt_id = AgentAttemptId::new("agent-attempt-legacy-heal").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(
+                r#"{"message":"workspace database concurrency limit reached: waiting for ordinary permit timed out after 5s (gate=ordinary, holders=2/2, waiting=3)"}"#,
+            ),
+            interruption_reason: None,
+        })
+        .expect("fail task");
+
+    let first = database
+        .materialize_missing_pre_stream_failure_messages(chat_id)
+        .expect("heal");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].assistant_message_id, assistant_id);
+    assert_eq!(first[0].assistant_sequence, 1);
+
+    let assistant = database
+        .message(assistant_id)
+        .expect("assistant")
+        .expect("assistant");
+    assert_eq!(assistant.sequence, 1);
+    assert_eq!(assistant.role, "assistant");
+    assert!(
+        assistant.content.contains("workspace database is busy")
+            || assistant.content.contains("Reply has not started")
+    );
+    let metadata: Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata");
+    assert_eq!(metadata["streamingState"], "failed");
+    assert_eq!(metadata["runFailure"]["code"], "workspace_database_busy");
+    assert_eq!(metadata["runFailure"]["retryable"], true);
+    assert_eq!(metadata["runFailure"]["healedFromHistoricalTask"], true);
+    assert_eq!(metadata["partsSource"], "pre_stream_failure_historical");
+    assert_eq!(metadata["parts"][0]["type"], "error");
+
+    let second = database
+        .materialize_missing_pre_stream_failure_messages(chat_id)
+        .expect("second heal");
+    assert!(second.is_empty(), "second load must not duplicate");
+    let messages = database.messages_for_chat(chat_id).expect("messages");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.id == assistant_id)
+            .count(),
+        1
+    );
+
+    // Failed task stays terminal (not requeued).
+    let task = database.agent_task(&task_id).expect("task").expect("task");
+    assert_eq!(task.status, AgentTaskStatus::Failed);
+}
+
+#[test]
+fn materialize_missing_pre_stream_failure_heals_structured_stage() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let chat_id = "chat-structured-heal";
+    let (team_id, instance_id) = create_test_agent_team(&mut database, chat_id, "structured-heal");
+    let user_id = "user-structured-heal";
+    let assistant_id = "assistant-structured-heal";
+    database
+        .insert_message(NewMessage {
+            id: user_id,
+            chat_id,
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user insert");
+
+    let task_id = AgentTaskId::new("agent-task-structured-heal").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: &json!({
+                "queuedUserMessageId": user_id,
+                "visibleAssistantMessageId": assistant_id,
+                "visibleAssistantSequence": 1,
+                "message": "hello",
+            })
+            .to_string(),
+        })
+        .expect("enqueue");
+    let attempt_id = AgentAttemptId::new("agent-attempt-structured-heal").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(
+                &json!({
+                    "message": "Reply has not started: workspace database is busy. Please retry.",
+                    "code": "workspace_database_busy",
+                    "stage": "pre_stream_prepare",
+                    "retryable": true,
+                })
+                .to_string(),
+            ),
+            interruption_reason: None,
+        })
+        .expect("fail task");
+
+    let healed = database
+        .materialize_missing_pre_stream_failure_messages(chat_id)
+        .expect("heal");
+    assert_eq!(healed.len(), 1);
+    let metadata: Value = serde_json::from_str(
+        &database
+            .message(assistant_id)
+            .expect("assistant")
+            .expect("assistant")
+            .metadata_json,
+    )
+    .expect("metadata");
+    assert_eq!(metadata["runFailure"]["stage"], "pre_stream_prepare");
+}
+
+#[test]
+fn materialize_missing_pre_stream_failure_negative_matrix() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let chat_id = "chat-neg-matrix";
+    let (team_id, coordinator_id) = create_test_agent_team(&mut database, chat_id, "neg-matrix");
+
+    // 1) Already has assistant → skip
+    database
+        .insert_message(NewMessage {
+            id: "user-has-assistant",
+            chat_id,
+            role: "user",
+            content: "u1",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-has-assistant",
+            chat_id,
+            role: "assistant",
+            content: "already there",
+            sequence: 1,
+            metadata_json: Some(r#"{"streamingState":"complete"}"#),
+        })
+        .expect("assistant");
+    let task_has_assistant = AgentTaskId::new("agent-task-neg-has-assistant").expect("task id");
+    seed_failed_coordinator_task(
+        &mut database,
+        &team_id,
+        &coordinator_id,
+        &task_has_assistant,
+        "user-has-assistant",
+        "assistant-has-assistant",
+        1,
+        r#"{"message":"workspace database concurrency limit reached: gate=ordinary"}"#,
+    );
+
+    // 2) User deleted → skip
+    let task_missing_user = AgentTaskId::new("agent-task-neg-missing-user").expect("task id");
+    seed_failed_coordinator_task(
+        &mut database,
+        &team_id,
+        &coordinator_id,
+        &task_missing_user,
+        "user-missing",
+        "assistant-missing-user",
+        3,
+        r#"{"message":"workspace database concurrency limit reached: gate=ordinary"}"#,
+    );
+
+    // 3) Worker task → skip
+    let worker_id = AgentInstanceId::new("agent-instance-neg-worker").expect("worker");
+    let worker_definition = phase8_agent_definition("neg-worker", 1, 1);
+    database
+        .create_agent_instances_with_limits(
+            &[NewAgentInstance {
+                id: &worker_id,
+                team_id: &team_id,
+                definition: &worker_definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            4,
+            4,
+        )
+        .expect("worker");
+    let task_worker = AgentTaskId::new("agent-task-neg-worker").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_worker,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: None,
+            input_json: &json!({
+                "queuedUserMessageId": "user-has-assistant",
+                "visibleAssistantMessageId": "assistant-worker",
+                "visibleAssistantSequence": 5,
+                "message": "worker",
+            })
+            .to_string(),
+        })
+        .expect("enqueue worker");
+    let attempt_worker = AgentAttemptId::new("agent-attempt-neg-worker").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &task_worker, &attempt_worker)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_worker,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(
+                r#"{"message":"workspace database concurrency limit reached: gate=ordinary"}"#,
+            ),
+            interruption_reason: None,
+        })
+        .expect("fail worker");
+
+    // 4) Ordinary provider failure (not pre-stream whitelist) → skip
+    database
+        .insert_message(NewMessage {
+            id: "user-provider-fail",
+            chat_id,
+            role: "user",
+            content: "u2",
+            sequence: 2,
+            metadata_json: None,
+        })
+        .expect("user");
+    let task_provider = AgentTaskId::new("agent-task-neg-provider").expect("task id");
+    seed_failed_coordinator_task(
+        &mut database,
+        &team_id,
+        &coordinator_id,
+        &task_provider,
+        "user-provider-fail",
+        "assistant-provider-fail",
+        4,
+        r#"{"message":"provider returned 500","code":"provider_error","stage":"stream"}"#,
+    );
+
+    // 5) Legacy concurrency but has start/tool/provider evidence → skip
+    database
+        .insert_message(NewMessage {
+            id: "user-with-evidence",
+            chat_id,
+            role: "user",
+            content: "u3",
+            sequence: 6,
+            metadata_json: None,
+        })
+        .expect("user");
+    let task_evidence = AgentTaskId::new("agent-task-neg-evidence").expect("task id");
+    seed_failed_coordinator_task(
+        &mut database,
+        &team_id,
+        &coordinator_id,
+        &task_evidence,
+        "user-with-evidence",
+        "assistant-with-evidence",
+        7,
+        r#"{"message":"workspace database concurrency limit reached: gate=ordinary"}"#,
+    );
+    database
+        .insert_run_event(NewRunEvent {
+            id: "event-evidence-start",
+            chat_id,
+            run_id: task_evidence.as_str(),
+            sequence: 0,
+            event_type: "start",
+            payload_json: r#"{"assistantMessageId":"assistant-with-evidence"}"#,
+        })
+        .expect("start event");
+
+    let healed = database
+        .materialize_missing_pre_stream_failure_messages(chat_id)
+        .expect("heal");
+    assert!(
+        healed.is_empty(),
+        "negative matrix must not materialize: {healed:?}"
+    );
+    assert!(
+        database
+            .message("assistant-worker")
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .message("assistant-provider-fail")
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .message("assistant-with-evidence")
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .message("assistant-missing-user")
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn materialize_missing_pre_stream_failure_is_concurrent_idempotent() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
+        let chat_id = "chat-concurrent-heal";
+        let (team_id, instance_id) =
+            create_test_agent_team(&mut database, chat_id, "concurrent-heal");
+        database
+            .insert_message(NewMessage {
+                id: "user-concurrent-heal",
+                chat_id,
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user");
+        let task_id = AgentTaskId::new("agent-task-concurrent-heal").expect("task id");
+        seed_failed_coordinator_task(
+            &mut database,
+            &team_id,
+            &instance_id,
+            &task_id,
+            "user-concurrent-heal",
+            "assistant-concurrent-heal",
+            1,
+            r#"{"message":"workspace database concurrency limit reached: gate=ordinary"}"#,
+        );
+    }
+
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let path = workspace_path.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let mut database = WorkspaceDatabase::open_or_create_ungated(&path).expect("database");
+            barrier.wait();
+            database
+                .materialize_missing_pre_stream_failure_messages("chat-concurrent-heal")
+                .expect("heal")
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .collect::<Vec<_>>();
+    let applied: usize = results.iter().map(Vec::len).sum();
+    assert_eq!(applied, 1, "exactly one concurrent insert should apply");
+
+    let database = WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
+    let messages = database
+        .messages_for_chat("chat-concurrent-heal")
+        .expect("messages");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.id == "assistant-concurrent-heal")
+            .count(),
+        1
+    );
+    let assistant = messages
+        .iter()
+        .find(|message| message.id == "assistant-concurrent-heal")
+        .expect("assistant");
+    assert_eq!(assistant.sequence, 1);
+}
+
+fn seed_failed_coordinator_task(
+    database: &mut WorkspaceDatabase,
+    team_id: &AgentTeamId,
+    owner_instance_id: &AgentInstanceId,
+    task_id: &AgentTaskId,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    assistant_sequence: i64,
+    error_json: &str,
+) {
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: task_id,
+            team_id,
+            owner_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: &json!({
+                "queuedUserMessageId": user_message_id,
+                "visibleAssistantMessageId": assistant_message_id,
+                "visibleAssistantSequence": assistant_sequence,
+                "message": "hello",
+            })
+            .to_string(),
+        })
+        .expect("enqueue");
+    let attempt_id =
+        AgentAttemptId::new(format!("agent-attempt-{}", task_id.as_str())).expect("attempt");
+    database
+        .claim_runnable_agent_task(team_id, task_id, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id,
+            task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(error_json),
+            interruption_reason: None,
+        })
+        .expect("fail");
 }
 
 #[test]
