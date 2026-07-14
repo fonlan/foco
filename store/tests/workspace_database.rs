@@ -5382,7 +5382,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     let reject = database.update_llm_request_body("request-1", Some(r#"{"text":"legacy"}"#));
     assert!(reject.is_err(), "non-v1 request body must be rejected");
 
-    // Bypass store validators to plant legacy detail, then reopen to trigger cleanup.
+    // Bypass store validators to simulate an upgrade from a database without the cleanup marker.
     {
         let database_path = database.database_path().to_path_buf();
         let connection = rusqlite::Connection::open(&database_path).expect("open raw sqlite");
@@ -5434,6 +5434,12 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
             r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{"authorization":["********"]},"body":null}"#,
             r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":{"status":200,"version":"HTTP/1.1","headers":{"authorization":["********"],"x-multi":["a","b"]}}}"#,
         );
+        connection
+            .execute(
+                "DELETE FROM workspace_metadata WHERE key = 'llm_audit_detail_v1_pruned'",
+                [],
+            )
+            .expect("remove cleanup marker");
     }
     drop(database);
 
@@ -5476,6 +5482,15 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
         valid_response["http"]["headers"]["x-multi"],
         json!(["a", "b"])
     );
+    let cleanup_marker: String = Connection::open(database.database_path())
+        .expect("open marker database")
+        .query_row(
+            "SELECT value FROM workspace_metadata WHERE key = 'llm_audit_detail_v1_pruned'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("cleanup marker");
+    assert_eq!(cleanup_marker, "true");
 
     // Valid v1 is retained; later NULL/non-v1 cannot overwrite first capture.
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen mut");
@@ -5546,6 +5561,27 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
             .as_deref()
             .is_some_and(|value| value.contains("provider_final_response_v1"))
     );
+}
+
+#[test]
+fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let mut writer = Connection::open(&database_path).expect("open writer");
+    let transaction = writer.transaction().expect("writer transaction");
+    transaction
+        .execute(
+            "INSERT INTO chats (id, title, created_at, updated_at) VALUES ('chat-1', 'Lock holder', '2026-07-14T00:00:00Z', '2026-07-14T00:00:00Z')",
+            [],
+        )
+        .expect("hold write transaction");
+
+    WorkspaceDatabase::open_or_create(workspace.path())
+        .expect("reopen while another connection holds a write transaction");
+    transaction.rollback().expect("rollback writer transaction");
 }
 
 #[test]

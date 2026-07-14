@@ -91,6 +91,7 @@ const PLAN_AUTO_RUN_LEGACY_ENABLED_KEY: &str = "plan_auto_run_enabled";
 const PLAN_AUTO_RUN_BLOCKED_REASON_KEY: &str = "plan_auto_run_blocked_reason";
 const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
 const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
+const LLM_AUDIT_DETAIL_V1_PRUNED_KEY: &str = "llm_audit_detail_v1_pruned";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
   AND messages.id NOT IN (
@@ -695,7 +696,7 @@ impl WorkspaceDatabase {
         let mut connection = open_connection(&database_path)?;
         run_migrations(&mut connection, &database_path, database_existed)?;
         enable_write_ahead_logging(&connection, &database_path)?;
-        prune_non_v1_llm_audit_details(&connection, &database_path)?;
+        prune_non_v1_llm_audit_details_once(&mut connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -14159,6 +14160,13 @@ fn enable_write_ahead_logging(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), WorkspaceDatabaseError> {
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|source| sqlite_error(database_path, source))
@@ -14692,27 +14700,47 @@ fn merge_audit_detail_for_update(
     }
 }
 
-fn prune_non_v1_llm_audit_details(
-    connection: &Connection,
+fn prune_non_v1_llm_audit_details_once(
+    connection: &mut Connection,
     database_path: &Path,
 ) -> Result<(), WorkspaceDatabaseError> {
-    // Migration fixtures may stub llm_requests without detail columns; only prune when present.
-    if !table_has_columns(
-        connection,
-        database_path,
-        "llm_requests",
-        &["request_body_json", "response_body_json"],
-    )? {
+    if !table_exists(connection, database_path, "workspace_metadata")?
+        || !table_has_columns(
+            connection,
+            database_path,
+            "llm_requests",
+            &["request_body_json", "response_body_json"],
+        )?
+    {
         return Ok(());
     }
 
-    // Best-effort: never block open behind a concurrent IMMEDIATE writer. The cleanup is
-    // idempotent and the next successful open will prune remaining non-v1 details.
+    let already_pruned: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_metadata WHERE key = ?1)",
+            params![LLM_AUDIT_DETAIL_V1_PRUNED_KEY],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    if already_pruned {
+        return Ok(());
+    }
+
+    // PERF: The audit columns can contain gigabytes of provider payloads. Serialize this
+    // one-time cleanup and persist completion so normal database opens remain read-only.
     connection
         .busy_timeout(Duration::from_millis(0))
         .map_err(|source| sqlite_error(database_path, source))?;
-    let prune_result = connection.execute_batch(
-        r#"
+    let prune_result = (|| -> Result<(), rusqlite::Error> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_pruned: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_metadata WHERE key = ?1)",
+            params![LLM_AUDIT_DETAIL_V1_PRUNED_KEY],
+            |row| row.get(0),
+        )?;
+        if !already_pruned {
+            transaction.execute_batch(
+                r#"
             UPDATE llm_requests
             SET request_body_json = NULL
             WHERE request_body_json IS NOT NULL
@@ -14731,7 +14759,14 @@ fn prune_non_v1_llm_audit_details(
                 OR COALESCE(json_extract(response_body_json, '$.version'), 0) <> 1
               );
             "#,
-    );
+            )?;
+            transaction.execute(
+                "INSERT INTO workspace_metadata (key, value, updated_at) VALUES (?1, 'true', ?2)",
+                params![LLM_AUDIT_DETAIL_V1_PRUNED_KEY, now_timestamp()],
+            )?;
+        }
+        transaction.commit()
+    })();
     connection
         .busy_timeout(WORKSPACE_DATABASE_BUSY_TIMEOUT)
         .map_err(|source| sqlite_error(database_path, source))?;
