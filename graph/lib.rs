@@ -33,36 +33,260 @@ pub struct IndexReport {
 pub fn index_workspace(workspace_path: impl AsRef<Path>) -> Result<IndexReport, CodeGraphError> {
     let workspace_path = canonical_workspace_path(workspace_path.as_ref())?;
     let files = discover_workspace_files(&workspace_path)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+
+    // Short permit: load existing hashes only.
+    let existing_hashes = {
+        let database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+        database.code_graph_file_hashes()?
+    };
+
     let mut report = IndexReport::default();
     let mut live_paths = Vec::new();
+    let mut pending_writes: Vec<PreparedFileIndex> = Vec::new();
 
     for file_path in files {
         report.scanned_files += 1;
-        match index_workspace_file(&workspace_path, &file_path, &mut database)? {
-            FileIndexOutcome::Indexed {
-                relative_path,
-                had_parse_error,
-            } => {
-                report.indexed_files += 1;
-                if had_parse_error {
+        match prepare_workspace_file(&workspace_path, &file_path, &existing_hashes)? {
+            FilePrepareOutcome::Indexed(prepared) => {
+                if prepared.had_parse_error {
                     report.parse_errors += 1;
                 }
-                live_paths.push(relative_path);
+                live_paths.push(prepared.relative_path.clone());
+                pending_writes.push(prepared);
+                report.indexed_files += 1;
             }
-            FileIndexOutcome::Unchanged { relative_path } => {
+            FilePrepareOutcome::Unchanged { relative_path } => {
                 report.unchanged_files += 1;
                 live_paths.push(relative_path);
             }
-            FileIndexOutcome::Skipped => {
+            FilePrepareOutcome::Skipped => {
                 report.skipped_files += 1;
             }
         }
+
+        // Flush writes in small batches so a permit is not held for the whole workspace.
+        if pending_writes.len() >= CODE_GRAPH_WRITE_BATCH_SIZE {
+            flush_prepared_indexes(&workspace_path, &mut pending_writes)?;
+        }
     }
 
-    report.deleted_files = database.remove_stale_code_graph_files(&live_paths)?.len();
+    if !pending_writes.is_empty() {
+        flush_prepared_indexes(&workspace_path, &mut pending_writes)?;
+    }
+
+    // Short permit: stale cleanup only.
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+        report.deleted_files = database.remove_stale_code_graph_files(&live_paths)?.len();
+    }
 
     Ok(report)
+}
+
+const CODE_GRAPH_WRITE_BATCH_SIZE: usize = 16;
+
+struct PreparedFileIndex {
+    relative_path: String,
+    language: Option<&'static str>,
+    size_bytes: Option<i64>,
+    modified_at: Option<String>,
+    content_hash: String,
+    parse_status: &'static str,
+    parse_error_message: Option<String>,
+    symbols: Vec<OwnedSymbol>,
+    imports: Vec<OwnedImport>,
+    references: Vec<OwnedReference>,
+    edges: Vec<ExtractedEdge>,
+    fts_body: String,
+    had_parse_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedSymbol {
+    name: String,
+    kind: &'static str,
+    start: Point,
+    end: Point,
+    signature: Option<String>,
+    documentation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedImport {
+    module: String,
+    imported_symbol: Option<String>,
+    alias: Option<String>,
+    start: Point,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedReference {
+    name: String,
+    symbol_index: Option<usize>,
+    start: Point,
+    end: Point,
+}
+
+enum FilePrepareOutcome {
+    Indexed(PreparedFileIndex),
+    Unchanged { relative_path: String },
+    Skipped,
+}
+
+fn flush_prepared_indexes(
+    workspace_path: &Path,
+    pending: &mut Vec<PreparedFileIndex>,
+) -> Result<(), CodeGraphError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)?;
+    for prepared in pending.drain(..) {
+        let symbol_rows = prepared
+            .symbols
+            .iter()
+            .map(|symbol| NewCodeGraphSymbol {
+                name: &symbol.name,
+                kind: symbol.kind,
+                start_line: Some(point_row(symbol.start)),
+                start_column: Some(point_column(symbol.start)),
+                end_line: Some(point_row(symbol.end)),
+                end_column: Some(point_column(symbol.end)),
+                signature: symbol.signature.as_deref(),
+                documentation: symbol.documentation.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let import_rows = prepared
+            .imports
+            .iter()
+            .map(|import| NewCodeGraphImport {
+                module: &import.module,
+                imported_symbol: import.imported_symbol.as_deref(),
+                alias: import.alias.as_deref(),
+                start_line: Some(point_row(import.start)),
+                start_column: Some(point_column(import.start)),
+            })
+            .collect::<Vec<_>>();
+        let reference_rows = prepared
+            .references
+            .iter()
+            .map(|reference| NewCodeGraphReference {
+                name: &reference.name,
+                symbol_index: reference.symbol_index,
+                start_line: Some(point_row(reference.start)),
+                start_column: Some(point_column(reference.start)),
+                end_line: Some(point_row(reference.end)),
+                end_column: Some(point_column(reference.end)),
+            })
+            .collect::<Vec<_>>();
+        let edge_rows = prepared
+            .edges
+            .iter()
+            .map(|edge| NewCodeGraphEdge {
+                source_symbol_index: edge.source_symbol_index,
+                target_symbol_index: edge.target_symbol_index,
+                edge_kind: edge.edge_kind,
+                metadata_json: None,
+            })
+            .collect::<Vec<_>>();
+
+        database.replace_code_graph_file_index(NewCodeGraphFileIndex {
+            path: &prepared.relative_path,
+            language: prepared.language,
+            size_bytes: prepared.size_bytes,
+            modified_at: prepared.modified_at.as_deref(),
+            content_hash: &prepared.content_hash,
+            parse_status: prepared.parse_status,
+            parse_error_message: prepared.parse_error_message.as_deref(),
+            symbols: &symbol_rows,
+            imports: &import_rows,
+            references: &reference_rows,
+            edges: &edge_rows,
+            fts_body: &prepared.fts_body,
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_workspace_file(
+    workspace_path: &Path,
+    file_path: &Path,
+    existing_hashes: &HashMap<String, String>,
+) -> Result<FilePrepareOutcome, CodeGraphError> {
+    let bytes = fs::read(file_path).map_err(|source| io_error(file_path, source))?;
+    let text = std::str::from_utf8(&bytes);
+    let language = detect_language(file_path, text.ok());
+    let Some(language) = language else {
+        return Ok(FilePrepareOutcome::Skipped);
+    };
+
+    let relative_path = workspace_relative_path(workspace_path, file_path)?;
+    let content_hash = content_hash(&bytes);
+    if existing_hashes.get(&relative_path) == Some(&content_hash) {
+        return Ok(FilePrepareOutcome::Unchanged { relative_path });
+    }
+
+    let metadata = fs::metadata(file_path).map_err(|source| io_error(file_path, source))?;
+    let modified_at = metadata.modified().ok().map(system_time_to_timestamp);
+    let extracted = match text {
+        Ok(text) => extract_file(language, text, file_path)?,
+        Err(_) => ExtractedFile {
+            parse_status: "error",
+            parse_error_message: Some("file is not valid UTF-8".to_string()),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            references: Vec::new(),
+            edges: Vec::new(),
+        },
+    };
+    let had_parse_error = extracted.parse_status == "error";
+    let size_bytes = i64::try_from(bytes.len()).ok();
+    let fts_body = text.unwrap_or_default().to_string();
+
+    Ok(FilePrepareOutcome::Indexed(PreparedFileIndex {
+        relative_path,
+        language: Some(language.name()),
+        size_bytes,
+        modified_at,
+        content_hash,
+        parse_status: extracted.parse_status,
+        parse_error_message: extracted.parse_error_message,
+        symbols: extracted
+            .symbols
+            .into_iter()
+            .map(|symbol| OwnedSymbol {
+                name: symbol.name,
+                kind: symbol.kind,
+                start: symbol.start,
+                end: symbol.end,
+                signature: symbol.signature,
+                documentation: symbol.documentation,
+            })
+            .collect(),
+        imports: extracted
+            .imports
+            .into_iter()
+            .map(|import| OwnedImport {
+                module: import.module,
+                imported_symbol: import.imported_symbol,
+                alias: import.alias,
+                start: import.start,
+            })
+            .collect(),
+        references: extracted
+            .references
+            .into_iter()
+            .map(|reference| OwnedReference {
+                name: reference.name,
+                symbol_index: reference.symbol_index,
+                start: reference.start,
+                end: reference.end,
+            })
+            .collect(),
+        edges: extracted.edges,
+        fts_body,
+        had_parse_error,
+    }))
 }
 
 pub fn start_code_graph_watcher(
@@ -238,17 +462,6 @@ impl From<notify::Error> for CodeGraphError {
     }
 }
 
-enum FileIndexOutcome {
-    Indexed {
-        relative_path: String,
-        had_parse_error: bool,
-    },
-    Unchanged {
-        relative_path: String,
-    },
-    Skipped,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LanguageKind {
     Rust,
@@ -320,109 +533,6 @@ struct ExtractedEdge {
     source_symbol_index: usize,
     target_symbol_index: usize,
     edge_kind: &'static str,
-}
-
-fn index_workspace_file(
-    workspace_path: &Path,
-    file_path: &Path,
-    database: &mut WorkspaceDatabase,
-) -> Result<FileIndexOutcome, CodeGraphError> {
-    let bytes = fs::read(file_path).map_err(|source| io_error(file_path, source))?;
-    let text = std::str::from_utf8(&bytes);
-    let language = detect_language(file_path, text.ok());
-    let Some(language) = language else {
-        return Ok(FileIndexOutcome::Skipped);
-    };
-
-    let relative_path = workspace_relative_path(workspace_path, file_path)?;
-    let content_hash = content_hash(&bytes);
-    if database.code_graph_file_hash(&relative_path)? == Some(content_hash.clone()) {
-        return Ok(FileIndexOutcome::Unchanged { relative_path });
-    }
-
-    let metadata = fs::metadata(file_path).map_err(|source| io_error(file_path, source))?;
-    let modified_at = metadata.modified().ok().map(system_time_to_timestamp);
-    let extracted = match text {
-        Ok(text) => extract_file(language, text, file_path)?,
-        Err(_) => ExtractedFile {
-            parse_status: "error",
-            parse_error_message: Some("file is not valid UTF-8".to_string()),
-            symbols: Vec::new(),
-            imports: Vec::new(),
-            references: Vec::new(),
-            edges: Vec::new(),
-        },
-    };
-    let had_parse_error = extracted.parse_status == "error";
-    let size_bytes = i64::try_from(bytes.len()).ok();
-    let fts_body = text.unwrap_or_default();
-    let symbol_rows = extracted
-        .symbols
-        .iter()
-        .map(|symbol| NewCodeGraphSymbol {
-            name: &symbol.name,
-            kind: symbol.kind,
-            start_line: Some(point_row(symbol.start)),
-            start_column: Some(point_column(symbol.start)),
-            end_line: Some(point_row(symbol.end)),
-            end_column: Some(point_column(symbol.end)),
-            signature: symbol.signature.as_deref(),
-            documentation: symbol.documentation.as_deref(),
-        })
-        .collect::<Vec<_>>();
-    let import_rows = extracted
-        .imports
-        .iter()
-        .map(|import| NewCodeGraphImport {
-            module: &import.module,
-            imported_symbol: import.imported_symbol.as_deref(),
-            alias: import.alias.as_deref(),
-            start_line: Some(point_row(import.start)),
-            start_column: Some(point_column(import.start)),
-        })
-        .collect::<Vec<_>>();
-    let reference_rows = extracted
-        .references
-        .iter()
-        .map(|reference| NewCodeGraphReference {
-            name: &reference.name,
-            symbol_index: reference.symbol_index,
-            start_line: Some(point_row(reference.start)),
-            start_column: Some(point_column(reference.start)),
-            end_line: Some(point_row(reference.end)),
-            end_column: Some(point_column(reference.end)),
-        })
-        .collect::<Vec<_>>();
-    let edge_rows = extracted
-        .edges
-        .iter()
-        .map(|edge| NewCodeGraphEdge {
-            source_symbol_index: edge.source_symbol_index,
-            target_symbol_index: edge.target_symbol_index,
-            edge_kind: edge.edge_kind,
-            metadata_json: None,
-        })
-        .collect::<Vec<_>>();
-
-    database.replace_code_graph_file_index(NewCodeGraphFileIndex {
-        path: &relative_path,
-        language: Some(language.name()),
-        size_bytes,
-        modified_at: modified_at.as_deref(),
-        content_hash: &content_hash,
-        parse_status: extracted.parse_status,
-        parse_error_message: extracted.parse_error_message.as_deref(),
-        symbols: &symbol_rows,
-        imports: &import_rows,
-        references: &reference_rows,
-        edges: &edge_rows,
-        fts_body,
-    })?;
-
-    Ok(FileIndexOutcome::Indexed {
-        relative_path,
-        had_parse_error,
-    })
 }
 
 fn extract_file(
@@ -1675,5 +1785,51 @@ RUN echo hello
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("query count")
+    }
+
+    #[test]
+    fn index_workspace_shares_store_gate_with_critical_reservation() {
+        use foco_store::workspace::{
+            open_workspace_database, open_workspace_database_critical,
+            WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+        };
+        use std::time::Instant;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "fn gated_symbol() {}\n",
+        )
+        .expect("source");
+
+        // Critical Agent lifecycle reservation remains usable while ordinary slots are busy.
+        let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");
+        let ordinary_2 = open_workspace_database(workspace.path()).expect("ordinary 2");
+        let critical = open_workspace_database_critical(workspace.path()).expect("critical");
+
+        let workspace_path = workspace.path().to_path_buf();
+        let started_at = Instant::now();
+        let index_error = match index_workspace(&workspace_path) {
+            Ok(_) => panic!("index must observe ordinary concurrency limit"),
+            Err(error) => error,
+        };
+        assert!(
+            started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+            "index should wait for ordinary timeout"
+        );
+        let message = index_error.to_string();
+        assert!(
+            message.contains("workspace database concurrency limit reached"),
+            "{message}"
+        );
+
+        drop(ordinary_2);
+        // With one ordinary free and critical held, short gated opens still index.
+        let report = index_workspace(workspace.path()).expect("index after ordinary release");
+        assert!(report.scanned_files >= 1);
+        assert_eq!(report.indexed_files, 1);
+
+        drop(ordinary_1);
+        drop(critical);
     }
 }

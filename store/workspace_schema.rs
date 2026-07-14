@@ -1332,7 +1332,7 @@ mod tests {
     fn hook_runs_redact_secret_input_and_output_json() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
         database
             .insert_hook_run(NewHookRun {

@@ -5211,7 +5211,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory chat")
                 .expect("chat insert");
@@ -5320,7 +5320,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Extraction chat")
                 .expect("chat insert");
@@ -5357,7 +5357,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Extraction chat")
                 .expect("chat insert");
@@ -5504,7 +5504,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-claim", "Extraction claim chat")
                 .expect("chat insert");
@@ -5839,7 +5839,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory chat")
                 .expect("chat insert");
@@ -6003,7 +6003,7 @@ mod tests {
         drop(memory);
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             assert!(
                 workspace_database
                     .delete_chat("chat-1")
@@ -6029,7 +6029,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory updates")
                 .expect("chat insert");
@@ -6136,7 +6136,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory relations")
                 .expect("chat insert");
@@ -6232,7 +6232,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory profile")
                 .expect("chat insert");

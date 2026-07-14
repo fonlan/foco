@@ -4,10 +4,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     net::{IpAddr, SocketAddr},
-    panic::Location,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -86,7 +85,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch,
+    Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc, watch,
 };
 use tokio::time::timeout;
 
@@ -411,235 +410,23 @@ pub(crate) struct AppState {
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
 
-static WORKSPACE_DATABASE_GATES: LazyLock<Mutex<HashMap<PathBuf, WorkspaceDatabaseGate>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-const WORKSPACE_DATABASE_TOTAL_CAPACITY: usize = 3;
-const WORKSPACE_DATABASE_ORDINARY_CAPACITY: usize = 2;
-const WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT: Duration = Duration::from_secs(5);
-const WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT: Duration = Duration::from_secs(15);
-const WORKSPACE_DATABASE_GATE_POLL: Duration = Duration::from_millis(10);
-const WORKSPACE_DATABASE_LONG_HOLD_WARNING: Duration = Duration::from_secs(10);
-
-#[derive(Clone)]
-struct WorkspaceDatabaseGate {
-    total: Arc<Semaphore>,
-    ordinary: Arc<Semaphore>,
-}
-
-impl WorkspaceDatabaseGate {
-    fn new() -> Self {
-        Self {
-            total: Arc::new(Semaphore::new(WORKSPACE_DATABASE_TOTAL_CAPACITY)),
-            ordinary: Arc::new(Semaphore::new(WORKSPACE_DATABASE_ORDINARY_CAPACITY)),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum WorkspaceDatabaseGateKind {
-    Ordinary,
-    Critical,
-}
-
-impl WorkspaceDatabaseGateKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ordinary => "ordinary",
-            Self::Critical => "critical",
-        }
-    }
-
-    fn timeout(self) -> Duration {
-        match self {
-            Self::Ordinary => WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-            Self::Critical => WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT,
-        }
-    }
-}
-
-struct WorkspaceDatabasePermits {
-    _total: OwnedSemaphorePermit,
-    _ordinary: Option<OwnedSemaphorePermit>,
-}
-
-pub(crate) struct WorkspaceDatabaseHandle {
-    database: WorkspaceDatabase,
-    _permits: WorkspaceDatabasePermits,
-    workspace_path: PathBuf,
-    gate_kind: WorkspaceDatabaseGateKind,
-    acquired_at: Instant,
-    caller: &'static Location<'static>,
-}
-
-impl std::ops::Deref for WorkspaceDatabaseHandle {
-    type Target = WorkspaceDatabase;
-
-    fn deref(&self) -> &Self::Target {
-        &self.database
-    }
-}
-
-impl std::ops::DerefMut for WorkspaceDatabaseHandle {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.database
-    }
-}
-
-impl Drop for WorkspaceDatabaseHandle {
-    fn drop(&mut self) {
-        let held_for = self.acquired_at.elapsed();
-        if held_for >= WORKSPACE_DATABASE_LONG_HOLD_WARNING {
-            tracing::warn!(
-                workspace = %self.workspace_path.display(),
-                gate = self.gate_kind.as_str(),
-                held_ms = held_for.as_millis() as u64,
-                source_file = self.caller.file(),
-                source_line = self.caller.line(),
-                source_column = self.caller.column(),
-                "workspace database permit held longer than expected"
-            );
-        }
-    }
-}
+pub(crate) use foco_store::workspace::WorkspaceDatabaseHandle;
+pub(crate) use foco_store::workspace::WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT;
 
 #[track_caller]
 pub(crate) fn open_workspace_database(
-    workspace_path: impl AsRef<Path>,
+    workspace_path: impl AsRef<std::path::Path>,
 ) -> Result<WorkspaceDatabaseHandle, ApiError> {
-    open_workspace_database_with_gate(
-        workspace_path.as_ref(),
-        WorkspaceDatabaseGateKind::Ordinary,
-        Location::caller(),
-    )
+    foco_store::workspace::open_workspace_database(workspace_path)
+        .map_err(ApiError::from_workspace_error)
 }
 
 #[track_caller]
 pub(crate) fn open_workspace_database_critical(
-    workspace_path: impl AsRef<Path>,
+    workspace_path: impl AsRef<std::path::Path>,
 ) -> Result<WorkspaceDatabaseHandle, ApiError> {
-    open_workspace_database_with_gate(
-        workspace_path.as_ref(),
-        WorkspaceDatabaseGateKind::Critical,
-        Location::caller(),
-    )
-}
-
-fn open_workspace_database_with_gate(
-    workspace_path: &Path,
-    gate_kind: WorkspaceDatabaseGateKind,
-    caller: &'static Location<'static>,
-) -> Result<WorkspaceDatabaseHandle, ApiError> {
-    let (key, permits) = acquire_workspace_database_permits(workspace_path, gate_kind)?;
-    let acquired_at = Instant::now();
-    let database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    Ok(WorkspaceDatabaseHandle {
-        database,
-        _permits: permits,
-        workspace_path: key,
-        gate_kind,
-        acquired_at,
-        caller,
-    })
-}
-
-fn acquire_workspace_database_permits(
-    workspace_path: &Path,
-    gate_kind: WorkspaceDatabaseGateKind,
-) -> Result<(PathBuf, WorkspaceDatabasePermits), ApiError> {
-    let key = fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
-    let gate = {
-        let mut gates = WORKSPACE_DATABASE_GATES
-            .lock()
-            .map_err(|_| ApiError::internal("workspace database gate lock is poisoned"))?;
-        gates
-            .entry(key.clone())
-            .or_insert_with(WorkspaceDatabaseGate::new)
-            .clone()
-    };
-    let started_at = Instant::now();
-    let timeout = gate_kind.timeout();
-    let ordinary = match gate_kind {
-        WorkspaceDatabaseGateKind::Ordinary => Some(acquire_workspace_database_gate_slot(
-            &key,
-            &gate,
-            gate.ordinary.clone(),
-            gate_kind,
-            "ordinary",
-            started_at,
-            timeout,
-        )?),
-        WorkspaceDatabaseGateKind::Critical => None,
-    };
-    let total = acquire_workspace_database_gate_slot(
-        &key,
-        &gate,
-        gate.total.clone(),
-        gate_kind,
-        "total",
-        started_at,
-        timeout,
-    )?;
-    Ok((
-        key,
-        WorkspaceDatabasePermits {
-            _total: total,
-            _ordinary: ordinary,
-        },
-    ))
-}
-
-fn acquire_workspace_database_gate_slot(
-    key: &Path,
-    gate: &WorkspaceDatabaseGate,
-    semaphore: Arc<Semaphore>,
-    gate_kind: WorkspaceDatabaseGateKind,
-    slot_kind: &'static str,
-    started_at: Instant,
-    timeout: Duration,
-) -> Result<OwnedSemaphorePermit, ApiError> {
-    loop {
-        match semaphore.clone().try_acquire_owned() {
-            Ok(permit) => return Ok(permit),
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(ApiError::internal(format!(
-                    "workspace database gate is closed: {} (gate={}, slot={})",
-                    key.display(),
-                    gate_kind.as_str(),
-                    slot_kind,
-                )));
-            }
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                let waited = started_at.elapsed();
-                if waited >= timeout {
-                    tracing::warn!(
-                        workspace = %key.display(),
-                        gate = gate_kind.as_str(),
-                        slot = slot_kind,
-                        waited_ms = waited.as_millis() as u64,
-                        total_capacity = WORKSPACE_DATABASE_TOTAL_CAPACITY,
-                        total_available = gate.total.available_permits(),
-                        ordinary_capacity = WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-                        ordinary_available = gate.ordinary.available_permits(),
-                        "workspace database permit acquisition timed out"
-                    );
-                    return Err(ApiError::internal(format!(
-                        "workspace database concurrency limit reached for {} after {} ms (gate={}, slot={}, total={}/{}, ordinary={}/{})",
-                        key.display(),
-                        waited.as_millis(),
-                        gate_kind.as_str(),
-                        slot_kind,
-                        gate.total.available_permits(),
-                        WORKSPACE_DATABASE_TOTAL_CAPACITY,
-                        gate.ordinary.available_permits(),
-                        WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-                    )));
-                }
-                // ponytail: process-local backpressure only; cross-process pressure stays with SQLite/OS. Upgrade path is a pooled workspace DB runtime.
-                std::thread::sleep(WORKSPACE_DATABASE_GATE_POLL);
-            }
-        }
-    }
+    foco_store::workspace::open_workspace_database_critical(workspace_path)
+        .map_err(ApiError::from_workspace_error)
 }
 
 #[tokio::main]

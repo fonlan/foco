@@ -46,7 +46,7 @@ use serde_json::{Value, json};
 fn creates_workspace_foco_database_and_runs_migrations() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     assert!(workspace.path().join(".foco").is_dir());
     assert!(workspace_database_path(workspace.path()).is_file());
@@ -149,7 +149,7 @@ fn concurrent_first_open_serializes_workspace_migrations() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())
                     .and_then(|database| database.schema_version())
             })
         })
@@ -163,7 +163,7 @@ fn concurrent_first_open_serializes_workspace_migrations() {
         assert_eq!(schema_version, WORKSPACE_SCHEMA_VERSION);
     }
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -196,7 +196,7 @@ fn concurrent_old_workspace_open_serializes_migration_backup() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())
                     .and_then(|database| database.schema_version())
             })
         })
@@ -279,7 +279,7 @@ fn concurrent_global_memory_open_serializes_migrations() {
 fn mark_and_clear_chat_queued_run_are_atomic_with_unrelated_metadata() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat_with_metadata(
@@ -360,7 +360,7 @@ fn concurrent_mark_and_clear_queued_run_preserve_chat_message_identity() {
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat_with_metadata(
             "chat-race",
@@ -390,7 +390,7 @@ fn concurrent_mark_and_clear_queued_run_preserve_chat_message_identity() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                let mut database = WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                let mut database = WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())
                     .expect("workspace database");
                 if index % 2 == 0 {
                     database
@@ -415,7 +415,7 @@ fn concurrent_mark_and_clear_queued_run_preserve_chat_message_identity() {
     }
 
     let database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let chat = database.chat("chat-race").expect("chat").expect("chat row");
     let message = database
         .message("user-race")
@@ -559,7 +559,7 @@ fn workspace_spec_phase0_contract_defines_jobs_stale_writes_and_v1_output() {
 fn workspace_spec_content_update_rejects_stale_revision() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     assert!(database.workspace_spec().expect("initial spec").is_none());
 
@@ -602,7 +602,7 @@ fn workspace_spec_content_update_rejects_stale_revision() {
 fn delete_plan_removes_plan_graph_and_reports_missing() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -647,7 +647,7 @@ fn delete_plan_removes_plan_graph_and_reports_missing() {
 fn plan_completed_steps_remain_active_until_user_marks_complete() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let created = database
         .create_plan(NewPlan {
@@ -745,7 +745,7 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
 fn plans_newest_first_orders_before_pagination() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     for plan_id in [
         "plan-oldest",
@@ -812,7 +812,7 @@ fn plans_newest_first_orders_before_pagination() {
 fn reorder_active_plans_updates_only_reorderable_slots() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     create_minimal_plan(&mut database, "plan-ready-1", "ready");
     create_minimal_plan(&mut database, "plan-running", "ready");
@@ -912,7 +912,7 @@ fn update_plan_cannot_bypass_execution_state_machine() {
     for phase_status in ["pending", "running", "failed", "cancelled"] {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         let plan_id = format!("plan-update-guard-{phase_status}");
         create_minimal_plan(&mut database, &plan_id, "ready");
         let connection = Connection::open(database.database_path()).expect("open fixture database");
@@ -953,7 +953,7 @@ fn update_plan_cannot_bypass_execution_state_machine() {
 fn update_plan_only_edits_metadata_and_normal_state_machine_still_completes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     create_minimal_plan(&mut database, "plan-update-metadata", "ready");
 
     let updated = database
@@ -997,7 +997,7 @@ fn update_plan_only_edits_metadata_and_normal_state_machine_still_completes() {
 fn mark_plan_invalid_is_narrow_and_rejects_active_or_terminal_plans() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     create_minimal_plan(&mut database, "plan-invalid-reconcile", "ready");
     let failed = database
         .mark_plan_invalid("plan-invalid-reconcile", "invalid scheduler candidate")
@@ -1044,7 +1044,7 @@ fn mark_plan_invalid_is_narrow_and_rejects_active_or_terminal_plans() {
 fn create_plan_reports_duplicate_step_id_before_sqlite_constraint() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -1105,7 +1105,7 @@ fn create_plan_reports_duplicate_step_id_before_sqlite_constraint() {
 fn create_plan_reports_duplicate_step_id_within_same_request() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let error = database
         .create_plan(NewPlan {
@@ -1175,7 +1175,7 @@ fn create_auto_run_test_plan(database: &mut WorkspaceDatabase, id: &str, status:
 #[test]
 fn plan_auto_run_candidate_selects_next_runnable_plan() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let mut database = database;
 
     create_auto_run_test_plan(&mut database, "paused", "paused");
@@ -1197,7 +1197,7 @@ fn plan_auto_run_candidate_selects_next_runnable_plan() {
 fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_candidates() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let cases = [
         (
@@ -1251,7 +1251,7 @@ fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_can
 fn plan_auto_run_cancelled_phase_blocks_later_plan_and_is_not_busy() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     create_auto_run_test_plan(&mut database, "blocked", "ready");
     create_auto_run_test_plan(&mut database, "later", "ready");
@@ -1288,7 +1288,7 @@ fn plan_auto_run_cancelled_phase_blocks_later_plan_and_is_not_busy() {
 fn plan_auto_run_idle_disables_desired_preference() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     create_auto_run_test_plan(&mut database, "completed", "completed");
     database
@@ -1310,7 +1310,7 @@ fn plan_auto_run_idle_disables_desired_preference() {
 fn plan_auto_run_marks_running_plan_busy_without_candidate() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     create_auto_run_test_plan(&mut database, "running-plan", "ready");
     database
@@ -1338,7 +1338,7 @@ fn plan_auto_run_legacy_enabled_metadata_migrates_to_desired_preference() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     {
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         database
             .set_workspace_metadata("plan_auto_run_enabled", "true")
             .expect("set legacy preference");
@@ -1357,7 +1357,7 @@ fn plan_auto_run_legacy_enabled_metadata_migrates_to_desired_preference() {
     drop(connection);
 
     let database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated workspace database");
     let state = database.plan_auto_run_state().expect("migrated state");
     assert!(state.desired_enabled);
 }
@@ -1367,7 +1367,7 @@ fn plan_auto_run_desired_and_block_survive_reopen_and_retry_clears_block() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     {
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         create_auto_run_test_plan(&mut database, "blocked", "ready");
         database
             .set_plan_auto_run_enabled(true)
@@ -1385,7 +1385,7 @@ fn plan_auto_run_desired_and_block_survive_reopen_and_retry_clears_block() {
     }
 
     let mut reopened =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopened database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopened database");
     let state = reopened.plan_auto_run_state().expect("reopened state");
     assert!(state.desired_enabled);
     assert_eq!(state.blocked_reason.as_deref(), Some("cancelled_phase"));
@@ -1411,7 +1411,7 @@ fn plan_auto_run_desired_and_block_survive_reopen_and_retry_clears_block() {
 fn disabling_auto_run_while_blocked_prevents_retry_resume() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     create_auto_run_test_plan(&mut database, "blocked", "ready");
     database
         .set_plan_auto_run_enabled(true)
@@ -1446,7 +1446,7 @@ fn disabling_auto_run_while_blocked_prevents_retry_resume() {
 fn plan_phase_run_completion_advances_until_pause() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -1590,7 +1590,7 @@ fn plan_phase_run_completion_advances_until_pause() {
 fn phase_commit_does_not_mark_plan_shared_merged() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -1665,7 +1665,7 @@ fn phase_commit_does_not_mark_plan_shared_merged() {
 fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -1774,7 +1774,7 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
 #[test]
 fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-running-without-agent-run",
@@ -1842,7 +1842,7 @@ fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
     let attempt_id;
     {
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         database
             .create_plan(NewPlan {
                 id: "plan-derived-effects",
@@ -1948,7 +1948,7 @@ fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
     }
 
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
     let pending = database
         .awaiting_plan_phase_derived_effects()
         .expect("pending effects");
@@ -1972,7 +1972,7 @@ fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
 #[test]
 fn terminal_plan_phase_attempt_discards_unconfirmed_derived_effects() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-terminal-effects",
@@ -2083,7 +2083,7 @@ fn terminal_plan_phase_attempt_discards_unconfirmed_derived_effects() {
 fn starting_failed_plan_phase_clears_previous_agent_run() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -2203,7 +2203,7 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
 #[test]
 fn plan_phase_attempt_history_survives_retry_and_second_failure() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-attempt-history",
@@ -2360,7 +2360,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
 #[test]
 fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-cancelled-phase-run",
@@ -2489,7 +2489,7 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
 #[test]
 fn cancelled_earliest_phase_blocks_resume_without_state_changes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-cancelled-resume-barrier",
@@ -2565,7 +2565,7 @@ fn cancelled_earliest_phase_blocks_resume_without_state_changes() {
 
     drop(database);
     let mut reopened =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
     let error = reopened
         .transition_plan("plan-cancelled-resume-barrier", "resume")
         .expect_err("persisted cancelled phase must block resume after restart");
@@ -2582,7 +2582,7 @@ fn cancelled_earliest_phase_blocks_resume_without_state_changes() {
 #[test]
 fn retry_rejects_phase_with_incomplete_predecessor_without_creating_attempt() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-retry-order-barrier",
@@ -2647,7 +2647,7 @@ fn retry_rejects_phase_with_incomplete_predecessor_without_creating_attempt() {
 #[test]
 fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-retry-earliest-cancelled",
@@ -2752,7 +2752,7 @@ fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
 fn completed_running_plan_phase_agent_tasks_finds_stale_completed_tasks() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -2845,7 +2845,7 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
     ] {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         let plan_id = format!("plan-stale-{suffix}-phase");
         let phase_id = format!("{plan_id}-1");
         let step_id = format!("plan-stale-{suffix}-step-1");
@@ -2967,7 +2967,7 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
 #[test]
 fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-attempt-step-complete",
@@ -3053,7 +3053,7 @@ fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
         ("cancelled", "cancelled", None, None),
     ] {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
         let plan_id = format!("plan-attempt-reconcile-{suffix}");
         let phase_id = format!("{plan_id}-phase-1");
         let step_id = format!("{plan_id}-step-1");
@@ -3165,7 +3165,7 @@ fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
 #[test]
 fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
             id: "plan-attempt-migration-024",
@@ -3254,7 +3254,7 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
         .expect("seed stale v23 data");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -3283,7 +3283,7 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
 fn plan_phase_merge_attempt_can_begin_once() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -3340,7 +3340,7 @@ fn plan_phase_merge_attempt_can_begin_once() {
 fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -3478,7 +3478,7 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
 fn plan_phase_merge_run_failure_marks_plan_failed_without_shared_merge_commit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let merge_task_id = attach_test_plan_merge_run(
         &mut database,
@@ -3507,7 +3507,7 @@ fn plan_phase_merge_run_failure_marks_plan_failed_without_shared_merge_commit() 
 fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_merge_commit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let merge_task_id = attach_test_plan_merge_run(
         &mut database,
@@ -3581,7 +3581,7 @@ fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_mer
 fn fast_forward_failure_without_merge_dispatch_marks_failed_and_archive_preserves_error() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .create_plan(NewPlan {
@@ -3636,7 +3636,7 @@ fn fast_forward_failure_without_merge_dispatch_marks_failed_and_archive_preserve
 fn workspace_spec_jobs_redact_audit_json_fields() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let job = database
         .insert_workspace_spec_job(NewWorkspaceSpecJob {
@@ -3697,7 +3697,7 @@ fn workspace_spec_job_claim_is_fifo_and_single_owner() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     {
         let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
         for id in ["spec-job-a", "spec-job-b", "spec-job-c"] {
             database
                 .insert_workspace_spec_job(NewWorkspaceSpecJob {
@@ -3721,7 +3721,7 @@ fn workspace_spec_job_claim_is_fifo_and_single_owner() {
         let barrier = barrier.clone();
         workers.push(thread::spawn(move || {
             let mut database =
-                WorkspaceDatabase::open_or_create(workspace_path.as_path()).expect("worker db");
+                WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path()).expect("worker db");
             barrier.wait();
             database
                 .claim_next_workspace_spec_job()
@@ -3742,7 +3742,7 @@ fn workspace_spec_job_claim_is_fifo_and_single_owner() {
     );
 
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     assert!(
         database
             .claim_next_workspace_spec_job()
@@ -3766,7 +3766,7 @@ fn workspace_spec_job_claim_is_fifo_and_single_owner() {
     drop(database);
 
     let mut reopened =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen workspace database");
     assert_eq!(
         reopened
             .claim_next_workspace_spec_job()
@@ -3781,7 +3781,7 @@ fn workspace_spec_job_claim_is_fifo_and_single_owner() {
 fn workspace_spec_job_has_retry_reflects_retry_children() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_workspace_spec_job(NewWorkspaceSpecJob {
@@ -3823,7 +3823,7 @@ fn workspace_spec_job_has_retry_reflects_retry_children() {
 fn delete_chat_cascades_spec_snapshot_but_preserves_workspace_spec() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Spec snapshot chat")
@@ -3859,7 +3859,7 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let workspace_path = workspace.path().to_path_buf();
     let mut database =
-        WorkspaceDatabase::open_or_create(&workspace_path).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("workspace database");
     database
         .insert_chat("chat-1", "Lock test")
         .expect("chat insert");
@@ -3875,7 +3875,7 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
     let (started_tx, started_rx) = mpsc::channel();
     let writer = thread::spawn(move || {
         let mut database =
-            WorkspaceDatabase::open_or_create(&workspace_path).expect("writer database");
+            WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("writer database");
         started_tx.send(()).expect("writer start signal");
         database
             .insert_run_event(NewRunEvent {
@@ -3909,7 +3909,7 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
 fn counts_runtime_tool_state_compression_events_for_chat() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-1", "Compression events")
         .expect("chat insert");
@@ -3949,7 +3949,7 @@ fn counts_runtime_tool_state_compression_events_for_chat() {
 fn infers_runtime_tool_state_compression_from_saved_request_bodies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-1", "legacy-compression");
     let task_1 = AgentTaskId::new("agent-task-1").expect("task id");
@@ -4071,7 +4071,7 @@ fn backs_up_existing_database_before_migration() {
         .expect("old schema");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
 
     assert_eq!(
         database.schema_version().expect("schema version"),
@@ -4159,7 +4159,7 @@ fn migrates_v17_workspace_spec_tables_and_creates_backup() {
     add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -4230,7 +4230,7 @@ fn migrates_v7_task_graphs_table_to_todo_graphs() {
         .expect("legacy todo graph row");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -4250,7 +4250,7 @@ fn migrates_v7_task_graphs_table_to_todo_graphs() {
 fn chat_memory_facts_cascade_when_chat_is_deleted() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Memory chat")
@@ -4296,7 +4296,7 @@ fn chat_memory_facts_cascade_when_chat_is_deleted() {
 fn chat_statistics_memory_sources_follow_message_and_tool_references() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Statistics chat")
@@ -4419,7 +4419,7 @@ fn chat_statistics_memory_sources_follow_message_and_tool_references() {
 fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat_with_metadata(
@@ -4487,7 +4487,7 @@ fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
 fn mark_chat_queued_run_started_rebuilds_missing_queued_run_metadata() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat_with_metadata(
@@ -4559,7 +4559,7 @@ fn mark_chat_queued_run_started_rebuilds_missing_queued_run_metadata() {
 fn set_chat_queued_run_adds_run_to_existing_chat_metadata() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat_with_metadata("chat-existing", "Existing chat", r#"{"kind":"normal"}"#)
         .expect("chat insert");
@@ -4588,7 +4588,7 @@ fn set_chat_queued_run_adds_run_to_existing_chat_metadata() {
 fn repository_helpers_round_trip_todo_graphs() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "ToDo graph chat")
@@ -4660,7 +4660,7 @@ fn repository_helpers_round_trip_todo_graphs() {
 fn scheduled_task_records_round_trip_and_list_runs() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     let task = database
         .insert_scheduled_task(NewScheduledTask {
@@ -5028,7 +5028,7 @@ fn scheduled_task_records_round_trip_and_list_runs() {
 fn claims_due_scheduled_task_run_once_and_updates_task_state() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_scheduled_task(NewScheduledTask {
@@ -5095,7 +5095,7 @@ fn claims_due_scheduled_task_run_once_and_updates_task_state() {
 fn scheduled_task_active_runs_and_retention_policy() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_scheduled_task(NewScheduledTask {
@@ -5190,7 +5190,7 @@ fn scheduled_task_active_runs_and_retention_policy() {
 fn repository_helpers_reject_invalid_todo_graph_dependencies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "ToDo graph chat")
@@ -5246,7 +5246,7 @@ fn repository_helpers_reject_invalid_todo_graph_dependencies() {
 fn chat_page_uses_cursor_search_and_scoped_code_change_stats() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     for (id, title, created_at) in [
         ("chat-1", "Alpha setup", "2026-07-03T10:00:00.000Z"),
@@ -5357,7 +5357,7 @@ fn chat_page_uses_cursor_search_and_scoped_code_change_stats() {
 fn repository_helpers_round_trip_core_records() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .set_workspace_metadata("active_chat", "chat-1")
         .expect("metadata write");
@@ -5601,7 +5601,7 @@ fn repository_helpers_round_trip_core_records() {
 fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-1", "Audit detail invariants")
         .expect("chat insert");
@@ -5710,7 +5710,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     }
     drop(database);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
     for id in [
         "request-1",
         "request-empty-object",
@@ -5760,7 +5760,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     assert_eq!(cleanup_marker, "true");
 
     // Valid v1 is retained; later NULL/non-v1 cannot overwrite first capture.
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen mut");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen mut");
     database
         .update_llm_request_body(
             "request-1",
@@ -5833,7 +5833,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
 #[test]
 fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let database_path = database.database_path().to_path_buf();
     drop(database);
 
@@ -5846,7 +5846,7 @@ fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
         )
         .expect("hold write transaction");
 
-    WorkspaceDatabase::open_or_create(workspace.path())
+    WorkspaceDatabase::open_or_create_ungated(workspace.path())
         .expect("reopen while another connection holds a write transaction");
     transaction.rollback().expect("rollback writer transaction");
 }
@@ -5855,7 +5855,7 @@ fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
 fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Deleted chat")
@@ -5999,7 +5999,7 @@ fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
 fn messages_for_chat_page_and_role_counts_are_ordered() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-1", "Paged chat")
         .expect("chat insert");
@@ -6064,7 +6064,7 @@ fn messages_for_chat_page_and_role_counts_are_ordered() {
 fn repository_helpers_persist_terminal_working_directory() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let first_directory = workspace.path().display().to_string();
     let second_directory = workspace.path().join("nested").display().to_string();
 
@@ -6109,7 +6109,7 @@ fn repository_helpers_persist_terminal_working_directory() {
 fn repository_helpers_round_trip_tool_calls_and_results() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Tool chat")
@@ -6204,7 +6204,7 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
 fn upsert_tool_call_overwrites_incomplete_stub_with_different_run_or_input() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Tool chat")
@@ -6269,7 +6269,7 @@ fn upsert_tool_call_overwrites_incomplete_stub_with_different_run_or_input() {
 fn upsert_tool_call_rejects_overwrite_of_call_with_completed_result() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Tool chat")
@@ -6344,7 +6344,7 @@ fn upsert_tool_call_rejects_overwrite_of_call_with_completed_result() {
 fn upsert_tool_call_promotes_status_for_completed_call_with_matching_identity() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Tool chat")
@@ -6411,7 +6411,7 @@ fn upsert_tool_call_promotes_status_for_completed_call_with_matching_identity() 
 fn code_graph_query_helpers_return_compact_relationships() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let lib_symbols = [
         NewCodeGraphSymbol {
             name: "public_api",
@@ -6554,7 +6554,7 @@ fn code_graph_query_helpers_return_compact_relationships() {
 fn replacing_code_graph_file_index_clears_old_fts_entries() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let old_symbols = [
         NewCodeGraphSymbol {
             name: "kept_helper",
@@ -6653,7 +6653,7 @@ fn replacing_code_graph_file_index_clears_old_fts_entries() {
 fn audits_mocked_llm_request_response_and_stream_events() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_chat("chat-1", "Audit chat")
@@ -7021,7 +7021,7 @@ fn audits_mocked_llm_request_response_and_stream_events() {
 fn versioned_provider_http_headers_only_mask_authorization() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_llm_request(NewLlmRequest {
@@ -7181,7 +7181,7 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-1", "Audit filter chat")
         .expect("chat insert");
@@ -7393,7 +7393,7 @@ fn llm_request_audit_request_kind_breakdown_uses_fact_filters_and_sums_usage() {
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-1", "Request kind breakdown")
         .expect("chat insert");
@@ -7558,7 +7558,7 @@ fn migrates_v27_llm_request_kind_and_spec_job_chat_id_defaults() {
         .expect("v27 audit/spec schema");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -7587,7 +7587,7 @@ fn migrates_v27_llm_request_kind_and_spec_job_chat_id_defaults() {
 #[test]
 fn migrates_v21_llm_requests_into_usage_rollups() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let database_path = database.database_path().to_path_buf();
     drop(database);
     let connection = Connection::open(&database_path).expect("database rollback to v21");
@@ -7614,7 +7614,7 @@ fn migrates_v21_llm_requests_into_usage_rollups() {
         .expect("v21 llm request fixture");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -7662,7 +7662,7 @@ fn migrates_v21_llm_requests_into_usage_rollups() {
 fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebuild() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_llm_request(NewLlmRequest {
@@ -7955,7 +7955,7 @@ fn llm_request_usage_rollup_tracks_delta_and_matches_direct_group_by_after_rebui
 fn prunes_llm_request_details_without_deleting_statistics() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
 
     database
         .insert_llm_request(NewLlmRequest {
@@ -8082,7 +8082,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
 fn vacuum_reclaims_workspace_database_freelist_pages() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     let large_input = "x".repeat(1024 * 1024);
     let large_body = format!(
         r#"{{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{{}},"body":"{large_input}"}}"#
@@ -8134,7 +8134,7 @@ fn vacuum_reclaims_workspace_database_freelist_pages() {
 #[test]
 fn stores_prompt_context_injections_for_chat_replay() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .insert_chat("chat-1", "Prompt cache chat")
         .expect("chat insert");
@@ -8178,7 +8178,7 @@ fn stores_prompt_context_injections_for_chat_replay() {
 #[test]
 fn prompt_context_injection_memory_summaries_round_trip_structured_json() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .insert_chat("chat-1", "Memory summary chat")
         .expect("chat insert");
@@ -8242,7 +8242,7 @@ fn migrates_prompt_context_injection_memory_summaries_default() {
         .expect("v29 prompt context schema");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8316,7 +8316,7 @@ fn migrates_v9_without_creating_teams_for_existing_chats() {
     }
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8404,7 +8404,7 @@ fn migrates_v13_agent_message_foreign_keys_to_current_table() {
     add_workspace_memory_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8493,7 +8493,7 @@ fn migrates_v14_scheduled_task_tables_without_losing_existing_data() {
     add_workspace_memory_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8533,7 +8533,7 @@ fn migrates_v15_memory_dream_tables() {
     add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8572,7 +8572,7 @@ fn migrates_v16_memory_references_table() {
     add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8658,7 +8658,7 @@ fn migrates_v18_memory_extraction_jobs_allow_skipped_status() {
     add_workspace_agent_plan_reference_tables(&connection);
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8727,7 +8727,7 @@ fn migrates_v30_memory_facts_enabled_column_with_existing_rows() {
         .expect("v30 schema");
     drop(connection);
 
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
@@ -8757,7 +8757,7 @@ fn failed_agent_schema_migration_rolls_back_and_preserves_backup() {
     drop(connection);
 
     assert!(
-        WorkspaceDatabase::open_or_create(workspace.path()).is_err(),
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).is_err(),
         "migration must fail"
     );
     let connection = Connection::open(&database_path).expect("preserved database");
@@ -8787,7 +8787,7 @@ fn failed_agent_schema_migration_rolls_back_and_preserves_backup() {
 fn agent_task_enqueue_sequences_are_unique_and_strictly_increasing() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let workspace_path = workspace.path().to_path_buf();
-    let mut database = WorkspaceDatabase::open_or_create(&workspace_path).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-sequence", "seq");
 
@@ -8798,7 +8798,7 @@ fn agent_task_enqueue_sequences_are_unique_and_strictly_increasing() {
             let instance_id = instance_id.clone();
             thread::spawn(move || {
                 let mut database =
-                    WorkspaceDatabase::open_or_create(workspace_path).expect("worker database");
+                    WorkspaceDatabase::open_or_create_ungated(workspace_path).expect("worker database");
                 let task_id =
                     AgentTaskId::new(format!("agent-task-sequence-{index}")).expect("task id");
                 database
@@ -8827,7 +8827,7 @@ fn agent_task_enqueue_sequences_are_unique_and_strictly_increasing() {
 fn two_schedulers_cannot_claim_the_same_agent_task() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let workspace_path = workspace.path().to_path_buf();
-    let mut database = WorkspaceDatabase::open_or_create(&workspace_path).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
     let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-claim", "claim");
     let task_id = AgentTaskId::new("agent-task-claim").expect("task id");
     database
@@ -8848,7 +8848,7 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
             let task_id = task_id.clone();
             thread::spawn(move || {
                 let mut database =
-                    WorkspaceDatabase::open_or_create(workspace_path).expect("scheduler database");
+                    WorkspaceDatabase::open_or_create_ungated(workspace_path).expect("scheduler database");
                 let attempt_id = AgentAttemptId::new(format!("agent-attempt-claim-{index}"))
                     .expect("attempt id");
                 database
@@ -8876,7 +8876,7 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
 #[test]
 fn deferred_workspace_agent_task_waits_for_earlier_active_task() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (first_team_id, first_instance_id) =
         create_test_agent_team(&mut database, "chat-agent-defer-first", "defer-first");
     let (deferred_team_id, deferred_instance_id) =
@@ -8949,7 +8949,7 @@ fn deferred_workspace_agent_task_waits_for_earlier_active_task() {
 #[test]
 fn deferred_workspace_agent_task_ignores_earlier_plan_session_task() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (plan_team_id, plan_instance_id) =
         create_test_agent_team(&mut database, "chat-agent-defer-plan", "defer-plan");
     let (deferred_team_id, deferred_instance_id) = create_test_agent_team(
@@ -9008,7 +9008,7 @@ fn deferred_workspace_agent_task_ignores_earlier_plan_session_task() {
 #[test]
 fn agent_team_max_concurrent_runs_blocks_second_instance_claim() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) =
         create_test_agent_team(&mut database, "chat-agent-team-limit", "team-limit");
     let worker_id = create_test_agent_worker(&database, &team_id, "team-limit-worker");
@@ -9090,7 +9090,7 @@ fn agent_team_max_concurrent_runs_blocks_second_instance_claim() {
 #[test]
 fn messages_for_chat_filters_worker_agent_assistant_messages() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) =
         create_test_agent_team(&mut database, "chat-agent-message-filter", "message-filter");
     let worker_id = create_test_agent_worker(&database, &team_id, "message-filter-worker");
@@ -9176,7 +9176,7 @@ fn messages_for_chat_filters_worker_agent_assistant_messages() {
 #[test]
 fn agent_queue_limits_and_team_lifecycle_are_enforced() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-lifecycle", "lifecycle");
     let first_task = AgentTaskId::new("agent-task-lifecycle-first").expect("task id");
@@ -9258,7 +9258,7 @@ fn agent_queue_limits_and_team_lifecycle_are_enforced() {
 #[test]
 fn agent_instance_context_reset_creates_new_generation_without_deleting_history() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-context-reset", "context-reset");
 
@@ -9314,7 +9314,7 @@ fn agent_instance_context_reset_creates_new_generation_without_deleting_history(
 #[test]
 fn interrupted_queue_head_requires_explicit_retry_and_keeps_fifo() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-retry", "retry");
     let first_task = AgentTaskId::new("agent-task-retry-first").expect("task id");
     let second_task = AgentTaskId::new("agent-task-retry-second").expect("task id");
@@ -9396,7 +9396,7 @@ fn interrupted_queue_head_requires_explicit_retry_and_keeps_fifo() {
 #[test]
 fn agent_task_state_updates_are_conditional_and_attempts_are_durable() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-state", "state");
     let task_id = AgentTaskId::new("agent-task-state").expect("task id");
     database
@@ -9506,7 +9506,7 @@ fn agent_task_state_updates_are_conditional_and_attempts_are_durable() {
 #[test]
 fn agent_task_state_update_for_attempt_rejects_replaced_attempt() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-attempt-guard", "attempt-guard");
     let task_id = AgentTaskId::new("agent-task-attempt-guard").expect("task id");
@@ -9593,7 +9593,7 @@ fn agent_task_state_update_for_attempt_rejects_replaced_attempt() {
 #[test]
 fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) =
         create_test_agent_team(&mut database, "chat-agent-wait-recovery", "wait-recovery");
     let worker_id = AgentInstanceId::new("agent-instance-wait-recovery-worker").expect("worker id");
@@ -9726,7 +9726,7 @@ fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
 #[test]
 fn interrupted_agent_wait_task_recovers_when_dependency_finishes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) = create_test_agent_team(
         &mut database,
         "chat-agent-interrupted-wait-recovery",
@@ -9860,7 +9860,7 @@ fn interrupted_agent_wait_task_recovers_when_dependency_finishes() {
 #[test]
 fn interrupted_agent_wait_recovery_keeps_one_active_task_per_owner() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) = create_test_agent_team(
         &mut database,
         "chat-agent-interrupted-wait-fifo",
@@ -9986,7 +9986,7 @@ fn interrupted_agent_wait_recovery_keeps_one_active_task_per_owner() {
 #[test]
 fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (first_team, first_instance) =
         create_test_agent_team(&mut database, "chat-agent-first", "first");
     let (second_team, second_instance) =
@@ -10109,7 +10109,7 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
 #[test]
 fn phase8_creates_multiple_agent_instances_atomically() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, _) =
         create_test_agent_team(&mut database, "chat-agent-phase8-create", "phase8-create");
     let definition = phase8_agent_definition("phase8-create-worker", 7, 4);
@@ -10204,7 +10204,7 @@ fn phase8_creates_multiple_agent_instances_atomically() {
 #[test]
 fn phase12_persists_isolated_agent_instance_worktree_metadata() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, _) = create_test_agent_team(
         &mut database,
         "chat-agent-phase12-worktree",
@@ -10273,7 +10273,7 @@ fn phase12_persists_isolated_agent_instance_worktree_metadata() {
 #[test]
 fn plan_worktree_audit_lists_unmerged_isolated_plan_worktrees() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let plan_id = "plan-worktree-audit";
     let phase_id = "plan-worktree-audit-phase";
 
@@ -10377,7 +10377,7 @@ fn plan_worktree_audit_lists_unmerged_isolated_plan_worktrees() {
 #[test]
 fn phase12_rejects_worktree_status_update_for_shared_instance() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, _) =
         create_test_agent_team(&mut database, "chat-agent-phase12-shared", "phase12-shared");
     let definition = phase8_agent_definition("phase12-shared-worker", 1, 2);
@@ -10415,7 +10415,7 @@ fn phase12_rejects_worktree_status_update_for_shared_instance() {
 #[test]
 fn phase8_routes_definition_by_least_pending_and_filters_unavailable_instances() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, _) =
         create_test_agent_team(&mut database, "chat-agent-phase8-route", "phase8-route");
     let definition = phase8_agent_definition("phase8-route-worker", 1, 4);
@@ -10520,7 +10520,7 @@ fn phase8_routes_definition_by_least_pending_and_filters_unavailable_instances()
 #[test]
 fn phase8_runnable_tasks_are_fair_and_keep_instance_fifo() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, _) =
         create_test_agent_team(&mut database, "chat-agent-phase8-fair", "phase8-fair");
     Connection::open(database.database_path())
@@ -10622,7 +10622,7 @@ fn phase8_runnable_tasks_are_fair_and_keep_instance_fifo() {
 #[test]
 fn phase7_waiting_tasks_resume_after_dependency_finishes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) =
         create_test_agent_team(&mut database, "chat-agent-phase7-resume", "phase7-resume");
     let worker_id = create_test_agent_worker(&database, &team_id, "phase7-resume-worker");
@@ -10750,7 +10750,7 @@ fn phase7_waiting_tasks_resume_after_dependency_finishes() {
 #[test]
 fn phase7_waiting_tasks_resume_after_deadline() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) = create_test_agent_team(
         &mut database,
         "chat-agent-phase7-deadline",
@@ -10833,7 +10833,7 @@ fn phase7_waiting_tasks_resume_after_deadline() {
 #[test]
 fn phase7_agent_task_transfer_accepts_only_queued_tasks() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) = create_test_agent_team(
         &mut database,
         "chat-agent-phase7-transfer",
@@ -10879,7 +10879,7 @@ fn phase7_agent_task_transfer_accepts_only_queued_tasks() {
 #[test]
 fn phase7_waiting_cancel_clears_dependencies_and_retry_preserves_previous_error() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, coordinator_id) = create_test_agent_team(
         &mut database,
         "chat-agent-phase7-cancel-retry",
@@ -11014,7 +11014,7 @@ fn phase7_waiting_cancel_clears_dependencies_and_retry_preserves_previous_error(
 #[test]
 fn phase6_agent_messages_are_ordered_redacted_and_explicitly_consumed() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-messages", "messages");
 
@@ -11093,7 +11093,7 @@ fn phase6_agent_messages_are_ordered_redacted_and_explicitly_consumed() {
 #[test]
 fn phase6_agent_child_tasks_are_team_scoped_and_queued_only_cancellable() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-phase6-tasks", "phase6-tasks");
     let (other_team_id, other_instance_id) =
@@ -11187,7 +11187,7 @@ fn phase6_agent_child_tasks_are_team_scoped_and_queued_only_cancellable() {
 #[test]
 fn phase6_agent_definition_lookup_returns_existing_instances_only() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) = create_test_agent_team(
         &mut database,
         "chat-agent-definition-lookup",
@@ -11217,7 +11217,7 @@ fn phase6_agent_definition_lookup_returns_existing_instances_only() {
 #[test]
 fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-agent-runtime", "runtime");
     let task_id = AgentTaskId::new("agent-task-runtime").expect("task id");
@@ -11758,7 +11758,7 @@ fn add_memory_reference_tables(connection: &Connection) {
 fn latest_completed_llm_usage_for_chat_selects_latest_completed_usage() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
-        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-usage", "Usage chat")
         .expect("chat insert");
@@ -12046,7 +12046,7 @@ fn assert_no_agent_messages_old_references(connection: &Connection) {
 #[test]
 fn agent_task_for_queued_user_message_prefers_latest_rewrite_task() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     let (team_id, instance_id) =
         create_test_agent_team(&mut database, "chat-rewrite-task", "rewrite-task");
     let old_task_id = AgentTaskId::new("agent-task-rewrite-old").expect("old task id");
@@ -12097,7 +12097,7 @@ fn agent_task_for_queued_user_message_prefers_latest_rewrite_task() {
 #[test]
 fn rewrite_chat_from_user_message_truncates_persisted_history_and_prompt_state() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .insert_chat("chat-rewrite", "Rewrite chat")
         .expect("chat insert");
@@ -12239,7 +12239,7 @@ fn rewrite_chat_from_user_message_truncates_persisted_history_and_prompt_state()
 #[test]
 fn rewrite_chat_from_user_message_handles_first_and_terminal_user_turns() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
 
     database
         .insert_chat("chat-first-turn", "First turn")
@@ -12345,7 +12345,7 @@ fn rewrite_chat_from_user_message_handles_first_and_terminal_user_turns() {
 #[test]
 fn rewrite_chat_from_user_message_rolls_back_when_new_assistant_conflicts() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .insert_chat("chat-rollback", "Rollback")
         .expect("chat insert");

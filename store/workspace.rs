@@ -60,6 +60,12 @@ pub use workspace_records::{
     ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
     WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
+pub use crate::workspace_gate::{
+    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, open_workspace_database,
+    open_workspace_database_critical, WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT,
+    WORKSPACE_DATABASE_ORDINARY_CAPACITY, WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+    WORKSPACE_DATABASE_TOTAL_CAPACITY,
+};
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
@@ -681,7 +687,31 @@ impl WorkspaceDatabaseSpaceStats {
 }
 
 impl WorkspaceDatabase {
+    /// Production default open: ordinary concurrency gate (capacity 2 of total 3).
+    ///
+    /// Prefer this (or [`Self::open_or_create_critical`]) outside tests. The
+    /// returned handle must be dropped promptly; do not hold it across
+    /// provider/network awaits or full Agent runs.
+    #[track_caller]
     pub fn open_or_create(
+        workspace_path: impl AsRef<Path>,
+    ) -> Result<crate::workspace_gate::WorkspaceDatabaseHandle, WorkspaceDatabaseError> {
+        crate::workspace_gate::open_workspace_database(workspace_path)
+    }
+
+    /// Critical open: total capacity only (reserves 1 slot for Agent lifecycle).
+    #[track_caller]
+    pub fn open_or_create_critical(
+        workspace_path: impl AsRef<Path>,
+    ) -> Result<crate::workspace_gate::WorkspaceDatabaseHandle, WorkspaceDatabaseError> {
+        crate::workspace_gate::open_workspace_database_critical(workspace_path)
+    }
+
+    /// Ungated open for the gate implementation and controlled tests only.
+    ///
+    /// Production code must use [`Self::open_or_create`] or
+    /// [`Self::open_or_create_critical`].
+    pub fn open_or_create_ungated(
         workspace_path: impl AsRef<Path>,
     ) -> Result<Self, WorkspaceDatabaseError> {
         let workspace_path = workspace_path.as_ref();
@@ -11048,6 +11078,28 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    /// Load all indexed code-graph path → content-hash pairs for short permit holds.
+    pub fn code_graph_file_hashes(&self) -> Result<HashMap<String, String>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT code_graph_files.path, code_graph_file_hashes.content_hash
+                 FROM code_graph_file_hashes
+                 JOIN code_graph_files
+                    ON code_graph_files.id = code_graph_file_hashes.file_id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut hashes = HashMap::new();
+        for row in rows {
+            let (path, hash) = row.map_err(|source| self.sqlite_error(source))?;
+            hashes.insert(path, hash);
+        }
+        Ok(hashes)
+    }
+
     pub fn replace_code_graph_file_index(
         &mut self,
         index: NewCodeGraphFileIndex<'_>,
@@ -12747,6 +12799,9 @@ pub enum WorkspaceDatabaseError {
         field: &'static str,
         source: serde_json::Error,
     },
+    ConcurrencyLimit {
+        message: String,
+    },
     InvalidAgentRuntimeData {
         message: String,
     },
@@ -12839,6 +12894,7 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::AgentRuntimeJson { field, source } => {
                 write!(formatter, "invalid Agent runtime JSON in {field}: {source}")
             }
+            Self::ConcurrencyLimit { message } => write!(formatter, "{message}"),
             Self::InvalidAgentRuntimeData { message } => {
                 write!(formatter, "invalid Agent runtime data: {message}")
             }
@@ -12950,6 +13006,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::Sqlite { source, .. } => Some(source),
             Self::TodoGraphJson { source } => Some(source),
             Self::InvalidAgentRuntimeData { .. }
+            | Self::ConcurrencyLimit { .. }
             | Self::InvalidAuditData { .. }
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }

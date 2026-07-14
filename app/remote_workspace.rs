@@ -48,8 +48,9 @@ use foco_store::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
         NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
         TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, workspace_database_path,
+        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        workspace_database_path,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -4396,7 +4397,7 @@ impl BrokerLlmAuditWriter {
         }
     }
 
-    fn open_ensured_database(&self) -> Result<WorkspaceDatabase, WorkspaceDatabaseError> {
+    fn open_ensured_database(&self) -> Result<WorkspaceDatabaseHandle, WorkspaceDatabaseError> {
         let mut database = WorkspaceDatabase::open_or_create(&self.context.audit_path)?;
         if let (Some(chat_id), Some(title)) = (
             self.context.chat_id.as_deref(),
@@ -6661,7 +6662,7 @@ fn ensure_sidecar_code_graph(state: &RemoteSidecarState) -> Result<(), axum::res
 
 fn sidecar_workspace_database(
     state: &RemoteSidecarState,
-) -> Result<WorkspaceDatabase, axum::response::Response> {
+) -> Result<WorkspaceDatabaseHandle, axum::response::Response> {
     WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
         .map_err(|e| ApiError::from_workspace_error(e).into_response())
 }

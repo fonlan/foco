@@ -2080,15 +2080,16 @@ fn persist_running_llm_request_for_kind(
             "chat run is no longer current because its queued run was replaced",
         ));
     }
+    let chat_id = database
+        .chat(&context.chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_some()
+        .then_some(context.chat_id.as_str());
     database
         .insert_llm_request(NewLlmRequest {
             id: request_id,
             workspace_id: &context.workspace_id,
-            chat_id: database
-                .chat(&context.chat_id)
-                .map_err(ApiError::from_workspace_error)?
-                .is_some()
-                .then_some(context.chat_id.as_str()),
+            chat_id,
             request_kind,
             agent_team_id: context.agent_associations.team_id.as_ref(),
             agent_instance_id: context.agent_associations.instance_id.as_ref(),

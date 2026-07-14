@@ -505,11 +505,18 @@ pub(crate) fn sync_scheduled_task_runs_for_agent_task(
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
+    sync_scheduled_task_runs_for_agent_task_with_database(&mut database, agent_task_id)
+}
+
+pub(crate) fn sync_scheduled_task_runs_for_agent_task_with_database(
+    database: &mut WorkspaceDatabase,
+    agent_task_id: &AgentTaskId,
+) -> Result<(), ApiError> {
     let runs = database
         .scheduled_task_runs_for_agent_task(agent_task_id)
         .map_err(ApiError::from_workspace_error)?;
     for run in runs {
-        sync_scheduled_task_run(&mut database, run)?;
+        sync_scheduled_task_run(database, run)?;
     }
     Ok(())
 }

@@ -193,7 +193,7 @@ pub(crate) async fn scheduled_tasks(
     let mut status_counts: HashMap<String, usize> = HashMap::new();
     let mut candidates: Vec<(
         &WorkspaceConfig,
-        WorkspaceDatabase,
+        WorkspaceDatabaseHandle,
         Vec<ScheduledTaskRecord>,
     )> = Vec::new();
 

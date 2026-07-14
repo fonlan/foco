@@ -5,7 +5,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -216,7 +216,7 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
 
 struct MemoryDreamTranscript {
     chat_id: Option<String>,
-    database: Option<WorkspaceDatabase>,
+    workspace_path: Option<PathBuf>,
     next_sequence: i64,
 }
 
@@ -224,7 +224,7 @@ impl MemoryDreamTranscript {
     fn disabled() -> Self {
         Self {
             chat_id: None,
-            database: None,
+            workspace_path: None,
             next_sequence: 0,
         }
     }
@@ -241,7 +241,8 @@ impl MemoryDreamTranscript {
             return Ok(Self::disabled());
         };
 
-        let mut database = WorkspaceDatabase::open_or_create(transcript_request.workspace_path)
+        let workspace_path = transcript_request.workspace_path.to_path_buf();
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_path)
             .map_err(ApiError::from_workspace_error)?;
         let chat_id = unique_id("chat");
         let mut metadata = json!({
@@ -265,17 +266,17 @@ impl MemoryDreamTranscript {
                 &metadata_json,
             )
             .map_err(ApiError::from_workspace_error)?;
+        drop(database);
 
         let mut transcript = Self {
             chat_id: Some(chat_id),
-            database: Some(database),
+            workspace_path: Some(workspace_path),
             next_sequence: 0,
         };
-        transcript.record_json("job started", metadata);
-        transcript.record_json(
-            "input summary",
-            serde_json::from_str(input_summary_json).unwrap_or_else(|_| json!({})),
-        );
+        transcript.record_json("job started", metadata)?;
+        let input_summary =
+            serde_json::from_str(input_summary_json).unwrap_or_else(|_| json!({}));
+        transcript.record_json("input summary", input_summary)?;
         Ok(transcript)
     }
 
@@ -287,15 +288,17 @@ impl MemoryDreamTranscript {
             return Ok(Self::disabled());
         };
 
-        let database = WorkspaceDatabase::open_or_create(transcript_request.workspace_path)
+        let workspace_path = transcript_request.workspace_path.to_path_buf();
+        let database = WorkspaceDatabase::open_or_create(&workspace_path)
             .map_err(ApiError::from_workspace_error)?;
         let next_sequence = database
             .next_message_sequence_for_chat(&chat_id)
             .map_err(ApiError::from_workspace_error)?;
+        drop(database);
 
         Ok(Self {
             chat_id: Some(chat_id),
-            database: Some(database),
+            workspace_path: Some(workspace_path),
             next_sequence,
         })
     }
@@ -304,30 +307,49 @@ impl MemoryDreamTranscript {
         self.chat_id.as_deref()
     }
 
-    fn record_json(&mut self, title: &str, payload: Value) {
+    fn record_json(&mut self, title: &str, payload: Value) -> Result<(), ApiError> {
         let Some(chat_id) = self.chat_id.as_deref() else {
-            return;
+            return Ok(());
         };
-        let Some(database) = self.database.as_mut() else {
-            return;
+        let Some(workspace_path) = self.workspace_path.as_ref() else {
+            return Ok(());
         };
         let metadata_json = serde_json::to_string(&json!({
             "kind": "memory_dream_transcript_step",
             "title": title,
         }))
-        .unwrap_or_else(|_| "{}".to_string());
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize memory Dream transcript step metadata: {source}"
+            ))
+        })?;
         let content = memory_dream_transcript_content(title, &payload);
         let message_id = unique_id("msg-system");
-        let inserted = database.insert_message(NewMessage {
-            id: &message_id,
-            chat_id,
-            role: "system",
-            content: &content,
-            sequence: self.next_sequence,
-            metadata_json: Some(&metadata_json),
-        });
-        if inserted.is_ok() {
-            self.next_sequence += 1;
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_message(NewMessage {
+                id: &message_id,
+                chat_id,
+                role: "system",
+                content: &content,
+                sequence: self.next_sequence,
+                metadata_json: Some(&metadata_json),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        self.next_sequence += 1;
+        Ok(())
+    }
+
+    fn record_json_best_effort(&mut self, title: &str, payload: Value) {
+        if let Err(error) = self.record_json(title, payload) {
+            tracing::warn!(
+                workspace = ?self.workspace_path.as_ref().map(|path| path.display().to_string()),
+                chat_id = ?self.chat_id,
+                title,
+                error = %error.message(),
+                "memory Dream transcript write failed"
+            );
         }
     }
 }
@@ -533,7 +555,7 @@ async fn finish_memory_dream_job(
                     error_message: None,
                 })
                 .map_err(ApiError::from_memory_error)?;
-            started.transcript.record_json(
+            started.transcript.record_json_best_effort(
                 "final status",
                 json!({
                     "status": MemoryDreamJobStatus::Completed.as_str(),
@@ -560,7 +582,7 @@ async fn finish_memory_dream_job(
             let error_message = error.message.clone();
             let failure_summary = DreamRunSummary::failed(&error);
             let output_summary_json = failure_summary.to_json().to_string();
-            started.transcript.record_json(
+            started.transcript.record_json_best_effort(
                 "final status",
                 json!({
                     "status": MemoryDreamJobStatus::Failed.as_str(),
@@ -637,7 +659,7 @@ async fn run_memory_dream_job_inner(
         deterministic_changes_proposed = changes.len(),
         "Memory Dream deterministic planning completed"
     );
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "deterministic candidates",
         json!({
             "candidateCount": candidates.len(),
@@ -658,7 +680,7 @@ async fn run_memory_dream_job_inner(
     policy
         .validate_batch_size(candidates.len(), changes.len())
         .map_err(ApiError::from_memory_error)?;
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "backend validation summary",
         json!({
             "stage": "deterministic",
@@ -686,7 +708,7 @@ async fn run_memory_dream_job_inner(
         profiles_refreshed,
         "Memory Dream deterministic changes applied"
     );
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "applied changes summary",
         json!({
             "stage": "deterministic",
@@ -774,7 +796,7 @@ async fn run_memory_dream_job_inner(
                 profiles_refreshed =
                     refresh_dream_profiles(database, request.scope, &apply_summary)
                         .map_err(ApiError::from_memory_error)?;
-                transcript.record_json(
+                transcript.record_json_best_effort(
                     "applied changes summary",
                     json!({
                         "stage": "llm",
@@ -798,7 +820,7 @@ async fn run_memory_dream_job_inner(
                     || apply_summary.applied > 0 =>
             {
                 llm_planner = "fallback_deterministic_only";
-                transcript.record_json(
+                transcript.record_json_best_effort(
                     "LLM planner failure",
                     json!({
                         "fallback": llm_planner,
@@ -817,7 +839,7 @@ async fn run_memory_dream_job_inner(
                 changes_skipped = 1;
             }
             Err(error) => {
-                transcript.record_json(
+                transcript.record_json_best_effort(
                     "LLM planner failure",
                     json!({
                         "fallback": null,
@@ -983,7 +1005,7 @@ async fn run_memory_dream_llm_planner(
         profiles,
         deterministic_changes,
     )?;
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "LLM planner request summary",
         json!({
             "modelId": &selection.model_id,
@@ -999,20 +1021,20 @@ async fn run_memory_dream_llm_planner(
     let output = match request_memory_dream_planner_output(planner, selection, input).await {
         Ok(output) => output,
         Err(error) => {
-            transcript.record_json(
+            transcript.record_json_best_effort(
                 "LLM changeset parse failure",
                 json!({ "errorMessage": &error.message }),
             );
             return Err(error);
         }
     };
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "LLM changeset JSON",
         serde_json::to_value(&output).unwrap_or_else(|_| json!({})),
     );
     let validated =
         validate_memory_dream_planner_output(&output, request.scope, candidates, policy)?;
-    transcript.record_json(
+    transcript.record_json_best_effort(
         "backend validation summary",
         json!({
             "stage": "llm",
@@ -1117,7 +1139,7 @@ fn validated_memory_references_for_fact(
     fact: &MemoryFactRecord,
     config: Option<&GlobalConfig>,
     workspace: Option<&WorkspaceConfig>,
-    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database: Option<&WorkspaceDatabaseHandle>,
     workspace_database_error: Option<&str>,
     checked_at: &str,
 ) -> Result<Vec<OwnedMemoryReference>, MemoryDatabaseError> {
@@ -1215,7 +1237,7 @@ fn validate_extracted_memory_reference(
     reference: &ExtractedMemoryReference,
     config: Option<&GlobalConfig>,
     workspace: Option<&WorkspaceConfig>,
-    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database: Option<&WorkspaceDatabaseHandle>,
     workspace_database_error: Option<&str>,
 ) -> Result<ReferenceValidation, MemoryDatabaseError> {
     match reference.reference_type {
@@ -1281,7 +1303,7 @@ fn validate_file_reference(
 
 fn validate_symbol_reference(
     reference: &ExtractedMemoryReference,
-    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database: Option<&WorkspaceDatabaseHandle>,
     workspace_database_error: Option<&str>,
 ) -> ReferenceValidation {
     let Some(database) = workspace_database else {
