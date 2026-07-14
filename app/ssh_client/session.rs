@@ -875,15 +875,17 @@ async fn try_agent_auth(handle: &mut Handle<ClientHandler>, user: &str) -> Resul
         use russh::keys::agent::client::AgentClient;
 
         // Order: OpenSSH named pipe (SSH_AUTH_SOCK or default) → Pageant.
+        // Use the generic loop only so we do not name stream types (e.g. pageant::PageantStream)
+        // that would require declaring transitive crates as direct dependencies of foco-app.
         if let Some(path) = windows_agent_pipe_path() {
             if let Ok(mut agent) = AgentClient::connect_named_pipe(&path).await {
-                if try_agent_identities_windows_pipe(handle, user, &mut agent).await? {
+                if try_agent_identities_loop(handle, user, &mut agent).await? {
                     return Ok(true);
                 }
             }
         }
         if let Ok(mut agent) = AgentClient::connect_pageant().await {
-            if try_agent_identities_pageant(handle, user, &mut agent).await? {
+            if try_agent_identities_loop(handle, user, &mut agent).await? {
                 return Ok(true);
             }
         }
@@ -905,26 +907,6 @@ fn windows_agent_pipe_path() -> Option<std::ffi::OsString> {
     }
     // OpenSSH for Windows default agent pipe.
     Some(std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"))
-}
-
-#[cfg(windows)]
-async fn try_agent_identities_windows_pipe(
-    handle: &mut Handle<ClientHandler>,
-    user: &str,
-    agent: &mut russh::keys::agent::client::AgentClient<
-        tokio::net::windows::named_pipe::NamedPipeClient,
-    >,
-) -> Result<bool, SshError> {
-    try_agent_identities_loop(handle, user, agent).await
-}
-
-#[cfg(windows)]
-async fn try_agent_identities_pageant(
-    handle: &mut Handle<ClientHandler>,
-    user: &str,
-    agent: &mut russh::keys::agent::client::AgentClient<pageant::PageantStream>,
-) -> Result<bool, SshError> {
-    try_agent_identities_loop(handle, user, agent).await
 }
 
 #[cfg(windows)]
