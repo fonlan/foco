@@ -953,6 +953,7 @@ pub struct HookConfig {
 pub const DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_MEMORY_CONTEXT_BUDGET_PERCENT: u32 = 12;
 pub const DEFAULT_SPEC_LLM_TIMEOUT_MS: u64 = 120_000;
 const MAX_BACKGROUND_LLM_TIMEOUT_MS: u64 = 600_000;
 
@@ -965,6 +966,8 @@ pub struct MemorySettings {
     pub extraction_mode: String,
     #[serde(default = "default_memory_retrieval_mode")]
     pub retrieval_mode: String,
+    #[serde(default = "default_memory_context_budget_percent")]
+    pub context_budget_percent: u32,
     #[serde(default)]
     pub retention_days: Option<u32>,
     #[serde(default)]
@@ -985,6 +988,7 @@ impl Default for MemorySettings {
             enabled: false,
             extraction_mode: default_memory_extraction_mode(),
             retrieval_mode: default_memory_retrieval_mode(),
+            context_budget_percent: default_memory_context_budget_percent(),
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
@@ -1192,6 +1196,10 @@ fn default_memory_extraction_mode() -> String {
 
 fn default_memory_retrieval_mode() -> String {
     "fts".to_string()
+}
+
+fn default_memory_context_budget_percent() -> u32 {
+    DEFAULT_MEMORY_CONTEXT_BUDGET_PERCENT
 }
 
 fn default_memory_dream_mode() -> String {
@@ -2670,6 +2678,16 @@ fn validate_memory_settings(
                 format!("memory.retrieval_mode has unsupported value '{other}'"),
             );
         }
+    }
+
+    if !(1..=100).contains(&settings.context_budget_percent) {
+        return invalid_config(
+            config_path,
+            format!(
+                "memory.context_budget_percent must be between 1 and 100, got {}",
+                settings.context_budget_percent
+            ),
+        );
     }
 
     if settings.retention_days == Some(0) {
@@ -4541,6 +4559,71 @@ mod tests {
         let loaded = load_global_config(&paths.config_file).expect("old config should load");
 
         assert_eq!(loaded.memory.dream, MemoryDreamSettings::default());
+    }
+
+    #[test]
+    fn memory_context_budget_percent_defaults_for_old_configs() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        let config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        let mut json = serde_json::to_value(&config).expect("config json");
+        json.get_mut("memory")
+            .and_then(Value::as_object_mut)
+            .expect("memory object")
+            .remove("contextBudgetPercent");
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&json).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("old config should load");
+
+        assert_eq!(
+            loaded.memory.context_budget_percent,
+            DEFAULT_MEMORY_CONTEXT_BUDGET_PERCENT
+        );
+        assert_eq!(loaded.memory.context_budget_percent, 12);
+    }
+
+    #[test]
+    fn memory_context_budget_percent_is_validated() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.memory.context_budget_percent = 0;
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("zero context budget percent should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.context_budget_percent must be between 1 and 100")
+        );
+
+        loaded.config.memory.context_budget_percent = 101;
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("context budget percent above 100 should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.context_budget_percent must be between 1 and 100")
+        );
+
+        loaded.config.memory.context_budget_percent = 1;
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("minimum context budget percent should save");
+        loaded.config.memory.context_budget_percent = 100;
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("maximum context budget percent should save");
+        loaded.config.memory.context_budget_percent = 25;
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("valid context budget percent should save");
+        let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
+        assert_eq!(reloaded.memory.context_budget_percent, 25);
     }
 
     #[test]

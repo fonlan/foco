@@ -245,8 +245,6 @@ pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
 pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS: usize = 8;
 // Safety margin reserved beyond system prompt + max output when packing checkpoint input.
 pub(crate) const LLM_CONTEXT_COMPRESSION_REQUEST_SAFETY_TOKENS: u64 = 128;
-// Percent of the model context budget reserved for memory profile and retrieved facts.
-const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 // Maximum active memory facts considered when building query-specific memory context.
 const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
 // Graph traversal depth used when expanding retrieved memory facts through edges.
@@ -7027,7 +7025,12 @@ impl ApiError {
     }
 
     fn from_config_error(error: foco_store::config::ConfigError) -> Self {
-        Self::internal(error.to_string())
+        match error {
+            foco_store::config::ConfigError::Validation { message, .. } => {
+                Self::bad_request(message)
+            }
+            other => Self::internal(other.to_string()),
+        }
     }
 
     pub(crate) fn from_workspace_error(

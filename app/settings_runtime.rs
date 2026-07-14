@@ -107,6 +107,7 @@ pub(crate) async fn settings_response(
             enabled: config.memory.enabled,
             extraction_mode: config.memory.extraction_mode.clone(),
             retrieval_mode: config.memory.retrieval_mode.clone(),
+            context_budget_percent: config.memory.context_budget_percent,
             retention_days: config.memory.retention_days,
             extraction_model_id: config.memory.extraction_model_id.clone(),
             retrieval_model_id: config.memory.retrieval_model_id.clone(),

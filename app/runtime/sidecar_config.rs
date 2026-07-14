@@ -324,6 +324,34 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_runtime_bundle_syncs_memory_context_budget_percent() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+
+        let default_bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("default memory budget bundle");
+        let default_json = serde_json::to_value(&default_bundle).expect("default bundle json");
+        assert_eq!(default_bundle.payload.memory.context_budget_percent, 12);
+        assert_eq!(
+            default_json["payload"]["memory"]["contextBudgetPercent"],
+            Value::Number(12.into())
+        );
+
+        config.memory.context_budget_percent = 30;
+        let custom_bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
+            .expect("custom memory budget bundle");
+        let custom_json = serde_json::to_value(&custom_bundle).expect("custom bundle json");
+
+        assert_eq!(custom_bundle.payload.memory.context_budget_percent, 30);
+        assert_eq!(
+            custom_json["payload"]["memory"]["contextBudgetPercent"],
+            Value::Number(30.into())
+        );
+        assert_ne!(default_bundle.hash, custom_bundle.hash);
+    }
+
+    #[test]
     fn sidecar_runtime_bundle_syncs_only_workspace_hosted_mcp_servers() {
         let profile = tempfile::tempdir().expect("profile");
         let workspace = tempfile::tempdir().expect("workspace");

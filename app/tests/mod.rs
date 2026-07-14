@@ -63,8 +63,8 @@ use crate::http::{
     },
     settings::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
-        DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
-        ManualPromptSettingsRequest, ManualSkillsRequest, TestModelRequest,
+        DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualMemorySettingsRequest,
+        ManualModelRequest, ManualPromptSettingsRequest, ManualSkillsRequest, TestModelRequest,
         UpdateAgentDefinitionRequest, UpdateModelRouteRequest,
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
         default_plan_mode_system_prompt, filter_provider_model_ids, model_test_execution_options,
@@ -5919,6 +5919,119 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
         blank_normalized.prompts.context_compression_system_prompt,
         None
     );
+}
+
+#[tokio::test]
+async fn save_memory_settings_context_budget_percent_is_optional_and_validated() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = GlobalConfig::first_run(workspace_dir);
+    config.memory.enabled = true;
+    config.memory.context_budget_percent = 33;
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let loaded = crate::http::settings::settings(State(state.clone()))
+        .await
+        .expect("settings")
+        .0;
+    assert_eq!(loaded.memory.context_budget_percent, 33);
+
+    let preserved = crate::http::settings::save_memory_settings(
+        State(state.clone()),
+        Json(ManualMemorySettingsRequest {
+            enabled: true,
+            extraction_mode: "manual".to_string(),
+            retrieval_mode: "fts".to_string(),
+            context_budget_percent: None,
+            retention_days: None,
+            extraction_model_id: None,
+            retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
+            dream: None,
+        }),
+    )
+    .await
+    .expect("save without context budget percent")
+    .0;
+    assert_eq!(preserved.memory.context_budget_percent, 33);
+
+    let updated = crate::http::settings::save_memory_settings(
+        State(state.clone()),
+        Json(ManualMemorySettingsRequest {
+            enabled: true,
+            extraction_mode: "manual".to_string(),
+            retrieval_mode: "fts".to_string(),
+            context_budget_percent: Some(40),
+            retention_days: None,
+            extraction_model_id: None,
+            retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
+            dream: None,
+        }),
+    )
+    .await
+    .expect("save context budget percent")
+    .0;
+    assert_eq!(updated.memory.context_budget_percent, 40);
+
+    let rejected_zero = match crate::http::settings::save_memory_settings(
+        State(state.clone()),
+        Json(ManualMemorySettingsRequest {
+            enabled: true,
+            extraction_mode: "manual".to_string(),
+            retrieval_mode: "fts".to_string(),
+            context_budget_percent: Some(0),
+            retention_days: None,
+            extraction_model_id: None,
+            retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
+            dream: None,
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("zero context budget percent should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(rejected_zero.status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected_zero
+            .message()
+            .contains("memory.context_budget_percent")
+    );
+
+    let rejected_over = match crate::http::settings::save_memory_settings(
+        State(state.clone()),
+        Json(ManualMemorySettingsRequest {
+            enabled: true,
+            extraction_mode: "manual".to_string(),
+            retrieval_mode: "fts".to_string(),
+            context_budget_percent: Some(101),
+            retention_days: None,
+            extraction_model_id: None,
+            retrieval_model_id: None,
+            extraction_llm_timeout_ms: 120_000,
+            retrieval_llm_timeout_ms: 60_000,
+            dream: None,
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("context budget percent above 100 should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(rejected_over.status, StatusCode::BAD_REQUEST);
+
+    let after_reject = crate::http::settings::settings(State(state))
+        .await
+        .expect("settings after reject")
+        .0;
+    assert_eq!(after_reject.memory.context_budget_percent, 40);
 }
 
 #[test]
@@ -11919,13 +12032,8 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         memory_settings: MemorySettings {
             enabled: true,
             extraction_mode: "pending_review".to_string(),
-            retrieval_mode: "fts".to_string(),
-            retention_days: None,
             extraction_model_id: Some("extract-model".to_string()),
-            retrieval_model_id: None,
-            extraction_llm_timeout_ms: 120_000,
-            retrieval_llm_timeout_ms: 60_000,
-            dream: MemoryDreamSettings::default(),
+            ..MemorySettings::default()
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -13713,14 +13821,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         global_config: GlobalConfig::first_run(workspace_dir.clone()),
         memory_settings: MemorySettings {
             enabled: false,
-            extraction_mode: "manual".to_string(),
-            retrieval_mode: "fts".to_string(),
-            retention_days: None,
-            extraction_model_id: None,
-            retrieval_model_id: None,
-            extraction_llm_timeout_ms: 120_000,
-            retrieval_llm_timeout_ms: 60_000,
-            dream: MemoryDreamSettings::default(),
+            ..MemorySettings::default()
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -13821,13 +13922,8 @@ fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
     context.memory_settings = MemorySettings {
         enabled: true,
         extraction_mode: "pending_review".to_string(),
-        retrieval_mode: "fts".to_string(),
-        retention_days: None,
         extraction_model_id: Some("extract-model".to_string()),
-        retrieval_model_id: None,
-        extraction_llm_timeout_ms: 120_000,
-        retrieval_llm_timeout_ms: 60_000,
-        dream: MemoryDreamSettings::default(),
+        ..MemorySettings::default()
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -14136,14 +14232,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         global_config: GlobalConfig::first_run(workspace_dir.clone()),
         memory_settings: MemorySettings {
             enabled: false,
-            extraction_mode: "manual".to_string(),
-            retrieval_mode: "fts".to_string(),
-            retention_days: None,
-            extraction_model_id: None,
-            retrieval_model_id: None,
-            extraction_llm_timeout_ms: 120_000,
-            retrieval_llm_timeout_ms: 60_000,
-            dream: MemoryDreamSettings::default(),
+            ..MemorySettings::default()
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -17837,35 +17926,17 @@ fn automatic_memory_extraction_targets_active_facts() {
     let pending_review_settings = MemorySettings {
         enabled: true,
         extraction_mode: "pending_review".to_string(),
-        retrieval_mode: "fts".to_string(),
-        retention_days: None,
-        extraction_model_id: None,
-        retrieval_model_id: None,
-        extraction_llm_timeout_ms: 120_000,
-        retrieval_llm_timeout_ms: 60_000,
-        dream: MemoryDreamSettings::default(),
+        ..MemorySettings::default()
     };
     let automatic_settings = MemorySettings {
         enabled: true,
         extraction_mode: "automatic".to_string(),
-        retrieval_mode: "fts".to_string(),
-        retention_days: None,
-        extraction_model_id: None,
-        retrieval_model_id: None,
-        extraction_llm_timeout_ms: 120_000,
-        retrieval_llm_timeout_ms: 60_000,
-        dream: MemoryDreamSettings::default(),
+        ..MemorySettings::default()
     };
     let manual_settings = MemorySettings {
         enabled: true,
         extraction_mode: "manual".to_string(),
-        retrieval_mode: "fts".to_string(),
-        retention_days: None,
-        extraction_model_id: None,
-        retrieval_model_id: None,
-        extraction_llm_timeout_ms: 120_000,
-        retrieval_llm_timeout_ms: 60_000,
-        dream: MemoryDreamSettings::default(),
+        ..MemorySettings::default()
     };
 
     assert!(should_queue_memory_extraction(&pending_review_settings));
@@ -21080,9 +21151,187 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         context
             .context_budget
             .available_message_tokens
-            .saturating_mul(MEMORY_CONTEXT_BUDGET_PERCENT)
+            .saturating_mul(u64::from(config.memory.context_budget_percent))
             / 100
     );
+    assert_eq!(config.memory.context_budget_percent, 12);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_memory_budget_follows_context_budget_percent() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-memory-budget-percent-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-memory-budget-percent-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.memory.enabled = true;
+    config.providers.push(ProviderSettings {
+        id: "provider".to_string(),
+        name: "Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+    config.models.push(ModelSettings {
+        id: "model".to_string(),
+        display_name: "Model".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 20_000,
+            max_output_tokens: 1_000,
+        }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-1", "Memory budget chat")
+            .expect("chat insert");
+    }
+    let long_fact = format!(
+        "Long renderer memory payload for budget packing. {}",
+        "detail ".repeat(400)
+    );
+    {
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory,
+            "source-budget-a",
+            "fact-budget-a",
+            MemoryScope::Workspace,
+            None,
+            &format!("Alpha fact. {long_fact}"),
+            false,
+        );
+        insert_test_memory_fact(
+            &mut memory,
+            "source-budget-b",
+            "fact-budget-b",
+            MemoryScope::Workspace,
+            None,
+            &format!("Beta fact. {long_fact}"),
+            false,
+        );
+        insert_test_memory_fact(
+            &mut memory,
+            "source-budget-c",
+            "fact-budget-c",
+            MemoryScope::Workspace,
+            None,
+            &format!("Gamma fact. {long_fact}"),
+            false,
+        );
+    }
+
+    async fn assemble_with_budget(
+        state: &AppState,
+        config: &GlobalConfig,
+        percent: u32,
+    ) -> PreparedPromptContext {
+        let mut config = config.clone();
+        config.memory.context_budget_percent = percent;
+        let mut context = prepare_prompt_context(
+            state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                queued_user_message_id: None,
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                session_mode: None,
+                message: Some("renderer budget packing".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            None,
+            PromptAssemblyPurpose::ChatRun,
+        )
+        .await
+        .expect("prompt context");
+        resolve_prompt_context_memory(&mut context, &state.memory_database_file, &config)
+            .await
+            .expect("resolve memory");
+        context
+    }
+
+    let low = assemble_with_budget(&state, &config, 1).await;
+    let high = assemble_with_budget(&state, &config, 50).await;
+    let preview_low = {
+        let mut config = config.clone();
+        config.memory.context_budget_percent = 1;
+        prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                queued_user_message_id: None,
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                session_mode: None,
+                message: Some("renderer budget packing".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            None,
+            PromptAssemblyPurpose::ContextPreview,
+        )
+        .await
+        .expect("preview prompt context")
+    };
+
+    assert_eq!(
+        low.memory_budget_tokens,
+        low.context_budget
+            .available_message_tokens
+            .saturating_mul(1)
+            / 100
+    );
+    assert_eq!(
+        high.memory_budget_tokens,
+        high.context_budget
+            .available_message_tokens
+            .saturating_mul(50)
+            / 100
+    );
+    assert!(high.memory_budget_tokens > low.memory_budget_tokens);
+    assert!(
+        high.memories_used.len() > low.memories_used.len(),
+        "higher budget should inject more complete memories: low={} high={}",
+        low.memories_used.len(),
+        high.memories_used.len()
+    );
+    assert_eq!(preview_low.memory_budget_tokens, low.memory_budget_tokens);
+    assert_eq!(preview_low.memories_used.len(), low.memories_used.len());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
@@ -25060,13 +25309,7 @@ fn memory_tool_test_context(
         memory_settings: MemorySettings {
             enabled: true,
             extraction_mode: "pending_review".to_string(),
-            retrieval_mode: "fts".to_string(),
-            extraction_model_id: None,
-            retrieval_model_id: None,
-            retention_days: None,
-            extraction_llm_timeout_ms: 120_000,
-            retrieval_llm_timeout_ms: 60_000,
-            dream: MemoryDreamSettings::default(),
+            ..MemorySettings::default()
         },
     }
 }

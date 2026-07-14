@@ -147,7 +147,7 @@ pub(crate) async fn memory_prompt_context(
     let budget_tokens = if config.memory.enabled {
         context_budget
             .available_message_tokens
-            .saturating_mul(MEMORY_CONTEXT_BUDGET_PERCENT)
+            .saturating_mul(u64::from(config.memory.context_budget_percent))
             / 100
     } else {
         0

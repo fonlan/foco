@@ -121,6 +121,9 @@ pub(crate) struct ManualMemorySettingsRequest {
     pub(crate) enabled: bool,
     pub(crate) extraction_mode: String,
     pub(crate) retrieval_mode: String,
+    /// Outer `None` = field omitted (preserve current value for old clients).
+    #[serde(default)]
+    pub(crate) context_budget_percent: Option<u32>,
     pub(crate) retention_days: Option<u32>,
     pub(crate) extraction_model_id: Option<String>,
     pub(crate) retrieval_model_id: Option<String>,
@@ -429,6 +432,7 @@ pub(crate) struct MemorySettingsSummary {
     pub(crate) enabled: bool,
     pub(crate) extraction_mode: String,
     pub(crate) retrieval_mode: String,
+    pub(crate) context_budget_percent: u32,
     pub(crate) retention_days: Option<u32>,
     pub(crate) extraction_model_id: Option<String>,
     pub(crate) retrieval_model_id: Option<String>,
@@ -1590,6 +1594,9 @@ pub(crate) async fn save_memory_settings(
         enabled: request.enabled,
         extraction_mode: request.extraction_mode.trim().to_string(),
         retrieval_mode: request.retrieval_mode.trim().to_string(),
+        context_budget_percent: request
+            .context_budget_percent
+            .unwrap_or(config.memory.context_budget_percent),
         retention_days: request.retention_days,
         extraction_model_id,
         retrieval_model_id,
