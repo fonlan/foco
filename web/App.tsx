@@ -779,6 +779,8 @@ type ChatSessionStatusInput = {
   chatKey: string;
   failedChatKeySet: Set<string>;
   openChatKeySet: Set<string>;
+  /** Visual-only: durable queuedRun.status === "running" (e.g. coordinator waiting). */
+  persistedRunning?: boolean;
   runningChatKeys: Set<string>;
   scheduledChatKey?: string | null;
   scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
@@ -791,6 +793,7 @@ export function deriveChatSessionStatus({
   chatKey,
   failedChatKeySet,
   openChatKeySet,
+  persistedRunning = false,
   runningChatKeys,
   scheduledChatKey = null,
   scheduledStatus = null,
@@ -804,9 +807,11 @@ export function deriveChatSessionStatus({
       .map((statusChatKey) => activeRunInfoByChatKey[statusChatKey] ?? null)
       .find((runInfo): runInfo is ActiveRunInfo => runInfo !== null) ??
     workspaceActiveRun;
+  // persistedRunning is tab/sidebar lifecycle only — never invents activeRun for cancel/guidance.
   const isRunning =
     statusChatKeys.some((statusChatKey) => runningChatKeys.has(statusChatKey)) ||
-    workspaceActiveRun !== null;
+    workspaceActiveRun !== null ||
+    persistedRunning;
   const isScheduled = scheduledStatus === "queued" || scheduledStatus === "starting";
   const isOpen = statusChatKeys.some(
     (statusChatKey) => openChatKeySet.has(statusChatKey) || activeChatKey === statusChatKey,
@@ -826,6 +831,13 @@ export function deriveChatSessionStatus({
     return { activeRun, kind: "open" };
   }
   return { activeRun, kind: "idle" };
+}
+
+/** True when workspace chat metadata still marks a durable main-agent lifecycle as running. */
+export function isPersistedQueuedRunRunning(
+  queuedRun: { status?: string | null } | null | undefined,
+): boolean {
+  return queuedRun?.status === "running";
 }
 
 export function chatSessionStatusDotClass(kind: ChatSessionStatusKind) {
@@ -1714,6 +1726,17 @@ export function App() {
       ),
     [openChatTabs],
   );
+  const persistedRunningChatKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const workspace of workspaces) {
+      for (const chat of workspace.chats) {
+        if (isPersistedQueuedRunRunning(chat.queuedRun)) {
+          keys.add(chatRunKey(workspace.id, chat.id));
+        }
+      }
+    }
+    return keys;
+  }, [workspaces]);
   const chatSessionStatusFor = useCallback(
     (
       chatKey: string,
@@ -1739,6 +1762,45 @@ export function App() {
       activeRunInfoByChatKey,
       failedChatKeySet,
       openChatKeySet,
+      runningChatKeys,
+    ],
+  );
+  // Tab/sidebar lifecycle only. Composer cancel/guidance keep chatSessionStatusFor (operational).
+  const chatSessionVisualStatusFor = useCallback(
+    (
+      chatKey: string,
+      options: {
+        scheduledChatKey?: string | null;
+        scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
+        workspaceActiveRun?: ActiveChatRunSummary | null;
+      } = {},
+    ) => {
+      const statusChatKeys =
+        options.scheduledChatKey && options.scheduledChatKey !== chatKey
+          ? [chatKey, options.scheduledChatKey]
+          : [chatKey];
+      const persistedRunning = statusChatKeys.some((statusChatKey) =>
+        persistedRunningChatKeys.has(statusChatKey),
+      );
+      return deriveChatSessionStatus({
+        activeChatKey,
+        activeRunInfoByChatKey,
+        chatKey,
+        failedChatKeySet,
+        openChatKeySet,
+        persistedRunning,
+        runningChatKeys,
+        scheduledChatKey: options.scheduledChatKey,
+        scheduledStatus: options.scheduledStatus,
+        workspaceActiveRun: options.workspaceActiveRun ?? null,
+      });
+    },
+    [
+      activeChatKey,
+      activeRunInfoByChatKey,
+      failedChatKeySet,
+      openChatKeySet,
+      persistedRunningChatKeys,
       runningChatKeys,
     ],
   );
@@ -11315,7 +11377,7 @@ export function App() {
                                     const chatKey = chatRunKey(workspace.id, chat.id);
                                     const scheduledChatKey =
                                       chat.scheduledChatKey ?? null;
-                                    const sessionStatus = chatSessionStatusFor(chatKey, {
+                                    const sessionStatus = chatSessionVisualStatusFor(chatKey, {
                                       scheduledChatKey,
                                       scheduledStatus: chat.scheduledStatus ?? null,
                                       workspaceActiveRun: chat.activeRun,
@@ -11634,7 +11696,7 @@ export function App() {
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <MainTabBar
                     activeTab={activeMainTab}
-                    chatSessionStatusFor={chatSessionStatusFor}
+                    chatSessionStatusFor={chatSessionVisualStatusFor}
                     onCloseTab={closeMainTab}
                     onCloseTabs={closeMainTabs}
                     onSelectTab={selectMainTab}

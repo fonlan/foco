@@ -98,6 +98,61 @@ describe("app-shell verification surfaces", () => {
     expect(within(workspaceList).queryByText("Second chat")).not.toBeInTheDocument();
   });
 
+  it("shows running icons on reload when queuedRun is still running without activeRun", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...chatSummary(
+              "chat-1",
+              "Tool run",
+              "2026-06-05T10:00:00Z",
+              "2026-06-05T10:05:00Z",
+            ),
+            activeRun: null,
+            queuedRun: {
+              assistantMessageId: "waiting-assistant",
+              content: "waiting for worker",
+              modelId: "gpt-test",
+              providerId: "openai",
+              skillIds: [],
+              status: "running",
+              thinkingLevel: null,
+              userMessageId: "waiting-user",
+            },
+          },
+          ...workspace.chats.filter((chat) => chat.id !== "chat-1"),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+    window.history.replaceState(null, "", "/?tab=workspace-1%2Fchat-1");
+
+    renderApp();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyButton = within(workspaceList).getByText("Tool run").closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    await waitFor(() =>
+      expect(
+        within(tabList).getByRole("status", { name: "Chat is running" }),
+      ).toBeInTheDocument(),
+    );
+    expect(tabList.querySelector(".chat-tab-running-spinner")).not.toBeNull();
+    expect(historyButton.querySelector(".session-status-dot")).toHaveClass(
+      "session-status-dot-running",
+    );
+    expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument();
+  });
+
   it("starts a restored queued chat when workspace skillIds is null", async () => {
     appTestState.workspaceResponseWorkspaces = [
       {

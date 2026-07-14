@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
@@ -74,6 +74,62 @@ describe("deriveChatSessionStatus", () => {
     ).toEqual(activeRun);
     expect(chatSessionStatusDotClass("running")).toBe("session-status-dot-running");
     expect(chatSessionStatusDotClass("failed")).toBe("session-status-dot-error");
+  });
+
+  it("treats persisted queuedRun running as visual running without inventing activeRun", () => {
+    const result = status({
+      openChatKeySet: new Set(["workspace-1:chat-1"]),
+      persistedRunning: true,
+    });
+    expect(result.kind).toBe("running");
+    expect(result.activeRun).toBeNull();
+  });
+
+  it("does not treat queued or missing persisted run as visual running", () => {
+    expect(status({ persistedRunning: false }).kind).toBe("idle");
+    expect(isPersistedQueuedRunRunning({ status: "queued" })).toBe(false);
+    expect(isPersistedQueuedRunRunning({ status: "running" })).toBe(true);
+    expect(isPersistedQueuedRunRunning(null)).toBe(false);
+    expect(isPersistedQueuedRunRunning(undefined)).toBe(false);
+    expect(isPersistedQueuedRunRunning({ status: "completed" })).toBe(false);
+  });
+
+  it("keeps local running, scheduled, failed, open, idle priority with persistedRunning", () => {
+    expect(
+      status({
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: true,
+        runningChatKeys: new Set(["workspace-1:chat-1"]),
+        scheduledStatus: "queued",
+      }).kind,
+    ).toBe("running");
+    expect(
+      status({
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: false,
+        scheduledStatus: "queued",
+      }).kind,
+    ).toBe("scheduled");
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: false,
+      }).kind,
+    ).toBe("failed");
+    expect(
+      status({
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: false,
+      }).kind,
+    ).toBe("open");
+    expect(status({ workspaceActiveRun: {
+      acceptingGuidance: true,
+      chatId: "chat-1",
+      lastSequence: 1,
+      runId: "run-1",
+      workspaceId: "workspace-1",
+    } }).kind).toBe("running");
   });
 });
 
