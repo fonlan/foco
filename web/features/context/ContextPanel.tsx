@@ -3123,7 +3123,13 @@ type ContextPanelSidebarProps = ComponentProps<typeof ContextPanel> & {
   contextPanelMobileHeight: number;
   diffPanelWidth: number;
   isResizing: boolean;
-  onResizeStart: () => void;
+  onResizeStart: (session: {
+    stacked: boolean;
+    startClientX: number;
+    startClientY: number;
+    startHeight: number;
+    startWidth: number;
+  }) => void;
   setMobileHeight: PanelNumberSetter;
   setWidth: PanelNumberSetter;
 };
@@ -3211,22 +3217,26 @@ export function ContextPanelSidebar({
           }}
           onPointerDown={(event) => {
             event.preventDefault();
-            if (window.innerWidth < CONTEXT_PANEL_STACKED_BREAKPOINT_PX) {
-              const maxHeight = Math.floor(
-                window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO,
-              );
-              const nextHeight = window.innerHeight - event.clientY;
-              setMobileHeight(
-                Math.min(Math.max(nextHeight, CONTEXT_PANEL_MIN_HEIGHT), maxHeight),
-              );
-            } else {
-              const nextWidth = window.innerWidth - event.clientX;
-              setWidth(
-                Math.min(Math.max(nextWidth, CONTEXT_PANEL_MIN_WIDTH), CONTEXT_PANEL_MAX_WIDTH),
-              );
-            }
+            const stacked = window.innerWidth < CONTEXT_PANEL_STACKED_BREAKPOINT_PX;
+            const maxHeight = Math.floor(
+              window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO,
+            );
+            const startHeight = Math.min(
+              Math.max(contextPanelMobileHeight, CONTEXT_PANEL_MIN_HEIGHT),
+              maxHeight,
+            );
+            const startWidth = Math.min(
+              Math.max(diffPanelWidth, CONTEXT_PANEL_MIN_WIDTH),
+              CONTEXT_PANEL_MAX_WIDTH,
+            );
             event.currentTarget.setPointerCapture(event.pointerId);
-            onResizeStart();
+            onResizeStart({
+              stacked,
+              startClientX: event.clientX,
+              startClientY: event.clientY,
+              startHeight,
+              startWidth,
+            });
           }}
           role="separator"
           tabIndex={0}

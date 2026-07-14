@@ -1820,19 +1820,26 @@ describe("app-shell verification surfaces", () => {
         }
 
         const widthBefore = appShell.style.getPropertyValue("--diff-panel-width");
+        const heightBefore = Number.parseFloat(
+          appShell.style.getPropertyValue("--context-panel-mobile-height") || "280",
+        );
 
         fireEvent.pointerDown(splitter, { clientY: 620, pointerId: 1 });
 
         await waitFor(() => {
           expect(document.body.style.cursor).toBe("row-resize");
           expect(document.body.style.userSelect).toBe("none");
-          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("224px");
+          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe(
+            `${heightBefore}px`,
+          );
         });
 
         fireEvent.pointerMove(window, { clientY: 560 });
 
         await waitFor(() => {
-          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("284px");
+          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe(
+            `${heightBefore + 60}px`,
+          );
         });
 
         expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe(widthBefore);
@@ -1842,6 +1849,9 @@ describe("app-shell verification surfaces", () => {
         await waitFor(() => {
           expect(document.body.style.cursor).toBe("");
           expect(document.body.style.userSelect).toBe("");
+          expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe(
+            `${heightBefore + 60}px`,
+          );
         });
       } finally {
         Object.defineProperty(window, "innerWidth", {
@@ -1882,6 +1892,9 @@ describe("app-shell verification surfaces", () => {
       }
 
       const heightBefore = appShell.style.getPropertyValue("--context-panel-mobile-height");
+      const widthBefore = Number.parseFloat(
+        appShell.style.getPropertyValue("--diff-panel-width") || "360",
+      );
 
       fireEvent.pointerDown(splitter, { clientX: 1100, pointerId: 1 });
 
@@ -1893,14 +1906,17 @@ describe("app-shell verification surfaces", () => {
       fireEvent.pointerMove(window, { clientX: 1080 });
 
       await waitFor(() => {
-        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe("360px");
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe(
+          `${widthBefore + 20}px`,
+        );
       });
 
-      // 1440 - 1080 = 360, which equals default width; drag further to prove width updates.
       fireEvent.pointerMove(window, { clientX: 1000 });
 
       await waitFor(() => {
-        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe("440px");
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe(
+          `${widthBefore + 100}px`,
+        );
       });
 
       expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe(heightBefore);
@@ -1910,6 +1926,9 @@ describe("app-shell verification surfaces", () => {
       await waitFor(() => {
         expect(document.body.style.cursor).toBe("");
         expect(document.body.style.userSelect).toBe("");
+        expect(appShell.style.getPropertyValue("--diff-panel-width")).toBe(
+          `${widthBefore + 100}px`,
+        );
       });
     } finally {
       Object.defineProperty(window, "innerWidth", {
@@ -1932,11 +1951,14 @@ describe("app-shell verification surfaces", () => {
     expect(stylesCss).toMatch(
       /@media \(max-width: 1199px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?cursor:\s*row-resize/,
     );
-    expect(stylesCss).not.toMatch(
-      /@media \(max-width: 1199px\)[\s\S]*?grid-template-rows:\s*minmax\(0,\s*1fr\)\s*minmax\(18rem,\s*36dvh\)/,
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 1199px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?top:\s*0;/,
     );
     expect(stylesCss).not.toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?cursor:\s*row-resize[\s\S]*?@media \(max-width: 1199px\)/,
+      /@media \(max-width: 1199px\)[\s\S]*?\.context-sidebar-splitter\s*\{[\s\S]*?top:\s*-0\.375rem/,
+    );
+    expect(stylesCss).not.toMatch(
+      /@media \(max-width: 1199px\)[\s\S]*?grid-template-rows:\s*minmax\(0,\s*1fr\)\s*minmax\(18rem,\s*36dvh\)/,
     );
 
     // Horizontal splitter must not be exclusive to the phone media query only.

@@ -186,6 +186,7 @@ import {
   useInitialBrowserRouteEffect,
   useRightPanelResizeEffect,
   useSidebarResizeEffect,
+  type PanelResizeDragSession,
 } from "./app/app-effects";
 import { useAppRouting } from "./app/app-routing";
 import {
@@ -1336,6 +1337,8 @@ export function App() {
     CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
   );
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
+  const appShellRef = useRef<HTMLDivElement | null>(null);
+  const contextPanelResizeDragRef = useRef<PanelResizeDragSession | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(WORKSPACE_SIDEBAR_MIN_WIDTH);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
@@ -2035,6 +2038,45 @@ export function App() {
       ),
     );
   }, []);
+
+  const previewContextPanelHeight = useCallback((value: number) => {
+    appShellRef.current?.style.setProperty(
+      "--context-panel-mobile-height",
+      `${value}px`,
+    );
+  }, []);
+
+  const previewContextPanelWidth = useCallback((value: number) => {
+    appShellRef.current?.style.setProperty("--diff-panel-width", `${value}px`);
+  }, []);
+
+  const handleContextPanelResizeStart = useCallback(
+    (session: PanelResizeDragSession) => {
+      contextPanelResizeDragRef.current = session;
+      if (session.stacked) {
+        previewContextPanelHeight(session.startHeight);
+      } else {
+        previewContextPanelWidth(session.startWidth);
+      }
+      setIsResizingDiffPanel(true);
+    },
+    [previewContextPanelHeight, previewContextPanelWidth],
+  );
+
+  const handleContextPanelResizeEnd = useCallback(
+    (finalSize: { height: number; stacked: boolean; width: number }) => {
+      contextPanelResizeDragRef.current = null;
+      if (finalSize.stacked) {
+        setContextPanelMobileHeight(finalSize.height);
+        previewContextPanelHeight(finalSize.height);
+      } else {
+        setDiffPanelWidth(finalSize.width);
+        previewContextPanelWidth(finalSize.width);
+      }
+      setIsResizingDiffPanel(false);
+    },
+    [previewContextPanelHeight, previewContextPanelWidth],
+  );
   const updateBrowserRoute = useCallback(
     (route: BrowserRoute, mode: "push" | "replace" = "push") => {
       if (typeof window === "undefined") {
@@ -4086,15 +4128,16 @@ export function App() {
   }, [workspaces]);
 
   useRightPanelResizeEffect({
+    dragSessionRef: contextPanelResizeDragRef,
     isResizing: isResizingDiffPanel,
     maxHeightRatio: CONTEXT_PANEL_MAX_HEIGHT_RATIO,
     maxWidth: CONTEXT_PANEL_MAX_WIDTH,
     minHeight: CONTEXT_PANEL_MIN_HEIGHT,
     minWidth: CONTEXT_PANEL_MIN_WIDTH,
     stackedBreakpoint: CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
-    onResizeEnd: () => setIsResizingDiffPanel(false),
-    setHeight: setContextPanelMobileHeight,
-    setWidth: setDiffPanelWidth,
+    onHeightPreview: previewContextPanelHeight,
+    onWidthPreview: previewContextPanelWidth,
+    onResizeEnd: handleContextPanelResizeEnd,
   });
 
   useSidebarResizeEffect({
@@ -11089,6 +11132,7 @@ export function App() {
           <div
             className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""} ${isWorkspaceSidebarOpen ? "" : "app-shell-workspace-closed"
               }`}
+            ref={appShellRef}
             style={
               {
                 "--diff-panel-width": `${diffPanelWidth}px`,
@@ -11996,7 +12040,7 @@ export function App() {
                 selectedSkillPrefix={selectedSkillPrefix}
                 setMobileHeight={setContextPanelMobileHeight}
                 setWidth={setDiffPanelWidth}
-                onResizeStart={() => setIsResizingDiffPanel(true)}
+                onResizeStart={handleContextPanelResizeStart}
                 todoGraph={todoGraph}
                 availableModels={availableModels}
                 plans={activePlans}

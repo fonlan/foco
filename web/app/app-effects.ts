@@ -65,53 +65,91 @@ export function useBrowserPopState(
   }, [applyRouteRef]);
 }
 
+type PanelResizeDragSession = {
+  stacked: boolean;
+  startClientX: number;
+  startClientY: number;
+  startHeight: number;
+  startWidth: number;
+};
+
+export type { PanelResizeDragSession };
+
 type PanelResizeEffectOptions = {
+  dragSessionRef: RefObject<PanelResizeDragSession | null>;
   isResizing: boolean;
   maxHeightRatio: number;
   maxWidth: number;
   minHeight: number;
   minWidth: number;
+  /** Apply height during drag without React state (smooth CSS var update). */
+  onHeightPreview: (value: number) => void;
+  /** Apply width during drag without React state (smooth CSS var update). */
+  onWidthPreview: (value: number) => void;
   /** Width below which the panel is stacked under main and resizes by height. */
   stackedBreakpoint: number;
-  onResizeEnd: () => void;
-  setHeight: (value: number | ((current: number) => number)) => void;
-  setWidth: (value: number | ((current: number) => number)) => void;
+  onResizeEnd: (finalSize: {
+    height: number;
+    stacked: boolean;
+    width: number;
+  }) => void;
 };
 
 export function useRightPanelResizeEffect({
+  dragSessionRef,
   isResizing,
   maxHeightRatio,
   maxWidth,
   minHeight,
   minWidth,
+  onHeightPreview,
+  onWidthPreview,
   stackedBreakpoint,
   onResizeEnd,
-  setHeight,
-  setWidth,
 }: PanelResizeEffectOptions) {
   useEffect(() => {
     if (!isResizing) {
       return;
     }
 
-    // Freeze layout axis for this pointer session so mid-drag viewport
-    // changes cannot flip height/width handling while the cursor stays fixed.
-    const stacked = window.innerWidth < stackedBreakpoint;
+    const session = dragSessionRef.current;
+    if (!session) {
+      return;
+    }
+
+    // Freeze layout axis and start metrics for this pointer session.
+    const stacked = session.stacked;
+    const startClientX = session.startClientX;
+    const startClientY = session.startClientY;
+    const startHeight = session.startHeight;
+    const startWidth = session.startWidth;
+    let lastHeight = startHeight;
+    let lastWidth = startWidth;
+
+    function clampHeight(value: number) {
+      const maxHeight = Math.floor(window.innerHeight * maxHeightRatio);
+      return Math.min(Math.max(value, minHeight), maxHeight);
+    }
+
+    function clampWidth(value: number) {
+      return Math.min(Math.max(value, minWidth), maxWidth);
+    }
 
     function handlePointerMove(event: PointerEvent) {
       if (stacked) {
-        const maxHeight = Math.floor(window.innerHeight * maxHeightRatio);
-        const nextHeight = window.innerHeight - event.clientY;
-        setHeight(Math.min(Math.max(nextHeight, minHeight), maxHeight));
+        lastHeight = clampHeight(
+          startHeight + startClientY - event.clientY,
+        );
+        onHeightPreview(lastHeight);
         return;
       }
 
-      const nextWidth = window.innerWidth - event.clientX;
-      setWidth(Math.min(Math.max(nextWidth, minWidth), maxWidth));
+      lastWidth = clampWidth(startWidth + startClientX - event.clientX);
+      onWidthPreview(lastWidth);
     }
 
     function handlePointerUp() {
-      onResizeEnd();
+      onResizeEnd({ height: lastHeight, width: lastWidth, stacked });
     }
 
     const previousCursor = document.body.style.cursor;
@@ -130,15 +168,16 @@ export function useRightPanelResizeEffect({
       window.removeEventListener("pointercancel", handlePointerUp);
     };
   }, [
+    dragSessionRef,
     isResizing,
     maxHeightRatio,
     maxWidth,
     minHeight,
     minWidth,
+    onHeightPreview,
+    onWidthPreview,
     stackedBreakpoint,
     onResizeEnd,
-    setHeight,
-    setWidth,
   ]);
 }
 
