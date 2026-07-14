@@ -6832,6 +6832,30 @@ export function App() {
     }
   }
 
+  function workspaceFileDownloadUrl(workspaceId: string, path: string) {
+    return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/download?path=${encodeURIComponent(path)}`;
+  }
+
+  function downloadWorkspaceFile(node: WorkspaceFileTreeNode) {
+    if (!activeWorkspace) {
+      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      return;
+    }
+    if (!node.path) {
+      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      return;
+    }
+
+    setWorkspaceFilesError(null);
+    const anchor = document.createElement("a");
+    anchor.href = workspaceFileDownloadUrl(activeWorkspace.id, node.path);
+    anchor.download = node.name;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
+
   function workspaceFileAbsolutePath(workspacePath: string, relativePath: string) {
     const separator = workspacePath.includes("\\") ? "\\" : "/";
     const root = workspacePath.replace(/[\\/]+$/, "");
@@ -11242,6 +11266,21 @@ export function App() {
                   <FileText aria-hidden="true" className="size-3.5" />
                   <span>{t("Open")}</span>
                 </button>
+                {workspaceFileContextMenu.node.kind === "file" ? (
+                  <button
+                    className="workspace-chat-context-menu-item"
+                    onClick={() => {
+                      const { node } = workspaceFileContextMenu;
+                      setWorkspaceFileContextMenu(null);
+                      downloadWorkspaceFile(node);
+                    }}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <Download aria-hidden="true" className="size-3.5" />
+                    <span>{t("Download")}</span>
+                  </button>
+                ) : null}
                 <button
                   className="workspace-chat-context-menu-item"
                   onClick={() => {

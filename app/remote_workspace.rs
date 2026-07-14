@@ -2163,6 +2163,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             get(remote_sidecar_file_blob),
         )
         .route(
+            "/api/remote/workspace/files/download",
+            get(remote_sidecar_file_download),
+        )
+        .route(
             "/api/remote/workspace/files/save",
             post(remote_sidecar_file_save),
         )
@@ -12838,6 +12842,18 @@ async fn remote_sidecar_file_blob(
         .header(axum::http::header::CACHE_CONTROL, "private, max-age=60")
         .body(axum::body::Body::from(bytes))
         .expect("sidecar blob response is valid"))
+}
+
+async fn remote_sidecar_file_download(
+    State(state): State<RemoteSidecarState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let rel_path = query.get("path").map(String::as_str).unwrap_or("");
+    let ws_path = sidecar_workspace_path(&state);
+    let abs_path = crate::http::workspaces::workspace_file_path(ws_path, rel_path)
+        .map_err(|e| e.into_response())?;
+    crate::http::workspaces::workspace_file_download_response(&abs_path, rel_path)
+        .map_err(|e| e.into_response())
 }
 
 async fn remote_sidecar_git_command(

@@ -26008,6 +26008,13 @@ fn proxy_workspace_route_path_keeps_ai_statistics_on_main_process() {
     );
     assert_eq!(
         crate::http::router::proxy_workspace_route_path(
+            "/api/workspaces/remote/files/download"
+        ),
+        Some("files/download"),
+        "file download must proxy to the remote sidecar like other file routes"
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path(
             "/api/workspaces/remote/chats/chat-1/statistics"
         ),
         Some("chats/chat-1/statistics")

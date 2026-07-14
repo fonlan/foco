@@ -4975,6 +4975,7 @@ describe("app-panels-stats verification surfaces", () => {
     const menu = await screen.findByRole("menu", { name: "button.tsx" });
     for (const item of [
       "Open",
+      "Download",
       "Rename",
       "Delete",
       "Copy file name",
@@ -5018,6 +5019,71 @@ describe("app-panels-stats verification surfaces", () => {
     expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
       `${workspace.path}\\src\\components\\button.tsx`,
     );
+  });
+
+  it("downloads a file from the file tree context menu", async () => {
+    const createdAnchors: HTMLAnchorElement[] = [];
+    const originalCreateElement = document.createElement.bind(document);
+    const createElementSpy = vi
+      .spyOn(document, "createElement")
+      .mockImplementation((tagName: string, options?: ElementCreationOptions) => {
+        const element = originalCreateElement(tagName, options);
+        if (tagName.toLowerCase() === "a") {
+          createdAnchors.push(element as HTMLAnchorElement);
+          vi.spyOn(element as HTMLAnchorElement, "click").mockImplementation(() => {});
+        }
+        return element;
+      });
+
+    try {
+      renderApp();
+
+      await screen.findAllByText("Default");
+      await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+      const componentsRow = screen
+        .getByText("components")
+        .closest("div[role='treeitem']");
+      expect(componentsRow).not.toBeNull();
+      await userEvent.click(
+        within(componentsRow as HTMLElement).getByRole("button", {
+          name: "Expand folder",
+        }),
+      );
+
+      const fileRow = (await screen.findByText("button.tsx")).closest(
+        "div[role='treeitem']",
+      );
+      expect(fileRow).not.toBeNull();
+      fireEvent.contextMenu(fileRow as HTMLElement);
+
+      const fileMenu = await screen.findByRole("menu", { name: "button.tsx" });
+      await userEvent.click(
+        within(fileMenu).getByRole("menuitem", { name: "Download" }),
+      );
+
+      expect(createdAnchors).toHaveLength(1);
+      expect(createdAnchors[0]?.getAttribute("href")).toBe(
+        "/api/workspaces/workspace-1/files/download?path=src%2Fcomponents%2Fbutton.tsx",
+      );
+      expect(createdAnchors[0]?.download).toBe("button.tsx");
+      expect(createdAnchors[0]?.click).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole("menu", { name: "button.tsx" })).not.toBeInTheDocument();
+
+      const directoryRow = screen
+        .getByText("components")
+        .closest("div[role='treeitem']");
+      expect(directoryRow).not.toBeNull();
+      fireEvent.contextMenu(directoryRow as HTMLElement);
+      const directoryMenu = await screen.findByRole("menu", {
+        name: "components",
+      });
+      expect(
+        within(directoryMenu).queryByRole("menuitem", { name: "Download" }),
+      ).not.toBeInTheDocument();
+    } finally {
+      createElementSpy.mockRestore();
+    }
   });
 
   it("toggles markdown file preview from the editor toolbar", async () => {

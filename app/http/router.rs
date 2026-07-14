@@ -115,6 +115,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::workspaces::workspace_file_blob),
         )
         .route(
+            "/api/workspaces/{workspace_id}/files/download",
+            get(crate::http::workspaces::workspace_file_download),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/files/save",
             post(crate::http::workspaces::save_workspace_file),
         )

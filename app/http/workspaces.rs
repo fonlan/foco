@@ -341,6 +341,51 @@ pub(crate) async fn workspace_file_blob(
         .expect("workspace file blob response is valid"))
 }
 
+pub(crate) async fn workspace_file_download(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<WorkspaceFileBlobQuery>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = workspace_file_path(&workspace.path, &query.path)?;
+    workspace_file_download_response(&path, &query.path)
+}
+
+/// Build a forced-download response for a regular workspace file.
+/// Shared by local and SSH sidecar handlers so headers stay identical.
+pub(crate) fn workspace_file_download_response(
+    absolute_path: &Path,
+    relative_path: &str,
+) -> Result<Response, ApiError> {
+    let metadata = fs::metadata(absolute_path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace file was not found: {relative_path}: {source}"
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path is not a file: {relative_path}"
+        )));
+    }
+
+    let bytes = fs::read(absolute_path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read workspace file {relative_path}: {source}"
+        ))
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, "attachment")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(bytes))
+        .expect("workspace file download response is valid"))
+}
+
 pub(crate) async fn save_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -1348,8 +1393,14 @@ pub(crate) fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str,
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_server_is_available, workspace_image_content_type};
+    use super::{
+        remote_server_is_available, workspace_file_download_response, workspace_file_path,
+        workspace_image_content_type,
+    };
+    use axum::body::to_bytes;
+    use axum::http::header;
     use foco_store::config::RemoteServerProfile;
+    use std::fs;
 
     #[test]
     fn workspace_image_content_type_accepts_svg_only_as_image_text() {
@@ -1371,6 +1422,79 @@ mod tests {
         assert!(remote_server_is_available(&server));
         server.sidecar_install_state = Some("customCommand".to_string());
         assert!(remote_server_is_available(&server));
+    }
+
+    #[tokio::test]
+    async fn workspace_file_download_response_serves_text_and_binary_as_attachment() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let text_path = root.path().join("note.txt");
+        let binary_path = root.path().join("data.bin");
+        fs::write(&text_path, b"hello download").expect("write text");
+        fs::write(&binary_path, [0u8, 1, 2, 255]).expect("write binary");
+
+        let text_response =
+            workspace_file_download_response(&text_path, "note.txt").expect("text download");
+        assert_eq!(text_response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            text_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            text_response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("attachment")
+        );
+        assert_eq!(
+            text_response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        let text_body = to_bytes(text_response.into_body(), usize::MAX)
+            .await
+            .expect("text body");
+        assert_eq!(text_body.as_ref(), b"hello download");
+
+        let binary_response =
+            workspace_file_download_response(&binary_path, "data.bin").expect("binary download");
+        let binary_body = to_bytes(binary_response.into_body(), usize::MAX)
+            .await
+            .expect("binary body");
+        assert_eq!(binary_body.as_ref(), [0u8, 1, 2, 255]);
+    }
+
+    #[test]
+    fn workspace_file_download_response_rejects_directory_and_missing_file() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("create directory");
+
+        let directory_error =
+            workspace_file_download_response(&nested, "nested").expect_err("directory");
+        assert!(directory_error.message().contains("not a file"));
+
+        let missing = root.path().join("missing.txt");
+        let missing_error =
+            workspace_file_download_response(&missing, "missing.txt").expect_err("missing");
+        assert!(missing_error.message().contains("was not found"));
+    }
+
+    #[test]
+    fn workspace_file_path_rejects_escape_outside_workspace() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let error = workspace_file_path(root.path(), "../outside.txt").expect_err("escape");
+        assert!(
+            error.message().contains("escapes")
+                || error.message().contains("outside")
+                || error.message().contains("invalid")
+                || error.message().contains("..")
+        );
     }
 }
 
