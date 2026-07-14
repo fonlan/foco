@@ -252,7 +252,9 @@ fn plan_mode_status_error() -> ToolRuntimeError {
     )
 }
 
-fn open_plan_database(workspace_path: &Path) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
+fn open_plan_database(
+    workspace_path: &Path,
+) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
 }
 

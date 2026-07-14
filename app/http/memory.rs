@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::{collections::HashSet, path::PathBuf};
 
 use axum::{
     Json,
@@ -1075,9 +1072,8 @@ pub(crate) async fn run_memory_dream(
     let result =
         spawn_manual_memory_dream_for_state(&state, &config, scope, workspace_id.as_deref(), mode)
             .await?;
-    let transcript_workspace_id =
-        memory_dream_transcript_workspace_id(&config, result.transcript_chat_id.as_deref())?;
     let database = open_dream_memory_database(&state, &config, scope, workspace_id.as_deref())?;
+    let transcript_workspace_id = memory_dream_transcript_workspace_id_for_job(&config, &result)?;
     let job = memory_dream_job_summary(&database, result.clone(), transcript_workspace_id)?;
 
     Ok(Json(MemoryDreamRunResponse {
@@ -1136,15 +1132,12 @@ pub(crate) async fn memory_dream_jobs(
         total_count += database
             .count_dream_jobs_for_scope(MemoryDreamScope::Global, None, status)
             .map_err(ApiError::from_memory_error)?;
-        let transcript_workspaces = memory_dream_transcript_workspace_ids(&config)?;
         for job in database
             .dream_jobs_for_scope_page(MemoryDreamScope::Global, None, status, fetch_limit, 0)
             .map_err(ApiError::from_memory_error)?
         {
-            let transcript_workspace_id = job
-                .transcript_chat_id
-                .as_ref()
-                .and_then(|chat_id| transcript_workspaces.get(chat_id).cloned());
+            let transcript_workspace_id =
+                memory_dream_transcript_workspace_id_for_job(&config, &job)?;
             jobs.push(memory_dream_job_summary(
                 &database,
                 job,
@@ -1302,8 +1295,7 @@ fn find_memory_dream_job(
         .dream_job(job_id)
         .map_err(ApiError::from_memory_error)?
     {
-        let transcript_workspace_id =
-            memory_dream_transcript_workspace_id(config, job.transcript_chat_id.as_deref())?;
+        let transcript_workspace_id = memory_dream_transcript_workspace_id_for_job(config, &job)?;
         return Ok(LocatedMemoryDreamJob {
             database: global_database,
             job,
@@ -1465,32 +1457,55 @@ fn memory_dream_json(value: &str, field: &str) -> Result<Value, ApiError> {
     })
 }
 
-fn memory_dream_transcript_workspace_ids(
+fn memory_dream_transcript_workspace_id_for_job(
     config: &GlobalConfig,
-) -> Result<HashMap<String, String>, ApiError> {
-    let mut transcript_workspaces = HashMap::new();
-    for workspace in &config.workspaces {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
-        for chat in database
-            .dream_transcript_chats()
-            .map_err(ApiError::from_workspace_error)?
-        {
-            transcript_workspaces.insert(chat.id, workspace.id.clone());
+    job: &MemoryDreamJobRecord,
+) -> Result<Option<String>, ApiError> {
+    if let Some(workspace_id) = memory_dream_transcript_workspace_id_from_input(job) {
+        return Ok(Some(workspace_id));
+    }
+    if job.scope == "workspace" {
+        if let Some(workspace_id) = job.workspace_id.clone() {
+            return Ok(Some(workspace_id));
         }
     }
-
-    Ok(transcript_workspaces)
+    memory_dream_transcript_workspace_id_by_chat_lookup(config, job.transcript_chat_id.as_deref())
 }
 
-fn memory_dream_transcript_workspace_id(
+fn memory_dream_transcript_workspace_id_from_input(job: &MemoryDreamJobRecord) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&job.input_summary_json).ok()?;
+    value
+        .get("transcriptWorkspaceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Legacy fallback: resolve a single transcript chat via primary-key lookup per workspace.
+/// Never enumerates every dream transcript chat across all workspaces.
+fn memory_dream_transcript_workspace_id_by_chat_lookup(
     config: &GlobalConfig,
     transcript_chat_id: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     let Some(transcript_chat_id) = transcript_chat_id else {
         return Ok(None);
     };
-    Ok(memory_dream_transcript_workspace_ids(config)?.remove(transcript_chat_id))
+    for workspace in &config.workspaces {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        if database
+            .chat(transcript_chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .is_some()
+        {
+            // Best-effort lazy backfill is not persisted here: job stores live in
+            // memory DBs and this path only serves API responses for pre-migration jobs.
+            return Ok(Some(workspace.id.clone()));
+        }
+    }
+
+    Ok(None)
 }
 
 fn dream_limit(value: Option<u32>, default: u32, max: u32) -> u32 {

@@ -169,7 +169,9 @@ pub(crate) fn graph_explore(
     }))
 }
 
-fn open_code_graph_database(workspace_path: &Path) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
+fn open_code_graph_database(
+    workspace_path: &Path,
+) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
 }
 

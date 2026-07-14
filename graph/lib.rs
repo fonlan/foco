@@ -1790,17 +1790,13 @@ RUN echo hello
     #[test]
     fn index_workspace_shares_store_gate_with_critical_reservation() {
         use foco_store::workspace::{
-            open_workspace_database, open_workspace_database_critical,
-            WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+            WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, open_workspace_database,
+            open_workspace_database_critical,
         };
         use std::time::Instant;
 
         let workspace = tempfile::tempdir().expect("workspace");
-        fs::write(
-            workspace.path().join("lib.rs"),
-            "fn gated_symbol() {}\n",
-        )
-        .expect("source");
+        fs::write(workspace.path().join("lib.rs"), "fn gated_symbol() {}\n").expect("source");
 
         // Critical Agent lifecycle reservation remains usable while ordinary slots are busy.
         let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");

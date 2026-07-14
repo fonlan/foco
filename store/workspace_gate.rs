@@ -227,7 +227,8 @@ fn acquire_workspace_database_permits(
     workspace_path: &Path,
     gate_kind: WorkspaceDatabaseGateKind,
 ) -> Result<(PathBuf, WorkspaceDatabasePermits), WorkspaceDatabaseError> {
-    let key = std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+    let key =
+        std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
     let gate = {
         let mut gates = WORKSPACE_DATABASE_GATES.lock().map_err(|_| {
             WorkspaceDatabaseError::ConcurrencyLimit {
@@ -315,7 +316,9 @@ fn acquire_workspace_database_gate_slot(
         // Upgrade path is a pooled workspace DB runtime.
         // Sleep-poll is intentional: sync openers run from tools/graph and must not depend on a
         // Tokio runtime; Condvar is still notified on release for prompt wakeup when waiters race.
-        let remaining = timeout.saturating_sub(waited).min(WORKSPACE_DATABASE_GATE_POLL);
+        let remaining = timeout
+            .saturating_sub(waited)
+            .min(WORKSPACE_DATABASE_GATE_POLL);
         let mut available = semaphore
             .available
             .lock()
@@ -452,7 +455,10 @@ mod tests {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
                 if matches!(name, "target" | "node_modules" | ".git" | ".foco") {
                     continue;
                 }

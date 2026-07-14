@@ -419,6 +419,7 @@ async fn run_started_memory_dream_guarded(
             ApiError::bad_request("memory Dream transcript requires at least one workspace")
         })?;
         Some(MemoryDreamTranscriptRequest {
+            workspace_id: &workspace.id,
             workspace_path: &workspace.path,
         })
     } else {
@@ -476,6 +477,7 @@ fn start_manual_memory_dream_guarded(
             ApiError::bad_request("memory Dream transcript requires at least one workspace")
         })?;
         Some(MemoryDreamTranscriptRequest {
+            workspace_id: &workspace.id,
             workspace_path: &workspace.path,
         })
     } else {
@@ -532,6 +534,7 @@ async fn run_memory_dream_guarded(
             ApiError::bad_request("memory Dream transcript requires at least one workspace")
         })?;
         Some(MemoryDreamTranscriptRequest {
+            workspace_id: &workspace.id,
             workspace_path: &workspace.path,
         })
     } else {

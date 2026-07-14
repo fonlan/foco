@@ -1324,6 +1324,20 @@ ALTER TABLE llm_requests
     ADD COLUMN thinking_level TEXT CHECK (thinking_level IS NULL OR length(thinking_level) > 0);
 "#;
 
+pub(crate) const MIGRATION_037: &str = r#"
+CREATE INDEX IF NOT EXISTS messages_user_created_at_idx
+ON messages (created_at)
+WHERE role = 'user';
+
+CREATE INDEX IF NOT EXISTS chats_visible_updated_created_id_idx
+ON chats (updated_at DESC, created_at DESC, id DESC)
+WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream';
+
+CREATE INDEX IF NOT EXISTS chats_memory_dream_updated_created_id_idx
+ON chats (updated_at DESC, created_at DESC, id DESC)
+WHERE json_extract(metadata_json, '$.kind') = 'memory_dream';
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};
@@ -1331,8 +1345,8 @@ mod tests {
     #[test]
     fn hook_runs_redact_secret_input_and_output_json() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let mut database =
-            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+        let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path())
+            .expect("workspace database");
 
         database
             .insert_hook_run(NewHookRun {

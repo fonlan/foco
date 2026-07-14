@@ -2651,7 +2651,7 @@ struct RemoteRunCleanupGuard {
     state: RemoteSidecarState,
     run_id: String,
     queued_user_message_id: Option<String>,
-    disarmed: bool,
+    disarmed: Arc<AtomicBool>,
 }
 
 impl RemoteRunCleanupGuard {
@@ -2661,7 +2661,7 @@ impl RemoteRunCleanupGuard {
             state,
             run_id,
             queued_user_message_id: None,
-            disarmed: false,
+            disarmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2674,26 +2674,44 @@ impl RemoteRunCleanupGuard {
             state,
             run_id,
             queued_user_message_id: Some(queued_user_message_id),
-            disarmed: false,
+            disarmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn disarm(&mut self) {
-        self.disarmed = true;
+    fn disarm(&self) {
+        self.disarmed.store(true, Ordering::Relaxed);
     }
 }
 
 impl Drop for RemoteRunCleanupGuard {
     fn drop(&mut self) {
-        if !self.disarmed {
-            if let Some(queued_user_message_id) = self.queued_user_message_id.as_deref()
-                && let Ok(mut database) =
-                    WorkspaceDatabase::open_or_create(sidecar_workspace_path(&self.state))
-            {
-                let _ = remote_clear_message_queued_run(&mut database, queued_user_message_id);
-            }
-            remote_sidecar_cancel_active_run(&self.state, &self.run_id, false, true);
+        if self.disarmed.swap(true, Ordering::Relaxed) {
+            return;
         }
+        if let Some(queued_user_message_id) = self.queued_user_message_id.as_deref() {
+            // Critical open: stream may still hold an ordinary permit while this Drop runs.
+            match WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(&self.state)) {
+                Ok(mut database) => {
+                    if let Err(error) =
+                        remote_clear_message_queued_run(&mut database, queued_user_message_id)
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            message_id = %queued_user_message_id,
+                            "failed to clear remote queuedRun during run cleanup"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        message_id = %queued_user_message_id,
+                        "failed to open workspace database during remote run cleanup"
+                    );
+                }
+            }
+        }
+        remote_sidecar_cancel_active_run(&self.state, &self.run_id, false, true);
     }
 }
 
@@ -11693,6 +11711,12 @@ async fn remote_sidecar_chat_stream(
     let stream_state = state.clone();
     let run_stream = run_stream.clone();
     let stream = async_stream::stream! {
+        // Create first so disconnect during mark/prepare still clears queuedRun.
+        let cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
+            stream_state.clone(),
+            run_id.clone(),
+            queued_user_message_id.clone(),
+        );
         let mut database = database;
         if let Err(error) = remote_mark_message_queued_run_started(&mut database, &queued_user_message_id) {
             yield Ok(remote_sidecar_record_run_event(&run_stream, 0, json!({
@@ -11701,13 +11725,10 @@ async fn remote_sidecar_chat_stream(
             })));
             yield Ok(remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" })));
             remote_sidecar_finish_active_run(&stream_state, &run_id);
+            // Leave armed so Drop clears queuedRun after this early exit path.
+            drop(cleanup_guard);
             return;
         }
-        let mut cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
-            stream_state.clone(),
-            run_id.clone(),
-            queued_user_message_id.clone(),
-        );
         let mut sequence = 0_i64;
         let mut text = String::new();
         let mut reasoning = String::new();

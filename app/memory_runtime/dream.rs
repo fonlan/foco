@@ -77,6 +77,7 @@ pub(crate) struct MemoryDreamPlannerRequest<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemoryDreamTranscriptRequest<'a> {
+    pub(crate) workspace_id: &'a str,
     pub(crate) workspace_path: &'a Path,
 }
 
@@ -274,8 +275,7 @@ impl MemoryDreamTranscript {
             next_sequence: 0,
         };
         transcript.record_json("job started", metadata)?;
-        let input_summary =
-            serde_json::from_str(input_summary_json).unwrap_or_else(|_| json!({}));
+        let input_summary = serde_json::from_str(input_summary_json).unwrap_or_else(|_| json!({}));
         transcript.record_json("input summary", input_summary)?;
         Ok(transcript)
     }
@@ -421,6 +421,9 @@ pub(crate) fn start_memory_dream_job(
         "latestSuccessfulDreamAt": latest_success_at,
         "maxFactsPerRun": request.settings.max_facts_per_run,
         "maxChangesPerRun": request.settings.max_changes_per_run,
+        "transcriptWorkspaceId": request
+            .transcript
+            .map(|transcript| transcript.workspace_id),
     })
     .to_string();
 
@@ -4597,6 +4600,7 @@ mod tests {
             global_memory_database_file: None,
             planner: None,
             transcript: Some(MemoryDreamTranscriptRequest {
+                workspace_id: "workspace-transcript",
                 workspace_path: &workspace_dir,
             }),
         };

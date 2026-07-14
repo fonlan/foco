@@ -100,7 +100,9 @@ pub(crate) fn get_todo_graph(
     }
 }
 
-fn open_todo_graph_database(workspace_path: &Path) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
+fn open_todo_graph_database(
+    workspace_path: &Path,
+) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ToolRuntimeError> {
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -1043,12 +1043,14 @@ impl MemoryDatabase {
             .iter()
             .map(|fact| fact.id.as_str())
             .collect::<Vec<_>>();
-        let mut source_links = Vec::new();
+        let sources_by_fact = self.sources_for_facts(&source_fact_ids)?;
+        let mut source_links = Vec::with_capacity(facts.len());
         for fact in &facts {
-            let mut source_ids = self
-                .sources_for_fact(&fact.id)?
+            let mut source_ids = sources_by_fact
+                .get(&fact.id)
                 .into_iter()
-                .map(|source| source.id)
+                .flatten()
+                .map(|source| source.id.clone())
                 .collect::<Vec<_>>();
             source_ids.sort();
             source_links.push(json!({
@@ -2201,22 +2203,71 @@ impl MemoryDatabase {
         fact_id: &str,
     ) -> Result<Vec<MemorySourceRecord>, MemoryDatabaseError> {
         require_non_empty("fact_id", fact_id)?;
+        let mut by_fact = self.sources_for_facts(&[fact_id])?;
+        Ok(by_fact.remove(fact_id).unwrap_or_default())
+    }
+
+    pub fn sources_for_facts(
+        &self,
+        fact_ids: &[&str],
+    ) -> Result<HashMap<String, Vec<MemorySourceRecord>>, MemoryDatabaseError> {
+        if fact_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        for fact_id in fact_ids {
+            require_non_empty("fact_id", fact_id)?;
+        }
+
+        let placeholders = (1..=fact_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT fs.fact_id, s.id, s.scope, s.chat_id, s.source_type, s.source_id, s.title, s.content,
+                    s.metadata_json, s.created_at, s.updated_at
+             FROM memory_sources s
+             JOIN memory_fact_sources fs ON fs.source_id = s.id
+             WHERE fs.fact_id IN ({placeholders})
+             ORDER BY fs.fact_id ASC, s.created_at ASC, s.id ASC"
+        );
+        let query_params = fact_ids.iter().map(|fact_id| *fact_id).collect::<Vec<_>>();
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT s.id, s.scope, s.chat_id, s.source_type, s.source_id, s.title, s.content,
-                        s.metadata_json, s.created_at, s.updated_at
-                 FROM memory_sources s
-                 JOIN memory_fact_sources fs ON fs.source_id = s.id
-                 WHERE fs.fact_id = ?1
-                 ORDER BY s.created_at ASC, s.id ASC",
-            )
+            .prepare(&sql)
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
-            .query_map(params![fact_id], memory_source_from_row)
+            .query_map(params_from_iter(query_params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MemorySourceRecord {
+                        id: row.get(1)?,
+                        scope: row.get(2)?,
+                        chat_id: row.get(3)?,
+                        source_type: row.get(4)?,
+                        source_id: row.get(5)?,
+                        title: row.get(6)?,
+                        content: row.get(7)?,
+                        metadata_json: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    },
+                ))
+            })
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
-        collect_rows(rows, &self.database_path)
+        let mut sources_by_fact = HashMap::new();
+        for row in rows {
+            let (fact_id, source) =
+                row.map_err(|source| sqlite_error(&self.database_path, source))?;
+            sources_by_fact
+                .entry(fact_id)
+                .or_insert_with(Vec::new)
+                .push(source);
+        }
+        for fact_id in fact_ids {
+            sources_by_fact.entry((*fact_id).to_string()).or_default();
+        }
+        Ok(sources_by_fact)
     }
 
     pub fn facts_created_from_chat_sources(
@@ -5211,7 +5262,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory chat")
                 .expect("chat insert");
@@ -5320,7 +5372,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Extraction chat")
                 .expect("chat insert");
@@ -5357,7 +5410,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Extraction chat")
                 .expect("chat insert");
@@ -5504,7 +5558,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-claim", "Extraction claim chat")
                 .expect("chat insert");
@@ -5536,11 +5591,10 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    let mut memory =
-                        MemoryDatabase::open_workspace_at(workspace_database_path(
-                            workspace_path.as_path(),
-                        ))
-                        .expect("workspace memory database");
+                    let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(
+                        workspace_path.as_path(),
+                    ))
+                    .expect("workspace memory database");
                     memory
                         .mark_extraction_job_running("job-claim")
                         .expect("claim attempt")
@@ -5839,7 +5893,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory chat")
                 .expect("chat insert");
@@ -6003,7 +6058,8 @@ mod tests {
         drop(memory);
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             assert!(
                 workspace_database
                     .delete_chat("chat-1")
@@ -6029,7 +6085,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory updates")
                 .expect("chat insert");
@@ -6136,7 +6193,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory relations")
                 .expect("chat insert");
@@ -6232,7 +6290,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         {
             let mut workspace_database =
-                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+                WorkspaceDatabase::open_or_create_ungated(workspace.path())
+                    .expect("workspace database");
             workspace_database
                 .insert_chat("chat-1", "Memory profile")
                 .expect("chat insert");

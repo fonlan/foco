@@ -84,9 +84,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc, watch,
-};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc, watch};
 use tokio::time::timeout;
 
 use crate::http::assets::verify_frontend_assets;
@@ -410,8 +408,8 @@ pub(crate) struct AppState {
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
 
-pub(crate) use foco_store::workspace::WorkspaceDatabaseHandle;
 pub(crate) use foco_store::workspace::WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT;
+pub(crate) use foco_store::workspace::WorkspaceDatabaseHandle;
 
 #[track_caller]
 pub(crate) fn open_workspace_database(

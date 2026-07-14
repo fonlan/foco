@@ -32,6 +32,12 @@ mod workspace_records;
 #[path = "workspace_schema.rs"]
 mod workspace_schema;
 
+pub use crate::workspace_gate::{
+    WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT, WORKSPACE_DATABASE_ORDINARY_CAPACITY,
+    WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, WORKSPACE_DATABASE_TOTAL_CAPACITY,
+    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, open_workspace_database,
+    open_workspace_database_critical,
+};
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
@@ -60,25 +66,19 @@ pub use workspace_records::{
     ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
     WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
-pub use crate::workspace_gate::{
-    WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle, open_workspace_database,
-    open_workspace_database_critical, WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT,
-    WORKSPACE_DATABASE_ORDINARY_CAPACITY, WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-    WORKSPACE_DATABASE_TOTAL_CAPACITY,
-};
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, Migration,
+    MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 36;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 37;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -297,6 +297,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 36,
         sql: MIGRATION_036,
+    },
+    Migration {
+        version: 37,
+        sql: MIGRATION_037,
     },
 ];
 
@@ -4572,39 +4576,36 @@ impl WorkspaceDatabase {
         &self,
         kind: Option<&str>,
     ) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare(
+        let (sql, params): (&str, Vec<SqlValue>) = match kind {
+            Some(kind) => (
                 "SELECT id, title, created_at, updated_at, archived_at, metadata_json
                  FROM chats
+                 WHERE json_extract(metadata_json, '$.kind') = ?1
                  ORDER BY updated_at DESC, created_at DESC, id DESC",
-            )
+                vec![SqlValue::Text(kind.to_string())],
+            ),
+            None => (
+                "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+                 FROM chats
+                 WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'
+                 ORDER BY updated_at DESC, created_at DESC, id DESC",
+                Vec::new(),
+            ),
+        };
+        let mut statement = self
+            .connection
+            .prepare(sql)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(ChatRecord {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    archived_at: row.get(4)?,
-                    metadata_json: row.get(5)?,
-                })
-            })
+            .query_map(params_from_iter(params), chat_from_row)
             .map_err(|source| self.sqlite_error(source))?;
 
-        collect_rows(rows, &self.database_path)?
-            .into_iter()
-            .filter_map(
-                |chat| match chat_metadata_kind_matches(&chat.metadata_json, kind) {
-                    Ok(true) => Some(Ok(chat)),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect()
+        collect_rows(rows, &self.database_path)
     }
 
+    /// Full-table assistant metadata scan. Production overview paths must use
+    /// [`Self::code_change_stats_for_chats`] / [`Self::code_change_stats_for_chat`]
+    /// with the current page of chat ids instead.
     pub fn chat_code_change_stats(
         &self,
     ) -> Result<HashMap<String, CodeChangeStats>, WorkspaceDatabaseError> {
@@ -4695,19 +4696,19 @@ impl WorkspaceDatabase {
     }
 
     pub fn has_user_message_since(&self, since: &str) -> Result<bool, WorkspaceDatabaseError> {
-        let count = self
-            .connection
+        self.connection
             .query_row(
-                "SELECT COUNT(*)
-                 FROM messages
-                 WHERE role = 'user' AND created_at >= ?1
-                 LIMIT 1",
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM messages
+                     WHERE role = 'user' AND created_at >= ?1
+                     LIMIT 1
+                 )",
                 params![since],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|source| self.sqlite_error(source))?;
-
-        Ok(count > 0)
+            .map(|value| value != 0)
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn insert_message(
@@ -4807,11 +4808,12 @@ impl WorkspaceDatabase {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
-        let chat = chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(
-            || WorkspaceDatabaseError::InvalidMessageMetadata {
-                message: format!("chat was not found: {chat_id}"),
-            },
-        )?;
+        let chat =
+            chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                }
+            })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         // Rebuild when missing: list/message APIs may clear queuedRun before the Agent task
         // is visible (new chat insert has queuedRun before team/task exists).
@@ -4945,11 +4947,12 @@ impl WorkspaceDatabase {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
-        let chat = chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(
-            || WorkspaceDatabaseError::InvalidMessageMetadata {
-                message: format!("chat was not found: {chat_id}"),
-            },
-        )?;
+        let chat =
+            chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                }
+            })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         let should_clear_chat = chat_metadata
             .get(QUEUED_CHAT_METADATA_KEY)
@@ -11079,7 +11082,9 @@ impl WorkspaceDatabase {
     }
 
     /// Load all indexed code-graph path → content-hash pairs for short permit holds.
-    pub fn code_graph_file_hashes(&self) -> Result<HashMap<String, String>, WorkspaceDatabaseError> {
+    pub fn code_graph_file_hashes(
+        &self,
+    ) -> Result<HashMap<String, String>, WorkspaceDatabaseError> {
         let mut statement = self
             .connection
             .prepare(
@@ -14836,18 +14841,6 @@ fn like_contains_pattern(query: &str) -> String {
     }
     pattern.push('%');
     pattern
-}
-
-fn chat_metadata_kind_matches(
-    metadata_json: &str,
-    kind: Option<&str>,
-) -> Result<bool, WorkspaceDatabaseError> {
-    let metadata = parse_json_object(metadata_json, "chat metadata")?;
-    let chat_kind = metadata.get("kind").and_then(Value::as_str);
-    Ok(match kind {
-        Some(kind) => chat_kind == Some(kind),
-        None => chat_kind != Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND),
-    })
 }
 
 fn create_directory(path: &Path) -> Result<(), WorkspaceDatabaseError> {
