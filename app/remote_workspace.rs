@@ -1415,12 +1415,30 @@ impl RemoteWorkspaceManager {
             None,
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
+
+        // Register the session before best-effort version cleanup so concurrent connect
+        // short-circuits on an actual session map entry (not Ready status alone). Keep the
+        // std MutexGuard off the await: insert under a short lock, then cleanup over SSH.
         let summary = session.summary();
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
-        sessions.insert(key, session);
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+            sessions.insert(key, session);
+        }
+
+        // Best-effort: after bootstrap identity + control broker succeed, prune older
+        // Foco-managed sidecar version dirs. Custom focoCommand is skipped. Failures never
+        // downgrade a successful Ready session.
+        maybe_cleanup_stale_managed_remote_sidecar_versions(
+            &server,
+            server_id,
+            workspace_id,
+            &sidecar_command,
+        )
+        .await;
+
         Ok(summary)
     }
 
@@ -1839,6 +1857,10 @@ struct RemoteSidecarIdentity {
 struct RemoteSidecarCommand {
     command: String,
     identity: RemoteSidecarIdentity,
+    /// When `Some`, the command points at a Foco-managed install under
+    /// `$HOME/.foco/sidecars/<version>/...`. Custom `focoCommand` leaves this `None`
+    /// so remote version-directory cleanup is skipped.
+    managed_install_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3093,6 +3115,7 @@ async fn ensure_sidecar_command(
         return Ok(RemoteSidecarCommand {
             command: command.to_string(),
             identity,
+            managed_install_version: None,
         });
     }
 
@@ -3116,6 +3139,7 @@ async fn ensure_sidecar_command(
         return Ok(RemoteSidecarCommand {
             command: remote_bin,
             identity,
+            managed_install_version: Some(asset.version),
         });
     }
 
@@ -3139,6 +3163,7 @@ async fn ensure_sidecar_command(
                 return Ok(RemoteSidecarCommand {
                     command: remote_bin.clone(),
                     identity: identity.clone(),
+                    managed_install_version: Some(asset.version.clone()),
                 });
             }
 
@@ -3185,6 +3210,7 @@ async fn ensure_sidecar_command(
             Ok(RemoteSidecarCommand {
                 command: remote_bin.clone(),
                 identity: identity.clone(),
+                managed_install_version: Some(asset.version.clone()),
             })
         }
         .await
@@ -3409,6 +3435,207 @@ async fn stop_stale_remote_sidecars(
         ));
     }
     Ok(())
+}
+
+/// Keep the currently started managed version plus one recent historical version under
+/// `$HOME/.foco/sidecars/`.
+const REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT: usize = 2;
+
+/// Direct version-directory candidates for the pure retain policy (tests + shell parity).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteSidecarVersionDirCandidate {
+    name: String,
+    modified: std::time::SystemTime,
+}
+
+/// Version dir names must be safe single path components for both shell TSV parsing
+/// (tab/newline would break mtime\\tname) and `$root/$name` deletion. Align with Phase 1
+/// update asset path components: ASCII alnum + `.-_+` only.
+fn is_safe_remote_sidecar_version_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
+
+#[cfg(test)]
+fn is_protected_remote_sidecar_version_dir(name: &str, current_version: &str) -> bool {
+    name == current_version
+}
+
+/// Pure retain policy for managed remote sidecar version dirs.
+///
+/// Always protect the successful current version directory name (exact match), whether or not
+/// it appears in `candidates`. Keep at most `retain_count` real version directories total
+/// (current slot + newest remaining by mtime). Equal mtimes sort by name ascending. The remote
+/// shell cleanup script mirrors this policy.
+#[cfg(test)]
+fn select_remote_sidecar_version_dirs_to_remove(
+    candidates: &[RemoteSidecarVersionDirCandidate],
+    current_version: &str,
+    retain_count: usize,
+) -> Vec<String> {
+    // Always reserve one retain slot for the current version (shell parity).
+    let keep_other_count = retain_count.saturating_sub(1);
+
+    let mut others = candidates
+        .iter()
+        .filter(|candidate| {
+            !is_protected_remote_sidecar_version_dir(&candidate.name, current_version)
+        })
+        .collect::<Vec<_>>();
+
+    others.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    others
+        .into_iter()
+        .skip(keep_other_count)
+        .map(|candidate| candidate.name.clone())
+        .collect()
+}
+
+fn should_run_managed_remote_sidecar_version_cleanup(
+    sidecar_command: &RemoteSidecarCommand,
+) -> bool {
+    sidecar_command
+        .managed_install_version
+        .as_deref()
+        .is_some_and(is_safe_remote_sidecar_version_dir_name)
+}
+
+/// Generate a best-effort remote shell script that retains the current managed sidecar
+/// version directory plus one recent historical version under `$HOME/.foco/sidecars`.
+///
+/// Only real direct child directories are considered; symlinks and non-directories are skipped.
+/// Deletion failures are ignored and the script always exits 0.
+fn remote_managed_sidecar_version_retain_script(
+    current_version: &str,
+    retain_count: usize,
+) -> String {
+    // Policy parity with `select_remote_sidecar_version_dirs_to_remove`.
+    // Name filter mirrors `is_safe_remote_sidecar_version_dir_name` (no whitespace/control
+    // chars) so TSV mtime/name fields cannot shift.
+    format!(
+        r#"set +e
+# Foco managed remote sidecar version retain (best-effort; always exit 0).
+root="$HOME/.foco/sidecars"
+current={current_version}
+retain={retain_count}
+[ -n "$current" ] || exit 0
+[ -d "$root" ] || exit 0
+if [ "$retain" -gt 0 ] 2>/dev/null; then
+  keep_other=$((retain - 1))
+else
+  keep_other=0
+fi
+tmp="$(mktemp 2>/dev/null || true)"
+[ -n "$tmp" ] || exit 0
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+: > "$tmp"
+for path in "$root"/*; do
+  [ -e "$path" ] || [ -L "$path" ] || continue
+  name="${{path##*/}}"
+  case "$name" in
+    ''|'.'|'..'|*'/'*|*'\\'*|*[[:space:]]*|*[[:cntrl:]]*) continue ;;
+  esac
+  # Do not follow symlinks; only real direct child directories are candidates.
+  [ -L "$path" ] && continue
+  [ -d "$path" ] || continue
+  # Always protect the successful current version (even if it is not newest by mtime).
+  [ "$name" = "$current" ] && continue
+  mtime="$(stat -c %Y -- "$path" 2>/dev/null || stat -f %m -- "$path" 2>/dev/null || printf '0')"
+  printf '%s\t%s\n' "$mtime" "$name" >> "$tmp"
+done
+# If sort fails, skip deletions rather than acting on an empty/unordered list.
+if ! LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 -o "$tmp" "$tmp" 2>/dev/null; then
+  rm -f -- "$tmp" 2>/dev/null || true
+  trap - EXIT HUP INT TERM
+  exit 0
+fi
+kept=0
+while IFS="$(printf '\t')" read -r mtime name; do
+  [ -n "$name" ] || continue
+  case "$name" in
+    ''|'.'|'..'|*'/'*|*'\\'*|*[[:space:]]*|*[[:cntrl:]]*) continue ;;
+  esac
+  if [ "$kept" -lt "$keep_other" ]; then
+    kept=$((kept + 1))
+    continue
+  fi
+  victim="$root/$name"
+  [ -L "$victim" ] && continue
+  [ -d "$victim" ] || continue
+  rm -rf -- "$victim" 2>/dev/null || true
+done < "$tmp"
+rm -f -- "$tmp" 2>/dev/null || true
+trap - EXIT HUP INT TERM
+exit 0
+"#,
+        current_version = shell_quote(current_version),
+        retain_count = retain_count,
+    )
+}
+
+/// Best-effort prune of older Foco-managed remote sidecar version directories after a
+/// successful connect. Custom `focoCommand` is a no-op. Failures are logged only.
+async fn maybe_cleanup_stale_managed_remote_sidecar_versions(
+    server: &RemoteServerProfile,
+    server_id: &str,
+    workspace_id: &str,
+    sidecar_command: &RemoteSidecarCommand,
+) {
+    if !should_run_managed_remote_sidecar_version_cleanup(sidecar_command) {
+        return;
+    }
+    let current_version = sidecar_command
+        .managed_install_version
+        .as_deref()
+        .expect("managed_install_version present when cleanup should run");
+
+    let script = remote_managed_sidecar_version_retain_script(
+        current_version,
+        REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+    );
+    match run_ssh_output(server, &script, server_id, Some(workspace_id)).await {
+        Ok(output) if output.success() => {
+            tracing::info!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                retain_count = REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+                "managed remote sidecar version cleanup completed"
+            );
+        }
+        Ok(output) => {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                detail = %output_text(&output),
+                "managed remote sidecar version cleanup returned non-zero (best-effort)"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                error = %error.message(),
+                "managed remote sidecar version cleanup failed (best-effort)"
+            );
+        }
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -16047,6 +16274,152 @@ mod tests {
         assert!(script.contains("grep -F -- \"--workspace-path $wpath\""));
         assert!(script.contains("awk '{print $4}' \"/proc/$pid/stat\""));
         assert!(script.contains("[ \"$ppid\" = \"1\" ] || continue"));
+    }
+
+    #[test]
+    fn remote_managed_sidecar_version_retain_script_encodes_safety_and_policy() {
+        let script = remote_managed_sidecar_version_retain_script(
+            "1.2.3",
+            REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+        );
+        assert!(script.contains("root=\"$HOME/.foco/sidecars\""));
+        assert!(script.contains("current='1.2.3'"));
+        assert!(script.contains("retain=2"));
+        assert!(script.contains("[ \"$name\" = \"$current\" ] && continue"));
+        assert!(script.contains("[ -L \"$path\" ] && continue"));
+        assert!(script.contains("[ -d \"$path\" ] || continue"));
+        assert!(script.contains("rm -rf -- \"$victim\" 2>/dev/null || true"));
+        assert!(script.contains("exit 0"));
+        assert!(script.contains("set +e"));
+        assert!(script.contains("*[[:space:]]*|*[[:cntrl:]]*"));
+        assert!(script.contains("If sort fails, skip deletions"));
+        // Must not reuse process cleanup (stop_stale_remote_sidecars).
+        assert!(!script.contains("--remote-sidecar"));
+        assert!(!script.contains("/proc/"));
+        // Version is shell-quoted; path separators must not appear as unquoted current.
+        let quoted = shell_quote("1.2.3-beta'x");
+        let dangerous = remote_managed_sidecar_version_retain_script("1.2.3-beta'x", 2);
+        assert!(dangerous.contains(&format!("current={quoted}")));
+    }
+
+    #[test]
+    fn select_remote_sidecar_version_dirs_protects_current_over_mtime() {
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let mid = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(20);
+        let newest = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(30);
+        // Current is oldest by mtime but must still be protected; keep one newest other.
+        let candidates = vec![
+            RemoteSidecarVersionDirCandidate {
+                name: "1.0.0".to_string(),
+                modified: older,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "1.1.0".to_string(),
+                modified: mid,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "1.2.0".to_string(),
+                modified: newest,
+            },
+        ];
+        let remove = select_remote_sidecar_version_dirs_to_remove(
+            &candidates,
+            "1.0.0",
+            REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+        );
+        assert_eq!(remove, vec!["1.1.0".to_string()]);
+    }
+
+    #[test]
+    fn select_remote_sidecar_version_dirs_keeps_two_when_under_limit() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let t1 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2);
+        let candidates = vec![
+            RemoteSidecarVersionDirCandidate {
+                name: "1.0.0".to_string(),
+                modified: t0,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "1.1.0".to_string(),
+                modified: t1,
+            },
+        ];
+        let remove = select_remote_sidecar_version_dirs_to_remove(
+            &candidates,
+            "1.1.0",
+            REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+        );
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn select_remote_sidecar_version_dirs_mtime_tie_breaks_by_name() {
+        let same = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let candidates = vec![
+            RemoteSidecarVersionDirCandidate {
+                name: "1.0.0".to_string(),
+                modified: same,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "b-hist".to_string(),
+                modified: same,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "a-hist".to_string(),
+                modified: same,
+            },
+            RemoteSidecarVersionDirCandidate {
+                name: "c-hist".to_string(),
+                modified: same,
+            },
+        ];
+        // protect 1.0.0; keep one other (name asc among equal mtime => a-hist); remove b and c.
+        let mut remove = select_remote_sidecar_version_dirs_to_remove(
+            &candidates,
+            "1.0.0",
+            REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+        );
+        remove.sort();
+        assert_eq!(
+            remove,
+            vec!["b-hist".to_string(), "c-hist".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_remote_sidecar_cleanup_gate_skips_custom_and_unsafe() {
+        let custom = RemoteSidecarCommand {
+            command: "/usr/local/bin/foco".to_string(),
+            identity: RemoteSidecarIdentity {
+                version: "1.2.3".to_string(),
+                target: "linux-x64".to_string(),
+                build_id: "sha256:abc".to_string(),
+            },
+            managed_install_version: None,
+        };
+        assert!(!should_run_managed_remote_sidecar_version_cleanup(&custom));
+
+        let managed = RemoteSidecarCommand {
+            command: "\"$HOME\"/'.foco/sidecars/1.2.3/linux-x64/foco'".to_string(),
+            identity: custom.identity.clone(),
+            managed_install_version: Some("1.2.3".to_string()),
+        };
+        assert!(should_run_managed_remote_sidecar_version_cleanup(&managed));
+
+        let unsafe_name = RemoteSidecarCommand {
+            managed_install_version: Some("../escape".to_string()),
+            ..managed
+        };
+        assert!(!should_run_managed_remote_sidecar_version_cleanup(&unsafe_name));
+        assert!(!is_safe_remote_sidecar_version_dir_name(""));
+        assert!(!is_safe_remote_sidecar_version_dir_name("."));
+        assert!(!is_safe_remote_sidecar_version_dir_name(".."));
+        assert!(!is_safe_remote_sidecar_version_dir_name("a/b"));
+        assert!(!is_safe_remote_sidecar_version_dir_name("1.2.3\tbad"));
+        assert!(!is_safe_remote_sidecar_version_dir_name("has space"));
+        assert!(!is_safe_remote_sidecar_version_dir_name("1.2.3\n"));
+        assert!(is_safe_remote_sidecar_version_dir_name("1.2.3"));
+        assert!(is_safe_remote_sidecar_version_dir_name("1.2.3-beta+build"));
     }
 
     #[test]
