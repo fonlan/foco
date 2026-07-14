@@ -410,16 +410,55 @@ export function trimInactiveChatMessageCaches(
   return { messagesByKey: changed ? next : current, trimmedChatKeys };
 }
 
+export type MergeLoadedMessagesResult = {
+  messages: ShellMessage[];
+  preservedCachePrefix: boolean;
+};
+
+/**
+ * Merge a freshly loaded latest page with the in-memory chat cache.
+ * - When cache and loaded page share a stable message id, keep the cache prefix
+ *   before that overlap and let the server page replace the overlap and suffix.
+ * - When there is no overlap, drop unprovable cache history (edit rewrite / trim)
+ *   and do not re-insert streaming bubbles from the discarded thread.
+ * - When preserveStreamingPlaceholders is true and there is id continuity with
+ *   the cache, re-insert streaming assistants the server has not yet returned.
+ */
 export function mergeLoadedMessagesWithStreamingPlaceholders(
   loadedMessages: ShellMessage[],
   cachedMessages: ShellMessage[],
-  activeRun: ActiveChatRunSummary | null,
-): ShellMessage[] {
-  if (!activeRun || !cachedMessages.length) {
-    return loadedMessages;
+  preserveStreamingPlaceholders: boolean,
+): MergeLoadedMessagesResult {
+  if (!cachedMessages.length) {
+    return { messages: loadedMessages, preservedCachePrefix: false };
   }
 
-  const loadedIds = new Set(loadedMessages.map((message) => message.id));
+  const cachedIndexById = new Map(
+    cachedMessages.map((message, index) => [message.id, index]),
+  );
+  let cacheOverlapStart = -1;
+  for (const message of loadedMessages) {
+    const cachedIndex = cachedIndexById.get(message.id);
+    if (cachedIndex !== undefined) {
+      cacheOverlapStart = cachedIndex;
+      break;
+    }
+  }
+
+  const preservedPrefix =
+    cacheOverlapStart > 0 ? cachedMessages.slice(0, cacheOverlapStart) : [];
+  const preservedCachePrefix = preservedPrefix.length > 0;
+  let nextMessages =
+    preservedCachePrefix || cacheOverlapStart === 0
+      ? [...preservedPrefix, ...loadedMessages]
+      : [...loadedMessages];
+
+  // No id continuity with cache: do not resurrect history or orphan streaming.
+  if (!preserveStreamingPlaceholders || cacheOverlapStart < 0) {
+    return { messages: nextMessages, preservedCachePrefix };
+  }
+
+  const loadedIds = new Set(nextMessages.map((message) => message.id));
   const placeholders = cachedMessages
     .map((message, index) => ({ index, message }))
     .filter(
@@ -429,30 +468,39 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
         !loadedIds.has(message.id),
     );
   if (!placeholders.length) {
-    return loadedMessages;
+    return { messages: nextMessages, preservedCachePrefix };
   }
 
-  const nextMessages = [...loadedMessages];
   for (const { index, message } of placeholders) {
     let anchor: ShellMessage | undefined;
     for (let anchorIndex = index - 1; anchorIndex >= 0; anchorIndex -= 1) {
       const candidate = cachedMessages[anchorIndex];
-      if (candidate && nextMessages.some((message) => message.id === candidate.id)) {
+      if (candidate && nextMessages.some((item) => item.id === candidate.id)) {
         anchor = candidate;
         break;
       }
     }
-    const anchorIndex = anchor
-      ? nextMessages.findIndex((candidate) => candidate.id === anchor.id)
-      : -1;
-    const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : nextMessages.length;
+    if (!anchor) {
+      continue;
+    }
+    const anchorIndex = nextMessages.findIndex(
+      (candidate) => candidate.id === anchor.id,
+    );
+    if (anchorIndex < 0) {
+      continue;
+    }
+    const insertIndex = anchorIndex + 1;
     // ponytail: only preserves the live assistant bubble; if we later need
     // multi-placeholder replay ordering, use backend sequence numbers here.
-    nextMessages.splice(insertIndex, 0, message);
+    nextMessages = [
+      ...nextMessages.slice(0, insertIndex),
+      message,
+      ...nextMessages.slice(insertIndex),
+    ];
     loadedIds.add(message.id);
   }
 
-  return nextMessages;
+  return { messages: nextMessages, preservedCachePrefix };
 }
 
 export function preserveCachedReasoningDurations(
@@ -5589,17 +5637,30 @@ export function App() {
       );
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
       const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
-      const mergedMessages = mergeLoadedMessagesWithStreamingPlaceholders(
+      const localRunInfo = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
+      const hasLocalActiveRun =
+        Boolean(localRunInfo) && runningChatKeysRef.current.has(chatKey);
+      // Preserve local streaming even when the messages API omits activeRun
+      // (e.g. subagent return window) or run summary fields are incomplete.
+      const preserveStreamingPlaceholders =
+        Boolean(activeRun) || hasLocalActiveRun;
+      const mergeResult = mergeLoadedMessagesWithStreamingPlaceholders(
         normalizedMessages,
         cachedMessages,
-        activeRun,
+        preserveStreamingPlaceholders,
       );
       const nextMessages = preserveCachedReasoningDurations(
-        mergedMessages,
+        mergeResult.messages,
         cachedMessages,
       );
       const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
-      const pagination = normalizeChatMessagesPagination(data.pagination);
+      const serverPagination = normalizeChatMessagesPagination(data.pagination);
+      const existingPagination = chatMessagePaginationByKeyRef.current[chatKey];
+      const cacheWasTrimmed = trimmedChatCacheKeysRef.current.has(chatKey);
+      const pagination =
+        mergeResult.preservedCachePrefix && existingPagination && !cacheWasTrimmed
+          ? existingPagination
+          : serverPagination;
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
       setReadOnlyChatKeys((current) => {
         const readOnly = data.chat?.readOnly === true;
@@ -5633,7 +5694,7 @@ export function App() {
       }
       if (activeRun) {
         void subscribeActiveChatRun(activeRun);
-      } else {
+      } else if (!hasLocalActiveRun) {
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
         clearWorkspaceChatActiveRun(workspaceId, chatId);
@@ -5812,6 +5873,7 @@ export function App() {
     }
     const cachedMessages = chatMessagesByKeyRef.current[chatKey];
     const cacheWasTrimmed = trimmedChatCacheKeysRef.current.has(chatKey);
+    const localChatRunning = runningChatKeysRef.current.has(chatKey);
 
     if (!cachedMessages) {
       setActiveWorkspaceId(workspaceId);
@@ -5844,7 +5906,7 @@ export function App() {
     if (options.updateUrl !== false) {
       updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
     }
-    if (workspaceChatActiveRun || cacheWasTrimmed) {
+    if (workspaceChatActiveRun || cacheWasTrimmed || localChatRunning) {
       void loadChatMessages(workspaceId, chatId);
     }
   }
@@ -6589,7 +6651,7 @@ export function App() {
       return;
     }
 
-    setActiveMainTab({ chatId: tab.chatId, type: "chat", workspaceId: tab.workspaceId });
+    selectWorkspaceChat(tab.workspaceId, tab.chatId);
   }
 
   function closeChatTab(workspaceId: string, chatId: string) {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ActiveChatRunSummary, ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
+import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
   return {
@@ -125,14 +125,6 @@ describe("normalizeChatMessageSummary", () => {
 });
 
 describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
-  const activeRun: ActiveChatRunSummary = {
-    acceptingGuidance: false,
-    chatId: "chat-1",
-    lastSequence: 0,
-    runId: "run-1",
-    workspaceId: "workspace-1",
-  };
-
   it("keeps a cached streaming assistant placeholder after its loaded user message", () => {
     const loadedUser = { ...message("user-1"), role: "user" as const };
     const placeholder = { ...message("assistant-stream"), status: "streaming" as const };
@@ -140,11 +132,12 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     const result = mergeLoadedMessagesWithStreamingPlaceholders(
       [loadedUser],
       [loadedUser, placeholder],
-      activeRun,
+      true,
     );
 
-    expect(result.map((item) => item.id)).toEqual(["user-1", "assistant-stream"]);
-    expect(result[1]).toBe(placeholder);
+    expect(result.messages.map((item) => item.id)).toEqual(["user-1", "assistant-stream"]);
+    expect(result.messages[1]).toBe(placeholder);
+    expect(result.preservedCachePrefix).toBe(false);
   });
 
   it("lets a loaded assistant with the same id replace the cached placeholder", () => {
@@ -155,24 +148,131 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     const result = mergeLoadedMessagesWithStreamingPlaceholders(
       [loadedUser, loadedAssistant],
       [loadedUser, placeholder],
-      activeRun,
+      true,
     );
 
-    expect(result).toEqual([loadedUser, loadedAssistant]);
-    expect(result[1].status).toBeUndefined();
+    expect(result.messages).toEqual([loadedUser, loadedAssistant]);
+    expect(result.messages[1].status).toBeUndefined();
+    expect(result.preservedCachePrefix).toBe(false);
   });
 
-  it("drops cached streaming placeholders when there is no active run", () => {
+  it("drops cached streaming placeholders when preserveStreaming is false", () => {
     const loadedUser = { ...message("user-1"), role: "user" as const };
     const placeholder = { ...message("assistant-stream"), status: "streaming" as const };
 
     const result = mergeLoadedMessagesWithStreamingPlaceholders(
       [loadedUser],
       [loadedUser, placeholder],
-      null,
+      false,
     );
 
-    expect(result).toEqual([loadedUser]);
+    expect(result.messages).toEqual([loadedUser]);
+    expect(result.preservedCachePrefix).toBe(false);
+  });
+
+  it("preserves older cached pages when the latest page overlaps stable message ids", () => {
+    const older = [
+      { ...message("old-1"), role: "user" as const, content: "Earlier note." },
+      { ...message("old-2"), content: "Earlier answer." },
+    ];
+    const recent = [
+      { ...message("user-1"), role: "user" as const, content: "Please inspect README." },
+      { ...message("assistant-1"), content: "Done." },
+    ];
+    const loaded = recent.map((item) => ({ ...item, content: `${item.content} (server)` }));
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      loaded,
+      [...older, ...recent],
+      false,
+    );
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "old-2",
+      "user-1",
+      "assistant-1",
+    ]);
+    expect(result.messages[0]?.content).toBe("Earlier note.");
+    expect(result.messages[2]?.content).toBe("Please inspect README. (server)");
+    expect(result.messages[3]?.content).toBe("Done. (server)");
+  });
+
+  it("does not resurrect cache history when the latest page has no id overlap", () => {
+    const staleCache = [
+      { ...message("old-1"), role: "user" as const, content: "Deleted history." },
+      { ...message("old-2"), content: "Also deleted." },
+    ];
+    const rewritten = [
+      { ...message("new-user"), role: "user" as const, content: "Rewritten prompt." },
+      { ...message("new-assistant"), content: "Rewritten answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      rewritten,
+      staleCache,
+      false,
+    );
+
+    expect(result.preservedCachePrefix).toBe(false);
+    expect(result.messages).toEqual(rewritten);
+    expect(result.messages.map((item) => item.id)).not.toContain("old-1");
+  });
+
+  it("does not resurrect a streaming placeholder when there is no id overlap", () => {
+    const staleCache = [
+      { ...message("old-1"), role: "user" as const, content: "Deleted history." },
+      {
+        ...message("assistant-stream"),
+        status: "streaming" as const,
+        content: "Orphan thinking…",
+      },
+    ];
+    const rewritten = [
+      { ...message("new-user"), role: "user" as const, content: "Rewritten prompt." },
+      { ...message("new-assistant"), content: "Rewritten answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      rewritten,
+      staleCache,
+      true,
+    );
+
+    expect(result.preservedCachePrefix).toBe(false);
+    expect(result.messages).toEqual(rewritten);
+    expect(result.messages.map((item) => item.id)).not.toContain("assistant-stream");
+    expect(result.messages.map((item) => item.id)).not.toContain("old-1");
+  });
+
+  it("keeps a local streaming assistant when preserveStreaming is true and ids overlap", () => {
+    const loadedUser = { ...message("user-1"), role: "user" as const };
+    const older = { ...message("old-1"), role: "user" as const, content: "Earlier note." };
+    const placeholder = {
+      ...message("assistant-stream"),
+      status: "streaming" as const,
+      content: "Thinking…",
+      parts: [
+        { text: "Reasoning live", type: "reasoning" as const, liveDurationMs: 1500 },
+        { text: "Partial answer", type: "text" as const },
+      ],
+    };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedUser],
+      [older, loadedUser, placeholder],
+      true,
+    );
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "user-1",
+      "assistant-stream",
+    ]);
+    expect(result.messages[2]).toBe(placeholder);
+    expect(result.messages[2]?.parts).toEqual(placeholder.parts);
   });
 });
 

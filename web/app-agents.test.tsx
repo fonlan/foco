@@ -9,6 +9,7 @@ import {
   agentTranscriptResponse,
   agentTeamSnapshot,
   appTestState,
+  chatMessages,
   defaultComposerPlaceholder,
   defaultReviewSystemPrompt,
   deferred,
@@ -18,6 +19,8 @@ import {
   renderApp,
   resetAppTestEnvironment,
   settings,
+  workspace,
+  workspaceChats,
 } from "./test-utils/app-test-harness";
 
 function installMessageListScrollMetrics(
@@ -2021,5 +2024,293 @@ describe("app agents verification surfaces", () => {
         thinkingLevel: "low",
       });
     });
+  });
+
+  it("keeps loaded earlier main-chat history after returning from a worker while parent run is active", async () => {
+    const parentActiveRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 0,
+      runId: "run-parent-1",
+      workspaceId: "workspace-1",
+    };
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier main-chat note.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-main",
+      parts: [{ text: "Earlier main-chat note.", type: "text" }],
+    };
+    let latestPageLoads = 0;
+    const hangingStream = () =>
+      new Response(new ReadableStream({ start() {} }), {
+        headers: { "Content-Type": "text/event-stream" },
+        status: 200,
+      });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const requestUrl = new URL(url, "http://127.0.0.1");
+        const path = requestUrl.pathname;
+
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              {
+                ...workspace,
+                chats: workspaceChats.slice(0, 5).map((chat) =>
+                  chat.id === "chat-1" ? { ...chat, activeRun: parentActiveRun } : chat,
+                ),
+              },
+            ],
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          if (requestUrl.searchParams.get("beforeSequence") === "200") {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: parentActiveRun,
+              messages: [olderMessage],
+              pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+            });
+          }
+          latestPageLoads += 1;
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: parentActiveRun,
+            pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+          });
+        }
+
+        if (path.startsWith("/api/workspaces/workspace-1/chat/runs/run-parent-1/stream")) {
+          return hangingStream();
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(agentTranscriptResponse);
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(await screen.findByText("Earlier main-chat note.")).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.queryByText("Earlier main-chat note.")).not.toBeInTheDocument();
+
+    const loadsBeforeReturn = latestPageLoads;
+    await userEvent.click(screen.getByRole("button", { name: "Main chat" }));
+
+    await waitFor(() => expect(latestPageLoads).toBeGreaterThan(loadsBeforeReturn));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(screen.getByText("Earlier main-chat note.")).toBeInTheDocument();
+    expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(screen.getAllByText("Earlier main-chat note.")).toHaveLength(1);
+    expect(screen.getAllByText("Please inspect README.")).toHaveLength(1);
+  });
+
+  it("keeps streaming main assistant parts when returning from worker with temporary null activeRun", async () => {
+    let messageLoads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const requestUrl = new URL(url, "http://127.0.0.1");
+        const path = requestUrl.pathname;
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          messageLoads += 1;
+          // After the stream has started, the messages refresh can briefly omit
+          // activeRun and the unfinished assistant message.
+          const omitLiveAssistant = messageLoads > 1;
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: null,
+            messages: omitLiveAssistant
+              ? [
+                  ...chatMessages.messages,
+                  {
+                    content: "Continue with workers",
+                    createdAt: "2026-06-10T08:01:00.000Z",
+                    extractedMemories: [],
+                    id: "queued-user-1",
+                    memoriesUsed: [],
+                    metrics: null,
+                    parts: [{ text: "Continue with workers", type: "text" }],
+                    reasoning: null,
+                    role: "user",
+                    toolCalls: [],
+                  },
+                ]
+              : chatMessages.messages,
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(agentTranscriptResponse);
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "Continue with workers",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Live reasoning about workers",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Streaming main answer",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("Live reasoning about workers")).toBeInTheDocument();
+    expect(await screen.findByText("Streaming main answer")).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const loadsBeforeReturn = messageLoads;
+    await userEvent.click(screen.getByRole("button", { name: "Main chat" }));
+    await waitFor(() => expect(messageLoads).toBeGreaterThan(loadsBeforeReturn));
+
+    expect(await screen.findByText("Live reasoning about workers")).toBeInTheDocument();
+    expect(screen.getByText("Streaming main answer")).toBeInTheDocument();
+    expect(screen.getByText("Continue with workers")).toBeInTheDocument();
+  });
+
+  it("restores main chat history when closing the last agent tab", async () => {
+    const parentActiveRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 0,
+      runId: "run-parent-close",
+      workspaceId: "workspace-1",
+    };
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "History before agent tab close.",
+      createdAt: "2026-06-10T07:58:00.000Z",
+      id: "message-older-close",
+      parts: [{ text: "History before agent tab close.", type: "text" }],
+    };
+    let latestPageLoads = 0;
+    const hangingStream = () =>
+      new Response(new ReadableStream({ start() {} }), {
+        headers: { "Content-Type": "text/event-stream" },
+        status: 200,
+      });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const requestUrl = new URL(url, "http://127.0.0.1");
+        const path = requestUrl.pathname;
+
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              {
+                ...workspace,
+                chats: workspaceChats.slice(0, 5).map((chat) =>
+                  chat.id === "chat-1" ? { ...chat, activeRun: parentActiveRun } : chat,
+                ),
+              },
+            ],
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          if (requestUrl.searchParams.get("beforeSequence") === "200") {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: parentActiveRun,
+              messages: [olderMessage],
+              pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+            });
+          }
+          latestPageLoads += 1;
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: parentActiveRun,
+            pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+          });
+        }
+
+        if (path.startsWith("/api/workspaces/workspace-1/chat/runs/run-parent-close/stream")) {
+          return hangingStream();
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(agentTranscriptResponse);
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(await screen.findByText("History before agent tab close.")).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const workerTab =
+      screen.getAllByRole("tab", { name: /Worker/ }).find(
+        (tab) => tab.getAttribute("aria-selected") === "true",
+      ) ?? screen.getAllByRole("tab", { name: /Worker/ })[0]!;
+    await userEvent.click(
+      within(workerTab.parentElement as HTMLElement).getByRole("button", {
+        name: "Close chat tab Worker",
+      }),
+    );
+
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(screen.getByText("History before agent tab close.")).toBeInTheDocument();
+    expect(latestPageLoads).toBeGreaterThanOrEqual(1);
   });
 });
