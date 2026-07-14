@@ -630,6 +630,35 @@ impl MemoryDatabase {
         schema_version(&self.connection, &self.database_path)
     }
 
+    /// Low-frequency `PRAGMA optimize` for query-planner statistics.
+    ///
+    /// Global Memory uses process-local throttling only (no durable metadata table).
+    /// Workspace Memory reuses the shared workspace gate path; prefer calling
+    /// [`crate::workspace::WorkspaceDatabase::maybe_run_pragma_optimize`] on the
+    /// workspace DB for durable throttle. Failures must not abort Dream/terminal work.
+    pub fn maybe_run_pragma_optimize(
+        &mut self,
+        force: bool,
+    ) -> Result<bool, MemoryDatabaseError> {
+        let throttle = match self.kind {
+            MemoryDatabaseKind::Global => {
+                crate::workspace::SqlitePragmaOptimizeThrottle::ProcessLocalOnly
+            }
+            MemoryDatabaseKind::Workspace => {
+                // Workspace Memory shares the file with WorkspaceDatabase but has no
+                // independent metadata table; process-local throttle still avoids hot-path spam.
+                crate::workspace::SqlitePragmaOptimizeThrottle::ProcessLocalOnly
+            }
+        };
+        crate::workspace::maybe_run_sqlite_pragma_optimize(
+            &mut self.connection,
+            &self.database_path,
+            throttle,
+            force,
+        )
+        .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
     pub fn insert_source(
         &mut self,
         source: NewMemorySource<'_>,

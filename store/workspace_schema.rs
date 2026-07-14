@@ -30,8 +30,6 @@ CREATE TABLE messages (
     UNIQUE (chat_id, sequence)
 );
 
-CREATE INDEX messages_chat_sequence_idx ON messages (chat_id, sequence);
-
 CREATE TABLE run_events (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
     chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -44,7 +42,6 @@ CREATE TABLE run_events (
 );
 
 CREATE INDEX run_events_chat_idx ON run_events (chat_id);
-CREATE INDEX run_events_run_sequence_idx ON run_events (run_id, sequence);
 
 CREATE TABLE tool_calls (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
@@ -215,7 +212,6 @@ CREATE TABLE llm_request_events (
     UNIQUE (llm_request_id, sequence)
 );
 
-CREATE INDEX llm_request_events_request_sequence_idx ON llm_request_events (llm_request_id, sequence);
 CREATE INDEX llm_request_events_type_idx ON llm_request_events (event_type);
 "#;
 
@@ -235,8 +231,6 @@ CREATE TABLE context_compression_snapshots (
     UNIQUE (chat_id, sequence)
 );
 
-CREATE INDEX context_compression_snapshots_chat_sequence_idx
-    ON context_compression_snapshots (chat_id, sequence);
 CREATE INDEX context_compression_snapshots_run_idx
     ON context_compression_snapshots (run_id);
 "#;
@@ -997,7 +991,6 @@ CREATE TABLE plan_phases (
     UNIQUE (plan_id, sequence)
 );
 
-CREATE INDEX plan_phases_plan_sequence_idx ON plan_phases (plan_id, sequence);
 CREATE INDEX plan_phases_status_idx ON plan_phases (status);
 
 CREATE TABLE plan_steps (
@@ -1022,7 +1015,6 @@ CREATE TABLE plan_steps (
 );
 
 CREATE INDEX plan_steps_plan_idx ON plan_steps (plan_id);
-CREATE INDEX plan_steps_phase_sequence_idx ON plan_steps (phase_id, sequence);
 "#;
 
 pub(crate) const MIGRATION_021: &str = r#"

@@ -48,6 +48,13 @@ async fn run_memory_dream_scheduler(state: AppState) {
     if let Err(error) = reconcile_memory_dream_runs(&state) {
         tracing::error!(error = %error.message, "Memory Dream startup reconciliation failed");
     }
+    // Low-frequency Global Memory planner maintenance; never on request hot path.
+    if let Err(error) = maybe_optimize_global_memory_database(&state) {
+        tracing::warn!(
+            error = %error.message,
+            "Global Memory PRAGMA optimize skipped"
+        );
+    }
 
     loop {
         let scan_minutes = match dispatch_auto_memory_dreams_at(&state, Utc::now()).await {
@@ -57,6 +64,13 @@ async fn run_memory_dream_scheduler(state: AppState) {
                 MEMORY_DREAM_SCHEDULER_DEFAULT_SCAN_MINUTES
             }
         };
+        // Same tick cadence as Dream scan: process-local throttle still enforces 24h.
+        if let Err(error) = maybe_optimize_global_memory_database(&state) {
+            tracing::warn!(
+                error = %error.message,
+                "Global Memory PRAGMA optimize skipped"
+            );
+        }
         let delay = time::sleep(Duration::from_secs(u64::from(scan_minutes.max(1)) * 60));
         tokio::pin!(delay);
 
@@ -69,6 +83,24 @@ async fn run_memory_dream_scheduler(state: AppState) {
             _ = &mut delay => {}
         }
     }
+}
+
+fn maybe_optimize_global_memory_database(state: &AppState) -> Result<(), ApiError> {
+    let mut database = MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+        .map_err(ApiError::from_memory_error)?;
+    match database.maybe_run_pragma_optimize(false) {
+        Ok(true) => {
+            tracing::info!(
+                path = %database.database_path().display(),
+                "Global Memory PRAGMA optimize completed"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(ApiError::from_memory_error(error));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn reconcile_memory_dream_runs(state: &AppState) -> Result<usize, ApiError> {

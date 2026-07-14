@@ -122,6 +122,24 @@ fn prune_api_audit_details_for_config(
                 "pruned API request details"
             );
         }
+        match database.maybe_run_pragma_optimize(false) {
+            Ok(true) => {
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    "workspace database PRAGMA optimize completed"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    error = %error,
+                    "workspace database PRAGMA optimize skipped"
+                );
+            }
+        }
         match vacuum_workspace_database_if_needed(&mut database, &workspace.id, &workspace.path) {
             Ok(Some(reclaimed_bytes)) => {
                 summary.vacuumed_workspace_count =

@@ -14708,3 +14708,514 @@ fn migration_038_collapses_active_dreams_and_drops_redundant_indexes() {
         assert_eq!(count, 0, "expected {index_name} to be dropped");
     }
 }
+
+const MIGRATION_038_DROPPED_REDUNDANT_INDEXES: &[&str] = &[
+    "messages_chat_sequence_idx",
+    "run_events_run_sequence_idx",
+    "llm_request_events_request_sequence_idx",
+    "context_compression_snapshots_chat_sequence_idx",
+    "plan_phases_plan_sequence_idx",
+    "plan_steps_phase_sequence_idx",
+];
+
+fn named_index_exists(connection: &Connection, name: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("index lookup")
+        > 0
+}
+
+fn assert_plan_uses_unique_autoindex_or_search(plan: &str, table: &str) {
+    let lower = plan.to_ascii_lowercase();
+    let uses_autoindex = lower.contains("using covering index")
+        || lower.contains("using index")
+        || lower.contains("autoindex")
+        || lower.contains("using integer primary key");
+    let searches = lower.contains("search");
+    assert!(
+        uses_autoindex || searches,
+        "expected UNIQUE autoindex/SEARCH for {table}, plan:\n{plan}"
+    );
+    // Dropped named indexes must not reappear in the plan.
+    for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
+        assert!(
+            !plan.contains(index_name),
+            "plan must not use dropped index {index_name}:\n{plan}"
+        );
+    }
+}
+
+#[test]
+fn migration_038_fresh_and_upgrade_share_dropped_redundant_index_set() {
+    // Fresh open (user_version 0 → 38) must never recreate the six dropped indexes.
+    let fresh_workspace = tempfile::tempdir().expect("fresh workspace");
+    let fresh =
+        WorkspaceDatabase::open_or_create_ungated(fresh_workspace.path()).expect("fresh open");
+    assert_eq!(
+        fresh.schema_version().expect("fresh schema"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let fresh_connection = Connection::open(fresh.database_path()).expect("fresh connection");
+    for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
+        assert!(
+            !named_index_exists(&fresh_connection, index_name),
+            "fresh schema recreated dropped index {index_name}"
+        );
+    }
+    // Retained candidate indexes remain.
+    assert!(named_index_exists(
+        &fresh_connection,
+        "chats_title_nocase_idx"
+    ));
+    assert!(named_index_exists(
+        &fresh_connection,
+        "memory_dream_changes_target_fact_ids_idx"
+    ));
+    assert!(named_index_exists(
+        &fresh_connection,
+        "memory_dream_changes_new_fact_idx"
+    ));
+    drop(fresh_connection);
+    drop(fresh);
+
+    // Reopen does not recreate dropped indexes.
+    let reopened =
+        WorkspaceDatabase::open_or_create_ungated(fresh_workspace.path()).expect("reopen");
+    let reopened_connection = Connection::open(reopened.database_path()).expect("reopen connection");
+    for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
+        assert!(
+            !named_index_exists(&reopened_connection, index_name),
+            "reopen recreated dropped index {index_name}"
+        );
+    }
+    drop(reopened_connection);
+    drop(reopened);
+
+    // Upgrade path already covered by migration_038_collapses_active_dreams_and_drops_redundant_indexes;
+    // compare that upgrade also lacks the same six names (seeded then dropped).
+    let upgrade_workspace = tempfile::tempdir().expect("upgrade workspace");
+    let database_path = workspace_database_path(upgrade_workspace.path());
+    std::fs::create_dir_all(database_path.parent().expect("parent")).expect("mkdir");
+    {
+        let connection = Connection::open(&database_path).expect("open raw");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA user_version = 37;
+                CREATE TABLE chats (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE memory_dream_jobs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    scope TEXT NOT NULL,
+                    workspace_id TEXT,
+                    trigger_type TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    model_id TEXT,
+                    input_summary_json TEXT NOT NULL DEFAULT '{}',
+                    output_summary_json TEXT,
+                    transcript_chat_id TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE INDEX messages_chat_sequence_idx ON chats (id);
+                CREATE INDEX run_events_run_sequence_idx ON chats (id);
+                CREATE INDEX llm_request_events_request_sequence_idx ON chats (id);
+                CREATE INDEX context_compression_snapshots_chat_sequence_idx ON chats (id);
+                CREATE INDEX plan_phases_plan_sequence_idx ON chats (id);
+                CREATE INDEX plan_steps_phase_sequence_idx ON chats (id);
+                "#,
+            )
+            .expect("seed v37");
+    }
+    let upgraded =
+        WorkspaceDatabase::open_or_create_ungated(upgrade_workspace.path()).expect("upgrade");
+    let upgraded_connection = Connection::open(upgraded.database_path()).expect("upgrade connection");
+    for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
+        assert!(
+            !named_index_exists(&upgraded_connection, index_name),
+            "upgrade left dropped index {index_name}"
+        );
+    }
+}
+
+#[test]
+fn dropped_redundant_sequence_indexes_still_use_unique_autoindex() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database.insert_chat("chat-seq", "Seq").expect("chat");
+    for sequence in 0..40 {
+        database
+            .insert_message(NewMessage {
+                id: &format!("msg-{sequence}"),
+                chat_id: "chat-seq",
+                role: "user",
+                content: "body",
+                sequence,
+                metadata_json: None,
+            })
+            .expect("message");
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("ev-{sequence}"),
+                chat_id: "chat-seq",
+                run_id: "run-1",
+                sequence,
+                event_type: "text",
+                payload_json: "{}",
+            })
+            .expect("run event");
+    }
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "llm-1",
+            workspace_id: "ws",
+            chat_id: Some("chat-seq"),
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "p",
+            model_id: "m",
+            thinking_level: None,
+            request_started_at: "2026-07-14T00:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("llm request");
+    for sequence in 0..10 {
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("lre-{sequence}"),
+                llm_request_id: "llm-1",
+                sequence,
+                event_at: "2026-07-14T00:00:00.000Z",
+                event_type: if sequence == 0 { "start" } else { "delta" },
+                raw_chunk_json: None,
+                normalized_event_json: "{}",
+            })
+            .expect("llm event");
+    }
+    for sequence in 0..5 {
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id: &format!("snap-{sequence}"),
+                chat_id: "chat-seq",
+                run_id: "run-1",
+                sequence,
+                summary: "summary",
+                source_message_start_sequence: 0,
+                source_message_end_sequence: sequence,
+                original_token_count: 10,
+                summary_token_count: 2,
+                metadata_json: None,
+            })
+            .expect("snapshot");
+    }
+    let plan = database
+        .create_plan(NewPlan {
+            id: "plan-1",
+            title: "Plan",
+            overview: "overview",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "phase-1",
+                title: "Phase",
+                summary: "summary",
+                steps: vec![
+                    NewPlanStep {
+                        id: "step-1",
+                        title: "Step 1",
+                        detail: "detail",
+                        acceptance: vec![],
+                    },
+                    NewPlanStep {
+                        id: "step-2",
+                        title: "Step 2",
+                        detail: "detail",
+                        acceptance: vec![],
+                    },
+                ],
+            }],
+        })
+        .expect("plan");
+    assert_eq!(plan.phases.len(), 1);
+    drop(database);
+
+    let connection =
+        Connection::open(workspace_database_path(workspace.path())).expect("open database");
+    for index_name in MIGRATION_038_DROPPED_REDUNDANT_INDEXES {
+        assert!(
+            !named_index_exists(&connection, index_name),
+            "named index still present: {index_name}"
+        );
+    }
+
+    let messages_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM messages WHERE chat_id = 'chat-seq' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&messages_plan, "messages");
+
+    let run_events_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM run_events WHERE run_id = 'run-1' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&run_events_plan, "run_events");
+
+    let llm_events_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM llm_request_events WHERE llm_request_id = 'llm-1' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&llm_events_plan, "llm_request_events");
+
+    let snapshots_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM context_compression_snapshots WHERE chat_id = 'chat-seq' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&snapshots_plan, "context_compression_snapshots");
+
+    let phases_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM plan_phases WHERE plan_id = 'plan-1' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&phases_plan, "plan_phases");
+
+    let steps_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM plan_steps WHERE phase_id = 'phase-1' ORDER BY sequence ASC",
+    );
+    assert_plan_uses_unique_autoindex_or_search(&steps_plan, "plan_steps");
+
+    // Result ordering still matches production helpers after drop.
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
+    let messages = database.messages_for_chat("chat-seq").expect("messages");
+    assert_eq!(messages.len(), 40);
+    assert!(messages.windows(2).all(|w| w[0].sequence < w[1].sequence));
+    let events = database.run_events_for_run("run-1").expect("events");
+    assert_eq!(events.len(), 40);
+    assert!(events.windows(2).all(|w| w[0].sequence < w[1].sequence));
+}
+
+#[test]
+fn retained_index_candidates_have_production_homology_evidence() {
+    // Phase 3 candidate decision record (no DROP in this plan):
+    // - chats_title_nocase_idx: keep; leading-wildcard LIKE '%query%' cannot use it
+    // - memory_dream_changes_*_idx: keep; no production WHERE uses those columns alone
+    // - llm_requests: no new composite index without EXPLAIN proof (covered by existing AI stats fixture)
+    let workspace = tempfile::tempdir().expect("workspace");
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    drop(database);
+
+    let connection =
+        Connection::open(workspace_database_path(workspace.path())).expect("open database");
+    connection.execute_batch("BEGIN;").expect("begin");
+    {
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO chats (id, title, created_at, updated_at, archived_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, NULL, '{}')",
+            )
+            .expect("prepare chats");
+        for index in 0..3_000 {
+            insert
+                .execute(params![
+                    format!("chat-{index}"),
+                    format!("Title seed {index} alpha"),
+                    format!("2026-06-01T{:02}:00:00.000Z", index % 24),
+                    format!("2026-06-02T{:02}:00:00.000Z", index % 24),
+                ])
+                .expect("chat insert");
+        }
+    }
+    {
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO memory_dream_jobs
+                    (id, scope, workspace_id, trigger_type, mode, status, input_summary_json, created_at)
+                 VALUES (?1, 'workspace', 'ws-1', 'manual', 'deterministic_only', 'completed', '{}', ?2)",
+            )
+            .expect("prepare jobs");
+        for index in 0..50 {
+            insert
+                .execute(params![
+                    format!("job-{index}"),
+                    format!("2026-07-01T00:{:02}:00.000Z", index % 60)
+                ])
+                .expect("job insert");
+        }
+    }
+    {
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO memory_dream_changes
+                    (id, job_id, operation, target_fact_ids_json, new_fact_id, before_json,
+                     after_json, reason, confidence, risk_level, status, evidence_json,
+                     error_message, created_at, applied_at)
+                 VALUES (?1, ?2, 'update', ?3, ?4, NULL, NULL, 'reason', 0.5, 'low', 'proposed', '[]',
+                         NULL, ?5, NULL)",
+            )
+            .expect("prepare changes");
+        for index in 0..2_000 {
+            let job_id = format!("job-{}", index % 50);
+            insert
+                .execute(params![
+                    format!("change-{index}"),
+                    job_id,
+                    format!(r#"[\"fact-{}\"]"#, index % 100),
+                    if index % 3 == 0 {
+                        Some(format!("new-fact-{index}"))
+                    } else {
+                        None
+                    },
+                    format!("2026-07-02T00:{:02}:00.000Z", index % 60),
+                ])
+                .expect("change insert");
+        }
+    }
+    connection.execute_batch("COMMIT;").expect("commit");
+
+    // Title leading-wildcard: document that chats_title_nocase_idx is not usable here.
+    let title_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM chats
+         WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'
+           AND title LIKE '%alpha%' ESCAPE '\\' COLLATE NOCASE
+         ORDER BY updated_at DESC, created_at DESC, id DESC
+         LIMIT 20",
+    );
+    let title_analysis = analyze_query_plan(&title_plan);
+    assert!(
+        !title_analysis.details.is_empty(),
+        "title plan should exist for evidence"
+    );
+    // Decision: keep chats_title_nocase_idx for non-leading-wildcard / future use; do not DROP in migration 38.
+    assert!(
+        named_index_exists(&connection, "chats_title_nocase_idx"),
+        "title nocase index must remain"
+    );
+    let _leading_wildcard_may_scan = plan_has_unconstrained_scan_on(&title_plan, "chats");
+
+    // Production dream_changes_for_job: job_id (+ optional status), not target_fact_ids / new_fact_id.
+    let dream_changes_plan = explain_query_plan(
+        &connection,
+        "SELECT id, job_id, operation, target_fact_ids_json, new_fact_id, before_json,
+                after_json, reason, confidence, risk_level, status, evidence_json,
+                error_message, created_at, applied_at
+         FROM memory_dream_changes
+         WHERE job_id = 'job-1'
+           AND ('proposed' IS NULL OR status = 'proposed')
+         ORDER BY created_at ASC, id ASC
+         LIMIT 50",
+    );
+    assert_plan_uses_index(&dream_changes_plan, "memory_dream_changes_job_status_idx");
+    // No production query filters by target_fact_ids_json or new_fact_id alone → do not DROP on intuition.
+    assert!(named_index_exists(
+        &connection,
+        "memory_dream_changes_target_fact_ids_idx"
+    ));
+    assert!(named_index_exists(
+        &connection,
+        "memory_dream_changes_new_fact_idx"
+    ));
+    let target_only_plan = explain_query_plan(
+        &connection,
+        r#"SELECT id FROM memory_dream_changes WHERE target_fact_ids_json = '["fact-1"]' LIMIT 10"#,
+    );
+    let new_fact_plan = explain_query_plan(
+        &connection,
+        "SELECT id FROM memory_dream_changes WHERE new_fact_id = 'new-fact-0' LIMIT 10",
+    );
+    // Evidence only: whether planner can use those indexes when queried (not a production path).
+    let _target_idx_may_be_used = plan_uses_index(
+        &target_only_plan,
+        "memory_dream_changes_target_fact_ids_idx",
+    );
+    let _new_fact_idx_may_be_used =
+        plan_uses_index(&new_fact_plan, "memory_dream_changes_new_fact_idx");
+
+    // AI Statistics: existing llm_request_audit_query_plans_cover_rows_count_summary_and_breakdown
+    // already records that started_at / request_kind indexes suffice; no composite index added here.
+}
+
+#[test]
+fn workspace_pragma_optimize_is_throttled_and_non_fatal_path_safe() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    assert!(
+        database
+            .maybe_run_pragma_optimize(true)
+            .expect("force optimize"),
+        "forced optimize should run"
+    );
+    assert!(
+        !database
+            .maybe_run_pragma_optimize(false)
+            .expect("throttled optimize"),
+        "second optimize within interval should no-op"
+    );
+    let last_at = database
+        .workspace_metadata("sqlite_pragma_optimize_last_at")
+        .expect("metadata")
+        .expect("last_at stored");
+    assert!(
+        last_at.contains('T'),
+        "expected RFC3339 last_at, got {last_at}"
+    );
+
+    // Force still allowed for tests/maintenance escape hatch.
+    assert!(
+        database
+            .maybe_run_pragma_optimize(true)
+            .expect("force again")
+    );
+}
+
+#[test]
+fn global_memory_pragma_optimize_is_throttled_process_local() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join("memory.sqlite");
+    let mut database = MemoryDatabase::open_or_create_global_at(&path).expect("global memory");
+    assert!(
+        database
+            .maybe_run_pragma_optimize(true)
+            .expect("force optimize")
+    );
+    assert!(
+        !database
+            .maybe_run_pragma_optimize(false)
+            .expect("throttled"),
+        "process-local throttle should suppress immediate re-run"
+    );
+}
+

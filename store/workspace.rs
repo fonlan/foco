@@ -9,7 +9,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use chrono::{NaiveDateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
     AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentTaskId,
@@ -188,6 +188,9 @@ const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
 const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
 const LLM_AUDIT_DETAIL_V1_PRUNED_KEY: &str = "llm_audit_detail_v1_pruned";
 const LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY: &str = "llm_audit_status_code_v1_repaired";
+const SQLITE_PRAGMA_OPTIMIZE_LAST_AT_KEY: &str = "sqlite_pragma_optimize_last_at";
+/// Minimum gap between successful `PRAGMA optimize` runs for the same database path.
+pub const SQLITE_PRAGMA_OPTIMIZE_MIN_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKSPACE_MIGRATION_LOCK_SUFFIX: &str = ".migrate.lock";
 const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
@@ -855,6 +858,24 @@ impl WorkspaceDatabase {
         self.connection
             .execute_batch("VACUUM")
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Low-frequency `PRAGMA optimize` for query-planner statistics.
+    ///
+    /// Not for request hot paths. Throttled by durable `workspace_metadata` and a
+    /// process-local minimum interval. Failures are returned to the caller so
+    /// maintenance can log a warning without aborting the rest of the tick.
+    pub fn maybe_run_pragma_optimize(
+        &mut self,
+        force: bool,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        maybe_run_sqlite_pragma_optimize(
+            &mut self.connection,
+            &self.database_path,
+            SqlitePragmaOptimizeThrottle::WorkspaceMetadata,
+            force,
+        )
+        .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn schema_version(&self) -> Result<u32, WorkspaceDatabaseError> {
@@ -15839,6 +15860,86 @@ fn collect_rows<T>(
 
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqlitePragmaOptimizeThrottle {
+    /// Persist last success under `workspace_metadata` and process-local map.
+    WorkspaceMetadata,
+    /// Process-local map only (Global Memory has no workspace_metadata table).
+    ProcessLocalOnly,
+}
+
+pub(crate) fn maybe_run_sqlite_pragma_optimize(
+    connection: &mut Connection,
+    database_path: &Path,
+    throttle: SqlitePragmaOptimizeThrottle,
+    force: bool,
+) -> Result<bool, rusqlite::Error> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST_PROCESS_RUN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let path_key = database_path.to_string_lossy().into_owned();
+    let now_instant = Instant::now();
+    let min_interval = Duration::from_secs(SQLITE_PRAGMA_OPTIMIZE_MIN_INTERVAL_SECS);
+
+    if !force {
+        let map = LAST_PROCESS_RUN.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = map.lock() {
+            if let Some(last) = guard.get(&path_key) {
+                if now_instant.duration_since(*last) < min_interval {
+                    return Ok(false);
+                }
+            }
+        }
+
+        if matches!(throttle, SqlitePragmaOptimizeThrottle::WorkspaceMetadata) {
+            let last_at: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM workspace_metadata WHERE key = ?1",
+                    params![SQLITE_PRAGMA_OPTIMIZE_LAST_AT_KEY],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(last_at) = last_at {
+                if let Ok(last) = DateTime::parse_from_rfc3339(&last_at) {
+                    let elapsed = Utc::now().signed_duration_since(last.with_timezone(&Utc));
+                    if elapsed
+                        < chrono::Duration::seconds(
+                            i64::try_from(SQLITE_PRAGMA_OPTIMIZE_MIN_INTERVAL_SECS)
+                                .unwrap_or(i64::MAX),
+                        )
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    connection.execute_batch("PRAGMA optimize")?;
+
+    if matches!(throttle, SqlitePragmaOptimizeThrottle::WorkspaceMetadata) {
+        let updated_at = now_timestamp();
+        connection.execute(
+            "INSERT INTO workspace_metadata (key, value, updated_at)
+             VALUES (?1, ?2, ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at",
+            params![SQLITE_PRAGMA_OPTIMIZE_LAST_AT_KEY, updated_at],
+        )?;
+    }
+
+    if let Ok(mut guard) = LAST_PROCESS_RUN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.insert(path_key, Instant::now());
+    }
+
+    Ok(true)
 }
 
 fn validate_llm_request_tokens(request: &NewLlmRequest<'_>) -> Result<(), WorkspaceDatabaseError> {
