@@ -293,8 +293,8 @@ fn select_update_version_dirs_to_remove(
 }
 
 fn remove_update_version_dir(updates_root: &Path, name: &str) -> Result<(), String> {
-    let validated_name = safe_update_path_component(name, "version")
-        .map_err(|error| error.message().to_string())?;
+    let validated_name =
+        safe_update_path_component(name, "version").map_err(|error| error.message().to_string())?;
     let path = updates_root.join(validated_name);
     if !is_direct_child_path(updates_root, &path, validated_name) {
         return Err(format!(
@@ -1218,8 +1218,11 @@ mod tests {
     #[test]
     fn update_version_dir_selection_keeps_fewer_than_retain_count() {
         let candidates = vec![candidate("v1.0.0", 1), candidate("v1.1.0", 2)];
-        let remove =
-            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        let remove = select_update_version_dirs_to_remove(
+            &candidates,
+            "1.1.0",
+            UPDATE_VERSION_DIR_RETAIN_COUNT,
+        );
         assert!(remove.is_empty());
     }
 
@@ -1231,8 +1234,11 @@ mod tests {
             candidate("v1.2.0", 3),
             candidate("v1.3.0", 4),
         ];
-        let mut remove =
-            select_update_version_dirs_to_remove(&candidates, "1.3.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        let mut remove = select_update_version_dirs_to_remove(
+            &candidates,
+            "1.3.0",
+            UPDATE_VERSION_DIR_RETAIN_COUNT,
+        );
         remove.sort();
         assert_eq!(remove, vec!["v1.0.0".to_string(), "v1.1.0".to_string()]);
     }
@@ -1245,8 +1251,11 @@ mod tests {
             candidate("v1.2.0", 5),
         ];
         // Current v1.1.0 is oldest mtime but must stay; keep one newest history (v1.0.0).
-        let remove =
-            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        let remove = select_update_version_dirs_to_remove(
+            &candidates,
+            "1.1.0",
+            UPDATE_VERSION_DIR_RETAIN_COUNT,
+        );
         assert_eq!(remove, vec!["v1.2.0".to_string()]);
     }
 
@@ -1268,8 +1277,11 @@ mod tests {
             },
         ];
         // Current is protected. Among equal-mtime others, sort by name ascending and keep one.
-        let remove =
-            select_update_version_dirs_to_remove(&candidates, "1.1.0", UPDATE_VERSION_DIR_RETAIN_COUNT);
+        let remove = select_update_version_dirs_to_remove(
+            &candidates,
+            "1.1.0",
+            UPDATE_VERSION_DIR_RETAIN_COUNT,
+        );
         assert_eq!(remove, vec!["v1.2.0".to_string()]);
     }
 
@@ -1331,7 +1343,13 @@ mod tests {
 
         let remaining: Vec<_> = std::fs::read_dir(&updates)
             .expect("read")
-            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         let mut remaining = remaining;
         remaining.sort();
@@ -1430,7 +1448,10 @@ mod tests {
     #[test]
     fn cleanup_errors_do_not_panic_or_return() {
         // Missing root is a quiet no-op.
-        cleanup_stale_update_version_dirs(Path::new("/definitely/missing/foco-updates-xyz"), "1.0.0");
+        cleanup_stale_update_version_dirs(
+            Path::new("/definitely/missing/foco-updates-xyz"),
+            "1.0.0",
+        );
         // Root that is a file: discovery fails, must not panic.
         let dir = tempfile::tempdir().expect("tempdir");
         let file_root = dir.path().join("not-a-dir");
@@ -1451,7 +1472,15 @@ mod tests {
             &parent.join("nested").join("v1.2.3"),
             "v1.2.3"
         ));
-        assert!(!is_direct_child_path(parent, Path::new("/tmp/evil"), "evil"));
-        assert!(!is_direct_child_path(parent, &parent.join("v1.2.3"), "../x"));
+        assert!(!is_direct_child_path(
+            parent,
+            Path::new("/tmp/evil"),
+            "evil"
+        ));
+        assert!(!is_direct_child_path(
+            parent,
+            &parent.join("v1.2.3"),
+            "../x"
+        ));
     }
 }

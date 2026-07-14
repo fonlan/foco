@@ -16380,10 +16380,7 @@ mod tests {
             REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
         );
         remove.sort();
-        assert_eq!(
-            remove,
-            vec!["b-hist".to_string(), "c-hist".to_string()]
-        );
+        assert_eq!(remove, vec!["b-hist".to_string(), "c-hist".to_string()]);
     }
 
     #[test]
@@ -16410,7 +16407,9 @@ mod tests {
             managed_install_version: Some("../escape".to_string()),
             ..managed
         };
-        assert!(!should_run_managed_remote_sidecar_version_cleanup(&unsafe_name));
+        assert!(!should_run_managed_remote_sidecar_version_cleanup(
+            &unsafe_name
+        ));
         assert!(!is_safe_remote_sidecar_version_dir_name(""));
         assert!(!is_safe_remote_sidecar_version_dir_name("."));
         assert!(!is_safe_remote_sidecar_version_dir_name(".."));

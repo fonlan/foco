@@ -69,4 +69,19 @@ Advanced server profiles may set `focoCommand` to skip upload and run an existin
 
 ## Cleanup
 
-Remote cleanup keeps the most recent two sidecar versions under `~/.foco/sidecars/` and removes older version directories after a newer sidecar has started successfully. Cleanup is best-effort: failure to remove an old version should be logged in diagnostics but must not block opening the workspace.
+Two independent remote lifecycle steps must not be confused:
+
+1. **Orphan process stop (not version-dir cleanup):** before starting a new sidecar for a workspace, Foco may stop already-orphaned remote sidecar **processes** that match the same server/workspace identity. That only signals processes; it does **not** delete old version binaries or directories under `~/.foco/sidecars/`.
+2. **Managed version-directory retain (after successful connect):** after a Foco-managed sidecar successfully finishes bootstrap identity verification and the control broker is ready (session registered, workspace Ready), Foco best-effort prunes older **version directories** under remote `~/.foco/sidecars/`.
+
+Version-directory retain policy:
+
+- Root: only direct children of `$HOME/.foco/sidecars/` (no path escape).
+- Retain count: **2** total — always protect the currently started managed version directory, then keep one additional recent historical version directory (newest by mtime; equal mtimes break ties by name ascending).
+- Candidates: real directories only; skip symlinks and non-directories; unsafe directory names are skipped.
+- Trigger: only Foco-managed install paths (`managed_install_version` set). Custom `focoCommand` **does not** run this cleanup.
+- Failure mode: best-effort — log warning/diagnostics only; never block opening the workspace or downgrade a successful Ready session.
+
+### Local automatic-update asset retain (desktop main process)
+
+Separately, local auto-update downloads land under `~/.foco/updates/<version>/` on the host that runs Foco. After a successful install restarts the process with `--updated-restart`, the main process best-effort prunes historical version directories under `~/.foco/updates/`, keeping at most **2** (running `CARGO_PKG_VERSION` always protected, plus one recent historical directory by mtime). Ordinary startups do not trigger cleanup. Deletion is limited to validated direct children of the updates root; failures are warning-only and never abort startup.

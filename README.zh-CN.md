@@ -136,7 +136,11 @@ npm run build:release
 
 SSH 远程工作区使用桌面发布包内置的 Linux sidecar。CI release workflow 会用 `cross` 构建 `linux-x64` 和 `linux-arm64` sidecar，写入 `sidecars/manifest.json`，并记录每个二进制的 `sha256`。macOS 打包会把校验后的 sidecar 复制到 `Foco.app/Contents/Resources/sidecars/`；Windows NSIS 安装器会复制到安装目录下的 `resources\\sidecars\\`。
 
-用户只需要安装本机 Foco。主进程使用纯 Rust SSH 客户端（`russh`）：支持密码或公钥/SSH Agent 认证、OpenSSH 兼容 `known_hosts`、远程命令、stdin 上传 sidecar、keepalive，以及到远端 loopback sidecar 的 `direct-tcpip` 转发。运行时**不**依赖系统 `ssh`/`scp`/`sftp` 或 askpass。首次连接远程工作区时，Foco 会按服务器 target 选择包内 sidecar，校验 manifest hash，然后通过 SSH stdin 上传到 `~/.foco/sidecars/<version>/<target>/foco`。高级服务器配置可以设置 `focoCommand`，跳过上传并使用远端已有的 Foco 命令。远端清理策略保留最近 2 个 sidecar 版本，并在新版本成功启动后删除更旧版本。
+用户只需要安装本机 Foco。主进程使用纯 Rust SSH 客户端（`russh`）：支持密码或公钥/SSH Agent 认证、OpenSSH 兼容 `known_hosts`、远程命令、stdin 上传 sidecar、keepalive，以及到远端 loopback sidecar 的 `direct-tcpip` 转发。运行时**不**依赖系统 `ssh`/`scp`/`sftp` 或 askpass。首次连接远程工作区时，Foco 会按服务器 target 选择包内 sidecar，校验 manifest hash，然后通过 SSH stdin 上传到 `~/.foco/sidecars/<version>/<target>/foco`。高级服务器配置可以设置 `focoCommand`，跳过上传并使用远端已有的 Foco 命令。
+
+**Foco 托管的远端 sidecar 版本保留：** 在托管 sidecar 成功完成 bootstrap 身份校验且 control broker 就绪后，Foco 以 best-effort 方式清理远端 `~/.foco/sidecars/` 下的历史**版本目录**，最多保留 **2** 个（当前已成功启动的版本目录 + 按 mtime 最近的 1 个历史版本）。仅考虑该根目录的直接子项；当前版本始终受保护；符号链接与非目录会被跳过。自定义 `focoCommand` **不参与**该清理。清理失败只记 warning，不阻断打开远程工作区。这与启动前按同一工作区身份停止远端孤儿 sidecar **进程**是不同机制（停止进程不会删除旧版本二进制或版本目录）。
+
+**本机自动更新资产保留：** 更新下载目录位于本机 `~/.foco/updates/<version>/`。在安装成功并以 `--updated-restart` 重启后，Foco 以 best-effort 清理 `~/.foco/updates/` 下的历史版本目录，最多保留 **2** 个（当前运行版本 + 按 mtime 最近的 1 个历史版本）。普通启动不触发清理；失败只记 warning，不影响重启启动。
 
 支持的 OpenSSH config 字段（配置文件字段可被服务器配置覆盖）：HostName、User、Port、IdentityFile、UserKnownHostsFile、StrictHostKeyChecking。`ProxyCommand` / `ProxyJump` 会明确拒绝（不会静默直连）。登录密码仅可保存在本机全局配置；摘要 API 只暴露 `passwordConfigured`。未知主机密钥需确认指纹；密钥已变更时硬失败，需用户自行修正 known_hosts。
 
