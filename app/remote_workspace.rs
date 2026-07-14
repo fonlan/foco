@@ -114,10 +114,12 @@ use crate::{
     },
     save_config,
     skills::{
-        SelectedSkillPromptEntry, SkillPromptEntry, available_skills_routing_message,
+        SelectedSkillPromptEntry, SkillDiscovery, SkillPromptEntry,
+        available_skills_routing_message, discover_global_skills_for_profile,
         discover_workspace_skills_for_path, format_selected_skills_message, parse_skill_file,
         parse_skill_markdown, selected_skill_prompt_entry, skill_is_disabled,
         skill_is_required_disabled, skill_prompt_entry_from_settings,
+        skill_read_root_dirs_from_settings,
     },
     spec_runtime::{
         apply_workspace_spec_job_output, claim_next_workspace_spec_job_for_path,
@@ -240,6 +242,9 @@ struct RemotePreparedChatContext {
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
     context_budget: ContextBudget,
     compression_enabled: bool,
+    /// Run-scoped Skill read grants from the same discovery used for `## Skills`.
+    /// Not written to runtime bundle, SQLite, or provider request JSON.
+    skill_read_root_dirs: Vec<PathBuf>,
 }
 
 struct RemoteSidecarHistoryMessages {
@@ -290,6 +295,7 @@ impl RemoteSidecarRuntimeToolState {
             compression_snapshots: Vec::new(),
             context_budget: remote_sidecar_context_budget_for_request(state, request)?,
             compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
+            skill_read_root_dirs: Vec::new(),
         };
         Ok(Self::from_prepared(&prepared))
     }
@@ -2194,6 +2200,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         token: options.token,
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
+        user_profile_dir: resolve_remote_sidecar_user_profile_dir(),
         last_config_hash: Arc::new(Mutex::new(None)),
         runtime_config: Arc::new(Mutex::new(None)),
         code_graph_watcher: Arc::new(Mutex::new(None)),
@@ -2795,6 +2802,32 @@ pub(crate) struct RemoteSidecarState {
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     workspace_id: String,
     pub(crate) workspace_path: String,
+    /// Sidecar-local user profile (remote `$HOME`). Used only for remote global
+    /// Skills under `~/.agents/skills`. Never taken from the main-process host
+    /// profile or guessed from the workspace parent. `None` when HOME is missing
+    /// or not absolute; workspace Skills still work.
+    user_profile_dir: Option<PathBuf>,
+}
+
+/// Resolve the remote process profile directory for global Skill discovery.
+/// Returns `None` when `$HOME` is unset, empty, or not an absolute path.
+fn resolve_remote_sidecar_user_profile_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        tracing::warn!(
+            "remote sidecar HOME is empty; remote global skills under ~/.agents/skills will not be discovered"
+        );
+        return None;
+    }
+    let path = PathBuf::from(home);
+    if !path.is_absolute() {
+        tracing::warn!(
+            home = %path.display(),
+            "remote sidecar HOME is not absolute; remote global skills under ~/.agents/skills will not be discovered"
+        );
+        return None;
+    }
+    Some(path)
 }
 
 /// Bearer token middleware for all sidecar HTTP routes.
@@ -8851,8 +8884,12 @@ async fn build_remote_tool_catalog(
 
 #[derive(Clone)]
 enum RemoteSidecarSkillSource {
-    Synced(String),
-    Workspace(PathBuf),
+    /// Global skill content synced from the main-process host via runtime bundle.
+    SyncedLocalGlobal(String),
+    /// Global skill discovered on the remote host under `$HOME/.agents/skills`.
+    RemoteGlobalFile(PathBuf),
+    /// Workspace skill discovered under the remote workspace.
+    WorkspaceFile(PathBuf),
 }
 
 #[derive(Clone)]
@@ -8862,6 +8899,12 @@ struct RemoteSidecarSkillCandidate {
     prompt: SkillPromptEntry,
     source: RemoteSidecarSkillSource,
     disabled: bool,
+}
+
+struct RemoteSidecarSkillContext {
+    routing_message: Option<NeutralChatMessage>,
+    selected_entries: Vec<SelectedSkillPromptEntry>,
+    skill_read_root_dirs: Vec<PathBuf>,
 }
 
 fn remote_sidecar_requested_skill_ids(
@@ -8929,17 +8972,39 @@ fn remote_sidecar_workspace_skill_location_is_disabled(
     })
 }
 
+fn remote_sidecar_discover_remote_global_skills(state: &RemoteSidecarState) -> SkillDiscovery {
+    match state.user_profile_dir.as_deref() {
+        Some(profile) => discover_global_skills_for_profile(profile),
+        None => {
+            tracing::warn!(
+                workspace_id = %state.workspace_id,
+                "remote sidecar user profile is unavailable; remote global skills under ~/.agents/skills will not be discovered"
+            );
+            SkillDiscovery {
+                skills: Vec::new(),
+                errors: vec![crate::skills::SkillDiscoveryErrorSummary {
+                    path: "$HOME/.agents/skills".to_string(),
+                    message: "remote home/profile directory is missing or not absolute; remote global skills cannot be discovered".to_string(),
+                }],
+                required_disabled: Vec::new(),
+            }
+        }
+    }
+}
+
 fn remote_sidecar_skill_context(
     state: &RemoteSidecarState,
     bundle: Option<&SidecarRuntimeConfigBundle>,
     requested_skill_ids: &[String],
-) -> Result<(Option<NeutralChatMessage>, Vec<SelectedSkillPromptEntry>), axum::response::Response> {
+) -> Result<RemoteSidecarSkillContext, axum::response::Response> {
     let workspace_path = Path::new(&state.workspace_path);
-    let discovery = discover_workspace_skills_for_path(
+    let workspace_discovery = discover_workspace_skills_for_path(
         &state.workspace_id,
         &state.workspace_id,
         workspace_path,
     );
+    let remote_global_discovery = remote_sidecar_discover_remote_global_skills(state);
+
     let disabled_skill_ids = bundle
         .map(|bundle| {
             bundle
@@ -8960,10 +9025,17 @@ fn remote_sidecar_skill_context(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    let required_disabled_skill_ids = discovery
+    let global_location_disabled = disabled_location_ids.contains("global:agents");
+    let required_disabled_skill_ids = workspace_discovery
         .required_disabled
         .iter()
         .map(String::as_str)
+        .chain(
+            remote_global_discovery
+                .required_disabled
+                .iter()
+                .map(String::as_str),
+        )
         .chain(
             bundle
                 .into_iter()
@@ -8972,49 +9044,56 @@ fn remote_sidecar_skill_context(
         )
         .collect::<HashSet<_>>();
 
-    let enabled_workspace_skills = discovery
-        .skills
-        .iter()
-        .filter(|skill| {
-            !skill_is_disabled(skill, &disabled_skill_ids)
-                && !skill_is_required_disabled(skill, &required_disabled_skill_ids)
-                && !remote_sidecar_workspace_skill_location_is_disabled(
-                    state,
-                    skill,
-                    &disabled_location_ids,
-                )
-        })
-        .collect::<Vec<_>>();
-    let routing_entries = enabled_workspace_skills
-        .iter()
-        .map(|skill| skill_prompt_entry_from_settings(skill))
-        .collect::<Vec<_>>();
-    let routing_message = available_skills_routing_message(&routing_entries);
+    // Build effective candidates by scoped key first. Same `global:<id>`:
+    // RemoteGlobalFile overrides SyncedLocalGlobal. Workspace keys never collide
+    // with global keys.
+    let mut effective_by_key = HashMap::<String, RemoteSidecarSkillCandidate>::new();
 
-    let mut candidates = bundle
+    for skill in bundle
         .into_iter()
         .flat_map(|bundle| bundle.payload.global_skills.iter())
-        .map(|skill| RemoteSidecarSkillCandidate {
-            key: skill.key.clone(),
-            id: skill.id.clone(),
-            prompt: skill.prompt_entry(),
-            source: RemoteSidecarSkillSource::Synced(skill.content_markdown.clone()),
-            disabled: disabled_skill_ids.contains(skill.key.as_str())
-                || disabled_skill_ids.contains(skill.id.as_str())
-                || required_disabled_skill_ids.contains(skill.key.as_str())
-                || required_disabled_skill_ids.contains(skill.id.as_str())
-                || disabled_location_ids.contains("global:agents"),
-        })
-        .collect::<Vec<_>>();
-    candidates.extend(
-        discovery
-            .skills
-            .iter()
-            .map(|skill| RemoteSidecarSkillCandidate {
+    {
+        effective_by_key.insert(
+            skill.key.clone(),
+            RemoteSidecarSkillCandidate {
+                key: skill.key.clone(),
+                id: skill.id.clone(),
+                prompt: skill.prompt_entry(),
+                source: RemoteSidecarSkillSource::SyncedLocalGlobal(skill.content_markdown.clone()),
+                disabled: disabled_skill_ids.contains(skill.key.as_str())
+                    || disabled_skill_ids.contains(skill.id.as_str())
+                    || required_disabled_skill_ids.contains(skill.key.as_str())
+                    || required_disabled_skill_ids.contains(skill.id.as_str())
+                    || global_location_disabled,
+            },
+        );
+    }
+
+    for skill in &remote_global_discovery.skills {
+        let disabled = skill_is_disabled(skill, &disabled_skill_ids)
+            || skill_is_required_disabled(skill, &required_disabled_skill_ids)
+            || global_location_disabled;
+        // Remote host global always wins over main-process synced local global.
+        effective_by_key.insert(
+            skill.key.clone(),
+            RemoteSidecarSkillCandidate {
                 key: skill.key.clone(),
                 id: skill.id.clone(),
                 prompt: skill_prompt_entry_from_settings(skill),
-                source: RemoteSidecarSkillSource::Workspace(skill.path.clone()),
+                source: RemoteSidecarSkillSource::RemoteGlobalFile(skill.path.clone()),
+                disabled,
+            },
+        );
+    }
+
+    for skill in &workspace_discovery.skills {
+        effective_by_key.insert(
+            skill.key.clone(),
+            RemoteSidecarSkillCandidate {
+                key: skill.key.clone(),
+                id: skill.id.clone(),
+                prompt: skill_prompt_entry_from_settings(skill),
+                source: RemoteSidecarSkillSource::WorkspaceFile(skill.path.clone()),
                 disabled: skill_is_disabled(skill, &disabled_skill_ids)
                     || skill_is_required_disabled(skill, &required_disabled_skill_ids)
                     || remote_sidecar_workspace_skill_location_is_disabled(
@@ -9022,8 +9101,84 @@ fn remote_sidecar_skill_context(
                         skill,
                         &disabled_location_ids,
                     ),
-            }),
-    );
+            },
+        );
+    }
+
+    // Routing table: only remote filesystem-backed skills (remote global + workspace).
+    // Synced local globals are selection-only fallbacks and never auto-route.
+    let mut routing_skills = Vec::new();
+    for candidate in effective_by_key.values() {
+        if candidate.disabled {
+            continue;
+        }
+        match &candidate.source {
+            RemoteSidecarSkillSource::RemoteGlobalFile(_)
+            | RemoteSidecarSkillSource::WorkspaceFile(_) => {
+                routing_skills.push(candidate.clone());
+            }
+            RemoteSidecarSkillSource::SyncedLocalGlobal(_) => {}
+        }
+    }
+    routing_skills.sort_by(|left, right| {
+        left.prompt
+            .scope
+            .cmp(&right.prompt.scope)
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.prompt.path.cmp(&right.prompt.path))
+    });
+    let routing_entries = routing_skills
+        .iter()
+        .map(|candidate| candidate.prompt.clone())
+        .collect::<Vec<_>>();
+    let routing_message = available_skills_routing_message(&routing_entries);
+
+    // Skill read roots match routing visibility only (filesystem-backed remote skills).
+    let routing_settings_for_roots = routing_skills
+        .iter()
+        .filter_map(|candidate| {
+            let path = match &candidate.source {
+                RemoteSidecarSkillSource::RemoteGlobalFile(path)
+                | RemoteSidecarSkillSource::WorkspaceFile(path) => path.clone(),
+                RemoteSidecarSkillSource::SyncedLocalGlobal(_) => return None,
+            };
+            Some(SkillSettings {
+                key: candidate.key.clone(),
+                id: candidate.id.clone(),
+                name: candidate.prompt.name.clone(),
+                description: candidate.prompt.description.clone(),
+                path,
+                scope: if matches!(
+                    candidate.source,
+                    RemoteSidecarSkillSource::RemoteGlobalFile(_)
+                ) {
+                    foco_store::config::SKILL_SCOPE_GLOBAL.to_string()
+                } else {
+                    foco_store::config::SKILL_SCOPE_WORKSPACE.to_string()
+                },
+                workspace_id: if matches!(
+                    candidate.source,
+                    RemoteSidecarSkillSource::WorkspaceFile(_)
+                ) {
+                    Some(state.workspace_id.clone())
+                } else {
+                    None
+                },
+                workspace_name: if matches!(
+                    candidate.source,
+                    RemoteSidecarSkillSource::WorkspaceFile(_)
+                ) {
+                    Some(state.workspace_id.clone())
+                } else {
+                    None
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let skill_read_root_dirs = skill_read_root_dirs_from_settings(&routing_settings_for_roots);
+
+    let effective_candidates = effective_by_key.values().collect::<Vec<_>>();
 
     let mut seen_requested = HashSet::new();
     let mut seen_resolved = HashSet::new();
@@ -9039,13 +9194,17 @@ fn remote_sidecar_skill_context(
             ))
             .into_response());
         }
-        let mut matches = candidates
+        // Scoped key exact match first (uses effective candidate after remote-over-local).
+        let mut matches = effective_candidates
             .iter()
+            .copied()
             .filter(|candidate| candidate.key == requested)
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            matches = candidates
+            // Legacy bare id: uniqueness only across distinct effective scoped keys.
+            matches = effective_candidates
                 .iter()
+                .copied()
                 .filter(|candidate| candidate.id == requested)
                 .collect();
         }
@@ -9078,22 +9237,34 @@ fn remote_sidecar_skill_context(
             ))
             .into_response());
         }
-        if matches!(candidate.source, RemoteSidecarSkillSource::Workspace(_))
-            && discovery.errors.iter().any(|error| {
-                error
-                    .message
-                    .contains(&format!("duplicate skill id '{}'", candidate.id))
-            })
-        {
+
+        let has_duplicate_declaration = match &candidate.source {
+            RemoteSidecarSkillSource::WorkspaceFile(_) => {
+                workspace_discovery.errors.iter().any(|error| {
+                    error
+                        .message
+                        .contains(&format!("duplicate skill id '{}'", candidate.id))
+                })
+            }
+            RemoteSidecarSkillSource::RemoteGlobalFile(_) => {
+                remote_global_discovery.errors.iter().any(|error| {
+                    error
+                        .message
+                        .contains(&format!("duplicate skill id '{}'", candidate.id))
+                })
+            }
+            RemoteSidecarSkillSource::SyncedLocalGlobal(_) => false,
+        };
+        if has_duplicate_declaration {
             return Err(ApiError::bad_request(format!(
-                "selected skill '{}' has duplicate workspace declarations",
+                "selected skill '{}' has duplicate declarations",
                 candidate.key
             ))
             .into_response());
         }
 
         let content_markdown = match &candidate.source {
-            RemoteSidecarSkillSource::Synced(content_markdown) => {
+            RemoteSidecarSkillSource::SyncedLocalGlobal(content_markdown) => {
                 let parsed =
                     parse_skill_markdown(Path::new(&candidate.prompt.path), content_markdown)
                         .map_err(|error| ApiError::bad_request(error).into_response())?;
@@ -9106,7 +9277,8 @@ fn remote_sidecar_skill_context(
                 }
                 parsed.markdown
             }
-            RemoteSidecarSkillSource::Workspace(path) => {
+            RemoteSidecarSkillSource::RemoteGlobalFile(path)
+            | RemoteSidecarSkillSource::WorkspaceFile(path) => {
                 let parsed = parse_skill_file(path)
                     .map_err(|error| ApiError::bad_request(error).into_response())?;
                 if parsed.id != candidate.id {
@@ -9125,7 +9297,11 @@ fn remote_sidecar_skill_context(
         ));
     }
 
-    Ok((routing_message, selected_entries))
+    Ok(RemoteSidecarSkillContext {
+        routing_message,
+        selected_entries,
+        skill_read_root_dirs,
+    })
 }
 
 fn apply_sidecar_selected_skills(
@@ -9272,9 +9448,10 @@ fn remote_sidecar_prepare_chat_context_with_options(
         &tool_catalog.memory_prompt_tools,
         &tool_catalog.mcp_prompt_tools,
     ));
-    let (skill_routing_message, selected_skill_entries) =
-        remote_sidecar_skill_context(state, bundle.as_ref(), requested_skill_ids)?;
-    apply_sidecar_selected_skills(&selected_skill_entries, &mut filtered_messages)?;
+    let skill_context = remote_sidecar_skill_context(state, bundle.as_ref(), requested_skill_ids)?;
+    apply_sidecar_selected_skills(&skill_context.selected_entries, &mut filtered_messages)?;
+    let skill_routing_message = skill_context.routing_message;
+    let skill_read_root_dirs = skill_context.skill_read_root_dirs;
     let tools = tool_catalog.tools.clone();
     let todo_graph_context = database
         .todo_graph(chat_id)
@@ -9411,6 +9588,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                 message_context_sources,
                 active_tool_start_index,
                 compression_snapshots,
+                skill_read_root_dirs,
             );
         }
     }
@@ -9469,6 +9647,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
         message_context_sources,
         active_tool_start_index,
         compression_snapshots,
+        skill_read_root_dirs,
     )
 }
 
@@ -9543,6 +9722,7 @@ fn remote_sidecar_finish_prepared_context(
     message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
+    skill_read_root_dirs: Vec<PathBuf>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
     let context_budget = remote_sidecar_context_budget_for_request(state, &provider_request)
         .map_err(|e| e.into_response())?;
@@ -9556,6 +9736,7 @@ fn remote_sidecar_finish_prepared_context(
         compression_snapshots,
         context_budget,
         compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
+        skill_read_root_dirs,
     })
 }
 
@@ -10399,6 +10580,7 @@ async fn remote_sidecar_execute_tool_call(
     assistant_message_id: &str,
     provider_id: &str,
     model_id: &str,
+    skill_read_root_dirs: Vec<PathBuf>,
 ) -> (Value, bool, String, String, Vec<Value>, Vec<String>) {
     // ponytail: remote sidecar reuses the shared execute_tool path one call at a time.
     // Ceiling: this duplicates a thin slice of main chat wiring; if remote tools grow
@@ -10554,7 +10736,7 @@ async fn remote_sidecar_execute_tool_call(
             memory_settings: global_config.memory.clone(),
         },
         None,
-        Vec::new(),
+        skill_read_root_dirs,
         ToolResourceLockRegistry::default(),
         foco_tools::ToolCancellationToken::default(),
         tool_output_tx.clone(),
@@ -12188,6 +12370,7 @@ async fn remote_sidecar_chat_stream(
     let initial_provider_request = initial_prepared.provider_request.clone();
     let tool_catalog = initial_prepared.tool_catalog.clone();
     let session_mode = initial_prepared.session_mode.clone();
+    let skill_read_root_dirs = initial_prepared.skill_read_root_dirs.clone();
     let initial_runtime_tool_state =
         RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
     let run = RemoteActiveRunSummary {
@@ -12541,6 +12724,7 @@ async fn remote_sidecar_chat_stream(
                                 &assistant_message_id,
                                 &provider_id,
                                 &model_id,
+                                skill_read_root_dirs.clone(),
                             );
                             tokio::pin!(execution);
                             let (
@@ -13390,15 +13574,31 @@ async fn remote_sidecar_skill_install(
 async fn remote_sidecar_skills_discover(
     State(state): State<RemoteSidecarState>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let discovery = crate::skills::discover_workspace_skills_for_path(
+    let workspace_discovery = crate::skills::discover_workspace_skills_for_path(
         &state.workspace_id,
         &state.workspace_id,
         sidecar_workspace_path(&state),
     );
+    let remote_global_discovery = remote_sidecar_discover_remote_global_skills(&state);
+    let mut skills = remote_global_discovery.skills;
+    skills.extend(workspace_discovery.skills);
+    skills.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then_with(|| left.workspace_name.cmp(&right.workspace_name))
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut errors = remote_global_discovery.errors;
+    errors.extend(workspace_discovery.errors);
+    let mut required_disabled = remote_global_discovery.required_disabled;
+    required_disabled.extend(workspace_discovery.required_disabled);
+    required_disabled.sort();
+    required_disabled.dedup();
     Ok(Json(json!({
-        "detected": discovery.skills,
-        "errors": discovery.errors,
-        "requiredDisabled": discovery.required_disabled,
+        "detected": skills,
+        "errors": errors,
+        "requiredDisabled": required_disabled,
     })))
 }
 
@@ -14665,6 +14865,17 @@ mod tests {
         RemoteSidecarState,
         tokio::sync::broadcast::Receiver<ControlEnvelope>,
     ) {
+        test_sidecar_state_with_profile(workspace_path, ws_count, None)
+    }
+
+    fn test_sidecar_state_with_profile(
+        workspace_path: String,
+        ws_count: usize,
+        user_profile_dir: Option<PathBuf>,
+    ) -> (
+        RemoteSidecarState,
+        tokio::sync::broadcast::Receiver<ControlEnvelope>,
+    ) {
         let (broker_tx, broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(16);
         (
             RemoteSidecarState {
@@ -14681,6 +14892,7 @@ mod tests {
                 shutdown_tx: default_shutdown_tx(),
                 workspace_id: "workspace".to_string(),
                 workspace_path,
+                user_profile_dir,
             },
             broker_rx,
         )
@@ -17164,6 +17376,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_string_lossy().to_string(),
+            user_profile_dir: None,
         };
         let base_payload = json!({
             "chatId": "chat-1",
@@ -19385,6 +19598,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_string_lossy().to_string(),
+            user_profile_dir: None,
         };
 
         let response = tokio::time::timeout(
@@ -23711,6 +23925,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            user_profile_dir: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -23779,6 +23994,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            user_profile_dir: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -23936,6 +24152,7 @@ mod tests {
                 "msg-assistant-tools",
                 "provider",
                 "model",
+                Vec::new(),
             )
             .await;
         (output, is_error, events, additional_context)
@@ -26382,12 +26599,13 @@ mod tests {
         let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
             .expect("runtime bundle");
 
-        let (_, selected) =
+        let skill_context =
             remote_sidecar_skill_context(&state, Some(&bundle), &["workspace-demo".to_string()])
                 .expect("other workspace disabled key must not affect current workspace skill");
 
         assert_eq!(
-            selected
+            skill_context
+                .selected_entries
                 .iter()
                 .map(|entry| entry.prompt.key.as_str())
                 .collect::<Vec<_>>(),
@@ -26460,7 +26678,8 @@ mod tests {
 
         let unknown =
             remote_sidecar_skill_context(&state, Some(&bundle), &["global:missing".to_string()])
-                .expect_err("unknown skill should fail");
+                .err()
+                .expect("unknown skill should fail");
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 
         let mut disabled_bundle = bundle.clone();
@@ -26473,7 +26692,8 @@ mod tests {
             Some(&disabled_bundle),
             &["global-demo".to_string()],
         )
-        .expect_err("disabled skill should fail");
+        .err()
+        .expect("disabled skill should fail");
         assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
 
         let mut required_disabled_bundle = bundle.clone();
@@ -26486,7 +26706,8 @@ mod tests {
             Some(&required_disabled_bundle),
             &["global-demo".to_string()],
         )
-        .expect_err("required-disabled skill should fail");
+        .err()
+        .expect("required-disabled skill should fail");
         assert_eq!(required_disabled.status(), StatusCode::BAD_REQUEST);
 
         let mut changed_bundle = bundle;
@@ -26497,7 +26718,8 @@ mod tests {
             Some(&changed_bundle),
             &["global:global-demo".to_string()],
         )
-        .expect_err("changed skill id should fail");
+        .err()
+        .expect("changed skill id should fail");
         assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -26548,6 +26770,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_sidecar_routes_remote_global_skills_and_prefers_remote_over_synced_local() {
+        let remote_profile = tempfile::tempdir().expect("remote profile");
+        let local_profile = tempfile::tempdir().expect("local profile for bundle");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+
+        let remote_skill_path = write_remote_test_skill(
+            &remote_profile.path().join(".agents").join("skills"),
+            "demo",
+            "Remote demo skill.",
+            "REMOTE_GLOBAL_MARKER",
+        );
+        fs::create_dir_all(remote_skill_path.parent().unwrap().join("references"))
+            .expect("references dir");
+        fs::write(
+            remote_skill_path
+                .parent()
+                .unwrap()
+                .join("references")
+                .join("extra.md"),
+            "REMOTE_REF_MARKER\n",
+        )
+        .expect("reference file");
+        write_remote_test_skill(
+            &local_profile.path().join(".agents").join("skills"),
+            "demo",
+            "Local demo skill.",
+            "LOCAL_GLOBAL_MARKER",
+        );
+        let workspace_skill_path = write_remote_test_skill(
+            &workspace.path().join(".agents").join("skills"),
+            "workspace-demo",
+            "Workspace demo skill.",
+            "WORKSPACE_MARKER",
+        );
+        // Same bare id as remote global, different scoped key.
+        write_remote_test_skill(
+            &workspace.path().join(".claude").join("skills"),
+            "demo",
+            "Workspace demo with same bare id.",
+            "WORKSPACE_SAME_ID_MARKER",
+        );
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        insert_remote_provider_messages(
+            &mut database,
+            json!({
+                "queuedRun": {
+                    "skillIds": ["global:demo"]
+                }
+            }),
+        );
+
+        let (state, _) = test_sidecar_state_with_profile(
+            workspace.path().display().to_string(),
+            1,
+            Some(remote_profile.path().to_path_buf()),
+        );
+        let bundle = build_sidecar_runtime_config_bundle(
+            local_profile.path(),
+            &remote_test_config(workspace.path()),
+            1,
+        )
+        .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle.clone());
+
+        // Unselected request: routing includes remote global + workspace, not local-only.
+        let empty_ctx =
+            remote_sidecar_skill_context(&state, Some(&bundle), &[]).expect("empty selection");
+        let routing = empty_ctx
+            .routing_message
+            .expect("routing should include remote skills")
+            .content;
+        assert!(routing.contains("global:demo"));
+        assert!(routing.contains(&remote_skill_path.display().to_string()));
+        assert!(routing.contains("workspace:workspace:workspace-demo"));
+        assert!(routing.contains(&workspace_skill_path.display().to_string()));
+        assert!(!routing.contains("LOCAL_GLOBAL_MARKER"));
+        assert!(!empty_ctx.skill_read_root_dirs.is_empty());
+        let remote_skill_root = fs::canonicalize(remote_skill_path.parent().unwrap()).unwrap();
+        assert!(
+            empty_ctx
+                .skill_read_root_dirs
+                .iter()
+                .any(|root| root == &remote_skill_root)
+        );
+
+        // Same global key: remote wins for scoped and bare selection.
+        let by_key =
+            remote_sidecar_skill_context(&state, Some(&bundle), &["global:demo".to_string()])
+                .expect("global:demo selection");
+        assert_eq!(by_key.selected_entries.len(), 1);
+        assert!(
+            by_key.selected_entries[0]
+                .content_markdown
+                .contains("REMOTE_GLOBAL_MARKER")
+        );
+        assert!(
+            !by_key.selected_entries[0]
+                .content_markdown
+                .contains("LOCAL_GLOBAL_MARKER")
+        );
+        assert_eq!(
+            by_key.selected_entries[0].prompt.path,
+            remote_skill_path.display().to_string()
+        );
+
+        // Bare id is still ambiguous across remote global + workspace same id.
+        let ambiguous = remote_sidecar_skill_context(&state, Some(&bundle), &["demo".to_string()])
+            .err()
+            .expect("bare demo id should be ambiguous");
+        assert_eq!(ambiguous.status(), StatusCode::BAD_REQUEST);
+
+        // Workspace scoped key still resolves workspace skill.
+        let workspace_selected = remote_sidecar_skill_context(
+            &state,
+            Some(&bundle),
+            &["workspace:workspace:demo".to_string()],
+        )
+        .expect("workspace scoped selection");
+        assert!(
+            workspace_selected.selected_entries[0]
+                .content_markdown
+                .contains("WORKSPACE_SAME_ID_MARKER")
+        );
+
+        // Provider request injects remote instructions, not local marker.
+        let request = remote_sidecar_provider_request(
+            &state,
+            &database,
+            "chat-1",
+            "msg-user-1",
+            "msg-assistant-1",
+            "model-1",
+            Value::Null,
+        )
+        .await
+        .expect("provider request");
+        let selected = request
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with("# Selected Skills"))
+            .expect("selected skills")
+            .content
+            .clone();
+        assert!(selected.contains("REMOTE_GLOBAL_MARKER"));
+        assert!(!selected.contains("LOCAL_GLOBAL_MARKER"));
+        assert!(selected.contains(&remote_skill_path.display().to_string()));
+
+        // Tool grants: run-scoped roots cover remote skill dir; sibling skill does not.
+        assert!(crate::skills::path_is_within_skill_read_roots(
+            &fs::canonicalize(&remote_skill_path).unwrap(),
+            &empty_ctx.skill_read_root_dirs
+        ));
+        assert!(crate::skills::path_is_within_skill_read_roots(
+            &fs::canonicalize(
+                remote_skill_path
+                    .parent()
+                    .unwrap()
+                    .join("references")
+                    .join("extra.md")
+            )
+            .unwrap(),
+            &empty_ctx.skill_read_root_dirs
+        ));
+        let other_remote = write_remote_test_skill(
+            &remote_profile.path().join(".agents").join("skills"),
+            "other-unrouted",
+            "Other.",
+            "OTHER_MARKER",
+        );
+        // Rebuild roots after other skill exists — still only routing skills are granted.
+        let roots_after = remote_sidecar_skill_context(&state, Some(&bundle), &[])
+            .expect("routing after other skill")
+            .skill_read_root_dirs;
+        // other-unrouted is also remote global and will enter routing if enabled.
+        // Use a path under HOME outside any skill directory for denial check.
+        let home_file = remote_profile.path().join("secret.txt");
+        fs::write(&home_file, "SECRET\n").expect("home file");
+        assert!(!crate::skills::path_is_within_skill_read_roots(
+            &fs::canonicalize(&home_file).unwrap(),
+            &roots_after
+        ));
+
+        let (catalog_state, catalog) =
+            test_remote_sidecar_local_catalog(workspace.path(), None).await;
+        let mut grant_state = catalog_state;
+        grant_state.user_profile_dir = Some(remote_profile.path().to_path_buf());
+        let roots = empty_ctx.skill_read_root_dirs.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-tools".to_string());
+        let (broker_event_tx, _broker_event_rx) = mpsc::unbounded_channel();
+        let (output, is_error, _, _, _, _) = timeout(
+            Duration::from_secs(5),
+            remote_sidecar_execute_tool_call(
+                &grant_state,
+                &run_stream,
+                &catalog,
+                broker_event_tx,
+                NeutralToolCall {
+                    call_id: "tc-read-skill".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({
+                        "path": remote_skill_path.display().to_string(),
+                    }),
+                    thought_signatures: None,
+                },
+                "chat-tools",
+                None,
+                "run-tools",
+                "msg-assistant-tools",
+                "provider",
+                "model",
+                roots.clone(),
+            ),
+        )
+        .await
+        .expect("read skill should not hang on external-access question");
+        assert!(!is_error, "read skill should succeed: {output}");
+        let output_text = format!("{output}");
+        assert!(
+            output_text.contains("REMOTE_GLOBAL_MARKER"),
+            "expected remote skill content: {output_text}"
+        );
+
+        let ref_path = remote_skill_path
+            .parent()
+            .unwrap()
+            .join("references")
+            .join("extra.md");
+        let (broker_event_tx, _) = mpsc::unbounded_channel();
+        let (ref_output, ref_is_error, _, _, _, _) = timeout(
+            Duration::from_secs(5),
+            remote_sidecar_execute_tool_call(
+                &grant_state,
+                &run_stream,
+                &catalog,
+                broker_event_tx,
+                NeutralToolCall {
+                    call_id: "tc-read-ref".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({
+                        "path": ref_path.display().to_string(),
+                    }),
+                    thought_signatures: None,
+                },
+                "chat-tools",
+                None,
+                "run-tools",
+                "msg-assistant-tools",
+                "provider",
+                "model",
+                roots,
+            ),
+        )
+        .await
+        .expect("read skill reference should not hang");
+        assert!(
+            !ref_is_error,
+            "read skill reference should succeed: {ref_output}"
+        );
+        let _ = other_remote;
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_synced_local_global_selectable_when_remote_missing_same_key() {
+        let remote_profile = tempfile::tempdir().expect("remote profile empty");
+        let local_profile = tempfile::tempdir().expect("local profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        write_remote_test_skill(
+            &local_profile.path().join(".agents").join("skills"),
+            "only-local",
+            "Only local skill.",
+            "ONLY_LOCAL_MARKER",
+        );
+        let (state, _) = test_sidecar_state_with_profile(
+            workspace.path().display().to_string(),
+            1,
+            Some(remote_profile.path().to_path_buf()),
+        );
+        let bundle = build_sidecar_runtime_config_bundle(
+            local_profile.path(),
+            &remote_test_config(workspace.path()),
+            1,
+        )
+        .expect("bundle");
+
+        let empty =
+            remote_sidecar_skill_context(&state, Some(&bundle), &[]).expect("empty selection");
+        if let Some(routing) = empty.routing_message {
+            assert!(!routing.content.contains("global:only-local"));
+        }
+
+        let selected =
+            remote_sidecar_skill_context(&state, Some(&bundle), &["global:only-local".to_string()])
+                .expect("select synced local when remote missing");
+        assert_eq!(selected.selected_entries.len(), 1);
+        assert!(
+            selected.selected_entries[0]
+                .content_markdown
+                .contains("ONLY_LOCAL_MARKER")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_skills_discover_includes_remote_global_and_workspace() {
+        let remote_profile = tempfile::tempdir().expect("remote profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        write_remote_test_skill(
+            &remote_profile.path().join(".agents").join("skills"),
+            "remote-global",
+            "Remote global.",
+            "body",
+        );
+        write_remote_test_skill(
+            &workspace.path().join(".agents").join("skills"),
+            "ws-skill",
+            "Workspace skill.",
+            "body",
+        );
+        let (state, _) = test_sidecar_state_with_profile(
+            workspace.path().display().to_string(),
+            0,
+            Some(remote_profile.path().to_path_buf()),
+        );
+        let response = remote_sidecar_skills_discover(State(state))
+            .await
+            .expect("discover")
+            .0;
+        let detected = response["detected"].as_array().expect("detected array");
+        let keys = detected
+            .iter()
+            .filter_map(|skill| skill.get("key").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(keys.iter().any(|key| *key == "global:remote-global"));
+        assert!(
+            keys.iter()
+                .any(|key| *key == "workspace:workspace:ws-skill")
+        );
+    }
+
+    #[tokio::test]
     async fn llm_stream_broker_rpc_round_trips_through_pending_channel() {
         let (broker_tx, mut broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
@@ -26564,6 +27127,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            user_profile_dir: None,
         };
 
         let mut response_rx = remote_sidecar_broker_request(

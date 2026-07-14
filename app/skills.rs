@@ -16,7 +16,7 @@ use crate::{ApiError, markdown_code_block, neutral_text_message};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillDiscoveryErrorSummary {
-    path: String,
+    pub(crate) path: String,
     pub(crate) message: String,
 }
 
@@ -378,6 +378,24 @@ pub(crate) fn discover_workspace_skills_for_path(
     discover_skills_in_roots(roots)
 }
 
+/// Discover only global skills under `user_profile_dir/.agents/skills`.
+///
+/// Produces the same `global:<id>` keys, `scope=global`, absolute paths, and
+/// frontmatter/duplicate/invalid/required-disabled handling as full discovery.
+pub(crate) fn discover_global_skills_for_profile(user_profile_dir: &Path) -> SkillDiscovery {
+    discover_skills_in_roots([global_skill_search_root(user_profile_dir)])
+}
+
+pub(crate) fn global_skill_search_root(user_profile_dir: &Path) -> SkillSearchRoot {
+    SkillSearchRoot {
+        id: "global:agents".to_string(),
+        directory: user_profile_dir.join(".agents").join("skills"),
+        scope: SKILL_SCOPE_GLOBAL,
+        workspace_id: None,
+        workspace_name: None,
+    }
+}
+
 fn discover_skills_in_roots(roots: impl IntoIterator<Item = SkillSearchRoot>) -> SkillDiscovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
@@ -498,15 +516,7 @@ pub(crate) fn skill_search_roots(
     user_profile_dir: &Path,
     workspaces: &[WorkspaceConfig],
 ) -> Vec<SkillSearchRoot> {
-    let mut roots = Vec::new();
-
-    roots.push(SkillSearchRoot {
-        id: "global:agents".to_string(),
-        directory: user_profile_dir.join(".agents").join("skills"),
-        scope: SKILL_SCOPE_GLOBAL,
-        workspace_id: None,
-        workspace_name: None,
-    });
+    let mut roots = vec![global_skill_search_root(user_profile_dir)];
 
     for workspace in workspaces {
         let Some(workspace_path) = workspace.local_path() else {
@@ -1059,6 +1069,37 @@ fn skill_scope_prompt_label(skill: &SkillSettings) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discover_global_skills_for_profile_scans_agents_skills_only() {
+        let profile = tempfile::tempdir().expect("profile");
+        let skill_dir = profile
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("global-demo");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: global-demo\ndescription: Global demo.\n---\n\nBody.\n",
+        )
+        .expect("skill");
+        // Workspace-style path under profile must not be discovered by global-only helper.
+        let fake_ws = profile.path().join(".claude").join("skills").join("ws");
+        fs::create_dir_all(&fake_ws).expect("ws skill dir");
+        fs::write(
+            fake_ws.join("SKILL.md"),
+            "---\nname: ws\ndescription: Workspace-like.\n---\n\nBody.\n",
+        )
+        .expect("ws skill");
+
+        let discovery = discover_global_skills_for_profile(profile.path());
+        assert_eq!(discovery.skills.len(), 1);
+        assert_eq!(discovery.skills[0].key, "global:global-demo");
+        assert_eq!(discovery.skills[0].scope, SKILL_SCOPE_GLOBAL);
+        assert!(discovery.skills[0].path.is_absolute());
+        assert!(discovery.skills[0].path.ends_with("SKILL.md"));
+    }
 
     #[test]
     fn available_skills_snapshot_filters_disabled_and_workspace() {
