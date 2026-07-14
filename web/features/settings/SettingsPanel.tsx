@@ -1074,6 +1074,7 @@ export function SettingsPanel({
       retrievalModelId: data.memory.retrievalModelId ?? "",
       extractionLlmTimeoutMs: String(data.memory.extractionLlmTimeoutMs),
       retrievalLlmTimeoutMs: String(data.memory.retrievalLlmTimeoutMs),
+      contextBudgetPercent: String(data.memory.contextBudgetPercent),
       retentionDays:
         data.memory.retentionDays === null ? "" : String(data.memory.retentionDays),
       dream: {
@@ -2781,6 +2782,12 @@ export function SettingsPanel({
           retrievalLlmTimeoutMs: requiredPositiveInteger(
             memorySettingsForm.retrievalLlmTimeoutMs,
             t("Retrieval LLM timeout ms"),
+          ),
+          contextBudgetPercent: requiredIntegerInRange(
+            memorySettingsForm.contextBudgetPercent,
+            t("Memory context budget %"),
+            1,
+            100,
           ),
           retentionDays: optionalPositiveInteger(
             memorySettingsForm.retentionDays,
@@ -7396,6 +7403,25 @@ export function SettingsPanel({
                             placeholder="60000"
                             value={memorySettingsForm.retrievalLlmTimeoutMs}
                           />
+                        </div>
+                        <div className="sm:col-span-2">
+                          <TextField
+                            inputMode="numeric"
+                            label={t("Memory context budget %")}
+                            onChange={(value) =>
+                              setMemorySettingsForm((current) => ({
+                                ...current,
+                                contextBudgetPercent: value,
+                              }))
+                            }
+                            placeholder="12"
+                            value={memorySettingsForm.contextBudgetPercent}
+                          />
+                          <p className="mt-1 text-xs text-stone-500">
+                            {t(
+                              "Percent of the model's available message tokens that matched memories may occupy. This is a token budget, not a fixed number of memories.",
+                            )}
+                          </p>
                         </div>
                       </div>
                     </fieldset>
@@ -13545,6 +13571,7 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
     retrievalModelId: "",
     extractionLlmTimeoutMs: "120000",
     retrievalLlmTimeoutMs: "60000",
+    contextBudgetPercent: "12",
     retentionDays: "",
     dream: {
       enabled: false,
@@ -14417,6 +14444,32 @@ function requiredPositiveInteger(value: string, label: string) {
 
   if (numberValue === null) {
     throw new Error(`${label} must be a positive whole number`);
+  }
+
+  return numberValue;
+}
+
+/** Parse a required whole number in inclusive [min, max]. Empty/non-integer/out-of-range throw. */
+function requiredIntegerInRange(
+  value: string,
+  label: string,
+  min: number,
+  max: number,
+) {
+  const trimmed = value.trim();
+
+  if (!trimmed || !/^\d+$/.test(trimmed)) {
+    throw new Error(`${label} must be a whole number from ${min} to ${max}`);
+  }
+
+  const numberValue = Number(trimmed);
+
+  if (
+    !Number.isSafeInteger(numberValue) ||
+    numberValue < min ||
+    numberValue > max
+  ) {
+    throw new Error(`${label} must be a whole number from ${min} to ${max}`);
   }
 
   return numberValue;

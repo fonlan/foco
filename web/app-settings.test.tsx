@@ -1266,6 +1266,14 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
 
+    const budgetInput = screen.getByLabelText("Memory context budget %");
+    expect(budgetInput).toHaveValue("12");
+    expect(
+      screen.getByText(
+        "Percent of the model's available message tokens that matched memories may occupy. This is a token budget, not a fixed number of memories.",
+      ),
+    ).toBeInTheDocument();
+
     const dreamControlOrder = [
       screen.getByLabelText("Enable Dream"),
       screen.getByLabelText("Enable Auto Dream"),
@@ -1303,6 +1311,7 @@ describe("app-settings verification surfaces", () => {
     changeInput(screen.getByLabelText("Retention days"), "30");
     changeInput(screen.getByLabelText("Extraction LLM timeout ms"), "130000");
     changeInput(screen.getByLabelText("Retrieval LLM timeout ms"), "70000");
+    changeInput(budgetInput, "25");
     await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
     await userEvent.selectOptions(screen.getByLabelText("Matching model"), "gpt-test");
     await userEvent.click(screen.getByLabelText("Enable Dream"));
@@ -1331,6 +1340,7 @@ describe("app-settings verification surfaces", () => {
         retrievalModelId: "gpt-test",
         extractionLlmTimeoutMs: 130000,
         retrievalLlmTimeoutMs: 70000,
+        contextBudgetPercent: 25,
         retentionDays: 30,
         dream: {
           enabled: true,
@@ -1347,6 +1357,67 @@ describe("app-settings verification surfaces", () => {
         },
       });
     });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Memory context budget %")).toHaveValue("25");
+    });
+  });
+
+  it("rejects invalid memory context budget percent without saving", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    const budgetInput = screen.getByLabelText("Memory context budget %");
+    expect(budgetInput).toHaveValue("12");
+
+    const saveCallsBefore = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/settings/memory",
+    ).length;
+
+    changeInput(budgetInput, "0");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
+
+    expect(
+      await screen.findByText("Memory context budget % must be a whole number from 1 to 100"),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/settings/memory"),
+    ).toHaveLength(saveCallsBefore);
+
+    changeInput(budgetInput, "101");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
+
+    expect(
+      await screen.findByText("Memory context budget % must be a whole number from 1 to 100"),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/settings/memory"),
+    ).toHaveLength(saveCallsBefore);
+
+    changeInput(budgetInput, "12.5");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
+
+    expect(
+      await screen.findByText("Memory context budget % must be a whole number from 1 to 100"),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/settings/memory"),
+    ).toHaveLength(saveCallsBefore);
+
+    changeInput(budgetInput, "");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
+
+    expect(
+      await screen.findByText("Memory context budget % must be a whole number from 1 to 100"),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/settings/memory"),
+    ).toHaveLength(saveCallsBefore);
   });
 
   it("uses semantic colors for Dream history status pills", async () => {

@@ -223,6 +223,7 @@ export const settings = {
     retrievalModelId: null,
     extractionLlmTimeoutMs: 120000,
     retrievalLlmTimeoutMs: 60000,
+    contextBudgetPercent: 12,
     dream: {
       enabled: false,
       autoEnabled: false,
@@ -3766,6 +3767,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings/memory") {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contextBudgetPercent?: number;
       dream?: typeof settings.memory.dream;
       extractionLlmTimeoutMs?: number;
       extractionModelId?: string | null;
@@ -3786,6 +3788,8 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           body.extractionLlmTimeoutMs ?? settings.memory.extractionLlmTimeoutMs,
         retrievalLlmTimeoutMs:
           body.retrievalLlmTimeoutMs ?? settings.memory.retrievalLlmTimeoutMs,
+        contextBudgetPercent:
+          body.contextBudgetPercent ?? settings.memory.contextBudgetPercent,
         retentionDays: body.retentionDays ?? 30,
         dream: body.dream ?? settings.memory.dream,
       },

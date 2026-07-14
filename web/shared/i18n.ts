@@ -991,6 +991,9 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Retention days": "保留天数",
     "Extraction model": "抽取模型",
     "Matching model": "匹配模型",
+    "Memory context budget %": "记忆上下文预算 %",
+    "Percent of the model's available message tokens that matched memories may occupy. This is a token budget, not a fixed number of memories.":
+      "按模型当前可用消息 token 的百分比，限制匹配记忆最多可占用的上下文预算；不是固定记忆条数。",
     Dream: "Dream",
     "Consolidates stale, duplicate, and pending memories without creating scheduled task rows.":
       "整理过期、重复和待审核的记忆，不会创建定时任务记录。",

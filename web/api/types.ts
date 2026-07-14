@@ -1757,6 +1757,8 @@ type MemorySettingsSummary = {
   retrievalModelId: string | null;
   extractionLlmTimeoutMs: number;
   retrievalLlmTimeoutMs: number;
+  /** Percent of available message tokens for matched memories (1–100, default 12). */
+  contextBudgetPercent: number;
   dream: MemoryDreamSettingsSummary;
   extractionModes: MemoryExtractionModeSummary[];
   retrievalModes: MemoryExtractionModeSummary[];
@@ -1834,6 +1836,8 @@ export type MemorySettingsFormState = {
   retrievalModelId: string;
   extractionLlmTimeoutMs: string;
   retrievalLlmTimeoutMs: string;
+  /** Form string for 1–100 integer percent; default `"12"`. */
+  contextBudgetPercent: string;
   dream: {
     enabled: boolean;
     autoEnabled: boolean;
