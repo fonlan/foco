@@ -1237,6 +1237,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Remove prompt file {path}": "移除提示词文件 {path}",
     "No prompt files": "暂无提示词文件",
     "Extra prompt": "额外提示词",
+    "Context compression prompt": "上下文压缩提示词",
+    "Used only for internal contextCompression checkpoint requests. It is not injected into normal chat System prompts.":
+      "仅用于内部 contextCompression 检查点请求，不会注入普通聊天 System 提示词。",
+    "Restore default context compression prompt": "恢复默认上下文压缩提示词",
     "Save prompt settings": "保存提示词设置",
     "Reload settings": "重新加载设置",
     Reload: "重新加载",

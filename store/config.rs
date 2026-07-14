@@ -2966,6 +2966,24 @@ fn validate_prompt_settings(
         }
     }
 
+    if let Some(prompt) = settings.context_compression_system_prompt.as_deref() {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return invalid_config(
+                config_path,
+                "prompts.context_compression_system_prompt must not be empty or whitespace-only",
+            );
+        }
+        if trimmed.chars().count() > SPEC_SYSTEM_PROMPT_MAX_CHARS {
+            return invalid_config(
+                config_path,
+                format!(
+                    "prompts.context_compression_system_prompt must be no longer than {SPEC_SYSTEM_PROMPT_MAX_CHARS} characters"
+                ),
+            );
+        }
+    }
+
     Ok(())
 }
 

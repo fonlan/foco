@@ -171,6 +171,10 @@ pub(crate) struct ManualPromptSettingsRequest {
     pub(crate) system_prompt: Option<String>,
     pub(crate) files: Vec<String>,
     pub(crate) extra_text: String,
+    /// Outer `None` = field omitted (preserve existing override for old clients).
+    /// Inner `None` / blank = clear override and use built-in default.
+    #[serde(default)]
+    pub(crate) context_compression_system_prompt: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -498,6 +502,10 @@ pub(crate) struct PromptSettingsSummary {
     pub(crate) system_prompts: Vec<SystemPromptSummary>,
     pub(crate) files: Vec<String>,
     pub(crate) extra_text: String,
+    /// Stored override only; `null` means use built-in default.
+    pub(crate) context_compression_system_prompt: Option<String>,
+    /// Built-in default for dedicated contextCompression requests (not chat System).
+    pub(crate) default_context_compression_system_prompt: String,
 }
 
 #[derive(Serialize)]
@@ -1678,13 +1686,19 @@ pub(crate) async fn save_prompt_settings(
         .into_iter()
         .filter(|prompt| prompt.name != IMAGE_GENERATION_SYSTEM_PROMPT_NAME)
         .collect();
+    let context_compression_system_prompt = match request.context_compression_system_prompt {
+        // Old clients omit the field: keep the existing override.
+        None => config.prompts.context_compression_system_prompt.clone(),
+        // Explicit null / blank clears override; non-empty becomes the stored override.
+        Some(value) => optional_trimmed_string(value),
+    };
 
     config.prompts = PromptSettings {
         system_prompts,
         system_prompt: None,
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
-        context_compression_system_prompt: config.prompts.context_compression_system_prompt.clone(),
+        context_compression_system_prompt,
     };
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     refresh_review_agent_system_prompt(&mut config)?;

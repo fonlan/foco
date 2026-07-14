@@ -201,6 +201,12 @@ pub(crate) async fn settings_response(
                 })
                 .collect(),
             extra_text: config.prompts.extra_text.clone(),
+            context_compression_system_prompt: config
+                .prompts
+                .context_compression_system_prompt
+                .clone(),
+            default_context_compression_system_prompt:
+                crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT.to_string(),
         },
         workspaces: config
             .workspaces

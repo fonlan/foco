@@ -287,6 +287,43 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_runtime_bundle_syncs_context_compression_system_prompt() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+
+        let default_bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("default compression prompt bundle");
+        assert_eq!(
+            default_bundle
+                .payload
+                .prompts
+                .context_compression_system_prompt,
+            None
+        );
+
+        config.prompts.context_compression_system_prompt =
+            Some("multi-line\ncustom checkpoint handoff".to_string());
+        let custom_bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
+            .expect("custom compression prompt bundle");
+        let custom_json = serde_json::to_value(&custom_bundle).expect("custom bundle json");
+
+        assert_eq!(
+            custom_bundle
+                .payload
+                .prompts
+                .context_compression_system_prompt
+                .as_deref(),
+            Some("multi-line\ncustom checkpoint handoff")
+        );
+        assert_eq!(
+            custom_json["payload"]["prompts"]["contextCompressionSystemPrompt"],
+            Value::String("multi-line\ncustom checkpoint handoff".to_string())
+        );
+        assert_ne!(default_bundle.hash, custom_bundle.hash);
+    }
+
+    #[test]
     fn sidecar_runtime_bundle_syncs_only_workspace_hosted_mcp_servers() {
         let profile = tempfile::tempdir().expect("profile");
         let workspace = tempfile::tempdir().expect("workspace");

@@ -1644,6 +1644,10 @@ export type PromptSettingsSummary = {
   systemPrompts?: SystemPromptSummary[];
   files: string[];
   extraText: string;
+  /** Stored override only; null means use built-in default. */
+  contextCompressionSystemPrompt?: string | null;
+  /** Built-in default for internal contextCompression requests. */
+  defaultContextCompressionSystemPrompt?: string;
 };
 
 export type PromptSettingsFormState = {
@@ -1651,6 +1655,13 @@ export type PromptSettingsFormState = {
   systemPrompts: SystemPromptSummary[];
   files: string[];
   extraText: string;
+  /** Editor display text (override or current default). */
+  contextCompressionSystemPrompt: string;
+  /**
+   * When false, save submits null so the built-in default is used.
+   * Distinguishes “restored default” from an override that happens to match.
+   */
+  contextCompressionSystemPromptCustom: boolean;
   pendingFile: string;
   pendingSystemPromptName: string;
   pendingSystemPromptRename: string;

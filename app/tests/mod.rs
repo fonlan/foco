@@ -3504,6 +3504,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             system_prompt: None,
             files: Vec::new(),
             extra_text: String::new(),
+            context_compression_system_prompt: None,
         }),
     )
     .await
@@ -3638,6 +3639,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             system_prompt: None,
             files: Vec::new(),
             extra_text: String::new(),
+            context_compression_system_prompt: None,
         }),
     )
     .await
@@ -4636,7 +4638,8 @@ fn context_token_breakdown_groups_tool_related_sources_as_tool_calls() {
     assert_eq!(tool_calls.tokens, 60);
     assert_eq!(tool_calls.required_tokens, 10);
     assert_eq!(tool_calls.optional_tokens, 50);
-    assert_eq!(tool_calls.compressible_tokens, 20);
+    // Both RuntimeToolState and RuntimeToolStateSnapshot are LLM checkpoint candidates.
+    assert_eq!(tool_calls.compressible_tokens, 50);
     assert!(!breakdown.by_source.iter().any(|entry| matches!(
         entry.source,
         PromptContextSourceBucket::TodoGraph
@@ -5205,6 +5208,10 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
     assert_eq!(request.max_output_tokens, Some(2048));
     assert_eq!(request.messages.len(), 4);
     assert_eq!(request.messages[0].role, NeutralChatRole::System);
+    assert_eq!(
+        request.messages[0].content,
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
     assert_eq!(request.messages[1].role, NeutralChatRole::User);
     assert_eq!(request.messages[1].content, "fix a bug");
     assert_eq!(request.messages[2].tool_calls.len(), 1);
@@ -5220,6 +5227,20 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
             || message.content.contains("tool calls: read_file")
             || message.content.contains("...")
     }));
+
+    let custom_request = crate::prompt::build_context_compression_summary_request_with_prompt(
+        "model",
+        &checkpoint_messages,
+        "exact multi-line\ncustom checkpoint prompt",
+    );
+    assert_eq!(
+        custom_request.messages[0].content,
+        "exact multi-line\ncustom checkpoint prompt"
+    );
+    assert_eq!(
+        custom_request.messages[2].tool_calls[0].arguments,
+        tool_call.arguments
+    );
 }
 
 #[test]
@@ -5449,6 +5470,123 @@ fn effective_context_compression_system_prompt_uses_override_and_default() {
     assert_eq!(
         crate::prompt::effective_context_compression_system_prompt(&blank),
         crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
+}
+
+#[tokio::test]
+async fn save_prompt_settings_persists_context_compression_override_and_restores_default() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir);
+    config.prompts.context_compression_system_prompt =
+        Some("seed custom compression prompt".to_string());
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let loaded = crate::http::settings::settings(State(state.clone()))
+        .await
+        .expect("settings")
+        .0;
+    assert_eq!(
+        loaded.prompts.context_compression_system_prompt.as_deref(),
+        Some("seed custom compression prompt")
+    );
+    assert_eq!(
+        loaded.prompts.default_context_compression_system_prompt,
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
+
+    let saved = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: String::new(),
+            context_compression_system_prompt: Some(Some(
+                "  multi-line\ncustom handoff  ".to_string(),
+            )),
+        }),
+    )
+    .await
+    .expect("save custom compression prompt")
+    .0;
+    assert_eq!(
+        saved.prompts.context_compression_system_prompt.as_deref(),
+        Some("multi-line\ncustom handoff")
+    );
+
+    // Old clients omit the field and must not clear the override.
+    let preserved = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: "extra".to_string(),
+            context_compression_system_prompt: None,
+        }),
+    )
+    .await
+    .expect("save without compression field")
+    .0;
+    assert_eq!(preserved.prompts.extra_text, "extra");
+    assert_eq!(
+        preserved
+            .prompts
+            .context_compression_system_prompt
+            .as_deref(),
+        Some("multi-line\ncustom handoff")
+    );
+
+    let cleared = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: "extra".to_string(),
+            context_compression_system_prompt: Some(None),
+        }),
+    )
+    .await
+    .expect("clear compression override")
+    .0;
+    assert_eq!(cleared.prompts.context_compression_system_prompt, None);
+    assert_eq!(
+        cleared.prompts.default_context_compression_system_prompt,
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
+
+    let blank_normalized = crate::http::settings::save_prompt_settings(
+        State(state),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: "extra".to_string(),
+            context_compression_system_prompt: Some(Some("  \n  ".to_string())),
+        }),
+    )
+    .await
+    .expect("blank compression prompt normalizes to null")
+    .0;
+    assert_eq!(
+        blank_normalized.prompts.context_compression_system_prompt,
+        None
     );
 }
 

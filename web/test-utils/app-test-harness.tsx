@@ -272,9 +272,12 @@ export const settings = {
     defaultSystemPrompt: "You are Foco, a local coding agent.",
     defaultPlanModeSystemPrompt,
     defaultReviewSystemPrompt,
+    defaultContextCompressionSystemPrompt:
+      "You are creating a context checkpoint handoff summary for a coding agent so work can continue after older conversation messages are replaced by this summary.",
+    contextCompressionSystemPrompt: null as string | null,
     extraText: "",
-    files: [],
-    systemPrompt: null,
+    files: [] as string[],
+    systemPrompt: null as string | null,
     systemPrompts: [
       {
         content: "You are Foco, a local coding agent.",
@@ -2801,7 +2804,12 @@ export function resetAppTestEnvironment() {
     "scheduled-task-1": [...scheduledTaskRunsByTaskId["scheduled-task-1"]],
   };
   appTestState.scheduledTasksResponse = scheduledTasks;
-  appTestState.settingsResponse = settings;
+  appTestState.settingsResponse = {
+    ...settings,
+    prompts: {
+      ...settings.prompts,
+    },
+  };
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
   appTestState.workspaceSpecResponsesByWorkspaceId = {
     [workspace.id]: clonedWorkspaceSpec(),
@@ -3824,6 +3832,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings/prompts") {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contextCompressionSystemPrompt?: string | null;
       extraText?: string;
       files?: string[];
       systemPrompts?: Array<{ content: string; name: string }>;
@@ -3837,18 +3846,32 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           name: "Default",
         },
       ];
-    return jsonResponse({
-      ...settings,
+    const hasCompressionField = Object.prototype.hasOwnProperty.call(
+      body,
+      "contextCompressionSystemPrompt",
+    );
+    const nextCompressionOverride = hasCompressionField
+      ? typeof body.contextCompressionSystemPrompt === "string" &&
+        body.contextCompressionSystemPrompt.trim()
+        ? body.contextCompressionSystemPrompt
+        : null
+      : (appTestState.settingsResponse.prompts.contextCompressionSystemPrompt ?? null);
+    const nextSettings = {
+      ...appTestState.settingsResponse,
       prompts: {
-        defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
-        defaultPlanModeSystemPrompt: settings.prompts.defaultPlanModeSystemPrompt,
-        defaultReviewSystemPrompt: settings.prompts.defaultReviewSystemPrompt,
-        extraText: body.extraText ?? "Keep replies concise.",
-        files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
-        systemPrompt: null,
+        ...appTestState.settingsResponse.prompts,
+        defaultContextCompressionSystemPrompt:
+          appTestState.settingsResponse.prompts.defaultContextCompressionSystemPrompt ??
+          settings.prompts.defaultContextCompressionSystemPrompt,
+        contextCompressionSystemPrompt: nextCompressionOverride,
+        extraText: body.extraText ?? "",
+        files: body.files ?? ([] as string[]),
+        systemPrompt: null as string | null,
         systemPrompts,
       },
-    });
+    } satisfies typeof appTestState.settingsResponse;
+    appTestState.settingsResponse = nextSettings;
+    return jsonResponse(nextSettings);
   }
 
   if (path === "/api/memory") {

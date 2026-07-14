@@ -2135,6 +2135,7 @@ describe("app-settings verification surfaces", () => {
         "/api/settings/prompts",
         expect.objectContaining({
           body: JSON.stringify({
+            contextCompressionSystemPrompt: null,
             extraText: "Keep replies concise.",
             files: ["C:/Users/fonla/.codex/AGENTS.md"],
             systemPrompts: [
@@ -2236,6 +2237,7 @@ describe("app-settings verification surfaces", () => {
         "/api/settings/prompts",
         expect.objectContaining({
           body: JSON.stringify({
+            contextCompressionSystemPrompt: null,
             extraText: "",
             files: [],
             systemPrompts: [
@@ -2286,6 +2288,7 @@ describe("app-settings verification surfaces", () => {
         "/api/settings/prompts",
         expect.objectContaining({
           body: JSON.stringify({
+            contextCompressionSystemPrompt: null,
             extraText: "",
             files: [],
             systemPrompts: [
@@ -2307,6 +2310,100 @@ describe("app-settings verification surfaces", () => {
         }),
       );
     });
+  });
+
+  it("loads, edits, restores, and saves context compression prompt", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const defaultCompressionPrompt =
+      "You are creating a context checkpoint handoff summary for a coding agent so work can continue after older conversation messages are replaced by this summary.";
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      prompts: {
+        ...appTestState.settingsResponse.prompts,
+        contextCompressionSystemPrompt: "Custom checkpoint handoff.",
+        defaultContextCompressionSystemPrompt: defaultCompressionPrompt,
+      },
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("System prompt")).toHaveValue(
+        "You are Foco, a local coding agent.",
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("context-compression-system-prompt")).toHaveValue(
+        "Custom checkpoint handoff.",
+      );
+    });
+    const compressionInput = screen.getByTestId("context-compression-system-prompt");
+    changeInput(compressionInput, "Edited checkpoint prompt.");
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/prompts",
+        expect.objectContaining({
+          body: expect.stringContaining(
+            '"contextCompressionSystemPrompt":"Edited checkpoint prompt."',
+          ),
+          method: "POST",
+        }),
+      );
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore default context compression prompt" }),
+    );
+    expect(compressionInput).toHaveValue(defaultCompressionPrompt);
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/prompts",
+        expect.objectContaining({
+          body: expect.stringContaining('"contextCompressionSystemPrompt":null'),
+          method: "POST",
+        }),
+      );
+    });
+  });
+
+  it("keeps context compression prompt edits when save fails", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = typeof input === "string" ? input : input.toString();
+      if (path === "/api/settings/prompts" && init?.method === "POST") {
+        return new Response(JSON.stringify({ error: "prompt save failed" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("System prompt")).toHaveValue(
+        "You are Foco, a local coding agent.",
+      );
+    });
+
+    const compressionInput = screen.getByTestId("context-compression-system-prompt");
+    changeInput(compressionInput, "Unsaved compression prompt.");
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/prompt save failed/i)).toBeInTheDocument();
+    });
+    expect(compressionInput).toHaveValue("Unsaved compression prompt.");
   });
 
   it("closes the model dialog from the backdrop without saving", async () => {

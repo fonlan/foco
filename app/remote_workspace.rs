@@ -20328,6 +20328,26 @@ mod tests {
             }]
         }))
         .expect("blocking hook config");
+        // Prefer real model window for checkpoint budget so the mock single-request path stays
+        // under budget; pack/trigger still use the injected tiny context_window below.
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: String::new(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
         let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
             .expect("runtime bundle");
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);

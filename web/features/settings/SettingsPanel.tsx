@@ -1023,12 +1023,21 @@ export function SettingsPanel({
 
   function syncPromptSettingsForm(data: SettingsResponse) {
     const systemPrompts = normalizedSystemPromptSummaries(data.prompts);
+    const defaultCompressionPrompt =
+      data.prompts.defaultContextCompressionSystemPrompt ?? "";
+    const compressionOverride = data.prompts.contextCompressionSystemPrompt;
+    const compressionCustom =
+      typeof compressionOverride === "string" && compressionOverride.trim().length > 0;
     setPromptSettingsForm({
       activeSystemPromptName:
         systemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
           ?.name ??
         systemPrompts[0]?.name ??
         DEFAULT_SYSTEM_PROMPT_NAME,
+      contextCompressionSystemPrompt: compressionCustom
+        ? compressionOverride
+        : defaultCompressionPrompt,
+      contextCompressionSystemPromptCustom: compressionCustom,
       extraText: data.prompts.extraText,
       files: data.prompts.files,
       pendingFile: "",
@@ -1150,6 +1159,37 @@ export function SettingsPanel({
       }
     }
   }, [onSettingsChange]);
+
+  // Seed compression prompt editor from settings when the form still has the empty default.
+  useEffect(() => {
+    if (!settings) {
+      return;
+    }
+    const defaultCompressionPrompt =
+      settings.prompts.defaultContextCompressionSystemPrompt ?? "";
+    const compressionOverride = settings.prompts.contextCompressionSystemPrompt;
+    const compressionCustom =
+      typeof compressionOverride === "string" && compressionOverride.trim().length > 0;
+    const nextCompressionValue = compressionCustom
+      ? compressionOverride
+      : defaultCompressionPrompt;
+    if (!nextCompressionValue) {
+      return;
+    }
+    setPromptSettingsForm((current) => {
+      if (
+        current.contextCompressionSystemPromptCustom ||
+        current.contextCompressionSystemPrompt.trim().length > 0
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        contextCompressionSystemPrompt: nextCompressionValue,
+        contextCompressionSystemPromptCustom: compressionCustom,
+      };
+    });
+  }, [settings]);
 
   const loadHooks = useCallback(async (workspaceId: string) => {
     if (!workspaceId) {
@@ -2329,8 +2369,14 @@ export function SettingsPanel({
 
     try {
       const files = promptSettingsForm.files.map((file) => file.trim());
+      const contextCompressionSystemPrompt =
+        promptSettingsForm.contextCompressionSystemPromptCustom &&
+        promptSettingsForm.contextCompressionSystemPrompt.trim()
+          ? promptSettingsForm.contextCompressionSystemPrompt
+          : null;
       const data = await requestJson<SettingsResponse>("/api/settings/prompts", {
         body: JSON.stringify({
+          contextCompressionSystemPrompt,
           extraText: promptSettingsForm.extraText,
           files,
           systemPrompts: promptSettingsForm.systemPrompts,
@@ -6026,6 +6072,57 @@ export function SettingsPanel({
                     value={promptSettingsForm.extraText}
                   />
                 </label>
+
+                <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-stone-600">
+                        {t("Context compression prompt")}
+                      </p>
+                      <p className="mt-1 text-xs text-stone-500">
+                        {t(
+                          "Used only for internal contextCompression checkpoint requests. It is not injected into normal chat System prompts.",
+                        )}
+                      </p>
+                    </div>
+                    <button
+                      aria-label={t("Restore default context compression prompt")}
+                      className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      onClick={() =>
+                        setPromptSettingsForm((current) => ({
+                          ...current,
+                          contextCompressionSystemPrompt:
+                            settings?.prompts.defaultContextCompressionSystemPrompt ?? "",
+                          contextCompressionSystemPromptCustom: false,
+                        }))
+                      }
+                      title={t("Restore default")}
+                      type="button"
+                    >
+                      <RefreshCw aria-hidden="true" className="size-3.5" />
+                      {t("Restore default")}
+                    </button>
+                  </div>
+                  <label className="mt-3 block">
+                    <span className="sr-only">{t("Context compression prompt")}</span>
+                    <textarea
+                      aria-label={t("Context compression prompt")}
+                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      data-testid="context-compression-system-prompt"
+                      onChange={(event) =>
+                        setPromptSettingsForm((current) => ({
+                          ...current,
+                          contextCompressionSystemPrompt: event.target.value,
+                          contextCompressionSystemPromptCustom: true,
+                        }))
+                      }
+                      placeholder={
+                        settings?.prompts.defaultContextCompressionSystemPrompt ?? ""
+                      }
+                      value={promptSettingsForm.contextCompressionSystemPrompt}
+                    />
+                  </label>
+                </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
@@ -13345,6 +13442,8 @@ function emptyWebSearchForm(): WebSearchFormState {
 function emptyPromptSettingsForm(): PromptSettingsFormState {
   return {
     activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
+    contextCompressionSystemPrompt: "",
+    contextCompressionSystemPromptCustom: false,
     extraText: "",
     files: [],
     pendingFile: "",
