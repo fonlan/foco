@@ -44,7 +44,7 @@ const CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 64;
 const CHAT_TITLE_GENERATION_MAX_INPUT_CHARS: usize = 4_000;
 const CHAT_TITLE_MAX_CHARS: usize = 60;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatStreamRequest {
     pub(crate) chat_id: Option<String>,

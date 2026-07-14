@@ -20,7 +20,8 @@ use foco_store::{
     workspace::{
         AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
         AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord,
-        NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, WorkspaceDatabase,
+        NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, WorkspaceDatabase,
     },
 };
 use futures_util::FutureExt;
@@ -72,6 +73,25 @@ const AGENT_LIFECYCLE_DB_RETRY_ERROR_AFTER: Duration = Duration::from_secs(120);
 const AGENT_LIFECYCLE_DB_RETRY_ERROR_INTERVAL: Duration = Duration::from_secs(120);
 const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
 const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
+// Bounded pre-stream ordinary-DB wait (~10–15s total). Not the infinite lifecycle retry.
+#[cfg(not(test))]
+const PRE_STREAM_DB_RETRY_BUDGET: Duration = Duration::from_secs(12);
+#[cfg(test)]
+const PRE_STREAM_DB_RETRY_BUDGET: Duration = Duration::from_millis(40);
+#[cfg(not(test))]
+const PRE_STREAM_DB_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const PRE_STREAM_DB_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const PRE_STREAM_DB_RETRY_MAX_DELAY: Duration = Duration::from_millis(1_500);
+#[cfg(test)]
+const PRE_STREAM_DB_RETRY_MAX_DELAY: Duration = Duration::from_millis(4);
+const PRE_STREAM_FAILURE_CODE_WORKSPACE_DATABASE_BUSY: &str = "workspace_database_busy";
+const PRE_STREAM_FAILURE_STAGE_PREPARE: &str = "pre_stream_prepare";
+const PRE_STREAM_USER_MESSAGE_DATABASE_BUSY: &str =
+    "Reply has not started: workspace database is busy. Please retry.";
+const PRE_STREAM_USER_MESSAGE_GENERIC: &str =
+    "Reply has not started: preparation failed. Please retry.";
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -748,7 +768,14 @@ async fn run_coordinator_task_inner(
         },
         agent_primary_chat_output,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if is_workspace_database_concurrency_error(&error) {
+            pre_stream_workspace_database_busy_error(&error.message)
+        } else {
+            error
+        }
+    })?;
     chat_context.tool_workspace_path = match instance.execution_workspace_mode {
         AgentExecutionWorkspaceMode::Shared => instance
             .execution_root_path
@@ -1086,7 +1113,7 @@ async fn fail_claimed_task_durably(
         &context,
         state.app_shutdown_rx.clone(),
         || {
-            fail_claimed_task(
+            fail_claimed_task_with_pre_stream_closure(
                 &identity.workspace.path,
                 &identity.task_id,
                 Some(&identity.attempt_id),
@@ -1095,6 +1122,272 @@ async fn fail_claimed_task_durably(
         },
     )
     .await
+}
+
+pub(crate) async fn open_workspace_database_ordinary_with_pre_stream_retry(
+    workspace_path: &Path,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<foco_store::workspace::WorkspaceDatabaseHandle, ApiError> {
+    let started_at = Instant::now();
+    let mut attempt = 0_u64;
+    let mut retry_delay = PRE_STREAM_DB_RETRY_INITIAL_DELAY;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        match open_workspace_database(workspace_path) {
+            Ok(database) => return Ok(database),
+            Err(api_error) => {
+                if !is_workspace_database_concurrency_error(&api_error) {
+                    return Err(api_error);
+                }
+                if started_at.elapsed() >= PRE_STREAM_DB_RETRY_BUDGET {
+                    return Err(pre_stream_workspace_database_busy_error(&api_error.message));
+                }
+                if *shutdown_rx.borrow() {
+                    return Err(ApiError::internal(
+                        "application is shutting down while waiting for workspace database",
+                    ));
+                }
+                tracing::warn!(
+                    workspace = %workspace_path.display(),
+                    attempt,
+                    error = %api_error.message,
+                    "pre-stream ordinary workspace database open hit concurrency limit; bounded retry"
+                );
+                let jitter_ms = (attempt.saturating_mul(17)) % 50;
+                let sleep_for = retry_delay.saturating_add(Duration::from_millis(jitter_ms));
+                tokio::select! {
+                    _ = time::sleep(sleep_for) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return Err(ApiError::internal(
+                                "application is shutting down while waiting for workspace database",
+                            ));
+                        }
+                    }
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(PRE_STREAM_DB_RETRY_MAX_DELAY);
+            }
+        }
+    }
+}
+
+fn pre_stream_workspace_database_busy_error(diagnostic: &str) -> ApiError {
+    ApiError::internal(format!(
+        "pre_stream_failure code={PRE_STREAM_FAILURE_CODE_WORKSPACE_DATABASE_BUSY} stage={PRE_STREAM_FAILURE_STAGE_PREPARE} retryable=true message={PRE_STREAM_USER_MESSAGE_DATABASE_BUSY} detail={diagnostic}"
+    ))
+}
+
+fn parse_pre_stream_failure(message: &str) -> PreStreamFailureInfo {
+    if message.contains(PRE_STREAM_FAILURE_CODE_WORKSPACE_DATABASE_BUSY)
+        || is_workspace_database_concurrency_error_message(message)
+    {
+        return PreStreamFailureInfo {
+            code: PRE_STREAM_FAILURE_CODE_WORKSPACE_DATABASE_BUSY.to_string(),
+            stage: PRE_STREAM_FAILURE_STAGE_PREPARE.to_string(),
+            retryable: true,
+            user_message: PRE_STREAM_USER_MESSAGE_DATABASE_BUSY.to_string(),
+            diagnostic: message.to_string(),
+        };
+    }
+    if let Some(rest) = message.strip_prefix("pre_stream_failure ") {
+        let mut code = "pre_stream_error".to_string();
+        let mut stage = PRE_STREAM_FAILURE_STAGE_PREPARE.to_string();
+        let mut retryable = false;
+        for token in rest.split_whitespace() {
+            if let Some(value) = token.strip_prefix("code=") {
+                code = value.to_string();
+            } else if let Some(value) = token.strip_prefix("stage=") {
+                stage = value.to_string();
+            } else if let Some(value) = token.strip_prefix("retryable=") {
+                retryable = value == "true";
+            }
+        }
+        let (user_message, diagnostic) = if let Some((_, after_message)) = rest.split_once(" message=") {
+            if let Some((user, detail)) = after_message.split_once(" detail=") {
+                (user.to_string(), detail.to_string())
+            } else {
+                (after_message.to_string(), message.to_string())
+            }
+        } else {
+            (PRE_STREAM_USER_MESSAGE_GENERIC.to_string(), message.to_string())
+        };
+        return PreStreamFailureInfo {
+            code,
+            stage,
+            retryable,
+            user_message,
+            diagnostic,
+        };
+    }
+    PreStreamFailureInfo {
+        code: "pre_stream_error".to_string(),
+        stage: PRE_STREAM_FAILURE_STAGE_PREPARE.to_string(),
+        retryable: false,
+        user_message: PRE_STREAM_USER_MESSAGE_GENERIC.to_string(),
+        diagnostic: message.to_string(),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreStreamFailureInfo {
+    code: String,
+    stage: String,
+    retryable: bool,
+    user_message: String,
+    diagnostic: String,
+}
+
+fn is_workspace_database_concurrency_error_message(message: &str) -> bool {
+    message.contains("workspace database concurrency limit reached")
+}
+
+fn fail_claimed_task_with_pre_stream_closure(
+    workspace_path: &Path,
+    task_id: &AgentTaskId,
+    expected_attempt_id: Option<&AgentAttemptId>,
+    message: &str,
+) -> Result<(), ApiError> {
+    let mut database = open_workspace_database_critical(workspace_path)?;
+    let Some(task) = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if task.status != AgentTaskStatus::Running {
+        return Ok(());
+    }
+
+    let failure = parse_pre_stream_failure(message);
+    let mut error = json!({
+        "message": failure.user_message,
+        "code": failure.code,
+        "stage": failure.stage,
+        "retryable": failure.retryable,
+        "diagnostic": failure.diagnostic,
+    });
+    let mut error_json = error.to_string();
+    if error_json.len() > AGENT_MAX_TASK_OUTCOME_BYTES {
+        error = json!({
+            "message": format!(
+                "Agent task error_json exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
+            )
+        });
+        error_json = error.to_string();
+    }
+
+    // Prefer atomic coordinator pre-stream closure when we have attempt + visible assistant ids.
+    if let Some(attempt_id) = expected_attempt_id {
+        if let Ok(task_input) = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json) {
+            if let Some(assistant_id) = task_input.visible_assistant_message_id.as_deref() {
+                if let Some(assistant_sequence) = task_input.visible_assistant_sequence {
+                    let team = database
+                        .agent_team(&task.team_id)
+                        .map_err(ApiError::from_workspace_error)?;
+                    let instance = database
+                        .agent_instance(&task.owner_instance_id)
+                        .map_err(ApiError::from_workspace_error)?;
+                    let materialize_assistant = instance
+                        .as_ref()
+                        .is_some_and(|instance| instance.role == AgentRole::Coordinator);
+                    if let Some(team) = team {
+                        let run_failure = json!({
+                            "code": failure.code,
+                            "stage": failure.stage,
+                            "retryable": failure.retryable,
+                            "taskId": task.id.as_str(),
+                            "attemptId": attempt_id.as_str(),
+                            "message": failure.user_message,
+                        });
+                        let parts = vec![StoredChatMessagePart::Error {
+                            text: failure.user_message.clone(),
+                        }];
+                        let assistant_metadata = json!({
+                            "streamingState": "failed",
+                            "runFailure": run_failure,
+                            "parts": parts,
+                            "partsVersion": STORED_CHAT_PARTS_VERSION,
+                            "partsSource": "pre_stream_failure",
+                        })
+                        .to_string();
+                        let result = database
+                            .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+                                task_id: &task.id,
+                                attempt_id,
+                                chat_id: &team.chat_id,
+                                user_message_id: &task_input.queued_user_message_id,
+                                assistant_message_id: assistant_id,
+                                assistant_sequence,
+                                error_json: &error_json,
+                                assistant_content: &failure.user_message,
+                                assistant_metadata_json: &assistant_metadata,
+                                materialize_assistant,
+                            })
+                            .map_err(ApiError::from_workspace_error)?;
+                        match result {
+                            PreStreamChatFailureClosureResult::Applied => {
+                                crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                                    &mut database,
+                                    &task.id,
+                                )?;
+                                return Ok(());
+                            }
+                            PreStreamChatFailureClosureResult::Skipped { reason } => {
+                                tracing::info!(
+                                    task_id = %task.id,
+                                    attempt_id = %attempt_id,
+                                    reason = %reason,
+                                    "pre-stream failure closure skipped; falling back to task-only fail"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Generic path: task/event only (workers, missing assistant identity, or skipped race).
+    let update = AgentTaskStateUpdate {
+        team_id: &task.team_id,
+        task_id: &task.id,
+        expected_status: AgentTaskStatus::Running,
+        transition: AgentTaskTransition::Fail,
+        result_json: None,
+        error_json: Some(&error_json),
+        interruption_reason: None,
+    };
+    let updated = match expected_attempt_id {
+        Some(attempt_id) => database.update_agent_task_state_for_attempt(update, attempt_id),
+        None => database.update_agent_task_state(update),
+    }
+    .map_err(ApiError::from_workspace_error)?;
+    if !updated {
+        return Ok(());
+    }
+    insert_agent_event(
+        &mut database,
+        &task.team_id,
+        "task_failed",
+        Some(&task.owner_instance_id),
+        Some(&task.id),
+        expected_attempt_id,
+        json!({
+            "outcome": error,
+            "recoveryReason": "coordinator_lifecycle_closure",
+        }),
+    )?;
+    database
+        .fail_plan_phase_run(&task.id, &failure.user_message)
+        .map_err(ApiError::from_workspace_error)?;
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+        &mut database,
+        &task.id,
+    )?;
+    Ok(())
 }
 
 pub(crate) async fn fail_claimed_task_with_retry(
@@ -1120,9 +1413,7 @@ pub(crate) async fn fail_claimed_task_with_retry(
 }
 
 fn is_workspace_database_concurrency_error(error: &ApiError) -> bool {
-    error
-        .message
-        .contains("workspace database concurrency limit reached")
+    is_workspace_database_concurrency_error_message(&error.message)
 }
 
 fn agent_task_model_selection(

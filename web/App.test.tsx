@@ -119,8 +119,25 @@ describe("normalizeChatMessageSummary", () => {
   it("keeps only UI-supported loaded message statuses", () => {
     expect(normalizeChatMessageSummary(summary("streaming")).status).toBe("streaming");
     expect(normalizeChatMessageSummary(summary("error")).status).toBe("error");
+    expect(normalizeChatMessageSummary(summary("failed")).status).toBe("error");
     expect(normalizeChatMessageSummary(summary("complete")).status).toBeUndefined();
     expect(normalizeChatMessageSummary(summary(null)).status).toBeUndefined();
+  });
+
+  it("marks durable error parts as error status even without status field", () => {
+    const result = normalizeChatMessageSummary({
+      ...message("assistant-failed"),
+      status: undefined,
+      parts: [{ type: "error", text: "Reply has not started: workspace database is busy. Please retry." }],
+      content: "Reply has not started: workspace database is busy. Please retry.",
+    });
+    expect(result.status).toBe("error");
+    expect(result.parts).toEqual([
+      {
+        type: "error",
+        text: "Reply has not started: workspace database is busy. Please retry.",
+      },
+    ]);
   });
 });
 

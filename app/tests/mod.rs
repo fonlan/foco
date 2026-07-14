@@ -8489,7 +8489,7 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
 }
 
 #[test]
-fn assistant_status_from_metadata_only_exposes_streaming() {
+fn assistant_status_from_metadata_only_exposes_streaming_and_failed() {
     assert_eq!(
         assistant_status_from_metadata(r#"{"streamingState":"streaming"}"#)
             .expect("streaming metadata")
@@ -8501,10 +8501,17 @@ fn assistant_status_from_metadata_only_exposes_streaming() {
             .expect("complete metadata")
             .is_none()
     );
-    assert!(
+    assert_eq!(
         assistant_status_from_metadata(r#"{"streamingState":"failed"}"#)
             .expect("failed metadata")
-            .is_none()
+            .as_deref(),
+        Some("error"),
+    );
+    assert_eq!(
+        assistant_status_from_metadata(r#"{"parts":[{"type":"error","text":"busy"}]}"#)
+            .expect("error part metadata")
+            .as_deref(),
+        Some("error"),
     );
 }
 

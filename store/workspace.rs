@@ -58,13 +58,14 @@ pub use workspace_records::{
     NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection,
     PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
     PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PromptContextInjectionRecord,
-    RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord,
-    ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord, ScheduledTaskUpdate,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
-    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
+    PreStreamChatFailureClosureResult, PromptContextInjectionRecord, RewriteChatFromUserMessage,
+    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
+    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -5035,6 +5036,358 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
+    }
+
+    /// Atomic pre-stream coordinator failure: fail running task/attempt, write
+    /// durable assistant Error bubble, clear matching queuedRun, and append
+    /// task_failed event. Idempotent when run identity no longer matches.
+    pub fn close_pre_stream_chat_failure(
+        &mut self,
+        closure: PreStreamChatFailureClosure<'_>,
+    ) -> Result<PreStreamChatFailureClosureResult, WorkspaceDatabaseError> {
+        validate_agent_json(closure.error_json, "error_json")?;
+        validate_json_metadata(closure.assistant_metadata_json, "assistant message metadata")?;
+
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let task = transaction
+            .query_row(
+                "SELECT id, team_id, owner_instance_id, status
+                 FROM agent_tasks
+                 WHERE id = ?1",
+                params![closure.task_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some((_task_id, team_id, owner_instance_id, task_status)) = task else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(PreStreamChatFailureClosureResult::Skipped {
+                reason: "task not found".to_string(),
+            });
+        };
+        if task_status != AgentTaskStatus::Running.as_str() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(PreStreamChatFailureClosureResult::Skipped {
+                reason: format!("task status is '{task_status}'"),
+            });
+        }
+
+        let attempt_matches = transaction
+            .query_row(
+                "SELECT 1 FROM agent_attempts
+                 WHERE id = ?1 AND task_id = ?2 AND team_id = ?3 AND status = 'running'",
+                params![
+                    closure.attempt_id.as_str(),
+                    closure.task_id.as_str(),
+                    team_id
+                ],
+                |_| Ok(1_i64),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .is_some();
+        if !attempt_matches {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(PreStreamChatFailureClosureResult::Skipped {
+                reason: "attempt is not the active running attempt".to_string(),
+            });
+        }
+
+        // Fail task + attempt while still in the same Immediate transaction.
+        let now = now_timestamp();
+        let task_updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = ?4,
+                     error_json = ?5,
+                     completed_at = ?6,
+                     updated_at = ?6
+                 WHERE id = ?1 AND team_id = ?2 AND status = ?3",
+                params![
+                    closure.task_id.as_str(),
+                    team_id,
+                    AgentTaskStatus::Running.as_str(),
+                    AgentTaskStatus::Failed.as_str(),
+                    closure.error_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if task_updated != 1 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(PreStreamChatFailureClosureResult::Skipped {
+                reason: "task was no longer running".to_string(),
+            });
+        }
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_attempts
+                 SET status = 'failed', completed_at = ?3
+                 WHERE id = ?1 AND task_id = ?2 AND status = 'running'",
+                params![
+                    closure.attempt_id.as_str(),
+                    closure.task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if attempt_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "task '{}' has no active attempt for pre-stream failure closure",
+                    closure.task_id
+                ),
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET status = CASE
+                         WHEN status = 'draining' THEN 'draining'
+                         ELSE 'idle'
+                     END,
+                     updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![owner_instance_id, team_id, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        // Materialize durable assistant error only when identity still matches.
+        if closure.materialize_assistant {
+            let existing_assistant =
+                message_from_transaction(&transaction, &database_path, closure.assistant_message_id)?;
+            let can_write_assistant = match existing_assistant {
+                Some(existing) => {
+                    if existing.chat_id != closure.chat_id
+                        || existing.role != "assistant"
+                        || existing.sequence != closure.assistant_sequence
+                    {
+                        false
+                    } else {
+                        // Do not overwrite a completed/successful assistant body.
+                        let metadata =
+                            parse_json_object(&existing.metadata_json, "assistant message metadata")?;
+                        let streaming_state = metadata
+                            .get("streamingState")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        existing.content.trim().is_empty()
+                            || streaming_state == "streaming"
+                            || streaming_state == "failed"
+                            || metadata.get("runFailure").is_some()
+                    }
+                }
+                None => true,
+            };
+
+            if can_write_assistant {
+                let changed = transaction
+                    .execute(
+                        "INSERT INTO messages
+                            (id, chat_id, role, content, sequence, created_at, metadata_json)
+                         VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6)
+                         ON CONFLICT(id) DO UPDATE SET
+                            content = excluded.content,
+                            metadata_json = excluded.metadata_json
+                         WHERE messages.chat_id = excluded.chat_id
+                            AND messages.role = excluded.role
+                            AND messages.sequence = excluded.sequence",
+                        params![
+                            closure.assistant_message_id,
+                            closure.chat_id,
+                            closure.assistant_content,
+                            closure.assistant_sequence,
+                            now,
+                            closure.assistant_metadata_json
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                if changed == 0 {
+                    // Race: assistant already finalized by a newer identity.
+                }
+            }
+
+            // Clear queuedRun only when it still matches this run identity.
+            if let Some(chat) =
+                chat_from_transaction(&transaction, &database_path, closure.chat_id)?
+            {
+                let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+                let should_clear_chat = chat_metadata
+                    .get(QUEUED_CHAT_METADATA_KEY)
+                    .and_then(Value::as_object)
+                    .is_some_and(|queued_run| {
+                        let user_ok = queued_run
+                            .get("userMessageId")
+                            .or_else(|| queued_run.get("user_message_id"))
+                            .and_then(Value::as_str)
+                            == Some(closure.user_message_id);
+                        let assistant_ok = queued_run
+                            .get("assistantMessageId")
+                            .or_else(|| queued_run.get("assistant_message_id"))
+                            .and_then(Value::as_str)
+                            .map(|id| id == closure.assistant_message_id)
+                            .unwrap_or(true);
+                        let sequence_ok = queued_run
+                            .get("assistantSequence")
+                            .or_else(|| queued_run.get("assistant_sequence"))
+                            .and_then(Value::as_i64)
+                            .map(|seq| seq == closure.assistant_sequence)
+                            .unwrap_or(true);
+                        user_ok && assistant_ok && sequence_ok
+                    });
+                if should_clear_chat {
+                    chat_metadata.remove(QUEUED_CHAT_METADATA_KEY);
+                    let chat_metadata_json =
+                        serde_json::to_string(&chat_metadata).map_err(|source| {
+                            WorkspaceDatabaseError::InvalidMessageMetadata {
+                                message: format!("chat metadata is invalid JSON: {source}"),
+                            }
+                        })?;
+                    transaction
+                        .execute(
+                            "UPDATE chats SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![chat_metadata_json, now, closure.chat_id],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                } else {
+                    transaction
+                        .execute(
+                            "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                            params![now, closure.chat_id],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+            }
+
+            if let Some(message) =
+                message_from_transaction(&transaction, &database_path, closure.user_message_id)?
+            {
+                if message.chat_id == closure.chat_id {
+                    let mut message_metadata =
+                        parse_json_object(&message.metadata_json, "user message metadata")?;
+                    let should_clear_message = message_metadata
+                        .get(QUEUED_MESSAGE_METADATA_KEY)
+                        .and_then(Value::as_object)
+                        .is_some_and(|queued_run| {
+                            let assistant_ok = queued_run
+                                .get("assistantMessageId")
+                                .or_else(|| queued_run.get("assistant_message_id"))
+                                .and_then(Value::as_str)
+                                .map(|id| id == closure.assistant_message_id)
+                                .unwrap_or(true);
+                            let sequence_ok = queued_run
+                                .get("assistantSequence")
+                                .or_else(|| queued_run.get("assistant_sequence"))
+                                .and_then(Value::as_i64)
+                                .map(|seq| seq == closure.assistant_sequence)
+                                .unwrap_or(true);
+                            assistant_ok && sequence_ok
+                        });
+                    if should_clear_message
+                        && message_metadata
+                            .remove(QUEUED_MESSAGE_METADATA_KEY)
+                            .is_some()
+                    {
+                        let message_metadata_json =
+                            serde_json::to_string(&message_metadata).map_err(|source| {
+                                WorkspaceDatabaseError::InvalidMessageMetadata {
+                                    message: format!(
+                                        "user message metadata is invalid JSON: {source}"
+                                    ),
+                                }
+                            })?;
+                        transaction
+                            .execute(
+                                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                                params![
+                                    message_metadata_json,
+                                    closure.user_message_id,
+                                    closure.chat_id
+                                ],
+                            )
+                            .map_err(|source| sqlite_error(&database_path, source))?;
+                    }
+                }
+            }
+        }
+
+        // task_failed event (same payload shape as fail_claimed_task).
+        let payload_value = json!({
+            "outcome": serde_json::from_str::<Value>(closure.error_json)
+                .unwrap_or_else(|_| json!({ "message": closure.error_json })),
+            "recoveryReason": "pre_stream_failure_closure",
+        });
+        let payload_json = redact_agent_json(&payload_value.to_string(), "payload_json")?;
+        let event_sequence: i64 = transaction
+            .query_row(
+                "SELECT next_event_sequence FROM agent_teams WHERE id = ?1",
+                params![team_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_teams
+                 SET next_event_sequence = next_event_sequence + 1, updated_at = ?2
+                 WHERE id = ?1",
+                params![team_id, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_events
+                    (team_id, sequence, event_type, instance_id, task_id, attempt_id,
+                     message_id, payload_json, created_at)
+                 VALUES (?1, ?2, 'task_failed', ?3, ?4, ?5, NULL, ?6, ?7)",
+                params![
+                    team_id,
+                    event_sequence,
+                    owner_instance_id,
+                    closure.task_id.as_str(),
+                    closure.attempt_id.as_str(),
+                    payload_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        // Plan phase / scheduled-task sync after commit (own transactions).
+        let phase_error_message = serde_json::from_str::<Value>(closure.error_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "pre-stream failure".to_string());
+        let _ = self.fail_plan_phase_run(closure.task_id, &phase_error_message)?;
+
+        Ok(PreStreamChatFailureClosureResult::Applied)
     }
 
     pub fn clear_chat_queued_run(

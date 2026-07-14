@@ -150,7 +150,8 @@ use crate::runtime::{
     execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
     pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
     ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
-    spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
+    spawn_code_graph_index_initialization, open_workspace_database_ordinary_with_pre_stream_retry,
+    validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
@@ -1809,6 +1810,9 @@ enum ChatMessagePart {
 #[serde(rename_all = "camelCase", tag = "type")]
 enum StoredChatMessagePart {
     Text {
+        text: String,
+    },
+    Error {
         text: String,
     },
     Reasoning {
@@ -4726,8 +4730,11 @@ async fn prepare_chat_context_for_output(
     if let Some(queued_user_message_id) = queued_user_message_id.as_deref()
         && let Some(chat_id) = prompt_context.chat_id.as_deref()
     {
-        let database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database_ordinary_with_pre_stream_retry(
+            &prompt_context.workspace_path,
+            state.app_shutdown_rx.clone(),
+        )
+        .await?;
         if let Some(message) = database
             .message(queued_user_message_id)
             .map_err(ApiError::from_workspace_error)?
@@ -4798,8 +4805,11 @@ async fn prepare_chat_context_for_output(
             "UserPromptSubmit hook blocked message: {reason}"
         )));
     }
-    let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database_ordinary_with_pre_stream_retry(
+        &prompt_context.workspace_path,
+        state.app_shutdown_rx.clone(),
+    )
+    .await?;
     let (chat_id, chat_created) = if prompt_context.is_new_chat {
         let chat_id = prompt_context
             .chat_id
@@ -9604,7 +9614,23 @@ fn assistant_status_from_metadata(metadata_json: &str) -> Result<Option<String>,
     Ok(
         match metadata.get("streamingState").and_then(Value::as_str) {
             Some("streaming") => Some("streaming".to_string()),
-            _ => None,
+            Some("failed") => Some("error".to_string()),
+            _ => {
+                // Durable Error parts without streamingState still surface as failed.
+                let has_error_part = metadata
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("error")
+                        })
+                    });
+                if has_error_part {
+                    Some("error".to_string())
+                } else {
+                    None
+                }
+            }
         },
     )
 }
@@ -9850,6 +9876,7 @@ fn assistant_parts_from_metadata(
         .into_iter()
         .map(|part| match part {
             StoredChatMessagePart::Text { text } => Ok(ChatMessagePart::Text { text }),
+            StoredChatMessagePart::Error { text } => Ok(ChatMessagePart::Error { text }),
             StoredChatMessagePart::Reasoning { text, duration_ms } => {
                 Ok(ChatMessagePart::Reasoning { text, duration_ms })
             }
@@ -11852,9 +11879,7 @@ fn stored_chat_message_parts(
         .into_iter()
         .map(|part| match part {
             ChatMessagePart::Text { text } => Ok(StoredChatMessagePart::Text { text }),
-            ChatMessagePart::Error { .. } => Err(ApiError::internal(
-                "assistant message history parts must not contain error parts",
-            )),
+            ChatMessagePart::Error { text } => Ok(StoredChatMessagePart::Error { text }),
             ChatMessagePart::Reasoning { text, duration_ms } => {
                 Ok(StoredChatMessagePart::Reasoning { text, duration_ms })
             }

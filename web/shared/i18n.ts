@@ -526,6 +526,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Thinking duration {duration}": "思考时长 {duration}",
     "Model default": "模型默认",
     "Retry last run": "重试上次运行",
+    "Reply has not started: workspace database is busy. Please retry.":
+      "回复尚未开始，工作区数据库繁忙，请重试",
+    "Reply has not started: preparation failed. Please retry.":
+      "回复尚未开始，准备失败，请重试",
     "Cancel run": "取消运行",
     "Send message": "发送消息",
     "Send guidance": "发送引导",

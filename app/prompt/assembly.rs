@@ -6,7 +6,10 @@ use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
 };
-use crate::runtime::{spawn_code_graph_workspace_initialization_if_needed, web_search_enabled};
+use crate::runtime::{
+    open_workspace_database_ordinary_with_pre_stream_retry,
+    spawn_code_graph_workspace_initialization_if_needed, web_search_enabled,
+};
 use crate::*;
 use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
@@ -79,8 +82,11 @@ pub(crate) async fn prepare_prompt_context(
         .await
         .map_err(ApiError::from_mcp_error)?;
     let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let database = open_workspace_database_ordinary_with_pre_stream_retry(
+        &workspace.path,
+        state.app_shutdown_rx.clone(),
+    )
+    .await?;
     let requested_chat_id = optional_trimmed_string(request.chat_id);
     let is_new_chat = requested_chat_id.is_none();
     let chat_id = match requested_chat_id {

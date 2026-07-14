@@ -147,6 +147,28 @@ pub struct AgentTaskStateUpdate<'a> {
     pub interruption_reason: Option<&'a str>,
 }
 
+/// Atomic pre-stream coordinator failure: task fail + optional assistant error bubble + queuedRun clear.
+#[derive(Clone, Debug)]
+pub struct PreStreamChatFailureClosure<'a> {
+    pub task_id: &'a AgentTaskId,
+    pub attempt_id: &'a AgentAttemptId,
+    pub chat_id: &'a str,
+    pub user_message_id: &'a str,
+    pub assistant_message_id: &'a str,
+    pub assistant_sequence: i64,
+    pub error_json: &'a str,
+    pub assistant_content: &'a str,
+    pub assistant_metadata_json: &'a str,
+    /// When false (worker/subagent), only task/event close; no main-chat assistant row.
+    pub materialize_assistant: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreStreamChatFailureClosureResult {
+    Applied,
+    Skipped { reason: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentAttemptRecord {
     pub id: AgentAttemptId,

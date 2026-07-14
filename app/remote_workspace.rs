@@ -9816,6 +9816,21 @@ fn remote_sidecar_chat_messages_for_request(
                             });
                             sequences.push(sequence);
                         }
+                        crate::StoredChatMessagePart::Error { text } => {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Assistant,
+                                content: text,
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_name: None,
+                            });
+                            sequences.push(sequence);
+                        }
                         crate::StoredChatMessagePart::Reasoning { text, .. } => {
                             if text.trim().is_empty() {
                                 continue;

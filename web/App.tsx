@@ -5437,6 +5437,55 @@ export function App() {
     });
   }
 
+  function restoreRetryRunRequestFromFailedMessages(
+    workspaceId: string,
+    chatId: string,
+    chatMessages: ShellMessage[],
+  ) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    if (runningChatKeysRef.current.has(chatKey) || isSendingMessage) {
+      return;
+    }
+    // Prefer the latest failed assistant that still has a preceding user with runConfig.
+    for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+      const message = chatMessages[index];
+      if (message?.role !== "assistant" || message.status !== "error") {
+        continue;
+      }
+      const hasErrorPart = message.parts.some((part) => part.type === "error");
+      if (!hasErrorPart && !message.content) {
+        continue;
+      }
+      let userMessage: ShellMessage | undefined;
+      for (let userIndex = index - 1; userIndex >= 0; userIndex -= 1) {
+        const candidate = chatMessages[userIndex];
+        if (candidate?.role === "user") {
+          userMessage = candidate;
+          break;
+        }
+      }
+      const runConfig = userMessage?.runConfig;
+      if (!userMessage || !runConfig?.modelId) {
+        continue;
+      }
+      setRetryRunRequest({
+        workspaceId,
+        chatId,
+        content: userMessage.content,
+        attachments: [],
+        modelId: runConfig.modelId,
+        providerId: runConfig.providerId ?? selectedProviderIdRef.current ?? "",
+        thinkingLevel: runConfig.thinkingLevel ?? "",
+        skillIds: normalizeStringArray(runConfig.selectedSkillIds),
+        sessionMode: runConfig.sessionMode ?? userMessage.sessionMode ?? undefined,
+        teamModeEnabled: runConfig.teamModeEnabled ?? false,
+        localChatKey: chatKey,
+      });
+      setChatRunFailed(chatKey, true);
+      return;
+    }
+  }
+
   function compareWorkspaceChatListItemsByCreatedAtDesc(
     left: WorkspaceChatListItem,
     right: WorkspaceChatListItem,
@@ -5699,6 +5748,7 @@ export function App() {
       setChatMessagePaginationByKey((current) => ({ ...current, [chatKey]: pagination }));
       trimInactiveChatCaches();
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
+      restoreRetryRunRequestFromFailedMessages(workspaceId, chatId, nextMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
         setPendingQuestion((current) =>
@@ -16023,7 +16073,10 @@ function normalizeActiveChatRunSummary(
 }
 
 function normalizeChatMessageStatus(value: unknown): "error" | "streaming" | undefined {
-  return value === "error" || value === "streaming" ? value : undefined;
+  if (value === "error" || value === "failed") {
+    return "error";
+  }
+  return value === "streaming" ? value : undefined;
 }
 
 export function normalizeChatMessageSummary(
@@ -16087,6 +16140,11 @@ export function normalizeChatMessageSummary(
       teamModeEnabled: fieldValue(runConfigRecord, "teamModeEnabled", "team_mode_enabled") === true,
     }
     : null;
+  const statusFromParts =
+    !status &&
+    parts.some((part) => part.type === "error")
+      ? ("error" as const)
+      : status;
   const normalizedMessage = {
     ...message,
     extractedMemories,
@@ -16097,7 +16155,7 @@ export function normalizeChatMessageSummary(
     runConfig,
     runBadges: [],
     sessionMode,
-    status,
+    status: statusFromParts,
     specUpdates,
     toolCalls,
     parts,
