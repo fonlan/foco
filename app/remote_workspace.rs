@@ -104,12 +104,13 @@ use crate::{
         prepare_context_compression_snapshot, tool_prompt_infos,
     },
     runtime::{
-        BrokeredImageFile, ProviderAuditCapture, QuestionRegistry, ReadOnlyToolProgressAction,
-        ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
-        SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
-        image_tool_timeout_ms, materialize_brokered_image_result, reasoning_loop_guard_message,
-        run_post_tool_hooks, web_tool_timeout_ms,
+        BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
+        QuestionRegistry, REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT,
+        ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, ReasoningLoopDetector,
+        RepeatedToolCallDetector, SidecarRuntimeConfigBundle, ToolOutputDeltaEvent,
+        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
+        execute_tool, execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
+        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -914,6 +915,67 @@ fn remote_sidecar_initial_context_sources(
 
 fn remote_sidecar_current_turn_output(accumulated: &str, turn_start: usize) -> String {
     accumulated[turn_start..].to_string()
+}
+
+fn remote_sidecar_flush_open_content_parts(
+    content_parts_prefix: &mut Vec<Value>,
+    text: &str,
+    reasoning: &str,
+    flushed_text_len: &mut usize,
+    flushed_reasoning_len: &mut usize,
+) {
+    let unflushed_reasoning = reasoning.get(*flushed_reasoning_len..).unwrap_or_default();
+    if !unflushed_reasoning.is_empty() {
+        content_parts_prefix.push(json!({
+            "type": "reasoning",
+            "text": unflushed_reasoning,
+        }));
+    }
+    let unflushed_text = text.get(*flushed_text_len..).unwrap_or_default();
+    if !unflushed_text.is_empty() {
+        content_parts_prefix.push(json!({
+            "type": "text",
+            "text": unflushed_text,
+        }));
+    }
+    *flushed_text_len = text.len();
+    *flushed_reasoning_len = reasoning.len();
+}
+
+fn remote_sidecar_append_reasoning_loop_recovery_to_request(
+    messages: &mut Vec<NeutralChatMessage>,
+    runtime_tool_state: &mut RemoteSidecarRuntimeToolState,
+    turn_text: &str,
+    turn_reasoning: &str,
+) {
+    if !turn_text.trim().is_empty() || !turn_reasoning.trim().is_empty() {
+        messages.push(NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: turn_text.to_string(),
+            attachments: Vec::new(),
+            reasoning: (!turn_reasoning.is_empty()).then(|| turn_reasoning.to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        });
+        runtime_tool_state.message_source_sequences.push(None);
+        runtime_tool_state
+            .message_context_sources
+            .push(PromptContextSource::RuntimeAssistant);
+    }
+    messages.push(NeutralChatMessage {
+        role: NeutralChatRole::User,
+        content: REASONING_LOOP_RECOVERY_USER_TEXT.to_string(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+    });
+    runtime_tool_state.message_source_sequences.push(None);
+    runtime_tool_state
+        .message_context_sources
+        .push(PromptContextSource::Guidance);
 }
 
 fn remote_sidecar_tool_round_cap_error(max_tool_rounds: usize) -> String {
@@ -6855,16 +6917,20 @@ fn remote_push_context_compression_part(
 
 /// Build assistant `metadata.parts` including compression blocks for history reload.
 /// start+completed for the same compression collapse into one completed part (local parity).
+/// `content_parts_prefix` holds ordered segments already closed by interruptions (reasoning/text/
+/// userInterruption); `content_suffix`/`reasoning_suffix` are the open tail after the last flush.
 fn remote_chat_parts_with_context_compression(
-    content: &str,
-    reasoning: Option<&str>,
+    content_suffix: &str,
+    reasoning_suffix: Option<&str>,
     compression_events: &[RemoteSidecarContextCompressionEventDetail],
+    content_parts_prefix: &[Value],
 ) -> Vec<Value> {
     let mut parts = Vec::new();
     for detail in compression_events {
         remote_push_context_compression_part(&mut parts, detail);
     }
-    parts.extend(remote_chat_parts(content, reasoning));
+    parts.extend(content_parts_prefix.iter().cloned());
+    parts.extend(remote_chat_parts(content_suffix, reasoning_suffix));
     parts
 }
 
@@ -7422,6 +7488,19 @@ fn remote_materialize_missing_assistant_parts(
                 &message_tool_calls,
             ));
         } else {
+            // Durable remote events may only include guidance_applied / tool_call /
+            // compression (text/reasoning deltas stay in-memory). When stream parts
+            // lack content segments, fold message fields as a best-effort tail so
+            // rematerialize is not interruption-only.
+            let has_text_or_reasoning = event_parts.iter().any(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("text" | "reasoning")
+                )
+            });
+            if !has_text_or_reasoning {
+                event_parts.extend(remote_chat_parts(&message.content, reasoning));
+            }
             event_parts = remote_hydrate_assistant_parts(&event_parts, &message_tool_calls);
         }
 
@@ -9615,6 +9694,39 @@ fn remote_sidecar_chat_messages_for_request(
                         }
                     }
                 }
+                // Local parity: parts often omit toolCall entries (remote complete writes
+                // reasoning/text/interruption only). Merge unreplayed tool_calls table rows
+                // when the full parts stream is in scope (no checkpoint cutpoint).
+                if replay_start == 0 {
+                    for tool_record in tool_records {
+                        if !replayed_tool_call_ids.insert(tool_record.id.clone()) {
+                            continue;
+                        }
+                        let Some(result) = tool_record.result.as_ref() else {
+                            continue;
+                        };
+                        raw_messages.push(NeutralChatMessage {
+                            role: NeutralChatRole::Assistant,
+                            content: String::new(),
+                            attachments: Vec::new(),
+                            reasoning: None,
+                            tool_calls: vec![remote_neutral_tool_call_from_record(&tool_record)],
+                            tool_call_id: None,
+                            tool_name: None,
+                        });
+                        sequences.push(sequence);
+                        raw_messages.push(NeutralChatMessage {
+                            role: NeutralChatRole::Tool,
+                            content: result.output_json.clone(),
+                            attachments: Vec::new(),
+                            reasoning: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(tool_record.id.clone()),
+                            tool_name: Some(tool_record.tool_name.clone()),
+                        });
+                        sequences.push(sequence);
+                    }
+                }
                 continue;
             }
 
@@ -10507,6 +10619,23 @@ fn remote_broker_resolved_provider_id(payload: &Value, fallback: &str) -> String
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// Outcome of a single broker `llm.stream` turn.
+/// Reasoning-loop interruptions cancel only the current RPC and never emit error/streamEnd.
+#[derive(Debug)]
+enum RemoteSidecarBrokerLlmTurnOutcome {
+    Completed {
+        tool_calls: Option<Vec<NeutralToolCall>>,
+        resolved_provider_id: String,
+    },
+    ReasoningLoopInterrupted {
+        message: String,
+        resolved_provider_id: String,
+        turn_total_latency_ms: i64,
+        turn_first_token_latency_ms: Option<i64>,
+        turn_llm_request_id: String,
+    },
+}
+
 async fn remote_sidecar_run_broker_llm_turn(
     state: &RemoteSidecarState,
     run_stream: &RemoteActiveRunStream,
@@ -10524,7 +10653,10 @@ async fn remote_sidecar_run_broker_llm_turn(
     run_metrics: &mut RemoteSidecarRunMetrics,
     sequence: &mut i64,
     compression_events: &[RemoteSidecarContextCompressionEventDetail],
-) -> Result<(Option<Vec<NeutralToolCall>>, String), ()> {
+    content_parts_prefix: &[Value],
+    flushed_text_len: usize,
+    flushed_reasoning_len: usize,
+) -> Result<RemoteSidecarBrokerLlmTurnOutcome, ()> {
     let mut broker_rx =
         remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
             .await
@@ -10659,41 +10791,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     if let Some(detection) = loop_detection {
                         let message = reasoning_loop_guard_message(detection);
                         remote_sidecar_cancel_broker_request_id(state, broker_request_id);
+                        state.broker_pending.lock().await.remove(broker_request_id);
                         let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                        let total_latency_ms = run_metrics.total_latency_ms();
-                        let metrics = remote_chat_metrics(
-                            model_id,
-                            resolved_provider_id.as_str(),
-                            run_metrics,
-                            total_latency_ms,
-                        );
-                        let metadata = json!({
-                            "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                            "parts": remote_chat_parts_with_context_compression(
-                                text,
-                                (!reasoning.is_empty()).then_some(reasoning.as_str()),
-                                compression_events,
-                            ),
-                            "metrics": metrics,
-                        });
-                        let assistant_sequence = database
-                            .message(assistant_message_id)
-                            .ok()
-                            .flatten()
-                            .map(|message| message.sequence)
-                            .unwrap_or_else(|| {
-                                database
-                                    .next_message_sequence_for_chat(chat_id)
-                                    .unwrap_or(0)
-                            });
-                        let _ = database.upsert_message_content(NewMessage {
-                            id: assistant_message_id,
-                            chat_id,
-                            role: "assistant",
-                            content: text,
-                            sequence: assistant_sequence,
-                            metadata_json: Some(&metadata.to_string()),
-                        });
                         let turn_total_latency_ms = turn_metrics.total_latency_ms();
                         let _ = persist_sidecar_llm_audit(
                             database,
@@ -10712,17 +10811,17 @@ async fn remote_sidecar_run_broker_llm_turn(
                                 "partial": true,
                             }),
                         );
-                        *sequence += 1;
-                        run_stream.record(
-                            *sequence,
-                            json!({
-                                "type": "error",
-                                "message": message,
-                            }),
+                        // Guard only cancels this broker RPC. Outer run loop owns recovery,
+                        // SSE interruption boundary, and any terminal Error/streamEnd.
+                        return Ok(
+                            RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
+                                message,
+                                resolved_provider_id,
+                                turn_total_latency_ms,
+                                turn_first_token_latency_ms: turn_metrics.first_token_latency_ms,
+                                turn_llm_request_id: broker_request_id.to_string(),
+                            },
                         );
-                        *sequence += 1;
-                        run_stream.record(*sequence, json!({ "type": "streamEnd" }));
-                        return Err(());
                     }
                 } else if kind == "usageDelta" {
                     let usage = envelope
@@ -10831,7 +10930,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                             "toolCalls": tool_calls.clone(),
                         }),
                     );
-                    return Ok((Some(tool_calls), response_provider_id));
+                    return Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                        tool_calls: Some(tool_calls),
+                        resolved_provider_id: response_provider_id,
+                    });
                 }
 
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -10843,12 +10945,17 @@ async fn remote_sidecar_run_broker_llm_turn(
                     total_latency_ms,
                 );
                 let usage = run_metrics.usage_value();
+                let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
+                let remaining_reasoning = reasoning
+                    .get(flushed_reasoning_len..)
+                    .unwrap_or(reasoning.as_str());
                 let metadata = json!({
                     "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
                     "parts": remote_chat_parts_with_context_compression(
-                        text,
-                        (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                        remaining_text,
+                        (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
                         compression_events,
+                        content_parts_prefix,
                     ),
                     "metrics": metrics,
                 });
@@ -10905,7 +11012,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                 run_stream.record(*sequence, completion_payload);
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
-                return Ok((None, response_provider_id));
+                return Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                    tool_calls: None,
+                    resolved_provider_id: response_provider_id,
+                });
             }
             "error" => {
                 let message = envelope
@@ -12108,6 +12218,11 @@ async fn remote_sidecar_chat_stream(
         // Accumulates start+completed compression details for this run so final
         // assistant metadata.parts can include history-reload bubbles.
         let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
+        // Ordered parts closed by reasoning-loop recoveries (before open turn suffix).
+        let mut content_parts_prefix: Vec<Value> = Vec::new();
+        let mut flushed_text_len = 0usize;
+        let mut flushed_reasoning_len = 0usize;
+        let mut reasoning_loop_recovery_count = 0usize;
         yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
             "type": "start",
             "chatId": chat_id,
@@ -12217,6 +12332,9 @@ async fn remote_sidecar_chat_stream(
                 &mut run_metrics,
                 &mut sequence,
                 &run_compression_events,
+                &content_parts_prefix,
+                flushed_text_len,
+                flushed_reasoning_len,
             ).await;
             let mut reached_terminal_event = false;
             for (event, terminal) in remote_sidecar_snapshot_run_events(&run_stream, &mut last_yielded_sequence) {
@@ -12230,15 +12348,20 @@ async fn remote_sidecar_chat_stream(
             let turn_reasoning =
                 remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
             match llm_turn {
-                Ok((tool_calls, resolved_provider_id)) => {
+                Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                    tool_calls: None,
+                    resolved_provider_id,
+                }) => {
+                    let _ = resolved_provider_id;
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
+                Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                    tool_calls: Some(tool_calls),
+                    resolved_provider_id,
+                }) => {
                     provider_id = resolved_provider_id;
-                    match tool_calls {
-                    None => {
-                        remote_sidecar_finish_active_run(&stream_state, &run_id);
-                        cleanup_guard.disarm();
-                        break;
-                    }
-                    Some(tool_calls) => {
                     if reached_terminal_event {
                         remote_sidecar_finish_active_run(&stream_state, &run_id);
                         cleanup_guard.disarm();
@@ -12493,6 +12616,22 @@ async fn remote_sidecar_chat_stream(
                         last_yielded_sequence = sequence;
                     }
 
+                    // Close the tool-producing turn into ordered parts so complete/history
+                    // replay keeps Assistant → tools → later text (and interruption) order.
+                    remote_sidecar_flush_open_content_parts(
+                        &mut content_parts_prefix,
+                        &text,
+                        &reasoning,
+                        &mut flushed_text_len,
+                        &mut flushed_reasoning_len,
+                    );
+                    for tool_call in &tool_calls {
+                        content_parts_prefix.push(json!({
+                            "type": "toolCall",
+                            "tool_call_id": tool_call.call_id,
+                        }));
+                    }
+
                     current_request = NeutralChatRequest {
                         model_id: current_request.model_id.clone(),
                         messages: next_messages,
@@ -12503,7 +12642,126 @@ async fn remote_sidecar_chat_stream(
                         prompt_cache_retention: current_request.prompt_cache_retention.clone(),
                     };
                 }
-                }
+                Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
+                    message,
+                    resolved_provider_id,
+                    turn_total_latency_ms,
+                    turn_first_token_latency_ms,
+                    turn_llm_request_id,
+                }) => {
+                    provider_id = resolved_provider_id;
+                    if reasoning_loop_recovery_count < MAX_REASONING_LOOP_RECOVERIES_PER_RUN {
+                        reasoning_loop_recovery_count =
+                            reasoning_loop_recovery_count.saturating_add(1);
+                        remote_sidecar_flush_open_content_parts(
+                            &mut content_parts_prefix,
+                            &text,
+                            &reasoning,
+                            &mut flushed_text_len,
+                            &mut flushed_reasoning_len,
+                        );
+                        let interrupted_metrics = json!({
+                            "modelId": model_id,
+                            "providerId": provider_id,
+                            "totalLatencyMs": turn_total_latency_ms,
+                            "firstTokenLatencyMs": turn_first_token_latency_ms,
+                            "outputTokens": null,
+                            "llmRequestIds": [turn_llm_request_id],
+                        });
+                        let guidance_id = unique_id("msg-guidance");
+                        let interruption_part = json!({
+                            "type": "userInterruption",
+                            "id": guidance_id,
+                            "content": REASONING_LOOP_RECOVERY_USER_TEXT,
+                            "source": REASONING_LOOP_GUARD_SOURCE,
+                            "interruptedAssistantMetrics": interrupted_metrics,
+                        });
+                        content_parts_prefix.push(interruption_part.clone());
+                        remote_sidecar_append_reasoning_loop_recovery_to_request(
+                            &mut current_request.messages,
+                            &mut runtime_tool_state,
+                            &turn_text,
+                            &turn_reasoning,
+                        );
+                        let guidance_payload = json!({
+                            "type": "guidanceApplied",
+                            "id": guidance_id,
+                            "content": REASONING_LOOP_RECOVERY_USER_TEXT,
+                            "parts": [],
+                            "source": REASONING_LOOP_GUARD_SOURCE,
+                            "assistantMessageId": assistant_message_id,
+                            "interruptedAssistantId": assistant_message_id,
+                            "interruptedAssistantMetrics": interrupted_metrics,
+                        });
+                        sequence += 1;
+                        let _ = database.insert_run_event(NewRunEvent {
+                            id: &unique_id("run-event"),
+                            chat_id: &chat_id,
+                            run_id: &run_id,
+                            sequence,
+                            event_type: "guidance_applied",
+                            payload_json: &guidance_payload.to_string(),
+                        });
+                        yield Ok(remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            guidance_payload,
+                        ));
+                        last_yielded_sequence = sequence;
+                        // Same run / task / phase attempt continues with a new broker request.
+                        continue;
+                    }
+
+                    // Exhausted automatic recoveries: fail the run like the original guard.
+                    let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
+                    let remaining_reasoning =
+                        reasoning.get(flushed_reasoning_len..).unwrap_or(reasoning.as_str());
+                    let total_latency_ms = run_metrics.total_latency_ms();
+                    let metrics =
+                        remote_chat_metrics(&model_id, &provider_id, &run_metrics, total_latency_ms);
+                    let metadata = json!({
+                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                        "parts": remote_chat_parts_with_context_compression(
+                            remaining_text,
+                            (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
+                            &run_compression_events,
+                            &content_parts_prefix,
+                        ),
+                        "metrics": metrics,
+                    });
+                    let assistant_sequence = database
+                        .message(&assistant_message_id)
+                        .ok()
+                        .flatten()
+                        .map(|message| message.sequence)
+                        .unwrap_or_else(|| {
+                            database
+                                .next_message_sequence_for_chat(&chat_id)
+                                .unwrap_or(0)
+                        });
+                    let _ = database.upsert_message_content(NewMessage {
+                        id: &assistant_message_id,
+                        chat_id: &chat_id,
+                        role: "assistant",
+                        content: &text,
+                        sequence: assistant_sequence,
+                        metadata_json: Some(&metadata.to_string()),
+                    });
+                    sequence += 1;
+                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
+                        "type": "error",
+                        "message": message,
+                    })));
+                    sequence += 1;
+                    yield Ok(remote_sidecar_record_run_event(
+                        &run_stream,
+                        sequence,
+                        json!({ "type": "streamEnd" }),
+                    ));
+                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
                 }
                 Err(()) => {
                     let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
@@ -19136,6 +19394,9 @@ mod tests {
             &mut run_metrics,
             &mut sequence,
             &[],
+            &[],
+            0,
+            0,
         )
         .await;
         broker.await.expect("broker task");
@@ -19288,46 +19549,53 @@ mod tests {
             &mut run_metrics,
             &mut sequence,
             &[],
+            &[],
+            0,
+            0,
         )
         .await;
         broker.await.expect("broker task");
 
-        assert!(result.is_err());
+        // Broker-turn helper only cancels the RPC + partial audit; outer loop owns recovery/error.
+        let interrupted = match result {
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
+                message,
+                turn_llm_request_id,
+                ..
+            }) => {
+                assert!(message.contains("Runtime progress guard"));
+                assert!(message.contains("repeated reasoning loop"));
+                assert!(message.contains("Partial reasoning was preserved"));
+                assert_eq!(turn_llm_request_id, "broker-request-1");
+                true
+            }
+            other => {
+                panic!("expected ReasoningLoopInterrupted, got {other:?}");
+            }
+        };
+        assert!(interrupted);
         assert!(text.is_empty());
         assert!(!reasoning.is_empty());
         assert!(!reasoning.contains("SENTINEL_AFTER_LOOP_GUARD"));
         let events = run_stream.snapshot_after(-1);
-        assert_eq!(
+        assert!(
             events
                 .iter()
-                .rev()
-                .take(2)
-                .map(|(_, event)| event["type"].as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec!["streamEnd", "error"]
+                .all(|(_, event)| event["type"] != "error" && event["type"] != "streamEnd"),
+            "broker turn must not emit terminal error/streamEnd on loop guard: {events:?}"
         );
-        let error_message = events
-            .iter()
-            .find_map(|(_, event)| {
-                (event["type"] == "error")
-                    .then(|| event["message"].as_str())
-                    .flatten()
-            })
-            .expect("reasoning loop error event");
-        assert!(error_message.contains("Runtime progress guard"));
-        assert!(error_message.contains("repeated reasoning loop"));
-        assert!(error_message.contains("Partial reasoning was preserved"));
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| event["type"] == "reasoningDelta")
+        );
 
+        // Assistant placeholder is not finalized by the broker-turn helper alone.
         let assistant = database
             .message("msg-assistant-1")
             .expect("assistant message lookup")
             .expect("assistant message");
-        let metadata: Value =
-            serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
-        assert_eq!(
-            metadata.get("reasoning").and_then(Value::as_str),
-            Some(reasoning.as_str())
-        );
+        assert_eq!(assistant.content, "");
         let audit = database
             .llm_request("broker-request-1")
             .expect("sidecar audit lookup")
@@ -19337,6 +19605,772 @@ mod tests {
         // Sidecar mirror: structured columns only; partial/error stay in SSE + message metadata.
         assert_eq!(audit.request_body_json, None);
         assert_eq!(audit.response_body_json, None);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_reasoning_loop_auto_recovers_with_second_broker_rpc() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "trigger loop then recover",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let broker =
+            tokio::spawn(async move {
+                let first_request = loop {
+                    let envelope = broker_rx.recv().await.expect("first broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let first_id = first_request.id.clone().expect("first request id");
+                let first_pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&first_id)
+                    .cloned()
+                    .expect("first pending response channel");
+                let reasoning_period =
+                    "Inspect the premise, compare the evidence, and restart the same analysis. ";
+                for _ in 0..24 {
+                    if first_pending
+                        .send(ControlEnvelope {
+                            version: 1,
+                            message_type: "stream".to_string(),
+                            id: Some(first_id.clone()),
+                            method: None,
+                            payload: json!({
+                                "kind": "reasoningDelta",
+                                "delta": reasoning_period,
+                            }),
+                            timestamp: None,
+                        })
+                        .is_err()
+                    {
+                        // Consumer may cancel and drop the channel once the loop is detected.
+                        break;
+                    }
+                }
+                loop {
+                    let envelope = broker_rx.recv().await.expect("first cancel");
+                    if envelope.message_type == "cancel" {
+                        assert_eq!(envelope.id.as_deref(), Some(first_id.as_str()));
+                        break;
+                    }
+                }
+
+                let second_request = loop {
+                    let envelope = broker_rx.recv().await.expect("second broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let second_messages = second_request.payload["request"]["messages"]
+                    .as_array()
+                    .expect("second request messages")
+                    .clone();
+                assert!(
+                    second_messages.iter().any(|message| {
+                        message["role"] == "assistant"
+                            && (message
+                                .get("reasoning")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.is_empty())
+                                || message
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.is_empty()))
+                    }),
+                    "second RPC must include partial assistant: {second_messages:?}"
+                );
+                assert!(
+                    second_messages.iter().any(|message| {
+                        message["role"] == "user"
+                            && message.get("content").and_then(Value::as_str).is_some_and(
+                                |content| content.contains(REASONING_LOOP_RECOVERY_USER_TEXT),
+                            )
+                    }),
+                    "second RPC must include fixed recovery user text: {second_messages:?}"
+                );
+                let second_id = second_request.id.expect("second request id");
+                let second_pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&second_id)
+                    .cloned()
+                    .expect("second pending response channel");
+                second_pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "stream".to_string(),
+                        id: Some(second_id.clone()),
+                        method: None,
+                        payload: json!({
+                            "kind": "textDelta",
+                            "delta": "Recovered after reasoning loop",
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send recovery text");
+                second_pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "response".to_string(),
+                        id: Some(second_id.clone()),
+                        method: None,
+                        payload: json!({
+                            "usage": { "inputTokens": 6, "outputTokens": 3 },
+                            "toolCalls": [],
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send recovery response");
+                (first_id, second_id)
+            });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("recovery SSE body should finish")
+        .expect("SSE bytes");
+        let (first_broker_request_id, second_broker_request_id) =
+            broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"guidanceApplied\""));
+        assert!(text.contains(REASONING_LOOP_RECOVERY_USER_TEXT));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains("Recovered after reasoning loop"));
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(
+            text.contains(&format!("\"llmRequestId\":\"{first_broker_request_id}\"")),
+            "SSE streamAttemptStart must include first broker id: {text}"
+        );
+        assert!(
+            text.contains(&format!("\"llmRequestId\":\"{second_broker_request_id}\"")),
+            "SSE streamAttemptStart must include second broker id: {text}"
+        );
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant message lookup")
+            .expect("assistant message");
+        assert_eq!(assistant.content, "Recovered after reasoning loop");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("assistant parts");
+        assert!(
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                    && part.get("content").and_then(Value::as_str)
+                        == Some(REASONING_LOOP_RECOVERY_USER_TEXT)
+                    && part.get("source").and_then(Value::as_str)
+                        == Some(REASONING_LOOP_GUARD_SOURCE)
+            }),
+            "final parts must include userInterruption: {parts:?}"
+        );
+
+        let first_audit = database
+            .llm_request(&first_broker_request_id)
+            .expect("first audit lookup")
+            .expect("first broker audit");
+        assert_eq!(first_audit.final_state, "failed");
+        let second_audit = database
+            .llm_request(&second_broker_request_id)
+            .expect("second audit lookup")
+            .expect("second broker audit");
+        assert_eq!(second_audit.final_state, "succeeded");
+
+        let durable_events = database
+            .history_run_events_for_chat_messages("chat-1", &["msg-assistant-1".to_string()])
+            .expect("run events");
+        assert!(
+            durable_events
+                .iter()
+                .any(|event| event.event_type == "guidance_applied"),
+            "guidance_applied must be durable for rematerialize"
+        );
+
+        let history = remote_sidecar_chat_messages_for_request(
+            &database,
+            "chat-1",
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .expect("history for request");
+        assert!(
+            history.messages.iter().any(|message| {
+                message.role == NeutralChatRole::User
+                    && message.content.contains(REASONING_LOOP_RECOVERY_USER_TEXT)
+            }),
+            "prompt history should replay interruption as user: {:?}",
+            history.messages
+        );
+        let mut saw_partial_assistant = false;
+        let mut saw_recovery_user = false;
+        let mut saw_final_assistant = false;
+        for message in &history.messages {
+            match message.role {
+                NeutralChatRole::Assistant
+                    if !message.content.is_empty()
+                        || message
+                            .reasoning
+                            .as_ref()
+                            .is_some_and(|value| !value.is_empty()) =>
+                {
+                    if saw_recovery_user {
+                        saw_final_assistant = true;
+                    } else {
+                        saw_partial_assistant = true;
+                    }
+                }
+                NeutralChatRole::User
+                    if message.content.contains(REASONING_LOOP_RECOVERY_USER_TEXT) =>
+                {
+                    saw_recovery_user = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_partial_assistant && saw_recovery_user && saw_final_assistant,
+            "expected Assistant → User → Assistant boundary in history: {:?}",
+            history.messages
+        );
+
+        // Strip parts so reconnect/history rematerialize rebuilds interruption from run_events.
+        // Remote stream only durable-persists guidance_applied (not every reasoningDelta).
+        // Rematerialize must rebuild interruption and best-effort fold message content/reasoning.
+        let mut stripped = serde_json::from_str::<Value>(&assistant.metadata_json)
+            .expect("assistant metadata for strip");
+        if let Some(object) = stripped.as_object_mut() {
+            object.remove("parts");
+            object.remove("partsSource");
+            object.remove("partsVersion");
+        }
+        database
+            .update_message_metadata("msg-assistant-1", &stripped.to_string())
+            .expect("strip parts");
+        let tool_calls = database.tool_calls_for_chat("chat-1").expect("tool calls");
+        let mut messages = database
+            .messages_for_chat_page("chat-1", None, 50)
+            .expect("messages");
+        remote_materialize_missing_assistant_parts(
+            &mut database,
+            "chat-1",
+            &mut messages,
+            &tool_calls,
+        )
+        .expect("rematerialize after strip");
+        let rematerialized = messages
+            .iter()
+            .find(|message| message.id == "msg-assistant-1")
+            .expect("assistant after rematerialize");
+        let rematerialized_meta: Value =
+            serde_json::from_str(&rematerialized.metadata_json).expect("rematerialized metadata");
+        let rematerialized_parts = rematerialized_meta
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("rematerialized parts");
+        assert!(
+            rematerialized_parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                    && part.get("content").and_then(Value::as_str)
+                        == Some(REASONING_LOOP_RECOVERY_USER_TEXT)
+                    && part.get("source").and_then(Value::as_str)
+                        == Some(REASONING_LOOP_GUARD_SOURCE)
+            }),
+            "rematerialize must rebuild userInterruption: {rematerialized_parts:?}"
+        );
+        assert!(
+            rematerialized_parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("text")
+                    && part.get("text").and_then(Value::as_str)
+                        == Some("Recovered after reasoning loop")
+            }),
+            "rematerialize must fold message content when stream deltas were not durable: {rematerialized_parts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_reasoning_loop_fails_after_max_recoveries() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "exhaust recoveries",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let max_recoveries = MAX_REASONING_LOOP_RECOVERIES_PER_RUN;
+        let broker = tokio::spawn(async move {
+            // MAX recoveries + 1 looping turns: recover 3 times, fail on 4th.
+            for turn in 0..=max_recoveries {
+                let request = loop {
+                    let envelope = broker_rx.recv().await.expect("looping broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let id = request.id.clone().expect("request id");
+                let pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&id)
+                    .cloned()
+                    .expect("pending response channel");
+                let reasoning_period =
+                    "Inspect the premise, compare the evidence, and restart the same analysis. ";
+                for _ in 0..24 {
+                    if pending
+                        .send(ControlEnvelope {
+                            version: 1,
+                            message_type: "stream".to_string(),
+                            id: Some(id.clone()),
+                            method: None,
+                            payload: json!({
+                                "kind": "reasoningDelta",
+                                "delta": reasoning_period,
+                            }),
+                            timestamp: None,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                loop {
+                    let envelope = broker_rx.recv().await.expect("cancel");
+                    if envelope.message_type == "cancel" {
+                        assert_eq!(envelope.id.as_deref(), Some(id.as_str()));
+                        break;
+                    }
+                }
+                let _ = turn;
+            }
+        });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(8),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("max recovery SSE body should finish")
+        .expect("SSE bytes");
+        broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        let guidance_count = text.matches("\"type\":\"guidanceApplied\"").count();
+        assert_eq!(guidance_count, MAX_REASONING_LOOP_RECOVERIES_PER_RUN);
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("repeated reasoning loop"));
+        assert!(text.contains("\"type\":\"streamEnd\""));
+        assert!(!text.contains("\"type\":\"complete\""));
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant message lookup")
+            .expect("assistant message");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("final partial parts");
+        assert!(
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("userInterruption")
+            }),
+            "exhausted recoveries must keep interruption parts: {parts:?}"
+        );
+        assert!(
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("reasoning")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+            }),
+            "exhausted recoveries must keep partial reasoning: {parts:?}"
+        );
+        let user = database
+            .message("msg-user-1")
+            .expect("user lookup")
+            .expect("user message");
+        let user_meta: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
+        assert!(
+            user_meta.get("queuedRun").is_none(),
+            "failed recovery should clear queuedRun"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_stream_reasoning_loop_recovery_then_tool_stays_on_same_assistant()
+    {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("write tool fixture");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "loop then tool",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("insert assistant placeholder");
+        drop(database);
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let broker =
+            tokio::spawn(async move {
+                // Turn 1: loop → cancel → recovery.
+                let first_request = loop {
+                    let envelope = broker_rx.recv().await.expect("first broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let first_id = first_request.id.clone().expect("first request id");
+                let first_pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&first_id)
+                    .cloned()
+                    .expect("first pending");
+                let reasoning_period =
+                    "Inspect the premise, compare the evidence, and restart the same analysis. ";
+                for _ in 0..24 {
+                    if first_pending
+                        .send(ControlEnvelope {
+                            version: 1,
+                            message_type: "stream".to_string(),
+                            id: Some(first_id.clone()),
+                            method: None,
+                            payload: json!({
+                                "kind": "reasoningDelta",
+                                "delta": reasoning_period,
+                            }),
+                            timestamp: None,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                loop {
+                    let envelope = broker_rx.recv().await.expect("first cancel");
+                    if envelope.message_type == "cancel" {
+                        assert_eq!(envelope.id.as_deref(), Some(first_id.as_str()));
+                        break;
+                    }
+                }
+
+                // Turn 2: after recovery, request a tool call on the same assistant message.
+                let second_request = loop {
+                    let envelope = broker_rx.recv().await.expect("second broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                let second_messages = second_request.payload["request"]["messages"]
+                    .as_array()
+                    .expect("second messages");
+                assert!(
+                    second_messages.iter().any(|message| {
+                        message["role"] == "user"
+                            && message.get("content").and_then(Value::as_str).is_some_and(
+                                |content| content.contains(REASONING_LOOP_RECOVERY_USER_TEXT),
+                            )
+                    }),
+                    "tool turn must still include recovery user: {second_messages:?}"
+                );
+                let second_id = second_request.id.expect("second request id");
+                let second_pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&second_id)
+                    .cloned()
+                    .expect("second pending");
+                second_pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "response".to_string(),
+                        id: Some(second_id.clone()),
+                        method: None,
+                        payload: json!({
+                            "usage": { "inputTokens": 4, "outputTokens": 2 },
+                            "toolCalls": [{
+                                "callId": "call-after-recovery",
+                                "name": "read_file",
+                                "arguments": {
+                                    "path": "Cargo.toml",
+                                    "startLine": null,
+                                    "endLine": null,
+                                    "timeoutMs": null
+                                }
+                            }],
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send tool response");
+
+                // Turn 3: tool result follow-up.
+                let third_request = loop {
+                    let envelope = broker_rx.recv().await.expect("third broker request");
+                    if envelope.message_type == "request" {
+                        break envelope;
+                    }
+                };
+                assert!(
+                    third_request.payload["request"]["messages"]
+                        .as_array()
+                        .expect("third messages")
+                        .iter()
+                        .any(|message| message["role"] == "tool"),
+                    "third turn must include tool result"
+                );
+                let third_id = third_request.id.expect("third request id");
+                let third_pending = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&third_id)
+                    .cloned()
+                    .expect("third pending");
+                third_pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "stream".to_string(),
+                        id: Some(third_id.clone()),
+                        method: None,
+                        payload: json!({
+                            "kind": "textDelta",
+                            "delta": "tool done after recovery",
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send final text");
+                third_pending
+                    .send(ControlEnvelope {
+                        version: 1,
+                        message_type: "response".to_string(),
+                        id: Some(third_id),
+                        method: None,
+                        payload: json!({
+                            "usage": { "inputTokens": 5, "outputTokens": 2 },
+                            "toolCalls": [],
+                        }),
+                        timestamp: None,
+                    })
+                    .expect("send final response");
+            });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("recovery+tool SSE body should finish")
+        .expect("SSE bytes");
+        broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"guidanceApplied\""));
+        assert!(text.contains("\"type\":\"toolCall\""));
+        assert!(text.contains("\"type\":\"toolResult\""));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains("tool done after recovery"));
+        assert!(!text.contains("\"type\":\"error\""));
+        // Tool events must bind to the original assistant message id.
+        assert!(text.contains("\"assistantMessageId\":\"msg-assistant-1\""));
+        assert!(text.contains("call-after-recovery"));
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let tool_calls = database
+            .tool_calls_for_message("msg-assistant-1")
+            .expect("tool calls for assistant");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call-after-recovery");
+        assert_eq!(tool_calls[0].tool_name, "read_file");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant");
+        assert!(assistant.content.contains("tool done after recovery"));
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("parts");
+        let interruption_idx = parts
+            .iter()
+            .position(|part| part.get("type").and_then(Value::as_str) == Some("userInterruption"));
+        let tool_part_idx = parts.iter().position(|part| {
+            part.get("type").and_then(Value::as_str) == Some("toolCall")
+                && remote_tool_call_part_id(part) == Some("call-after-recovery")
+        });
+        let final_text_idx = parts.iter().position(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("tool done after recovery"))
+        });
+        assert!(
+            interruption_idx.is_some(),
+            "parts keep interruption before tool: {parts:?}"
+        );
+        assert!(
+            tool_part_idx.is_some(),
+            "complete must persist toolCall in ordered parts: {parts:?}"
+        );
+        assert!(
+            final_text_idx.is_some(),
+            "parts keep final text after tool: {parts:?}"
+        );
+        assert!(
+            interruption_idx.unwrap() < tool_part_idx.unwrap()
+                && tool_part_idx.unwrap() < final_text_idx.unwrap(),
+            "expected interruption → toolCall → final text order, got {parts:?}"
+        );
+
+        // Next-run prompt rebuild must replay tools even when parts already exist
+        // (not only the no-parts fallback path).
+        let history = remote_sidecar_chat_messages_for_request(
+            &database,
+            "chat-1",
+            Some("msg-assistant-next"),
+            &std::collections::HashSet::new(),
+        )
+        .expect("history for next request");
+        assert!(
+            history.messages.iter().any(|message| {
+                message.role == NeutralChatRole::User
+                    && message.content.contains(REASONING_LOOP_RECOVERY_USER_TEXT)
+            }),
+            "next-run history must keep recovery user: {:?}",
+            history.messages
+        );
+        assert!(
+            history.messages.iter().any(|message| {
+                message.role == NeutralChatRole::Assistant
+                    && message
+                        .tool_calls
+                        .iter()
+                        .any(|tool_call| tool_call.call_id == "call-after-recovery")
+            }),
+            "next-run history must keep tool call: {:?}",
+            history.messages
+        );
+        assert!(
+            history.messages.iter().any(|message| {
+                message.role == NeutralChatRole::Tool
+                    && message.tool_call_id.as_deref() == Some("call-after-recovery")
+            }),
+            "next-run history must keep tool result: {:?}",
+            history.messages
+        );
     }
 
     #[tokio::test]
@@ -19428,7 +20462,7 @@ mod tests {
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut sequence = 0_i64;
-        let (result, resolved_provider_id) = remote_sidecar_run_broker_llm_turn(
+        let outcome = remote_sidecar_run_broker_llm_turn(
             &state,
             &run_stream,
             "broker-request-1",
@@ -19445,10 +20479,19 @@ mod tests {
             &mut run_metrics,
             &mut sequence,
             &[],
+            &[],
+            0,
+            0,
         )
         .await
         .expect("llm turn should succeed");
-        let result = result.expect("tool call should request followup");
+        let (result, resolved_provider_id) = match outcome {
+            RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                tool_calls: Some(tool_calls),
+                resolved_provider_id,
+            } => (tool_calls, resolved_provider_id),
+            other => panic!("expected tool followup completion, got {other:?}"),
+        };
         broker.await.expect("broker task");
 
         assert_eq!(resolved_provider_id, "provider-current");
@@ -21426,7 +22469,7 @@ mod tests {
                 model_id: "model-1".to_string(),
             },
         ];
-        let parts = remote_chat_parts_with_context_compression("Done.", None, &events);
+        let parts = remote_chat_parts_with_context_compression("Done.", None, &events, &[]);
         assert_eq!(parts.len(), 2);
         assert_eq!(
             parts[0].get("type").and_then(Value::as_str),
@@ -21476,7 +22519,7 @@ mod tests {
             },
         ];
         let parts =
-            remote_chat_parts_with_context_compression("After tools.", Some("think"), &events);
+            remote_chat_parts_with_context_compression("After tools.", Some("think"), &events, &[]);
         assert_eq!(parts.len(), 4);
         assert_eq!(
             parts
@@ -22027,6 +23070,7 @@ mod tests {
             "compressed answer",
             None,
             &compression_events,
+            &[],
         );
         let metadata = json!({
             "parts": parts,
