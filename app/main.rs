@@ -61,11 +61,12 @@ use foco_store::{
         LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
         LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
         LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord,
-        LlmRequestRecord, MessageRecord, MessageRoleCountRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
-        NewToolResult, PromptContextInjectionRecord, RewriteChatFromUserMessage, TodoGraphRecord,
-        TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        LlmRequestRecord, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        NewPromptContextInjection, NewToolCall, NewToolResult, PromptContextInjectionRecord,
+        RewriteChatFromUserMessage, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
+        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
         workspace_database_path,
     },
 };
@@ -7072,6 +7073,7 @@ impl ApiError {
 
     pub(crate) fn from_memory_error(error: MemoryDatabaseError) -> Self {
         match error {
+            MemoryDatabaseError::AlreadyActive { .. } => Self::conflict(error.to_string()),
             MemoryDatabaseError::InvalidMemoryInput { .. }
             | MemoryDatabaseError::InvalidMemoryJson { .. } => Self::bad_request(error.to_string()),
             MemoryDatabaseError::ConcurrencyLimit { .. } => Self::internal(error.to_string()),
@@ -9729,47 +9731,26 @@ pub(crate) fn append_assistant_spec_update_summary(
 
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    let Some(message) = database
-        .message(assistant_message_id)
-        .map_err(ApiError::from_workspace_error)?
-    else {
-        return Ok(());
-    };
-
-    let metadata = parse_json_value(&message.metadata_json, "assistant message metadata")?;
-    let mut metadata = metadata
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ApiError::internal("assistant message metadata must be a JSON object"))?;
-    let mut spec_updates = metadata
-        .get("specUpdates")
-        .map(|value| serde_json::from_value::<Vec<ChatSpecUpdateSummary>>(value.clone()))
-        .transpose()
-        .map_err(|source| {
-            ApiError::internal(format!(
-                "failed to parse assistant message metadata.specUpdates: {source}"
-            ))
-        })?
-        .unwrap_or_default();
-    if let Some(existing) = spec_updates
-        .iter_mut()
-        .find(|update| update.id == summary.id)
-    {
-        *existing = summary;
-    } else {
-        spec_updates.push(summary);
-    }
-    metadata.insert("specUpdates".to_string(), json!(spec_updates));
-    let metadata_json = serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
+    let summary_value = serde_json::to_value(&summary).map_err(|source| {
         ApiError::internal(format!(
-            "failed to serialize assistant message metadata: {source}"
+            "failed to serialize assistant message metadata.specUpdates entry: {source}"
         ))
     })?;
-
-    database
-        .update_message_metadata(assistant_message_id, &metadata_json)
-        .map_err(ApiError::from_workspace_error)?;
-    Ok(())
+    match database.mutate_message_metadata(
+        assistant_message_id,
+        MessageMetadataMutation::UpsertSpecUpdate {
+            summary: summary_value,
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(WorkspaceDatabaseError::InvalidMessageMetadata { message })
+            if message.contains("message was not found") =>
+        {
+            // Spec job may finish after the assistant row was deleted by edit-rerun.
+            Ok(())
+        }
+        Err(error) => Err(ApiError::from_workspace_error(error)),
+    }
 }
 
 pub(crate) fn chat_spec_update_summary(
@@ -10741,7 +10722,6 @@ fn materialize_missing_assistant_parts(
         .iter_mut()
         .filter(|message| message.role == "assistant" && missing_message_ids.contains(&message.id))
     {
-        let mut metadata = parse_json_value(&message.metadata_json, "assistant message metadata")?;
         let Some(parts) = parts_by_message
             .remove(&message.id)
             .filter(|parts| !parts.is_empty())
@@ -10749,25 +10729,20 @@ fn materialize_missing_assistant_parts(
             continue;
         };
         let stored_parts = stored_chat_message_parts(parts)?;
-        let metadata = metadata.as_object_mut().ok_or_else(|| {
-            ApiError::internal("assistant message metadata must be a JSON object")
-        })?;
-        metadata.insert("parts".to_string(), json!(stored_parts));
-        metadata.insert(
-            "partsVersion".to_string(),
-            Value::Number(STORED_CHAT_PARTS_VERSION.into()),
-        );
-        metadata.insert(
-            "partsSource".to_string(),
-            Value::String("run_events".to_string()),
-        );
-        let metadata_json = serde_json::to_string(metadata).map_err(|source| {
+        let parts_value = serde_json::to_value(&stored_parts).map_err(|source| {
             ApiError::internal(format!(
-                "failed to serialize assistant message metadata: {source}"
+                "failed to serialize assistant message parts: {source}"
             ))
         })?;
-        database
-            .update_message_metadata(&message.id, &metadata_json)
+        let metadata_json = database
+            .mutate_message_metadata(
+                &message.id,
+                MessageMetadataMutation::SetParts {
+                    parts: parts_value,
+                    parts_version: STORED_CHAT_PARTS_VERSION,
+                    parts_source: "run_events".to_string(),
+                },
+            )
             .map_err(ApiError::from_workspace_error)?;
         message.metadata_json = metadata_json;
     }

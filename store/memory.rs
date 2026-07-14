@@ -22,21 +22,23 @@ mod memory_schema;
 
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
-    MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryEdgeRecord, MemoryExtractionJobRecord,
-    MemoryFactRecord, MemoryProfileRecord, MemoryReferenceRecord, MemorySourceRecord,
-    NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact,
-    NewMemoryProfile, NewMemoryReference, NewMemorySource, UpdateMemoryDreamChange,
-    UpdateMemoryDreamJob, UpdateMemoryFact, UpdateMemorySource,
+    MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryDreamJobTransitionOutcome,
+    MemoryEdgeRecord, MemoryExtractionJobRecord, MemoryFactRecord, MemoryProfileRecord,
+    MemoryReferenceRecord, MemorySourceRecord, NewMemoryDreamChange, NewMemoryDreamJob,
+    NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile, NewMemoryReference,
+    NewMemorySource, StartMemoryDreamJobOutcome, UpdateMemoryDreamChange, UpdateMemoryDreamJob,
+    UpdateMemoryFact, UpdateMemorySource,
 };
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
-    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL,
-    GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_FACT_ENABLED_MIGRATION_SQL, MEMORY_REFERENCES_SCHEMA_SQL,
+    GLOBAL_MEMORY_DREAM_ACTIVE_SINGLEFLIGHT_MIGRATION_SQL, GLOBAL_MEMORY_DREAM_SCHEMA_SQL,
+    GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL, GLOBAL_MEMORY_SCHEMA_SQL,
+    MEMORY_FACT_ENABLED_MIGRATION_SQL, MEMORY_REFERENCES_SCHEMA_SQL,
     WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
 };
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
-pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 5;
+pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 6;
 const GLOBAL_MEMORY_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const GLOBAL_MEMORY_MIGRATION_LOCK_SUFFIX: &str = ".migrate.lock";
 
@@ -60,6 +62,10 @@ const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
         version: 5,
         sql: MEMORY_FACT_ENABLED_MIGRATION_SQL,
+    },
+    MemoryMigration {
+        version: 6,
+        sql: GLOBAL_MEMORY_DREAM_ACTIVE_SINGLEFLIGHT_MIGRATION_SQL,
     },
 ];
 
@@ -1516,8 +1522,32 @@ impl MemoryDatabase {
         &mut self,
         job: NewMemoryDreamJob<'_>,
     ) -> Result<(), MemoryDatabaseError> {
+        match self.start_dream_job(job)? {
+            StartMemoryDreamJobOutcome::Started => Ok(()),
+            StartMemoryDreamJobOutcome::AlreadyActive => {
+                Err(MemoryDatabaseError::AlreadyActive {
+                    message: "memory Dream is already active".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Insert a Dream job under the partial UNIQUE active-job constraint.
+    ///
+    /// Always inserts as `queued` first (or as terminal for non-live starts), then claims
+    /// to `running` in the same Immediate transaction when `job.status == Running`.
+    /// Concurrent starters lose the UNIQUE race and receive `AlreadyActive` without a
+    /// raw SQLite constraint error.
+    pub fn start_dream_job(
+        &mut self,
+        job: NewMemoryDreamJob<'_>,
+    ) -> Result<StartMemoryDreamJobOutcome, MemoryDatabaseError> {
         self.validate_dream_scope(job.scope, job.workspace_id)?;
         validate_dream_job(&job)?;
+        let insert_status = match job.status {
+            MemoryDreamJobStatus::Running => MemoryDreamJobStatus::Queued,
+            other => other,
+        };
         let now = now_timestamp();
         let input_summary_json = redact_memory_json(
             job.input_summary_json,
@@ -1527,50 +1557,119 @@ impl MemoryDatabase {
             job.output_summary_json,
             "memory_dream_jobs.output_summary_json",
         )?;
-        let started_at = job.status.starts_run().then_some(now.as_str());
-        let completed_at = job.status.is_terminal().then_some(now.as_str());
+        let started_at = insert_status.starts_run().then_some(now.as_str());
+        let completed_at = insert_status.is_terminal().then_some(now.as_str());
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        let insert_result = transaction.execute(
+            "INSERT INTO memory_dream_jobs
+                (id, scope, workspace_id, trigger_type, mode, status, model_id,
+                 input_summary_json, output_summary_json, transcript_chat_id, error_message,
+                 created_at, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                job.id,
+                job.scope.as_str(),
+                job.workspace_id,
+                job.trigger_type.as_str(),
+                job.mode.as_str(),
+                insert_status.as_str(),
+                job.model_id,
+                input_summary_json,
+                output_summary_json,
+                job.transcript_chat_id,
+                job.error_message,
+                now,
+                started_at,
+                completed_at,
+            ],
+        );
+        match insert_result {
+            Ok(_) => {}
+            Err(source) if is_active_dream_singleflight_conflict(&source) => {
+                return Ok(StartMemoryDreamJobOutcome::AlreadyActive);
+            }
+            Err(source) => return Err(sqlite_error(&database_path, source)),
+        }
+
+        if job.status == MemoryDreamJobStatus::Running {
+            let claimed = transaction
+                .execute(
+                    "UPDATE memory_dream_jobs
+                     SET status = 'running',
+                         started_at = COALESCE(started_at, ?2),
+                         completed_at = NULL,
+                         error_message = NULL
+                     WHERE id = ?1 AND status = 'queued'",
+                    params![job.id, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if claimed == 0 {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory Dream job was not claimable: {}", job.id),
+                });
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(StartMemoryDreamJobOutcome::Started)
+    }
+
+    /// Claim a queued Dream job to running exactly once.
+    pub fn claim_dream_job_running(
+        &mut self,
+        id: &str,
+    ) -> Result<MemoryDreamJobTransitionOutcome, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
             .execute(
-                "INSERT INTO memory_dream_jobs
-                    (id, scope, workspace_id, trigger_type, mode, status, model_id,
-                     input_summary_json, output_summary_json, transcript_chat_id, error_message,
-                     created_at, started_at, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    job.id,
-                    job.scope.as_str(),
-                    job.workspace_id,
-                    job.trigger_type.as_str(),
-                    job.mode.as_str(),
-                    job.status.as_str(),
-                    job.model_id,
-                    input_summary_json,
-                    output_summary_json,
-                    job.transcript_chat_id,
-                    job.error_message,
-                    now,
-                    started_at,
-                    completed_at,
-                ],
+                "UPDATE memory_dream_jobs
+                 SET status = 'running',
+                     started_at = COALESCE(started_at, ?2),
+                     completed_at = NULL,
+                     error_message = NULL
+                 WHERE id = ?1 AND status = 'queued'",
+                params![id, now],
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
-
-        Ok(())
+        Ok(if changed > 0 {
+            MemoryDreamJobTransitionOutcome::Applied
+        } else {
+            MemoryDreamJobTransitionOutcome::NotApplied
+        })
     }
 
     pub fn update_dream_job_status(
         &mut self,
         update: UpdateMemoryDreamJob<'_>,
     ) -> Result<bool, MemoryDatabaseError> {
+        Ok(self.finish_dream_job(update)? == MemoryDreamJobTransitionOutcome::Applied)
+    }
+
+    /// Apply a Dream job status transition with strict pre-state rules.
+    ///
+    /// - claim (`queued` → `running`) only via [`Self::claim_dream_job_running`] / [`Self::start_dream_job`]
+    /// - `Running` updates attach fields while already `running` (never claim from `queued`)
+    /// - terminal statuses only from `running`
+    /// - terminal rows are never overwritten
+    pub fn finish_dream_job(
+        &mut self,
+        update: UpdateMemoryDreamJob<'_>,
+    ) -> Result<MemoryDreamJobTransitionOutcome, MemoryDatabaseError> {
         validate_dream_job_update(&update)?;
         let now = now_timestamp();
         let output_summary_json = redact_optional_memory_json(
             update.output_summary_json,
             "memory_dream_jobs.output_summary_json",
         )?;
-        let started_at = update.status.starts_run().then_some(now.as_str());
-        let completed_at = update.status.is_terminal().then_some(now.as_str());
         let error_message = match update.status {
             MemoryDreamJobStatus::Failed
             | MemoryDreamJobStatus::Cancelled
@@ -1580,34 +1679,99 @@ impl MemoryDatabase {
             | MemoryDreamJobStatus::Completed => None,
         };
 
+        let changed = match update.status {
+            MemoryDreamJobStatus::Queued => {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "memory Dream job cannot transition back to queued".to_string(),
+                });
+            }
+            MemoryDreamJobStatus::Running => {
+                // Attach transcript / refresh running fields only; never claim from queued.
+                self.connection
+                    .execute(
+                        "UPDATE memory_dream_jobs
+                         SET status = 'running',
+                             output_summary_json = COALESCE(?2, output_summary_json),
+                             transcript_chat_id = COALESCE(?3, transcript_chat_id),
+                             error_message = NULL,
+                             started_at = COALESCE(started_at, ?4),
+                             completed_at = NULL
+                         WHERE id = ?1
+                           AND status = 'running'",
+                        params![
+                            update.id,
+                            output_summary_json,
+                            update.transcript_chat_id,
+                            now,
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&self.database_path, source))?
+            }
+            MemoryDreamJobStatus::Completed
+            | MemoryDreamJobStatus::Failed
+            | MemoryDreamJobStatus::Cancelled
+            | MemoryDreamJobStatus::Skipped => self
+                .connection
+                .execute(
+                    "UPDATE memory_dream_jobs
+                     SET status = ?2,
+                         output_summary_json = COALESCE(?3, output_summary_json),
+                         transcript_chat_id = COALESCE(?4, transcript_chat_id),
+                         error_message = ?5,
+                         started_at = COALESCE(started_at, ?6),
+                         completed_at = ?6
+                     WHERE id = ?1
+                       AND status = 'running'",
+                    params![
+                        update.id,
+                        update.status.as_str(),
+                        output_summary_json,
+                        update.transcript_chat_id,
+                        error_message,
+                        now,
+                    ],
+                )
+                .map_err(|source| sqlite_error(&self.database_path, source))?,
+        };
+
+        Ok(if changed > 0 {
+            MemoryDreamJobTransitionOutcome::Applied
+        } else {
+            MemoryDreamJobTransitionOutcome::NotApplied
+        })
+    }
+
+    /// Startup reconcile: mark a leftover active job failed if still `queued` or `running`.
+    ///
+    /// This is intentionally broader than terminal finish (running-only) so interrupted
+    /// queued rows can be closed. Callers must only use it for stale/interrupted recovery
+    /// after excluding live in-process Dream runs.
+    pub fn fail_interrupted_dream_job(
+        &mut self,
+        id: &str,
+        error_message: &str,
+    ) -> Result<MemoryDreamJobTransitionOutcome, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        require_non_empty("error_message", error_message)?;
+        let now = now_timestamp();
         let changed = self
             .connection
             .execute(
                 "UPDATE memory_dream_jobs
-                 SET status = ?2,
-                     output_summary_json = ?3,
-                     transcript_chat_id = COALESCE(?4, transcript_chat_id),
-                     error_message = ?5,
-                     started_at = CASE
-                        WHEN ?6 IS NULL THEN started_at
-                        ELSE COALESCE(started_at, ?6)
-                     END,
-                     completed_at = ?7
+                 SET status = 'failed',
+                     error_message = ?2,
+                     started_at = COALESCE(started_at, ?3),
+                     completed_at = ?3
                  WHERE id = ?1
-                   AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped')",
-                params![
-                    update.id,
-                    update.status.as_str(),
-                    output_summary_json,
-                    update.transcript_chat_id,
-                    error_message,
-                    started_at,
-                    completed_at,
-                ],
+                   AND status IN ('queued', 'running')",
+                params![id, error_message, now],
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
-
-        Ok(changed > 0)
+        Ok(if changed > 0 {
+            MemoryDreamJobTransitionOutcome::Applied
+        } else {
+            MemoryDreamJobTransitionOutcome::NotApplied
+        })
     }
 
     pub fn insert_dream_change(
@@ -3249,6 +3413,10 @@ pub enum MemoryDatabaseError {
     ConcurrencyLimit {
         message: String,
     },
+    /// Another active Dream job already exists for this database/scope singleflight.
+    AlreadyActive {
+        message: String,
+    },
     InvalidMemoryInput {
         message: String,
     },
@@ -3278,6 +3446,7 @@ impl fmt::Display for MemoryDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConcurrencyLimit { message } => write!(formatter, "{message}"),
+            Self::AlreadyActive { message } => write!(formatter, "{message}"),
             Self::InvalidMemoryInput { message } => {
                 write!(formatter, "invalid memory data: {message}")
             }
@@ -3315,6 +3484,7 @@ impl std::error::Error for MemoryDatabaseError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
             Self::ConcurrencyLimit { .. }
+            | Self::AlreadyActive { .. }
             | Self::InvalidMemoryInput { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::UnsupportedSchemaVersion { .. } => None,
@@ -4735,6 +4905,33 @@ fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> MemoryDatabase
     }
 }
 
+fn is_sqlite_unique_constraint_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+                || matches!(
+                    code.extended_code,
+                    rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                )
+    ) || error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("unique constraint failed")
+}
+
+/// Only the active-job partial UNIQUE counts as already-active singleflight.
+/// PK / other UNIQUE conflicts must surface as Sqlite errors.
+fn is_active_dream_singleflight_conflict(error: &rusqlite::Error) -> bool {
+    if !is_sqlite_unique_constraint_error(error) {
+        return false;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    // SQLite may report the index name or the constrained column expression.
+    message.contains("memory_dream_jobs_active_singleflight_idx")
+        || message.contains("memory_dream_jobs.scope")
+}
+
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -5029,6 +5226,12 @@ mod tests {
                 error_message: None,
             })
             .expect("dream job insert");
+        assert_eq!(
+            database
+                .claim_dream_job_running("dream-job-1")
+                .expect("claim running"),
+            MemoryDreamJobTransitionOutcome::Applied
+        );
         assert!(
             database
                 .update_dream_job_status(UpdateMemoryDreamJob {
@@ -5038,7 +5241,7 @@ mod tests {
                     transcript_chat_id: Some("transcript-chat-1"),
                     error_message: None,
                 })
-                .expect("mark running")
+                .expect("attach transcript")
         );
         assert!(
             database
@@ -5128,6 +5331,303 @@ mod tests {
                 .expect("before json")["api_key"],
             "[REDACTED]"
         );
+    }
+
+    #[test]
+    fn memory_dream_start_is_singleflight_and_terminal_is_strict() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let profile = tempfile::tempdir().expect("profile");
+        let path = profile.path().to_path_buf();
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_global(&path).expect("global memory database");
+            assert_eq!(
+                database
+                    .start_dream_job(NewMemoryDreamJob {
+                        id: "dream-a",
+                        scope: MemoryDreamScope::Global,
+                        workspace_id: None,
+                        trigger_type: MemoryDreamTriggerType::Manual,
+                        mode: MemoryDreamRunMode::DeterministicOnly,
+                        status: MemoryDreamJobStatus::Running,
+                        model_id: None,
+                        input_summary_json: "{}",
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("start a"),
+                StartMemoryDreamJobOutcome::Started
+            );
+            assert_eq!(
+                database
+                    .start_dream_job(NewMemoryDreamJob {
+                        id: "dream-b",
+                        scope: MemoryDreamScope::Global,
+                        workspace_id: None,
+                        trigger_type: MemoryDreamTriggerType::Manual,
+                        mode: MemoryDreamRunMode::DeterministicOnly,
+                        status: MemoryDreamJobStatus::Running,
+                        model_id: None,
+                        input_summary_json: "{}",
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("start b"),
+                StartMemoryDreamJobOutcome::AlreadyActive
+            );
+            assert!(
+                database
+                    .finish_dream_job(UpdateMemoryDreamJob {
+                        id: "dream-a",
+                        status: MemoryDreamJobStatus::Completed,
+                        output_summary_json: Some(r#"{"ok":true}"#),
+                        transcript_chat_id: None,
+                        error_message: None,
+                    })
+                    .expect("complete")
+                    == MemoryDreamJobTransitionOutcome::Applied
+            );
+            // Terminal cannot be overwritten by a late failure path.
+            assert!(
+                database
+                    .finish_dream_job(UpdateMemoryDreamJob {
+                        id: "dream-a",
+                        status: MemoryDreamJobStatus::Failed,
+                        output_summary_json: None,
+                        transcript_chat_id: None,
+                        error_message: Some("late"),
+                    })
+                    .expect("late fail")
+                    == MemoryDreamJobTransitionOutcome::NotApplied
+            );
+        }
+
+        // Concurrent starters: only one succeeds under the partial unique index.
+        let barrier = Arc::new(Barrier::new(2));
+        let path_a = path.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let thread_a = thread::spawn(move || {
+            let mut database =
+                MemoryDatabase::open_or_create_global(&path_a).expect("conn a");
+            barrier_a.wait();
+            database
+                .start_dream_job(NewMemoryDreamJob {
+                    id: "concurrent-a",
+                    scope: MemoryDreamScope::Global,
+                    workspace_id: None,
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Running,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("start concurrent a")
+        });
+        let path_b = path.clone();
+        let barrier_b = Arc::clone(&barrier);
+        let thread_b = thread::spawn(move || {
+            let mut database =
+                MemoryDatabase::open_or_create_global(&path_b).expect("conn b");
+            barrier_b.wait();
+            database
+                .start_dream_job(NewMemoryDreamJob {
+                    id: "concurrent-b",
+                    scope: MemoryDreamScope::Global,
+                    workspace_id: None,
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Running,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("start concurrent b")
+        });
+        let outcome_a = thread_a.join().expect("join a");
+        let outcome_b = thread_b.join().expect("join b");
+        let started = matches!(outcome_a, StartMemoryDreamJobOutcome::Started) as u8
+            + matches!(outcome_b, StartMemoryDreamJobOutcome::Started) as u8;
+        let blocked = matches!(outcome_a, StartMemoryDreamJobOutcome::AlreadyActive) as u8
+            + matches!(outcome_b, StartMemoryDreamJobOutcome::AlreadyActive) as u8;
+        assert_eq!(started, 1);
+        assert_eq!(blocked, 1);
+    }
+
+    #[test]
+    fn finish_dream_job_running_does_not_claim_from_queued() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        assert_eq!(
+            database
+                .start_dream_job(NewMemoryDreamJob {
+                    id: "queued-only",
+                    scope: MemoryDreamScope::Global,
+                    workspace_id: None,
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Queued,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("insert queued"),
+            StartMemoryDreamJobOutcome::Started
+        );
+
+        // finish_dream_job(Running) must not claim; only claim_dream_job_running may.
+        assert_eq!(
+            database
+                .finish_dream_job(UpdateMemoryDreamJob {
+                    id: "queued-only",
+                    status: MemoryDreamJobStatus::Running,
+                    output_summary_json: None,
+                    transcript_chat_id: Some("chat-1"),
+                    error_message: None,
+                })
+                .expect("running attach"),
+            MemoryDreamJobTransitionOutcome::NotApplied
+        );
+        let job = database.dream_job("queued-only").expect("load").expect("exists");
+        assert_eq!(job.status, MemoryDreamJobStatus::Queued.as_str());
+        assert!(job.transcript_chat_id.is_none());
+
+        assert_eq!(
+            database
+                .claim_dream_job_running("queued-only")
+                .expect("claim"),
+            MemoryDreamJobTransitionOutcome::Applied
+        );
+        assert_eq!(
+            database
+                .finish_dream_job(UpdateMemoryDreamJob {
+                    id: "queued-only",
+                    status: MemoryDreamJobStatus::Running,
+                    output_summary_json: None,
+                    transcript_chat_id: Some("chat-1"),
+                    error_message: None,
+                })
+                .expect("attach after claim"),
+            MemoryDreamJobTransitionOutcome::Applied
+        );
+        let job = database.dream_job("queued-only").expect("load").expect("exists");
+        assert_eq!(job.status, MemoryDreamJobStatus::Running.as_str());
+        assert_eq!(job.transcript_chat_id.as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn memory_dream_duplicate_id_is_sqlite_not_already_active() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        database
+            .start_dream_job(NewMemoryDreamJob {
+                id: "same-id",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Completed,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: Some(r#"{"ok":true}"#),
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("first insert");
+        let err = database
+            .start_dream_job(NewMemoryDreamJob {
+                id: "same-id",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Completed,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: Some(r#"{"ok":true}"#),
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect_err("duplicate primary key");
+        assert!(
+            matches!(err, MemoryDatabaseError::Sqlite { .. }),
+            "expected Sqlite error for PK conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn global_memory_migration_6_collapses_multi_active_dreams() {
+        let profile = tempfile::tempdir().expect("profile");
+        let database_path = global_memory_database_path(profile.path());
+        {
+            let connection = Connection::open(&database_path).expect("open raw");
+            connection
+                .execute_batch(&format!(
+                    "{GLOBAL_MEMORY_SCHEMA_SQL}
+                     {GLOBAL_MEMORY_DREAM_SCHEMA_SQL}
+                     {MEMORY_REFERENCES_SCHEMA_SQL}
+                     {GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL}
+                     PRAGMA user_version = 5;
+                     INSERT INTO memory_dream_jobs
+                         (id, scope, workspace_id, trigger_type, mode, status, input_summary_json, created_at)
+                     VALUES
+                         ('old-queued', 'global', NULL, 'manual', 'deterministic_only', 'queued', '{{}}', '2026-07-01T00:00:00Z'),
+                         ('keep-running', 'global', NULL, 'manual', 'deterministic_only', 'running', '{{}}', '2026-07-02T00:00:00Z');"
+                ))
+                .expect("seed global v5 multi-active");
+        }
+
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("migrate to 6");
+        assert_eq!(
+            database.schema_version().expect("schema version"),
+            GLOBAL_MEMORY_SCHEMA_VERSION
+        );
+        let connection = Connection::open(database.database_path()).expect("open database");
+        let active: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_dream_jobs WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active count");
+        assert_eq!(active, 1);
+        let kept: String = connection
+            .query_row(
+                "SELECT id FROM memory_dream_jobs WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("kept id");
+        assert_eq!(kept, "keep-running");
+        let failed_error: String = connection
+            .query_row(
+                "SELECT error_message FROM memory_dream_jobs WHERE id = 'old-queued'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("collapsed error");
+        assert!(failed_error.contains("collapsed during schema migration 6"));
+        let singleflight: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'memory_dream_jobs_active_singleflight_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("singleflight index");
+        assert_eq!(singleflight, 1);
     }
 
     #[test]
@@ -5900,16 +6400,11 @@ mod tests {
                 error_message: None,
             })
             .expect("dream job insert");
-        assert!(
+        assert_eq!(
             database
-                .update_dream_job_status(UpdateMemoryDreamJob {
-                    id: "dream-job-1",
-                    status: MemoryDreamJobStatus::Running,
-                    output_summary_json: None,
-                    transcript_chat_id: None,
-                    error_message: None,
-                })
-                .expect("running")
+                .claim_dream_job_running("dream-job-1")
+                .expect("claim running"),
+            MemoryDreamJobTransitionOutcome::Applied
         );
         assert!(
             database

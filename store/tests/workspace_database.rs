@@ -30,9 +30,9 @@ use foco_store::{
         NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
         PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch,
         PreStreamChatFailureClosure, PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
-        RewriteChatFromUserMessage, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
-        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        MessageMetadataMutation, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
+        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
         WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
@@ -14480,5 +14480,231 @@ fn migration_037_indexes_are_created() {
             )
             .expect("index lookup");
         assert_eq!(count, 1, "missing index {index_name}");
+    }
+}
+
+#[test]
+fn mutate_message_metadata_preserves_unrelated_keys_under_concurrent_connections() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let path = workspace.path().to_path_buf();
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&path).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Concurrent metadata")
+            .expect("chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("message");
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    let path_parts = path.clone();
+    let barrier_parts = Arc::clone(&barrier);
+    let parts_thread = thread::spawn(move || {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&path_parts).expect("parts connection");
+        barrier_parts.wait();
+        database
+            .mutate_message_metadata(
+                "msg-assistant-1",
+                MessageMetadataMutation::SetParts {
+                    parts: json!([{"type": "text", "text": "streamed"}]),
+                    parts_version: 5,
+                    parts_source: "run_events".to_string(),
+                },
+            )
+            .expect("parts mutation");
+    });
+    let path_spec = path.clone();
+    let barrier_spec = Arc::clone(&barrier);
+    let spec_thread = thread::spawn(move || {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&path_spec).expect("spec connection");
+        barrier_spec.wait();
+        database
+            .mutate_message_metadata(
+                "msg-assistant-1",
+                MessageMetadataMutation::UpsertSpecUpdate {
+                    summary: json!({
+                        "id": "job-1-2",
+                        "jobId": "job-1",
+                        "baseRevision": 1,
+                        "revision": 2,
+                        "completedAt": "2026-07-14T00:00:00Z",
+                        "lines": [{"kind": "added", "text": "line"}],
+                        "truncated": false,
+                    }),
+                },
+            )
+            .expect("spec mutation");
+    });
+    parts_thread.join().expect("parts join");
+    spec_thread.join().expect("spec join");
+
+    let database = WorkspaceDatabase::open_or_create_ungated(&path).expect("reopen");
+    let metadata: Value = serde_json::from_str(
+        &database
+            .message("msg-assistant-1")
+            .expect("message")
+            .expect("message row")
+            .metadata_json,
+    )
+    .expect("metadata json");
+    assert_eq!(metadata["partsVersion"], 5);
+    assert_eq!(metadata["partsSource"], "run_events");
+    assert!(metadata["parts"].is_array());
+    assert_eq!(metadata["specUpdates"][0]["id"], "job-1-2");
+
+    // Idempotent re-upsert of the same spec update id.
+    let mut database = WorkspaceDatabase::open_or_create_ungated(&path).expect("reopen mut");
+    database
+        .mutate_message_metadata(
+            "msg-assistant-1",
+            MessageMetadataMutation::UpsertSpecUpdate {
+                summary: json!({
+                    "id": "job-1-2",
+                    "jobId": "job-1",
+                    "baseRevision": 1,
+                    "revision": 2,
+                    "completedAt": "2026-07-14T00:00:00Z",
+                    "lines": [{"kind": "added", "text": "line"}],
+                    "truncated": false,
+                }),
+            },
+        )
+        .expect("idempotent upsert");
+    let metadata: Value = serde_json::from_str(
+        &database
+            .message("msg-assistant-1")
+            .expect("message")
+            .expect("message row")
+            .metadata_json,
+    )
+    .expect("metadata json");
+    assert_eq!(
+        metadata["specUpdates"]
+            .as_array()
+            .expect("specUpdates array")
+            .len(),
+        1
+    );
+    assert_eq!(metadata["partsSource"], "run_events");
+}
+
+#[test]
+fn migration_038_collapses_active_dreams_and_drops_redundant_indexes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    std::fs::create_dir_all(database_path.parent().expect("parent")).expect("mkdir");
+    {
+        let connection = Connection::open(&database_path).expect("open raw");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA user_version = 37;
+                CREATE TABLE chats (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE memory_dream_jobs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    scope TEXT NOT NULL,
+                    workspace_id TEXT,
+                    trigger_type TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    model_id TEXT,
+                    input_summary_json TEXT NOT NULL DEFAULT '{}',
+                    output_summary_json TEXT,
+                    transcript_chat_id TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+                -- All six redundant indexes dropped by MIGRATION_038 (stub tables for DROP safety).
+                CREATE INDEX messages_chat_sequence_idx ON chats (id);
+                CREATE INDEX run_events_run_sequence_idx ON chats (id);
+                CREATE INDEX llm_request_events_request_sequence_idx ON chats (id);
+                CREATE INDEX context_compression_snapshots_chat_sequence_idx ON chats (id);
+                CREATE INDEX plan_phases_plan_sequence_idx ON chats (id);
+                CREATE INDEX plan_steps_phase_sequence_idx ON chats (id);
+                INSERT INTO memory_dream_jobs
+                    (id, scope, workspace_id, trigger_type, mode, status, input_summary_json, created_at)
+                VALUES
+                    ('old-queued', 'workspace', 'ws-1', 'manual', 'deterministic_only', 'queued', '{}', '2026-07-01T00:00:00Z'),
+                    ('keep-running', 'workspace', 'ws-1', 'manual', 'deterministic_only', 'running', '{}', '2026-07-02T00:00:00Z');
+                "#,
+            )
+            .expect("seed v37 fixture");
+    }
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrate to 38");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let active: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_dream_jobs WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active count");
+    assert_eq!(active, 1);
+    let kept: String = connection
+        .query_row(
+            "SELECT id FROM memory_dream_jobs WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("kept id");
+    assert_eq!(kept, "keep-running");
+    let failed_error: String = connection
+        .query_row(
+            "SELECT error_message FROM memory_dream_jobs WHERE id = 'old-queued'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("collapsed error");
+    assert!(failed_error.contains("collapsed during schema migration 38"));
+    let singleflight: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'memory_dream_jobs_active_singleflight_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("singleflight index");
+    assert_eq!(singleflight, 1);
+    for index_name in [
+        "messages_chat_sequence_idx",
+        "run_events_run_sequence_idx",
+        "llm_request_events_request_sequence_idx",
+        "context_compression_snapshots_chat_sequence_idx",
+        "plan_phases_plan_sequence_idx",
+        "plan_steps_phase_sequence_idx",
+    ] {
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index_name],
+                |row| row.get(0),
+            )
+            .expect("redundant index lookup");
+        assert_eq!(count, 0, "expected {index_name} to be dropped");
     }
 }

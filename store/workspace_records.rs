@@ -163,6 +163,32 @@ pub struct PreStreamChatFailureClosure<'a> {
     pub materialize_assistant: bool,
 }
 
+/// Typed assistant/message metadata mutations applied inside one Immediate transaction.
+///
+/// Unrelated top-level keys are preserved across concurrent mutations; callers must not
+/// read-modify-write whole metadata columns via bare `update_message_metadata`.
+#[derive(Clone, Debug)]
+pub enum MessageMetadataMutation {
+    /// Shallow-merge top-level object fields into existing metadata.
+    MergeFields { fields: serde_json::Map<String, Value> },
+    /// Replace `parts` / `partsVersion` / `partsSource` without touching other keys.
+    SetParts {
+        parts: Value,
+        parts_version: i64,
+        parts_source: String,
+    },
+    /// Upsert one object into `specUpdates[]` by `id` (replace matching id or append).
+    UpsertSpecUpdate { summary: Value },
+    /// Remove a single top-level key when present (idempotent if missing).
+    RemoveKey { key: String },
+    /// Merge fields into an existing nested object under `key`.
+    /// No-op when the key is missing or null; errors when present but not an object.
+    MergeNestedObjectFields {
+        key: String,
+        fields: serde_json::Map<String, Value>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreStreamChatFailureClosureResult {
     Applied,

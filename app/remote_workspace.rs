@@ -45,8 +45,8 @@ use foco_store::{
         NewMemorySource,
     },
     workspace::{
-        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
+        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
         TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
         WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
         WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
@@ -7550,22 +7550,26 @@ fn remote_materialize_missing_assistant_parts(
             event_parts = remote_hydrate_assistant_parts(&event_parts, &message_tool_calls);
         }
 
-        let mut metadata = metadata;
-        let Some(metadata_object) = metadata.as_object_mut() else {
+        let Some(metadata_object) = metadata.as_object() else {
             continue;
         };
-        metadata_object.insert("parts".to_string(), json!(event_parts));
-        metadata_object.insert(
-            "partsVersion".to_string(),
-            Value::Number(serde_json::Number::from(5)),
-        );
-        metadata_object.insert(
-            "partsSource".to_string(),
-            Value::String("run_events".to_string()),
-        );
-        let metadata_json = metadata.to_string();
-        database.update_message_metadata(&message.id, &metadata_json)?;
-        message.metadata_json = metadata_json;
+        // Preserve concurrent keys (e.g. specUpdates) via Store atomic mutation.
+        let metadata_json = database.mutate_message_metadata(
+            &message.id,
+            MessageMetadataMutation::SetParts {
+                parts: json!(event_parts),
+                parts_version: 5,
+                parts_source: "run_events".to_string(),
+            },
+        )?;
+        // Keep other top-level fields already loaded for this in-memory row.
+        let mut merged = metadata_object.clone();
+        if let Ok(Value::Object(updated)) = serde_json::from_str::<Value>(&metadata_json) {
+            for (key, value) in updated {
+                merged.insert(key, value);
+            }
+        }
+        message.metadata_json = Value::Object(merged).to_string();
     }
 
     Ok(())
@@ -8268,40 +8272,46 @@ fn remote_clear_message_queued_run(
     database: &mut WorkspaceDatabase,
     message_id: &str,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let Some(message) = database.message(message_id)? else {
-        return Ok(());
-    };
-    let Ok(mut metadata) = serde_json::from_str::<Value>(&message.metadata_json) else {
-        return Ok(());
-    };
-    let Some(object) = metadata.as_object_mut() else {
-        return Ok(());
-    };
-    if object.remove("queuedRun").is_none() {
-        return Ok(());
+    match database.mutate_message_metadata(
+        message_id,
+        MessageMetadataMutation::RemoveKey {
+            key: "queuedRun".to_string(),
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(WorkspaceDatabaseError::InvalidMessageMetadata { message })
+            if message.contains("message was not found") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
-    database.update_message_metadata(message_id, &metadata.to_string())
 }
 
 fn remote_mark_message_queued_run_started(
     database: &mut WorkspaceDatabase,
     message_id: &str,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
-    let Some(message) = database.message(message_id)? else {
-        return Ok(());
-    };
-    let Ok(mut metadata) = serde_json::from_str::<Value>(&message.metadata_json) else {
-        return Ok(());
-    };
-    let Some(queued_run) = metadata
-        .as_object_mut()
-        .and_then(|object| object.get_mut("queuedRun"))
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    queued_run.insert("status".to_string(), Value::String("running".to_string()));
-    database.update_message_metadata(message_id, &metadata.to_string())
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "status".to_string(),
+        Value::String("running".to_string()),
+    );
+    match database.mutate_message_metadata(
+        message_id,
+        MessageMetadataMutation::MergeNestedObjectFields {
+            key: "queuedRun".to_string(),
+            fields,
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(WorkspaceDatabaseError::InvalidMessageMetadata { message })
+            if message.contains("message was not found") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn remote_sidecar_chat_queue(

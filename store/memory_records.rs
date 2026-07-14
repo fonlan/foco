@@ -116,6 +116,13 @@ pub struct NewMemoryDreamJob<'a> {
     pub error_message: Option<&'a str>,
 }
 
+/// Result of starting a Dream job under the active-job singleflight constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartMemoryDreamJobOutcome {
+    Started,
+    AlreadyActive,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateMemoryDreamJob<'a> {
     pub id: &'a str,
@@ -123,6 +130,14 @@ pub struct UpdateMemoryDreamJob<'a> {
     pub output_summary_json: Option<&'a str>,
     pub transcript_chat_id: Option<&'a str>,
     pub error_message: Option<&'a str>,
+}
+
+/// Result of a Dream status transition with strict preconditions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryDreamJobTransitionOutcome {
+    Applied,
+    /// No rows updated: wrong pre-state, missing id, or terminal already closed.
+    NotApplied,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -45,7 +45,8 @@ use foco_store::{
         MemoryFactRecord, MemoryKind, MemoryProfileRecord, MemoryReferenceRecord,
         MemoryReferenceStatus, MemoryReferenceType, MemoryRelationKind, MemoryScope,
         MemorySourceType, MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge,
-        NewMemoryFact, NewMemoryReference, NewMemorySource, UpdateMemoryDreamJob, UpdateMemoryFact,
+        NewMemoryFact, NewMemoryReference, NewMemorySource, StartMemoryDreamJobOutcome,
+        UpdateMemoryDreamJob, UpdateMemoryFact,
     },
     workspace::{NewMessage, OpenedMemoryDatabase, WorkspaceDatabase},
 };
@@ -620,8 +621,8 @@ fn insert_running_memory_dream_job(
     job_model_id: Option<&str>,
     input_summary_json: &str,
 ) -> Result<(), ApiError> {
-    database
-        .insert_dream_job(NewMemoryDreamJob {
+    match database
+        .start_dream_job(NewMemoryDreamJob {
             id: job_id,
             scope: request.scope,
             workspace_id: request.workspace_id,
@@ -634,7 +635,13 @@ fn insert_running_memory_dream_job(
             transcript_chat_id: None,
             error_message: None,
         })
-        .map_err(ApiError::from_memory_error)?;
+        .map_err(ApiError::from_memory_error)?
+    {
+        StartMemoryDreamJobOutcome::Started => {}
+        StartMemoryDreamJobOutcome::AlreadyActive => {
+            return Err(ApiError::conflict("memory Dream is already active"));
+        }
+    }
     tracing::info!(
         job_id = %job_id,
         scope = request.scope.as_str(),

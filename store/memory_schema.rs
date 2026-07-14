@@ -426,3 +426,28 @@ CREATE INDEX memory_dream_changes_target_fact_ids_idx
     ON memory_dream_changes (target_fact_ids_json);
 CREATE INDEX memory_dream_changes_new_fact_idx ON memory_dream_changes (new_fact_id);
 "#;
+
+// Global Memory schema 6: collapse multi-active Dream jobs then enforce singleflight.
+pub const GLOBAL_MEMORY_DREAM_ACTIVE_SINGLEFLIGHT_MIGRATION_SQL: &str = r#"
+UPDATE memory_dream_jobs
+SET status = 'failed',
+    error_message = COALESCE(
+        error_message,
+        'duplicate active Dream job collapsed during schema migration 6'
+    ),
+    completed_at = COALESCE(completed_at, created_at)
+WHERE status IN ('queued', 'running')
+  AND id NOT IN (
+    SELECT id FROM memory_dream_jobs
+    WHERE status IN ('queued', 'running')
+    ORDER BY
+      CASE status WHEN 'running' THEN 0 ELSE 1 END,
+      created_at DESC,
+      id ASC
+    LIMIT 1
+  );
+
+CREATE UNIQUE INDEX IF NOT EXISTS memory_dream_jobs_active_singleflight_idx
+ON memory_dream_jobs (scope)
+WHERE status IN ('queued', 'running');
+"#;

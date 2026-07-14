@@ -1338,6 +1338,41 @@ ON chats (updated_at DESC, created_at DESC, id DESC)
 WHERE json_extract(metadata_json, '$.kind') = 'memory_dream';
 "#;
 
+// Drop indexes that fully duplicate UNIQUE constraints (autoindexes), and enforce
+// at most one active (queued|running) Dream job per workspace database.
+pub(crate) const MIGRATION_038: &str = r#"
+DROP INDEX IF EXISTS messages_chat_sequence_idx;
+DROP INDEX IF EXISTS run_events_run_sequence_idx;
+DROP INDEX IF EXISTS llm_request_events_request_sequence_idx;
+DROP INDEX IF EXISTS context_compression_snapshots_chat_sequence_idx;
+DROP INDEX IF EXISTS plan_phases_plan_sequence_idx;
+DROP INDEX IF EXISTS plan_steps_phase_sequence_idx;
+
+-- Deterministic legacy multi-active collapse: keep one recoverable active job
+-- (prefer running, then newest created_at, then id), fail the rest, then unique index.
+UPDATE memory_dream_jobs
+SET status = 'failed',
+    error_message = COALESCE(
+        error_message,
+        'duplicate active Dream job collapsed during schema migration 38'
+    ),
+    completed_at = COALESCE(completed_at, created_at)
+WHERE status IN ('queued', 'running')
+  AND id NOT IN (
+    SELECT id FROM memory_dream_jobs
+    WHERE status IN ('queued', 'running')
+    ORDER BY
+      CASE status WHEN 'running' THEN 0 ELSE 1 END,
+      created_at DESC,
+      id ASC
+    LIMIT 1
+  );
+
+CREATE UNIQUE INDEX IF NOT EXISTS memory_dream_jobs_active_singleflight_idx
+ON memory_dream_jobs (scope)
+WHERE status IN ('queued', 'running');
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

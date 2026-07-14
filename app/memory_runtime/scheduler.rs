@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use foco_store::{
     config::{GlobalConfig, WorkspaceConfig},
     memory::{
-        MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
-        MemoryDreamScope, MemoryDreamTriggerType, UpdateMemoryDreamJob,
+        MemoryDatabase, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamJobTransitionOutcome,
+        MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
     },
 };
 use tokio::{task::JoinHandle, time};
@@ -93,6 +93,24 @@ fn reconcile_memory_dream_scope(
     scope: MemoryDreamScope,
     workspace_id: Option<&str>,
 ) -> Result<usize, ApiError> {
+    let active_key = memory_dream_active_key(scope, workspace_id);
+    // Startup runs before any in-process Dream is registered, but keep this check so a
+    // late/repeated reconcile cannot kill a live run in the same process.
+    let scope_has_live_run = state
+        .memory_dream_runs
+        .try_lock()
+        .map(|runs| runs.contains(&active_key))
+        // Lock busy: prefer skip over risking a live in-process Dream.
+        .unwrap_or(true);
+    if scope_has_live_run {
+        tracing::info!(
+            scope = scope.as_str(),
+            workspace_id,
+            "Memory Dream startup reconciliation skipped scope with live in-process run"
+        );
+        return Ok(0);
+    }
+
     let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
     let mut reconciled = 0;
     for status in [MemoryDreamJobStatus::Queued, MemoryDreamJobStatus::Running] {
@@ -105,15 +123,31 @@ fn reconcile_memory_dream_scope(
             )
             .map_err(ApiError::from_memory_error)?;
         for job in jobs {
-            database
-                .update_dream_job_status(UpdateMemoryDreamJob {
-                    id: &job.id,
-                    status: MemoryDreamJobStatus::Failed,
-                    output_summary_json: None,
-                    transcript_chat_id: None,
-                    error_message: Some("memory Dream was interrupted before completion"),
-                })
+            // Re-check live set per job in case a run started after the scope check.
+            let job_has_live_run = state
+                .memory_dream_runs
+                .try_lock()
+                .map(|runs| runs.contains(&active_key))
+                .unwrap_or(true);
+            if job_has_live_run {
+                tracing::info!(
+                    job_id = %job.id,
+                    scope = scope.as_str(),
+                    workspace_id,
+                    "Memory Dream startup reconciliation skipped live in-process job"
+                );
+                continue;
+            }
+
+            let outcome = database
+                .fail_interrupted_dream_job(
+                    &job.id,
+                    "memory Dream was interrupted before completion",
+                )
                 .map_err(ApiError::from_memory_error)?;
+            if outcome != MemoryDreamJobTransitionOutcome::Applied {
+                continue;
+            }
             reconciled += 1;
             tracing::warn!(
                 job_id = %job.id,

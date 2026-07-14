@@ -60,7 +60,7 @@ pub use workspace_records::{
     PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
     PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
     PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
-    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
+    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization, MessageMetadataMutation,
     PromptContextInjectionRecord, RewriteChatFromUserMessage, RewriteChatFromUserMessageResult,
     RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRecord,
     ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskStatusCountRecord,
@@ -74,13 +74,14 @@ use workspace_schema::{
     MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, MIGRATION_021,
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
-    MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, Migration,
+    MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 37;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 38;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -387,6 +388,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 37,
         sql: MIGRATION_037,
+    },
+    Migration {
+        version: 38,
+        sql: MIGRATION_038,
     },
 ];
 
@@ -5839,6 +5844,49 @@ impl WorkspaceDatabase {
         }
 
         Ok(())
+    }
+
+    /// Apply a typed metadata mutation inside one Immediate transaction.
+    ///
+    /// Reads the current `metadata_json` under the write lock, shallow-merges only the
+    /// targeted field(s), and writes back. Concurrent mutations of unrelated keys do not
+    /// clobber each other. Prefer this over read → `message()` → `update_message_metadata`.
+    pub fn mutate_message_metadata(
+        &mut self,
+        message_id: &str,
+        mutation: MessageMetadataMutation,
+    ) -> Result<String, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let message = message_from_transaction(&transaction, &database_path, message_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("message was not found: {message_id}"),
+            })?;
+        let mut metadata = parse_json_object(&message.metadata_json, "message metadata")?;
+        apply_message_metadata_mutation(&mut metadata, mutation)?;
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("message metadata is invalid JSON: {source}"),
+            }
+        })?;
+        let updated = transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2",
+                params![metadata_json, message_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("message was not found: {message_id}"),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(metadata_json)
     }
 
     pub fn upsert_message_content(
@@ -15576,6 +15624,111 @@ fn validate_json_metadata(
     context: &str,
 ) -> Result<(), WorkspaceDatabaseError> {
     let _ = parse_json_object(metadata_json, context)?;
+    Ok(())
+}
+
+fn apply_message_metadata_mutation(
+    metadata: &mut serde_json::Map<String, Value>,
+    mutation: MessageMetadataMutation,
+) -> Result<(), WorkspaceDatabaseError> {
+    match mutation {
+        MessageMetadataMutation::MergeFields { fields } => {
+            for (key, value) in fields {
+                metadata.insert(key, value);
+            }
+        }
+        MessageMetadataMutation::SetParts {
+            parts,
+            parts_version,
+            parts_source,
+        } => {
+            if !parts.is_array() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.parts must be a JSON array".to_string(),
+                });
+            }
+            if parts_source.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.partsSource must not be empty".to_string(),
+                });
+            }
+            metadata.insert("parts".to_string(), parts);
+            metadata.insert(
+                "partsVersion".to_string(),
+                Value::Number(parts_version.into()),
+            );
+            metadata.insert(
+                "partsSource".to_string(),
+                Value::String(parts_source),
+            );
+        }
+        MessageMetadataMutation::UpsertSpecUpdate { summary } => {
+            let Some(summary_object) = summary.as_object() else {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.specUpdates entry must be a JSON object"
+                        .to_string(),
+                });
+            };
+            let Some(summary_id) = summary_object.get("id").and_then(Value::as_str) else {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.specUpdates entry must include id".to_string(),
+                });
+            };
+            if summary_id.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.specUpdates entry id must not be empty"
+                        .to_string(),
+                });
+            }
+            let mut updates = match metadata.get("specUpdates") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items.clone(),
+                Some(_) => {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "message metadata.specUpdates must be a JSON array".to_string(),
+                    });
+                }
+            };
+            if let Some(existing) = updates.iter_mut().find(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == summary_id)
+            }) {
+                *existing = summary;
+            } else {
+                updates.push(summary);
+            }
+            metadata.insert("specUpdates".to_string(), Value::Array(updates));
+        }
+        MessageMetadataMutation::RemoveKey { key } => {
+            if key.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata key must not be empty".to_string(),
+                });
+            }
+            metadata.remove(&key);
+        }
+        MessageMetadataMutation::MergeNestedObjectFields { key, fields } => {
+            if key.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata key must not be empty".to_string(),
+                });
+            }
+            match metadata.get_mut(&key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Object(nested)) => {
+                    for (field, value) in fields {
+                        nested.insert(field, value);
+                    }
+                }
+                Some(_) => {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!("message metadata.{key} must be a JSON object"),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
