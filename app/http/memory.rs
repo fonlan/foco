@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use axum::{
     Json,
@@ -1124,7 +1127,7 @@ pub(crate) async fn memory_dream_jobs(
         .clamp(1, MEMORY_DREAM_JOBS_LIMIT_MAX);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let fetch_limit = offset.saturating_add(page_size);
-    let mut jobs = Vec::new();
+    let mut pending = Vec::new();
     let mut total_count = 0;
 
     if scope.is_none() || scope == Some(MemoryDreamScope::Global) {
@@ -1136,13 +1139,10 @@ pub(crate) async fn memory_dream_jobs(
             .dream_jobs_for_scope_page(MemoryDreamScope::Global, None, status, fetch_limit, 0)
             .map_err(ApiError::from_memory_error)?
         {
-            let transcript_workspace_id =
-                memory_dream_transcript_workspace_id_for_job(&config, &job)?;
-            jobs.push(memory_dream_job_summary(
-                &database,
+            pending.push(PendingMemoryDreamJob {
                 job,
-                transcript_workspace_id,
-            )?);
+                source_workspace_id: None,
+            });
         }
     }
 
@@ -1172,26 +1172,16 @@ pub(crate) async fn memory_dream_jobs(
                 )
                 .map_err(ApiError::from_memory_error)?
             {
-                jobs.push(memory_dream_job_summary(
-                    &database,
+                pending.push(PendingMemoryDreamJob {
                     job,
-                    Some(workspace.id.clone()),
-                )?);
+                    source_workspace_id: Some(workspace.id.clone()),
+                });
             }
         }
     }
 
-    jobs.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let jobs = jobs
-        .into_iter()
-        .skip(offset as usize)
-        .take(page_size as usize)
-        .collect();
+    let page_jobs = select_memory_dream_jobs_page(pending, offset, page_size);
+    let jobs = materialize_memory_dream_job_summaries_for_page(&state, &config, page_jobs)?;
 
     Ok(Json(MemoryDreamJobsResponse {
         jobs,
@@ -1276,6 +1266,176 @@ fn memory_dream_workspaces<'a>(
     }
 
     Ok(config.workspaces.iter().collect())
+}
+
+/// Sortable Dream job row collected before summary / legacy transcript resolution.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMemoryDreamJob {
+    pub(crate) job: MemoryDreamJobRecord,
+    /// Workspace that owns the job store for workspace-scoped jobs.
+    pub(crate) source_workspace_id: Option<String>,
+}
+
+/// Observable counters for legacy transcript workspace resolution (tests).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyTranscriptLookupStats {
+    pub(crate) workspace_opens: usize,
+    pub(crate) batch_existence_queries: usize,
+}
+
+/// Sort by `created_at DESC, id ASC` and take the requested page.
+pub(crate) fn select_memory_dream_jobs_page(
+    mut pending: Vec<PendingMemoryDreamJob>,
+    offset: u32,
+    page_size: u32,
+) -> Vec<PendingMemoryDreamJob> {
+    pending.sort_by(|left, right| {
+        right
+            .job
+            .created_at
+            .cmp(&left.job.created_at)
+            .then_with(|| left.job.id.cmp(&right.job.id))
+    });
+    pending
+        .into_iter()
+        .skip(offset as usize)
+        .take(page_size as usize)
+        .collect()
+}
+
+fn materialize_memory_dream_job_summaries_for_page(
+    state: &AppState,
+    config: &GlobalConfig,
+    page_jobs: Vec<PendingMemoryDreamJob>,
+) -> Result<Vec<MemoryDreamJobSummary>, ApiError> {
+    if page_jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let transcript_by_job_id =
+        resolve_page_transcript_workspace_ids(config, &page_jobs, |workspace| {
+            WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)
+        })?;
+
+    let mut global_database = None;
+    let mut workspace_databases: HashMap<String, MemoryDatabase> = HashMap::new();
+    let mut summaries = Vec::with_capacity(page_jobs.len());
+
+    for pending in page_jobs {
+        let transcript_workspace_id = transcript_by_job_id.get(&pending.job.id).cloned().flatten();
+        let database = if let Some(workspace_id) = pending.source_workspace_id.as_deref() {
+            if !workspace_databases.contains_key(workspace_id) {
+                let opened = open_dream_memory_database(
+                    state,
+                    config,
+                    MemoryDreamScope::Workspace,
+                    Some(workspace_id),
+                )?;
+                workspace_databases.insert(workspace_id.to_string(), opened);
+            }
+            workspace_databases
+                .get(workspace_id)
+                .expect("workspace memory database was just inserted")
+        } else {
+            if global_database.is_none() {
+                global_database = Some(open_dream_memory_database(
+                    state,
+                    config,
+                    MemoryDreamScope::Global,
+                    None,
+                )?);
+            }
+            global_database
+                .as_ref()
+                .expect("global memory database was just opened")
+        };
+        summaries.push(memory_dream_job_summary(
+            database,
+            pending.job,
+            transcript_workspace_id,
+        )?);
+    }
+
+    Ok(summaries)
+}
+
+/// Resolve transcript workspace ids for the final list page only.
+///
+/// New Global jobs use persisted `transcriptWorkspaceId`; workspace jobs use their
+/// job workspace; only Global legacy jobs missing that field fall back to a bounded
+/// per-workspace chat PK/IN lookup.
+pub(crate) fn resolve_page_transcript_workspace_ids<F>(
+    config: &GlobalConfig,
+    page_jobs: &[PendingMemoryDreamJob],
+    open_workspace: F,
+) -> Result<HashMap<String, Option<String>>, ApiError>
+where
+    F: FnMut(&WorkspaceConfig) -> Result<WorkspaceDatabaseHandle, ApiError>,
+{
+    let (resolved, _stats) =
+        resolve_page_transcript_workspace_ids_with_stats(config, page_jobs, open_workspace)?;
+    Ok(resolved)
+}
+
+pub(crate) fn resolve_page_transcript_workspace_ids_with_stats<F>(
+    config: &GlobalConfig,
+    page_jobs: &[PendingMemoryDreamJob],
+    mut open_workspace: F,
+) -> Result<(HashMap<String, Option<String>>, LegacyTranscriptLookupStats), ApiError>
+where
+    F: FnMut(&WorkspaceConfig) -> Result<WorkspaceDatabaseHandle, ApiError>,
+{
+    let mut resolved: HashMap<String, Option<String>> = HashMap::with_capacity(page_jobs.len());
+    let mut legacy_chat_to_job_ids: HashMap<String, Vec<String>> = HashMap::new();
+
+    for pending in page_jobs {
+        if let Some(workspace_id) = memory_dream_transcript_workspace_id_from_input(&pending.job) {
+            resolved.insert(pending.job.id.clone(), Some(workspace_id));
+            continue;
+        }
+        if pending.job.scope == "workspace" {
+            let workspace_id = pending
+                .source_workspace_id
+                .clone()
+                .or_else(|| pending.job.workspace_id.clone());
+            resolved.insert(pending.job.id.clone(), workspace_id);
+            continue;
+        }
+        match pending.job.transcript_chat_id.as_deref() {
+            Some(chat_id) if !chat_id.trim().is_empty() => {
+                legacy_chat_to_job_ids
+                    .entry(chat_id.to_string())
+                    .or_default()
+                    .push(pending.job.id.clone());
+            }
+            _ => {
+                resolved.insert(pending.job.id.clone(), None);
+            }
+        }
+    }
+
+    let mut stats = LegacyTranscriptLookupStats::default();
+    if legacy_chat_to_job_ids.is_empty() {
+        return Ok((resolved, stats));
+    }
+
+    let candidates: Vec<String> = legacy_chat_to_job_ids.keys().cloned().collect();
+    let (chat_to_workspace, lookup_stats) = resolve_legacy_transcript_chat_ids_with_stats(
+        config.workspaces.iter(),
+        &candidates,
+        &mut open_workspace,
+    )?;
+    stats = lookup_stats;
+
+    for (chat_id, job_ids) in legacy_chat_to_job_ids {
+        let workspace_id = chat_to_workspace.get(&chat_id).cloned();
+        for job_id in job_ids {
+            resolved.insert(job_id, workspace_id.clone());
+        }
+    }
+
+    Ok((resolved, stats))
 }
 
 struct LocatedMemoryDreamJob {
@@ -1482,30 +1642,75 @@ fn memory_dream_transcript_workspace_id_from_input(job: &MemoryDreamJobRecord) -
         .map(str::to_string)
 }
 
-/// Legacy fallback: resolve a single transcript chat via primary-key lookup per workspace.
-/// Never enumerates every dream transcript chat across all workspaces.
+/// Single-job legacy fallback used by detail/manual-run paths.
+/// List endpoints must use [`resolve_page_transcript_workspace_ids_with_stats`] instead.
 fn memory_dream_transcript_workspace_id_by_chat_lookup(
     config: &GlobalConfig,
     transcript_chat_id: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    let Some(transcript_chat_id) = transcript_chat_id else {
+    let Some(transcript_chat_id) = transcript_chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(None);
     };
-    for workspace in &config.workspaces {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+    let chat_id = transcript_chat_id.to_string();
+    let (chat_to_workspace, _stats) = resolve_legacy_transcript_chat_ids_with_stats(
+        config.workspaces.iter(),
+        std::slice::from_ref(&chat_id),
+        |workspace| {
+            WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)
+        },
+    )?;
+    Ok(chat_to_workspace.get(&chat_id).cloned())
+}
+
+/// Bounded legacy resolution: each workspace is opened at most once; already-found
+/// chat ids are dropped from subsequent IN queries. Never calls `dream_transcript_chats()`.
+pub(crate) fn resolve_legacy_transcript_chat_ids_with_stats<'a, I, F>(
+    workspaces: I,
+    chat_ids: &[String],
+    mut open_workspace: F,
+) -> Result<(HashMap<String, String>, LegacyTranscriptLookupStats), ApiError>
+where
+    I: IntoIterator<Item = &'a WorkspaceConfig>,
+    F: FnMut(&WorkspaceConfig) -> Result<WorkspaceDatabaseHandle, ApiError>,
+{
+    let mut stats = LegacyTranscriptLookupStats::default();
+    if chat_ids.is_empty() {
+        return Ok((HashMap::new(), stats));
+    }
+
+    let mut unresolved: HashSet<String> = chat_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if unresolved.is_empty() {
+        return Ok((HashMap::new(), stats));
+    }
+
+    let mut chat_to_workspace: HashMap<String, String> = HashMap::new();
+    for workspace in workspaces {
+        if unresolved.is_empty() {
+            break;
+        }
+        let database = open_workspace(workspace)?;
+        stats.workspace_opens += 1;
+        let candidates: Vec<String> = unresolved.iter().cloned().collect();
+        let existing = database
+            .existing_chat_ids(&candidates)
             .map_err(ApiError::from_workspace_error)?;
-        if database
-            .chat(transcript_chat_id)
-            .map_err(ApiError::from_workspace_error)?
-            .is_some()
-        {
-            // Best-effort lazy backfill is not persisted here: job stores live in
-            // memory DBs and this path only serves API responses for pre-migration jobs.
-            return Ok(Some(workspace.id.clone()));
+        stats.batch_existence_queries += 1;
+        for chat_id in existing {
+            unresolved.remove(&chat_id);
+            chat_to_workspace.insert(chat_id, workspace.id.clone());
         }
     }
 
-    Ok(None)
+    Ok((chat_to_workspace, stats))
 }
 
 fn dream_limit(value: Option<u32>, default: u32, max: u32) -> u32 {

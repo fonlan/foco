@@ -442,6 +442,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_crates_do_not_call_chat_code_change_stats() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let mut offenders = Vec::new();
+        // Match only definitions / call sites; bare mentions in this guard do not count.
+        for pattern in ["fn chat_code_change_stats", ".chat_code_change_stats("] {
+            for crate_dir in ["app", "tools", "graph", "agent", "store"] {
+                let root = workspace_root.join(crate_dir);
+                if !root.exists() {
+                    continue;
+                }
+                collect_symbol_call_sites(&root, workspace_root, pattern, &mut offenders);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unscoped code-change aggregation was removed; use code_change_stats_for_chats with page chat ids: {offenders:?}"
+        );
+    }
+
+    fn collect_symbol_call_sites(
+        dir: &Path,
+        workspace_root: &Path,
+        symbol: &str,
+        offenders: &mut Vec<String>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
+                if matches!(name, "target" | "node_modules" | ".git" | ".foco") {
+                    continue;
+                }
+                collect_symbol_call_sites(&path, workspace_root, symbol, offenders);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+                continue;
+            }
+            let relative = match path.strip_prefix(workspace_root) {
+                Ok(relative) => relative,
+                Err(_) => continue,
+            };
+            if relative == Path::new("store/workspace_gate.rs") {
+                // This guard lives here; ignore self-references in test source.
+                continue;
+            }
+            let is_test_path = relative.components().any(|component| {
+                component.as_os_str() == "tests"
+                    || component
+                        .as_os_str()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with("_tests.rs"))
+            });
+            if is_test_path {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production_source = strip_cfg_test_regions(&source);
+            if production_source.contains(symbol) {
+                offenders.push(relative.display().to_string());
+            }
+        }
+    }
+
     fn collect_ungated_call_sites(
         dir: &Path,
         workspace_root: &Path,

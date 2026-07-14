@@ -52,9 +52,11 @@ use serde_json::json;
 use crate::http::{
     chat::{ChatGuidanceRequest, QueueChatMessageRequest},
     memory::{
-        MemoryDreamChangesQuery, MemoryDreamJobsQuery, MemoryDreamRunRequest, memory_dream_changes,
-        memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries,
-        memory_extraction_task_from_job, run_memory_dream,
+        LegacyTranscriptLookupStats, MemoryDreamChangesQuery, MemoryDreamJobsQuery,
+        MemoryDreamRunRequest, PendingMemoryDreamJob, memory_dream_changes, memory_dream_job,
+        memory_dream_jobs, memory_extraction_job_summaries, memory_extraction_task_from_job,
+        resolve_page_transcript_workspace_ids_with_stats, run_memory_dream,
+        select_memory_dream_jobs_page,
     },
     settings::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
@@ -14183,7 +14185,7 @@ fn git_diff_summary_uses_chinese_heading_for_chinese_language() {
 }
 
 #[test]
-fn chat_code_change_stats_sum_assistant_metadata() {
+fn code_change_stats_for_chats_bounds_to_requested_ids() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-chat-code-stats-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut database =
@@ -14191,6 +14193,9 @@ fn chat_code_change_stats_sum_assistant_metadata() {
 
     database
         .insert_chat("chat-1", "Code stats chat")
+        .expect("chat insert");
+    database
+        .insert_chat("chat-2", "Other chat")
         .expect("chat insert");
     database
         .insert_message(NewMessage {
@@ -14212,14 +14217,31 @@ fn chat_code_change_stats_sum_assistant_metadata() {
             metadata_json: Some(r#"{"codeChangeStats":{"additions":4,"deletions":0}}"#),
         })
         .expect("assistant message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-other",
+            chat_id: "chat-2",
+            role: "assistant",
+            content: "Unrelated.",
+            sequence: 0,
+            metadata_json: Some(r#"{"codeChangeStats":{"additions":100,"deletions":50}}"#),
+        })
+        .expect("assistant message insert");
 
-    let stats = database
-        .chat_code_change_stats()
-        .expect("chat code change stats");
-    let chat_stats = stats.get("chat-1").expect("chat stats");
-
+    let multi = database
+        .code_change_stats_for_chats(&["chat-1".to_string(), "missing-chat".to_string()])
+        .expect("bounded code change stats");
+    assert_eq!(multi.len(), 1);
+    let chat_stats = multi.get("chat-1").expect("chat stats");
     assert_eq!(chat_stats.additions, 7);
     assert_eq!(chat_stats.deletions, 2);
+    assert!(!multi.contains_key("chat-2"));
+    assert!(!multi.contains_key("missing-chat"));
+
+    let empty = database
+        .code_change_stats_for_chats(&[])
+        .expect("empty chat ids");
+    assert!(empty.is_empty());
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -16114,6 +16136,362 @@ async fn memory_dream_jobs_paginates_and_filters_on_server() {
     assert_eq!(filtered_response["jobs"][0]["scope"], "workspace");
     assert_eq!(filtered_response["jobs"][0]["status"], "failed");
 }
+
+#[test]
+fn select_memory_dream_jobs_page_orders_created_at_desc_id_asc() {
+    let pending = vec![
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job("b", "2026-01-02T00:00:00.000Z", None),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job("a", "2026-01-02T00:00:00.000Z", None),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job("c", "2026-01-03T00:00:00.000Z", None),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job("d", "2026-01-01T00:00:00.000Z", None),
+            source_workspace_id: None,
+        },
+    ];
+
+    let page = select_memory_dream_jobs_page(pending, 1, 2);
+    assert_eq!(
+        page.iter()
+            .map(|item| item.job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+}
+
+#[test]
+fn legacy_transcript_resolution_skips_persisted_ids_and_batches_workspace_opens() {
+    let workspace_one = tempfile::tempdir().expect("workspace one");
+    let workspace_two = tempfile::tempdir().expect("workspace two");
+    let mut config = GlobalConfig::first_run(workspace_one.path().to_path_buf());
+    let workspace_one_id = config.workspaces[0].id.clone();
+    let mut workspace_two_config = config.workspaces[0].clone();
+    workspace_two_config.id = "workspace-two".to_string();
+    workspace_two_config.path = workspace_two.path().to_path_buf();
+    config.workspaces.push(workspace_two_config);
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_one.path()).expect("workspace one db");
+        database
+            .insert_chat("legacy-chat-a", "Legacy A")
+            .expect("chat a");
+        database
+            .insert_chat("legacy-chat-b", "Legacy B")
+            .expect("chat b");
+    }
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_two.path()).expect("workspace two db");
+        database
+            .insert_chat("legacy-chat-only-two", "Legacy only two")
+            .expect("chat only two");
+    }
+
+    let page_jobs = vec![
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job_with_input(
+                "new-global",
+                "2026-01-05T00:00:00.000Z",
+                Some("legacy-chat-a"),
+                r#"{"transcriptWorkspaceId":"workspace-persisted"}"#,
+            ),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: {
+                let mut job =
+                    seed_pending_dream_job("workspace-job", "2026-01-04T00:00:00.000Z", None);
+                job.scope = "workspace".to_string();
+                job.workspace_id = Some(workspace_one_id.clone());
+                job
+            },
+            source_workspace_id: Some(workspace_one_id.clone()),
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job(
+                "legacy-global-a",
+                "2026-01-03T00:00:00.000Z",
+                Some("legacy-chat-a"),
+            ),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job(
+                "legacy-global-b",
+                "2026-01-02T00:00:00.000Z",
+                Some("legacy-chat-b"),
+            ),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job(
+                "legacy-global-two",
+                "2026-01-01T00:00:00.000Z",
+                Some("legacy-chat-only-two"),
+            ),
+            source_workspace_id: None,
+        },
+        PendingMemoryDreamJob {
+            job: seed_pending_dream_job(
+                "legacy-missing",
+                "2026-01-01T00:00:00.000Z",
+                Some("missing-chat"),
+            ),
+            source_workspace_id: None,
+        },
+    ];
+
+    let mut open_counts = std::collections::HashMap::<String, usize>::new();
+    let (resolved, stats) =
+        resolve_page_transcript_workspace_ids_with_stats(&config, &page_jobs, |workspace| {
+            *open_counts.entry(workspace.id.clone()).or_default() += 1;
+            WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)
+        })
+        .expect("resolve page transcript workspaces");
+
+    assert_eq!(
+        resolved.get("new-global").cloned().flatten().as_deref(),
+        Some("workspace-persisted")
+    );
+    assert_eq!(
+        resolved.get("workspace-job").cloned().flatten().as_deref(),
+        Some(workspace_one_id.as_str())
+    );
+    assert_eq!(
+        resolved
+            .get("legacy-global-a")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some(workspace_one_id.as_str())
+    );
+    assert_eq!(
+        resolved
+            .get("legacy-global-b")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some(workspace_one_id.as_str())
+    );
+    assert_eq!(
+        resolved
+            .get("legacy-global-two")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some("workspace-two")
+    );
+    assert_eq!(resolved.get("legacy-missing").cloned().flatten(), None);
+
+    // Two legacy chats in workspace one share a single open + batch query.
+    assert_eq!(stats.workspace_opens, 2);
+    assert_eq!(stats.batch_existence_queries, 2);
+    assert_eq!(open_counts.get(&workspace_one_id), Some(&1));
+    assert_eq!(open_counts.get("workspace-two"), Some(&1));
+    assert_eq!(
+        stats,
+        LegacyTranscriptLookupStats {
+            workspace_opens: 2,
+            batch_existence_queries: 2,
+        }
+    );
+}
+
+#[test]
+fn legacy_transcript_resolution_stops_after_all_ids_found() {
+    let workspace_one = tempfile::tempdir().expect("workspace one");
+    let workspace_two = tempfile::tempdir().expect("workspace two");
+    let mut config = GlobalConfig::first_run(workspace_one.path().to_path_buf());
+    let mut workspace_two_config = config.workspaces[0].clone();
+    workspace_two_config.id = "workspace-two".to_string();
+    workspace_two_config.path = workspace_two.path().to_path_buf();
+    config.workspaces.push(workspace_two_config);
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace_one.path()).expect("workspace one db");
+        database
+            .insert_chat("legacy-chat-hit", "Legacy hit")
+            .expect("chat");
+    }
+    WorkspaceDatabase::open_or_create(workspace_two.path()).expect("workspace two db");
+
+    let page_jobs = vec![PendingMemoryDreamJob {
+        job: seed_pending_dream_job(
+            "legacy-hit",
+            "2026-01-01T00:00:00.000Z",
+            Some("legacy-chat-hit"),
+        ),
+        source_workspace_id: None,
+    }];
+
+    let mut opened = Vec::new();
+    let (resolved, stats) =
+        resolve_page_transcript_workspace_ids_with_stats(&config, &page_jobs, |workspace| {
+            opened.push(workspace.id.clone());
+            WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)
+        })
+        .expect("resolve");
+
+    assert_eq!(
+        resolved.get("legacy-hit").cloned().flatten().as_deref(),
+        Some(config.workspaces[0].id.as_str())
+    );
+    assert_eq!(opened, vec![config.workspaces[0].id.clone()]);
+    assert_eq!(stats.workspace_opens, 1);
+    assert_eq!(stats.batch_existence_queries, 1);
+}
+
+#[tokio::test]
+async fn memory_dream_jobs_defers_legacy_lookup_until_selected_page() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat("page1-legacy-chat", "Page1 transcript")
+            .expect("page1 chat");
+        database
+            .insert_chat("page3-legacy-chat", "Page3 transcript")
+            .expect("page3 chat");
+    }
+    {
+        let mut global_database =
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .expect("global memory database");
+        // Insert oldest first, then sleep so created_at orders newest on page 1.
+        global_database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "global-legacy-page3",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Completed,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: Some(r#"{"summary":"legacy page3"}"#),
+                transcript_chat_id: Some("page3-legacy-chat"),
+                error_message: None,
+            })
+            .expect("legacy page3 job");
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("ensure workspace db");
+            let mut memory_database =
+                MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                    .expect("workspace memory");
+            memory_database
+                .insert_dream_job(NewMemoryDreamJob {
+                    id: "workspace-middle",
+                    scope: MemoryDreamScope::Workspace,
+                    workspace_id: Some(&workspace_id),
+                    trigger_type: MemoryDreamTriggerType::Manual,
+                    mode: MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Completed,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: Some(r#"{"summary":"workspace"}"#),
+                    transcript_chat_id: Some("page1-legacy-chat"),
+                    error_message: None,
+                })
+                .expect("workspace job");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        global_database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "global-new-with-id",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Completed,
+                model_id: None,
+                input_summary_json: &format!(r#"{{"transcriptWorkspaceId":"{workspace_id}"}}"#),
+                output_summary_json: Some(r#"{"summary":"new"}"#),
+                transcript_chat_id: Some("page1-legacy-chat"),
+                error_message: None,
+            })
+            .expect("new global job");
+    }
+
+    let page1_query = serde_json::from_value(json!({ "page": 1, "pageSize": 1 })).expect("page1");
+    let Json(page1) = memory_dream_jobs(State(state.clone()), Query(page1_query))
+        .await
+        .expect("page1 jobs");
+    let page1 = serde_json::to_value(page1).expect("page1 json");
+    assert_eq!(page1["totalCount"], 3);
+    assert_eq!(page1["totalPages"], 3);
+    assert_eq!(page1["jobs"][0]["id"], "global-new-with-id");
+    assert_eq!(page1["jobs"][0]["transcriptWorkspaceId"], workspace_id);
+
+    let page2_query = serde_json::from_value(json!({ "page": 2, "pageSize": 1 })).expect("page2");
+    let Json(page2) = memory_dream_jobs(State(state.clone()), Query(page2_query))
+        .await
+        .expect("page2 jobs");
+    let page2 = serde_json::to_value(page2).expect("page2 json");
+    assert_eq!(page2["jobs"][0]["id"], "workspace-middle");
+    assert_eq!(page2["jobs"][0]["transcriptWorkspaceId"], workspace_id);
+
+    let page3_query = serde_json::from_value(json!({ "page": 3, "pageSize": 1 })).expect("page3");
+    let Json(page3) = memory_dream_jobs(State(state), Query(page3_query))
+        .await
+        .expect("page3 jobs");
+    let page3 = serde_json::to_value(page3).expect("page3 json");
+    assert_eq!(page3["jobs"][0]["id"], "global-legacy-page3");
+    assert_eq!(page3["jobs"][0]["transcriptWorkspaceId"], workspace_id);
+}
+
+fn seed_pending_dream_job(
+    id: &str,
+    created_at: &str,
+    transcript_chat_id: Option<&str>,
+) -> foco_store::memory::MemoryDreamJobRecord {
+    seed_pending_dream_job_with_input(id, created_at, transcript_chat_id, "{}")
+}
+
+fn seed_pending_dream_job_with_input(
+    id: &str,
+    created_at: &str,
+    transcript_chat_id: Option<&str>,
+    input_summary_json: &str,
+) -> foco_store::memory::MemoryDreamJobRecord {
+    foco_store::memory::MemoryDreamJobRecord {
+        id: id.to_string(),
+        scope: "global".to_string(),
+        workspace_id: None,
+        trigger_type: "manual".to_string(),
+        mode: "deterministic_only".to_string(),
+        status: "completed".to_string(),
+        model_id: None,
+        input_summary_json: input_summary_json.to_string(),
+        output_summary_json: None,
+        transcript_chat_id: transcript_chat_id.map(str::to_string),
+        error_message: None,
+        created_at: created_at.to_string(),
+        started_at: None,
+        completed_at: None,
+    }
+}
+
 #[tokio::test]
 async fn auto_memory_dream_scheduler_uses_threshold_trigger() {
     let profile = tempfile::tempdir().expect("profile");

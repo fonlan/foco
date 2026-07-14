@@ -5367,6 +5367,18 @@ fn chat_page_uses_cursor_search_and_scoped_code_change_stats() {
     assert_eq!(stats.len(), 1);
     assert_eq!(stats["chat-3"].additions, 4);
     assert_eq!(stats["chat-3"].deletions, 1);
+
+    let existing = database
+        .existing_chat_ids(&[
+            "chat-3".to_string(),
+            "missing-chat".to_string(),
+            "chat-1".to_string(),
+        ])
+        .expect("existing chat ids");
+    assert!(existing.contains("chat-1"));
+    assert!(existing.contains("chat-3"));
+    assert!(!existing.contains("missing-chat"));
+    assert_eq!(existing.len(), 2);
 }
 
 #[test]

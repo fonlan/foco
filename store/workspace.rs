@@ -4401,6 +4401,43 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    /// Bounded primary-key existence check for a page of chat ids.
+    /// Production list paths must not scan every chat in the workspace.
+    pub fn existing_chat_ids(
+        &self,
+        chat_ids: &[String],
+    ) -> Result<HashSet<String>, WorkspaceDatabaseError> {
+        if chat_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let placeholders = (1..=chat_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM chats WHERE id IN ({placeholders})");
+        let query_params = chat_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(query_params), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        let mut existing = HashSet::with_capacity(chat_ids.len());
+        for row in rows {
+            existing.insert(row.map_err(|source| self.sqlite_error(source))?);
+        }
+        Ok(existing)
+    }
+
     pub fn delete_chat(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {
         let deleted = self
             .connection
@@ -4601,28 +4638,6 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
-    }
-
-    /// Full-table assistant metadata scan. Production overview paths must use
-    /// [`Self::code_change_stats_for_chats`] / [`Self::code_change_stats_for_chat`]
-    /// with the current page of chat ids instead.
-    pub fn chat_code_change_stats(
-        &self,
-    ) -> Result<HashMap<String, CodeChangeStats>, WorkspaceDatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT chat_id, metadata_json
-                 FROM messages
-                 WHERE role = 'assistant'",
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|source| self.sqlite_error(source))?;
-        self.code_change_stats_from_rows(rows)
     }
 
     fn code_change_stats_from_rows(
