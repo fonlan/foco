@@ -18115,6 +18115,8 @@ mod tests {
         .await
         .expect("broker AI statistics detail");
         assert_eq!(detail.request.id, "broker-request-real-wire");
+        assert_eq!(detail.request.status_code, Some(200));
+        assert_eq!(detail.request.final_state, "succeeded");
         assert_eq!(detail.request.request_detail_status, "captured");
         assert_eq!(detail.request.response_detail_status, "captured");
         assert_eq!(detail.request.request_body.as_ref(), Some(&request_wire));
@@ -18166,18 +18168,16 @@ mod tests {
                  headers: axum::http::HeaderMap,
                  body: axum::body::Bytes| async move {
                     let _ = (method, uri, headers, body);
-                    let mut response = axum::response::Response::new(axum::body::Body::from(
-                        concat!(
+                    // Non-default success 2xx: proves status_code is not hard-coded to 200.
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::CREATED)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(concat!(
                             "data: {\"id\":\"broker-status-only\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"status only\"}}]}\n\n",
                             "data: {\"id\":\"broker-status-only\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
                             "data: [DONE]\n\n"
-                        ),
-                    ));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        header::HeaderValue::from_static("text/event-stream"),
-                    );
-                    response
+                        )))
+                        .expect("build 201 response")
                 },
             ),
         );
@@ -18362,7 +18362,11 @@ mod tests {
         assert_eq!(request.request_kind, "chat completion");
         assert_eq!(request.provider_id, "provider-1");
         assert_eq!(request.final_state, "succeeded");
-        assert_eq!(request.status_code, Some(200));
+        assert_eq!(
+            request.status_code,
+            Some(201),
+            "details-off must still persist real Response status (not hard-coded 200)"
+        );
         assert!(
             request.request_body_json.is_none(),
             "details-off must not persist request wire dump"
@@ -18371,6 +18375,239 @@ mod tests {
             request.response_body_json.is_none(),
             "details-off must not persist response wire dump"
         );
+    }
+
+    /// HTTP non-2xx: final_state is failed while status_code keeps the real Response head status.
+    #[tokio::test]
+    async fn broker_control_llm_stream_persists_http_failure_status_code_independently_of_final_state()
+     {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                |method: axum::http::Method,
+                 uri: axum::http::Uri,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    let _ = (method, uri, headers, body);
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::BAD_GATEWAY)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            r#"{"error":"upstream unavailable"}"#,
+                        ))
+                        .expect("build 502 response")
+                },
+            ),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: "/remote/project".to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        let broker_request_id = "broker-request-http-failure-status".to_string();
+        let provider_request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "HTTP failure must keep status_code.".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let broker_payload = json!({
+            "workspaceId": workspace_id,
+            "chatId": "chat-broker-http-fail",
+            "chatTitle": "Broker HTTP fail",
+            "providerId": "provider-legacy",
+            "modelId": "model-1",
+            "requestKind": "chat completion",
+            "request": provider_request,
+        });
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_request_id = broker_request_id.clone();
+        let control_task = tokio::spawn(async move {
+            let (stream, _) = control_listener
+                .accept()
+                .await
+                .expect("accept control connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept control websocket");
+            let config_message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("config sync timeout")
+                .expect("config sync message")
+                .expect("config sync websocket result");
+            let tungstenite::Message::Text(config_text) = config_message else {
+                panic!("expected config sync text frame");
+            };
+            let config_envelope: ControlEnvelope =
+                serde_json::from_str(config_text.as_str()).expect("config sync envelope");
+            assert_eq!(config_envelope.message_type, "config");
+            assert_eq!(config_envelope.method.as_deref(), Some("config.sync"));
+            let config_id = config_envelope.id.expect("config sync id");
+            let config_response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(config_id),
+                method: None,
+                payload: json!({ "status": "ok" }),
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&config_response)
+                        .expect("serialize config response")
+                        .into(),
+                ))
+                .await
+                .expect("send config response");
+            let request = ControlEnvelope {
+                version: 1,
+                message_type: "request".to_string(),
+                id: Some(control_request_id.clone()),
+                method: Some("llm.stream".to_string()),
+                payload: broker_payload,
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("serialize broker request")
+                        .into(),
+                ))
+                .await
+                .expect("send broker request");
+
+            loop {
+                let message = timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("broker response timeout")
+                    .expect("broker response message")
+                    .expect("broker response websocket result");
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let envelope: ControlEnvelope =
+                    serde_json::from_str(text.as_str()).expect("broker response envelope");
+                if envelope.id.as_deref() != Some(control_request_id.as_str()) {
+                    continue;
+                }
+                match envelope.message_type.as_str() {
+                    "error" => return envelope,
+                    "response" => panic!("expected broker error for HTTP 502, got ok response"),
+                    _ => {}
+                }
+            }
+        });
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .expect("connect main-process control websocket");
+        let broker_error = timeout(Duration::from_secs(5), control_task)
+            .await
+            .expect("control fixture completion timeout")
+            .expect("control fixture task");
+        connection_task.abort();
+        let _ = connection_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        assert_eq!(broker_error.message_type, "error");
+        // Non-2xx may surface as provider_error (open) or stream_error (consume); both are failed.
+        let code = broker_error.payload["code"].as_str().unwrap_or_default();
+        assert!(
+            code == "provider_error" || code == "stream_error",
+            "unexpected broker error code: {code}"
+        );
+
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        let database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit database");
+        let request = database
+            .llm_request(&broker_request_id)
+            .expect("broker audit lookup")
+            .expect("broker audit row");
+        assert_eq!(request.chat_id.as_deref(), Some("chat-broker-http-fail"));
+        assert_eq!(request.final_state, "failed");
+        assert_eq!(
+            request.status_code,
+            Some(502),
+            "HTTP failure must persist real Response status independently of final_state"
+        );
+        let response_wire: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("failed response wire"),
+        )
+        .expect("response wire JSON");
+        assert_eq!(response_wire["format"], "provider_final_response_v1");
+        assert_eq!(response_wire["state"], "failed");
+        assert_eq!(response_wire["http"]["status"], 502);
+        drop(database);
+
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state),
+            AxumPath((workspace_id, broker_request_id)),
+        )
+        .await
+        .expect("broker AI statistics detail");
+        assert_eq!(detail.request.final_state, "failed");
+        assert_eq!(detail.request.status_code, Some(502));
     }
 
     /// Full production-shaped remote path:
@@ -18682,6 +18919,7 @@ mod tests {
         assert_eq!(request.request_kind, "chat completion");
         assert_eq!(request.provider_id, "provider-1");
         assert_eq!(request.final_state, "succeeded");
+        assert_eq!(request.status_code, Some(200));
         assert_eq!(request.input_tokens, Some(9));
         assert_eq!(request.output_tokens, Some(3));
         let request_wire: Value = serde_json::from_str(
@@ -18740,6 +18978,8 @@ mod tests {
         .await
         .expect("SSH AI statistics detail");
         assert_eq!(detail.request.id, broker_request_id);
+        assert_eq!(detail.request.status_code, Some(200));
+        assert_eq!(detail.request.final_state, "succeeded");
         assert_eq!(detail.request.request_detail_status, "captured");
         assert_eq!(detail.request.response_detail_status, "captured");
         assert_eq!(
@@ -18791,6 +19031,11 @@ mod tests {
         assert_eq!(list.requests.len(), 1);
         assert_eq!(list.requests[0].id, broker_request_id);
         assert_eq!(list.requests[0].final_state, "succeeded");
+        assert_eq!(
+            list.requests[0].status_code,
+            Some(200),
+            "list API must surface structured status_code from remote-workspace-audit"
+        );
     }
 
     #[test]

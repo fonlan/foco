@@ -17,6 +17,7 @@ Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 s
 - `merge_audit_detail_for_update`：真实 v1 可覆盖 NULL/非 v1；已有有效 v1 不被 NULL/legacy/normalized/重复 finish 覆盖。
 - `open_or_create` 幂等清理非 v1 详情为 NULL（不伪造转 v1）；缺 detail 列的迁移 stub 跳过；并发写锁 busy 时 best-effort 跳过，下次 open 再试。
 - 详情关闭：`save_request_response_details=false` 时 request/response detail 为 NULL（不再保留 compact `{cancelled}` 正文）。
+- **结构化 `llm_requests.status_code` 与详情开关解耦**：只要观察到真实 HTTP Response head，就写入结构化 `status_code`（本地与 SSH 主进程 `remote-workspace-audit` 同契约）；完整 head dump 与 wire envelope 仍仅在详情开启时保留。无 Response（DNS/TLS/连接失败或响应前取消）→ `status_code` 为 NULL（UI `n/a`）。列表/详情 API **只读**该列，不从 `final_state` 或可选 wire dump 推导，不得硬编码 200。存量：`status_code IS NULL` 且仍保留合法 `provider_final_response_v1` 时一次性从 `http.status`（否则 failed envelope 的 `statusCode` 100–599）回填；metadata `llm_audit_status_code_v1_repaired`；非 v1/已清理/无 head 保持 NULL。
 - 归一化状态只保留在 `llm_request_events.normalized_event_json`、run events 与结构化列。
 
 源码守卫 `app/provider_audit_source_guard.rs` 固定以下边界：
@@ -30,10 +31,14 @@ Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 s
 
 - `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters`：真实本地 HTTP 覆盖 OpenAI Chat、OpenAI Responses、Anthropic、Gemini；逐请求比较 observer dump 与服务端实际 method/path/body，校验 Request headers 仅 Authorization 星号化、其它最终 HeaderMap 值保留、最终 adapter 映射和每个 attempt 只发送一次。
 - `providers/lib.rs::tests::captures_final_wire_request_and_only_final_response`, `captures_http_response_head_for_non_success_stream` 与 `connection_failure_before_http_response_does_not_fabricate_response_head`：固定 2xx streaming、非 2xx、收到 response 后失败以及连接建立前失败的可用性边界；真实 status/version/response headers 在 body 消费前捕获，Request/Response 均仅 Authorization 星号化，连接类失败不得伪造 HTTP head。
+- `providers/lib.rs` status 聚焦：`http_status_preserves_non_default_success_status_without_detail_dumps`（201 且详情关闭 dump 仍 None）、`http_status_is_captured_without_detail_dumps`（502）、`http_status_survives_stream_decode_failure_after_response_head`、`connection_failure_http_status_is_none_without_response`。
 - `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire`：真实主聊天生产路径贯穿 mock provider → 双 observers → SQLite `llm_requests` → AI statistics detail handler；仅 1 条 turn 审计、无 `run-` summary row；新记录为 `provider_request_v1` / `provider_final_response_v1`、chunk-only sentinel 不落库。
 - `app/tests/mod.rs::main_chat_details_disabled_send_once_without_request_or_response_dump`：详情关闭时仍只发送一次，成功审计统计保留，但 request/response detail 为 `NULL`。
-- `app/remote_workspace.rs::remote_ssh_sidecar_chat_turn_persists_real_wire_to_profile_audit_mirror`：真实 `WorkspaceLocation::Ssh` + `remote_sidecar_chat_stream` → control WS → mock provider → 主进程 `profile/.foco/remote-workspace-audit` list/detail；sidecar mirror detail 恒 NULL；同一 broker id 全链路一致。
-- `app/remote_workspace.rs::broker_control_llm_stream_persists_real_provider_wire_and_exposes_same_request_id_to_detail_api`：control WS → `llm.stream` → mock OpenAI → SQLite → Detail API（Ssh 路径）。
+- `app/remote_workspace.rs::remote_ssh_sidecar_chat_turn_persists_real_wire_to_profile_audit_mirror`：真实 `WorkspaceLocation::Ssh` + `remote_sidecar_chat_stream` → control WS → mock provider → 主进程 `profile/.foco/remote-workspace-audit` list/detail；sidecar mirror detail 恒 NULL；同一 broker id 全链路一致；SQLite/list/detail 同一真实 `statusCode`。
+- `app/remote_workspace.rs::broker_control_llm_stream_persists_real_provider_wire_and_exposes_same_request_id_to_detail_api`：control WS → `llm.stream` → mock OpenAI → SQLite → Detail API（Ssh 路径）；断言结构化 `status_code`。
+- `app/remote_workspace.rs::broker_control_llm_stream_persists_status_code_without_request_response_details`：详情关闭仍写真实 `status_code`（含非默认 2xx），wire dump 为 NULL。
+- `app/remote_workspace.rs::broker_control_llm_stream_persists_http_failure_status_code_independently_of_final_state`：HTTP 502 → `final_state=failed` 且 `status_code=502`（业务终态与 HTTP 状态独立）。
+- `store/tests/workspace_database.rs::repairs_null_status_code_from_valid_v1_response_wire_once`：存量回填矩阵（合法 succeeded/failed v1、无 head、非 v1、非法 status、已有 status 不覆盖、cleaned detail、二次 open 不重复扫描）。
 - `store/tests/workspace_database.rs::rejects_non_v1_audit_details_and_prunes_legacy_on_open`：写入拒绝非 v1；重开清理 `{}`/Neutral/normalized/`{error}`/`{cancelled}`/`legacy_text_v1`；合法 v1 保留。
 
 升级 genai fork、修改 adapter、ProviderAuditCapture、主聊天 turn/retry、远程 Broker、SQLite 审计或详情 API 时，必须重跑上述测试；provider 层 fixture 或前端手工 wire fixture 不能替代 App/SSH 端到端硬验收。

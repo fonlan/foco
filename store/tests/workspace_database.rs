@@ -5921,11 +5921,12 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
     insert(&mut database, "invalid-status-range", "failed");
     insert(&mut database, "non-v1-response", "succeeded");
     insert(&mut database, "already-has-status", "succeeded");
+    insert(&mut database, "cleaned-details", "succeeded");
 
     {
         let database_path = database.database_path().to_path_buf();
         let connection = rusqlite::Connection::open(&database_path).expect("open raw sqlite");
-        let plant = |id: &str, status_code: Option<i64>, response: &str| {
+        let plant = |id: &str, status_code: Option<i64>, response: Option<&str>| {
             connection
                 .execute(
                     "UPDATE llm_requests SET status_code = ?1, response_body_json = ?2 WHERE id = ?3",
@@ -5936,38 +5937,52 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
         plant(
             "with-http-status",
             None,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            ),
         );
         plant(
             "failed-status-code-only",
             None,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"upstream","statusCode":502,"http":null}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"upstream","statusCode":502,"http":null}"#,
+            ),
         );
         plant(
             "no-head-succeeded",
             None,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":null}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":null}"#,
+            ),
         );
         plant(
             "running-with-http",
             None,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            ),
         );
         plant(
             "invalid-status-range",
             None,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"bad","statusCode":999,"http":null}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"bad","statusCode":999,"http":null}"#,
+            ),
         );
         plant(
             "non-v1-response",
             None,
-            r#"{"text":"normalized","statusCode":200}"#,
+            Some(r#"{"text":"normalized","statusCode":200}"#),
         );
         plant(
             "already-has-status",
             Some(418),
-            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            Some(
+                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"http":{"status":200,"version":"HTTP/1.1","headers":{}}}"#,
+            ),
         );
+        // Detail already cleaned / never captured: keep NULL status_code (no forged 200).
+        plant("cleaned-details", None, None);
         connection
             .execute(
                 "DELETE FROM workspace_metadata WHERE key = 'llm_audit_status_code_v1_repaired'",
@@ -6037,6 +6052,15 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
             .status_code,
         Some(418),
         "existing status_code is not overwritten"
+    );
+    assert_eq!(
+        database
+            .llm_request("cleaned-details")
+            .expect("read")
+            .expect("row")
+            .status_code,
+        None,
+        "cleaned/missing detail must stay n/a"
     );
 
     let repair_marker: String = rusqlite::Connection::open(database.database_path())

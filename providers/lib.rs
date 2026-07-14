@@ -3699,6 +3699,43 @@ mod tests {
         assert_eq!(raw_requests.len(), 1);
     }
 
+    /// Non-default success 2xx proves `http_status()` is the real Response status, not hard-coded 200.
+    /// Details-off still omits request/final dumps.
+    #[tokio::test]
+    async fn http_status_preserves_non_default_success_status_without_detail_dumps() {
+        let response = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("201 Created", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "non-default success status",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, false)
+            .await
+            .expect("open 201 fixture stream");
+        assert!(stream.wire_request_dump().is_none());
+        while stream.next_event().await.is_some() {}
+        assert!(stream.final_response_dump().is_none());
+        assert_eq!(
+            stream.http_status(),
+            Some(201),
+            "must return observed Response status, not a hard-coded 200"
+        );
+        assert_eq!(fixture.await.expect("fixture task").len(), 1);
+    }
+
     #[tokio::test]
     async fn http_status_is_captured_without_detail_dumps() {
         let (fixture_root, fixture) = spawn_raw_http_fixture(
@@ -3728,6 +3765,45 @@ mod tests {
         assert!(stream.wire_request_dump().is_none());
         assert!(stream.final_response_dump().is_none());
         assert_eq!(stream.http_status(), Some(502));
+        assert_eq!(fixture.await.expect("fixture task").len(), 1);
+    }
+
+    /// HTTP 200 with unparseable SSE: head was established, so status stays 200 while final dump fails.
+    #[tokio::test]
+    async fn http_status_survives_stream_decode_failure_after_response_head() {
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", "data: {not-valid-json\n\n")
+                .await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "decode fails after head",
+        )]);
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open decode-failure fixture stream");
+        while stream.next_event().await.is_some() {}
+
+        assert_eq!(
+            stream.http_status(),
+            Some(200),
+            "Response head status remains available after body/SSE decode failure"
+        );
+        assert!(matches!(
+            stream.final_response_dump(),
+            Some(ProviderFinalResponseDump::Failed {
+                http: Some(ProviderHttpResponseHeadDump { status: 200, .. }),
+                ..
+            })
+        ));
         assert_eq!(fixture.await.expect("fixture task").len(), 1);
     }
 
