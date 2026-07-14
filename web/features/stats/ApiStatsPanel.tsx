@@ -46,7 +46,11 @@ import type {
 } from "../../api/types";
 import { type AiStatsColumnId } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
-import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
+import {
+  findVerticalScrollAncestor,
+  forwardWheelAtVerticalBoundary,
+  wheelDeltaPixels,
+} from "../../shared/scroll-forwarding";
 import {
   readAiStatsVisibleColumnIds,
   writeAiStatsVisibleColumnIds,
@@ -459,15 +463,9 @@ export function ApiStatsPanel({
       if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
         return;
       }
-      const deltaUnit =
-        event.deltaMode === WheelEvent.DOM_DELTA_LINE
-          ? 16
-          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-            ? tableScroller.clientHeight
-            : 1;
       const node = findVerticalScrollAncestor(tableScroller.parentElement);
       if (node) {
-        node.scrollTop += event.deltaY * deltaUnit;
+        node.scrollTop += wheelDeltaPixels(event, node.clientHeight);
         event.preventDefault();
       }
     };
@@ -1313,38 +1311,8 @@ function AuditJsonBlock({
     setCollapsedPaths(new Set());
   }, []);
 
-  const forwardWheelAtVerticalBoundary = useCallback((event: WheelEvent) => {
-    if (
-      event.deltaY === 0 ||
-      Math.abs(event.deltaY) <= Math.abs(event.deltaX)
-    ) {
-      return;
-    }
-
-    const codeScroller = event.currentTarget as HTMLElement;
-    const atTop = codeScroller.scrollTop <= 0;
-    const atBottom =
-      codeScroller.scrollTop + codeScroller.clientHeight >=
-      codeScroller.scrollHeight - 1;
-    if ((event.deltaY < 0 && !atTop) || (event.deltaY > 0 && !atBottom)) {
-      return;
-    }
-
-    const detailScroller = findVerticalScrollAncestor(codeScroller.parentElement);
-    if (!detailScroller || detailScroller === codeScroller) {
-      return;
-    }
-    const deltaUnit =
-      event.deltaMode === WheelEvent.DOM_DELTA_LINE
-        ? 16
-        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-          ? detailScroller.clientHeight
-          : 1;
-    const previousScrollTop = detailScroller.scrollTop;
-    detailScroller.scrollTop += event.deltaY * deltaUnit;
-    if (detailScroller.scrollTop !== previousScrollTop) {
-      event.preventDefault();
-    }
+  const forwardWheelAtVerticalBoundaryHandler = useCallback((event: WheelEvent) => {
+    forwardWheelAtVerticalBoundary(event, event.currentTarget as HTMLElement);
   }, []);
 
   useEffect(() => {
@@ -1352,13 +1320,13 @@ function AuditJsonBlock({
     if (!codeScroller) {
       return;
     }
-    codeScroller.addEventListener("wheel", forwardWheelAtVerticalBoundary, {
+    codeScroller.addEventListener("wheel", forwardWheelAtVerticalBoundaryHandler, {
       passive: false,
     });
     return () => {
-      codeScroller.removeEventListener("wheel", forwardWheelAtVerticalBoundary);
+      codeScroller.removeEventListener("wheel", forwardWheelAtVerticalBoundaryHandler);
     };
-  }, [forwardWheelAtVerticalBoundary]);
+  }, [forwardWheelAtVerticalBoundaryHandler]);
 
   const togglePath = useCallback((path: string) => {
     setCollapsedPaths((current) => {

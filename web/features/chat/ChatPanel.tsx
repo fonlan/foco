@@ -67,6 +67,7 @@ import type {
 } from "../../api/types";
 import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
+import { forwardWheelAtVerticalBoundary } from "../../shared/scroll-forwarding";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
@@ -76,6 +77,7 @@ const COMPOSER_EDITOR_KEY_STEP_PX = 24;
 const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
 const CHAT_TOP_LOAD_THRESHOLD_PX = 64;
 const MAX_GENERATED_IMAGE_PREVIEWS = 16;
+const TOOL_CALL_SCROLL_CLASS = "tool-call-scroll panel-scroll";
 
 const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
   agent_cancel_task: Server,
@@ -2511,7 +2513,7 @@ function CompactReplacementDiffBlock({ diff }: { diff: CompactReplacementDiff })
   return (
     <div className="min-w-0">
       <div className="mb-1 font-semibold text-stone-500">Diff</div>
-      <div className="panel-scroll max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5">
+      <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5`}>
         {diff.lines.map((line, index) => (
           <div
             className={`edit-file-diff-line grid grid-cols-[1.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${line.kind === "added"
@@ -2546,7 +2548,7 @@ function RawToolCallView({
     <>
       <div className="min-w-0">
         <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-        <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+        <pre className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5`}>
           {formatJsonValue(input)}
         </pre>
       </div>
@@ -2554,7 +2556,7 @@ function RawToolCallView({
         <div className="min-w-0">
           <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
           <pre
-            className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
               ? "border-rose-200 text-rose-700"
               : "border-stone-200"
               }`}
@@ -2567,7 +2569,7 @@ function RawToolCallView({
           <div className="mb-1 font-semibold text-stone-500">
             {t("Live output")}
           </div>
-          <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
+          <pre className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}>
             {liveOutputText}
           </pre>
         </div>
@@ -2597,7 +2599,7 @@ function CompactToolCallView({
   const specMarkdown = successfulSpecMarkdown(toolCall);
   if (specMarkdown !== null) {
     return (
-      <div className="panel-scroll max-h-64 overflow-auto border-l border-stone-200 pl-3">
+      <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3`}>
         <MarkdownContent
           content={specMarkdown}
           isUser={false}
@@ -2610,7 +2612,7 @@ function CompactToolCallView({
   const text = compactToolCallText(toolCall, input, liveOutputText, compactJson);
   return (
     <pre
-      className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
         ? "border-rose-200 text-rose-700"
         : "border-stone-200 text-stone-700"
         }`}
@@ -2738,6 +2740,7 @@ function ToolCallBlock({
   } = helpers;
   const { language, t } = useI18n();
   const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
+  const toolCallRootRef = useRef<HTMLDivElement>(null);
   const input = normalizedToolInput(toolCall.input);
   const compactReplacementDiff = successfulCompactReplacementDiff(toolCall, input);
   const detailText = toolCallDetailText(toolCall);
@@ -2750,8 +2753,32 @@ function ToolCallBlock({
   const displayName = toolDisplayName(toolCall.name, language);
   const ToolIcon = TOOL_CALL_ICONS[toolCall.name] ?? Wrench;
 
+  useEffect(() => {
+    const root = toolCallRootRef.current;
+    if (!root) {
+      return;
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      const scroller = target.closest(".tool-call-scroll");
+      if (!(scroller instanceof HTMLElement) || !root.contains(scroller)) {
+        return;
+      }
+      forwardWheelAtVerticalBoundary(event, scroller);
+    };
+
+    root.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      root.removeEventListener("wheel", handleWheel);
+    };
+  }, []);
+
   return (
-    <div className="grid min-w-0 gap-2">
+    <div className="grid min-w-0 gap-2" ref={toolCallRootRef}>
       <GeneratedImageFilesBlock
         files={generatedImages}
         formatFileSize={helpers.formatFileSize}

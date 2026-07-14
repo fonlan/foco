@@ -303,6 +303,11 @@ summary:focus-visible {
   touch-action: auto;
 }
 
+.tool-call-scroll.panel-scroll {
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+}
+
 .panel-scroll::-webkit-scrollbar {
   height: 0.75rem;
   width: 0.75rem;

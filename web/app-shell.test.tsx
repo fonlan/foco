@@ -491,6 +491,131 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("forwards tool call wheel input only at vertical boundaries in compact and raw modes", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    const messageList = document.querySelector(
+      ".message-list",
+    ) as HTMLElement | null;
+    if (!assistantBubble || !messageList) {
+      throw new Error("Expected assistant bubble and message list");
+    }
+
+    messageList.style.overflowY = "auto";
+    Object.defineProperties(messageList, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 1200 },
+    });
+    messageList.scrollTop = 200;
+
+    const compactScroller = assistantBubble.querySelector(
+      ".tool-call-scroll",
+    ) as HTMLElement | null;
+    if (!compactScroller) {
+      throw new Error("Expected compact tool-call scroller");
+    }
+    Object.defineProperties(compactScroller, {
+      clientHeight: { configurable: true, value: 120 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+
+    compactScroller.scrollTop = 100;
+    const midWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    compactScroller.dispatchEvent(midWheel);
+    expect(messageList.scrollTop).toBe(200);
+    expect(midWheel.defaultPrevented).toBe(false);
+
+    compactScroller.scrollTop = 280;
+    const bottomWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    compactScroller.dispatchEvent(bottomWheel);
+    expect(messageList.scrollTop).toBe(240);
+    expect(bottomWheel.defaultPrevented).toBe(true);
+
+    compactScroller.scrollTop = 0;
+    const topWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: -30,
+    });
+    compactScroller.dispatchEvent(topWheel);
+    expect(messageList.scrollTop).toBe(210);
+    expect(topWheel.defaultPrevented).toBe(true);
+
+    compactScroller.scrollTop = 280;
+    const horizontalWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaX: 50,
+      deltaY: 10,
+    });
+    compactScroller.dispatchEvent(horizontalWheel);
+    expect(messageList.scrollTop).toBe(210);
+    expect(horizontalWheel.defaultPrevented).toBe(false);
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
+
+    const inputLabel = within(assistantBubble).getByText("Input");
+    const inputScroller = inputLabel
+      .closest(".min-w-0")
+      ?.querySelector(".tool-call-scroll") as HTMLElement | null;
+    const outputLabel = within(assistantBubble).getByText("Output");
+    const outputScroller = outputLabel
+      .closest(".min-w-0")
+      ?.querySelector(".tool-call-scroll") as HTMLElement | null;
+    if (!inputScroller || !outputScroller) {
+      throw new Error("Expected raw Input and Output tool-call scrollers");
+    }
+
+    for (const scroller of [inputScroller, outputScroller]) {
+      Object.defineProperties(scroller, {
+        clientHeight: { configurable: true, value: 100 },
+        scrollHeight: { configurable: true, value: 360 },
+      });
+    }
+
+    messageList.scrollTop = 210;
+    inputScroller.scrollTop = 50;
+    const rawMidWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    inputScroller.dispatchEvent(rawMidWheel);
+    expect(messageList.scrollTop).toBe(210);
+    expect(rawMidWheel.defaultPrevented).toBe(false);
+
+    inputScroller.scrollTop = 260;
+    const rawInputBottomWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: 40,
+    });
+    inputScroller.dispatchEvent(rawInputBottomWheel);
+    expect(messageList.scrollTop).toBe(250);
+    expect(rawInputBottomWheel.defaultPrevented).toBe(true);
+
+    outputScroller.scrollTop = 0;
+    const rawOutputTopWheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: -20,
+    });
+    outputScroller.dispatchEvent(rawOutputTopWheel);
+    expect(messageList.scrollTop).toBe(230);
+    expect(rawOutputTopWheel.defaultPrevented).toBe(true);
+  });
+
   it("localizes the tool call raw toggle label", async () => {
     appTestState.settingsResponse = {
       ...appTestState.settingsResponse,
