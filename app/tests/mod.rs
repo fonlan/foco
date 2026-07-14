@@ -4257,6 +4257,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
         system_prompt: None,
         files: vec![configured_prompt_file],
         extra_text: "Extra prompt instructions.\n".to_string(),
+        context_compression_system_prompt: None,
     })
     .expect("configured prompt messages");
     let extra_prompt_message = configured_extra_prompt_message(&PromptSettings {
@@ -4264,6 +4265,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
         system_prompt: None,
         files: Vec::new(),
         extra_text: "Extra prompt instructions.\n".to_string(),
+        context_compression_system_prompt: None,
     })
     .expect("extra prompt message");
 
@@ -4989,8 +4991,9 @@ async fn context_compression_runtime_tool_state_events_precede_llm_events() {
         vec![PromptContextSource::ReservedPrompt],
         900,
     );
-    context.context_budget.system_prompt_tokens = 620;
-    context.context_budget.context_window = 1_000;
+    // Stay in the 80% local tool-state band without crossing the 95% LLM checkpoint.
+    context.context_budget.context_window = 10_000;
+    context.context_budget.system_prompt_tokens = 7_800;
     context
         .global_config
         .app
@@ -5003,8 +5006,12 @@ async fn context_compression_runtime_tool_state_events_precede_llm_events() {
 
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!(
-        total_used_context_tokens >= 800,
+        total_used_context_tokens >= context_window_compression_trigger_tokens(10_000),
         "total_used_context_tokens={total_used_context_tokens}"
+    );
+    assert!(
+        total_used_context_tokens < crate::prompt::llm_context_compression_trigger_tokens(10_000),
+        "precondition: start below 95% so only local 80% should run after force-free content is reduced"
     );
 
     let result = ensure_context_compression(&mut context)
@@ -5216,6 +5223,236 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
 }
 
 #[test]
+fn plan_context_compression_checkpoint_chunks_keeps_single_request_when_under_budget() {
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::User, "goal".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "done".to_string()),
+    ];
+    let chunks = crate::prompt::plan_context_compression_checkpoint_chunks(&messages, 10_000)
+        .expect("chunks");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), 2);
+}
+
+#[test]
+fn plan_context_compression_checkpoint_chunks_splits_oversized_tool_result_with_coverage() {
+    let huge = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(400);
+    let messages = vec![
+        NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: String::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: vec![NeutralToolCall {
+                call_id: "call-huge".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "big.txt" }),
+                thought_signatures: None,
+            }],
+            tool_call_id: None,
+            tool_name: None,
+        },
+        NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: huge.clone(),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-huge".to_string()),
+            tool_name: Some("read_file".to_string()),
+        },
+    ];
+    // Tiny budget forces hierarchical fragment split of the tool result.
+    let chunks = crate::prompt::plan_context_compression_checkpoint_chunks(&messages, 80)
+        .expect("oversized chunks");
+    assert!(
+        chunks.len() > 1,
+        "expected multiple chunks, got {}",
+        chunks.len()
+    );
+
+    let mut reconstructed = String::new();
+    let mut saw_fragment_meta = false;
+    for chunk in &chunks {
+        for message in chunk {
+            if message.content.contains("context_checkpoint_fragment") {
+                saw_fragment_meta = true;
+                assert!(message.content.contains("call_id=call-huge"));
+                assert!(message.content.contains("tool=read_file"));
+                assert!(message.content.contains("part="));
+                if let Some((_, body)) = message.content.split_once('\n') {
+                    reconstructed.push_str(body);
+                }
+            } else if message.role == NeutralChatRole::Tool {
+                reconstructed.push_str(&message.content);
+            }
+        }
+    }
+    assert!(saw_fragment_meta);
+    assert_eq!(reconstructed, huge);
+}
+
+#[test]
+fn plan_context_compression_checkpoint_chunks_splits_oversized_tool_call_arguments_with_coverage() {
+    let huge_body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(400);
+    let arguments = json!({
+        "path": "big.rs",
+        "content": huge_body,
+    });
+    let args_text = serde_json::to_string(&arguments).expect("serialize args");
+    let messages = vec![NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: vec![NeutralToolCall {
+            call_id: "call-write".to_string(),
+            name: "write_file".to_string(),
+            arguments: arguments.clone(),
+            thought_signatures: None,
+        }],
+        tool_call_id: None,
+        tool_name: None,
+    }];
+    let chunks = crate::prompt::plan_context_compression_checkpoint_chunks(&messages, 80)
+        .expect("oversized tool-call argument chunks");
+    assert!(
+        chunks.len() > 1,
+        "expected multiple chunks for huge tool-call args, got {}",
+        chunks.len()
+    );
+
+    let mut reconstructed = String::new();
+    let mut saw_fragment_meta = false;
+    for chunk in &chunks {
+        for message in chunk {
+            assert!(
+                message.tool_calls.len() <= 1,
+                "fragment must not retain sibling tool_calls"
+            );
+            let Some(call) = message.tool_calls.first() else {
+                continue;
+            };
+            if let Some(meta) = call.arguments.get("contextCheckpointFragment") {
+                saw_fragment_meta = true;
+                assert_eq!(
+                    meta.get("callId").and_then(|v| v.as_str()),
+                    Some("call-write")
+                );
+                assert_eq!(
+                    meta.get("tool").and_then(|v| v.as_str()),
+                    Some("write_file")
+                );
+                assert!(meta.get("part").is_some());
+                assert!(meta.get("totalParts").is_some());
+                if let Some(slice) = meta.get("argumentsText").and_then(|v| v.as_str()) {
+                    reconstructed.push_str(slice);
+                }
+            } else {
+                // Unsharded full args (should not happen with tiny budget, but keep coverage).
+                reconstructed.push_str(&serde_json::to_string(&call.arguments).unwrap());
+            }
+        }
+    }
+    assert!(
+        saw_fragment_meta,
+        "expected contextCheckpointFragment metadata"
+    );
+    assert_eq!(reconstructed, args_text);
+}
+
+#[test]
+fn plan_context_compression_checkpoint_chunks_splits_multi_tool_call_without_sibling_args() {
+    let huge_a = "A".repeat(2_000);
+    let huge_b = "B".repeat(2_000);
+    let messages = vec![NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: vec![
+            NeutralToolCall {
+                call_id: "call-a".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "a.txt", "content": huge_a }),
+                thought_signatures: None,
+            },
+            NeutralToolCall {
+                call_id: "call-b".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "b.txt", "content": huge_b }),
+                thought_signatures: None,
+            },
+        ],
+        tool_call_id: None,
+        tool_name: None,
+    }];
+    let chunks = crate::prompt::plan_context_compression_checkpoint_chunks(&messages, 120)
+        .expect("multi tool-call chunks");
+    assert!(chunks.len() > 1);
+
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for chunk in &chunks {
+        for message in chunk {
+            assert!(
+                message.tool_calls.len() <= 1,
+                "multi-tool fragment must isolate a single tool call"
+            );
+            let Some(call) = message.tool_calls.first() else {
+                continue;
+            };
+            match call.call_id.as_str() {
+                "call-a" => {
+                    saw_a = true;
+                    // Sibling B full payload must not appear on A's fragment.
+                    let encoded = serde_json::to_string(&call.arguments).unwrap();
+                    assert!(!encoded.contains(&huge_b));
+                }
+                "call-b" => {
+                    saw_b = true;
+                    let encoded = serde_json::to_string(&call.arguments).unwrap();
+                    assert!(!encoded.contains(&huge_a));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_a && saw_b, "both tool calls must be covered");
+}
+
+#[test]
+fn effective_context_compression_system_prompt_uses_override_and_default() {
+    let default_settings = PromptSettings {
+        system_prompts: Vec::new(),
+        system_prompt: None,
+        files: Vec::new(),
+        extra_text: String::new(),
+        context_compression_system_prompt: None,
+    };
+    assert_eq!(
+        crate::prompt::effective_context_compression_system_prompt(&default_settings),
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
+    let custom = PromptSettings {
+        context_compression_system_prompt: Some("  custom handoff prompt  ".to_string()),
+        ..default_settings.clone()
+    };
+    assert_eq!(
+        crate::prompt::effective_context_compression_system_prompt(&custom),
+        "custom handoff prompt"
+    );
+    let blank = PromptSettings {
+        context_compression_system_prompt: Some("   \n".to_string()),
+        ..default_settings
+    };
+    assert_eq!(
+        crate::prompt::effective_context_compression_system_prompt(&blank),
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT
+    );
+}
+
+#[test]
 fn compression_snapshot_message_is_plain_user_summary() {
     let snapshot = ContextCompressionSnapshotRecord {
         id: "ctx-1".to_string(),
@@ -5326,7 +5563,11 @@ async fn ensure_context_compression_tries_llm_when_recent_large_group_would_be_d
         .await
         .expect_err("large recent group should enter the LLM compression branch");
 
-    assert!(error.message().contains("API key"));
+    assert!(
+        error.message().contains("API key") || error.message().contains("hierarchy"),
+        "unexpected error: {}",
+        error.message()
+    );
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
@@ -5539,6 +5780,7 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
     context.active_tool_start_index = context.provider_request.messages.len() - 1;
     context.runtime_tool_state_compression_count =
         CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS;
+    let count_before_failed_llm = context.runtime_tool_state_compression_count;
 
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -5571,6 +5813,11 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
         .expect_err("required overflow should try the LLM fallback");
 
     assert!(error.message().contains("API key"));
+    // Failed LLM checkpoint must not reset the local 80% cycle counter (no half success).
+    assert_eq!(
+        context.runtime_tool_state_compression_count,
+        count_before_failed_llm
+    );
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 

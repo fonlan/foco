@@ -598,6 +598,7 @@ impl RemoteSidecarRuntimeToolState {
                 assistant_message_id,
                 provider_id,
                 model_id,
+                self.context_budget.context_window,
                 &checkpoint_messages,
             )
             .await
@@ -707,6 +708,8 @@ impl RemoteSidecarRuntimeToolState {
         self.message_context_sources = prepared.replaced.message_context_sources;
         self.active_tool_start_index = prepared.replaced.active_tool_start_index;
         self.compression_snapshots.push(prepared.snapshot.clone());
+        // Full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
+        self.runtime_tool_state_compression_count = 0;
 
         events.push(RemoteSidecarContextCompressionEventDetail {
             status: "completed".to_string(),
@@ -11279,10 +11282,210 @@ async fn remote_sidecar_run_broker_context_compression_summary(
     assistant_message_id: &str,
     provider_id: &str,
     model_id: &str,
+    context_window: u64,
     checkpoint_messages: &[NeutralChatMessage],
 ) -> RemoteSidecarContextCompressionOutcome {
-    let request =
-        crate::prompt::build_context_compression_summary_request(model_id, checkpoint_messages);
+    let compression_prompt = {
+        let runtime_config = state.runtime_config.lock().ok();
+        runtime_config
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .map(|bundle| {
+                crate::prompt::effective_context_compression_system_prompt(&bundle.payload.prompts)
+                    .to_string()
+            })
+            .unwrap_or_else(|| crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT.to_string())
+    };
+    // Prefer the model limit from the runtime bundle for the dedicated compression request
+    // budget. Pack/trigger windows may be test-injected smaller values; the provider still
+    // accepts the model's real context window.
+    let compression_model_window = {
+        let runtime_config = state.runtime_config.lock().ok();
+        runtime_config
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .and_then(|bundle| {
+                bundle
+                    .payload
+                    .models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .and_then(|model| model.limits.as_ref())
+                    .map(|limits| limits.context_window)
+            })
+            .filter(|window| *window > 0)
+            .unwrap_or(context_window)
+            .max(context_window)
+    };
+    let input_budget = crate::prompt::compression_request_input_token_budget(
+        compression_model_window,
+        &compression_prompt,
+    );
+    let mut pending = match crate::prompt::plan_context_compression_checkpoint_chunks(
+        checkpoint_messages,
+        input_budget,
+    ) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            return RemoteSidecarContextCompressionOutcome::Failed {
+                message: error.message().to_string(),
+            };
+        }
+    };
+    let mut requests_used = 0usize;
+    let mut depth = 0usize;
+    let mut resolved_provider_id = provider_id.to_string();
+
+    loop {
+        depth = depth.saturating_add(1);
+        if depth > crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+            return RemoteSidecarContextCompressionOutcome::Failed {
+                message: format!(
+                    "context compression hierarchy exceeded max depth ({})",
+                    crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
+                ),
+            };
+        }
+
+        if pending.len() == 1 {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return RemoteSidecarContextCompressionOutcome::Failed {
+                    message: format!(
+                        "context compression hierarchy exceeded max requests ({})",
+                        crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
+                    ),
+                };
+            }
+            return remote_sidecar_run_broker_context_compression_summary_once(
+                state,
+                run_stream,
+                database,
+                workspace_id,
+                chat_id,
+                run_id,
+                user_message_id,
+                assistant_message_id,
+                provider_id,
+                model_id,
+                &compression_prompt,
+                &pending[0],
+            )
+            .await;
+        }
+
+        let remaining =
+            crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS.saturating_sub(requests_used);
+        if pending.len().saturating_add(1) > remaining {
+            return RemoteSidecarContextCompressionOutcome::Failed {
+                message: format!(
+                    "context compression hierarchy needs at least {} requests for {} chunks plus merge, but only {remaining} remain (max {})",
+                    pending.len().saturating_add(1),
+                    pending.len(),
+                    crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
+                ),
+            };
+        }
+
+        let mut chunk_summaries = Vec::with_capacity(pending.len());
+        for chunk in &pending {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return RemoteSidecarContextCompressionOutcome::Failed {
+                    message: format!(
+                        "context compression hierarchy exceeded max requests ({})",
+                        crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
+                    ),
+                };
+            }
+            match remote_sidecar_run_broker_context_compression_summary_once(
+                state,
+                run_stream,
+                database,
+                workspace_id,
+                chat_id,
+                run_id,
+                user_message_id,
+                assistant_message_id,
+                provider_id,
+                model_id,
+                &compression_prompt,
+                chunk,
+            )
+            .await
+            {
+                RemoteSidecarContextCompressionOutcome::Succeeded {
+                    summary,
+                    provider_id,
+                    ..
+                } => {
+                    resolved_provider_id = provider_id;
+                    chunk_summaries.push(summary);
+                }
+                other => return other,
+            }
+        }
+
+        let merge_messages = crate::prompt::build_chunk_merge_checkpoint_messages(&chunk_summaries);
+        if crate::prompt::checkpoint_messages_estimated_tokens(&merge_messages) <= input_budget {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return RemoteSidecarContextCompressionOutcome::Failed {
+                    message: format!(
+                        "context compression hierarchy exceeded max requests ({})",
+                        crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
+                    ),
+                };
+            }
+            return remote_sidecar_run_broker_context_compression_summary_once(
+                state,
+                run_stream,
+                database,
+                workspace_id,
+                chat_id,
+                run_id,
+                user_message_id,
+                assistant_message_id,
+                resolved_provider_id.as_str(),
+                model_id,
+                &compression_prompt,
+                &merge_messages,
+            )
+            .await;
+        }
+        match crate::prompt::plan_context_compression_checkpoint_chunks(
+            &merge_messages,
+            input_budget,
+        ) {
+            Ok(chunks) => pending = chunks,
+            Err(error) => {
+                return RemoteSidecarContextCompressionOutcome::Failed {
+                    message: error.message().to_string(),
+                };
+            }
+        }
+    }
+}
+
+async fn remote_sidecar_run_broker_context_compression_summary_once(
+    state: &RemoteSidecarState,
+    run_stream: Option<&RemoteActiveRunStream>,
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    chat_id: &str,
+    run_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    compression_system_prompt: &str,
+    checkpoint_messages: &[NeutralChatMessage],
+) -> RemoteSidecarContextCompressionOutcome {
+    let request = crate::prompt::build_context_compression_summary_request_with_prompt(
+        model_id,
+        checkpoint_messages,
+        compression_system_prompt,
+    );
     let broker_request_id = unique_id("broker-ctx-compress");
     if let Some(run_stream) = run_stream {
         run_stream.set_broker_request_id(broker_request_id.clone());
@@ -19566,6 +19769,7 @@ mod tests {
             "msg-assistant-1",
             "provider-legacy",
             "model-1",
+            128_000,
             &[neutral_text_message(
                 NeutralChatRole::User,
                 "goal: compress earlier turns".to_string(),
@@ -19674,6 +19878,7 @@ mod tests {
                 "msg-assistant-1",
                 "provider-1",
                 "model-1",
+                128_000,
                 &[neutral_text_message(
                     NeutralChatRole::User,
                     "source".to_string(),
@@ -19738,6 +19943,7 @@ mod tests {
                 "msg-assistant-1",
                 "provider-1",
                 "model-1",
+                128_000,
                 &[neutral_text_message(
                     NeutralChatRole::User,
                     "source".to_string(),
@@ -19824,6 +20030,26 @@ mod tests {
             }]
         }))
         .expect("compression hook config");
+        // Prefer real model window for checkpoint budget so the mock single-request path stays
+        // under budget; pack/trigger still use the injected tiny context_window below.
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: String::new(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
         let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
             .expect("runtime bundle");
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);
@@ -19984,8 +20210,7 @@ mod tests {
         assert!(packed.iter().any(|message| {
             message
                 .content
-                .contains("compact remote summary survives rebuild")
-                || message.content.contains("survives rebuild")
+                .contains("compact remote summary for continuation")
         }));
         assert!(packed.iter().any(|message| {
             message.content.contains("Hook Context")
@@ -20379,29 +20604,44 @@ mod tests {
             request.payload.get("requestKind").and_then(Value::as_str),
             Some("contextCompression")
         );
-        let id = request.id.clone().expect("request id");
-        let pending = broker_state
-            .broker_pending
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .expect("pending response channel");
-        pending
-            .send(ControlEnvelope {
-                version: 1,
-                message_type: "response".to_string(),
-                id: Some(id),
-                method: None,
-                payload: json!({
-                    "llmRequestId": "broker-rebuild-1",
-                    "text": "compact remote summary survives rebuild",
-                    "toolCalls": [],
-                    "usage": { "inputTokens": 80, "outputTokens": 12 }
-                }),
-                timestamp: None,
-            })
-            .expect("response");
+        // Hierarchical checkpoint may issue multiple contextCompression broker turns when the
+        // injected pack window is tiny; answer every pending request until compress finishes.
+        let mut pending_request = Some(request);
+        while let Some(request) = pending_request.take() {
+            let id = request.id.clone().expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "llmRequestId": "broker-rebuild-1",
+                        "text": "compact remote summary survives rebuild",
+                        "toolCalls": [],
+                        "usage": { "inputTokens": 80, "outputTokens": 12 }
+                    }),
+                    timestamp: None,
+                })
+                .expect("response");
+            pending_request = match timeout(Duration::from_millis(200), broker_rx.recv()).await {
+                Ok(Some(next)) => {
+                    assert_eq!(
+                        next.payload.get("requestKind").and_then(Value::as_str),
+                        Some("contextCompression")
+                    );
+                    Some(next)
+                }
+                _ => None,
+            };
+        }
 
         let (packed, events) = compress_task
             .await
@@ -20534,6 +20774,29 @@ mod tests {
 
         let (state, mut broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: String::new(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
         let broker_state = state.clone();
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         let mut messages = vec![
@@ -20642,6 +20905,29 @@ mod tests {
 
         let (state, mut broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: String::new(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
         let broker_state = state.clone();
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         let mut messages = vec![

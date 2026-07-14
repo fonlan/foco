@@ -239,6 +239,10 @@ pub(crate) const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToo
 pub(crate) const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
 // Maximum output tokens requested for model-generated fallback compression summaries.
 pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
+// Hard cap on provider requests for one hierarchical checkpoint (chunks + merge levels).
+pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS: usize = 8;
+// Safety margin reserved beyond system prompt + max output when packing checkpoint input.
+pub(crate) const LLM_CONTEXT_COMPRESSION_REQUEST_SAFETY_TOKENS: u64 = 128;
 // Percent of the model context budget reserved for memory profile and retrieved facts.
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 // Maximum active memory facts considered when building query-specific memory context.

@@ -1102,6 +1102,10 @@ pub struct PromptSettings {
     pub files: Vec<PathBuf>,
     #[serde(default)]
     pub extra_text: String,
+    /// Optional override for dedicated context-checkpoint System prompt.
+    /// Empty/whitespace is treated as unset (use built-in default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compression_system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

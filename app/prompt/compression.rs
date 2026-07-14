@@ -4,6 +4,7 @@ use foco_agent::{ContextPackItem, context_compression_trigger_tokens, estimate_t
 use foco_providers::{
     NeutralChatMessage, NeutralChatRole, NeutralToolCall, stream_chat_with_capture_observer,
 };
+use foco_store::config::PromptSettings;
 use foco_store::workspace::{
     ContextCompressionSnapshotRecord, NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
 };
@@ -499,6 +500,8 @@ async fn ensure_llm_context_compression(
             "availableMessageTokens": context.context_budget.available_message_tokens
         }),
     )?;
+    // A full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
+    context.runtime_tool_state_compression_count = 0;
     events.push(context_compression_event_detail(
         "completed",
         CONTEXT_COMPRESSION_KIND_LLM,
@@ -582,6 +585,37 @@ Preserve:
 - Critical file paths, identifiers, data, and references
 - Current state and the immediate next actions";
 
+/// Effective compression System prompt: non-empty override, else built-in default.
+pub(crate) fn effective_context_compression_system_prompt(settings: &PromptSettings) -> &str {
+    settings
+        .context_compression_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT)
+}
+
+/// Input token budget for one dedicated checkpoint request (no tools / no main System stack).
+pub(crate) fn compression_request_input_token_budget(
+    context_window: u64,
+    compression_system_prompt: &str,
+) -> u64 {
+    // Reserve compression max-output only when the model window can actually hold it; on tiny
+    // windows (tests / misconfigured models) keep at most half the window for output.
+    let reserved_output = u64::from(LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS)
+        .min(context_window.saturating_div(2).max(1));
+    context_window
+        .saturating_sub(reserved_output)
+        .saturating_sub(estimate_text_tokens(compression_system_prompt))
+        .saturating_sub(LLM_CONTEXT_COMPRESSION_REQUEST_SAFETY_TOKENS)
+        .max(1)
+}
+
+/// Estimate total tokens for a list of checkpoint Neutral messages.
+pub(crate) fn checkpoint_messages_estimated_tokens(messages: &[NeutralChatMessage]) -> u64 {
+    messages.iter().map(neutral_message_estimated_tokens).sum()
+}
+
 /// Build the provider request used by local and remote LLM context checkpoint summaries.
 ///
 /// Shape: single System compression prompt + ordered raw checkpoint Neutral messages.
@@ -625,11 +659,561 @@ pub(crate) fn context_compression_summary_has_benefit(summary: &str, original_to
     !summary.is_empty() && estimate_text_tokens(summary) < original_tokens
 }
 
+/// Split checkpoint messages into request-sized batches when they exceed one model window.
+///
+/// Preference order: whole tool batches / message groups → single-message content fragments.
+/// Every original character is covered by some chunk (no silent truncation).
+pub(crate) fn plan_context_compression_checkpoint_chunks(
+    checkpoint_messages: &[NeutralChatMessage],
+    input_token_budget: u64,
+) -> Result<Vec<Vec<NeutralChatMessage>>, ApiError> {
+    if checkpoint_messages.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    let budget = input_token_budget.max(1);
+    if checkpoint_messages_estimated_tokens(checkpoint_messages) <= budget {
+        return Ok(vec![checkpoint_messages.to_vec()]);
+    }
+
+    let units = checkpoint_message_units(checkpoint_messages);
+    let mut chunks: Vec<Vec<NeutralChatMessage>> = Vec::new();
+    let mut current: Vec<NeutralChatMessage> = Vec::new();
+    let mut current_tokens = 0u64;
+
+    for unit in units {
+        let unit_tokens = checkpoint_messages_estimated_tokens(&unit);
+        if unit_tokens <= budget {
+            if !current.is_empty() && current_tokens.saturating_add(unit_tokens) > budget {
+                chunks.push(std::mem::take(&mut current));
+                current_tokens = 0;
+            }
+            current_tokens = current_tokens.saturating_add(unit_tokens);
+            current.extend(unit);
+            continue;
+        }
+
+        // Flush partial chunk before splitting an oversized unit.
+        if !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        for fragment in split_oversized_checkpoint_unit(&unit, budget)? {
+            chunks.push(fragment);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        return Err(ApiError::internal(
+            "context compression checkpoint chunk planner produced no chunks",
+        ));
+    }
+    Ok(chunks)
+}
+
+/// Group messages into atomic units: non-tool alone, or assistant tool_calls + following tool results.
+fn checkpoint_message_units(messages: &[NeutralChatMessage]) -> Vec<Vec<NeutralChatMessage>> {
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        if !message.tool_calls.is_empty() {
+            let mut unit = vec![message.clone()];
+            index += 1;
+            while index < messages.len() && messages[index].role == NeutralChatRole::Tool {
+                unit.push(messages[index].clone());
+                index += 1;
+            }
+            units.push(unit);
+            continue;
+        }
+        units.push(vec![message.clone()]);
+        index += 1;
+    }
+    units
+}
+
+fn split_oversized_checkpoint_unit(
+    unit: &[NeutralChatMessage],
+    budget: u64,
+) -> Result<Vec<Vec<NeutralChatMessage>>, ApiError> {
+    let mut fragments: Vec<Vec<NeutralChatMessage>> = Vec::new();
+    for message in unit {
+        let message_tokens = neutral_message_estimated_tokens(message);
+        if message_tokens <= budget {
+            // Prefer attaching small messages to the previous fragment when room remains.
+            if let Some(last) = fragments.last_mut() {
+                let last_tokens = checkpoint_messages_estimated_tokens(last);
+                if last_tokens.saturating_add(message_tokens) <= budget {
+                    last.push(message.clone());
+                    continue;
+                }
+            }
+            fragments.push(vec![message.clone()]);
+            continue;
+        }
+        for piece in split_oversized_checkpoint_message(message, budget)? {
+            fragments.push(vec![piece]);
+        }
+    }
+    if fragments.is_empty() {
+        return Err(ApiError::internal(
+            "context compression failed to split oversized checkpoint unit",
+        ));
+    }
+    Ok(fragments)
+}
+
+/// Stable text form of tool-call arguments for fragment coverage (no silent truncation).
+fn checkpoint_arguments_payload_text(arguments: &Value) -> String {
+    match arguments {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Split a single oversized message into auditable fragments that fully cover the original payload.
+fn split_oversized_checkpoint_message(
+    message: &NeutralChatMessage,
+    budget: u64,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    if !message.tool_calls.is_empty() {
+        return split_oversized_assistant_tool_call_message(message, budget);
+    }
+
+    let payload = if !message.content.is_empty() {
+        message.content.clone()
+    } else if let Some(reasoning) = message.reasoning.as_ref().filter(|text| !text.is_empty()) {
+        // Reasoning-only oversize: shard reasoning text into content-bearing fragments.
+        reasoning.clone()
+    } else {
+        return Err(ApiError::internal(
+            "context compression cannot split oversized message without text/tool payload",
+        ));
+    };
+
+    let tool_name = message.tool_name.as_deref().unwrap_or("message");
+    let call_id = message.tool_call_id.as_deref().unwrap_or("none");
+    let parts = split_payload_text_into_shells(message, None, &payload, budget)?;
+    verify_content_fragment_coverage(&parts, &payload, tool_name, call_id)?;
+    Ok(parts)
+}
+
+/// Split an assistant message that carries one or more tool calls.
+///
+/// Each tool call is emitted alone (no sibling full arguments). Oversized arguments are
+/// sharded with `contextCheckpointFragment.argumentsText` covering the full args payload.
+fn split_oversized_assistant_tool_call_message(
+    message: &NeutralChatMessage,
+    budget: u64,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let mut parts = Vec::new();
+
+    // Keep assistant text/reasoning as separate messages so tool-call shards stay under budget.
+    if !message.content.is_empty()
+        || message
+            .reasoning
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+    {
+        let text_only = NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: message.content.clone(),
+            attachments: Vec::new(),
+            reasoning: message.reasoning.clone(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        };
+        if neutral_message_estimated_tokens(&text_only) <= budget {
+            parts.push(text_only);
+        } else {
+            parts.extend(split_oversized_checkpoint_message(&text_only, budget)?);
+        }
+    }
+
+    for tool_call in &message.tool_calls {
+        let args_text = checkpoint_arguments_payload_text(&tool_call.arguments);
+        let single = assistant_tool_call_message_shell(tool_call, tool_call.arguments.clone());
+        if neutral_message_estimated_tokens(&single) <= budget {
+            parts.push(single);
+            continue;
+        }
+
+        let sharded = split_payload_text_into_shells(message, Some(tool_call), &args_text, budget)?;
+        let mut reconstructed = String::new();
+        for fragment in &sharded {
+            if fragment.tool_calls.len() != 1 {
+                return Err(ApiError::internal(
+                    "context compression assistant fragment must carry exactly one tool call",
+                ));
+            }
+            let Some(call) = fragment.tool_calls.first() else {
+                return Err(ApiError::internal(
+                    "context compression assistant fragment missing tool call",
+                ));
+            };
+            let Some(fragment_meta) = call.arguments.get("contextCheckpointFragment") else {
+                return Err(ApiError::internal(
+                    "context compression assistant fragment missing fragment metadata",
+                ));
+            };
+            let slice = fragment_meta
+                .get("argumentsText")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            reconstructed.push_str(slice);
+        }
+        if reconstructed != args_text {
+            return Err(ApiError::internal(format!(
+                "context compression fragment split lost tool-call arguments coverage for {}",
+                tool_call.call_id
+            )));
+        }
+        parts.extend(sharded);
+    }
+
+    if parts.is_empty() {
+        return Err(ApiError::internal(
+            "context compression failed to split oversized assistant tool-call message",
+        ));
+    }
+    Ok(parts)
+}
+
+fn assistant_tool_call_message_shell(
+    tool_call: &NeutralToolCall,
+    arguments: Value,
+) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: vec![NeutralToolCall {
+            call_id: tool_call.call_id.clone(),
+            name: tool_call.name.clone(),
+            arguments,
+            thought_signatures: tool_call.thought_signatures.clone(),
+        }],
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
+fn split_payload_text_into_shells(
+    message: &NeutralChatMessage,
+    tool_call: Option<&NeutralToolCall>,
+    payload: &str,
+    budget: u64,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    if payload.is_empty() {
+        let empty = truncated_checkpoint_message_shell(message, tool_call, 1, 1, "");
+        if neutral_message_estimated_tokens(&empty) > budget {
+            return Err(ApiError::internal(format!(
+                "context compression fragment shell exceeds budget {budget}"
+            )));
+        }
+        return Ok(vec![empty]);
+    }
+
+    let chars: Vec<char> = payload.chars().collect();
+    let mut max_chars = 1usize;
+    let mut lo = 1usize;
+    let mut hi = chars.len().max(1);
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let slice: String = chars[..mid.min(chars.len())].iter().collect();
+        let probe = truncated_checkpoint_message_shell(message, tool_call, 999, 999, &slice);
+        if neutral_message_estimated_tokens(&probe) <= budget {
+            max_chars = mid;
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    max_chars = max_chars.max(1);
+
+    // Ensure at least a 1-char fragment can fit; otherwise budget is unusable.
+    let one_char = truncated_checkpoint_message_shell(message, tool_call, 1, 1, "x");
+    if neutral_message_estimated_tokens(&one_char) > budget {
+        return Err(ApiError::internal(format!(
+            "context compression fragment shell exceeds budget {budget}"
+        )));
+    }
+
+    let total_parts = chars.len().div_ceil(max_chars).max(1);
+    if total_parts > 10_000 {
+        return Err(ApiError::internal(format!(
+            "context compression cannot split message into {total_parts} fragments under budget {budget}"
+        )));
+    }
+
+    let mut parts = Vec::with_capacity(total_parts);
+    let mut offset = 0usize;
+    let mut part_index = 1usize;
+    while offset < chars.len() {
+        let end = (offset + max_chars).min(chars.len());
+        let slice: String = chars[offset..end].iter().collect();
+        let fragment =
+            truncated_checkpoint_message_shell(message, tool_call, part_index, total_parts, &slice);
+        if neutral_message_estimated_tokens(&fragment) > budget && slice.chars().count() > 1 {
+            let smaller_end = offset + (end - offset) / 2;
+            let smaller_end = smaller_end.max(offset + 1);
+            let slice: String = chars[offset..smaller_end].iter().collect();
+            parts.push(truncated_checkpoint_message_shell(
+                message,
+                tool_call,
+                part_index,
+                total_parts,
+                &slice,
+            ));
+            offset = smaller_end;
+        } else {
+            parts.push(fragment);
+            offset = end;
+        }
+        part_index += 1;
+        if part_index > total_parts.saturating_add(total_parts) {
+            return Err(ApiError::internal(
+                "context compression fragment split exceeded expected part count",
+            ));
+        }
+    }
+
+    let actual_total = parts.len();
+    if actual_total != total_parts {
+        for (index, part) in parts.iter_mut().enumerate() {
+            let body = fragment_payload_body(part, tool_call);
+            *part = truncated_checkpoint_message_shell(
+                message,
+                tool_call,
+                index + 1,
+                actual_total,
+                &body,
+            );
+        }
+    }
+
+    Ok(parts)
+}
+
+fn fragment_payload_body(part: &NeutralChatMessage, tool_call: Option<&NeutralToolCall>) -> String {
+    if tool_call.is_some() {
+        if let Some(call) = part.tool_calls.first() {
+            if let Some(meta) = call.arguments.get("contextCheckpointFragment") {
+                if let Some(text) = meta.get("argumentsText").and_then(Value::as_str) {
+                    return text.to_string();
+                }
+            }
+        }
+    }
+    part.content
+        .split_once('\n')
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_default()
+}
+
+fn verify_content_fragment_coverage(
+    parts: &[NeutralChatMessage],
+    original: &str,
+    _tool_name: &str,
+    _call_id: &str,
+) -> Result<(), ApiError> {
+    let mut reconstructed = String::new();
+    for part in parts {
+        if let Some((_, body)) = part.content.split_once('\n') {
+            reconstructed.push_str(body);
+        }
+    }
+    if reconstructed != original {
+        return Err(ApiError::internal(
+            "context compression fragment split lost original content coverage",
+        ));
+    }
+    Ok(())
+}
+
+fn truncated_checkpoint_message_shell(
+    source: &NeutralChatMessage,
+    tool_call: Option<&NeutralToolCall>,
+    part_index: usize,
+    total_parts: usize,
+    payload_slice: &str,
+) -> NeutralChatMessage {
+    let tool_name = tool_call
+        .map(|call| call.name.as_str())
+        .or(source.tool_name.as_deref())
+        .or_else(|| source.tool_calls.first().map(|call| call.name.as_str()))
+        .unwrap_or("message");
+    let call_id = tool_call
+        .map(|call| call.call_id.as_str())
+        .or(source.tool_call_id.as_deref())
+        .or_else(|| source.tool_calls.first().map(|call| call.call_id.as_str()))
+        .unwrap_or("none");
+    let header = format!(
+        "[context_checkpoint_fragment tool={tool_name} call_id={call_id} part={part_index}/{total_parts}]\n"
+    );
+
+    if let Some(tool_call) = tool_call {
+        // Single tool-call fragment: full original args replaced by auditable slice metadata.
+        NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: format!("{header}{payload_slice}"),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: vec![NeutralToolCall {
+                call_id: tool_call.call_id.clone(),
+                name: tool_call.name.clone(),
+                arguments: json!({
+                    "contextCheckpointFragment": {
+                        "tool": tool_call.name,
+                        "callId": tool_call.call_id,
+                        "part": part_index,
+                        "totalParts": total_parts,
+                        "argumentsText": payload_slice,
+                    }
+                }),
+                thought_signatures: tool_call.thought_signatures.clone(),
+            }],
+            tool_call_id: None,
+            tool_name: None,
+        }
+    } else if source.role == NeutralChatRole::Tool || source.tool_call_id.is_some() {
+        NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: format!("{header}{payload_slice}"),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+        }
+    } else {
+        NeutralChatMessage {
+            role: source.role.clone(),
+            content: format!("{header}{payload_slice}"),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+}
+
+/// Build merge-level checkpoint messages from intermediate chunk summaries.
+pub(crate) fn build_chunk_merge_checkpoint_messages(
+    chunk_summaries: &[String],
+) -> Vec<NeutralChatMessage> {
+    let total = chunk_summaries.len();
+    chunk_summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "[context_checkpoint_chunk_summary part={}/{}]\n{}",
+                    index + 1,
+                    total,
+                    summary.trim()
+                ),
+            )
+        })
+        .collect()
+}
+
 async fn llm_context_compression_summary(
     context: &mut PreparedChatContext,
     checkpoint_messages: &[NeutralChatMessage],
 ) -> Result<String, ApiError> {
-    let request = build_context_compression_summary_request(&context.model_id, checkpoint_messages);
+    let compression_prompt =
+        effective_context_compression_system_prompt(&context.global_config.prompts).to_string();
+    let input_budget = compression_request_input_token_budget(
+        context.context_budget.context_window,
+        &compression_prompt,
+    );
+    let mut pending =
+        plan_context_compression_checkpoint_chunks(checkpoint_messages, input_budget)?;
+    let mut requests_used = 0usize;
+    let mut depth = 0usize;
+
+    loop {
+        depth = depth.saturating_add(1);
+        if depth > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+            return Err(ApiError::internal(format!(
+                "context compression hierarchy exceeded max depth ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+            )));
+        }
+        if pending.len() == 1 {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return Err(ApiError::internal(format!(
+                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                )));
+            }
+            return llm_context_compression_summary_once(context, &pending[0], &compression_prompt)
+                .await;
+        }
+
+        // Fail early when chunk summaries + one merge cannot fit the remaining request budget.
+        let remaining =
+            LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS.saturating_sub(requests_used);
+        if pending.len().saturating_add(1) > remaining {
+            return Err(ApiError::internal(format!(
+                "context compression hierarchy needs at least {} requests for {} chunks plus merge, but only {remaining} remain (max {LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})",
+                pending.len().saturating_add(1),
+                pending.len()
+            )));
+        }
+
+        let mut chunk_summaries = Vec::with_capacity(pending.len());
+        for chunk in &pending {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return Err(ApiError::internal(format!(
+                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                )));
+            }
+            chunk_summaries.push(
+                llm_context_compression_summary_once(context, chunk, &compression_prompt).await?,
+            );
+        }
+
+        let merge_messages = build_chunk_merge_checkpoint_messages(&chunk_summaries);
+        if checkpoint_messages_estimated_tokens(&merge_messages) <= input_budget {
+            requests_used = requests_used.saturating_add(1);
+            if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
+                return Err(ApiError::internal(format!(
+                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                )));
+            }
+            return llm_context_compression_summary_once(
+                context,
+                &merge_messages,
+                &compression_prompt,
+            )
+            .await;
+        }
+        pending = plan_context_compression_checkpoint_chunks(&merge_messages, input_budget)?;
+    }
+}
+
+async fn llm_context_compression_summary_once(
+    context: &mut PreparedChatContext,
+    checkpoint_messages: &[NeutralChatMessage],
+    compression_system_prompt: &str,
+) -> Result<String, ApiError> {
+    let request = build_context_compression_summary_request_with_prompt(
+        &context.model_id,
+        checkpoint_messages,
+        compression_system_prompt,
+    );
     let request_id = unique_id("llm");
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();

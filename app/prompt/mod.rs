@@ -5,19 +5,22 @@ mod prompt_files;
 
 pub(crate) use assembly::{plan_mode_builtin_tool_allowed, prepare_prompt_context};
 pub(crate) use compression::{
-    ContextUsageInput, LlmContextCompressionMode, active_compression_snapshots,
-    active_llm_checkpoint_snapshot_ids, apply_compression_snapshot_to_messages,
-    assistant_parts_checkpoint_replay_start_index, build_context_compression_summary_request,
+    ContextUsageInput, DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT, LlmContextCompressionMode,
+    active_compression_snapshots, active_llm_checkpoint_snapshot_ids,
+    apply_compression_snapshot_to_messages, assistant_parts_checkpoint_replay_start_index,
+    build_chunk_merge_checkpoint_messages, build_context_compression_summary_request,
+    build_context_compression_summary_request_with_prompt, checkpoint_messages_estimated_tokens,
     compress_all_runtime_tool_state_messages, compress_runtime_tool_state_messages_if_needed,
-    compression_snapshot_message, context_compression_summary_has_benefit, context_message_groups,
-    context_token_breakdown, context_usage_response, context_usage_segments,
-    context_usage_segments_total, context_window_compression_trigger_tokens,
+    compression_request_input_token_budget, compression_snapshot_message,
+    context_compression_summary_has_benefit, context_message_groups, context_token_breakdown,
+    context_usage_response, context_usage_segments, context_usage_segments_total,
+    context_window_compression_trigger_tokens, effective_context_compression_system_prompt,
     ensure_context_compression, interleaved_tool_state_messages,
     llm_context_compression_group_indices, llm_context_compression_trigger_tokens,
     neutral_assistant_tool_call_message, neutral_message_estimated_tokens,
     neutral_tool_call_from_record, pack_neutral_messages, persist_chat_result,
-    persist_running_llm_request, plan_llm_context_compression, recover_after_tool_round_cap,
-    snapshot_covered_sequences,
+    persist_running_llm_request, plan_context_compression_checkpoint_chunks,
+    plan_llm_context_compression, recover_after_tool_round_cap, snapshot_covered_sequences,
 };
 #[cfg(test)]
 pub(crate) use compression::{

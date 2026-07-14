@@ -1684,6 +1684,7 @@ pub(crate) async fn save_prompt_settings(
         system_prompt: None,
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
+        context_compression_system_prompt: config.prompts.context_compression_system_prompt.clone(),
     };
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     refresh_review_agent_system_prompt(&mut config)?;
