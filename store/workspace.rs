@@ -93,6 +93,89 @@ pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
     "workspace spec generation",
     "workspace spec update",
 ];
+
+/// Shared with query-plan regression tests so EXPLAIN stays tied to production SQL.
+#[doc(hidden)]
+pub const NEXT_ENABLED_SCHEDULED_TASK_SQL: &str = "SELECT next_run_at
+                 FROM scheduled_tasks
+                 WHERE status = 'enabled' AND next_run_at IS NOT NULL
+                 ORDER BY next_run_at ASC
+                 LIMIT 1";
+
+/// Shared with query-plan regression tests so EXPLAIN stays tied to production SQL.
+#[doc(hidden)]
+pub const RUNNABLE_AGENT_TASKS_SQL: &str = "SELECT task.id, task.team_id, task.owner_instance_id,
+                        task.origin_instance_id, task.parent_task_id, task.sequence,
+                        task.status, task.input_json, task.result_json, task.error_json,
+                        task.created_at, task.updated_at, task.started_at, task.completed_at
+                 FROM agent_tasks AS task
+                 JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE task.status = 'queued' AND instance.status IN ('idle', 'draining')
+                   AND team.status IN ('active', 'draining')
+                   AND (
+                        SELECT COUNT(*)
+                        FROM agent_tasks AS running_task
+                        WHERE running_task.team_id = task.team_id
+                          AND running_task.status = 'running'
+                   ) < team.max_concurrent_runs
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agent_tasks AS earlier_task
+                        WHERE earlier_task.owner_instance_id = task.owner_instance_id
+                          AND earlier_task.sequence < task.sequence
+                          AND earlier_task.status IN ('queued', 'running', 'waiting')
+                   )
+                   AND (
+                        json_extract(task.input_json, '$.deferUntilWorkspaceIdle') IS NOT 1
+                        OR NOT EXISTS (
+                            SELECT 1 FROM agent_tasks AS earlier_workspace_task
+                            WHERE earlier_workspace_task.rowid < task.rowid
+                              AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
+                              AND COALESCE(json_extract(earlier_workspace_task.input_json, '$.sessionMode'), '') <> 'plan'
+                        )
+                   )
+                   AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                        )
+                        OR (
+                            EXISTS (
+                                SELECT 1 FROM agent_task_dependencies AS dependency
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.wait_mode = 'all'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM agent_task_dependencies AS dependency
+                                JOIN agent_tasks AS required_task
+                                  ON required_task.id = dependency.dependency_task_id
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND required_task.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM agent_task_dependencies AS dependency
+                            JOIN agent_tasks AS required_task
+                              ON required_task.id = dependency.dependency_task_id
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.wait_mode = 'any'
+                              AND required_task.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.deadline_at IS NOT NULL
+                              AND dependency.deadline_at <= ?1
+                        )
+                   )
+                 ORDER BY instance.last_scheduled_at IS NOT NULL,
+                          instance.last_scheduled_at,
+                          task.team_id,
+                          task.owner_instance_id,
+                          task.sequence
+                 LIMIT ?2";
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const PLAN_AUTO_RUN_DESIRED_ENABLED_KEY: &str = "plan_auto_run_desired_enabled";
@@ -8068,15 +8151,7 @@ impl WorkspaceDatabase {
         &self,
     ) -> Result<Option<String>, WorkspaceDatabaseError> {
         self.connection
-            .query_row(
-                "SELECT next_run_at
-                 FROM scheduled_tasks
-                 WHERE status = 'enabled' AND next_run_at IS NOT NULL
-                 ORDER BY next_run_at ASC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(NEXT_ENABLED_SCHEDULED_TASK_SQL, [], |row| row.get(0))
             .optional()
             .map_err(|source| self.sqlite_error(source))
     }
@@ -9799,80 +9874,7 @@ impl WorkspaceDatabase {
         let now = now_timestamp();
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT task.id, task.team_id, task.owner_instance_id,
-                        task.origin_instance_id, task.parent_task_id, task.sequence,
-                        task.status, task.input_json, task.result_json, task.error_json,
-                        task.created_at, task.updated_at, task.started_at, task.completed_at
-                 FROM agent_tasks AS task
-                 JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
-                 JOIN agent_teams AS team ON team.id = task.team_id
-                 WHERE task.status = 'queued' AND instance.status IN ('idle', 'draining')
-                   AND team.status IN ('active', 'draining')
-                   AND (
-                        SELECT COUNT(*)
-                        FROM agent_tasks AS running_task
-                        WHERE running_task.team_id = task.team_id
-                          AND running_task.status = 'running'
-                   ) < team.max_concurrent_runs
-                   AND NOT EXISTS (
-                        SELECT 1 FROM agent_tasks AS earlier_task
-                        WHERE earlier_task.owner_instance_id = task.owner_instance_id
-                          AND earlier_task.sequence < task.sequence
-                          AND earlier_task.status IN ('queued', 'running', 'waiting')
-                   )
-                   AND (
-                        json_extract(task.input_json, '$.deferUntilWorkspaceIdle') IS NOT 1
-                        OR NOT EXISTS (
-                            SELECT 1 FROM agent_tasks AS earlier_workspace_task
-                            WHERE earlier_workspace_task.rowid < task.rowid
-                              AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
-                              AND COALESCE(json_extract(earlier_workspace_task.input_json, '$.sessionMode'), '') <> 'plan'
-                        )
-                   )
-                   AND (
-                        NOT EXISTS (
-                            SELECT 1 FROM agent_task_dependencies AS dependency
-                            WHERE dependency.waiting_task_id = task.id
-                        )
-                        OR (
-                            EXISTS (
-                                SELECT 1 FROM agent_task_dependencies AS dependency
-                                WHERE dependency.waiting_task_id = task.id
-                                  AND dependency.wait_mode = 'all'
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1
-                                FROM agent_task_dependencies AS dependency
-                                JOIN agent_tasks AS required_task
-                                  ON required_task.id = dependency.dependency_task_id
-                                WHERE dependency.waiting_task_id = task.id
-                                  AND required_task.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
-                            )
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM agent_task_dependencies AS dependency
-                            JOIN agent_tasks AS required_task
-                              ON required_task.id = dependency.dependency_task_id
-                            WHERE dependency.waiting_task_id = task.id
-                              AND dependency.wait_mode = 'any'
-                              AND required_task.status IN ('completed', 'failed', 'cancelled', 'interrupted')
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM agent_task_dependencies AS dependency
-                            WHERE dependency.waiting_task_id = task.id
-                              AND dependency.deadline_at IS NOT NULL
-                              AND dependency.deadline_at <= ?1
-                        )
-                   )
-                 ORDER BY instance.last_scheduled_at IS NOT NULL,
-                          instance.last_scheduled_at,
-                          task.team_id,
-                          task.owner_instance_id,
-                          task.sequence
-                 LIMIT ?2",
-            )
+            .prepare(RUNNABLE_AGENT_TASKS_SQL)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params![now, limit], agent_task_from_row)
@@ -14209,6 +14211,116 @@ fn append_llm_request_audit_where_clause(
         &mut has_where,
         filters.exclude_request_kinds,
     );
+}
+
+/// Builds production LLM audit SELECT SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn llm_request_audit_rows_sql_for_tests(filters: LlmRequestAuditFilters<'_>) -> String {
+    let mut query = String::from(
+        "SELECT
+                id, workspace_id, chat_id, request_kind, provider_id, model_id, thinking_level,
+                request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
+                first_token_latency_ms, total_latency_ms, status_code, final_state,
+                invalidated_at, invalidated_reason
+             FROM llm_requests",
+    );
+    let mut query_params = Vec::new();
+    append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+    query.push_str(" ORDER BY request_started_at DESC, id DESC LIMIT ? OFFSET ?");
+    let _ = query_params;
+    query
+}
+
+/// Builds production LLM audit COUNT SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn llm_request_audit_count_sql_for_tests(filters: LlmRequestAuditFilters<'_>) -> String {
+    let mut query = String::from("SELECT COUNT(*) FROM llm_requests");
+    let mut query_params = Vec::new();
+    append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+    let _ = query_params;
+    query
+}
+
+/// Builds production LLM audit summary SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn llm_request_audit_summary_sql_for_tests(filters: LlmRequestAuditFilters<'_>) -> String {
+    let mut query = String::from(
+        "SELECT
+                COUNT(*),
+                COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                COUNT(total_latency_ms),
+                COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+             FROM llm_requests",
+    );
+    let mut query_params = Vec::new();
+    append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+    let _ = query_params;
+    query
+}
+
+/// Builds production requestKind breakdown SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn llm_request_audit_request_kind_breakdown_sql_for_tests(
+    filters: LlmRequestAuditFilters<'_>,
+) -> String {
+    let mut query = String::from(
+        "SELECT
+                request_kind,
+                COUNT(*),
+                COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                COUNT(total_latency_ms),
+                COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+             FROM llm_requests",
+    );
+    let mut query_params = Vec::new();
+    append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+    query.push_str(" GROUP BY request_kind ORDER BY request_kind");
+    let _ = query_params;
+    query
+}
+
+/// Builds production scheduled task list SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn scheduled_tasks_page_sql_for_tests(
+    status: Option<&str>,
+    search: Option<&str>,
+) -> Result<String, WorkspaceDatabaseError> {
+    let (where_clause, _) = scheduled_task_filter_sql(status, search)?;
+    Ok(format!(
+        "SELECT id, title, description, schedule_json, action_json, status,
+                    next_run_at, last_run_at, created_at, updated_at, metadata_json
+             FROM scheduled_tasks{where_clause}
+             ORDER BY
+                CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
+                next_run_at ASC,
+                updated_at DESC,
+                id ASC
+              LIMIT ? OFFSET ?"
+    ))
+}
+
+/// Builds production scheduled task count SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn scheduled_task_count_sql_for_tests(
+    status: Option<&str>,
+    search: Option<&str>,
+) -> Result<String, WorkspaceDatabaseError> {
+    let (where_clause, _) = scheduled_task_filter_sql(status, search)?;
+    Ok(format!(
+        "SELECT COUNT(*) FROM scheduled_tasks{where_clause}"
+    ))
 }
 
 fn append_llm_request_usage_rollup_where_clause(

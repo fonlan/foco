@@ -2863,31 +2863,8 @@ impl MemoryDatabase {
             });
         }
 
-        let (filter_sql, chat_param) = match self.kind {
-            MemoryDatabaseKind::Global => ("scope = 'global'", None),
-            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
-                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
-                chat_id,
-            ),
-            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
-        };
-        let enabled_filter_sql = if enabled_only { "AND enabled = 1" } else { "" };
-        let sql = format!(
-            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
-                    expires_at, metadata_json, created_at, updated_at
-             FROM memory_facts
-             WHERE ({filter_sql})
-               AND status = ?3
-               {enabled_filter_sql}
-               AND (?4 IS NULL OR kind = ?4)
-               AND (?5 IS NULL OR lower(fact) LIKE ?5 ESCAPE '\\')
-               AND is_latest = 1
-             ORDER BY
-               CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
-               pinned DESC,
-               updated_at DESC
-             LIMIT ?2 OFFSET ?6"
-        );
+        let (filter_sql, chat_param) = memory_facts_scope_filter_sql(self.kind, chat_id);
+        let sql = memory_facts_list_page_sql(filter_sql, enabled_only);
         let mut statement = self
             .connection
             .prepare(&sql)
@@ -2926,23 +2903,8 @@ impl MemoryDatabase {
             require_non_empty("query", query)?;
         }
 
-        let (filter_sql, chat_param) = match self.kind {
-            MemoryDatabaseKind::Global => ("scope = 'global'", None),
-            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
-                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
-                chat_id,
-            ),
-            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
-        };
-        let sql = format!(
-            "SELECT COUNT(*)
-             FROM memory_facts
-             WHERE ({filter_sql})
-               AND status = ?2
-               AND (?3 IS NULL OR kind = ?3)
-               AND (?4 IS NULL OR lower(fact) LIKE ?4 ESCAPE '\\')
-               AND is_latest = 1"
-        );
+        let (filter_sql, chat_param) = memory_facts_scope_filter_sql(self.kind, chat_id);
+        let sql = memory_facts_count_sql(filter_sql);
         let count = self
             .connection
             .query_row(
@@ -3989,6 +3951,55 @@ fn validate_scope_chat_id(
     }
 }
 
+/// Shared scope predicate for list/count so EXPLAIN tests stay production-homologous.
+fn memory_facts_scope_filter_sql(
+    kind: MemoryDatabaseKind,
+    chat_id: Option<&str>,
+) -> (&'static str, Option<&str>) {
+    match kind {
+        MemoryDatabaseKind::Global => ("scope = 'global'", None),
+        MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+            "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+            chat_id,
+        ),
+        MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+    }
+}
+
+/// Shared list SQL (parameterized) for production + query-plan regression tests.
+fn memory_facts_list_page_sql(filter_sql: &str, enabled_only: bool) -> String {
+    let enabled_filter_sql = if enabled_only { "AND enabled = 1" } else { "" };
+    format!(
+        "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, enabled, is_latest,
+                expires_at, metadata_json, created_at, updated_at
+         FROM memory_facts
+         WHERE ({filter_sql})
+           AND status = ?3
+           {enabled_filter_sql}
+           AND (?4 IS NULL OR kind = ?4)
+           AND (?5 IS NULL OR lower(fact) LIKE ?5 ESCAPE '\\')
+           AND is_latest = 1
+         ORDER BY
+           CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
+           pinned DESC,
+           updated_at DESC
+         LIMIT ?2 OFFSET ?6"
+    )
+}
+
+/// Shared count SQL (parameterized) for production + query-plan regression tests.
+fn memory_facts_count_sql(filter_sql: &str) -> String {
+    format!(
+        "SELECT COUNT(*)
+         FROM memory_facts
+         WHERE ({filter_sql})
+           AND status = ?2
+           AND (?3 IS NULL OR kind = ?3)
+           AND (?4 IS NULL OR lower(fact) LIKE ?4 ESCAPE '\\')
+           AND is_latest = 1"
+    )
+}
+
 fn require_non_empty(field: &str, value: &str) -> Result<(), MemoryDatabaseError> {
     if value.trim().is_empty() {
         return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -4694,7 +4705,7 @@ fn bool_to_i64(value: bool) -> i64 {
 mod tests {
     use super::*;
     use crate::workspace::{WorkspaceDatabase, workspace_database_path};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
     #[test]
     fn global_database_creates_memory_schema() {
@@ -6861,6 +6872,385 @@ mod tests {
         assert_eq!(old.status, MemoryStatus::Superseded.as_str());
         assert!(!new.enabled);
         assert!(new.is_latest);
+    }
+
+    #[test]
+    fn memory_list_and_count_query_plans_use_scope_status_indexes() {
+        // Global high-volume list/count path (no search term).
+        let profile = tempfile::tempdir().expect("profile");
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        drop(database);
+
+        let connection =
+            Connection::open(global_memory_database_path(profile.path())).expect("open global");
+        connection.execute_batch("BEGIN;").expect("begin");
+        {
+            let mut insert = connection
+                .prepare(
+                    "INSERT INTO memory_facts (
+                        id, scope, chat_id, status, kind, fact, confidence, pinned, enabled,
+                        is_latest, expires_at, metadata_json, created_at, updated_at
+                     ) VALUES (?1, 'global', NULL, ?2, ?3, ?4, 0.9, 0, 1, 1, NULL, '{}', ?5, ?5)",
+                )
+                .expect("prepare fact insert");
+            for index in 0..12_000 {
+                let status = match index % 11 {
+                    0 => "pending",
+                    1 => "superseded",
+                    2 => "expired",
+                    _ => "active",
+                };
+                let kind = match index % 3 {
+                    0 => "preference",
+                    1 => "project_fact",
+                    _ => "procedure",
+                };
+                let created_at = format!("2026-06-01T{:02}:00:00.000Z", index % 24);
+                insert
+                    .execute(params![
+                        format!("fact-global-{index}"),
+                        status,
+                        kind,
+                        format!("Global fact body {index}"),
+                        created_at,
+                    ])
+                    .expect("fact insert");
+            }
+        }
+        connection.execute_batch("COMMIT;").expect("commit");
+        drop(connection);
+
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("reopen global");
+        let page = database
+            .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 50, 0)
+            .expect("global page");
+        assert_eq!(page.len(), 50);
+        let count = database
+            .count_facts_for_scope(None, MemoryStatus::Active, None, None)
+            .expect("global count");
+        assert!(count as usize >= page.len());
+
+        let connection = Connection::open(database.database_path()).expect("open global");
+        // Production-homologous Global list SQL with representative binds (no search term).
+        let list_sql = explain_sql_with_numbered_binds(
+            &memory_facts_list_page_sql("scope = 'global'", false),
+            &[(2, "50"), (3, "active"), (4, "NULL"), (5, "NULL"), (6, "0")],
+        );
+        let list_plan = explain_query_plan(&connection, &list_sql);
+        assert!(
+            plan_uses_index(&list_plan, "memory_facts_scope_status_idx")
+                || plan_uses_index(&list_plan, "memory_facts_status_updated_idx")
+                || plan_uses_index(&list_plan, "memory_facts_latest_idx"),
+            "global list without query should use existing memory_facts indexes, plan:\n{list_plan}"
+        );
+        assert!(
+            !plan_has_unconstrained_scan_on(&list_plan, "memory_facts"),
+            "global list should not unconstrained-scan memory_facts, plan:\n{list_plan}"
+        );
+
+        let count_sql = explain_sql_with_numbered_binds(
+            &memory_facts_count_sql("scope = 'global'"),
+            &[(2, "active"), (3, "NULL"), (4, "NULL")],
+        );
+        let count_plan = explain_query_plan(&connection, &count_sql);
+        assert!(
+            plan_uses_index(&count_plan, "memory_facts_scope_status_idx")
+                || plan_uses_index(&count_plan, "memory_facts_status_updated_idx")
+                || plan_uses_index(&count_plan, "memory_facts_latest_idx"),
+            "global count without query should use existing memory_facts indexes, plan:\n{count_plan}"
+        );
+        assert!(
+            !plan_has_unconstrained_scan_on(&count_plan, "memory_facts"),
+            "global count should not unconstrained-scan memory_facts, plan:\n{count_plan}"
+        );
+
+        // User-triggered substring search is an accepted interactive scan exception
+        // (leading-wildcard LIKE); do not add ordinary B-tree indexes for '%query%'.
+        let search_sql = explain_sql_with_numbered_binds(
+            &memory_facts_list_page_sql("scope = 'global'", false),
+            &[
+                (2, "20"),
+                (3, "active"),
+                (4, "NULL"),
+                (5, "%fact body 1%"),
+                (6, "0"),
+            ],
+        );
+        let search_plan = explain_query_plan(&connection, &search_sql);
+        assert!(
+            !search_plan.is_empty(),
+            "fact substring search plan should exist for interactive exception documentation"
+        );
+        let _accepted_fact_substring_scan =
+            plan_has_unconstrained_scan_on(&search_plan, "memory_facts");
+
+        // Workspace scope path with chat OR workspace filter.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _ws =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace db");
+        let workspace_memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory");
+        drop(workspace_memory);
+
+        let connection =
+            Connection::open(workspace_database_path(workspace.path())).expect("open workspace");
+        connection
+            .execute(
+                "INSERT INTO chats (id, title, created_at, updated_at, archived_at, metadata_json)
+                 VALUES ('chat-mem', 'Mem', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z', NULL, '{}')",
+                [],
+            )
+            .expect("chat insert");
+        connection.execute_batch("BEGIN;").expect("begin ws");
+        {
+            let mut insert = connection
+                .prepare(
+                    "INSERT INTO memory_facts (
+                        id, scope, chat_id, status, kind, fact, confidence, pinned, enabled,
+                        is_latest, expires_at, metadata_json, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'active', 'project_fact', ?4, 0.9, 0, 1, 1, NULL, '{}', ?5, ?5)",
+                )
+                .expect("prepare ws fact insert");
+            for index in 0..10_000 {
+                let (scope, chat_id): (&str, Option<&str>) = if index % 4 == 0 {
+                    ("chat", Some("chat-mem"))
+                } else {
+                    ("workspace", None)
+                };
+                insert
+                    .execute(params![
+                        format!("fact-ws-{index}"),
+                        scope,
+                        chat_id,
+                        format!("Workspace fact {index}"),
+                        format!("2026-06-02T{:02}:00:00.000Z", index % 24),
+                    ])
+                    .expect("ws fact insert");
+            }
+        }
+        connection.execute_batch("COMMIT;").expect("commit ws");
+        drop(connection);
+
+        let workspace_memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("reopen workspace memory");
+        let ws_page = workspace_memory
+            .list_facts_for_scope_page(Some("chat-mem"), MemoryStatus::Active, None, None, 30, 0)
+            .expect("workspace+chat page");
+        assert_eq!(ws_page.len(), 30);
+
+        let connection =
+            Connection::open(workspace_database_path(workspace.path())).expect("open ws plan");
+        let (ws_filter, _) =
+            memory_facts_scope_filter_sql(MemoryDatabaseKind::Workspace, Some("chat-mem"));
+        let ws_list_sql = explain_sql_with_numbered_binds(
+            &memory_facts_list_page_sql(ws_filter, false),
+            &[
+                (1, "chat-mem"),
+                (2, "30"),
+                (3, "active"),
+                (4, "NULL"),
+                (5, "NULL"),
+                (6, "0"),
+            ],
+        );
+        let ws_plan = explain_query_plan(&connection, &ws_list_sql);
+        assert!(
+            plan_uses_index(&ws_plan, "memory_facts_scope_status_idx")
+                || plan_uses_index(&ws_plan, "memory_facts_chat_status_idx")
+                || plan_uses_index(&ws_plan, "memory_facts_status_updated_idx")
+                || plan_uses_index(&ws_plan, "memory_facts_latest_idx"),
+            "workspace/chat list should use existing named indexes, plan:\n{ws_plan}"
+        );
+        assert!(
+            !plan_has_unconstrained_scan_on(&ws_plan, "memory_facts"),
+            "workspace/chat list should not unconstrained-scan memory_facts, plan:\n{ws_plan}"
+        );
+        // Decision: no new memory_facts composite index; existing scope/status/latest indexes suffice.
+    }
+
+    #[test]
+    fn sources_for_facts_batches_and_profile_refresh_avoids_n_plus_one() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace db");
+            workspace_database
+                .insert_chat("chat-batch", "Batch memory")
+                .expect("chat insert");
+        }
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory");
+
+        for index in 0..40 {
+            let source_id = format!("source-batch-{index}");
+            let fact_id = format!("fact-batch-{index}");
+            let source_content = format!("Source content {index}");
+            let fact_text = format!("Batch fact {index}");
+            memory
+                .insert_source(NewMemorySource {
+                    id: &source_id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-batch"),
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Batch source",
+                    content: &source_content,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+            memory
+                .insert_fact(NewMemoryFact {
+                    id: &fact_id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-batch"),
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact: &fact_text,
+                    confidence: Some(0.8),
+                    pinned: index % 5 == 0,
+                    source_ids: &[source_id.as_str()],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+
+        let fact_ids = (0..40)
+            .map(|index| format!("fact-batch-{index}"))
+            .collect::<Vec<_>>();
+        let fact_id_refs = fact_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let sources_by_fact = memory
+            .sources_for_facts(&fact_id_refs)
+            .expect("batch sources");
+        assert_eq!(sources_by_fact.len(), 40);
+        for index in 0..40 {
+            let sources = sources_by_fact
+                .get(&format!("fact-batch-{index}"))
+                .expect("fact sources");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].id, format!("source-batch-{index}"));
+        }
+
+        let profile = memory
+            .refresh_profile_from_active_facts(MemoryScope::Chat, Some("chat-batch"), 40)
+            .expect("profile refresh")
+            .expect("profile row");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&profile.metadata_json).expect("profile metadata");
+        assert_eq!(metadata["sourceFactCount"], 40);
+        assert_eq!(metadata["sourceLinks"].as_array().expect("links").len(), 40);
+        // Profile stores sourceLinks for all facts from one sources_for_facts batch, not N+1.
+        for link in metadata["sourceLinks"].as_array().expect("links") {
+            assert_eq!(link["sourceIds"].as_array().expect("ids").len(), 1);
+        }
+
+        let connection = Connection::open(memory.database_path()).expect("open for explain");
+        // Homologous to sources_for_facts JOIN + IN list (PK/autoindex on fact_sources).
+        let sources_sql = "SELECT fs.fact_id, s.id
+             FROM memory_sources s
+             JOIN memory_fact_sources fs ON fs.source_id = s.id
+             WHERE fs.fact_id IN ('fact-batch-0','fact-batch-1','fact-batch-2')
+             ORDER BY fs.fact_id ASC, s.created_at ASC, s.id ASC";
+        let sources_plan = explain_query_plan(&connection, sources_sql);
+        assert!(
+            plan_uses_index(&sources_plan, "sqlite_autoindex_memory_fact_sources_1")
+                || plan_uses_index(&sources_plan, "memory_fact_sources_source_idx")
+                || plan_uses_index(&sources_plan, "sqlite_autoindex_memory_sources_1"),
+            "sources_for_facts batch join should use fact_sources/source keys, plan:\n{sources_plan}"
+        );
+        assert!(
+            !plan_has_unconstrained_scan_on(&sources_plan, "memory_fact_sources"),
+            "sources batch should not unconstrained-scan memory_fact_sources, plan:\n{sources_plan}"
+        );
+    }
+
+    fn explain_query_plan(connection: &Connection, sql: &str) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain");
+        let rows = statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?
+                ))
+            })
+            .expect("explain rows");
+        rows.map(|row| row.expect("explain row"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Replace `?N` placeholders by number (desc) so EXPLAIN mirrors production bind semantics.
+    fn explain_sql_with_numbered_binds(sql: &str, binds: &[(u32, &str)]) -> String {
+        let mut ordered = binds.to_vec();
+        ordered.sort_by(|left, right| right.0.cmp(&left.0));
+        let mut result = sql.to_string();
+        for (index, value) in ordered {
+            let needle = format!("?{index}");
+            let replacement =
+                if value == "NULL" || value.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+                    value.to_string()
+                } else {
+                    format!("'{}'", value.replace('\'', "''"))
+                };
+            result = result.replace(&needle, &replacement);
+        }
+        result
+    }
+
+    fn plan_uses_index(plan: &str, index_name: &str) -> bool {
+        for line in plan.lines() {
+            let detail = line
+                .rsplit_once('|')
+                .map(|(_, detail)| detail.trim())
+                .unwrap_or(line.trim());
+            if detail.contains(index_name)
+                && (detail.contains("USING INDEX")
+                    || detail.contains("USING COVERING INDEX")
+                    || detail.contains("SEARCH"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn plan_has_unconstrained_scan_on(plan: &str, table: &str) -> bool {
+        for line in plan.lines() {
+            let detail = line
+                .rsplit_once('|')
+                .map(|(_, detail)| detail.trim())
+                .unwrap_or(line.trim());
+            if !detail.starts_with("SCAN ") {
+                continue;
+            }
+            if detail.contains("USING INDEX ")
+                || detail.contains("USING COVERING INDEX ")
+                || detail.contains("USING INTEGER PRIMARY KEY")
+                || detail.contains("USING ROWID")
+                || detail.contains("CONSTANT ROW")
+                || detail.contains("SUBQUERY")
+                || detail.contains("AUTOMATIC")
+            {
+                continue;
+            }
+            let after_scan = detail.trim_start_matches("SCAN ").trim_start();
+            if after_scan == table
+                || after_scan.starts_with(&format!("{table} "))
+                || after_scan.starts_with(&format!("{table}\t"))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn memory_column_definition(

@@ -20,23 +20,28 @@ use foco_store::{
     },
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord,
-        LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewAgentContextEntry,
-        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
-        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
-        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
-        PlanPhaseAttemptTrigger, PlanStepPatch, RewriteChatFromUserMessage,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, prune_workspace_database_backups, workspace_database_path,
+        LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry, NewAgentContextSnapshot,
+        NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
+        NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
+        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
+        NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
+        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch, RUNNABLE_AGENT_TASKS_SQL,
+        RewriteChatFromUserMessage, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
+        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        llm_request_audit_count_sql_for_tests,
+        llm_request_audit_request_kind_breakdown_sql_for_tests,
+        llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
+        prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
+        scheduled_tasks_page_sql_for_tests, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -12542,30 +12547,183 @@ fn rewrite_chat_from_user_message_rolls_back_when_new_assistant_conflicts() {
 }
 
 fn explain_query_plan(connection: &Connection, sql: &str) -> String {
-    let mut statement = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-        .expect("prepare explain");
-    let rows = statement
-        .query_map([], |row| {
-            Ok(format!(
-                "{}|{}|{}|{}",
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?
-            ))
-        })
-        .expect("explain rows");
-    rows.map(|row| row.expect("explain row"))
+    explain_query_plan_rows(connection, sql)
+        .into_iter()
+        .map(|row| format!("{}|{}|{}|{}", row.id, row.parent, row.not_used, row.detail))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+#[derive(Debug, Clone)]
+struct QueryPlanRow {
+    id: i64,
+    parent: i64,
+    not_used: i64,
+    detail: String,
+}
+
+fn explain_query_plan_rows(connection: &Connection, sql: &str) -> Vec<QueryPlanRow> {
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare explain");
+    let parameter_count = statement.parameter_count();
+    // Prefer non-null text binds so range/equality estimates stay realistic for planner tests.
+    let binds = (0..parameter_count)
+        .map(|index| rusqlite::types::Value::Text(format!("explain-bind-{index}")))
+        .collect::<Vec<_>>();
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(binds), |row| {
+            Ok(QueryPlanRow {
+                id: row.get(0)?,
+                parent: row.get(1)?,
+                not_used: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })
+        .expect("explain rows");
+    rows.map(|row| row.expect("explain row")).collect()
+}
+
+#[derive(Debug, Default)]
+struct QueryPlanAnalysis {
+    details: Vec<String>,
+    searches: Vec<String>,
+    unconstrained_table_scans: Vec<String>,
+    indexes_used: Vec<String>,
+    uses_temp_b_tree: bool,
+}
+
+fn analyze_query_plan(plan: &str) -> QueryPlanAnalysis {
+    let mut analysis = QueryPlanAnalysis::default();
+    for line in plan.lines() {
+        let detail = line
+            .rsplit_once('|')
+            .map(|(_, detail)| detail.trim())
+            .unwrap_or(line.trim());
+        if detail.is_empty() {
+            continue;
+        }
+        analysis.details.push(detail.to_string());
+        if detail.contains("USE TEMP B-TREE") {
+            analysis.uses_temp_b_tree = true;
+        }
+        if detail.starts_with("SEARCH ") {
+            analysis.searches.push(detail.to_string());
+        }
+        if let Some(index_name) = index_name_from_plan_detail(detail) {
+            analysis.indexes_used.push(index_name.to_string());
+        }
+        if is_unconstrained_table_scan_detail(detail) {
+            analysis.unconstrained_table_scans.push(detail.to_string());
+        }
+    }
+    analysis
+}
+
+fn index_name_from_plan_detail(detail: &str) -> Option<&str> {
+    for marker in ["USING COVERING INDEX ", "USING INDEX "] {
+        if let Some(rest) = detail.split_once(marker).map(|(_, rest)| rest) {
+            let name = rest
+                .split(|ch: char| ch.is_whitespace() || ch == '(')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn is_unconstrained_table_scan_detail(detail: &str) -> bool {
+    let trimmed = detail.trim();
+    if !trimmed.starts_with("SCAN ") {
+        return false;
+    }
+    // Index-backed or rowid primary-key access is constrained.
+    if trimmed.contains("USING INDEX ")
+        || trimmed.contains("USING COVERING INDEX ")
+        || trimmed.contains("USING INTEGER PRIMARY KEY")
+        || trimmed.contains("USING ROWID")
+    {
+        return false;
+    }
+    // Ignore synthetic nodes.
+    if trimmed.contains("CONSTANT ROW")
+        || trimmed.contains("SUBQUERY")
+        || trimmed.contains("CO-ROUTINE")
+        || trimmed.contains("AUTOMATIC COVERING INDEX")
+        || trimmed.contains("AUTOMATIC INDEX")
+    {
+        return false;
+    }
+    true
+}
+
 fn plan_uses_index(plan: &str, index_name: &str) -> bool {
-    plan.contains(index_name)
-        && (plan.contains("USING INDEX")
-            || plan.contains("USING COVERING INDEX")
-            || plan.contains("SEARCH"))
+    analyze_query_plan(plan)
+        .indexes_used
+        .iter()
+        .any(|used| used == index_name)
+}
+
+fn plan_has_unconstrained_scan_on(plan: &str, table: &str) -> bool {
+    analyze_query_plan(plan)
+        .unconstrained_table_scans
+        .iter()
+        .any(|detail| {
+            // Match "SCAN table" / "SCAN table AS alias" but not "SCAN tables_other".
+            let after_scan = detail.trim_start_matches("SCAN ").trim_start();
+            after_scan == table
+                || after_scan.starts_with(&format!("{table} "))
+                || after_scan.starts_with(&format!("{table}\t"))
+        })
+}
+
+/// Expand `?` / `?N` placeholders with representative literals for EXPLAIN QUERY PLAN.
+fn sql_with_explain_literals(sql: &str, values: &[&str]) -> String {
+    let mut out = String::with_capacity(sql.len() + values.len() * 8);
+    let mut value_index = 0usize;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '?' {
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let value = values.get(value_index).copied().unwrap_or("NULL");
+            value_index += 1;
+            if value == "NULL" || value.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+                out.push_str(value);
+            } else {
+                out.push('\'');
+                out.push_str(&value.replace('\'', "''"));
+                out.push('\'');
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn assert_plan_uses_index(plan: &str, index_name: &str) {
+    assert!(
+        plan_uses_index(plan, index_name),
+        "expected index {index_name} in plan analysis {:?}, full plan:\n{plan}",
+        analyze_query_plan(plan).indexes_used
+    );
+}
+
+fn assert_no_unconstrained_table_scan(plan: &str, table: &str) {
+    assert!(
+        !plan_has_unconstrained_scan_on(plan, table),
+        "unexpected unconstrained SCAN on {table}: {:?}\nfull plan:\n{plan}",
+        analyze_query_plan(plan).unconstrained_table_scans
+    );
 }
 
 #[test]
@@ -12635,13 +12793,12 @@ fn has_user_message_since_uses_partial_user_created_at_index() {
              LIMIT 1
          )",
     );
+    assert_plan_uses_index(&plan, "messages_user_created_at_idx");
+    assert_no_unconstrained_table_scan(&plan, "messages");
+    let analysis = analyze_query_plan(&plan);
     assert!(
-        plan_uses_index(&plan, "messages_user_created_at_idx"),
-        "expected partial user created_at index, plan was:\n{plan}"
-    );
-    assert!(
-        !plan.contains("SCAN messages"),
-        "expected no full messages table scan, plan was:\n{plan}"
+        !analysis.searches.is_empty() || plan_uses_index(&plan, "messages_user_created_at_idx"),
+        "expected SEARCH or indexed access, plan:\n{plan}"
     );
 }
 
@@ -12709,29 +12866,38 @@ fn chat_kind_filters_use_partial_indexes_and_sql_where() {
     assert_eq!(page.chats.len(), 50);
 
     let connection = Connection::open(database.database_path()).expect("open database");
+    // Production visible pagination SQL (chat_page_matching_title without title query).
     let visible_plan = explain_query_plan(
         &connection,
-        "SELECT id FROM chats
+        "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+         FROM chats
          WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'
          ORDER BY updated_at DESC, created_at DESC, id DESC
-         LIMIT 50",
+         LIMIT 51",
     );
-    assert!(
-        plan_uses_index(&visible_plan, "chats_visible_updated_created_id_idx")
-            || plan_uses_index(&visible_plan, "chats_updated_created_id_idx"),
-        "expected visible/chat ordering index, plan was:\n{visible_plan}"
+    // Must use the memory_dream-excluding partial index; falling back only to the generic
+    // chats_updated_created_id_idx is no longer accepted.
+    assert_plan_uses_index(&visible_plan, "chats_visible_updated_created_id_idx");
+    assert_no_unconstrained_table_scan(&visible_plan, "chats");
+
+    let visible_count_plan = explain_query_plan(
+        &connection,
+        "SELECT COUNT(*)
+         FROM chats
+         WHERE COALESCE(json_extract(metadata_json, '$.kind'), '') != 'memory_dream'",
     );
+    assert_plan_uses_index(&visible_count_plan, "chats_visible_updated_created_id_idx");
+    assert_no_unconstrained_table_scan(&visible_count_plan, "chats");
 
     let dream_plan = explain_query_plan(
         &connection,
-        "SELECT id FROM chats
+        "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+         FROM chats
          WHERE json_extract(metadata_json, '$.kind') = 'memory_dream'
          ORDER BY updated_at DESC, created_at DESC, id DESC",
     );
-    assert!(
-        plan_uses_index(&dream_plan, "chats_memory_dream_updated_created_id_idx"),
-        "expected dream partial index, plan was:\n{dream_plan}"
-    );
+    assert_plan_uses_index(&dream_plan, "chats_memory_dream_updated_created_id_idx");
+    assert_no_unconstrained_table_scan(&dream_plan, "chats");
 
     // Title substring search is interactive and intentionally may scan;
     // chats_title_nocase_idx cannot optimize leading-wildcard LIKE '%query%'.
@@ -12743,19 +12909,25 @@ fn chat_kind_filters_use_partial_indexes_and_sql_where() {
          ORDER BY updated_at DESC, created_at DESC, id DESC
          LIMIT 20",
     );
+    let title_analysis = analyze_query_plan(&title_plan);
     assert!(
-        !title_plan.is_empty(),
+        !title_analysis.details.is_empty(),
         "title search plan should be available for interactive exception documentation"
     );
+    // Document accepted interactive exception: leading-wildcard substring may unconstrained-scan.
+    let _accepted_title_substring_scan = plan_has_unconstrained_scan_on(&title_plan, "chats");
 }
 
 #[test]
-fn llm_request_audit_default_window_query_plan_avoids_unexpected_full_scan() {
+fn llm_request_audit_query_plans_cover_rows_count_summary_and_breakdown() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
     database
         .insert_chat("chat-stats", "Stats")
+        .expect("chat insert");
+    database
+        .insert_chat("chat-other", "Other")
         .expect("chat insert");
     drop(database);
 
@@ -12768,21 +12940,49 @@ fn llm_request_audit_default_window_query_plan_avoids_unexpected_full_scan() {
                 "INSERT INTO llm_requests (
                    id, workspace_id, chat_id, request_kind, provider_id, model_id,
                    request_started_at, completed_at, input_tokens, output_tokens,
-                   total_latency_ms, status_code, final_state
-                 ) VALUES (?1, 'workspace-1', 'chat-stats', ?2, 'provider-a', 'model-a',
-                           ?3, ?3, 10, 5, 20, 200, 'succeeded')",
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   total_latency_ms, status_code, final_state, invalidated_at
+                 ) VALUES (?1, 'workspace-1', ?2, ?3, 'provider-a', 'model-a',
+                           ?4, ?4, ?5, 5, 1, 1, 0, ?6, 200, ?7, ?8)",
             )
             .expect("prepare llm insert");
-        for index in 0..8_000 {
-            let day = (index % 10) + 1;
+        for index in 0..12_000 {
+            let day = (index % 14) + 1;
             let started_at = format!("2026-07-{day:02}T12:00:00.000Z");
-            let kind = if index % 17 == 0 {
-                "contextCompression"
+            let kind = match index % 23 {
+                0 => "contextCompression",
+                1 => "prompt hook",
+                2 => "chat title generation",
+                _ => "chat completion",
+            };
+            let chat_id = if index % 11 == 0 {
+                "chat-other"
             } else {
-                "chat completion"
+                "chat-stats"
+            };
+            let final_state = if index % 31 == 0 {
+                "failed"
+            } else if index % 47 == 0 {
+                "cancelled"
+            } else {
+                "succeeded"
+            };
+            let invalidated_at: Option<&str> = if index % 53 == 0 {
+                Some("2026-07-14T00:00:00.000Z")
+            } else {
+                None
             };
             insert
-                .execute(params![format!("req-{index}"), kind, started_at])
+                .execute(params![
+                    format!("req-{index}"),
+                    chat_id,
+                    kind,
+                    started_at,
+                    10 + (index % 7),
+                    20 + (index % 13),
+                    final_state,
+                    invalidated_at,
+                ])
                 .expect("llm request insert");
         }
     }
@@ -12791,7 +12991,8 @@ fn llm_request_audit_default_window_query_plan_avoids_unexpected_full_scan() {
 
     let database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
-    let filters = LlmRequestAuditFilters {
+
+    let default_filters = LlmRequestAuditFilters {
         request_ids: &[],
         workspace_id: None,
         chat_id: None,
@@ -12806,45 +13007,490 @@ fn llm_request_audit_default_window_query_plan_avoids_unexpected_full_scan() {
         limit: Some(100),
         offset: Some(0),
     };
+    let kind_filters = LlmRequestAuditFilters {
+        request_kind: Some("contextCompression"),
+        exclude_request_kinds: &[],
+        ..default_filters
+    };
+    let chat_valid_filters = LlmRequestAuditFilters {
+        chat_id: Some("chat-stats"),
+        exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        valid_only: true,
+        ..default_filters
+    };
+
     let rows = database
-        .llm_request_audit_rows(filters)
+        .llm_request_audit_rows(default_filters)
         .expect("audit rows");
     assert!(!rows.is_empty());
+    assert!(rows.iter().all(|row| {
+        !MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.contains(&row.request_kind.as_str())
+            && row.invalidated_at.is_none()
+            && row.request_started_at.as_str() >= "2026-07-07T00:00:00.000Z"
+    }));
+
+    let count = database
+        .llm_request_audit_count(default_filters)
+        .expect("audit count");
+    assert!(count >= rows.len() as i64);
+
     let summary = database
-        .llm_request_audit_summary(filters)
+        .llm_request_audit_summary(default_filters)
         .expect("audit summary");
-    assert!(summary.total_requests > 0);
+    assert_eq!(summary.total_requests, count);
+    assert!(
+        summary.failed_requests > 0,
+        "fixture seeds failed/cancelled rows that count as failedRequests"
+    );
+    assert!(summary.total_tokens > 0);
+    assert!(summary.latency_sum > 0);
+
+    let kind_rows = database
+        .llm_request_audit_rows(kind_filters)
+        .expect("kind rows");
+    assert!(!kind_rows.is_empty());
+    assert!(
+        kind_rows
+            .iter()
+            .all(|row| row.request_kind == "contextCompression")
+    );
+
+    let chat_rows = database
+        .llm_request_audit_rows(chat_valid_filters)
+        .expect("chat rows");
+    assert!(!chat_rows.is_empty());
+    assert!(chat_rows.iter().all(|row| {
+        row.chat_id.as_deref() == Some("chat-stats") && row.invalidated_at.is_none()
+    }));
+
+    let breakdown = database
+        .llm_request_audit_request_kind_breakdown(default_filters)
+        .expect("kind breakdown");
+    assert!(!breakdown.is_empty());
+    let completion = breakdown
+        .iter()
+        .find(|row| row.request_kind == "chat completion")
+        .expect("chat completion breakdown");
+    assert!(completion.request_count > 0);
+    // failedRequests includes cancelled + failed (not only HTTP failures).
+    assert!(
+        completion.failed_requests > 0,
+        "fixture includes failed/cancelled chat completion rows"
+    );
 
     let connection = Connection::open(database.database_path()).expect("open database");
+
+    // Homology: production builders shape the EXPLAIN SQL (shared WHERE builder).
+    let rows_sql = llm_request_audit_rows_sql_for_tests(default_filters);
+    assert!(rows_sql.contains("request_started_at >= ?"));
+    assert!(rows_sql.contains("invalidated_at IS NULL"));
+    assert!(rows_sql.contains("request_kind NOT IN"));
+    let mut default_binds = vec!["2026-07-07T00:00:00.000Z"];
+    default_binds.extend(MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.iter().copied());
+    default_binds.push("100");
+    default_binds.push("0");
     let rows_plan = explain_query_plan(
         &connection,
-        "SELECT id
-         FROM llm_requests
-         WHERE request_started_at >= '2026-07-07T00:00:00.000Z'
-           AND invalidated_at IS NULL
-           AND request_kind NOT IN (
-             'chat title generation',
-             'contextCompression',
-             'memory extraction',
-             'memory retrieval',
-             'model availability test',
-             'prompt hook',
-             'workspace spec compaction',
-             'workspace spec generation',
-             'workspace spec update'
-           )
-         ORDER BY request_started_at DESC, id DESC
-         LIMIT 100",
+        &sql_with_explain_literals(&rows_sql, &default_binds),
     );
-    // Existing started_at / kind indexes are enough for the default 7-day window.
-    // Do not add write-amplifying composite indexes unless planner still SCANs.
+    // Default window: started_at range and/or request_kind exclusion. Real planner may pick
+    // llm_requests_request_kind_idx for NOT IN + date predicates without ANALYZE stats.
+    // Reject unconstrained table scans and unrelated indexes (e.g. chat_valid alone).
     assert!(
         plan_uses_index(&rows_plan, "llm_requests_started_at_idx")
-            || plan_uses_index(&rows_plan, "llm_requests_request_kind_idx")
-            || plan_uses_index(&rows_plan, "llm_requests_chat_valid_idx")
-            || !rows_plan.contains("SCAN llm_requests"),
-        "default AI Statistics window should use an existing index when possible, plan was:\n{rows_plan}"
+            || plan_uses_index(&rows_plan, "llm_requests_request_kind_idx"),
+        "default window rows should use started_at or request_kind index, plan:\n{rows_plan}"
     );
+    assert_no_unconstrained_table_scan(&rows_plan, "llm_requests");
+
+    let kind_rows_sql = llm_request_audit_rows_sql_for_tests(kind_filters);
+    assert!(kind_rows_sql.contains("request_kind = ?"));
+    let kind_rows_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(
+            &kind_rows_sql,
+            &["contextCompression", "2026-07-07T00:00:00.000Z", "100", "0"],
+        ),
+    );
+    assert!(
+        plan_uses_index(&kind_rows_plan, "llm_requests_request_kind_idx")
+            || plan_uses_index(&kind_rows_plan, "llm_requests_started_at_idx"),
+        "explicit requestKind filter should use kind or started_at index, plan:\n{kind_rows_plan}"
+    );
+    assert_no_unconstrained_table_scan(&kind_rows_plan, "llm_requests");
+
+    let chat_rows_sql = llm_request_audit_rows_sql_for_tests(chat_valid_filters);
+    assert!(chat_rows_sql.contains("chat_id = ?"));
+    let mut chat_binds = vec!["chat-stats", "2026-07-07T00:00:00.000Z"];
+    chat_binds.extend(MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.iter().copied());
+    chat_binds.push("100");
+    chat_binds.push("0");
+    let chat_rows_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&chat_rows_sql, &chat_binds),
+    );
+    assert!(
+        plan_uses_index(&chat_rows_plan, "llm_requests_chat_valid_idx")
+            || plan_uses_index(&chat_rows_plan, "llm_requests_chat_idx")
+            || plan_uses_index(&chat_rows_plan, "llm_requests_started_at_idx"),
+        "chatId+valid_only should use chat/valid or started_at index, plan:\n{chat_rows_plan}"
+    );
+    assert_no_unconstrained_table_scan(&chat_rows_plan, "llm_requests");
+
+    let count_sql = llm_request_audit_count_sql_for_tests(default_filters);
+    let mut count_binds = vec!["2026-07-07T00:00:00.000Z"];
+    count_binds.extend(MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.iter().copied());
+    let count_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&count_sql, &count_binds),
+    );
+    assert!(
+        plan_uses_index(&count_plan, "llm_requests_started_at_idx")
+            || plan_uses_index(&count_plan, "llm_requests_request_kind_idx"),
+        "default window count should use started_at or request_kind index, plan:\n{count_plan}"
+    );
+    assert_no_unconstrained_table_scan(&count_plan, "llm_requests");
+
+    let summary_sql = llm_request_audit_summary_sql_for_tests(default_filters);
+    let summary_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&summary_sql, &count_binds),
+    );
+    assert!(
+        plan_uses_index(&summary_plan, "llm_requests_started_at_idx")
+            || plan_uses_index(&summary_plan, "llm_requests_request_kind_idx"),
+        "default window summary should use started_at or request_kind index, plan:\n{summary_plan}"
+    );
+    assert_no_unconstrained_table_scan(&summary_plan, "llm_requests");
+    // Aggregates may introduce TEMP B-TREE; that is explicitly allowed.
+    let _summary_may_use_temp = analyze_query_plan(&summary_plan).uses_temp_b_tree;
+
+    let breakdown_sql = llm_request_audit_request_kind_breakdown_sql_for_tests(default_filters);
+    let breakdown_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&breakdown_sql, &count_binds),
+    );
+    assert!(
+        plan_uses_index(&breakdown_plan, "llm_requests_started_at_idx")
+            || plan_uses_index(&breakdown_plan, "llm_requests_request_kind_idx"),
+        "default window breakdown should use started_at or request_kind index, plan:\n{breakdown_plan}"
+    );
+    assert_no_unconstrained_table_scan(&breakdown_plan, "llm_requests");
+    // GROUP BY request_kind may use TEMP B-TREE; allowed for aggregate paths.
+    let _breakdown_may_use_temp = analyze_query_plan(&breakdown_plan).uses_temp_b_tree;
+
+    // Pure time-window (no kind exclusion) must use started_at range index.
+    let pure_window = LlmRequestAuditFilters {
+        request_ids: &[],
+        workspace_id: None,
+        chat_id: None,
+        request_kind: None,
+        exclude_request_kinds: &[],
+        provider_id: None,
+        model_id: None,
+        final_state: None,
+        started_after: Some("2026-07-07T00:00:00.000Z"),
+        started_before: None,
+        valid_only: false,
+        limit: Some(100),
+        offset: Some(0),
+    };
+    let pure_sql = llm_request_audit_rows_sql_for_tests(pure_window);
+    let pure_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&pure_sql, &["2026-07-07T00:00:00.000Z", "100", "0"]),
+    );
+    assert_plan_uses_index(&pure_plan, "llm_requests_started_at_idx");
+    assert_no_unconstrained_table_scan(&pure_plan, "llm_requests");
+
+    // Decision: no new composite index on llm_requests. Representative plans already use
+    // existing started_at/request_kind indexes for the default 7-day window without unconstrained SCAN.
+}
+
+#[test]
+fn scheduled_tasks_query_plans_use_status_next_run_index() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    drop(database);
+
+    let connection =
+        Connection::open(workspace_database_path(workspace.path())).expect("open database");
+    connection.execute_batch("BEGIN;").expect("begin fixture");
+    {
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO scheduled_tasks (
+                    id, title, description, schedule_json, action_json, status,
+                    next_run_at, last_run_at, created_at, updated_at, metadata_json
+                 ) VALUES (?1, ?2, NULL, '{}', '{}', ?3, ?4, NULL, ?5, ?5, '{}')",
+            )
+            .expect("prepare scheduled insert");
+        for index in 0..12_000 {
+            let status = match index % 5 {
+                0 => "paused",
+                1 => "completed",
+                2 => "archived",
+                _ => "enabled",
+            };
+            let next_run_at = if status == "enabled" {
+                Some(format!(
+                    "2026-07-{:02}T{:02}:00:00.000Z",
+                    (index % 28) + 1,
+                    index % 24
+                ))
+            } else {
+                None
+            };
+            let created_at = format!("2026-06-01T{:02}:00:00.000Z", index % 24);
+            insert
+                .execute(params![
+                    format!("scheduled-task-{index}"),
+                    format!("Task {index}"),
+                    status,
+                    next_run_at,
+                    created_at,
+                ])
+                .expect("scheduled task insert");
+        }
+    }
+    connection.execute_batch("COMMIT;").expect("commit fixture");
+    drop(connection);
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
+    let enabled_page = database
+        .scheduled_tasks_page(ScheduledTaskListFilter {
+            status: Some("enabled"),
+            search: None,
+            limit: 50,
+            offset: 0,
+        })
+        .expect("enabled page");
+    assert_eq!(enabled_page.len(), 50);
+    assert!(enabled_page.iter().all(|task| task.status == "enabled"));
+
+    let enabled_count = database
+        .scheduled_task_count(ScheduledTaskListFilter {
+            status: Some("enabled"),
+            search: None,
+            limit: 1,
+            offset: 0,
+        })
+        .expect("enabled count");
+    assert!(enabled_count >= 50);
+
+    let next_run = database
+        .next_enabled_scheduled_task_run_at()
+        .expect("next run")
+        .expect("some enabled next_run_at");
+    assert!(next_run.starts_with("2026-07-"));
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let due_plan = explain_query_plan(&connection, NEXT_ENABLED_SCHEDULED_TASK_SQL);
+    assert_plan_uses_index(&due_plan, "scheduled_tasks_status_next_run_idx");
+    assert_no_unconstrained_table_scan(&due_plan, "scheduled_tasks");
+
+    let page_sql = scheduled_tasks_page_sql_for_tests(Some("enabled"), None).expect("page sql");
+    assert!(page_sql.contains("status = ?"));
+    let page_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&page_sql, &["enabled", "50", "0"]),
+    );
+    assert_plan_uses_index(&page_plan, "scheduled_tasks_status_next_run_idx");
+    assert_no_unconstrained_table_scan(&page_plan, "scheduled_tasks");
+    let _page_may_use_temp_for_order = analyze_query_plan(&page_plan).uses_temp_b_tree;
+
+    let count_sql = scheduled_task_count_sql_for_tests(Some("enabled"), None).expect("count sql");
+    let count_plan = explain_query_plan(
+        &connection,
+        &sql_with_explain_literals(&count_sql, &["enabled"]),
+    );
+    assert_plan_uses_index(&count_plan, "scheduled_tasks_status_next_run_idx");
+    assert_no_unconstrained_table_scan(&count_plan, "scheduled_tasks");
+
+    // Decision: no new scheduled_tasks index; status+next_run composite is sufficient.
+}
+
+#[test]
+fn runnable_agent_tasks_query_plan_uses_runnable_and_dependency_indexes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    // Structural teams/instances via public APIs; bulk historical rows via SQL for planner scale.
+    let mut live_teams = Vec::new();
+    for team_index in 0..20 {
+        let chat_id = format!("chat-runnable-{team_index}");
+        let (team_id, instance_id) =
+            create_test_agent_team(&mut database, &chat_id, &format!("runnable-{team_index}"));
+        let worker_id = create_test_agent_worker(
+            &database,
+            &team_id,
+            &format!("worker-runnable-{team_index}"),
+        );
+        live_teams.push((team_id, instance_id, worker_id));
+    }
+    drop(database);
+
+    let connection =
+        Connection::open(workspace_database_path(workspace.path())).expect("open database");
+    connection.execute_batch("BEGIN;").expect("begin fixture");
+    {
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO agent_tasks (
+                    id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                    sequence, status, input_json, result_json, error_json,
+                    created_at, updated_at, started_at, completed_at
+                 ) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, '{}', NULL, NULL, ?6, ?6, ?6, ?7)",
+            )
+            .expect("prepare agent_tasks insert");
+        let mut sequence_by_owner = std::collections::HashMap::<String, i64>::new();
+        let mut next_sequence = |owner: &str| -> i64 {
+            let entry = sequence_by_owner.entry(owner.to_string()).or_insert(0);
+            let value = *entry;
+            *entry += 1;
+            value
+        };
+
+        // ~10k completed historical tasks for index selectivity.
+        for index in 0..10_000 {
+            let team_index = index % live_teams.len();
+            let (team_id, instance_id, worker_id) = &live_teams[team_index];
+            let owner = if index % 2 == 0 {
+                instance_id.as_str()
+            } else {
+                worker_id.as_str()
+            };
+            let sequence = next_sequence(owner);
+            let created_at = format!("2026-06-01T{:02}:00:00.000Z", index % 24);
+            insert
+                .execute(params![
+                    format!("agent-task-hist-{index}"),
+                    team_id.as_str(),
+                    owner,
+                    sequence,
+                    "completed",
+                    created_at,
+                    created_at,
+                ])
+                .expect("hist task insert");
+        }
+
+        // Queued candidates, sequence-blocked secondaries, and dependency-blocked waiters.
+        for (team_index, (team_id, instance_id, worker_id)) in live_teams.iter().enumerate() {
+            let owner_seq = next_sequence(instance_id.as_str());
+            insert
+                .execute(params![
+                    format!("agent-task-queued-{team_index}"),
+                    team_id.as_str(),
+                    instance_id.as_str(),
+                    owner_seq,
+                    "queued",
+                    "2026-07-01T00:00:00.000Z",
+                    Option::<String>::None,
+                ])
+                .expect("queued insert");
+            let blocked_seq = next_sequence(instance_id.as_str());
+            insert
+                .execute(params![
+                    format!("agent-task-blocked-seq-{team_index}"),
+                    team_id.as_str(),
+                    instance_id.as_str(),
+                    blocked_seq,
+                    "queued",
+                    "2026-07-01T00:00:01.000Z",
+                    Option::<String>::None,
+                ])
+                .expect("blocked-seq insert");
+
+            let dep_seq = next_sequence(worker_id.as_str());
+            insert
+                .execute(params![
+                    format!("agent-task-dep-src-{team_index}"),
+                    team_id.as_str(),
+                    worker_id.as_str(),
+                    dep_seq,
+                    "queued",
+                    "2026-07-01T00:00:02.000Z",
+                    Option::<String>::None,
+                ])
+                .expect("dep source insert");
+            let waiting_seq = next_sequence(worker_id.as_str());
+            insert
+                .execute(params![
+                    format!("agent-task-waiting-{team_index}"),
+                    team_id.as_str(),
+                    worker_id.as_str(),
+                    waiting_seq,
+                    "queued",
+                    "2026-07-01T00:00:03.000Z",
+                    Option::<String>::None,
+                ])
+                .expect("waiting insert");
+        }
+
+        let mut dep_insert = connection
+            .prepare(
+                "INSERT INTO agent_task_dependencies (
+                    team_id, waiting_task_id, dependency_task_id, wait_mode,
+                    created_at, pending_tool_call_id, deadline_at
+                 ) VALUES (?1, ?2, ?3, 'all', '2026-07-01T00:00:04.000Z', NULL, NULL)",
+            )
+            .expect("prepare dependency insert");
+        for (team_index, (team_id, _, _)) in live_teams.iter().enumerate() {
+            dep_insert
+                .execute(params![
+                    team_id.as_str(),
+                    format!("agent-task-waiting-{team_index}"),
+                    format!("agent-task-dep-src-{team_index}"),
+                ])
+                .expect("dependency insert");
+        }
+    }
+    connection.execute_batch("COMMIT;").expect("commit fixture");
+    drop(connection);
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
+    let runnable = database.runnable_agent_tasks(100).expect("runnable");
+    assert!(!runnable.is_empty());
+    assert!(
+        runnable
+            .iter()
+            .all(|task| task.status == AgentTaskStatus::Queued)
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let runnable_sql = sql_with_explain_literals(
+        RUNNABLE_AGENT_TASKS_SQL,
+        &["2026-07-14T12:00:00.000Z", "100"],
+    );
+    let plan = explain_query_plan(&connection, &runnable_sql);
+    let analysis = analyze_query_plan(&plan);
+
+    // Queued candidate set must use the partial runnable index (not any agent_tasks*).
+    assert_plan_uses_index(&plan, "agent_tasks_runnable_idx");
+    assert_no_unconstrained_table_scan(&plan, "agent_tasks");
+    // Dependency lookups: planner prefers PK (waiting_task_id, dependency_task_id) over
+    // agent_task_dependencies_waiting_idx (team_id, waiting_task_id); either is indexed.
+    assert!(
+        plan_uses_index(&plan, "sqlite_autoindex_agent_task_dependencies_1")
+            || plan_uses_index(&plan, "agent_task_dependencies_waiting_idx"),
+        "dependency lookup must use PK or waiting_task index, used={:?}\nplan:\n{plan}",
+        analysis.indexes_used
+    );
+    assert!(
+        plan_uses_index(&plan, "agent_instances_team_status_idx")
+            || plan_uses_index(&plan, "sqlite_autoindex_agent_instances_1"),
+        "instance join must use agent_instances PK/status index, used={:?}\nplan:\n{plan}",
+        analysis.indexes_used
+    );
+    assert_no_unconstrained_table_scan(&plan, "agent_instances");
+    // ORDER BY last_scheduled_at may require TEMP B-TREE; document as accepted.
+    let _sorting_temp_b_tree_is_acceptable = analysis.uses_temp_b_tree;
+    // Decision: no new agent indexes; runnable/dependency/instance indexes cover hot paths.
 }
 
 #[test]
