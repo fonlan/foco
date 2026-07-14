@@ -647,7 +647,13 @@ pub(crate) fn app_router(state: AppState) -> Router {
 ///
 /// Only proxies routes that operate on workspace-local resources: files, git,
 /// terminal, spec, plans, code graph, chat/runtime state, agents, schedules, and
-/// workspace statistics. Settings and provider secrets stay local.
+/// chat statistics. Settings and provider secrets stay local.
+///
+/// AI Statistics list (`/api/ai-statistics`) and workspace detail
+/// (`/api/workspaces/{id}/ai-statistics/{request_id}`) stay on the main process:
+/// real `provider_request_v1` / `provider_final_response_v1` wire lives only in
+/// the profile remote-workspace-audit mirror. Sidecar structured mirrors keep
+/// detail columns NULL and must not be treated as the dump source of truth.
 ///
 /// ponytail: v1 still buffers request bodies and non-SSE responses in memory.
 /// Chat streams are proxied as streams because reverse proxies otherwise wait for
@@ -862,9 +868,14 @@ async fn proxy_websocket_upgrade(request: Request, proxy_url: String, token: Str
 
 /// If the request path matches a proxied workspace route, return the path suffix
 /// after the workspace_id segment.  Returns None for routes that should stay local.
+///
+/// Intentionally excludes `ai-statistics`: dump detail is served from the main
+/// process audit mirror (`workspace_audit_path` → remote-workspace-audit), not
+/// the sidecar mirror (which always reports detail unavailable).
 pub(crate) fn proxy_workspace_route_path(path: &str) -> Option<&str> {
     // Match /api/workspaces/{id}/files, /api/workspaces/{id}/git, /api/workspaces/{id}/terminal,
     // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, chat/runtime, scheduled tasks.
+    // Do not add ai-statistics here; see middleware docs above.
     let rest = path.strip_prefix("/api/workspaces/")?;
     let after_id = rest.split_once('/')?.1;
     let prefix = after_id.split('/').next().unwrap_or("");
@@ -881,7 +892,6 @@ pub(crate) fn proxy_workspace_route_path(path: &str) -> Option<&str> {
         | "context-usage"
         | "agent-team"
         | "agent-tasks"
-        | "ai-statistics"
         | "scheduled-tasks"
         | "scheduled-task-runs" => Some(after_id),
         _ => None,

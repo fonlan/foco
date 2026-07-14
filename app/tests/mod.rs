@@ -25989,6 +25989,291 @@ fn restore_env_var(key: &str, value: Option<&str>) {
     }
 }
 
+#[test]
+fn proxy_workspace_route_path_keeps_ai_statistics_on_main_process() {
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path(
+            "/api/workspaces/remote/ai-statistics/broker-request-1"
+        ),
+        None,
+        "AI Statistics detail must stay on the main-process audit mirror"
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/remote/ai-statistics"),
+        None
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/remote/files"),
+        Some("files")
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path(
+            "/api/workspaces/remote/chats/chat-1/statistics"
+        ),
+        Some("chats/chat-1/statistics")
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/remote/context-usage"),
+        Some("context-usage")
+    );
+}
+
+#[tokio::test]
+async fn remote_ai_statistics_detail_http_reads_main_process_audit_mirror() {
+    // Real App Router path for SSH workspace detail: must not proxy to sidecar
+    // (which would only ever report unavailable). Wire lives in profile audit mirror.
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+
+    let mut config = prompt_test_config(workspace_dir);
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    config.workspaces.push(WorkspaceConfig {
+        id: "remote".to_string(),
+        name: "Remote".to_string(),
+        path: PathBuf::new(),
+        location: WorkspaceLocation::Ssh {
+            server_id: "srv".to_string(),
+            remote_path: "/srv/project".to_string(),
+        },
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let request_id = "broker-request-detail-fixture";
+    let request_wire = json!({
+        "format": "provider_request_v1",
+        "version": 1,
+        "method": "POST",
+        "url": "https://example.test/v1/chat/completions",
+        "headers": {
+            "authorization": ["********"],
+            "content-type": ["application/json"]
+        },
+        "body": "{\"model\":\"model\",\"messages\":[]}"
+    });
+    let response_wire = json!({
+        "format": "provider_final_response_v1",
+        "version": 1,
+        "state": "succeeded",
+        "partial": false,
+        "text": "mirror detail ok",
+        "http": {
+            "status": 200,
+            "version": "HTTP/1.1",
+            "headers": {
+                "authorization": ["********"],
+                "content-type": ["text/event-stream"],
+                "x-request-id": ["detail-fixture"]
+            }
+        }
+    });
+    let request_body_json = request_wire.to_string();
+    let response_body_json = response_wire.to_string();
+
+    let remote_workspace = state
+        .config
+        .lock()
+        .expect("config")
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == "remote")
+        .expect("remote workspace")
+        .clone();
+    let audit_path =
+        crate::remote_workspace::workspace_audit_path(profile.path(), &remote_workspace)
+            .expect("ssh audit path");
+    assert!(
+        audit_path
+            .to_string_lossy()
+            .contains("remote-workspace-audit"),
+        "audit path should be under profile remote-workspace-audit: {}",
+        audit_path.display()
+    );
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit db");
+        database
+            .insert_chat("chat-detail", "Detail fixture")
+            .expect("insert chat");
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: request_id,
+                workspace_id: "remote",
+                chat_id: Some("chat-detail"),
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider",
+                model_id: "model",
+                thinking_level: None,
+                request_started_at: "2026-07-14T02:00:00Z",
+                first_token_at: Some("2026-07-14T02:00:01Z"),
+                completed_at: Some("2026-07-14T02:00:02Z"),
+                input_tokens: Some(9),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
+                first_token_latency_ms: Some(100),
+                total_latency_ms: Some(200),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: Some(&request_body_json),
+                response_body_json: Some(&response_body_json),
+            })
+            .expect("insert main-process audit row");
+    }
+
+    let hits = Arc::new(Mutex::new(0u32));
+    let (sidecar_base, sidecar_task) =
+        serve_fake_sidecar_ai_statistics_unavailable(hits.clone()).await;
+    let sidecar_port = sidecar_base
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .expect("sidecar port")
+        .parse::<u16>()
+        .expect("sidecar port number");
+    state.remote_workspace_manager.insert_fake_session_for_test(
+        "srv",
+        "remote",
+        "/srv/project",
+        sidecar_port,
+        "sidecar-token",
+    );
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind app fixture server");
+    let app_addr = listener.local_addr().expect("app fixture address");
+    let app = crate::http::router::app_router(state);
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Sanity: a normal remote resource still proxies (proves session + middleware active).
+    let files_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/files?depth=1"
+    ))
+    .await
+    .expect("proxied files request");
+    assert_eq!(files_response.status(), StatusCode::OK);
+
+    let detail_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/ai-statistics/{request_id}"
+    ))
+    .await
+    .expect("ai statistics detail request");
+    assert_eq!(
+        detail_response.status(),
+        StatusCode::OK,
+        "detail must be served from main-process mirror, not sidecar"
+    );
+    let body = detail_response.json::<Value>().await.expect("detail json");
+    assert_eq!(body["request"]["id"], request_id);
+    assert_eq!(body["request"]["workspaceId"], "remote");
+    assert_eq!(body["request"]["requestDetailStatus"], "captured");
+    assert_eq!(body["request"]["responseDetailStatus"], "captured");
+    assert_eq!(
+        body["request"]["requestBody"]["format"],
+        "provider_request_v1"
+    );
+    assert_eq!(
+        body["request"]["responseBody"]["format"],
+        "provider_final_response_v1"
+    );
+    assert_eq!(
+        body["request"]["requestBody"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        body["request"]["responseBody"]["http"]["headers"]["authorization"][0],
+        "********"
+    );
+    assert_eq!(
+        body["request"]["responseBody"]["http"]["headers"]["x-request-id"][0],
+        "detail-fixture"
+    );
+
+    assert_eq!(
+        *hits.lock().expect("sidecar hits"),
+        0,
+        "AI Statistics detail must not hit the sidecar (which would return unavailable)"
+    );
+
+    app_task.abort();
+    sidecar_task.abort();
+}
+
+async fn serve_fake_sidecar_ai_statistics_unavailable(
+    hits: Arc<Mutex<u32>>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let detail_hits = hits.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/remote/workspace/files",
+            axum::routing::get(|| async {
+                Json(json!({
+                    "root": {
+                        "name": "project",
+                        "path": "/srv/project",
+                        "kind": "directory",
+                        "sizeBytes": null,
+                        "hasChildren": false,
+                        "childrenLoaded": true,
+                        "children": [],
+                    },
+                    "query": "depth=1",
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/api/remote/workspace/ai-statistics/{request_id}",
+            axum::routing::get(move |AxumPath(request_id): AxumPath<String>| {
+                let hits = detail_hits.clone();
+                async move {
+                    *hits.lock().expect("sidecar hits") += 1;
+                    // Sidecar mirror contract: structured-only, detail unavailable.
+                    Json(json!({
+                        "request": {
+                            "id": request_id,
+                            "workspaceId": "remote",
+                            "requestDetailStatus": "unavailable",
+                            "responseDetailStatus": "unavailable",
+                            "requestBody": null,
+                            "responseBody": null,
+                        },
+                        "events": [],
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind fake sidecar");
+    let addr = listener.local_addr().expect("sidecar address");
+    let base = format!("http://{addr}/");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (base, task)
+}
+
 #[tokio::test]
 async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests() {
     use futures_util::SinkExt;

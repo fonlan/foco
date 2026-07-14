@@ -1307,8 +1307,12 @@ pub(crate) fn workspace_spec_compaction_provider_request(
     let cut_percent = required_cut_percent(current_bytes, target_bytes);
     let aggression = match attempt {
         1 => "Prefer deletion over paraphrasing. Merge duplicate local/remote or repeated facts.",
-        2 => "Be aggressive: delete whole low-value subsections, collapse long matrices into short bullets, keep only durable contracts.",
-        _ => "Emergency cut: keep Purpose, Architecture, key contracts, and Open Questions; ruthlessly drop examples, tables, and repeated operational prose.",
+        2 => {
+            "Be aggressive: delete whole low-value subsections, collapse long matrices into short bullets, keep only durable contracts."
+        }
+        _ => {
+            "Emergency cut: keep Purpose, Architecture, key contracts, and Open Questions; ruthlessly drop examples, tables, and repeated operational prose."
+        }
     };
     let system_prompt = format!(
         "Compress the provided Project Spec Markdown into a complete replacement document. \
@@ -2057,10 +2061,7 @@ mod tests {
         assert!(user.contains("SIZE BUDGET"));
         assert!(user.contains("70000"));
         assert!(user.contains("attempt: 2/3"));
-        assert_eq!(
-            request.max_output_tokens,
-            Some(8_000)
-        );
+        assert_eq!(request.max_output_tokens, Some(8_000));
     }
 
     #[test]
@@ -2085,10 +2086,7 @@ mod tests {
             compaction_max_output_tokens(Some(4_000)),
             Some(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS)
         );
-        assert_eq!(
-            compaction_max_output_tokens(Some(32_000)),
-            Some(32_000)
-        );
+        assert_eq!(compaction_max_output_tokens(Some(32_000)), Some(32_000));
         assert_eq!(
             compaction_max_output_tokens(None),
             Some(WORKSPACE_SPEC_COMPACTION_MAX_OUTPUT_TOKENS)
@@ -2125,18 +2123,14 @@ mod tests {
     async fn compact_oversized_workspace_spec_fails_after_max_attempts() {
         let oversized = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 2_000);
         let mut attempts = 0_u32;
-        let error = compact_oversized_workspace_spec_markdown(
-            "model-1",
-            None,
-            &oversized,
-            |_request| {
+        let error =
+            compact_oversized_workspace_spec_markdown("model-1", None, &oversized, |_request| {
                 attempts += 1;
                 let body = "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_500);
                 async move { Ok(json!({ "contentMarkdown": body })) }
-            },
-        )
-        .await
-        .expect_err("should fail when every attempt stays over limit");
+            })
+            .await
+            .expect_err("should fail when every attempt stays over limit");
 
         assert_eq!(attempts, WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS);
         let message = error.message();
@@ -2152,17 +2146,13 @@ mod tests {
     async fn compact_oversized_workspace_spec_returns_unchanged_when_within_limit() {
         let content = "short enough".to_string();
         let mut attempts = 0_u32;
-        let result = compact_oversized_workspace_spec_markdown(
-            "model-1",
-            None,
-            &content,
-            |_request| {
+        let result =
+            compact_oversized_workspace_spec_markdown("model-1", None, &content, |_request| {
                 attempts += 1;
                 async move { Ok(json!({ "contentMarkdown": "should not run" })) }
-            },
-        )
-        .await
-        .expect("under-limit content should pass through");
+            })
+            .await
+            .expect("under-limit content should pass through");
 
         assert_eq!(attempts, 0);
         assert_eq!(result, content);
