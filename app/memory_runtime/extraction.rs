@@ -319,18 +319,13 @@ pub(crate) async fn run_memory_extraction_job(
     let workspace_memory_path = workspace_database_path(&task.workspace_path);
     let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
         .map_err(ApiError::from_memory_error)?;
-    let Some(job) = workspace_memory_database
-        .extraction_job(&task.job_id)
+    // Atomic claim: only one runner can transition queued -> running.
+    if !workspace_memory_database
+        .mark_extraction_job_running(&task.job_id)
         .map_err(ApiError::from_memory_error)?
-    else {
-        return Ok(Vec::new());
-    };
-    if job.status != "queued" {
+    {
         return Ok(Vec::new());
     }
-    workspace_memory_database
-        .mark_extraction_job_running(&task.job_id)
-        .map_err(ApiError::from_memory_error)?;
     drop(workspace_memory_database);
 
     let mut attempt = 1;

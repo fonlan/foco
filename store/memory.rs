@@ -2,10 +2,16 @@ use std::{
     collections::HashSet,
     fmt, fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use serde_json::Value;
 use serde_json::json;
 
@@ -31,6 +37,8 @@ pub use memory_schema::{
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
 pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 5;
+const GLOBAL_MEMORY_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const GLOBAL_MEMORY_MIGRATION_LOCK_SUFFIX: &str = ".migrate.lock";
 
 const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
@@ -544,6 +552,7 @@ impl MemoryDatabase {
 
         let mut connection = open_connection(&database_path)?;
         run_global_migrations(&mut connection, &database_path)?;
+        enable_write_ahead_logging(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -639,14 +648,18 @@ impl MemoryDatabase {
 
     pub fn delete_source(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
         require_non_empty("id", id)?;
-        let linked_count: i64 = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let linked_count: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM memory_fact_sources WHERE source_id = ?1",
                 params![id],
                 |row| row.get(0),
             )
-            .map_err(|source| sqlite_error(&self.database_path, source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         if linked_count > 0 {
             return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -654,10 +667,12 @@ impl MemoryDatabase {
             });
         }
 
-        let deleted = self
-            .connection
+        let deleted = transaction
             .execute("DELETE FROM memory_sources WHERE id = ?1", params![id])
-            .map_err(|source| sqlite_error(&self.database_path, source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(deleted > 0)
     }
@@ -890,12 +905,27 @@ impl MemoryDatabase {
     ) -> Result<bool, MemoryDatabaseError> {
         require_non_empty("fact_id", fact_id)?;
         require_non_empty("source_id", source_id)?;
-        let fact = self
-            .fact(fact_id)?
-            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
-                message: format!("memory fact was not found: {fact_id}"),
-            })?;
-        let source_count = self.source_count_for_fact(fact_id)?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let fact = fact_by_id(&transaction, &database_path, fact_id).map_err(|error| {
+            if matches!(
+                &error,
+                MemoryDatabaseError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows,
+                    ..
+                }
+            ) {
+                MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory fact was not found: {fact_id}"),
+                }
+            } else {
+                error
+            }
+        })?;
+        let source_count = source_count_for_fact(&transaction, &database_path, fact_id)?;
 
         if fact.kind != MemoryKind::UserNote.as_str() && source_count <= 1 {
             return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -903,23 +933,31 @@ impl MemoryDatabase {
             });
         }
 
-        let deleted = self
-            .connection
+        let deleted = transaction
             .execute(
                 "DELETE FROM memory_fact_sources WHERE fact_id = ?1 AND source_id = ?2",
                 params![fact_id, source_id],
             )
-            .map_err(|source| sqlite_error(&self.database_path, source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(deleted > 0)
     }
 
     pub fn insert_edge(&mut self, edge: NewMemoryEdge<'_>) -> Result<(), MemoryDatabaseError> {
         validate_edge(&edge)?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
         if edge.relation == MemoryRelationKind::Updates
             && update_relation_would_cycle(
-                &self.connection,
-                &self.database_path,
+                &transaction,
+                &database_path,
                 edge.source_fact_id,
                 edge.target_fact_id,
             )?
@@ -928,12 +966,6 @@ impl MemoryDatabase {
                 message: "updates relation would create a cycle".to_string(),
             });
         }
-        let now = now_timestamp();
-        let database_path = self.database_path.clone();
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|source| sqlite_error(&database_path, source))?;
         let metadata_json = if edge.relation == MemoryRelationKind::Derives {
             Some(derives_edge_metadata(
                 &transaction,
@@ -1234,7 +1266,7 @@ impl MemoryDatabase {
                      started_at = COALESCE(started_at, ?2),
                      completed_at = NULL,
                      error_message = NULL
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'queued'",
                 params![id, now],
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -1259,7 +1291,7 @@ impl MemoryDatabase {
                      error_message = NULL,
                      started_at = COALESCE(started_at, ?3),
                      completed_at = ?3
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'running'",
                 params![id, output_json, now],
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -1287,7 +1319,7 @@ impl MemoryDatabase {
                      error_message = ?3,
                      started_at = COALESCE(started_at, ?4),
                      completed_at = ?4
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'running'",
                 params![id, output_json, error_message, now],
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -1522,7 +1554,8 @@ impl MemoryDatabase {
                         ELSE COALESCE(started_at, ?6)
                      END,
                      completed_at = ?7
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped')",
                 params![
                     update.id,
                     update.status.as_str(),
@@ -1615,7 +1648,9 @@ impl MemoryDatabase {
                         WHEN ?5 IS NULL THEN applied_at
                         ELSE COALESCE(applied_at, ?5)
                      END
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND status = 'proposed'
+                   AND ?2 IN ('applied', 'skipped', 'failed')",
                 params![
                     update.id,
                     update.status.as_str(),
@@ -3244,19 +3279,41 @@ fn open_connection(database_path: &Path) -> Result<Connection, MemoryDatabaseErr
         })?;
 
     connection
-        .pragma_update(None, "foreign_keys", true)
+        .busy_timeout(GLOBAL_MEMORY_DATABASE_BUSY_TIMEOUT)
         .map_err(|source| MemoryDatabaseError::Sqlite {
             path: database_path.to_path_buf(),
             source,
         })?;
     connection
-        .pragma_update(None, "journal_mode", "WAL")
+        .pragma_update(None, "foreign_keys", true)
         .map_err(|source| MemoryDatabaseError::Sqlite {
             path: database_path.to_path_buf(),
             source,
         })?;
 
     Ok(connection)
+}
+
+fn enable_write_ahead_logging(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), MemoryDatabaseError> {
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|source| MemoryDatabaseError::Sqlite {
+            path: database_path.to_path_buf(),
+            source,
+        })?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|source| MemoryDatabaseError::Sqlite {
+            path: database_path.to_path_buf(),
+            source,
+        })
 }
 
 fn run_global_migrations(
@@ -3277,9 +3334,40 @@ fn run_global_migrations(
         return Ok(());
     }
 
+    let _migration_lock = acquire_global_memory_migration_lock(database_path)?;
+    let current_version = schema_version(connection, database_path)?;
+
+    if current_version > GLOBAL_MEMORY_SCHEMA_VERSION {
+        return Err(MemoryDatabaseError::UnsupportedSchemaVersion {
+            path: database_path.to_path_buf(),
+            found: current_version,
+            latest: GLOBAL_MEMORY_SCHEMA_VERSION,
+        });
+    }
+
+    if current_version == GLOBAL_MEMORY_SCHEMA_VERSION {
+        return Ok(());
+    }
+
     let transaction = connection
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| sqlite_error(database_path, source))?;
+    let current_version = schema_version(&transaction, database_path)?;
+
+    if current_version > GLOBAL_MEMORY_SCHEMA_VERSION {
+        return Err(MemoryDatabaseError::UnsupportedSchemaVersion {
+            path: database_path.to_path_buf(),
+            found: current_version,
+            latest: GLOBAL_MEMORY_SCHEMA_VERSION,
+        });
+    }
+
+    if current_version == GLOBAL_MEMORY_SCHEMA_VERSION {
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(database_path, source))?;
+        return Ok(());
+    }
 
     for migration in GLOBAL_MEMORY_MIGRATIONS
         .iter()
@@ -3306,6 +3394,129 @@ fn run_global_migrations(
         .map_err(|source| sqlite_error(database_path, source))?;
 
     Ok(())
+}
+
+struct GlobalMemoryMigrationLock {
+    _file: fs::File,
+}
+
+fn acquire_global_memory_migration_lock(
+    database_path: &Path,
+) -> Result<GlobalMemoryMigrationLock, MemoryDatabaseError> {
+    let lock_path = global_memory_migration_lock_path(database_path);
+    if let Some(parent) = lock_path.parent() {
+        create_directory(parent)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| MemoryDatabaseError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    lock_file_exclusive(&file).map_err(|source| MemoryDatabaseError::Io {
+        path: lock_path,
+        source,
+    })?;
+
+    Ok(GlobalMemoryMigrationLock { _file: file })
+}
+
+fn global_memory_migration_lock_path(database_path: &Path) -> PathBuf {
+    let resolved = database_path
+        .canonicalize()
+        .unwrap_or_else(|_| database_path.to_path_buf());
+    let file_name = resolved
+        .file_name()
+        .map(|name| {
+            let mut lock_name = name.to_os_string();
+            lock_name.push(GLOBAL_MEMORY_MIGRATION_LOCK_SUFFIX);
+            lock_name
+        })
+        .unwrap_or_else(|| format!("memory.sqlite{GLOBAL_MEMORY_MIGRATION_LOCK_SUFFIX}").into());
+    resolved.with_file_name(file_name)
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &fs::File) -> io::Result<()> {
+    // LOCK_EX = 2
+    let result = libc_flock(file.as_raw_fd(), 2);
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+fn libc_flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int {
+    unsafe { flock(fd, operation) }
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        fn LockFileEx(
+            h_file: *mut std::ffi::c_void,
+            dw_flags: u32,
+            dw_reserved: u32,
+            n_number_of_bytes_to_lock_low: u32,
+            n_number_of_bytes_to_lock_high: u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: ptr::null_mut(),
+    };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file_exclusive(_file: &fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "global memory database migration lock is not supported on this platform",
+    ))
 }
 
 fn table_has_column(
@@ -5257,6 +5468,12 @@ mod tests {
         assert!(
             memory
                 .complete_extraction_job("job-1", r#"{"apiKey":"sk-secret","facts":[]}"#)
+                .expect("complete skipped job is rejected")
+                == false
+        );
+        assert!(
+            memory
+                .complete_extraction_job("job-2", r#"{"apiKey":"sk-secret","facts":[]}"#)
                 .expect("mark completed")
         );
         let completed = memory
@@ -5268,6 +5485,7 @@ mod tests {
             .expect("completed jobs");
 
         assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "job-2");
         assert!(completed[0].error_message.is_none());
         assert!(
             !completed[0]
@@ -5276,6 +5494,344 @@ mod tests {
                 .unwrap()
                 .contains("sk-secret")
         );
+    }
+
+    #[test]
+    fn concurrent_extraction_claim_only_succeeds_once() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-claim", "Extraction claim chat")
+                .expect("chat insert");
+        }
+        {
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                    .expect("workspace memory database");
+            memory
+                .insert_extraction_job(NewMemoryExtractionJob {
+                    id: "job-claim",
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-claim"),
+                    status: MemoryExtractionJobStatus::Queued,
+                    model_id: Some("model-1"),
+                    input_json: r#"{"trigger":"chat_completed"}"#,
+                    output_json: None,
+                    error_message: None,
+                })
+                .expect("job insert");
+        }
+
+        const THREAD_COUNT: usize = 8;
+        let workspace_path = Arc::new(workspace.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let threads = (0..THREAD_COUNT)
+            .map(|_| {
+                let workspace_path = Arc::clone(&workspace_path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut memory =
+                        MemoryDatabase::open_workspace_at(workspace_database_path(
+                            workspace_path.as_path(),
+                        ))
+                        .expect("workspace memory database");
+                    memory
+                        .mark_extraction_job_running("job-claim")
+                        .expect("claim attempt")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let claimed = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count();
+        assert_eq!(claimed, 1);
+
+        let memory = MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+            .expect("workspace memory database");
+        let job = memory
+            .extraction_job("job-claim")
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, "running");
+    }
+
+    #[test]
+    fn concurrent_unlink_keeps_non_user_note_source_invariant() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let profile = tempfile::tempdir().expect("profile");
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_global(profile.path()).expect("global memory");
+            database
+                .insert_source(NewMemorySource {
+                    id: "source-a",
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "A",
+                    content: "source a",
+                    metadata_json: "{}",
+                })
+                .expect("source a");
+            database
+                .insert_source(NewMemorySource {
+                    id: "source-b",
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "B",
+                    content: "source b",
+                    metadata_json: "{}",
+                })
+                .expect("source b");
+            database
+                .insert_fact(NewMemoryFact {
+                    id: "fact-dual",
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact: "dual source fact",
+                    confidence: Some(0.9),
+                    pinned: false,
+                    source_ids: &["source-a", "source-b"],
+                    metadata_json: "{}",
+                })
+                .expect("fact");
+        }
+
+        let profile_path = Arc::new(profile.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(2));
+        let left = {
+            let profile_path = Arc::clone(&profile_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database =
+                    MemoryDatabase::open_or_create_global(profile_path.as_path()).expect("db");
+                database.unlink_fact_source("fact-dual", "source-a")
+            })
+        };
+        let right = {
+            let profile_path = Arc::clone(&profile_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database =
+                    MemoryDatabase::open_or_create_global(profile_path.as_path()).expect("db");
+                database.unlink_fact_source("fact-dual", "source-b")
+            })
+        };
+
+        let left_result = left.join().expect("left unlink thread");
+        let right_result = right.join().expect("right unlink thread");
+        let successes = [&left_result, &right_result]
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count();
+        let rejections = [&left_result, &right_result]
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(MemoryDatabaseError::InvalidMemoryInput { message })
+                        if message.contains("at least one source")
+                )
+            })
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(rejections, 1);
+
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory");
+        assert_eq!(
+            database
+                .source_count_for_fact("fact-dual")
+                .expect("source count"),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_opposite_updates_edges_reject_cycle() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let profile = tempfile::tempdir().expect("profile");
+        {
+            let mut database =
+                MemoryDatabase::open_or_create_global(profile.path()).expect("global memory");
+            for (source_id, content) in [("source-x", "x"), ("source-y", "y")] {
+                database
+                    .insert_source(NewMemorySource {
+                        id: source_id,
+                        scope: MemoryScope::Global,
+                        chat_id: None,
+                        source_type: MemorySourceType::ManualNote,
+                        source_id: None,
+                        title: source_id,
+                        content,
+                        metadata_json: "{}",
+                    })
+                    .expect("source");
+            }
+            database
+                .insert_fact(NewMemoryFact {
+                    id: "fact-x",
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact: "fact x",
+                    confidence: Some(0.8),
+                    pinned: false,
+                    source_ids: &["source-x"],
+                    metadata_json: "{}",
+                })
+                .expect("fact x");
+            database
+                .insert_fact(NewMemoryFact {
+                    id: "fact-y",
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact: "fact y",
+                    confidence: Some(0.8),
+                    pinned: false,
+                    source_ids: &["source-y"],
+                    metadata_json: "{}",
+                })
+                .expect("fact y");
+        }
+
+        let profile_path = Arc::new(profile.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(2));
+        let xy = {
+            let profile_path = Arc::clone(&profile_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database =
+                    MemoryDatabase::open_or_create_global(profile_path.as_path()).expect("db");
+                database.insert_edge(NewMemoryEdge {
+                    id: "edge-x-y",
+                    source_fact_id: "fact-x",
+                    target_fact_id: "fact-y",
+                    relation: MemoryRelationKind::Updates,
+                    metadata_json: "{}",
+                })
+            })
+        };
+        let yx = {
+            let profile_path = Arc::clone(&profile_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database =
+                    MemoryDatabase::open_or_create_global(profile_path.as_path()).expect("db");
+                database.insert_edge(NewMemoryEdge {
+                    id: "edge-y-x",
+                    source_fact_id: "fact-y",
+                    target_fact_id: "fact-x",
+                    relation: MemoryRelationKind::Updates,
+                    metadata_json: "{}",
+                })
+            })
+        };
+
+        let xy_result = xy.join().expect("xy edge thread");
+        let yx_result = yx.join().expect("yx edge thread");
+        let successes = [&xy_result, &yx_result]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count();
+        let cycle_rejections = [&xy_result, &yx_result]
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(MemoryDatabaseError::InvalidMemoryInput { message })
+                        if message.contains("cycle")
+                )
+            })
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(cycle_rejections, 1);
+    }
+
+    #[test]
+    fn dream_job_status_rejects_terminal_overwrite() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory");
+        database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "dream-job-1",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Queued,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: None,
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("dream job insert");
+        assert!(
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: "dream-job-1",
+                    status: MemoryDreamJobStatus::Running,
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("running")
+        );
+        assert!(
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: "dream-job-1",
+                    status: MemoryDreamJobStatus::Completed,
+                    output_summary_json: Some(r#"{"ok":true}"#),
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("completed")
+        );
+        assert!(
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: "dream-job-1",
+                    status: MemoryDreamJobStatus::Failed,
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: Some("stale runner"),
+                })
+                .expect("stale fail rejected")
+                == false
+        );
+        let job = database
+            .dream_job("dream-job-1")
+            .expect("job")
+            .expect("exists");
+        assert_eq!(job.status, "completed");
     }
 
     #[test]

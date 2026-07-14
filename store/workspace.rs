@@ -6,6 +6,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use chrono::{NaiveDateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
@@ -93,6 +96,7 @@ const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
 const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
 const LLM_AUDIT_DETAIL_V1_PRUNED_KEY: &str = "llm_audit_detail_v1_pruned";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKSPACE_MIGRATION_LOCK_SUFFIX: &str = ".migrate.lock";
 const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
   AND messages.id NOT IN (
       SELECT private_message_id
@@ -4682,8 +4686,13 @@ impl WorkspaceDatabase {
     ) -> Result<(), WorkspaceDatabaseError> {
         let now = now_timestamp();
         let metadata_json = message.metadata_json.unwrap_or("{}");
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        transaction
             .execute(
                 "INSERT INTO messages
                     (id, chat_id, role, content, sequence, created_at, metadata_json)
@@ -4698,14 +4707,17 @@ impl WorkspaceDatabase {
                     metadata_json
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        transaction
             .execute(
                 "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
                 params![now, message.chat_id],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -4716,8 +4728,12 @@ impl WorkspaceDatabase {
     ) -> Result<bool, WorkspaceDatabaseError> {
         let now = now_timestamp();
         let metadata_json = message.metadata_json.unwrap_or("{}");
-        let inserted = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO messages
                     (id, chat_id, role, content, sequence, created_at, metadata_json)
@@ -4732,16 +4748,19 @@ impl WorkspaceDatabase {
                     metadata_json
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         if inserted > 0 {
-            self.connection
+            transaction
                 .execute(
                     "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
                     params![now, message.chat_id],
                 )
-                .map_err(|source| self.sqlite_error(source))?;
+                .map_err(|source| sqlite_error(&database_path, source))?;
         }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(inserted > 0)
     }
@@ -4753,11 +4772,16 @@ impl WorkspaceDatabase {
         assistant_message_id: &str,
         assistant_sequence: i64,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let chat =
-            self.chat(chat_id)?
-                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
-                })?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let chat = chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(
+            || WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat was not found: {chat_id}"),
+            },
+        )?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         // Rebuild when missing: list/message APIs may clear queuedRun before the Agent task
         // is visible (new chat insert has queuedRun before team/task exists).
@@ -4814,11 +4838,10 @@ impl WorkspaceDatabase {
             }
         })?;
 
-        let message = self.message(user_message_id)?.ok_or_else(|| {
-            WorkspaceDatabaseError::InvalidMessageMetadata {
+        let message = message_from_transaction(&transaction, &database_path, user_message_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
                 message: format!("message was not found: {user_message_id}"),
-            }
-        })?;
+            })?;
         let mut message_metadata =
             parse_json_object(&message.metadata_json, "user message metadata")?;
         match message_metadata.get_mut(QUEUED_MESSAGE_METADATA_KEY) {
@@ -4856,18 +4879,28 @@ impl WorkspaceDatabase {
             }
         })?;
 
-        self.connection
+        transaction
             .execute(
                 "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
                 params![chat_metadata_json, chat_id],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated_messages = transaction
             .execute(
                 "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
                 params![message_metadata_json, user_message_id, chat_id],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated_messages == 0 {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!(
+                    "message '{user_message_id}' was not found in chat '{chat_id}' while marking queued run started"
+                ),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -4877,11 +4910,16 @@ impl WorkspaceDatabase {
         chat_id: &str,
         user_message_id: &str,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let chat =
-            self.chat(chat_id)?
-                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
-                })?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let chat = chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(
+            || WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat was not found: {chat_id}"),
+            },
+        )?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         let should_clear_chat = chat_metadata
             .get(QUEUED_CHAT_METADATA_KEY)
@@ -4900,36 +4938,41 @@ impl WorkspaceDatabase {
                     message: format!("chat metadata is invalid JSON: {source}"),
                 }
             })?;
-            self.connection
+            transaction
                 .execute(
                     "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
                     params![chat_metadata_json, chat_id],
                 )
-                .map_err(|source| self.sqlite_error(source))?;
+                .map_err(|source| sqlite_error(&database_path, source))?;
         }
 
-        let Some(message) = self.message(user_message_id)? else {
-            return Ok(());
-        };
-        let mut message_metadata =
-            parse_json_object(&message.metadata_json, "user message metadata")?;
-        if message_metadata
-            .remove(QUEUED_MESSAGE_METADATA_KEY)
-            .is_some()
+        if let Some(message) =
+            message_from_transaction(&transaction, &database_path, user_message_id)?
         {
-            let message_metadata_json =
-                serde_json::to_string(&message_metadata).map_err(|source| {
-                    WorkspaceDatabaseError::InvalidMessageMetadata {
-                        message: format!("user message metadata is invalid JSON: {source}"),
-                    }
-                })?;
-            self.connection
-                .execute(
-                    "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
-                    params![message_metadata_json, user_message_id, chat_id],
-                )
-                .map_err(|source| self.sqlite_error(source))?;
+            let mut message_metadata =
+                parse_json_object(&message.metadata_json, "user message metadata")?;
+            if message_metadata
+                .remove(QUEUED_MESSAGE_METADATA_KEY)
+                .is_some()
+            {
+                let message_metadata_json =
+                    serde_json::to_string(&message_metadata).map_err(|source| {
+                        WorkspaceDatabaseError::InvalidMessageMetadata {
+                            message: format!("user message metadata is invalid JSON: {source}"),
+                        }
+                    })?;
+                transaction
+                    .execute(
+                        "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                        params![message_metadata_json, user_message_id, chat_id],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
         }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -4985,9 +5028,13 @@ impl WorkspaceDatabase {
     ) -> Result<(), WorkspaceDatabaseError> {
         let now = now_timestamp();
         let metadata_json = message.metadata_json.unwrap_or("{}");
-
-        let changed = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let changed = transaction
             .execute(
                 "INSERT INTO messages
                     (id, chat_id, role, content, sequence, created_at, metadata_json)
@@ -5008,7 +5055,7 @@ impl WorkspaceDatabase {
                     metadata_json
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         if changed == 0 {
             return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
@@ -5019,12 +5066,15 @@ impl WorkspaceDatabase {
             });
         }
 
-        self.connection
+        transaction
             .execute(
                 "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
                 params![now, message.chat_id],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -14191,6 +14241,23 @@ fn run_migrations(
         return Ok(());
     }
 
+    // VACUUM INTO cannot run inside a transaction, so backup + Immediate migration must be
+    // owned by a process-wide lock keyed by the database file path.
+    let _migration_lock = acquire_workspace_migration_lock(database_path)?;
+    let current_version = schema_version(connection, database_path)?;
+
+    if current_version > WORKSPACE_SCHEMA_VERSION {
+        return Err(WorkspaceDatabaseError::UnsupportedSchemaVersion {
+            path: database_path.to_path_buf(),
+            found: current_version,
+            latest: WORKSPACE_SCHEMA_VERSION,
+        });
+    }
+
+    if current_version == WORKSPACE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
     if database_existed && has_user_schema(connection, database_path)? {
         create_migration_backup(connection, database_path, current_version)?;
     }
@@ -14209,6 +14276,16 @@ fn run_migrations(
             found: current_version,
             latest: WORKSPACE_SCHEMA_VERSION,
         });
+    }
+
+    if current_version == WORKSPACE_SCHEMA_VERSION {
+        transaction
+            .commit()
+            .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                path: database_path.to_path_buf(),
+                source,
+            })?;
+        return Ok(());
     }
 
     for migration in MIGRATIONS
@@ -14345,6 +14422,129 @@ fn run_migrations(
         })?;
 
     Ok(())
+}
+
+struct WorkspaceMigrationLock {
+    _file: fs::File,
+}
+
+fn acquire_workspace_migration_lock(
+    database_path: &Path,
+) -> Result<WorkspaceMigrationLock, WorkspaceDatabaseError> {
+    let lock_path = workspace_migration_lock_path(database_path);
+    if let Some(parent) = lock_path.parent() {
+        create_directory(parent)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| WorkspaceDatabaseError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    lock_file_exclusive(&file).map_err(|source| WorkspaceDatabaseError::Io {
+        path: lock_path,
+        source,
+    })?;
+
+    Ok(WorkspaceMigrationLock { _file: file })
+}
+
+fn workspace_migration_lock_path(database_path: &Path) -> PathBuf {
+    let resolved = database_path
+        .canonicalize()
+        .unwrap_or_else(|_| database_path.to_path_buf());
+    let file_name = resolved
+        .file_name()
+        .map(|name| {
+            let mut lock_name = name.to_os_string();
+            lock_name.push(WORKSPACE_MIGRATION_LOCK_SUFFIX);
+            lock_name
+        })
+        .unwrap_or_else(|| format!("foco.sqlite{WORKSPACE_MIGRATION_LOCK_SUFFIX}").into());
+    resolved.with_file_name(file_name)
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &fs::File) -> io::Result<()> {
+    // LOCK_EX = 2
+    let result = libc_flock(file.as_raw_fd(), 2);
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+fn libc_flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int {
+    unsafe { flock(fd, operation) }
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        fn LockFileEx(
+            h_file: *mut std::ffi::c_void,
+            dw_flags: u32,
+            dw_reserved: u32,
+            n_number_of_bytes_to_lock_low: u32,
+            n_number_of_bytes_to_lock_high: u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: ptr::null_mut(),
+    };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file_exclusive(_file: &fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "workspace database migration lock is not supported on this platform",
+    ))
 }
 
 fn table_exists(
@@ -14509,6 +14709,50 @@ fn parse_json_object(
         .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
             message: format!("{context} must be a JSON object"),
         })
+}
+
+fn chat_from_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+) -> Result<Option<ChatRecord>, WorkspaceDatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id, title, created_at, updated_at, archived_at, metadata_json
+             FROM chats
+             WHERE id = ?1",
+            params![id],
+            chat_from_row,
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn message_from_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+) -> Result<Option<MessageRecord>, WorkspaceDatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
+             FROM messages
+             WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(MessageRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    sequence: row.get(4)?,
+                    created_at: row.get(5)?,
+                    metadata_json: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))
 }
 
 fn chat_from_row(row: &Row<'_>) -> rusqlite::Result<ChatRecord> {

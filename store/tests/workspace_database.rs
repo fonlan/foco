@@ -171,6 +171,273 @@ fn concurrent_first_open_serializes_workspace_migrations() {
 }
 
 #[test]
+fn concurrent_old_workspace_open_serializes_migration_backup() {
+    const THREAD_COUNT: usize = 8;
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    {
+        let connection = Connection::open(&database_path).expect("old database");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_data (id INTEGER PRIMARY KEY);
+                 INSERT INTO legacy_data DEFAULT VALUES;
+                 PRAGMA user_version = 0;",
+            )
+            .expect("old schema");
+    }
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+    let threads = (0..THREAD_COUNT)
+        .map(|_| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                    .and_then(|database| database.schema_version())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        let schema_version = thread
+            .join()
+            .expect("workspace database open thread")
+            .expect("concurrent old workspace database open");
+        assert_eq!(schema_version, WORKSPACE_SCHEMA_VERSION);
+    }
+
+    let backup_dir = workspace.path().join(".foco").join("backups");
+    let backups = fs::read_dir(&backup_dir)
+        .expect("backup directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backups.len(),
+        1,
+        "migration backup must be created exactly once under concurrent open"
+    );
+}
+
+#[test]
+fn concurrent_global_memory_open_serializes_migrations() {
+    const THREAD_COUNT: usize = 8;
+
+    let root = tempfile::tempdir().expect("global memory root");
+    let database_path = root.path().join("memory.sqlite");
+    {
+        let connection = Connection::open(&database_path).expect("old global memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_memory (id INTEGER PRIMARY KEY);
+                 INSERT INTO legacy_memory DEFAULT VALUES;
+                 PRAGMA user_version = 0;",
+            )
+            .expect("old global memory schema");
+    }
+
+    let database_path = Arc::new(database_path);
+    let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+    let threads = (0..THREAD_COUNT)
+        .map(|_| {
+            let database_path = Arc::clone(&database_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                MemoryDatabase::open_or_create_global_at(database_path.as_path())
+                    .and_then(|database| database.schema_version())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        let schema_version = thread
+            .join()
+            .expect("global memory open thread")
+            .expect("concurrent global memory open");
+        assert_eq!(schema_version, foco_store::memory::GLOBAL_MEMORY_SCHEMA_VERSION);
+    }
+
+    let database =
+        MemoryDatabase::open_or_create_global_at(database_path.as_path()).expect("global memory");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        foco_store::memory::GLOBAL_MEMORY_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database_path.as_path()).expect("open global memory");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode");
+    assert_eq!(journal_mode, "wal");
+}
+
+#[test]
+fn mark_and_clear_chat_queued_run_are_atomic_with_unrelated_metadata() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat_with_metadata(
+            "chat-queued-atomic",
+            "Queued chat",
+            r#"{"queuedRun":{"status":"queued","userMessageId":"user-queued-atomic","modelId":"model","providerId":"provider","content":"hello"},"planOrigin":{"planId":"plan-1","phaseId":"phase-1"},"skillIds":["skill-a"]}"#,
+        )
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-queued-atomic",
+            chat_id: "chat-queued-atomic",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"queuedRun":{"status":"queued","modelId":"model","providerId":"provider"},"skillIds":["skill-a"]}"#,
+            ),
+        })
+        .expect("message insert");
+
+    database
+        .mark_chat_queued_run_started(
+            "chat-queued-atomic",
+            "user-queued-atomic",
+            "assistant-queued-atomic",
+            1,
+        )
+        .expect("queued run started");
+
+    let chat_metadata: Value = serde_json::from_str(
+        &database
+            .chat("chat-queued-atomic")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    assert_eq!(chat_metadata["queuedRun"]["status"], "running");
+    assert_eq!(chat_metadata["planOrigin"]["planId"], "plan-1");
+    assert_eq!(chat_metadata["skillIds"][0], "skill-a");
+
+    database
+        .clear_chat_queued_run("chat-queued-atomic", "user-other")
+        .expect("clear other queued run is no-op for chat");
+    let chat_metadata_after_mismatch: Value = serde_json::from_str(
+        &database
+            .chat("chat-queued-atomic")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    assert_eq!(
+        chat_metadata_after_mismatch["queuedRun"]["status"],
+        "running"
+    );
+
+    database
+        .clear_chat_queued_run("chat-queued-atomic", "user-queued-atomic")
+        .expect("clear matching queued run");
+    let chat_metadata_cleared: Value = serde_json::from_str(
+        &database
+            .chat("chat-queued-atomic")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    assert!(chat_metadata_cleared.get("queuedRun").is_none());
+    assert_eq!(chat_metadata_cleared["planOrigin"]["planId"], "plan-1");
+    assert_eq!(chat_metadata_cleared["skillIds"][0], "skill-a");
+}
+
+#[test]
+fn concurrent_mark_and_clear_queued_run_preserve_chat_message_identity() {
+    const THREAD_COUNT: usize = 6;
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat_with_metadata(
+            "chat-race",
+            "Race chat",
+            r#"{"queuedRun":{"status":"queued","userMessageId":"user-race","modelId":"model","providerId":"provider"},"keep":"yes"}"#,
+        )
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-race",
+            chat_id: "chat-race",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"queuedRun":{"status":"queued","modelId":"model","providerId":"provider"},"keep":"yes"}"#,
+            ),
+        })
+        .expect("message insert");
+    drop(database);
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+    let threads = (0..THREAD_COUNT)
+        .map(|index| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database = WorkspaceDatabase::open_or_create(workspace_path.as_path())
+                    .expect("workspace database");
+                if index % 2 == 0 {
+                    database
+                        .mark_chat_queued_run_started(
+                            "chat-race",
+                            "user-race",
+                            "assistant-race",
+                            1,
+                        )
+                        .expect("mark started");
+                } else {
+                    database
+                        .clear_chat_queued_run("chat-race", "user-race")
+                        .expect("clear queued run");
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread.join().expect("queued run race thread");
+    }
+
+    let database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let chat = database.chat("chat-race").expect("chat").expect("chat row");
+    let message = database
+        .message("user-race")
+        .expect("message")
+        .expect("message row");
+    let chat_metadata: Value = serde_json::from_str(&chat.metadata_json).expect("chat metadata");
+    let message_metadata: Value =
+        serde_json::from_str(&message.metadata_json).expect("message metadata");
+    assert_eq!(chat_metadata["keep"], "yes");
+    assert_eq!(message_metadata["keep"], "yes");
+    let chat_has_queued = chat_metadata.get("queuedRun").is_some();
+    let message_has_queued = message_metadata.get("queuedRun").is_some();
+    if chat_has_queued {
+        assert_eq!(chat_metadata["queuedRun"]["userMessageId"], "user-race");
+        assert!(
+            message_has_queued,
+            "chat and message queuedRun identity must stay aligned when present"
+        );
+    }
+}
+
+#[test]
 fn workspace_spec_phase0_contract_defines_lifecycle_and_prompt_snapshot() {
     let disabled = WorkspaceSpecSettings::disabled();
     assert!(!disabled.allows_generation());
