@@ -1,5 +1,6 @@
 use super::{
-    active_compression_snapshots, compression_snapshot_message, snapshot_covered_sequences,
+    active_compression_snapshots, active_llm_checkpoint_snapshot_ids, compression_snapshot_message,
+    snapshot_covered_sequences,
 };
 use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
@@ -492,7 +493,11 @@ pub(crate) async fn prepare_prompt_context(
         }
 
         let sequence = existing_message.sequence;
-        for neutral_message in neutral_messages_from_record(&replay_database, existing_message)? {
+        for neutral_message in neutral_messages_from_record(
+            &replay_database,
+            existing_message,
+            &active_llm_checkpoint_snapshot_ids(&compression_snapshots),
+        )? {
             neutral_messages.push(neutral_message);
             message_source_sequences.push(Some(sequence));
             message_context_sources.push(PromptContextSource::StoredMessage { sequence });

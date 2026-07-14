@@ -1313,6 +1313,7 @@ pub(crate) fn chat_extracted_memory_summary(fact: MemoryFactRecord) -> ChatExtra
 pub(crate) fn neutral_messages_from_record(
     database: &WorkspaceDatabase,
     message: MessageRecord,
+    active_llm_checkpoint_snapshot_ids: &HashSet<String>,
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let role = match message.role.as_str() {
         "system" => NeutralChatRole::System,
@@ -1359,7 +1360,13 @@ pub(crate) fn neutral_messages_from_record(
             .map_err(ApiError::from_workspace_error)?;
 
         if let Some(parts) = stored_assistant_parts_from_metadata(&message.metadata_json)? {
-            return replay_stored_assistant_parts(&message, parts, &tool_calls, reasoning);
+            return replay_stored_assistant_parts(
+                &message,
+                parts,
+                &tool_calls,
+                reasoning,
+                active_llm_checkpoint_snapshot_ids,
+            );
         }
 
         if tool_calls.is_empty() {
@@ -1476,6 +1483,7 @@ fn replay_stored_assistant_parts(
     parts: Vec<StoredChatMessagePart>,
     tool_calls: &[ToolCallWithResultRecord],
     fallback_reasoning: Option<String>,
+    active_llm_checkpoint_snapshot_ids: &HashSet<String>,
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let tool_calls_by_id = tool_calls
         .iter()
@@ -1483,8 +1491,14 @@ fn replay_stored_assistant_parts(
         .collect::<HashMap<_, _>>();
     let mut replayed_tool_call_ids = HashSet::new();
     let mut messages = Vec::new();
+    // Last successful active LLM ContextCompression part is the prompt replay cutpoint.
+    // UI materialization keeps full parts; only provider prompt rebuild applies this filter.
+    let replay_start = crate::prompt::assistant_parts_checkpoint_replay_start_index(
+        &parts,
+        active_llm_checkpoint_snapshot_ids,
+    );
 
-    for part in parts {
+    for part in parts.into_iter().skip(replay_start) {
         match part {
             StoredChatMessagePart::Text { text } => {
                 if !text.trim().is_empty() {
@@ -1509,24 +1523,32 @@ fn replay_stored_assistant_parts(
         }
     }
 
-    for tool_call in tool_calls {
-        if replayed_tool_call_ids.contains(&tool_call.id) {
-            continue;
+    // Only append orphan tool calls that appear after the cutpoint (already replayed via parts).
+    // Pre-cutpoint tools are intentionally omitted from the provider prompt.
+    if replay_start == 0 {
+        for tool_call in tool_calls {
+            if replayed_tool_call_ids.contains(&tool_call.id) {
+                continue;
+            }
+            append_replayed_tool_call_pair(
+                &mut messages,
+                message,
+                Some(tool_call),
+                &tool_call.id,
+                &mut replayed_tool_call_ids,
+            )?;
         }
-        append_replayed_tool_call_pair(
-            &mut messages,
-            message,
-            Some(tool_call),
-            &tool_call.id,
-            &mut replayed_tool_call_ids,
-        )?;
     }
 
     if messages.is_empty() && (!message.content.trim().is_empty() || fallback_reasoning.is_some()) {
-        messages.push(neutral_assistant_message(
-            message.content.clone(),
-            fallback_reasoning,
-        ));
+        // When a checkpoint cutpoint cleared pre-cutpoint parts, do not fall back to full
+        // final content/reasoning that may predate the checkpoint boundary.
+        if replay_start == 0 {
+            messages.push(neutral_assistant_message(
+                message.content.clone(),
+                fallback_reasoning,
+            ));
+        }
     }
 
     Ok(messages)

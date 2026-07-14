@@ -567,7 +567,7 @@ impl RemoteSidecarRuntimeToolState {
         };
         let covered_indices = plan.covered_message_indices;
         let original_tokens = plan.original_tokens;
-        let source_summary = plan.source_summary;
+        let checkpoint_messages = plan.checkpoint_messages;
         let covered_snapshot_ids = plan.covered_snapshot_ids;
         let covered_sequences = plan.covered_sequences;
         let compression_started_at = utc_timestamp();
@@ -598,7 +598,7 @@ impl RemoteSidecarRuntimeToolState {
                 assistant_message_id,
                 provider_id,
                 model_id,
-                &source_summary,
+                &checkpoint_messages,
             )
             .await
             {
@@ -9100,12 +9100,19 @@ fn remote_sidecar_prepare_chat_context_with_options(
         tool_catalog,
         session_mode,
     } = options;
-    let history = remote_sidecar_chat_messages_for_request(database, chat_id, assistant_message_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     let compression_snapshots = database
         .context_compression_snapshots_for_chat(chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     let compression_snapshots = crate::prompt::active_compression_snapshots(&compression_snapshots);
+    let active_llm_snapshot_ids =
+        crate::prompt::active_llm_checkpoint_snapshot_ids(&compression_snapshots);
+    let history = remote_sidecar_chat_messages_for_request(
+        database,
+        chat_id,
+        assistant_message_id,
+        &active_llm_snapshot_ids,
+    )
+    .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     let covered_sequences = crate::prompt::snapshot_covered_sequences(&compression_snapshots);
 
     let mut filtered_messages = Vec::new();
@@ -9419,6 +9426,7 @@ fn remote_sidecar_chat_messages_for_request(
     database: &WorkspaceDatabase,
     chat_id: &str,
     assistant_message_id: Option<&str>,
+    active_llm_checkpoint_snapshot_ids: &std::collections::HashSet<String>,
 ) -> Result<RemoteSidecarHistoryMessages, foco_store::workspace::WorkspaceDatabaseError> {
     let messages = database.messages_for_chat(chat_id)?;
     let target_sequence = assistant_message_id.and_then(|assistant_message_id| {
@@ -9455,11 +9463,96 @@ fn remote_sidecar_chat_messages_for_request(
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|value| !value.is_empty());
-        let mut tool_message_parts = Vec::new();
-        let mut assistant_tool_calls = Vec::new();
-        if message.role == "assistant"
-            && let Some(tool_records) = tool_calls_by_message.remove(&message.id)
-        {
+
+        if message.role == "assistant" {
+            let tool_records = tool_calls_by_message
+                .remove(&message.id)
+                .unwrap_or_default();
+            let parts = metadata.get("parts").cloned().and_then(|value| {
+                serde_json::from_value::<Vec<crate::StoredChatMessagePart>>(value).ok()
+            });
+            if let Some(parts) = parts {
+                let replay_start = crate::prompt::assistant_parts_checkpoint_replay_start_index(
+                    &parts,
+                    active_llm_checkpoint_snapshot_ids,
+                );
+                let tool_calls_by_id = tool_records
+                    .iter()
+                    .map(|tool_call| (tool_call.id.as_str(), tool_call))
+                    .collect::<HashMap<_, _>>();
+                let mut replayed_tool_call_ids = std::collections::HashSet::new();
+                for part in parts.into_iter().skip(replay_start) {
+                    match part {
+                        crate::StoredChatMessagePart::Text { text } => {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Assistant,
+                                content: text,
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_name: None,
+                            });
+                            sequences.push(sequence);
+                        }
+                        crate::StoredChatMessagePart::Reasoning { text, .. } => {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Assistant,
+                                content: String::new(),
+                                attachments: Vec::new(),
+                                reasoning: Some(text),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_name: None,
+                            });
+                            sequences.push(sequence);
+                        }
+                        crate::StoredChatMessagePart::ToolCall { tool_call_id } => {
+                            if !replayed_tool_call_ids.insert(tool_call_id.clone()) {
+                                continue;
+                            }
+                            let Some(tool_record) = tool_calls_by_id.get(tool_call_id.as_str())
+                            else {
+                                continue;
+                            };
+                            let Some(result) = tool_record.result.as_ref() else {
+                                continue;
+                            };
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Assistant,
+                                content: String::new(),
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: vec![remote_neutral_tool_call_from_record(tool_record)],
+                                tool_call_id: None,
+                                tool_name: None,
+                            });
+                            sequences.push(sequence);
+                            raw_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Tool,
+                                content: result.output_json.clone(),
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: Some(tool_record.id.clone()),
+                                tool_name: Some(tool_record.tool_name.clone()),
+                            });
+                            sequences.push(sequence);
+                        }
+                        crate::StoredChatMessagePart::ContextCompression { .. } => {}
+                    }
+                }
+                continue;
+            }
+
+            let mut tool_message_parts = Vec::new();
+            let mut assistant_tool_calls = Vec::new();
             for tool_record in tool_records {
                 assistant_tool_calls.push(remote_neutral_tool_call_from_record(&tool_record));
                 if let Some(result) = tool_record.result {
@@ -9474,28 +9567,37 @@ fn remote_sidecar_chat_messages_for_request(
                     });
                 }
             }
-        }
-        if message.role == "assistant"
-            && message.content.is_empty()
-            && reasoning.is_none()
-            && assistant_tool_calls.is_empty()
-        {
+            if message.content.is_empty() && reasoning.is_none() && assistant_tool_calls.is_empty()
+            {
+                continue;
+            }
+            raw_messages.push(NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: message.content,
+                attachments: Vec::new(),
+                reasoning,
+                tool_calls: assistant_tool_calls,
+                tool_call_id: None,
+                tool_name: None,
+            });
+            sequences.push(sequence);
+            for tool_message in tool_message_parts {
+                raw_messages.push(tool_message);
+                sequences.push(sequence);
+            }
             continue;
         }
+
         raw_messages.push(NeutralChatMessage {
             role: neutral_role_for_message(&message.role),
             content: message.content,
             attachments: Vec::new(),
             reasoning,
-            tool_calls: assistant_tool_calls,
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
         });
         sequences.push(sequence);
-        for tool_message in tool_message_parts {
-            raw_messages.push(tool_message);
-            sequences.push(sequence);
-        }
     }
 
     Ok(RemoteSidecarHistoryMessages {
@@ -11177,10 +11279,10 @@ async fn remote_sidecar_run_broker_context_compression_summary(
     assistant_message_id: &str,
     provider_id: &str,
     model_id: &str,
-    source_summary: &str,
+    checkpoint_messages: &[NeutralChatMessage],
 ) -> RemoteSidecarContextCompressionOutcome {
     let request =
-        crate::prompt::build_context_compression_summary_request(model_id, source_summary);
+        crate::prompt::build_context_compression_summary_request(model_id, checkpoint_messages);
     let broker_request_id = unique_id("broker-ctx-compress");
     if let Some(run_stream) = run_stream {
         run_stream.set_broker_request_id(broker_request_id.clone());
@@ -19464,7 +19566,10 @@ mod tests {
             "msg-assistant-1",
             "provider-legacy",
             "model-1",
-            "goal: compress earlier turns",
+            &[neutral_text_message(
+                NeutralChatRole::User,
+                "goal: compress earlier turns".to_string(),
+            )],
         )
         .await;
         broker.await.expect("broker task");
@@ -19569,7 +19674,10 @@ mod tests {
                 "msg-assistant-1",
                 "provider-1",
                 "model-1",
-                "source",
+                &[neutral_text_message(
+                    NeutralChatRole::User,
+                    "source".to_string(),
+                )],
             )
             .await;
             broker.await.expect("broker");
@@ -19630,7 +19738,10 @@ mod tests {
                 "msg-assistant-1",
                 "provider-1",
                 "model-1",
-                "source",
+                &[neutral_text_message(
+                    NeutralChatRole::User,
+                    "source".to_string(),
+                )],
             )
             .await;
             broker.await.expect("broker");
@@ -19870,11 +19981,12 @@ mod tests {
                 && event.status == "completed"
                 && event.snapshot_id.is_some()
         }));
-        assert!(
-            packed
-                .iter()
-                .any(|message| message.content.contains("Context Compression Snapshot"))
-        );
+        assert!(packed.iter().any(|message| {
+            message
+                .content
+                .contains("compact remote summary survives rebuild")
+                || message.content.contains("survives rebuild")
+        }));
         assert!(packed.iter().any(|message| {
             message.content.contains("Hook Context")
                 && message.content.contains("pre remote context")
@@ -20298,11 +20410,12 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.kind == CONTEXT_COMPRESSION_KIND_LLM && event.status == "completed"
         }));
-        assert!(
-            packed
-                .iter()
-                .any(|message| message.content.contains("Context Compression Snapshot"))
-        );
+        assert!(packed.iter().any(|message| {
+            message
+                .content
+                .contains("compact remote summary survives rebuild")
+                || message.content.contains("survives rebuild")
+        }));
 
         let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
             .expect("reopen db for snapshot")
@@ -20358,10 +20471,13 @@ mod tests {
                 .iter()
                 .any(|snapshot| snapshot.summary.contains("survives rebuild"))
         );
-        assert!(rebuilt.provider_request.messages.iter().any(|message| {
-            message.content.contains("Context Compression Snapshot")
-                && message.content.contains("survives rebuild")
-        }));
+        assert!(
+            rebuilt
+                .provider_request
+                .messages
+                .iter()
+                .any(|message| { message.content.contains("survives rebuild") })
+        );
         // Active snapshot replay must skip every covered sequence; do not revive them.
         assert!(
             !rebuilt
@@ -20388,16 +20504,19 @@ mod tests {
             );
         }
         assert!(
+            covered_sequences.contains(&4),
+            "full checkpoint covers current user sequence"
+        );
+        // Covered current turn is replaced by the summary on rebuild; do not revive raw user text.
+        assert!(
             rebuilt
                 .provider_request
                 .messages
                 .iter()
-                .any(|message| message.role == NeutralChatRole::User
-                    && message.content == "current turn")
+                .all(|message| message.content != "current turn")
         );
-        // Current user sequence must still be present (not covered).
         assert!(
-            rebuilt
+            !rebuilt
                 .message_source_sequences
                 .iter()
                 .any(|sequence| *sequence == Some(4))
@@ -20801,9 +20920,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_llm_context_compression_required_overflow_covers_runtime_snapshots_even_if_must_keep() {
-        // Mirrors app/tests ensure_context_compression_tries_llm_for_required_overflow_snapshots:
-        // Normal cannot cover must_keep recent runtime snapshots; RequiredOverflow can.
+    fn plan_llm_context_compression_covers_runtime_snapshots_and_current_user() {
+        // Full checkpoint candidacy covers must_keep runtime snapshots and CurrentUser.
         let messages = vec![
             neutral_text_message(NeutralChatRole::System, "system".to_string()),
             neutral_text_message(NeutralChatRole::System, "stable ".repeat(80)),
@@ -20826,25 +20944,21 @@ mod tests {
             messages.len() - 1,
         )
         .expect("groups");
-        assert!(
-            crate::prompt::plan_llm_context_compression(
-                &messages,
-                &sequences,
-                &sources,
-                &[],
-                &groups,
-                8,
-                crate::prompt::LlmContextCompressionMode::Normal,
-            )
-            .expect("normal plan")
-            .is_none()
-                || crate::prompt::llm_context_compression_group_indices(
-                    &groups,
-                    8,
-                    crate::prompt::LlmContextCompressionMode::Normal,
-                )
-                .is_empty()
-        );
+        let normal = crate::prompt::plan_llm_context_compression(
+            &messages,
+            &sequences,
+            &sources,
+            &[],
+            &groups,
+            8,
+            crate::prompt::LlmContextCompressionMode::Normal,
+        )
+        .expect("normal plan")
+        .expect("some normal plan");
+        assert!(normal.covered_message_indices.contains(&2));
+        assert!(normal.covered_message_indices.contains(&3));
+        assert!(normal.covered_message_indices.contains(&4));
+        assert!(normal.covered_sequences.contains(&9));
         let overflow = crate::prompt::plan_llm_context_compression(
             &messages,
             &sequences,
@@ -20858,7 +20972,14 @@ mod tests {
         .expect("some overflow plan");
         assert!(overflow.covered_message_indices.contains(&2));
         assert!(overflow.covered_message_indices.contains(&3));
-        assert!(!overflow.covered_sequences.contains(&9));
+        assert!(overflow.covered_message_indices.contains(&4));
+        assert!(overflow.covered_sequences.contains(&9));
+        assert_eq!(normal.checkpoint_messages.len(), 3);
+        assert!(normal.checkpoint_messages.iter().all(|message| {
+            message.role == NeutralChatRole::User
+                || message.role == NeutralChatRole::Assistant
+                || message.role == NeutralChatRole::Tool
+        }));
     }
 
     #[test]
@@ -23587,9 +23708,13 @@ mod tests {
         )
         .expect("record tool result");
 
-        let history =
-            remote_sidecar_chat_messages_for_request(&database, "chat-1", Some("msg-assistant-2"))
-                .expect("chat messages");
+        let history = remote_sidecar_chat_messages_for_request(
+            &database,
+            "chat-1",
+            Some("msg-assistant-2"),
+            &std::collections::HashSet::new(),
+        )
+        .expect("chat messages");
         let messages = history.messages;
         assert_eq!(messages.len(), 3);
         assert_eq!(history.sequences, vec![0, 1, 1]);
@@ -23680,9 +23805,13 @@ mod tests {
             database.insert_message(message).expect("insert message");
         }
 
-        let history =
-            remote_sidecar_chat_messages_for_request(&database, "chat-1", Some("msg-assistant-2"))
-                .expect("chat messages");
+        let history = remote_sidecar_chat_messages_for_request(
+            &database,
+            "chat-1",
+            Some("msg-assistant-2"),
+            &std::collections::HashSet::new(),
+        )
+        .expect("chat messages");
         let messages = history.messages;
 
         assert_eq!(messages.len(), 2);
@@ -23886,7 +24015,7 @@ mod tests {
                 .provider_request
                 .messages
                 .iter()
-                .any(|message| message.content.contains("Context Compression Snapshot"))
+                .any(|message| message.content.contains("compressed earlier turns"))
         );
         assert!(
             prepared
@@ -23925,7 +24054,7 @@ mod tests {
 
     #[test]
     fn plan_llm_context_compression_shared_candidates_match_local_rules() {
-        // Normal mode keeps the latest two compressible groups; cover older history only.
+        // Full checkpoint covers all compressible conversation groups including CurrentUser.
         let messages = vec![
             neutral_text_message(NeutralChatRole::System, "system".to_string()),
             neutral_text_message(NeutralChatRole::User, "old-0".to_string()),
@@ -23972,14 +24101,33 @@ mod tests {
         .expect("some plan");
         assert!(!plan.covered_message_indices.is_empty());
         assert!(plan.covered_sequences.contains(&0));
-        assert!(!plan.covered_sequences.contains(&6));
+        assert!(plan.covered_sequences.contains(&6));
         assert!(plan.original_tokens > 0);
-        assert!(!plan.source_summary.is_empty());
-
-        let snapshot_message = neutral_text_message(
-            NeutralChatRole::System,
-            "## Context Compression Snapshot\n\nsummary".to_string(),
+        assert_eq!(
+            plan.checkpoint_messages.len(),
+            plan.covered_message_indices.len()
         );
+        assert!(plan.checkpoint_messages.iter().any(|message| {
+            message.role == NeutralChatRole::User && message.content == "current"
+        }));
+
+        let snapshot_message = crate::prompt::compression_snapshot_message(
+            &foco_store::workspace::ContextCompressionSnapshotRecord {
+                id: "ctx-test".to_string(),
+                chat_id: "chat".to_string(),
+                run_id: "run".to_string(),
+                sequence: 0,
+                summary: "pure summary only".to_string(),
+                source_message_start_sequence: 0,
+                source_message_end_sequence: 6,
+                original_token_count: 10,
+                summary_token_count: 2,
+                created_at: "2026-07-14T00:00:00Z".to_string(),
+                metadata_json: r#"{"kind":"llm"}"#.to_string(),
+            },
+        );
+        assert_eq!(snapshot_message.role, NeutralChatRole::User);
+        assert_eq!(snapshot_message.content, "pure summary only");
         let replaced = crate::prompt::apply_compression_snapshot_to_messages(
             &messages,
             &sequences,

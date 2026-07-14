@@ -221,17 +221,14 @@ const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
 // Consecutive read-only exploration batches before telling the model to edit, ask, or finish.
 const READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD: usize = 16;
-// Number of newest compressible LLM request/message groups kept verbatim when older context is compressed.
-const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 2;
 // Number of newest in-progress tool batches kept verbatim inside a long agent run.
+// (LLM checkpoint no longer preserves recent message groups; this is only for local tool-state.)
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES: usize = 2;
 // Maximum runtime tool-state snapshots appended during one assistant run.
 const CONTEXT_COMPRESSION_MAX_RUNTIME_TOOL_STATE_SNAPSHOTS: usize = 3;
-// Maximum characters kept from each covered message inside a compression snapshot summary.
+// Maximum characters kept from each covered message inside a runtime tool-state snapshot summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 
-// Prefix used to identify injected context compression snapshot messages.
-const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 // Metadata kind for deterministic local context compression snapshots.
 const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
 // Metadata kind for model-generated fallback context compression snapshots.

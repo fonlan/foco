@@ -5098,7 +5098,7 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
 }
 
 #[test]
-fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
+fn llm_context_compression_group_indices_cover_all_checkpoint_candidates() {
     let messages = vec![
         neutral_text_message(NeutralChatRole::System, "system".to_string()),
         neutral_text_message(NeutralChatRole::Assistant, "oldest".repeat(10)),
@@ -5115,13 +5115,14 @@ fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
     let message_groups = context_message_groups(&messages, &sequences, &sources, messages.len())
         .expect("context groups");
 
+    // Normal and RequiredOverflow both cover the full compressible conversation state.
     assert_eq!(
         llm_context_compression_group_indices(
             &message_groups,
             u64::MAX,
             LlmContextCompressionMode::Normal,
         ),
-        vec![1]
+        vec![1, 2, 3]
     );
     assert_eq!(
         llm_context_compression_group_indices(
@@ -5134,7 +5135,7 @@ fn llm_context_compression_group_indices_preserve_recent_two_in_normal_mode() {
 }
 
 #[test]
-fn llm_context_compression_group_indices_include_recent_group_that_pack_would_drop() {
+fn llm_context_compression_group_indices_include_current_user_and_runtime_tool_state() {
     let messages = vec![
         neutral_text_message(NeutralChatRole::System, "system".to_string()),
         neutral_text_message(NeutralChatRole::Assistant, "small history".repeat(10)),
@@ -5150,15 +5151,151 @@ fn llm_context_compression_group_indices_include_recent_group_that_pack_would_dr
     ];
     let message_groups = context_message_groups(&messages, &sequences, &sources, messages.len())
         .expect("context groups");
-    let large_group_tokens = message_groups[2].estimated_tokens;
 
     assert_eq!(
         llm_context_compression_group_indices(
             &message_groups,
-            large_group_tokens.saturating_sub(1),
+            u64::MAX,
             LlmContextCompressionMode::Normal,
         ),
-        vec![2]
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn build_context_compression_summary_request_uses_raw_neutral_messages() {
+    let tool_call = NeutralToolCall {
+        call_id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "app/main.rs", "content": "x".repeat(500) }),
+        thought_signatures: None,
+    };
+    let checkpoint_messages = vec![
+        neutral_text_message(NeutralChatRole::User, "fix a bug".to_string()),
+        NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: String::new(),
+            attachments: Vec::new(),
+            reasoning: Some("inspect file".to_string()),
+            tool_calls: vec![tool_call.clone()],
+            tool_call_id: None,
+            tool_name: None,
+        },
+        NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: json!({ "content": "fn main() {}".repeat(100) }).to_string(),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+        },
+    ];
+    let request =
+        crate::prompt::build_context_compression_summary_request("model", &checkpoint_messages);
+    assert!(request.tools.is_empty());
+    assert!(request.thinking_level.is_none());
+    assert_eq!(request.max_output_tokens, Some(2048));
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(request.messages[0].role, NeutralChatRole::System);
+    assert_eq!(request.messages[1].role, NeutralChatRole::User);
+    assert_eq!(request.messages[1].content, "fix a bug");
+    assert_eq!(request.messages[2].tool_calls.len(), 1);
+    assert_eq!(request.messages[2].tool_calls[0].call_id, "call-1");
+    assert_eq!(
+        request.messages[2].tool_calls[0].arguments,
+        tool_call.arguments
+    );
+    assert_eq!(request.messages[3].role, NeutralChatRole::Tool);
+    assert!(request.messages[3].content.contains("fn main() {}"));
+    assert!(!request.messages.iter().any(|message| {
+        message.content.contains("source ")
+            || message.content.contains("tool calls: read_file")
+            || message.content.contains("...")
+    }));
+}
+
+#[test]
+fn compression_snapshot_message_is_plain_user_summary() {
+    let snapshot = ContextCompressionSnapshotRecord {
+        id: "ctx-1".to_string(),
+        chat_id: "chat".to_string(),
+        run_id: "run".to_string(),
+        sequence: 1,
+        summary: "handoff summary only".to_string(),
+        source_message_start_sequence: 0,
+        source_message_end_sequence: 2,
+        original_token_count: 100,
+        summary_token_count: 10,
+        created_at: "2026-07-14T00:00:00Z".to_string(),
+        metadata_json: r#"{"kind":"llm"}"#.to_string(),
+    };
+    let message = crate::prompt::compression_snapshot_message(&snapshot);
+    assert_eq!(message.role, NeutralChatRole::User);
+    assert_eq!(message.content, "handoff summary only");
+    assert!(!message.content.contains("Snapshot ID"));
+    assert!(!message.content.contains("Original tokens"));
+}
+
+#[test]
+fn assistant_parts_checkpoint_replay_start_index_uses_last_active_llm_part() {
+    let parts = vec![
+        StoredChatMessagePart::Text {
+            text: "before".to_string(),
+        },
+        StoredChatMessagePart::ContextCompression {
+            id: "ctx-old".to_string(),
+            status: "completed".to_string(),
+            kind: "llm".to_string(),
+            detail: ContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: "llm".to_string(),
+                snapshot_id: Some("ctx-old".to_string()),
+                original_token_count: Some(10),
+                summary_token_count: Some(2),
+                started_at: None,
+                completed_at: None,
+                provider_id: "p".to_string(),
+                model_id: "m".to_string(),
+            },
+        },
+        StoredChatMessagePart::ToolCall {
+            tool_call_id: "call-old".to_string(),
+        },
+        StoredChatMessagePart::ContextCompression {
+            id: "ctx-new".to_string(),
+            status: "completed".to_string(),
+            kind: "llm".to_string(),
+            detail: ContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: "llm".to_string(),
+                snapshot_id: Some("ctx-new".to_string()),
+                original_token_count: Some(20),
+                summary_token_count: Some(3),
+                started_at: None,
+                completed_at: None,
+                provider_id: "p".to_string(),
+                model_id: "m".to_string(),
+            },
+        },
+        StoredChatMessagePart::Text {
+            text: "after".to_string(),
+        },
+    ];
+    let active = HashSet::from(["ctx-new".to_string()]);
+    assert_eq!(
+        crate::prompt::assistant_parts_checkpoint_replay_start_index(&parts, &active),
+        4
+    );
+    // Superseded/old snapshot must not advance the cutpoint.
+    let only_old = HashSet::from(["ctx-old".to_string()]);
+    assert_eq!(
+        crate::prompt::assistant_parts_checkpoint_replay_start_index(&parts, &only_old),
+        2
+    );
+    assert_eq!(
+        crate::prompt::assistant_parts_checkpoint_replay_start_index(&parts, &HashSet::new()),
+        0
     );
 }
 
@@ -5334,6 +5471,7 @@ async fn ensure_context_compression_disabled_overflow_skips_runtime_tool_state_e
         700,
     );
     context.context_budget.context_window = 10_000;
+    context.provider_config.api_key = None;
     context.active_tool_start_index = context.provider_request.messages.len();
     assert!(
         !context
@@ -5358,17 +5496,13 @@ async fn ensure_context_compression_disabled_overflow_skips_runtime_tool_state_e
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!(total_used_context_tokens < 9_500);
 
-    let result = ensure_context_compression(&mut context)
+    // Switch OFF: no local runtimeToolState snapshot, but full LLM checkpoint still covers raw
+    // RuntimeToolState and reaches the provider path.
+    let error = ensure_context_compression(&mut context)
         .await
-        .expect("disabled switch should skip runtime tool-state and not hard-fail ensure");
+        .expect_err("disabled runtime tool-state still enters full LLM checkpoint");
 
-    assert!(!result.runtime_tool_state_compressed);
-    assert!(
-        result
-            .events
-            .iter()
-            .all(|detail| detail.kind != "runtimeToolState")
-    );
+    assert!(error.message().contains("API key"));
     assert!(
         context
             .message_context_sources
@@ -5414,13 +5548,14 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
     )
     .expect("context groups");
     assert!(context_token_breakdown(&message_groups).required_tokens > 8);
-    assert!(
+    // Full checkpoint covers current user and runtime snapshots in both modes.
+    assert_eq!(
         llm_context_compression_group_indices(
             &message_groups,
             context.context_budget.available_message_tokens,
             LlmContextCompressionMode::Normal,
-        )
-        .is_empty()
+        ),
+        vec![2, 3, 4]
     );
     assert_eq!(
         llm_context_compression_group_indices(
@@ -5428,7 +5563,7 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
             context.context_budget.available_message_tokens,
             LlmContextCompressionMode::RequiredOverflow
         ),
-        vec![2, 3]
+        vec![2, 3, 4]
     );
 
     let error = ensure_context_compression(&mut context)
@@ -5675,7 +5810,8 @@ fn neutral_messages_from_record_replays_complete_tool_state_and_skips_incomplete
         .next()
         .expect("assistant message");
     let messages =
-        neutral_messages_from_record(&database, message).expect("neutral message replay");
+        neutral_messages_from_record(&database, message, &std::collections::HashSet::new())
+            .expect("neutral message replay");
 
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0].role, NeutralChatRole::Assistant);
@@ -5753,7 +5889,8 @@ fn neutral_messages_from_record_replays_stored_assistant_parts_in_order() {
         .next()
         .expect("assistant message");
     let messages =
-        neutral_messages_from_record(&database, message).expect("neutral message replay");
+        neutral_messages_from_record(&database, message, &std::collections::HashSet::new())
+            .expect("neutral message replay");
 
     assert_eq!(messages.len(), 6);
     assert_eq!(messages[0].role, NeutralChatRole::Assistant);
@@ -5909,7 +6046,8 @@ fn text_attachments_use_original_path_in_user_prompt() {
         metadata_json,
     };
     let replayed_messages =
-        neutral_messages_from_record(&database, stored_message).expect("neutral messages");
+        neutral_messages_from_record(&database, stored_message, &std::collections::HashSet::new())
+            .expect("neutral messages");
     assert!(
         replayed_messages[0]
             .content
@@ -6657,8 +6795,12 @@ fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
         metadata_json,
     };
 
-    let neutral_messages =
-        neutral_messages_from_record(&database, message.clone()).expect("neutral messages");
+    let neutral_messages = neutral_messages_from_record(
+        &database,
+        message.clone(),
+        &std::collections::HashSet::new(),
+    )
+    .expect("neutral messages");
     assert_eq!(neutral_messages.len(), 1);
     assert_eq!(neutral_messages[0].attachments.len(), 1);
     assert_eq!(neutral_messages[0].attachments[0].name, "screenshot.png");

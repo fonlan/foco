@@ -100,19 +100,19 @@ fn validate_prompt_context_lengths(
     Ok(())
 }
 
-/// Ensure runtime tool-state + optional LLM compression before the next provider request.
+/// Ensure runtime tool-state + optional LLM checkpoint before the next provider request.
 ///
 /// Overflow matrix for `runtime_tool_state_compression_enabled`:
 ///
-/// | switch | 80% force=false | required overflow force | RequiredOverflow LLM |
+/// | switch | 80% force=false | required overflow force | RequiredOverflow LLM checkpoint |
 /// | --- | --- | --- | --- |
-/// | OFF | skip | skip (force does not bypass switch) | try directly if still over budget |
-/// | ON | may trigger | force local tool-state first | LLM only if still over budget after force |
+/// | OFF | skip | skip (force does not bypass switch) | full conversation checkpoint if still over budget |
+/// | ON | may trigger | force local tool-state first | checkpoint only if still over budget after force |
 ///
-/// When the switch is OFF, raw `RuntimeToolState` remains outside the LLM candidate set; if overflow
-/// is mostly live tool text, LLM compression may have no candidates or still overflow (accepted
-/// trade-off to protect prompt-cache prefixes). Tool-round-cap recovery via
-/// `compress_all_runtime_tool_state` is not gated by this switch.
+/// LLM checkpoint candidates include raw `RuntimeToolState` (no local snapshot required). The 80%
+/// local tool-state path remains an optional independent optimization that still preserves the
+/// recent two tool batches. Tool-round-cap recovery via `compress_all_runtime_tool_state` is not
+/// gated by this switch.
 pub(crate) async fn ensure_context_compression(
     context: &mut PreparedChatContext,
 ) -> Result<ContextCompressionResult, ApiError> {
@@ -257,12 +257,13 @@ pub(crate) enum LlmContextCompressionMode {
     RequiredOverflow,
 }
 
-/// Pure planning input for LLM context compression (local + remote).
+/// Pure planning input for LLM context checkpoint (local + remote).
 #[derive(Clone, Debug)]
 pub(crate) struct LlmContextCompressionPlan {
     pub covered_message_indices: Vec<usize>,
     pub original_tokens: u64,
-    pub source_summary: String,
+    /// Ordered Neutral messages for the dedicated checkpoint request (raw conversation state).
+    pub checkpoint_messages: Vec<NeutralChatMessage>,
     pub covered_sequences: Vec<i64>,
     pub covered_snapshot_ids: Vec<String>,
 }
@@ -276,7 +277,7 @@ pub(crate) struct ReplacedPromptMessages {
     pub active_tool_start_index: usize,
 }
 
-/// Select covered groups/messages and build summary source text without I/O or provider calls.
+/// Select covered groups/messages and build checkpoint message list without I/O or provider calls.
 pub(crate) fn plan_llm_context_compression(
     messages: &[NeutralChatMessage],
     message_source_sequences: &[Option<i64>],
@@ -292,7 +293,13 @@ pub(crate) fn plan_llm_context_compression(
     if covered_group_indices.is_empty() {
         return Ok(None);
     }
-    let covered_message_indices = message_group_indices(message_groups, &covered_group_indices)?;
+    let mut covered_message_indices =
+        message_group_indices(message_groups, &covered_group_indices)?;
+    covered_message_indices =
+        trim_covered_indices_to_complete_tool_pairs(messages, covered_message_indices);
+    if covered_message_indices.is_empty() {
+        return Ok(None);
+    }
     let original_tokens = covered_message_indices
         .iter()
         .map(|index| neutral_message_estimated_tokens(&messages[*index]))
@@ -300,14 +307,16 @@ pub(crate) fn plan_llm_context_compression(
     if original_tokens == 0 {
         return Ok(None);
     }
-    let source_summary = context_compression_summary_allowing_snapshots(
+    let checkpoint_messages = build_checkpoint_messages(
         messages,
-        message_source_sequences,
+        message_context_sources,
+        compression_snapshots,
         &covered_message_indices,
     )?;
     let covered_snapshot_ids = compression_covered_snapshot_ids(
         messages,
         message_context_sources,
+        compression_snapshots,
         &covered_message_indices,
     );
     let covered_sequences = compression_covered_sequences_allowing_snapshots(
@@ -319,7 +328,7 @@ pub(crate) fn plan_llm_context_compression(
     Ok(Some(LlmContextCompressionPlan {
         covered_message_indices,
         original_tokens,
-        source_summary,
+        checkpoint_messages,
         covered_sequences,
         covered_snapshot_ids,
     }))
@@ -410,7 +419,7 @@ async fn ensure_llm_context_compression(
     };
     let covered_indices = plan.covered_message_indices;
     let original_tokens = plan.original_tokens;
-    let source_summary = plan.source_summary;
+    let checkpoint_messages = plan.checkpoint_messages;
     let covered_snapshot_ids = plan.covered_snapshot_ids;
     let covered_sequences = plan.covered_sequences;
     let compression_started_at = utc_timestamp();
@@ -427,7 +436,7 @@ async fn ensure_llm_context_compression(
         context,
     ));
 
-    let summary = llm_context_compression_summary(context, &source_summary).await?;
+    let summary = llm_context_compression_summary(context, &checkpoint_messages).await?;
     if !context_compression_summary_has_benefit(&summary, original_tokens) {
         events.pop();
         return Ok(false);
@@ -540,74 +549,68 @@ async fn ensure_llm_context_compression(
 
 pub(crate) fn llm_context_compression_group_indices(
     groups: &[ContextMessageGroup],
-    available_message_tokens: u64,
-    mode: LlmContextCompressionMode,
+    _available_message_tokens: u64,
+    _mode: LlmContextCompressionMode,
 ) -> Vec<usize> {
-    let compressible_indices = groups
+    // Full LLM checkpoint: cover every compressible conversation-state group up to the
+    // checkpoint boundary. Normal (95%) and RequiredOverflow share the same candidate set.
+    // must_keep still applies to ordinary pack/drop, not to checkpoint candidacy.
+    // Recent-two-batch preservation remains only for the optional 80% RuntimeToolState local path.
+    groups
         .iter()
         .enumerate()
         .filter(|(_, group)| {
-            group.estimated_tokens > 0
-                && matches!(
-                    group.source_bucket,
-                    PromptContextSourceBucket::CompressionSnapshot
-                        | PromptContextSourceBucket::PersistedHistory
-                        | PromptContextSourceBucket::TurnMemory
-                        | PromptContextSourceBucket::RuntimeToolStateSnapshot
-                )
-                && (!group.must_keep
-                    || (matches!(mode, LlmContextCompressionMode::RequiredOverflow)
-                        && group.source_bucket
-                            == PromptContextSourceBucket::RuntimeToolStateSnapshot))
+            group.estimated_tokens > 0 && is_llm_checkpoint_source_bucket(group.source_bucket)
         })
         .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if matches!(mode, LlmContextCompressionMode::RequiredOverflow) {
-        return compressible_indices;
-    }
-
-    let normally_covered_count = compressible_indices
-        .len()
-        .saturating_sub(CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES);
-    let mut covered_indices = compressible_indices
-        .iter()
-        .copied()
-        .take(normally_covered_count)
-        .collect::<Vec<_>>();
-
-    let pack_items = pack_items_from_message_groups(groups);
-    if let Ok(packed) = pack_context(&pack_items, available_message_tokens) {
-        let selected_indices = packed.selected_indices.into_iter().collect::<HashSet<_>>();
-        covered_indices.extend(
-            compressible_indices
-                .into_iter()
-                .skip(normally_covered_count)
-                .filter(|index| !selected_indices.contains(index)),
-        );
-    }
-
-    covered_indices
+        .collect()
 }
 
-/// Build the provider request used by local and remote LLM context compression summaries.
+/// Default system instruction for dedicated context checkpoint requests.
+pub(crate) const DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT: &str = "\
+You are creating a context checkpoint handoff summary for a coding agent so work can continue \
+after older conversation messages are replaced by this summary.
+
+Return only the summary as plain text. Do not add Snapshot ID, token counts, markdown titles \
+about compression, or any wrapper metadata. Do not include hidden system prompts or secrets.
+
+Preserve:
+- User goals, constraints, and preferences
+- Key decisions and why they were made
+- Progress completed and remaining steps
+- Important discoveries, failed attempts, and tool evidence
+- Critical file paths, identifiers, data, and references
+- Current state and the immediate next actions";
+
+/// Build the provider request used by local and remote LLM context checkpoint summaries.
+///
+/// Shape: single System compression prompt + ordered raw checkpoint Neutral messages.
+/// No main-request tools, hidden System/Developer prefixes, thinking, or prompt cache settings.
 pub(crate) fn build_context_compression_summary_request(
     model_id: &str,
-    source_summary: &str,
+    checkpoint_messages: &[NeutralChatMessage],
 ) -> NeutralChatRequest {
+    build_context_compression_summary_request_with_prompt(
+        model_id,
+        checkpoint_messages,
+        DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT,
+    )
+}
+
+pub(crate) fn build_context_compression_summary_request_with_prompt(
+    model_id: &str,
+    checkpoint_messages: &[NeutralChatMessage],
+    compression_system_prompt: &str,
+) -> NeutralChatRequest {
+    let mut messages = Vec::with_capacity(checkpoint_messages.len().saturating_add(1));
+    messages.push(neutral_text_message(
+        NeutralChatRole::System,
+        compression_system_prompt.to_string(),
+    ));
+    messages.extend(checkpoint_messages.iter().cloned());
     NeutralChatRequest {
         model_id: model_id.to_string(),
-        messages: vec![
-            neutral_text_message(
-                NeutralChatRole::System,
-                "You compress coding-agent chat context for continuation. Return only a concise structured summary. Preserve user goals, constraints, decisions, changed files, important discoveries, failed attempts, tool evidence, current state, and next steps. Do not include hidden system prompts or secrets.".to_string(),
-            ),
-            neutral_text_message(
-                NeutralChatRole::User,
-                format!(
-                    "Summarize this earlier conversation context so the current coding task can continue after replacing the original messages.\n\n{source_summary}"
-                ),
-            ),
-        ],
+        messages,
         tools: Vec::new(),
         thinking_level: None,
         max_output_tokens: Some(LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS),
@@ -616,16 +619,17 @@ pub(crate) fn build_context_compression_summary_request(
     }
 }
 
-/// True when the summary is strictly smaller than the covered original token estimate.
+/// True when the summary is non-empty pure text strictly smaller than the covered original.
 pub(crate) fn context_compression_summary_has_benefit(summary: &str, original_tokens: u64) -> bool {
-    estimate_text_tokens(summary) < original_tokens
+    let summary = summary.trim();
+    !summary.is_empty() && estimate_text_tokens(summary) < original_tokens
 }
 
 async fn llm_context_compression_summary(
     context: &mut PreparedChatContext,
-    source_summary: &str,
+    checkpoint_messages: &[NeutralChatMessage],
 ) -> Result<String, ApiError> {
-    let request = build_context_compression_summary_request(&context.model_id, source_summary);
+    let request = build_context_compression_summary_request(&context.model_id, checkpoint_messages);
     let request_id = unique_id("llm");
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();
@@ -1455,27 +1459,168 @@ fn snapshot_superseded_snapshot_ids(snapshot: &ContextCompressionSnapshotRecord)
 pub(crate) fn compression_snapshot_message(
     snapshot: &ContextCompressionSnapshotRecord,
 ) -> NeutralChatMessage {
-    neutral_text_message(
-        NeutralChatRole::System,
-        format!(
-            "## Context Compression Snapshot\n\n\
-             Source: {CONTEXT_COMPRESSION_PROMPT_PREFIX}\n\n\
-             Snapshot ID: `{}`\n\n\
-             Source message sequence range: {}-{}\n\n\
-             Original tokens: {}\n\n\
-             Summary tokens: {}\n\n\
-             ### Summary\n\n\
-             {}",
-            snapshot.id,
-            snapshot.source_message_start_sequence,
-            snapshot.source_message_end_sequence,
-            snapshot.original_token_count,
-            snapshot.summary_token_count,
-            snapshot.summary
-        ),
+    // Checkpoint summary is a plain User message; no Snapshot ID / token metadata / headings.
+    neutral_text_message(NeutralChatRole::User, snapshot.summary.clone())
+}
+
+/// Active LLM checkpoint snapshot IDs (excludes superseded and non-LLM kinds).
+pub(crate) fn active_llm_checkpoint_snapshot_ids(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> HashSet<String> {
+    active_compression_snapshots(snapshots)
+        .into_iter()
+        .filter(|snapshot| snapshot_metadata_kind(snapshot) == CONTEXT_COMPRESSION_KIND_LLM)
+        .map(|snapshot| snapshot.id)
+        .collect()
+}
+
+fn snapshot_metadata_kind(snapshot: &ContextCompressionSnapshotRecord) -> &'static str {
+    serde_json::from_str::<Value>(&snapshot.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|kind| kind == CONTEXT_COMPRESSION_KIND_LLM)
+        .map(|_| CONTEXT_COMPRESSION_KIND_LLM)
+        .unwrap_or(CONTEXT_COMPRESSION_KIND_RULE)
+}
+
+/// Index after the last successful active LLM ContextCompression part within assistant parts.
+/// Returns 0 when no active LLM checkpoint cutpoint exists (full replay).
+pub(crate) fn assistant_parts_checkpoint_replay_start_index(
+    parts: &[StoredChatMessagePart],
+    active_llm_snapshot_ids: &HashSet<String>,
+) -> usize {
+    if active_llm_snapshot_ids.is_empty() {
+        return 0;
+    }
+    parts
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, part)| match part {
+            StoredChatMessagePart::ContextCompression {
+                status,
+                kind,
+                detail,
+                ..
+            } if status == "completed"
+                && kind == CONTEXT_COMPRESSION_KIND_LLM
+                && detail
+                    .snapshot_id
+                    .as_ref()
+                    .is_some_and(|id| active_llm_snapshot_ids.contains(id)) =>
+            {
+                Some(index.saturating_add(1))
+            }
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn is_llm_checkpoint_source_bucket(source: PromptContextSourceBucket) -> bool {
+    matches!(
+        source,
+        PromptContextSourceBucket::PersistedHistory
+            | PromptContextSourceBucket::TurnMemory
+            | PromptContextSourceBucket::CompressionSnapshot
+            | PromptContextSourceBucket::AssistantDraft
+            | PromptContextSourceBucket::CurrentUser
+            | PromptContextSourceBucket::RuntimeAssistant
+            | PromptContextSourceBucket::RuntimeToolState
+            | PromptContextSourceBucket::RuntimeToolStateSnapshot
     )
 }
 
+/// Drop trailing incomplete tool-call/result pairs so the checkpoint request stays provider-valid.
+fn trim_covered_indices_to_complete_tool_pairs(
+    messages: &[NeutralChatMessage],
+    covered_indices: Vec<usize>,
+) -> Vec<usize> {
+    if covered_indices.is_empty() {
+        return covered_indices;
+    }
+
+    let covered_set = covered_indices.iter().copied().collect::<HashSet<_>>();
+    let result_ids = covered_indices
+        .iter()
+        .filter_map(|index| {
+            let message = messages.get(*index)?;
+            if message.role == NeutralChatRole::Tool {
+                message.tool_call_id.clone()
+            } else {
+                None
+            }
+        })
+        .collect::<HashSet<_>>();
+
+    let mut incomplete_from: Option<usize> = None;
+    for index in &covered_indices {
+        let Some(message) = messages.get(*index) else {
+            continue;
+        };
+        if message.tool_calls.is_empty() {
+            continue;
+        }
+        let all_paired = message.tool_calls.iter().all(|tool_call| {
+            result_ids.contains(&tool_call.call_id)
+                || messages.iter().enumerate().any(|(other_index, other)| {
+                    covered_set.contains(&other_index)
+                        && other.role == NeutralChatRole::Tool
+                        && other.tool_call_id.as_deref() == Some(tool_call.call_id.as_str())
+                })
+        });
+        if !all_paired {
+            incomplete_from = Some(*index);
+            break;
+        }
+    }
+
+    let Some(cut) = incomplete_from else {
+        return covered_indices;
+    };
+    covered_indices
+        .into_iter()
+        .filter(|index| *index < cut)
+        .collect()
+}
+
+fn build_checkpoint_messages(
+    messages: &[NeutralChatMessage],
+    message_context_sources: &[PromptContextSource],
+    compression_snapshots: &[ContextCompressionSnapshotRecord],
+    covered_indices: &[usize],
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let mut checkpoint_messages = Vec::with_capacity(covered_indices.len());
+    for index in covered_indices.iter().copied() {
+        let message = messages.get(index).ok_or_else(|| {
+            ApiError::internal("context compression covered message index is out of bounds")
+        })?;
+        let source = message_context_sources.get(index).ok_or_else(|| {
+            ApiError::internal("context compression covered source index is out of bounds")
+        })?;
+        if matches!(source, PromptContextSource::CompressionSnapshot) {
+            // Prior checkpoints join the new request as ordinary User summary content only.
+            let summary = compression_snapshot_id_from_message(message, compression_snapshots)
+                .and_then(|id| {
+                    compression_snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.id == id)
+                        .map(|snapshot| snapshot.summary.clone())
+                })
+                .unwrap_or_else(|| message.content.clone());
+            checkpoint_messages.push(neutral_text_message(NeutralChatRole::User, summary));
+            continue;
+        }
+        checkpoint_messages.push(message.clone());
+    }
+    Ok(checkpoint_messages)
+}
+
+#[allow(dead_code)]
 fn compact_message_for_compression(message: &NeutralChatMessage) -> String {
     let mut content = truncate_for_context_snapshot(&message.content);
 
@@ -1555,6 +1700,7 @@ fn truncate_for_context_snapshot(value: &str) -> String {
     output
 }
 
+#[allow(dead_code)]
 fn context_compression_summary_allowing_snapshots(
     messages: &[NeutralChatMessage],
     message_source_sequences: &[Option<i64>],
@@ -1611,7 +1757,7 @@ fn compression_covered_sequences_allowing_snapshots(
         let Some(message) = messages.get(*index) else {
             continue;
         };
-        let Some(snapshot_id) = compression_snapshot_id_from_message(message) else {
+        let Some(snapshot_id) = compression_snapshot_id_from_message(message, snapshots) else {
             continue;
         };
         let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.id == snapshot_id) else {
@@ -1628,6 +1774,7 @@ fn compression_covered_sequences_allowing_snapshots(
 fn compression_covered_snapshot_ids(
     messages: &[NeutralChatMessage],
     message_context_sources: &[PromptContextSource],
+    snapshots: &[ContextCompressionSnapshotRecord],
     covered_indices: &[usize],
 ) -> Vec<String> {
     let mut ids = covered_indices
@@ -1640,7 +1787,7 @@ fn compression_covered_snapshot_ids(
         .filter_map(|index| {
             messages
                 .get(*index)
-                .and_then(compression_snapshot_id_from_message)
+                .and_then(|message| compression_snapshot_id_from_message(message, snapshots))
         })
         .collect::<Vec<_>>();
     ids.sort();
@@ -1648,14 +1795,17 @@ fn compression_covered_snapshot_ids(
     ids
 }
 
-fn compression_snapshot_id_from_message(message: &NeutralChatMessage) -> Option<String> {
+fn compression_snapshot_id_from_message(
+    message: &NeutralChatMessage,
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> Option<String> {
     if let Some(start) = message.content.find("<snapshot_id>") {
         let start = start + "<snapshot_id>".len();
         let end = message.content[start..].find("</snapshot_id>")? + start;
         return Some(message.content[start..end].trim().to_string());
     }
 
-    message
+    if let Some(id) = message
         .content
         .lines()
         .find_map(|line| line.trim().strip_prefix("Snapshot ID: `"))
@@ -1663,6 +1813,15 @@ fn compression_snapshot_id_from_message(message: &NeutralChatMessage) -> Option<
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
+    {
+        return Some(id);
+    }
+
+    // Pure User summary format: match by summary text against known snapshot records.
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.summary == message.content)
+        .map(|snapshot| snapshot.id.clone())
 }
 
 fn direct_covered_sequences(
@@ -2486,15 +2645,7 @@ fn context_token_breakdown_source_bucket(
 }
 
 fn context_group_is_compressible(group: &ContextMessageGroup) -> bool {
-    group.estimated_tokens > 0
-        && matches!(
-            group.source_bucket,
-            PromptContextSourceBucket::PersistedHistory
-                | PromptContextSourceBucket::AgentPrivateContext
-                | PromptContextSourceBucket::TurnMemory
-                | PromptContextSourceBucket::RuntimeToolState
-                | PromptContextSourceBucket::CompressionSnapshot
-        )
+    group.estimated_tokens > 0 && is_llm_checkpoint_source_bucket(group.source_bucket)
 }
 
 fn required_context_overflow_error(
