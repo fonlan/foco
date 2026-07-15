@@ -877,6 +877,7 @@ type MainTabContextMenuState = {
 type WorkspaceFileContextMenuState = {
   left: number;
   node: WorkspaceFileTreeNode;
+  positioned: boolean;
   top: number;
   workspacePath: string;
 };
@@ -1238,6 +1239,7 @@ export function App() {
     useState<WorkspaceChatContextMenuState | null>(null);
   const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
     useState<WorkspaceFileContextMenuState | null>(null);
+  const workspaceFileContextMenuRef = useRef<HTMLDivElement>(null);
   // ponytail: keep inactive chat cache ref-only so hot streaming paths don't
   // rerender App; ceiling is App still owns too much chat state, upgrade path is
   // moving this cache into a dedicated hook/store.
@@ -4288,6 +4290,34 @@ export function App() {
       window.removeEventListener("resize", closeWorkspaceFileContextMenu);
       window.removeEventListener("scroll", closeWorkspaceFileContextMenuForScroll, true);
     };
+  }, [workspaceFileContextMenu]);
+
+  useLayoutEffect(() => {
+    if (!workspaceFileContextMenu || workspaceFileContextMenu.positioned) {
+      return;
+    }
+
+    const element = workspaceFileContextMenuRef.current;
+    if (!element || typeof window === "undefined") {
+      return;
+    }
+
+    const margin = 8;
+    const rect = element.getBoundingClientRect();
+    const nextLeft = Math.max(
+      margin,
+      Math.min(workspaceFileContextMenu.left, window.innerWidth - rect.width - margin),
+    );
+    const nextTop = Math.max(
+      margin,
+      Math.min(workspaceFileContextMenu.top, window.innerHeight - rect.height - margin),
+    );
+    setWorkspaceFileContextMenu({
+      ...workspaceFileContextMenu,
+      left: nextLeft,
+      positioned: true,
+      top: nextTop,
+    });
   }, [workspaceFileContextMenu]);
 
   useEffect(() => {
@@ -11125,6 +11155,7 @@ export function App() {
       setWorkspaceFileContextMenu({
         left: event.clientX,
         node,
+        positioned: false,
         top: event.clientY,
         workspacePath: activeWorkspace.path,
       });
@@ -11841,10 +11872,12 @@ export function App() {
               <div
                 aria-label={workspaceFileContextMenu.node.name}
                 className="workspace-chat-context-menu workspace-file-context-menu"
+                ref={workspaceFileContextMenuRef}
                 role="menu"
                 style={{
                   left: workspaceFileContextMenu.left,
                   top: workspaceFileContextMenu.top,
+                  visibility: workspaceFileContextMenu.positioned ? "visible" : "hidden",
                 }}
               >
                 <button

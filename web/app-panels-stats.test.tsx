@@ -5150,6 +5150,91 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.queryByRole("menu", { name: "README.md" })).not.toBeInTheDocument();
   });
 
+  it("clamps the file tree context menu into the viewport", async () => {
+    const originalInnerWidth = window.innerWidth;
+    const originalInnerHeight = window.innerHeight;
+    const menuWidth = 220;
+    const menuHeight = 280;
+    const clientX = 780;
+    const clientY = 560;
+    const margin = 8;
+
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 800,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 600,
+    });
+
+    const originalGetBoundingClientRect =
+      HTMLElement.prototype.getBoundingClientRect;
+    const getBoundingClientRectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.classList.contains("workspace-file-context-menu")) {
+          return {
+            bottom: menuHeight,
+            height: menuHeight,
+            left: 0,
+            right: menuWidth,
+            top: 0,
+            toJSON: () => ({}),
+            width: menuWidth,
+            x: 0,
+            y: 0,
+          } as DOMRect;
+        }
+        return originalGetBoundingClientRect.call(this);
+      });
+
+    try {
+      renderApp();
+
+      await screen.findAllByText("Default");
+      await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+      const fileRow = (await screen.findByText("README.md")).closest(
+        "div[role='treeitem']",
+      );
+      expect(fileRow).not.toBeNull();
+      fireEvent.contextMenu(fileRow as HTMLElement, { clientX, clientY });
+
+      const menu = await screen.findByRole("menu", { name: "README.md" });
+      const expectedLeft = Math.max(
+        margin,
+        Math.min(clientX, 800 - menuWidth - margin),
+      );
+      const expectedTop = Math.max(
+        margin,
+        Math.min(clientY, 600 - menuHeight - margin),
+      );
+
+      await waitFor(() => {
+        expect(menu).toHaveStyle({
+          left: `${expectedLeft}px`,
+          top: `${expectedTop}px`,
+          visibility: "visible",
+        });
+      });
+      expect(expectedLeft).toBe(572);
+      expect(expectedTop).toBe(312);
+      expect(expectedLeft + menuWidth).toBeLessThanOrEqual(800 - margin);
+      expect(expectedTop + menuHeight).toBeLessThanOrEqual(600 - margin);
+    } finally {
+      getBoundingClientRectSpy.mockRestore();
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: originalInnerHeight,
+      });
+    }
+  });
+
   it("toggles markdown file preview from the editor toolbar", async () => {
     renderApp();
 
