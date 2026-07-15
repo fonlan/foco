@@ -13784,6 +13784,7 @@ async fn remote_sidecar_preview_file(
         &resource_rel,
         head_only,
         "http://127.0.0.1",
+        None,
     )
     .map_err(|e| e.into_response())
 }

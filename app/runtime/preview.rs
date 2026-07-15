@@ -458,17 +458,16 @@ pub(crate) fn build_preview_file_response(
     content_length: u64,
     head_only: bool,
     foco_origin: &str,
+    preview_resource_source: Option<&str>,
 ) -> Response {
     let mime = preview_mime_type(resource_rel);
-    let csp = preview_content_security_policy(foco_origin);
-    let builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, cache_control_for_preview(mime))
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::CONTENT_SECURITY_POLICY, csp)
-        // Preview origin must not accept Foco auth cookies (different host).
-        .header("Cross-Origin-Resource-Policy", "same-origin");
+    let builder = preview_response_builder(
+        StatusCode::OK,
+        mime,
+        cache_control_for_preview(mime),
+        foco_origin,
+        preview_resource_source,
+    );
 
     // CSP frame-ancestors is the embed control (Foco origin only).
     // Do not set X-Frame-Options: SAMEORIGIN — that would block the Foco parent iframe.
@@ -485,6 +484,42 @@ pub(crate) fn build_preview_file_response(
         .expect("preview GET response is valid")
 }
 
+fn preview_response_builder(
+    status: StatusCode,
+    content_type: &str,
+    cache_control: &str,
+    foco_origin: &str,
+    preview_resource_source: Option<&str>,
+) -> axum::http::response::Builder {
+    let csp = preview_content_security_policy_for_resource(
+        foco_origin,
+        preview_resource_source.unwrap_or("'self'"),
+    );
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, csp)
+        .header(
+            "Cross-Origin-Resource-Policy",
+            if preview_resource_source.is_some() {
+                // Path-mode documents have an opaque sandbox origin, so no-cors
+                // images, styles, and classic scripts must be embeddable by it.
+                "cross-origin"
+            } else {
+                "same-origin"
+            },
+        );
+
+    if preview_resource_source.is_some() {
+        // ES modules, fonts, and fetch() send `Origin: null` from a sandboxed
+        // path-mode iframe. Scope this CORS grant to capability-token responses.
+        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "null");
+    }
+    builder
+}
+
 /// Read a local preview file after confinement checks and build the HTTP response.
 pub(crate) fn serve_local_preview_file(
     workspace_root: &Path,
@@ -492,6 +527,7 @@ pub(crate) fn serve_local_preview_file(
     resource_rel: &str,
     head_only: bool,
     foco_origin: &str,
+    preview_resource_source: Option<&str>,
 ) -> Result<Response, ApiError> {
     let file_path = open_preview_file(workspace_root, preview_root_rel, resource_rel)?;
     if head_only {
@@ -502,6 +538,7 @@ pub(crate) fn serve_local_preview_file(
             content_length,
             true,
             foco_origin,
+            preview_resource_source,
         ));
     }
     let bytes = fs::read(&file_path).map_err(|_| {
@@ -514,6 +551,7 @@ pub(crate) fn serve_local_preview_file(
         content_length,
         false,
         foco_origin,
+        preview_resource_source,
     ))
 }
 
@@ -630,10 +668,17 @@ fn cache_control_for_preview(mime: &str) -> &'static str {
 /// Content-Security-Policy for preview documents.
 /// frame-ancestors restricts embedding to the Foco page origin (same host, not preview).
 pub(crate) fn preview_content_security_policy(foco_origin: &str) -> String {
+    preview_content_security_policy_for_resource(foco_origin, "'self'")
+}
+
+fn preview_content_security_policy_for_resource(
+    foco_origin: &str,
+    preview_resource_source: &str,
+) -> String {
     // Allow the page's own scripts/styles/images/fonts/fetch (same preview origin).
     // frame-ancestors only Foco UI origin so arbitrary sites cannot embed the capability host.
     format!(
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {foco_origin}"
+        "default-src {preview_resource_source}; script-src {preview_resource_source} 'unsafe-inline' 'unsafe-eval'; style-src {preview_resource_source} 'unsafe-inline'; img-src {preview_resource_source} data: blob:; font-src {preview_resource_source} data:; connect-src {preview_resource_source}; media-src {preview_resource_source} blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {foco_origin}"
     )
 }
 
@@ -931,21 +976,25 @@ pub(crate) async fn preview_host_middleware(
         .unwrap_or("");
     let request_path = request.uri().path().to_string();
 
-    let (token, resource_path, redacted_label, foco_origin) =
+    let (token, resource_path, redacted_label, foco_origin, preview_resource_source) =
         if let Some(token) = parse_preview_host_token(host) {
             (
                 token,
                 request_path.clone(),
                 redact_preview_host_for_log(host),
                 foco_page_origin(state.listen_addr),
+                None,
             )
         } else if let Some((token, resource_path)) = parse_preview_path(&request_path) {
             let public_origin = request_public_origin(request.headers(), state.listen_addr);
+            let preview_resource_source =
+                format!("{}/", preview_path_origin(&public_origin, &token));
             (
                 token.clone(),
                 resource_path,
                 format!("/__preview/{}", redact_preview_token(&token)),
                 public_origin,
+                Some(preview_resource_source),
             )
         } else {
             return next.run(request).await;
@@ -962,6 +1011,7 @@ pub(crate) async fn preview_host_middleware(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
             &foco_origin,
+            preview_resource_source.as_deref(),
         );
     }
 
@@ -971,6 +1021,7 @@ pub(crate) async fn preview_host_middleware(
         &resource_path,
         method == Method::HEAD,
         &foco_origin,
+        preview_resource_source.as_deref(),
     )
     .await
     {
@@ -982,7 +1033,12 @@ pub(crate) async fn preview_host_middleware(
                 status = error.status.as_u16(),
                 "preview resource error"
             );
-            preview_error_response_with_origin(error.status, error.message(), &foco_origin)
+            preview_error_response_with_origin(
+                error.status,
+                error.message(),
+                &foco_origin,
+                preview_resource_source.as_deref(),
+            )
         }
     }
 }
@@ -1013,6 +1069,7 @@ async fn serve_preview_resource(
     request_path: &str,
     head_only: bool,
     foco_origin: &str,
+    preview_resource_source: Option<&str>,
 ) -> Result<Response, PreviewServeError> {
     let session = state.preview_sessions.touch(token)?;
 
@@ -1036,6 +1093,7 @@ async fn serve_preview_resource(
             &resource_rel,
             head_only,
             &foco_origin,
+            preview_resource_source,
         )
         .await;
     }
@@ -1046,6 +1104,7 @@ async fn serve_preview_resource(
         &resource_rel,
         head_only,
         &foco_origin,
+        preview_resource_source,
     )
     .map_err(PreviewServeError::from)
 }
@@ -1058,6 +1117,7 @@ async fn serve_remote_preview_resource(
     resource_rel: &str,
     head_only: bool,
     foco_origin: &str,
+    preview_resource_source: Option<&str>,
 ) -> Result<Response, PreviewServeError> {
     if let Err(error) =
         crate::remote_workspace::ensure_remote_workspace_connected(state, workspace_id).await
@@ -1155,6 +1215,7 @@ async fn serve_remote_preview_resource(
             content_length,
             true,
             foco_origin,
+            preview_resource_source,
         ));
     }
 
@@ -1163,14 +1224,13 @@ async fn serve_remote_preview_resource(
     // cancel channel. Content-Length is taken from upstream when available.
     let content_length = content_length_header;
     let mime = preview_mime_type(resource_rel);
-    let csp = preview_content_security_policy(foco_origin);
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, cache_control_for_preview(mime))
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::CONTENT_SECURITY_POLICY, csp)
-        .header("Cross-Origin-Resource-Policy", "same-origin");
+    let mut builder = preview_response_builder(
+        StatusCode::OK,
+        mime,
+        cache_control_for_preview(mime),
+        foco_origin,
+        preview_resource_source,
+    );
     if let Some(len) = content_length {
         builder = builder.header(header::CONTENT_LENGTH, len.to_string());
     }
@@ -1181,30 +1241,31 @@ async fn serve_remote_preview_resource(
 
 #[allow(dead_code)]
 fn preview_error_response(status: StatusCode, message: &str, state: &AppState) -> Response {
-    preview_error_response_with_origin(status, message, &foco_page_origin(state.listen_addr))
+    preview_error_response_with_origin(status, message, &foco_page_origin(state.listen_addr), None)
 }
 
 fn preview_error_response_with_origin(
     status: StatusCode,
     message: &str,
     foco_origin: &str,
+    preview_resource_source: Option<&str>,
 ) -> Response {
     // Never leak absolute filesystem paths.
     let safe = sanitize_preview_error_message(message);
-    let csp = preview_content_security_policy(foco_origin);
     let body = format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Preview error</title></head><body><h1>{}</h1><p>{}</p></body></html>",
         status.as_u16(),
         html_escape(&safe)
     );
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::CONTENT_SECURITY_POLICY, csp)
-        .body(Body::from(body))
-        .expect("preview error response is valid")
+    preview_response_builder(
+        status,
+        "text/html; charset=utf-8",
+        "no-store",
+        foco_origin,
+        preview_resource_source,
+    )
+    .body(Body::from(body))
+    .expect("preview error response is valid")
 }
 
 fn sanitize_preview_error_message(message: &str) -> String {
@@ -1425,8 +1486,19 @@ mod tests {
     #[test]
     fn csp_frame_ancestors_limits_embedding() {
         let csp = preview_content_security_policy("http://127.0.0.1:3210");
+        assert!(csp.contains("default-src 'self'"));
         assert!(csp.contains("frame-ancestors http://127.0.0.1:3210"));
         assert!(csp.contains("form-action 'none'"));
+    }
+
+    #[test]
+    fn path_mode_csp_uses_explicit_capability_source() {
+        let source = "https://foco.example/__preview/abcdefghijklmnopqrstuvwxyz012345/";
+        let csp = preview_content_security_policy_for_resource("https://foco.example", source);
+        assert!(csp.contains(&format!("default-src {source}")));
+        assert!(csp.contains(&format!("script-src {source}")));
+        assert!(csp.contains(&format!("img-src {source} data: blob:")));
+        assert!(!csp.contains("script-src 'self'"));
     }
 
     #[test]
@@ -1467,6 +1539,7 @@ mod tests {
             "site/index.html",
             false,
             "http://127.0.0.1:3210",
+            None,
         )
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1491,6 +1564,13 @@ mod tests {
                 .unwrap_or("")
                 .contains("frame-ancestors http://127.0.0.1:3210")
         );
+        assert_eq!(
+            headers
+                .get("Cross-Origin-Resource-Policy")
+                .and_then(|v| v.to_str().ok()),
+            Some("same-origin")
+        );
+        assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
 
         let head = serve_local_preview_file(
             root.path(),
@@ -1498,6 +1578,7 @@ mod tests {
             "site/index.html",
             true,
             "http://127.0.0.1:3210",
+            None,
         )
         .unwrap();
         assert_eq!(head.status(), StatusCode::OK);
@@ -1523,6 +1604,7 @@ mod tests {
             "site/assets/app.js",
             false,
             "http://127.0.0.1:3210",
+            None,
         )
         .unwrap();
         assert!(
@@ -1545,6 +1627,7 @@ mod tests {
             "site/assets/data.json",
             false,
             "http://127.0.0.1:3210",
+            None,
         )
         .unwrap();
         assert!(

@@ -29294,6 +29294,23 @@ async fn html_preview_local_session_serves_asset_chain_and_rejects_escape() {
             .and_then(|v| v.to_str().ok()),
         Some("no-store")
     );
+    let host_csp = html
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(host_csp.contains("default-src 'self'"), "csp={host_csp}");
+    assert_eq!(
+        html.headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("same-origin")
+    );
+    assert!(
+        html.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
     let html_text = html.text().await.expect("html body");
     assert!(html_text.contains("classic.js"));
     assert!(html_text.contains("module.js"));
@@ -29466,9 +29483,31 @@ async fn html_preview_path_mode_uses_public_origin_for_reverse_proxy() {
         .get(header::CONTENT_SECURITY_POLICY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let preview_resource_source = format!("https://foco.fonlan.top/__preview/{token}/");
+    assert!(
+        csp.contains(&format!("default-src {preview_resource_source};")),
+        "csp={csp}"
+    );
+    assert!(
+        csp.contains(&format!("script-src {preview_resource_source} ")),
+        "csp={csp}"
+    );
+    assert!(!csp.contains("script-src 'self'"), "csp={csp}");
     assert!(
         csp.contains("frame-ancestors https://foco.fonlan.top"),
         "csp={csp}"
+    );
+    assert_eq!(
+        html.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("null")
+    );
+    assert_eq!(
+        html.headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
     );
     let html_text = html.text().await.expect("html body");
     assert!(html_text.contains("classic.js"));
@@ -29476,10 +29515,34 @@ async fn html_preview_path_mode_uses_public_origin_for_reverse_proxy() {
     let asset = client
         .get(format!("http://{addr}/__preview/{token}/assets/classic.js"))
         .header(header::HOST, "foco.fonlan.top")
+        .header("x-forwarded-proto", "https")
         .send()
         .await
         .expect("asset get");
     assert_eq!(asset.status(), StatusCode::OK);
+    let asset_csp = asset
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        asset_csp.contains(&format!("script-src {preview_resource_source} ")),
+        "asset csp={asset_csp}"
+    );
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("null")
+    );
+    assert_eq!(
+        asset
+            .headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
+    );
 
     let escape = client
         .get(format!("http://{addr}/__preview/{token}/../secret.txt"))
@@ -29799,6 +29862,17 @@ async fn html_preview_remote_proxies_sidecar_without_token_or_local_fallback() {
         .await
         .expect("remote js");
     assert_eq!(js.status(), StatusCode::OK);
+    assert_eq!(
+        js.headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("same-origin")
+    );
+    assert!(
+        js.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
     assert!(
         js.headers()
             .get(header::CONTENT_TYPE)
@@ -29822,6 +29896,65 @@ async fn html_preview_remote_proxies_sidecar_without_token_or_local_fallback() {
         .expect("remote json");
     assert_eq!(json.status(), StatusCode::OK);
     assert!(json.text().await.unwrap().contains("\"remote\":true"));
+
+    let public_origin = "https://foco.example";
+    let preview_resource_source = format!("{public_origin}/__preview/{token}/");
+    let path_html = client
+        .get(format!("http://{addr}/__preview/{token}/index.html"))
+        .header(header::HOST, "foco.example")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .expect("remote path-mode html");
+    assert_eq!(path_html.status(), StatusCode::OK);
+    let path_html_csp = path_html
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        path_html_csp.contains(&format!("script-src {preview_resource_source} ")),
+        "remote path-mode csp={path_html_csp}"
+    );
+    assert_eq!(
+        path_html
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("null")
+    );
+    assert_eq!(
+        path_html
+            .headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
+    );
+    assert!(path_html.text().await.unwrap().contains("classic.js"));
+
+    let path_js = client
+        .get(format!("http://{addr}/__preview/{token}/assets/classic.js"))
+        .header(header::HOST, "foco.example")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .expect("remote path-mode js");
+    assert_eq!(path_js.status(), StatusCode::OK);
+    assert_eq!(
+        path_js
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("null")
+    );
+    assert_eq!(
+        path_js
+            .headers()
+            .get("Cross-Origin-Resource-Policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
+    );
+    assert_eq!(path_js.text().await.unwrap(), "window.__remote = true;");
 
     // Disconnect: must not fall back to local demo/ files.
     state
