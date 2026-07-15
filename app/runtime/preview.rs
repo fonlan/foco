@@ -179,7 +179,9 @@ fn generate_preview_token(existing: &HashMap<String, PreviewSession>) -> Result<
     for _ in 0..32 {
         let mut bytes = [0u8; PREVIEW_TOKEN_LEN];
         getrandom::fill(&mut bytes).map_err(|source| {
-            ApiError::internal(format!("failed to generate preview session token: {source}"))
+            ApiError::internal(format!(
+                "failed to generate preview session token: {source}"
+            ))
         })?;
         let token: String = bytes
             .iter()
