@@ -1281,6 +1281,34 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Used only for internal contextCompression checkpoint requests. It is not injected into normal chat System prompts.":
       "仅用于内部 contextCompression 检查点请求，不会注入普通聊天 System 提示词。",
     "Restore default context compression prompt": "恢复默认上下文压缩提示词",
+    "Plan Mode prompt": "Plan Mode 提示词",
+    "Review Agent prompt": "Review Agent 提示词",
+    "Used for Plan mode sessions. Stored as the built-in Plan Mode system prompt.":
+      "用于 Plan 模式会话。仍持久化为内置 Plan Mode 系统提示词。",
+    "Used for the built-in Review agent. Stored as the built-in Review system prompt.":
+      "用于内置 Review 智能体。仍持久化为内置 Review 系统提示词。",
+    "Restore default Plan Mode prompt": "恢复默认 Plan Mode 提示词",
+    "Restore default Review Agent prompt": "恢复默认 Review Agent 提示词",
+    "Spec generation prompt": "Spec 生成提示词",
+    "Spec update prompt": "Spec 更新提示词",
+    "Used when generating a Project Spec from evidence. Stored in Spec settings for compatibility.":
+      "用于从证据生成 Project Spec。为兼容旧配置仍保存在 Spec 设置中。",
+    "Used when deciding whether and how to update a Project Spec after a chat turn.":
+      "用于在聊天轮次结束后决定是否以及如何更新 Project Spec。",
+    "Restore default Spec generation prompt": "恢复默认 Spec 生成提示词",
+    "Restore default Spec update prompt": "恢复默认 Spec 更新提示词",
+    "Memory matching prompt": "记忆匹配提示词",
+    "Memory extraction prompt": "记忆抽取提示词",
+    "Dream prompt": "Dream 提示词",
+    "Used for LLM-based memory matching/retrieval. It is not injected into normal chat System prompts.":
+      "用于基于大模型的记忆匹配/检索，不会注入普通聊天 System 提示词。",
+    "Used for LLM-based memory extraction. A language-specific suffix is still appended at runtime.":
+      "用于基于大模型的记忆抽取；运行时仍会追加语言相关后缀。",
+    "Used for Dream memory consolidation runs. It is not injected into normal chat System prompts.":
+      "用于 Dream 记忆整理运行，不会注入普通聊天 System 提示词。",
+    "Restore default memory matching prompt": "恢复默认记忆匹配提示词",
+    "Restore default memory extraction prompt": "恢复默认记忆抽取提示词",
+    "Restore default Dream prompt": "恢复默认 Dream 提示词",
     "Save prompt settings": "保存提示词设置",
     "Reload settings": "重新加载设置",
     Reload: "重新加载",

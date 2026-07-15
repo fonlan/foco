@@ -1686,18 +1686,28 @@ export type PromptSettingsSummary = {
   defaultMemoryDreamSystemPrompt?: string;
 };
 
+/** Shared override-editor field: display value + whether user customized it. */
+export type PromptOverrideFieldState = {
+  /** Editor display text (stored override or built-in default). */
+  value: string;
+  /**
+   * When false, save submits null so the built-in default is used.
+   * Distinguishes “restored default” from an override that happens to match.
+   */
+  custom: boolean;
+};
+
 export type PromptSettingsFormState = {
   activeSystemPromptName: string;
   systemPrompts: SystemPromptSummary[];
   files: string[];
   extraText: string;
-  /** Editor display text (override or current default). */
-  contextCompressionSystemPrompt: string;
-  /**
-   * When false, save submits null so the built-in default is used.
-   * Distinguishes “restored default” from an override that happens to match.
-   */
-  contextCompressionSystemPromptCustom: boolean;
+  contextCompression: PromptOverrideFieldState;
+  generationSystemPrompt: PromptOverrideFieldState;
+  updateSystemPrompt: PromptOverrideFieldState;
+  memoryRetrieval: PromptOverrideFieldState;
+  memoryExtraction: PromptOverrideFieldState;
+  memoryDream: PromptOverrideFieldState;
   pendingFile: string;
   pendingSystemPromptName: string;
   pendingSystemPromptRename: string;
@@ -1725,11 +1735,10 @@ export type PlanSettingsSummary = {
   mergeAutomationModes: PlanMergeAutomationModeSummary[];
 };
 
+/** Spec automation-only form (prompts live on the Prompts page). */
 export type SpecSettingsFormState = {
   autoEnabled: boolean;
   generationModelId: string;
-  generationSystemPrompt: string;
-  updateSystemPrompt: string;
   llmTimeoutMs: string;
 };
 

@@ -958,10 +958,16 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByRole("button", { name: "重试 Spec 任务" })).toBeInTheDocument();
     expect(screen.getByText("自动化")).toBeInTheDocument();
     expect(screen.getByText("成功聊天轮次结束后更新已启用的工作区 Spec。")).toBeInTheDocument();
-    expect(screen.getByLabelText("Spec 生成模型")).toBeInTheDocument();
-    expect(screen.getByLabelText("Spec 生成系统提示词")).toBeInTheDocument();
-    expect(screen.getByLabelText("Spec 更新系统提示词")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "保存 Spec 设置" })).toBeInTheDocument();
+    const automation = screen.getByText("自动化").closest("fieldset");
+    expect(automation).not.toBeNull();
+    expect(within(automation as HTMLElement).getByLabelText("Spec 生成模型")).toBeInTheDocument();
+    expect(within(automation as HTMLElement).getByLabelText("启用自动 Spec")).toBeInTheDocument();
+    expect(within(automation as HTMLElement).getByLabelText("Spec LLM 超时 ms")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Spec 生成系统提示词")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Spec 更新系统提示词")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Spec 生成提示词")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Spec 更新提示词")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存 Spec 设置" })).not.toBeInTheDocument();
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "关于" }));
     expect(await screen.findByRole("heading", { name: "关于 Foco" })).toBeInTheDocument();
@@ -1220,6 +1226,14 @@ describe("app-settings verification surfaces", () => {
 
   it("saves spec settings", async () => {
     const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        generationSystemPrompt: "Keep this generation prompt",
+        updateSystemPrompt: "Keep this update prompt",
+      },
+    };
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
@@ -1227,32 +1241,63 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     expect(await screen.findByText("Spec settings")).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
-    await userEvent.selectOptions(screen.getByLabelText("Spec generation model"), "gpt-test");
-    changeInput(
-      screen.getByLabelText("Spec generation system prompt"),
-      "Generate the workspace spec from evidence.",
-    );
-    changeInput(
-      screen.getByLabelText("Spec update system prompt"),
-      "Update the workspace spec after durable changes.",
-    );
-    changeInput(screen.getByLabelText("Spec LLM timeout ms"), "90000");
-    await userEvent.click(screen.getByRole("button", { name: "Save spec settings" }));
+    expect(screen.queryByLabelText("Spec generation system prompt")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Spec update system prompt")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save spec settings" })).not.toBeInTheDocument();
 
+    const automation = screen.getByText("Automation").closest("fieldset");
+    expect(automation).not.toBeNull();
+    expect(
+      within(automation as HTMLElement).getByLabelText("Spec generation model"),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
     await waitFor(() => {
-      const saveCall = fetchMock.mock.calls.find(
-        ([url]) => url === "/api/settings/spec",
-      );
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/spec");
       expect(saveCall).toBeDefined();
       expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
         autoEnabled: false,
+        generationModelId: null,
+        llmTimeoutMs: 120000,
+      });
+      expect(JSON.parse(String(saveCall?.[1]?.body))).not.toHaveProperty(
+        "generationSystemPrompt",
+      );
+      expect(JSON.parse(String(saveCall?.[1]?.body))).not.toHaveProperty(
+        "updateSystemPrompt",
+      );
+    });
+
+    await userEvent.selectOptions(screen.getByLabelText("Spec generation model"), "gpt-test");
+    await waitFor(() => {
+      const modelCalls = fetchMock.mock.calls.filter(([url]) => url === "/api/settings/spec");
+      const lastBody = JSON.parse(String(modelCalls.at(-1)?.[1]?.body));
+      expect(lastBody).toEqual({
+        autoEnabled: false,
         generationModelId: "gpt-test",
-        generationSystemPrompt: "Generate the workspace spec from evidence.",
-        updateSystemPrompt: "Update the workspace spec after durable changes.",
+        llmTimeoutMs: 120000,
+      });
+    });
+
+    changeInput(screen.getByLabelText("Spec LLM timeout ms"), "90000");
+    fireEvent.blur(screen.getByLabelText("Spec LLM timeout ms"));
+    await waitFor(() => {
+      const timeoutCalls = fetchMock.mock.calls.filter(([url]) => url === "/api/settings/spec");
+      const lastBody = JSON.parse(String(timeoutCalls.at(-1)?.[1]?.body));
+      expect(lastBody).toEqual({
+        autoEnabled: false,
+        generationModelId: "gpt-test",
         llmTimeoutMs: 90000,
       });
     });
+
+    // Automation-only saves must not clear Spec prompts stored from the Prompts page.
+    expect(appTestState.settingsResponse.spec.generationSystemPrompt).toBe(
+      "Keep this generation prompt",
+    );
+    expect(appTestState.settingsResponse.spec.updateSystemPrompt).toBe(
+      "Keep this update prompt",
+    );
   });
 
   it("saves memory settings", async () => {
@@ -2190,9 +2235,7 @@ describe("app-settings verification surfaces", () => {
     expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
     await userEvent.clear(systemPromptInput);
     await userEvent.type(systemPromptInput, "Custom system prompt.");
-    await userEvent.click(screen.getByRole("button", { name: "Review" }));
-    await userEvent.clear(screen.getByLabelText("System prompt"));
-    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
+    changeInput(screen.getByTestId("review-system-prompt"), "Review as senior engineer.");
     await userEvent.type(
       screen.getByLabelText("Prompt file path"),
       "C:/Users/fonla/.codex/AGENTS.md",
@@ -2202,31 +2245,32 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/settings/prompts",
-        expect.objectContaining({
-          body: JSON.stringify({
-            contextCompressionSystemPrompt: null,
-            extraText: "Keep replies concise.",
-            files: ["C:/Users/fonla/.codex/AGENTS.md"],
-            systemPrompts: [
-              {
-                content: "Custom system prompt.",
-                name: "Default",
-              },
-              {
-                content: defaultPlanModeSystemPrompt,
-                name: "Plan Mode",
-              },
-              {
-                content: "Review as senior engineer.",
-                name: "Review",
-              },
-            ],
-          }),
-          method: "POST",
-        }),
-      );
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/prompts");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        contextCompressionSystemPrompt: null,
+        generationSystemPrompt: null,
+        updateSystemPrompt: null,
+        memoryRetrievalSystemPrompt: null,
+        memoryExtractionSystemPrompt: null,
+        memoryDreamSystemPrompt: null,
+        extraText: "Keep replies concise.",
+        files: ["C:/Users/fonla/.codex/AGENTS.md"],
+        systemPrompts: [
+          {
+            content: "Custom system prompt.",
+            name: "Default",
+          },
+          {
+            content: defaultPlanModeSystemPrompt,
+            name: "Plan Mode",
+          },
+          {
+            content: "Review as senior engineer.",
+            name: "Review",
+          },
+        ],
+      });
     });
   });
 
@@ -2259,13 +2303,15 @@ describe("app-settings verification surfaces", () => {
 
     const defaultPromptButton = screen.getByRole("button", { name: "Default" });
     expect(defaultPromptButton).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Plan Mode" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Plan Mode" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Review" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Image Generation" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Plan Mode prompt")).toBeInTheDocument();
+    expect(screen.getByLabelText("Review Agent prompt")).toBeInTheDocument();
     const restoreButtons = screen.getAllByRole("button", {
       name: "Restore default system prompt",
     });
-    expect(restoreButtons).toHaveLength(3);
+    expect(restoreButtons).toHaveLength(1);
   });
 
   it("keeps built-in Review fixed while renaming user system prompts", async () => {
@@ -2304,35 +2350,36 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/settings/prompts",
-        expect.objectContaining({
-          body: JSON.stringify({
-            contextCompressionSystemPrompt: null,
-            extraText: "",
-            files: [],
-            systemPrompts: [
-              {
-                content: "You are Foco, a local coding agent.",
-                name: "Default",
-              },
-              {
-                content: defaultPlanModeSystemPrompt,
-                name: "Plan Mode",
-              },
-              {
-                content: defaultReviewSystemPrompt,
-                name: "Review",
-              },
-              {
-                name: "Reviewer",
-                content: "Review as senior engineer.",
-              },
-            ],
-          }),
-          method: "POST",
-        }),
-      );
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/prompts");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        contextCompressionSystemPrompt: null,
+        generationSystemPrompt: null,
+        updateSystemPrompt: null,
+        memoryRetrievalSystemPrompt: null,
+        memoryExtractionSystemPrompt: null,
+        memoryDreamSystemPrompt: null,
+        extraText: "",
+        files: [],
+        systemPrompts: [
+          {
+            content: "You are Foco, a local coding agent.",
+            name: "Default",
+          },
+          {
+            content: defaultPlanModeSystemPrompt,
+            name: "Plan Mode",
+          },
+          {
+            content: defaultReviewSystemPrompt,
+            name: "Review",
+          },
+          {
+            name: "Reviewer",
+            content: "Review as senior engineer.",
+          },
+        ],
+      });
     });
   });
 
@@ -2348,39 +2395,70 @@ describe("app-settings verification surfaces", () => {
     await userEvent.clear(systemPromptInput);
     await userEvent.type(systemPromptInput, "Custom system prompt.");
     await userEvent.click(
-      screen.getAllByRole("button", { name: "Restore default system prompt" })[0],
+      screen.getByRole("button", { name: "Restore default system prompt" }),
     );
     expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
 
     await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/settings/prompts",
-        expect.objectContaining({
-          body: JSON.stringify({
-            contextCompressionSystemPrompt: null,
-            extraText: "",
-            files: [],
-            systemPrompts: [
-              {
-                content: "You are Foco, a local coding agent.",
-                name: "Default",
-              },
-              {
-                content: defaultPlanModeSystemPrompt,
-                name: "Plan Mode",
-              },
-              {
-                content: defaultReviewSystemPrompt,
-                name: "Review",
-              },
-            ],
-          }),
-          method: "POST",
-        }),
-      );
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/prompts");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        contextCompressionSystemPrompt: null,
+        generationSystemPrompt: null,
+        updateSystemPrompt: null,
+        memoryRetrievalSystemPrompt: null,
+        memoryExtractionSystemPrompt: null,
+        memoryDreamSystemPrompt: null,
+        extraText: "",
+        files: [],
+        systemPrompts: [
+          {
+            content: "You are Foco, a local coding agent.",
+            name: "Default",
+          },
+          {
+            content: defaultPlanModeSystemPrompt,
+            name: "Plan Mode",
+          },
+          {
+            content: defaultReviewSystemPrompt,
+            name: "Review",
+          },
+        ],
+      });
     });
+  });
+
+  it("renders prompt override editors in the configured order", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    const order = [
+      screen.getByLabelText("Extra prompt"),
+      screen.getByLabelText("System prompt"),
+      screen.getByLabelText("Plan Mode prompt"),
+      screen.getByLabelText("Review Agent prompt"),
+      screen.getByLabelText("Context compression prompt"),
+      screen.getByLabelText("Spec generation prompt"),
+      screen.getByLabelText("Spec update prompt"),
+      screen.getByLabelText("Memory matching prompt"),
+      screen.getByLabelText("Memory extraction prompt"),
+      screen.getByLabelText("Dream prompt"),
+      screen.getByLabelText("Prompt file path"),
+    ];
+    for (const [index, control] of order.entries()) {
+      const nextControl = order[index + 1];
+      if (nextControl) {
+        expect(
+          control.compareDocumentPosition(nextControl) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+    }
   });
 
   it("loads, edits, restores, and saves context compression prompt", async () => {

@@ -114,6 +114,7 @@ import type {
   PlanResponse,
   PlansResponse,
   PromptSettingsFormState,
+  PromptOverrideFieldState,
   PromptSettingsSummary,
   ProviderFormState,
   ProviderApiKeyResponse,
@@ -571,6 +572,7 @@ export function SettingsPanel({
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
+  const specAutoSaveRequestIdRef = useRef(0);
   const [specJobs, setSpecJobs] = useState<SettingsWorkspaceSpecJobSummary[]>([]);
   const [specJobsPage, setSpecJobsPage] = useState(1);
   const [specJobsPageSize, setSpecJobsPageSize] = useState(20);
@@ -956,15 +958,22 @@ export function SettingsPanel({
     : settings
       ? normalizedSystemPromptSummaries(settings.prompts)
       : [];
+  const listSystemPrompts = ordinarySystemPrompts(systemPrompts);
+  const planModeSystemPrompt =
+    systemPrompts.find((prompt) => prompt.name === PLAN_MODE_SYSTEM_PROMPT_NAME) ??
+    null;
+  const reviewSystemPrompt =
+    systemPrompts.find((prompt) => prompt.name === REVIEW_SYSTEM_PROMPT_NAME) ??
+    null;
   const savedSystemPrompts = settings
     ? normalizedSystemPromptSummaries(settings.prompts)
     : systemPrompts;
   const activeSystemPrompt =
-    systemPrompts.find(
+    listSystemPrompts.find(
       (prompt) => prompt.name === promptSettingsForm.activeSystemPromptName,
     ) ??
-    systemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME) ??
-    systemPrompts[0] ??
+    listSystemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME) ??
+    listSystemPrompts[0] ??
     null;
 
   function syncSkillsForm(data: SettingsResponse) {
@@ -1023,21 +1032,37 @@ export function SettingsPanel({
 
   function syncPromptSettingsForm(data: SettingsResponse) {
     const systemPrompts = normalizedSystemPromptSummaries(data.prompts);
-    const defaultCompressionPrompt =
-      data.prompts.defaultContextCompressionSystemPrompt ?? "";
-    const compressionOverride = data.prompts.contextCompressionSystemPrompt;
-    const compressionCustom =
-      typeof compressionOverride === "string" && compressionOverride.trim().length > 0;
+    const listPrompts = ordinarySystemPrompts(systemPrompts);
     setPromptSettingsForm({
       activeSystemPromptName:
-        systemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
+        listPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
           ?.name ??
-        systemPrompts[0]?.name ??
+        listPrompts[0]?.name ??
         DEFAULT_SYSTEM_PROMPT_NAME,
-      contextCompressionSystemPrompt: compressionCustom
-        ? compressionOverride
-        : defaultCompressionPrompt,
-      contextCompressionSystemPromptCustom: compressionCustom,
+      contextCompression: promptOverrideFromStored(
+        data.prompts.contextCompressionSystemPrompt,
+        data.prompts.defaultContextCompressionSystemPrompt,
+      ),
+      generationSystemPrompt: promptOverrideFromStored(
+        data.spec.generationSystemPrompt,
+        data.spec.defaultGenerationSystemPrompt,
+      ),
+      updateSystemPrompt: promptOverrideFromStored(
+        data.spec.updateSystemPrompt,
+        data.spec.defaultUpdateSystemPrompt,
+      ),
+      memoryRetrieval: promptOverrideFromStored(
+        data.prompts.memoryRetrievalSystemPrompt,
+        data.prompts.defaultMemoryRetrievalSystemPrompt,
+      ),
+      memoryExtraction: promptOverrideFromStored(
+        data.prompts.memoryExtractionSystemPrompt,
+        data.prompts.defaultMemoryExtractionSystemPrompt,
+      ),
+      memoryDream: promptOverrideFromStored(
+        data.prompts.memoryDreamSystemPrompt,
+        data.prompts.defaultMemoryDreamSystemPrompt,
+      ),
       extraText: data.prompts.extraText,
       files: data.prompts.files,
       pendingFile: "",
@@ -1052,8 +1077,6 @@ export function SettingsPanel({
     setSpecSettingsForm({
       autoEnabled: data.spec.autoEnabled,
       generationModelId: data.spec.generationModelId ?? "",
-      generationSystemPrompt: data.spec.generationSystemPrompt ?? "",
-      updateSystemPrompt: data.spec.updateSystemPrompt ?? "",
       llmTimeoutMs: String(data.spec.llmTimeoutMs),
     });
   }
@@ -1161,36 +1184,120 @@ export function SettingsPanel({
     }
   }, [onSettingsChange]);
 
-  // Seed compression prompt editor from settings when the form still has the empty default.
+  // Seed prompt override editors from loaded settings (system prompt list can fall
+  // back to settings while override fields live only in form state).
   useEffect(() => {
     if (!settings) {
       return;
     }
-    const defaultCompressionPrompt =
-      settings.prompts.defaultContextCompressionSystemPrompt ?? "";
-    const compressionOverride = settings.prompts.contextCompressionSystemPrompt;
-    const compressionCustom =
-      typeof compressionOverride === "string" && compressionOverride.trim().length > 0;
-    const nextCompressionValue = compressionCustom
-      ? compressionOverride
-      : defaultCompressionPrompt;
-    if (!nextCompressionValue) {
+    setPromptSettingsForm((current) => {
+      const needsSeed =
+        (!current.contextCompression.value &&
+          !current.contextCompression.custom) ||
+        (!current.generationSystemPrompt.value &&
+          !current.generationSystemPrompt.custom) ||
+        (!current.updateSystemPrompt.value && !current.updateSystemPrompt.custom) ||
+        (!current.memoryRetrieval.value && !current.memoryRetrieval.custom) ||
+        (!current.memoryExtraction.value && !current.memoryExtraction.custom) ||
+        (!current.memoryDream.value && !current.memoryDream.custom) ||
+        current.systemPrompts.length === 0;
+      if (!needsSeed) {
+        return current;
+      }
+      const systemPrompts =
+        current.systemPrompts.length > 0
+          ? current.systemPrompts
+          : normalizedSystemPromptSummaries(settings.prompts);
+      const listPrompts = ordinarySystemPrompts(systemPrompts);
+      return {
+        ...current,
+        activeSystemPromptName: listPrompts.some(
+          (prompt) => prompt.name === current.activeSystemPromptName,
+        )
+          ? current.activeSystemPromptName
+          : (listPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
+              ?.name ??
+            listPrompts[0]?.name ??
+            DEFAULT_SYSTEM_PROMPT_NAME),
+        contextCompression:
+          current.contextCompression.value || current.contextCompression.custom
+            ? current.contextCompression
+            : promptOverrideFromStored(
+                settings.prompts.contextCompressionSystemPrompt,
+                settings.prompts.defaultContextCompressionSystemPrompt,
+              ),
+        generationSystemPrompt:
+          current.generationSystemPrompt.value || current.generationSystemPrompt.custom
+            ? current.generationSystemPrompt
+            : promptOverrideFromStored(
+                settings.spec.generationSystemPrompt,
+                settings.spec.defaultGenerationSystemPrompt,
+              ),
+        updateSystemPrompt:
+          current.updateSystemPrompt.value || current.updateSystemPrompt.custom
+            ? current.updateSystemPrompt
+            : promptOverrideFromStored(
+                settings.spec.updateSystemPrompt,
+                settings.spec.defaultUpdateSystemPrompt,
+              ),
+        memoryRetrieval:
+          current.memoryRetrieval.value || current.memoryRetrieval.custom
+            ? current.memoryRetrieval
+            : promptOverrideFromStored(
+                settings.prompts.memoryRetrievalSystemPrompt,
+                settings.prompts.defaultMemoryRetrievalSystemPrompt,
+              ),
+        memoryExtraction:
+          current.memoryExtraction.value || current.memoryExtraction.custom
+            ? current.memoryExtraction
+            : promptOverrideFromStored(
+                settings.prompts.memoryExtractionSystemPrompt,
+                settings.prompts.defaultMemoryExtractionSystemPrompt,
+              ),
+        memoryDream:
+          current.memoryDream.value || current.memoryDream.custom
+            ? current.memoryDream
+            : promptOverrideFromStored(
+                settings.prompts.memoryDreamSystemPrompt,
+                settings.prompts.defaultMemoryDreamSystemPrompt,
+              ),
+        systemPrompts,
+        extraText: current.extraText || settings.prompts.extraText,
+        files: current.files.length ? current.files : settings.prompts.files,
+      };
+    });
+  }, [settings]);
+
+  // Keep ordinary system-prompt selection valid after Plan/Review leave the list.
+  useEffect(() => {
+    if (!settings) {
       return;
     }
     setPromptSettingsForm((current) => {
+      const listPrompts = ordinarySystemPrompts(
+        current.systemPrompts.length
+          ? current.systemPrompts
+          : normalizedSystemPromptSummaries(settings.prompts),
+      );
       if (
-        current.contextCompressionSystemPromptCustom ||
-        current.contextCompressionSystemPrompt.trim().length > 0
+        listPrompts.some((prompt) => prompt.name === current.activeSystemPromptName)
       ) {
+        return current;
+      }
+      const nextActive =
+        listPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
+          ?.name ??
+        listPrompts[0]?.name ??
+        DEFAULT_SYSTEM_PROMPT_NAME;
+      if (nextActive === current.activeSystemPromptName) {
         return current;
       }
       return {
         ...current,
-        contextCompressionSystemPrompt: nextCompressionValue,
-        contextCompressionSystemPromptCustom: compressionCustom,
+        activeSystemPromptName: nextActive,
       };
     });
-  }, [settings]);
+  }, [promptSettingsForm.activeSystemPromptName, promptSettingsForm.systemPrompts, settings]);
 
   const loadHooks = useCallback(async (workspaceId: string) => {
     if (!workspaceId) {
@@ -2370,14 +2477,26 @@ export function SettingsPanel({
 
     try {
       const files = promptSettingsForm.files.map((file) => file.trim());
-      const contextCompressionSystemPrompt =
-        promptSettingsForm.contextCompressionSystemPromptCustom &&
-        promptSettingsForm.contextCompressionSystemPrompt.trim()
-          ? promptSettingsForm.contextCompressionSystemPrompt
-          : null;
       const data = await requestJson<SettingsResponse>("/api/settings/prompts", {
         body: JSON.stringify({
-          contextCompressionSystemPrompt,
+          contextCompressionSystemPrompt: promptOverridePayload(
+            promptSettingsForm.contextCompression,
+          ),
+          generationSystemPrompt: promptOverridePayload(
+            promptSettingsForm.generationSystemPrompt,
+          ),
+          updateSystemPrompt: promptOverridePayload(
+            promptSettingsForm.updateSystemPrompt,
+          ),
+          memoryRetrievalSystemPrompt: promptOverridePayload(
+            promptSettingsForm.memoryRetrieval,
+          ),
+          memoryExtractionSystemPrompt: promptOverridePayload(
+            promptSettingsForm.memoryExtraction,
+          ),
+          memoryDreamSystemPrompt: promptOverridePayload(
+            promptSettingsForm.memoryDream,
+          ),
           extraText: promptSettingsForm.extraText,
           files,
           systemPrompts: promptSettingsForm.systemPrompts,
@@ -2395,37 +2514,47 @@ export function SettingsPanel({
     }
   }
 
-  async function saveSpecSettings(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function saveSpecSettingsSnapshot(nextForm: SpecSettingsFormState) {
+    const requestId = ++specAutoSaveRequestIdRef.current;
     setIsSavingSpecSettings(true);
     setError(null);
 
     try {
       const data = await requestJson<SettingsResponse>("/api/settings/spec", {
         body: JSON.stringify({
-          autoEnabled: specSettingsForm.autoEnabled,
-          generationModelId: specSettingsForm.generationModelId.trim() || null,
-          generationSystemPrompt:
-            specSettingsForm.generationSystemPrompt.trim() || null,
-          updateSystemPrompt: specSettingsForm.updateSystemPrompt.trim() || null,
+          autoEnabled: nextForm.autoEnabled,
+          generationModelId: nextForm.generationModelId.trim() || null,
           llmTimeoutMs: requiredPositiveInteger(
-            specSettingsForm.llmTimeoutMs,
+            nextForm.llmTimeoutMs,
             t("Spec LLM timeout ms"),
           ),
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
+      if (requestId !== specAutoSaveRequestIdRef.current) {
+        return;
+      }
       setSettings(data);
       onSettingsChange(data);
       syncSpecSettingsForm(data);
       await loadSpecJobs();
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (requestId === specAutoSaveRequestIdRef.current) {
+        setError(errorMessage(requestError));
+      }
     } finally {
-      setIsSavingSpecSettings(false);
+      if (requestId === specAutoSaveRequestIdRef.current) {
+        setIsSavingSpecSettings(false);
+      }
     }
   }
+
+  function queueSpecSettingsSave(nextForm: SpecSettingsFormState) {
+    setSpecSettingsForm(nextForm);
+    void saveSpecSettingsSnapshot(nextForm);
+  }
+
   async function retrySpecJob(workspaceId: string, jobId: string) {
     const operationKey = `${workspaceId}:${jobId}`;
     if (specJobOperationKeysRef.current.has(operationKey)) {
@@ -2626,6 +2755,36 @@ export function SettingsPanel({
     });
   }
 
+  function updateNamedSystemPromptContent(name: string, content: string) {
+    setPromptSettingsForm((current) => {
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      const hasPrompt = currentSystemPrompts.some((prompt) => prompt.name === name);
+      return {
+        ...current,
+        systemPrompts: hasPrompt
+          ? currentSystemPrompts.map((prompt) =>
+            prompt.name === name
+              ? {
+                ...prompt,
+                content,
+              }
+              : prompt,
+          )
+          : [
+            ...currentSystemPrompts,
+            {
+              content,
+              name,
+            },
+          ],
+      };
+    });
+  }
+
   function defaultSystemPromptContent(name: string) {
     if (!settings) {
       return null;
@@ -2672,9 +2831,16 @@ export function SettingsPanel({
           },
         ];
 
+      // Plan/Review are edited as cards; only promote Default/user prompts into the list editor.
+      const promoteActive =
+        name === DEFAULT_SYSTEM_PROMPT_NAME ||
+        (name !== PLAN_MODE_SYSTEM_PROMPT_NAME && name !== REVIEW_SYSTEM_PROMPT_NAME);
+
       return {
         ...current,
-        activeSystemPromptName: name,
+        activeSystemPromptName: promoteActive
+          ? name
+          : current.activeSystemPromptName,
         systemPrompts,
       };
     });
@@ -5805,7 +5971,25 @@ export function SettingsPanel({
                 className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
                 onSubmit={(event) => void savePromptSettings(event)}
               >
-                <div className="flex items-center justify-between gap-3">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    {t("Extra prompt")}
+                  </span>
+                  <textarea
+                    aria-label={t("Extra prompt")}
+                    className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    onChange={(event) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        extraText: event.target.value,
+                      }))
+                    }
+                    placeholder={t("Extra prompt")}
+                    value={promptSettingsForm.extraText}
+                  />
+                </label>
+
+                <div className="mt-6 flex items-center justify-between gap-3 border-t border-stone-200 pt-4">
                   <div className="flex items-center gap-2">
                     <Bot aria-hidden="true" className="size-5 text-teal-700" />
                     <h3 className="text-sm font-semibold text-stone-950">
@@ -5819,7 +6003,7 @@ export function SettingsPanel({
                 <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]">
                   <div className="grid content-start gap-2">
                     <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-50/80">
-                      {systemPrompts.map((prompt) => {
+                      {listSystemPrompts.map((prompt) => {
                         const isActive =
                           prompt.name === promptSettingsForm.activeSystemPromptName;
                         const isRenaming =
@@ -5973,6 +6157,7 @@ export function SettingsPanel({
                       {t("System prompt")}
                     </span>
                     <textarea
+                      aria-label={t("System prompt")}
                       className="min-h-72 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                       onChange={(event) =>
                         updateActiveSystemPromptContent(event.target.value)
@@ -5981,6 +6166,191 @@ export function SettingsPanel({
                     />
                   </label>
                 </div>
+
+                <div className="mt-4 grid gap-3">
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used for Plan mode sessions. Stored as the built-in Plan Mode system prompt.",
+                    )}
+                    onChange={(value) =>
+                      updateNamedSystemPromptContent(PLAN_MODE_SYSTEM_PROMPT_NAME, value)
+                    }
+                    onRestore={() => restoreSystemPromptDefault(PLAN_MODE_SYSTEM_PROMPT_NAME)}
+                    restoreAriaLabel={t("Restore default Plan Mode prompt")}
+                    testId="plan-mode-system-prompt"
+                    title={t("Plan Mode prompt")}
+                    t={t}
+                    value={planModeSystemPrompt?.content ?? ""}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used for the built-in Review agent. Stored as the built-in Review system prompt.",
+                    )}
+                    onChange={(value) =>
+                      updateNamedSystemPromptContent(REVIEW_SYSTEM_PROMPT_NAME, value)
+                    }
+                    onRestore={() => restoreSystemPromptDefault(REVIEW_SYSTEM_PROMPT_NAME)}
+                    restoreAriaLabel={t("Restore default Review Agent prompt")}
+                    testId="review-system-prompt"
+                    title={t("Review Agent prompt")}
+                    t={t}
+                    value={reviewSystemPrompt?.content ?? ""}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used only for internal contextCompression checkpoint requests. It is not injected into normal chat System prompts.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        contextCompression: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        contextCompression: {
+                          value:
+                            settings?.prompts.defaultContextCompressionSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default context compression prompt")}
+                    testId="context-compression-system-prompt"
+                    title={t("Context compression prompt")}
+                    t={t}
+                    value={promptSettingsForm.contextCompression.value}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used when generating a Project Spec from evidence. Stored in Spec settings for compatibility.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        generationSystemPrompt: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        generationSystemPrompt: {
+                          value: settings?.spec.defaultGenerationSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default Spec generation prompt")}
+                    testId="spec-generation-system-prompt"
+                    title={t("Spec generation prompt")}
+                    t={t}
+                    value={promptSettingsForm.generationSystemPrompt.value}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used when deciding whether and how to update a Project Spec after a chat turn.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        updateSystemPrompt: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        updateSystemPrompt: {
+                          value: settings?.spec.defaultUpdateSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default Spec update prompt")}
+                    testId="spec-update-system-prompt"
+                    title={t("Spec update prompt")}
+                    t={t}
+                    value={promptSettingsForm.updateSystemPrompt.value}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used for LLM-based memory matching/retrieval. It is not injected into normal chat System prompts.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryRetrieval: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryRetrieval: {
+                          value:
+                            settings?.prompts.defaultMemoryRetrievalSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default memory matching prompt")}
+                    testId="memory-retrieval-system-prompt"
+                    title={t("Memory matching prompt")}
+                    t={t}
+                    value={promptSettingsForm.memoryRetrieval.value}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used for LLM-based memory extraction. A language-specific suffix is still appended at runtime.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryExtraction: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryExtraction: {
+                          value:
+                            settings?.prompts.defaultMemoryExtractionSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default memory extraction prompt")}
+                    testId="memory-extraction-system-prompt"
+                    title={t("Memory extraction prompt")}
+                    t={t}
+                    value={promptSettingsForm.memoryExtraction.value}
+                  />
+                  <PromptOverrideEditor
+                    description={t(
+                      "Used for Dream memory consolidation runs. It is not injected into normal chat System prompts.",
+                    )}
+                    onChange={(value) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryDream: { value, custom: true },
+                      }))
+                    }
+                    onRestore={() =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        memoryDream: {
+                          value: settings?.prompts.defaultMemoryDreamSystemPrompt ?? "",
+                          custom: false,
+                        },
+                      }))
+                    }
+                    restoreAriaLabel={t("Restore default Dream prompt")}
+                    testId="memory-dream-system-prompt"
+                    title={t("Dream prompt")}
+                    t={t}
+                    value={promptSettingsForm.memoryDream.value}
+                  />
+                </div>
+
                 <div className="mt-6 flex items-center gap-2 border-t border-stone-200 pt-4">
                   <ScrollText aria-hidden="true" className="size-5 text-teal-700" />
                   <h3 className="text-sm font-semibold text-stone-950">
@@ -6063,74 +6433,6 @@ export function SettingsPanel({
                   </div>
                 </div>
 
-                <label className="mt-4 block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                    {t("Extra prompt")}
-                  </span>
-                  <textarea
-                    className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                    onChange={(event) =>
-                      setPromptSettingsForm((current) => ({
-                        ...current,
-                        extraText: event.target.value,
-                      }))
-                    }
-                    placeholder={t("Extra prompt")}
-                    value={promptSettingsForm.extraText}
-                  />
-                </label>
-
-                <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="text-xs font-semibold text-stone-600">
-                        {t("Context compression prompt")}
-                      </p>
-                      <p className="mt-1 text-xs text-stone-500">
-                        {t(
-                          "Used only for internal contextCompression checkpoint requests. It is not injected into normal chat System prompts.",
-                        )}
-                      </p>
-                    </div>
-                    <button
-                      aria-label={t("Restore default context compression prompt")}
-                      className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                      onClick={() =>
-                        setPromptSettingsForm((current) => ({
-                          ...current,
-                          contextCompressionSystemPrompt:
-                            settings?.prompts.defaultContextCompressionSystemPrompt ?? "",
-                          contextCompressionSystemPromptCustom: false,
-                        }))
-                      }
-                      title={t("Restore default")}
-                      type="button"
-                    >
-                      <RefreshCw aria-hidden="true" className="size-3.5" />
-                      {t("Restore default")}
-                    </button>
-                  </div>
-                  <label className="mt-3 block">
-                    <span className="sr-only">{t("Context compression prompt")}</span>
-                    <textarea
-                      aria-label={t("Context compression prompt")}
-                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      data-testid="context-compression-system-prompt"
-                      onChange={(event) =>
-                        setPromptSettingsForm((current) => ({
-                          ...current,
-                          contextCompressionSystemPrompt: event.target.value,
-                          contextCompressionSystemPromptCustom: true,
-                        }))
-                      }
-                      placeholder={
-                        settings?.prompts.defaultContextCompressionSystemPrompt ?? ""
-                      }
-                      value={promptSettingsForm.contextCompressionSystemPrompt}
-                    />
-                  </label>
-                </div>
-
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     aria-label={t("Save prompt settings")}
@@ -6153,15 +6455,20 @@ export function SettingsPanel({
 
           {activeSection === "spec" ? (
             <section className="grid gap-4">
-              <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
-                onSubmit={(event) => void saveSpecSettings(event)}
-              >
-                <div className="flex items-center gap-2">
-                  <FileText aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
-                    {t("Auto Spec")}
-                  </h3>
+              <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <FileText aria-hidden="true" className="size-5 text-teal-700" />
+                    <h3 className="text-sm font-semibold text-stone-950">
+                      {t("Auto Spec")}
+                    </h3>
+                  </div>
+                  {isSavingSpecSettings ? (
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-500">
+                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                      {t("Saving...")}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="mt-4 grid gap-3">
                   <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
@@ -6184,108 +6491,94 @@ export function SettingsPanel({
                         <input
                           checked={specSettingsForm.autoEnabled}
                           className="size-4 accent-teal-700"
+                          disabled={isSavingSpecSettings}
                           onChange={(event) =>
-                            setSpecSettingsForm((current) => ({
-                              ...current,
+                            queueSpecSettingsSave({
+                              ...specSettingsForm,
                               autoEnabled: event.target.checked,
-                            }))
+                            })
                           }
                           type="checkbox"
                         />
                       </label>
                     </div>
                     <div className="mt-3">
-                      <TextField
-                        inputMode="numeric"
-                        label={t("Spec LLM timeout ms")}
-                        onChange={(value) =>
-                          setSpecSettingsForm((current) => ({
-                            ...current,
-                            llmTimeoutMs: value,
-                          }))
-                        }
-                        placeholder="120000"
-                        value={specSettingsForm.llmTimeoutMs}
-                      />
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Spec generation model")}
+                        </span>
+                        <select
+                          aria-label={t("Spec generation model")}
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100"
+                          disabled={isSavingSpecSettings}
+                          onChange={(event) =>
+                            queueSpecSettingsSave({
+                              ...specSettingsForm,
+                              generationModelId: event.target.value,
+                            })
+                          }
+                          value={specSettingsForm.generationModelId}
+                        >
+                          <option value="">{t("Automatic")}</option>
+                          {configuredModelsByName.map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.displayName}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="mt-3">
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Spec LLM timeout ms")}
+                        </span>
+                        <input
+                          aria-label={t("Spec LLM timeout ms")}
+                          autoComplete="off"
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          inputMode="numeric"
+                          name="spec-llm-timeout-ms"
+                          onBlur={() => {
+                            try {
+                              requiredPositiveInteger(
+                                specSettingsForm.llmTimeoutMs,
+                                t("Spec LLM timeout ms"),
+                              );
+                              void saveSpecSettingsSnapshot(specSettingsForm);
+                            } catch (validationError) {
+                              setError(errorMessage(validationError));
+                            }
+                          }}
+                          onChange={(event) =>
+                            setSpecSettingsForm((current) => ({
+                              ...current,
+                              llmTimeoutMs: event.target.value,
+                            }))
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              try {
+                                requiredPositiveInteger(
+                                  specSettingsForm.llmTimeoutMs,
+                                  t("Spec LLM timeout ms"),
+                                );
+                                void saveSpecSettingsSnapshot(specSettingsForm);
+                              } catch (validationError) {
+                                setError(errorMessage(validationError));
+                              }
+                            }
+                          }}
+                          placeholder="120000"
+                          type="text"
+                          value={specSettingsForm.llmTimeoutMs}
+                        />
+                      </label>
                     </div>
                   </fieldset>
-
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                      {t("Spec generation model")}
-                    </span>
-                    <select
-                      aria-label={t("Spec generation model")}
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      onChange={(event) =>
-                        setSpecSettingsForm((current) => ({
-                          ...current,
-                          generationModelId: event.target.value,
-                        }))
-                      }
-                      value={specSettingsForm.generationModelId}
-                    >
-                      <option value="">{t("Automatic")}</option>
-                      {configuredModelsByName.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.displayName}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                      {t("Spec generation system prompt")}
-                    </span>
-                    <textarea
-                      aria-label={t("Spec generation system prompt")}
-                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      onChange={(event) =>
-                        setSpecSettingsForm((current) => ({
-                          ...current,
-                          generationSystemPrompt: event.target.value,
-                        }))
-                      }
-                      placeholder={settings?.spec.defaultGenerationSystemPrompt ?? ""}
-                      value={specSettingsForm.generationSystemPrompt}
-                    />
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                      {t("Spec update system prompt")}
-                    </span>
-                    <textarea
-                      aria-label={t("Spec update system prompt")}
-                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      onChange={(event) =>
-                        setSpecSettingsForm((current) => ({
-                          ...current,
-                          updateSystemPrompt: event.target.value,
-                        }))
-                      }
-                      placeholder={settings?.spec.defaultUpdateSystemPrompt ?? ""}
-                      value={specSettingsForm.updateSystemPrompt}
-                    />
-                  </label>
                 </div>
-
-                <button
-                  aria-label={t("Save spec settings")}
-                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                  disabled={isSavingSpecSettings}
-                  title={t("Save spec settings")}
-                  type="submit"
-                >
-                  {isSavingSpecSettings ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <CheckCircle2 aria-hidden="true" className="size-4" />
-                  )}
-                  {t("Save")}
-                </button>
-              </form>
+              </div>
 
               <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
@@ -13465,11 +13758,19 @@ function emptyWebSearchForm(): WebSearchFormState {
   };
 }
 
+function emptyPromptOverrideField(): PromptOverrideFieldState {
+  return { value: "", custom: false };
+}
+
 function emptyPromptSettingsForm(): PromptSettingsFormState {
   return {
     activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
-    contextCompressionSystemPrompt: "",
-    contextCompressionSystemPromptCustom: false,
+    contextCompression: emptyPromptOverrideField(),
+    generationSystemPrompt: emptyPromptOverrideField(),
+    updateSystemPrompt: emptyPromptOverrideField(),
+    memoryRetrieval: emptyPromptOverrideField(),
+    memoryExtraction: emptyPromptOverrideField(),
+    memoryDream: emptyPromptOverrideField(),
     extraText: "",
     files: [],
     pendingFile: "",
@@ -13484,8 +13785,6 @@ function emptySpecSettingsForm(): SpecSettingsFormState {
   return {
     autoEnabled: true,
     generationModelId: "",
-    generationSystemPrompt: "",
-    updateSystemPrompt: "",
     llmTimeoutMs: "120000",
   };
 }
@@ -13559,6 +13858,84 @@ function isSystemPromptFixed(name: string): boolean {
     name === DEFAULT_SYSTEM_PROMPT_NAME ||
     name === PLAN_MODE_SYSTEM_PROMPT_NAME ||
     name === REVIEW_SYSTEM_PROMPT_NAME
+  );
+}
+
+/** System prompts shown in the list editor (not Plan Mode / Review cards). */
+function ordinarySystemPrompts(prompts: SystemPromptSummary[]): SystemPromptSummary[] {
+  return prompts.filter(
+    (prompt) =>
+      prompt.name !== PLAN_MODE_SYSTEM_PROMPT_NAME &&
+      prompt.name !== REVIEW_SYSTEM_PROMPT_NAME &&
+      prompt.name !== IMAGE_AGENT_SYSTEM_PROMPT_NAME,
+  );
+}
+
+function promptOverrideFromStored(
+  override: string | null | undefined,
+  defaultValue: string | undefined,
+): PromptOverrideFieldState {
+  const custom = typeof override === "string" && override.trim().length > 0;
+  return {
+    value: custom ? override : (defaultValue ?? ""),
+    custom,
+  };
+}
+
+function promptOverridePayload(field: PromptOverrideFieldState): string | null {
+  return field.custom && field.value.trim() ? field.value : null;
+}
+
+function PromptOverrideEditor({
+  description,
+  onChange,
+  onRestore,
+  restoreAriaLabel,
+  t,
+  testId,
+  title,
+  value,
+}: {
+  description?: string;
+  onChange: (value: string) => void;
+  onRestore: () => void;
+  restoreAriaLabel: string;
+  t: Translate;
+  testId?: string;
+  title: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-stone-600">{title}</p>
+          {description ? (
+            <p className="mt-1 text-xs text-stone-500">{description}</p>
+          ) : null}
+        </div>
+        <button
+          aria-label={restoreAriaLabel}
+          className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          onClick={onRestore}
+          title={t("Restore default")}
+          type="button"
+        >
+          <RefreshCw aria-hidden="true" className="size-3.5" />
+          {t("Restore default")}
+        </button>
+      </div>
+      <label className="mt-3 block">
+        <span className="sr-only">{title}</span>
+        <textarea
+          aria-label={title}
+          className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+          data-testid={testId}
+          onChange={(event) => onChange(event.target.value)}
+          value={value}
+        />
+      </label>
+    </div>
   );
 }
 

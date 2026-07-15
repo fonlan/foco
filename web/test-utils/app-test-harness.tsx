@@ -260,9 +260,9 @@ export const settings = {
   },
   spec: {
     autoEnabled: true,
-    generationModelId: null,
-    generationSystemPrompt: null,
-    updateSystemPrompt: null,
+    generationModelId: null as string | null,
+    generationSystemPrompt: null as string | null,
+    updateSystemPrompt: null as string | null,
     llmTimeoutMs: 120000,
     defaultGenerationSystemPrompt:
       "Generate a concise Project Spec Markdown document from provided evidence.",
@@ -276,6 +276,15 @@ export const settings = {
     defaultContextCompressionSystemPrompt:
       "You are creating a context checkpoint handoff summary for a coding agent so work can continue after older conversation messages are replaced by this summary.",
     contextCompressionSystemPrompt: null as string | null,
+    defaultMemoryRetrievalSystemPrompt:
+      "Select only Foco memory facts that are directly relevant to the user's current request.",
+    memoryRetrievalSystemPrompt: null as string | null,
+    defaultMemoryExtractionSystemPrompt:
+      "Extract durable memory facts from the conversation.",
+    memoryExtractionSystemPrompt: null as string | null,
+    defaultMemoryDreamSystemPrompt:
+      "Consolidate and clean up memory facts for Dream runs.",
+    memoryDreamSystemPrompt: null as string | null,
     extraText: "",
     files: [] as string[],
     systemPrompt: null as string | null,
@@ -3875,18 +3884,41 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/settings/spec") {
-    const body = JSON.parse(String(init?.body ?? "{}")) as typeof settings.spec;
-    return jsonResponse({
-      ...settings,
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      autoEnabled?: boolean;
+      generationModelId?: string | null;
+      generationSystemPrompt?: string | null;
+      updateSystemPrompt?: string | null;
+      llmTimeoutMs?: number;
+    };
+    const nextSettings = {
+      ...appTestState.settingsResponse,
       spec: {
-        ...settings.spec,
-        autoEnabled: body.autoEnabled,
-        generationModelId: body.generationModelId ?? null,
-        generationSystemPrompt: body.generationSystemPrompt ?? null,
-        updateSystemPrompt: body.updateSystemPrompt ?? null,
-        llmTimeoutMs: body.llmTimeoutMs,
+        ...appTestState.settingsResponse.spec,
+        autoEnabled: body.autoEnabled ?? appTestState.settingsResponse.spec.autoEnabled,
+        generationModelId:
+          body.generationModelId === undefined
+            ? appTestState.settingsResponse.spec.generationModelId
+            : body.generationModelId,
+        // Omitted fields preserve existing Spec prompt overrides (automation-only save).
+        generationSystemPrompt: Object.prototype.hasOwnProperty.call(
+          body,
+          "generationSystemPrompt",
+        )
+          ? body.generationSystemPrompt ?? null
+          : appTestState.settingsResponse.spec.generationSystemPrompt,
+        updateSystemPrompt: Object.prototype.hasOwnProperty.call(
+          body,
+          "updateSystemPrompt",
+        )
+          ? body.updateSystemPrompt ?? null
+          : appTestState.settingsResponse.spec.updateSystemPrompt,
+        llmTimeoutMs:
+          body.llmTimeoutMs ?? appTestState.settingsResponse.spec.llmTimeoutMs,
       },
-    });
+    };
+    appTestState.settingsResponse = nextSettings;
+    return jsonResponse(nextSettings);
   }
 
   if (path === "/api/settings/plan") {
@@ -3915,6 +3947,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   if (path === "/api/settings/prompts") {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
       contextCompressionSystemPrompt?: string | null;
+      generationSystemPrompt?: string | null;
+      updateSystemPrompt?: string | null;
+      memoryRetrievalSystemPrompt?: string | null;
+      memoryExtractionSystemPrompt?: string | null;
+      memoryDreamSystemPrompt?: string | null;
       extraText?: string;
       files?: string[];
       systemPrompts?: Array<{ content: string; name: string }>;
@@ -3928,16 +3965,16 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
           name: "Default",
         },
       ];
-    const hasCompressionField = Object.prototype.hasOwnProperty.call(
-      body,
-      "contextCompressionSystemPrompt",
-    );
-    const nextCompressionOverride = hasCompressionField
-      ? typeof body.contextCompressionSystemPrompt === "string" &&
-        body.contextCompressionSystemPrompt.trim()
-        ? body.contextCompressionSystemPrompt
-        : null
-      : (appTestState.settingsResponse.prompts.contextCompressionSystemPrompt ?? null);
+    const optionalOverride = (
+      field: string,
+      current: string | null | undefined,
+    ): string | null => {
+      if (!Object.prototype.hasOwnProperty.call(body, field)) {
+        return current ?? null;
+      }
+      const raw = (body as Record<string, unknown>)[field];
+      return typeof raw === "string" && raw.trim() ? raw : null;
+    };
     const nextSettings = {
       ...appTestState.settingsResponse,
       prompts: {
@@ -3945,11 +3982,37 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         defaultContextCompressionSystemPrompt:
           appTestState.settingsResponse.prompts.defaultContextCompressionSystemPrompt ??
           settings.prompts.defaultContextCompressionSystemPrompt,
-        contextCompressionSystemPrompt: nextCompressionOverride,
+        contextCompressionSystemPrompt: optionalOverride(
+          "contextCompressionSystemPrompt",
+          appTestState.settingsResponse.prompts.contextCompressionSystemPrompt,
+        ),
+        memoryRetrievalSystemPrompt: optionalOverride(
+          "memoryRetrievalSystemPrompt",
+          appTestState.settingsResponse.prompts.memoryRetrievalSystemPrompt,
+        ),
+        memoryExtractionSystemPrompt: optionalOverride(
+          "memoryExtractionSystemPrompt",
+          appTestState.settingsResponse.prompts.memoryExtractionSystemPrompt,
+        ),
+        memoryDreamSystemPrompt: optionalOverride(
+          "memoryDreamSystemPrompt",
+          appTestState.settingsResponse.prompts.memoryDreamSystemPrompt,
+        ),
         extraText: body.extraText ?? "",
         files: body.files ?? ([] as string[]),
         systemPrompt: null as string | null,
         systemPrompts,
+      },
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        generationSystemPrompt: optionalOverride(
+          "generationSystemPrompt",
+          appTestState.settingsResponse.spec.generationSystemPrompt,
+        ),
+        updateSystemPrompt: optionalOverride(
+          "updateSystemPrompt",
+          appTestState.settingsResponse.spec.updateSystemPrompt,
+        ),
       },
     } satisfies typeof appTestState.settingsResponse;
     appTestState.settingsResponse = nextSettings;
