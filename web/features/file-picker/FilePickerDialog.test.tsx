@@ -13,7 +13,10 @@ function jsonResponse(body: unknown) {
 
 function listBodyAt(index: number) {
   const body = vi.mocked(fetch).mock.calls[index]?.[1]?.body;
-  return JSON.parse(String(body ?? "{}")) as { showHidden?: boolean };
+  return JSON.parse(String(body ?? "{}")) as {
+    showHidden?: boolean;
+    target?: { kind?: string; workspaceId?: string; serverId?: string };
+  };
 }
 
 describe("FilePickerDialog", () => {
@@ -57,5 +60,39 @@ describe("FilePickerDialog", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(listBodyAt(1).showHidden).toBe(true);
+  });
+
+  it("posts workspace target with camelCase workspaceId to list", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        entries: [],
+        parentPath: null,
+        path: "/workspace",
+        truncated: false,
+        warnings: [],
+      }),
+    );
+
+    render(
+      <FilePickerDialog
+        mode="file"
+        open={true}
+        target={{ kind: "workspace", workspaceId: "workspace-1" }}
+        title="Add attachment"
+        t={(key) => key}
+        onClose={() => undefined}
+        onSelect={() => undefined}
+      />,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const listCall = fetchMock.mock.calls.find(
+      ([url]) => typeof url === "string" && url === "/api/file-picker/list",
+    );
+    expect(listCall).toBeDefined();
+    expect(listBodyAt(fetchMock.mock.calls.indexOf(listCall!)).target).toEqual({
+      kind: "workspace",
+      workspaceId: "workspace-1",
+    });
   });
 });

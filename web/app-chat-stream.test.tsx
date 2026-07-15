@@ -3178,6 +3178,25 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() => expect(addAttachmentButton).toBeEnabled());
     await userEvent.click(addAttachmentButton);
     const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => typeof url === "string" && url === "/api/file-picker/list",
+        ),
+      ).toBe(true);
+    });
+    const listCall = fetchMock.mock.calls.find(
+      ([url]) => typeof url === "string" && url === "/api/file-picker/list",
+    );
+    const listBody = JSON.parse(String(listCall?.[1]?.body ?? "{}")) as {
+      target?: { kind?: string; workspaceId?: string };
+    };
+    expect(listBody.target).toEqual({
+      kind: "workspace",
+      workspaceId: "workspace-1",
+    });
+
     await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
     await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
     expect(await screen.findByText("note.txt")).toBeInTheDocument();

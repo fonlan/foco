@@ -53,7 +53,7 @@ pub(crate) struct FilePickerReadFilesRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(crate) enum FilePickerTarget {
     Local,
     RemoteServer { server_id: String },
@@ -677,5 +677,87 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         assert_eq!(response.entries.len(), 1);
         assert_eq!(response.entries[0].name, "folder");
+    }
+
+    #[test]
+    fn file_picker_target_deserializes_frontend_camel_case_ids() {
+        let workspace: FilePickerTarget =
+            serde_json::from_str(r#"{"kind":"workspace","workspaceId":"workspace-1"}"#).unwrap();
+        match workspace {
+            FilePickerTarget::Workspace { workspace_id } => {
+                assert_eq!(workspace_id, "workspace-1");
+            }
+            other => panic!("expected workspace target, got {other:?}"),
+        }
+
+        let remote: FilePickerTarget =
+            serde_json::from_str(r#"{"kind":"remoteServer","serverId":"server-1"}"#).unwrap();
+        match remote {
+            FilePickerTarget::RemoteServer { server_id } => {
+                assert_eq!(server_id, "server-1");
+            }
+            other => panic!("expected remoteServer target, got {other:?}"),
+        }
+
+        let local: FilePickerTarget = serde_json::from_str(r#"{"kind":"local"}"#).unwrap();
+        assert!(matches!(local, FilePickerTarget::Local));
+    }
+
+    #[test]
+    fn file_picker_target_serializes_camel_case_ids() {
+        let workspace = serde_json::to_value(FilePickerTarget::Workspace {
+            workspace_id: "workspace-1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            workspace,
+            serde_json::json!({
+                "kind": "workspace",
+                "workspaceId": "workspace-1",
+            })
+        );
+        assert!(workspace.get("workspace_id").is_none());
+
+        let remote = serde_json::to_value(FilePickerTarget::RemoteServer {
+            server_id: "server-1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            remote,
+            serde_json::json!({
+                "kind": "remoteServer",
+                "serverId": "server-1",
+            })
+        );
+        assert!(remote.get("server_id").is_none());
+
+        let local = serde_json::to_value(FilePickerTarget::Local).unwrap();
+        assert_eq!(local, serde_json::json!({ "kind": "local" }));
+    }
+
+    #[test]
+    fn file_picker_list_request_deserializes_workspace_target_from_frontend_json() {
+        let request: FilePickerListRequest = serde_json::from_str(
+            r#"{
+                "target": {"kind":"workspace","workspaceId":"workspace-1"},
+                "path": "",
+                "mode": "file",
+                "includeFiles": true,
+                "showHidden": false,
+                "limit": 500
+            }"#,
+        )
+        .unwrap();
+
+        match request.target {
+            FilePickerTarget::Workspace { workspace_id } => {
+                assert_eq!(workspace_id, "workspace-1");
+            }
+            other => panic!("expected workspace target, got {other:?}"),
+        }
+        assert!(matches!(request.mode, FilePickerMode::File));
+        assert!(request.include_files);
+        assert!(!request.show_hidden);
+        assert_eq!(request.limit, Some(500));
     }
 }
