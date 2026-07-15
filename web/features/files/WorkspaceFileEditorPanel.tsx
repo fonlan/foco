@@ -3,6 +3,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  AppWindow,
   Redo2,
   RefreshCw,
   Save,
@@ -83,12 +84,14 @@ export function WorkspaceFileEditorPanel({
   editor,
   file,
   onChangeContent,
+  onOpenHtmlPreview,
   onReload,
   onSave,
 }: {
   editor: WorkspaceFileEditorState | null;
   file: OpenFileTab;
   onChangeContent: (workspaceId: string, path: string, content: string) => void;
+  onOpenHtmlPreview?: () => void;
   onReload: (file: OpenFileTab) => Promise<void>;
   onSave: (file: OpenFileTab, content: string) => Promise<boolean> | boolean;
 }) {
@@ -96,6 +99,7 @@ export function WorkspaceFileEditorPanel({
   const imageUrl = isImage ? workspaceFileBlobUrl(file.workspaceId, file.path) : null;
   const language = monacoLanguageForPath(file.path);
   const isMarkdown = isMarkdownFilePath(file.path);
+  const isHtml = isHtmlFilePath(file.path);
   const editorPath = `${file.workspaceId}/${file.path}`;
   const handleChange = useCallback(
     (content: string) => onChangeContent(file.workspaceId, file.path, content),
@@ -121,10 +125,12 @@ export function WorkspaceFileEditorPanel({
           <MonacoFileEditor
             canSave={!editor?.isLoading && !editor?.isSaving}
             isDirty={editor?.isDirty ?? false}
+            isHtml={isHtml}
             isMarkdown={isMarkdown}
             isSaving={editor?.isSaving ?? false}
             language={language}
             onChange={handleChange}
+            onOpenHtmlPreview={onOpenHtmlPreview}
             onReload={handleReload}
             onSave={handleSave}
             path={editorPath}
@@ -159,10 +165,12 @@ type MonacoFileEditorCommand =
 function MonacoFileEditor({
   canSave,
   isDirty,
+  isHtml,
   isMarkdown,
   isSaving,
   language,
   onChange,
+  onOpenHtmlPreview,
   onReload,
   onSave,
   path,
@@ -172,10 +180,12 @@ function MonacoFileEditor({
 }: {
   canSave: boolean;
   isDirty: boolean;
+  isHtml: boolean;
   isMarkdown: boolean;
   isSaving: boolean;
   language: string;
   onChange: (value: string) => void;
+  onOpenHtmlPreview?: () => void;
   onReload: () => Promise<void>;
   onSave: (value: string) => Promise<boolean> | boolean;
   path: string;
@@ -457,6 +467,16 @@ function MonacoFileEditor({
             />
           </>
         ) : null}
+        {isHtml ? (
+          <>
+            <span className="workspace-file-editor-toolbar-separator" />
+            <EditorToolbarButton
+              icon={AppWindow}
+              label={t("Preview in new tab")}
+              onClick={() => onOpenHtmlPreview?.()}
+            />
+          </>
+        ) : null}
       </div>
       {monacoError ? (
         <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -552,6 +572,11 @@ function EditorToolbarButton({
 function isMarkdownFilePath(path: string) {
   const extension = path.split(".").pop()?.toLowerCase();
   return extension === "md" || extension === "markdown";
+}
+
+export function isHtmlFilePath(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase();
+  return extension === "html" || extension === "htm";
 }
 
 export function isWorkspaceImageFilePath(path: string) {

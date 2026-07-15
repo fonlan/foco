@@ -1,6 +1,7 @@
 import focoLogoSvg from "../foco.svg?raw";
 import {
   Activity,
+  AppWindow,
   Bot,
   CalendarClock,
   CheckCircle2,
@@ -67,6 +68,7 @@ import type {
   BrowserRoute,
   BrowserRouteChatTab,
   BrowserRouteFileTab,
+  BrowserRouteHtmlPreviewTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
   ChatCompressionStatistics,
@@ -192,6 +194,7 @@ import { useAppRouting } from "./app/app-routing";
 import {
   browserPathForRoute,
   currentBrowserRoute,
+  isHtmlPreviewPath,
 } from "./shared/browser-route";
 import { I18nContext, translate, useI18n } from "./shared/i18n";
 import {
@@ -241,12 +244,17 @@ import {
   userMessageParts,
 } from "./features/chat/chat-helpers";
 import {
+  isHtmlFilePath,
   isWorkspaceImageFilePath,
   preloadOptionalMonaco,
   WorkspaceFileEditorPanel,
   type OpenFileTab,
   type WorkspaceFileEditorState,
 } from "./features/files/WorkspaceFileEditorPanel";
+import {
+  WorkspaceHtmlPreviewPanel,
+  type OpenHtmlPreviewTab,
+} from "./features/files/WorkspaceHtmlPreviewPanel";
 const AgentsRuntimePanel = lazy(() =>
   import("./features/agents/AgentsRuntimePanel").then((m) => ({
     default: m.AgentsRuntimePanel,
@@ -738,6 +746,7 @@ type OpenAgentTab = {
 type ActiveMainTab =
   | { type: "chat"; workspaceId: string; chatId: string | null }
   | { type: "file"; workspaceId: string; path: string }
+  | { type: "htmlPreview"; workspaceId: string; path: string }
   | {
       type: "agent";
       workspaceId: string;
@@ -759,6 +768,7 @@ type FilePickerRequest = {
 type MainTabSummary =
   | (ChatTabSummary & { type: "chat" })
   | (OpenFileTab & { type: "file"; title: string })
+  | (OpenHtmlPreviewTab & { type: "htmlPreview"; title: string })
   | (OpenAgentTab & {
       type: "agent";
       title: string;
@@ -1217,6 +1227,8 @@ export function App() {
   );
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const openFileTabsRef = useRef<OpenFileTab[]>([]);
+  const [openHtmlPreviewTabs, setOpenHtmlPreviewTabs] = useState<OpenHtmlPreviewTab[]>([]);
+  const openHtmlPreviewTabsRef = useRef<OpenHtmlPreviewTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
     Record<string, WorkspaceFileEditorState>
   >({});
@@ -1844,8 +1856,13 @@ export function App() {
         title: tab.name,
         type: "file" as const,
       })),
+      ...openHtmlPreviewTabs.map((tab) => ({
+        ...tab,
+        title: tab.name,
+        type: "htmlPreview" as const,
+      })),
     ],
-    [openAgentTabs, openChatTabs, openFileTabs, workspaces],
+    [openAgentTabs, openChatTabs, openFileTabs, openHtmlPreviewTabs, workspaces],
   );
   const activeFileEditorKey =
     activeMainTab.type === "file"
@@ -1854,6 +1871,14 @@ export function App() {
   const activeFileTab =
     activeMainTab.type === "file"
       ? openFileTabs.find(
+        (tab) =>
+          tab.workspaceId === activeMainTab.workspaceId &&
+          tab.path === activeMainTab.path,
+      ) ?? null
+      : null;
+  const activeHtmlPreviewTab =
+    activeMainTab.type === "htmlPreview"
+      ? openHtmlPreviewTabs.find(
         (tab) =>
           tab.workspaceId === activeMainTab.workspaceId &&
           tab.path === activeMainTab.path,
@@ -2088,6 +2113,7 @@ export function App() {
           route,
           openChatTabsRef.current,
           openFileTabsRef.current,
+          openHtmlPreviewTabsRef.current,
         )
         : route;
       const nextPath = browserPathForRoute(routeWithTabs);
@@ -2116,6 +2142,10 @@ export function App() {
   useEffect(() => {
     openFileTabsRef.current = openFileTabs;
   }, [openFileTabs]);
+
+  useEffect(() => {
+    openHtmlPreviewTabsRef.current = openHtmlPreviewTabs;
+  }, [openHtmlPreviewTabs]);
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
@@ -4063,6 +4093,16 @@ export function App() {
       const next = current.filter((tab) =>
         workspaces.some((workspace) => workspace.id === tab.workspaceId),
       );
+      return next.length === current.length ? current : next;
+    });
+
+    setOpenHtmlPreviewTabs((current) => {
+      const next = current.filter((tab) =>
+        workspaces.some((workspace) => workspace.id === tab.workspaceId),
+      );
+      if (next.length !== current.length) {
+        openHtmlPreviewTabsRef.current = next;
+      }
       return next.length === current.length ? current : next;
     });
 
@@ -6319,6 +6359,80 @@ export function App() {
     }
   }
 
+  function openWorkspaceHtmlPreviewTab(
+    file: Pick<OpenFileTab, "workspaceId" | "path" | "name" | "workspaceName" | "workspaceLogoUrl">,
+    options: { updateUrl?: boolean } = {},
+  ) {
+    if (!isHtmlPreviewPath(file.path) && !isHtmlFilePath(file.path)) {
+      return;
+    }
+
+    const previewTab: OpenHtmlPreviewTab = {
+      name: file.name,
+      path: file.path,
+      workspaceId: file.workspaceId,
+      workspaceLogoUrl: file.workspaceLogoUrl,
+      workspaceName: file.workspaceName,
+    };
+    selectWorkspaceHtmlPreviewTab(previewTab, options);
+  }
+
+  function selectWorkspaceHtmlPreviewTab(
+    preview: OpenHtmlPreviewTab,
+    options: { updateUrl?: boolean } = {},
+  ) {
+    const nextTabs = upsertOpenHtmlPreviewTab(openHtmlPreviewTabsRef.current, preview);
+    openHtmlPreviewTabsRef.current = nextTabs;
+    setOpenHtmlPreviewTabs(nextTabs);
+    setActiveWorkspaceId(preview.workspaceId);
+    setExpandedWorkspaceId(preview.workspaceId);
+    setActiveMainTab({
+      path: preview.path,
+      type: "htmlPreview",
+      workspaceId: preview.workspaceId,
+    });
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    if (options.updateUrl !== false) {
+      updateBrowserRoute(browserRouteForActiveHtmlPreview(preview));
+    }
+  }
+
+  function restoreWorkspaceHtmlPreviewTabs(
+    previews: BrowserRouteHtmlPreviewTab[],
+    activePreview: BrowserRouteHtmlPreviewTab | null,
+  ) {
+    const nextTabs = previews.flatMap((preview) => {
+      if (!isHtmlPreviewPath(preview.path)) {
+        return [];
+      }
+
+      const workspace = workspaces.find((item) => item.id === preview.workspaceId);
+      if (!workspace) {
+        return [];
+      }
+
+      return [browserRouteHtmlPreviewTabToOpenTab(preview, workspace)];
+    });
+
+    openHtmlPreviewTabsRef.current = nextTabs;
+    setOpenHtmlPreviewTabs(nextTabs);
+
+    const selectedPreview = activePreview
+      ? nextTabs.find(
+        (tab) =>
+          tab.workspaceId === activePreview.workspaceId &&
+          tab.path === activePreview.path,
+      ) ?? null
+      : null;
+    if (!selectedPreview) {
+      return false;
+    }
+
+    selectWorkspaceHtmlPreviewTab(selectedPreview, { updateUrl: false });
+    return true;
+  }
+
   function initWorkspaceFileEditor(workspaceId: string, path: string) {
     const editorKey = workspaceFileEditorKey(workspaceId, path);
     setWorkspaceFileEditors((current) => ({
@@ -6380,6 +6494,17 @@ export function App() {
         : null,
       viewMode: "chat",
       workspaceId: file.workspaceId,
+    };
+  }
+
+  function browserRouteForActiveHtmlPreview(preview: OpenHtmlPreviewTab): BrowserRoute {
+    return {
+      activePreview: { path: preview.path, workspaceId: preview.workspaceId },
+      chatId: activeWorkspaceIdRef.current === preview.workspaceId
+        ? activeChatIdRef.current
+        : null,
+      viewMode: "chat",
+      workspaceId: preview.workspaceId,
     };
   }
 
@@ -6601,6 +6726,11 @@ export function App() {
       return;
     }
 
+    if (tab.type === "htmlPreview") {
+      selectWorkspaceHtmlPreviewTab(tab);
+      return;
+    }
+
     selectWorkspaceFileTab(tab);
     if (isWorkspaceImageFilePath(tab.path)) {
       return;
@@ -6623,6 +6753,11 @@ export function App() {
       return;
     }
 
+    if (tab.type === "htmlPreview") {
+      closeHtmlPreviewTab(tab);
+      return;
+    }
+
     const tabIndex = mainTabs.findIndex(
       (current) => current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path,
     );
@@ -6642,15 +6777,7 @@ export function App() {
       activeMainTab.workspaceId !== tab.workspaceId ||
       activeMainTab.path !== tab.path
     ) {
-      if (activeMainTab.type === "file" && activeFileTab) {
-        updateBrowserRoute(browserRouteForActiveFile(activeFileTab), "replace");
-      } else {
-        updateBrowserRoute({
-          chatId: activeChatId,
-          viewMode: "chat",
-          workspaceId: activeWorkspaceId || tab.workspaceId,
-        }, "replace");
-      }
+      updateBrowserRouteAfterTabClose(tab.workspaceId);
       return;
     }
 
@@ -6668,6 +6795,66 @@ export function App() {
       chatId: activeChatId,
       viewMode: "chat",
       workspaceId: activeWorkspaceId || tab.workspaceId,
+    }, "replace");
+  }
+
+  function closeHtmlPreviewTab(tab: OpenHtmlPreviewTab) {
+    const tabIndex = mainTabs.findIndex(
+      (current) =>
+        current.type === "htmlPreview" &&
+        current.workspaceId === tab.workspaceId &&
+        current.path === tab.path,
+    );
+    const nextOpenPreviewTabs = openHtmlPreviewTabsRef.current.filter(
+      (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
+    );
+    openHtmlPreviewTabsRef.current = nextOpenPreviewTabs;
+    setOpenHtmlPreviewTabs(nextOpenPreviewTabs);
+
+    if (
+      activeMainTab.type !== "htmlPreview" ||
+      activeMainTab.workspaceId !== tab.workspaceId ||
+      activeMainTab.path !== tab.path
+    ) {
+      updateBrowserRouteAfterTabClose(tab.workspaceId);
+      return;
+    }
+
+    const nextTabs = mainTabs.filter(
+      (current) =>
+        !(
+          current.type === "htmlPreview" &&
+          current.workspaceId === tab.workspaceId &&
+          current.path === tab.path
+        ),
+    );
+    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    if (nextTab) {
+      selectMainTab(nextTab);
+      return;
+    }
+
+    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
+    updateBrowserRoute({
+      chatId: activeChatId,
+      viewMode: "chat",
+      workspaceId: activeWorkspaceId || tab.workspaceId,
+    }, "replace");
+  }
+
+  function updateBrowserRouteAfterTabClose(fallbackWorkspaceId: string) {
+    if (activeMainTab.type === "file" && activeFileTab) {
+      updateBrowserRoute(browserRouteForActiveFile(activeFileTab), "replace");
+      return;
+    }
+    if (activeMainTab.type === "htmlPreview" && activeHtmlPreviewTab) {
+      updateBrowserRoute(browserRouteForActiveHtmlPreview(activeHtmlPreviewTab), "replace");
+      return;
+    }
+    updateBrowserRoute({
+      chatId: activeChatId,
+      viewMode: "chat",
+      workspaceId: activeWorkspaceId || fallbackWorkspaceId,
     }, "replace");
   }
 
@@ -6707,11 +6894,16 @@ export function App() {
     const nextOpenFileTabs = openFileTabsRef.current.filter(
       (tab) => !closedKeys.has(workspaceFileEditorKey(tab.workspaceId, tab.path)),
     );
+    const nextOpenHtmlPreviewTabs = openHtmlPreviewTabsRef.current.filter(
+      (tab) => !closedKeys.has(workspaceHtmlPreviewKey(tab.workspaceId, tab.path)),
+    );
 
     openChatTabsRef.current = nextOpenChatTabs;
     openFileTabsRef.current = nextOpenFileTabs;
+    openHtmlPreviewTabsRef.current = nextOpenHtmlPreviewTabs;
     setOpenChatTabs(nextOpenChatTabs);
     setOpenFileTabs(nextOpenFileTabs);
+    setOpenHtmlPreviewTabs(nextOpenHtmlPreviewTabs);
     setOpenAgentTabs((current) => {
       const next = current.filter(
         (tab) =>
@@ -6726,14 +6918,13 @@ export function App() {
     });
 
     for (const tab of tabsToClose) {
-      if (tab.type !== "chat") {
-        continue;
+      if (tab.type === "chat") {
+        const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
+        setChatRunFailed(chatKey, false);
+        removeMessagesForChatKey(chatKey);
+        removeChatPaginationForChatKey(chatKey);
+        removeContextUsageForChatKey(chatKey);
       }
-      const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
-      setChatRunFailed(chatKey, false);
-      removeMessagesForChatKey(chatKey);
-      removeChatPaginationForChatKey(chatKey);
-      removeContextUsageForChatKey(chatKey);
     }
 
     setWorkspaceFileEditors((current) => {
@@ -6748,15 +6939,7 @@ export function App() {
 
     const activeWasClosed = tabsToClose.some((tab) => mainTabMatches(activeMainTab, tab));
     if (!activeWasClosed) {
-      if (activeMainTab.type === "file" && activeFileTab) {
-        updateBrowserRoute(browserRouteForActiveFile(activeFileTab), "replace");
-      } else {
-        updateBrowserRoute({
-          chatId: activeChatId,
-          viewMode: "chat",
-          workspaceId: activeWorkspaceId || anchorTab.workspaceId,
-        }, "replace");
-      }
+      updateBrowserRouteAfterTabClose(anchorTab.workspaceId);
       return;
     }
 
@@ -7041,12 +7224,12 @@ export function App() {
     );
   }
   function renameWorkspaceFileTab(workspaceId: string, path: string, newName: string) {
+    const nextPath = workspaceRenamedFilePath(path, newName);
     setOpenFileTabs((current) =>
       current.map((tab) => {
         if (tab.workspaceId !== workspaceId || tab.path !== path) {
           return tab;
         }
-        const nextPath = workspaceRenamedFilePath(path, newName);
         return {
           ...tab,
           name: newName,
@@ -7056,7 +7239,6 @@ export function App() {
     );
     setWorkspaceFileEditors((current) => {
       const oldKey = workspaceFileEditorKey(workspaceId, path);
-      const nextPath = workspaceRenamedFilePath(path, newName);
       const newKey = workspaceFileEditorKey(workspaceId, nextPath);
       if (!(oldKey in current)) {
         return current;
@@ -7067,9 +7249,36 @@ export function App() {
     });
     setActiveMainTab((current) =>
       current.type === "file" && current.workspaceId === workspaceId && current.path === path
-        ? { path: workspaceRenamedFilePath(path, newName), type: "file", workspaceId }
+        ? { path: nextPath, type: "file", workspaceId }
         : current,
     );
+
+    const stillHtml = isHtmlPreviewPath(nextPath);
+    setOpenHtmlPreviewTabs((current) => {
+      const next = current.flatMap((tab) => {
+        if (tab.workspaceId !== workspaceId || tab.path !== path) {
+          return [tab];
+        }
+        if (!stillHtml) {
+          return [];
+        }
+        return [{ ...tab, name: newName, path: nextPath }];
+      });
+      openHtmlPreviewTabsRef.current = next;
+      return next;
+    });
+    setActiveMainTab((current) => {
+      if (
+        current.type === "htmlPreview" &&
+        current.workspaceId === workspaceId &&
+        current.path === path
+      ) {
+        return stillHtml
+          ? { path: nextPath, type: "htmlPreview", workspaceId }
+          : { chatId: activeChatId, type: "chat", workspaceId };
+      }
+      return current;
+    });
   }
 
   function closeWorkspaceFileTabsForPath(workspaceId: string, path: string) {
@@ -7094,8 +7303,26 @@ export function App() {
       }
       return next;
     });
+    setOpenHtmlPreviewTabs((current) => {
+      const next = current.filter((tab) => {
+        if (tab.workspaceId !== workspaceId) {
+          return true;
+        }
+        const matches = tab.path === path || tab.path.startsWith(`${path}/`);
+        return !matches;
+      });
+      openHtmlPreviewTabsRef.current = next;
+      return next;
+    });
     if (
       activeMainTab.type === "file" &&
+      activeMainTab.workspaceId === workspaceId &&
+      (activeMainTab.path === path || activeMainTab.path.startsWith(`${path}/`))
+    ) {
+      setActiveMainTab({ chatId: activeChatId, type: "chat", workspaceId });
+    }
+    if (
+      activeMainTab.type === "htmlPreview" &&
       activeMainTab.workspaceId === workspaceId &&
       (activeMainTab.path === path || activeMainTab.path.startsWith(`${path}/`))
     ) {
@@ -8139,6 +8366,7 @@ export function App() {
     onMissingWorkspace: setError,
     onRestoreWorkspaceChatTabs: restoreWorkspaceChatTabs,
     onRestoreWorkspaceFileTabs: restoreWorkspaceFileTabs,
+    onRestoreWorkspaceHtmlPreviewTabs: restoreWorkspaceHtmlPreviewTabs,
     onSelectWorkspaceChat: selectWorkspaceChat,
     onStartNewWorkspaceChat: startNewWorkspaceChat,
     setActiveChatId,
@@ -11636,6 +11864,31 @@ export function App() {
                   <FileText aria-hidden="true" className="size-3.5" />
                   <span>{t("Open")}</span>
                 </button>
+                {workspaceFileContextMenu.node.kind === "file" &&
+                isHtmlFilePath(workspaceFileContextMenu.node.path) ? (
+                  <button
+                    className="workspace-chat-context-menu-item"
+                    onClick={() => {
+                      const { node } = workspaceFileContextMenu;
+                      setWorkspaceFileContextMenu(null);
+                      if (!activeWorkspace) {
+                        return;
+                      }
+                      openWorkspaceHtmlPreviewTab({
+                        name: node.name,
+                        path: node.path,
+                        workspaceId: activeWorkspace.id,
+                        workspaceLogoUrl: activeWorkspace.logoUrl ?? null,
+                        workspaceName: activeWorkspace.name,
+                      });
+                    }}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <AppWindow aria-hidden="true" className="size-3.5" />
+                    <span>{t("Preview in new tab")}</span>
+                  </button>
+                ) : null}
                 {workspaceFileContextMenu.node.kind === "file" ? (
                   <button
                     className="workspace-chat-context-menu-item"
@@ -11754,10 +12007,34 @@ export function App() {
                   editor={activeFileEditor}
                   file={activeFileTab}
                   onChangeContent={updateWorkspaceFileEditorContent}
+                  onOpenHtmlPreview={
+                    isHtmlFilePath(activeFileTab.path)
+                      ? () => openWorkspaceHtmlPreviewTab(activeFileTab)
+                      : undefined
+                  }
                   onReload={reloadWorkspaceFileEditor}
                   onSave={saveWorkspaceFileEditor}
                 />
-              ) : activeMainTab.type === "agent" && activeAgentTab ? (
+              ) : null}
+              {openHtmlPreviewTabs.map((previewTab) => {
+                const isActivePreview =
+                  activeMainTab.type === "htmlPreview" &&
+                  activeMainTab.workspaceId === previewTab.workspaceId &&
+                  activeMainTab.path === previewTab.path;
+                return (
+                  <div
+                    className={
+                      isActivePreview
+                        ? "flex min-h-0 min-w-0 flex-1 flex-col"
+                        : "hidden"
+                    }
+                    key={workspaceHtmlPreviewKey(previewTab.workspaceId, previewTab.path)}
+                  >
+                    <WorkspaceHtmlPreviewPanel tab={previewTab} />
+                  </div>
+                );
+              })}
+              {activeMainTab.type === "agent" && activeAgentTab ? (
                 <Suspense fallback={<PanelLoadingFallback />}>
                   <AgentTranscriptPanel
                     key={agentTranscriptViewCacheKey(
@@ -11821,7 +12098,7 @@ export function App() {
                     workspaceId={activeAgentTab.workspaceId}
                   />
                 </Suspense>
-              ) : (
+              ) : activeMainTab.type !== "file" && activeMainTab.type !== "htmlPreview" ? (
                 <ChatPanel
                   activeWorkspaceName={activeWorkspace?.name ?? null}
                   helpers={chatPanelHelpers}
@@ -11895,7 +12172,7 @@ export function App() {
                   workspaces={workspaces}
                   workspaceId={activeWorkspace?.id ?? (activeWorkspaceId || null)}
                 />
-              )}
+              ) : null}
               {workspaces
                 .filter((workspace) => terminalOpenWorkspaceIds.has(workspace.id))
                 .map((workspace) => (
@@ -12866,7 +13143,17 @@ function MainTabBar({
             const isRunning =
               tab.type === "chat" &&
               chatSessionStatusFor(chatRunKey(tab.workspaceId, tab.chatId)).kind === "running";
-            const title = tab.title || t(tab.type === "chat" ? "Chat" : tab.type === "agent" ? "Agent" : "Files");
+            const title =
+              tab.type === "htmlPreview"
+                ? t("{name} · Preview", { name: tab.name })
+                : tab.title ||
+                  t(
+                    tab.type === "chat"
+                      ? "Chat"
+                      : tab.type === "agent"
+                        ? "Agent"
+                        : "Files",
+                  );
             const key = mainTabKey(tab);
 
             return (
@@ -12896,6 +13183,9 @@ function MainTabBar({
                   <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold leading-5">
                     {tab.type === "file" ? (
                       <FileText aria-hidden="true" className="size-3.5 shrink-0 text-slate-500" />
+                    ) : null}
+                    {tab.type === "htmlPreview" ? (
+                      <AppWindow aria-hidden="true" className="size-3.5 shrink-0 text-sky-600" />
                     ) : null}
                     {tab.type === "agent" ? (
                       <Bot aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
@@ -13227,6 +13517,7 @@ function browserRouteWithOpenTabs(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
   chatTabs: OpenChatTab[],
   fileTabs: OpenFileTab[],
+  previewTabs: OpenHtmlPreviewTab[],
 ): BrowserRoute {
   const nextRoute = route.tabs
     ? { ...route, tabs: dedupeBrowserRouteChatTabs(route.tabs) }
@@ -13239,11 +13530,21 @@ function browserRouteWithOpenTabs(
     routeFiles.push(route.activeFile);
   }
 
+  const routePreviews = route.previews
+    ? dedupeBrowserRouteHtmlPreviewTabs(route.previews)
+    : openHtmlPreviewTabsToBrowserRouteTabs(previewTabs);
+  if (route.activePreview) {
+    routePreviews.push(route.activePreview);
+  }
+
   const dedupedFiles = dedupeBrowserRouteFileTabs(routeFiles);
+  const dedupedPreviews = dedupeBrowserRouteHtmlPreviewTabs(routePreviews);
   return {
     ...nextRoute,
     ...(dedupedFiles.length ? { files: dedupedFiles } : {}),
     ...(route.activeFile ? { activeFile: route.activeFile } : {}),
+    ...(dedupedPreviews.length ? { previews: dedupedPreviews } : {}),
+    ...(route.activePreview ? { activePreview: route.activePreview } : {}),
   };
 }
 
@@ -13273,6 +13574,15 @@ function openFileTabsToBrowserRouteFileTabs(tabs: OpenFileTab[]): BrowserRouteFi
   }));
 }
 
+function openHtmlPreviewTabsToBrowserRouteTabs(
+  tabs: OpenHtmlPreviewTab[],
+): BrowserRouteHtmlPreviewTab[] {
+  return tabs.map((tab) => ({
+    path: tab.path,
+    workspaceId: tab.workspaceId,
+  }));
+}
+
 function browserRouteFileTabToOpenFileTab(
   file: BrowserRouteFileTab,
   workspace: WorkspaceSummary,
@@ -13281,6 +13591,19 @@ function browserRouteFileTabToOpenFileTab(
     name: fileNameFromPath(file.path),
     path: file.path,
     workspaceId: file.workspaceId,
+    workspaceLogoUrl: workspace.logoUrl ?? null,
+    workspaceName: workspace.name,
+  };
+}
+
+function browserRouteHtmlPreviewTabToOpenTab(
+  preview: BrowserRouteHtmlPreviewTab,
+  workspace: WorkspaceSummary,
+): OpenHtmlPreviewTab {
+  return {
+    name: fileNameFromPath(preview.path),
+    path: preview.path,
+    workspaceId: preview.workspaceId,
     workspaceLogoUrl: workspace.logoUrl ?? null,
     workspaceName: workspace.name,
   };
@@ -13307,6 +13630,23 @@ function dedupeBrowserRouteChatTabs(tabs: BrowserRouteChatTab[]) {
 function dedupeBrowserRouteFileTabs(tabs: BrowserRouteFileTab[]) {
   const seen = new Set<string>();
   return tabs.filter((tab) => {
+    const key = `${tab.workspaceId}\u0000${tab.path}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeBrowserRouteHtmlPreviewTabs(tabs: BrowserRouteHtmlPreviewTab[]) {
+  const seen = new Set<string>();
+  return tabs.filter((tab) => {
+    if (!isHtmlPreviewPath(tab.path)) {
+      return false;
+    }
+
     const key = `${tab.workspaceId}\u0000${tab.path}`;
     if (seen.has(key)) {
       return false;
@@ -13344,6 +13684,21 @@ function upsertOpenFileTab(tabs: OpenFileTab[], nextTab: OpenFileTab) {
   return [...tabs, nextTab];
 }
 
+function upsertOpenHtmlPreviewTab(
+  tabs: OpenHtmlPreviewTab[],
+  nextTab: OpenHtmlPreviewTab,
+) {
+  if (
+    tabs.some(
+      (tab) => tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
+    )
+  ) {
+    return tabs;
+  }
+
+  return [...tabs, nextTab];
+}
+
 function mainTabKey(tab: MainTabSummary) {
   if (tab.type === "chat") {
     return `chat:${chatRunKey(tab.workspaceId, tab.chatId)}`;
@@ -13351,6 +13706,10 @@ function mainTabKey(tab: MainTabSummary) {
 
   if (tab.type === "agent") {
     return `agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`;
+  }
+
+  if (tab.type === "htmlPreview") {
+    return workspaceHtmlPreviewKey(tab.workspaceId, tab.path);
   }
 
   return workspaceFileEditorKey(tab.workspaceId, tab.path);
@@ -13373,11 +13732,19 @@ function mainTabMatches(activeTab: ActiveMainTab, tab: MainTabSummary) {
     );
   }
 
+  if (tab.type === "htmlPreview") {
+    return activeTab.type === "htmlPreview" && activeTab.path === tab.path;
+  }
+
   return activeTab.type === "file" && activeTab.path === tab.path;
 }
 
 function workspaceFileEditorKey(workspaceId: string, path: string) {
   return `${workspaceId}:${path}`;
+}
+
+function workspaceHtmlPreviewKey(workspaceId: string, path: string) {
+  return `htmlPreview:${workspaceId}:${path}`;
 }
 
 function workspaceRenamedFilePath(path: string, newName: string) {

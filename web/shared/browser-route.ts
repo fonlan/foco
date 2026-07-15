@@ -3,6 +3,7 @@ import type {
   BrowserRoute,
   BrowserRouteChatTab,
   BrowserRouteFileTab,
+  BrowserRouteHtmlPreviewTab,
   SettingsSection,
 } from "../api/types";
 import { SETTINGS_SECTION_IDS } from "../app/constants";
@@ -10,6 +11,8 @@ import { SETTINGS_SECTION_IDS } from "../app/constants";
 const CHAT_TAB_QUERY_PARAM = "tab";
 const FILE_TAB_QUERY_PARAM = "file";
 const ACTIVE_FILE_QUERY_PARAM = "activeFile";
+const PREVIEW_TAB_QUERY_PARAM = "preview";
+const ACTIVE_PREVIEW_QUERY_PARAM = "activePreview";
 const STATS_PAGE_QUERY_PARAM = "page";
 const STATS_FILTER_QUERY_PARAMS = [
   ["workspaceId", "workspaceId"],
@@ -65,6 +68,8 @@ export function browserRouteFromPathname(
   const tabs = chatTabsFromSearch(search);
   const files = fileTabsFromSearch(search);
   const activeFile = activeFileFromSearch(search);
+  const previews = previewTabsFromSearch(search);
+  const activePreview = activePreviewFromSearch(search);
   // ponytail: last tab is active; add an explicit activeChat param if tab order stops carrying selection.
   const queryActiveChat = tabs.at(-1) ?? null;
 
@@ -73,7 +78,7 @@ export function browserRouteFromPathname(
       chatId: segments[1],
       viewMode: "chat",
       workspaceId: segments[0],
-    }, tabs, files, activeFile);
+    }, tabs, files, activeFile, previews, activePreview);
   }
 
   if (segments.length === 1) {
@@ -86,6 +91,8 @@ export function browserRouteFromPathname(
       tabs,
       files,
       activeFile,
+      previews,
+      activePreview,
     );
   }
 
@@ -98,6 +105,8 @@ export function browserRouteFromPathname(
     tabs,
     files,
     activeFile,
+    previews,
+    activePreview,
   );
 }
 
@@ -129,7 +138,14 @@ export function browserPathForRoute(route: BrowserRoute) {
 function browserPathnameForChatRoute(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
 ) {
-  if (route.chatId || route.tabs?.length || route.files?.length || route.activeFile) {
+  if (
+    route.chatId ||
+    route.tabs?.length ||
+    route.files?.length ||
+    route.activeFile ||
+    route.previews?.length ||
+    route.activePreview
+  ) {
     return "/";
   }
 
@@ -236,9 +252,46 @@ function fileTabsFromSearch(search: string): BrowserRouteFileTab[] {
   return files;
 }
 
+function previewTabsFromSearch(search: string): BrowserRouteHtmlPreviewTab[] {
+  const params = new URLSearchParams(search);
+  const previews: BrowserRouteHtmlPreviewTab[] = [];
+  const seen = new Set<string>();
+
+  for (const value of params.getAll(PREVIEW_TAB_QUERY_PARAM)) {
+    const preview = fileTabFromParamValue(value);
+    if (!preview || !isHtmlPreviewPath(preview.path)) {
+      continue;
+    }
+
+    const key = `${preview.workspaceId}\u0000${preview.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    previews.push(preview);
+  }
+
+  return previews;
+}
+
 function activeFileFromSearch(search: string) {
   const value = new URLSearchParams(search).get(ACTIVE_FILE_QUERY_PARAM);
   return value ? fileTabFromParamValue(value) : null;
+}
+
+function activePreviewFromSearch(search: string): BrowserRouteHtmlPreviewTab | null {
+  const value = new URLSearchParams(search).get(ACTIVE_PREVIEW_QUERY_PARAM);
+  if (!value) {
+    return null;
+  }
+
+  const preview = fileTabFromParamValue(value);
+  if (!preview || !isHtmlPreviewPath(preview.path)) {
+    return null;
+  }
+
+  return preview;
 }
 
 function fileTabFromParamValue(value: string): BrowserRouteFileTab | null {
@@ -260,9 +313,14 @@ function chatRouteSearch(route: Extract<BrowserRoute, { viewMode: "chat" }>) {
   const params = new URLSearchParams();
   appendChatTabsSearch(params, activeChatLast(route));
   appendFileTabsSearch(params, route.files ?? []);
+  appendPreviewTabsSearch(params, route.previews ?? []);
 
   if (route.activeFile?.workspaceId && route.activeFile.path) {
     params.set(ACTIVE_FILE_QUERY_PARAM, fileTabParamValue(route.activeFile));
+  }
+
+  if (route.activePreview?.workspaceId && route.activePreview.path) {
+    params.set(ACTIVE_PREVIEW_QUERY_PARAM, fileTabParamValue(route.activePreview));
   }
 
   return params.toString();
@@ -318,7 +376,27 @@ function appendFileTabsSearch(params: URLSearchParams, files: BrowserRouteFileTa
   }
 }
 
-function fileTabParamValue(file: BrowserRouteFileTab) {
+function appendPreviewTabsSearch(
+  params: URLSearchParams,
+  previews: BrowserRouteHtmlPreviewTab[],
+) {
+  const seen = new Set<string>();
+  for (const preview of previews) {
+    if (!preview.workspaceId || !preview.path || !isHtmlPreviewPath(preview.path)) {
+      continue;
+    }
+
+    const key = `${preview.workspaceId}\u0000${preview.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    params.append(PREVIEW_TAB_QUERY_PARAM, fileTabParamValue(preview));
+  }
+}
+
+function fileTabParamValue(file: BrowserRouteFileTab | BrowserRouteHtmlPreviewTab) {
   return `${encodeURIComponent(file.workspaceId)}/${encodeURIComponent(file.path)}`;
 }
 
@@ -327,19 +405,29 @@ function chatRouteWithTabs(
   tabs: BrowserRouteChatTab[],
   files: BrowserRouteFileTab[],
   activeFile: BrowserRouteFileTab | null,
+  previews: BrowserRouteHtmlPreviewTab[],
+  activePreview: BrowserRouteHtmlPreviewTab | null,
 ): BrowserRoute {
   const routeTabs = route.workspaceId && route.chatId
     ? [...tabs, { chatId: route.chatId, workspaceId: route.workspaceId }]
     : tabs;
   const dedupedRouteTabs = dedupeChatTabs(routeTabs);
   const dedupedRouteFiles = dedupeFileTabs(activeFile ? [...files, activeFile] : files);
+  const dedupedRoutePreviews = dedupePreviewTabs(
+    activePreview ? [...previews, activePreview] : previews,
+  );
   const nextRoute: Extract<BrowserRoute, { viewMode: "chat" }> = {
     ...route,
     ...(dedupedRouteTabs.length ? { tabs: dedupedRouteTabs } : {}),
     ...(dedupedRouteFiles.length ? { files: dedupedRouteFiles } : {}),
+    ...(dedupedRoutePreviews.length ? { previews: dedupedRoutePreviews } : {}),
   };
 
-  return activeFile ? { ...nextRoute, activeFile } : nextRoute;
+  return {
+    ...nextRoute,
+    ...(activeFile ? { activeFile } : {}),
+    ...(activePreview ? { activePreview } : {}),
+  };
 }
 
 function dedupeChatTabs(tabs: BrowserRouteChatTab[]) {
@@ -366,6 +454,28 @@ function dedupeFileTabs(files: BrowserRouteFileTab[]) {
     seen.add(key);
     return true;
   });
+}
+
+function dedupePreviewTabs(previews: BrowserRouteHtmlPreviewTab[]) {
+  const seen = new Set<string>();
+  return previews.filter((preview) => {
+    if (!isHtmlPreviewPath(preview.path)) {
+      return false;
+    }
+
+    const key = `${preview.workspaceId}\u0000${preview.path}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+export function isHtmlPreviewPath(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase();
+  return extension === "html" || extension === "htm";
 }
 
 function decodePathSegment(segment: string) {

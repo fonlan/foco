@@ -763,6 +763,28 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Word wrap": "自动换行",
     "Preview markdown": "预览 Markdown",
     "Edit markdown": "编辑 Markdown",
+    "Preview in new tab": "在新标签页中预览",
+    "HTML preview": "HTML 预览",
+    "{name} · Preview": "{name} · 预览",
+    "HTML preview toolbar": "HTML 预览工具栏",
+    "Refresh HTML preview": "刷新 HTML 预览",
+    "Loading HTML preview...": "正在加载 HTML 预览...",
+    "Retry HTML preview": "重试 HTML 预览",
+    "HTML preview is unavailable.": "HTML 预览不可用。",
+    "HTML preview for {name}": "{name} 的 HTML 预览",
+    "HTML preview failed to load. Refresh or recreate the session.":
+      "HTML 预览加载失败。请刷新或重新创建会话。",
+    "Remote workspace is offline or the preview connection failed.":
+      "远程工作区离线或预览连接失败。",
+    "HTML preview session expired. Refresh to create a new session.":
+      "HTML 预览会话已过期。请刷新以创建新会话。",
+    "Only .html and .htm files can be opened in the HTML preview tab.":
+      "仅 .html 与 .htm 文件可在 HTML 预览标签中打开。",
+    "Too many open HTML previews. Close idle previews and try again.":
+      "打开的 HTML 预览过多。请关闭空闲预览后重试。",
+    "Failed to create HTML preview session.": "创建 HTML 预览会话失败。",
+    "HTML preview returned an unsafe preview URL. Only *.preview.localhost origins are allowed.":
+      "HTML 预览返回了不安全的 URL。仅允许 *.preview.localhost 来源。",
     "Editor toolbar": "编辑器工具栏",
     "Saving...": "正在保存...",
     Copied: "已复制",

@@ -74,6 +74,54 @@ describe("browser route chat tabs", () => {
     });
   });
 
+  it("serializes HTML preview tabs into the route query string", () => {
+    expect(
+      browserPathForRoute({
+        activePreview: { path: "demo/index.html", workspaceId: "workspace-1" },
+        chatId: null,
+        previews: [
+          { path: "docs/readme.html", workspaceId: "workspace-1" },
+          { path: "demo/index.html", workspaceId: "workspace-1" },
+        ],
+        viewMode: "chat",
+        workspaceId: "workspace-1",
+      }),
+    ).toBe(
+      "/?preview=workspace-1%2Fdocs%252Freadme.html&preview=workspace-1%2Fdemo%252Findex.html&activePreview=workspace-1%2Fdemo%252Findex.html",
+    );
+  });
+
+  it("parses HTML preview tabs from the route query string", () => {
+    expect(
+      browserRouteFromPathname(
+        "/workspace-1",
+        "?preview=workspace-1%2Fdocs%252Freadme.html&activePreview=workspace-1%2Fdemo%252Findex.html",
+      ),
+    ).toEqual({
+      activePreview: { path: "demo/index.html", workspaceId: "workspace-1" },
+      chatId: null,
+      previews: [
+        { path: "docs/readme.html", workspaceId: "workspace-1" },
+        { path: "demo/index.html", workspaceId: "workspace-1" },
+      ],
+      viewMode: "chat",
+      workspaceId: "workspace-1",
+    });
+  });
+
+  it("ignores non-HTML preview recovery params", () => {
+    expect(
+      browserRouteFromPathname(
+        "/",
+        "?preview=workspace-1%2Fsrc%252Fmain.ts&activePreview=workspace-1%2Fsrc%252Fmain.ts",
+      ),
+    ).toEqual({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: null,
+    });
+  });
+
   it("normalizes legacy chat routes into a restorable single-tab route", () => {
     expect(browserRouteFromPathname("/workspace-1/chat-1")).toEqual({
       chatId: "chat-1",

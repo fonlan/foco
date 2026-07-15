@@ -29,6 +29,22 @@ export type BrowserRouteFileTab = {
   path: string;
 };
 
+/** Workspace HTML preview tab identity persisted in the URL (no capability token). */
+export type BrowserRouteHtmlPreviewTab = {
+  workspaceId: string;
+  path: string;
+};
+
+export type PreviewSessionResponse = {
+  token: string;
+  workspaceId: string;
+  entryPath: string;
+  rootPath: string;
+  previewUrl: string;
+  previewOrigin: string;
+  iframeSandbox: string;
+};
+
 export type BrowserRoute =
   | {
       viewMode: "chat";
@@ -37,6 +53,8 @@ export type BrowserRoute =
       tabs?: BrowserRouteChatTab[];
       files?: BrowserRouteFileTab[];
       activeFile?: BrowserRouteFileTab;
+      previews?: BrowserRouteHtmlPreviewTab[];
+      activePreview?: BrowserRouteHtmlPreviewTab;
     }
   | { viewMode: "settings"; section: SettingsSection }
   | { viewMode: "stats"; page: number; filters?: Partial<AiStatsFilterState> }

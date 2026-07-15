@@ -5,6 +5,7 @@ import type {
   BrowserRoute,
   BrowserRouteChatTab,
   BrowserRouteFileTab,
+  BrowserRouteHtmlPreviewTab,
   SettingsSection,
   WorkspaceSummary,
 } from "../api/types";
@@ -18,6 +19,10 @@ type AppRoutingOptions = {
   onRestoreWorkspaceFileTabs: (
     files: BrowserRouteFileTab[],
     activeFile: BrowserRouteFileTab | null,
+  ) => boolean;
+  onRestoreWorkspaceHtmlPreviewTabs: (
+    previews: BrowserRouteHtmlPreviewTab[],
+    activePreview: BrowserRouteHtmlPreviewTab | null,
   ) => boolean;
   onSelectWorkspaceChat: (
     workspaceId: string,
@@ -49,6 +54,7 @@ export function useAppRouting({
   onMissingWorkspace,
   onRestoreWorkspaceChatTabs,
   onRestoreWorkspaceFileTabs,
+  onRestoreWorkspaceHtmlPreviewTabs,
   onSelectWorkspaceChat,
   onStartNewWorkspaceChat,
   setActiveChatId,
@@ -148,11 +154,20 @@ export function useAppRouting({
       setIsMobileWorkspaceOpen(false);
       const routeTabs = route.tabs ?? [];
       const routeFiles = route.files ?? [];
+      const routePreviews = route.previews ?? [];
       onRestoreWorkspaceChatTabs(routeTabs);
       const restoredActiveFile = onRestoreWorkspaceFileTabs(
         routeFiles,
         route.activeFile ?? null,
       );
+      const restoredActivePreview = onRestoreWorkspaceHtmlPreviewTabs(
+        routePreviews,
+        route.activePreview ?? null,
+      );
+      // Active preview wins over active file when both are present.
+      if (restoredActivePreview) {
+        return;
+      }
       if (restoredActiveFile) {
         return;
       }
@@ -182,6 +197,7 @@ export function useAppRouting({
       onMissingWorkspace,
       onRestoreWorkspaceChatTabs,
       onRestoreWorkspaceFileTabs,
+      onRestoreWorkspaceHtmlPreviewTabs,
       onSelectWorkspaceChat,
       onStartNewWorkspaceChat,
       setActiveChatId,
