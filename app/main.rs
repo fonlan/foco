@@ -407,6 +407,7 @@ pub(crate) struct AppState {
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
     remote_server_connections: Arc<Mutex<HashSet<String>>>,
+    preview_sessions: crate::runtime::PreviewSessionRegistry,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
@@ -714,6 +715,7 @@ async fn run_server_until_shutdown(
         code_graph_indexes: code_graph_indexes.clone(),
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
+        preview_sessions: crate::runtime::PreviewSessionRegistry::default(),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };

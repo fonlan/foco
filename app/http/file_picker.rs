@@ -53,7 +53,11 @@ pub(crate) struct FilePickerReadFilesRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum FilePickerTarget {
     Local,
     RemoteServer { server_id: String },

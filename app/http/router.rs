@@ -633,6 +633,14 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/terminal/{session_id}/ws",
             get(crate::http::terminal::terminal_socket),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/preview/sessions",
+            post(crate::runtime::create_preview_session),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/preview/sessions/{token}",
+            delete(crate::runtime::release_preview_session),
+        )
         .fallback(static_asset)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -641,6 +649,12 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             auth_state,
             crate::http::auth::require_auth,
+        ))
+        // Preview host routing must run outside require_auth so capability tokens
+        // alone authorize reads, and before SPA fallback for non-API paths.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::runtime::preview_host_middleware,
         ))
         .layer(middleware::from_fn(log_http_request))
         .with_state(state)
@@ -916,11 +930,22 @@ async fn log_http_request(request: axum::extract::Request, next: middleware::Nex
     let started_at = Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    tracing::info!(%method, %path, "HTTP request started");
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let host_for_log = if crate::runtime::request_is_preview_host(request.headers()) {
+        crate::runtime::redact_preview_host_for_log(host)
+    } else {
+        host.to_string()
+    };
+    tracing::info!(%method, %path, host = %host_for_log, "HTTP request started");
     let response = next.run(request).await;
     tracing::info!(
         %method,
         %path,
+        host = %host_for_log,
         status = response.status().as_u16(),
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         "HTTP request completed"

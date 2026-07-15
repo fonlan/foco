@@ -4,6 +4,7 @@ mod chat_run;
 mod code_graph;
 mod image_tools;
 mod native_tools;
+mod preview;
 mod provider_audit;
 mod questions;
 pub(crate) mod reasoning_loop_detector;
@@ -48,6 +49,10 @@ pub(crate) use native_tools::{
 pub(crate) use native_tools::{
     RipgrepStatus, RipgrepToolSummary, detect_ripgrep, download_and_install_ripgrep,
     ripgrep_tool_summary,
+};
+pub(crate) use preview::{
+    PreviewSessionRegistry, create_preview_session, preview_host_middleware,
+    redact_preview_host_for_log, release_preview_session, request_is_preview_host,
 };
 pub(crate) use provider_audit::ProviderAuditCapture;
 pub(crate) use questions::{

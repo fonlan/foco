@@ -27982,6 +27982,7 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
+        preview_sessions: crate::runtime::PreviewSessionRegistry::default(),
     }
 }
 
