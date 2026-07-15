@@ -1040,6 +1040,132 @@ describe("app-workspaces verification surfaces", () => {
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
   });
 
+  it("localizes the add-workspace dialog in local mode for zh-CN", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" as const },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse(zhSettings)
+          : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "添加工作区" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "添加工作区" });
+    expect(within(dialog).getByText("创建或注册本地文件夹。")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "本地" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "SSH" })).toBeInTheDocument();
+    expect(within(dialog).getByText("名称")).toBeInTheDocument();
+    expect(within(dialog).getByPlaceholderText("工作区名称")).toBeInTheDocument();
+    expect(within(dialog).getByText("路径")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "选择工作区路径" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("启用项目 Spec")).toBeInTheDocument();
+    expect(within(dialog).getByText("高级")).toBeInTheDocument();
+    expect(within(dialog).getByText("工作区图标")).toBeInTheDocument();
+    expect(within(dialog).getByText("文件夹图标")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "上传图标" })).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "关闭工作区弹窗" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "取消工作区弹窗" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "添加工作区" })).toBeInTheDocument();
+
+    // Critical keys must not fall back to English.
+    expect(within(dialog).queryByText("Create or register a local folder.")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Local")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Name")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Path")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Advanced")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Folder icon")).not.toBeInTheDocument();
+  });
+
+  it("localizes the add-workspace dialog SSH mode for zh-CN", async () => {
+    const remoteServer = {
+      id: "srv-lab",
+      name: "Lab",
+      hostAlias: "lab.example",
+      user: "root",
+      port: 22,
+      identityFile: null,
+      authMethod: "key" as const,
+      passwordConfigured: false,
+      defaultRemoteRoot: "/home/lab",
+      focoCommand: null,
+      terminalShell: null,
+      connectTimeoutMs: 10000,
+      status: "ready",
+      lastError: null,
+      lastKnownTarget: null,
+      sidecarVersion: "0.1.8",
+      sidecarInstallState: "available",
+      workspaceCount: 0,
+      lastCheckedAt: null,
+    };
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" as const },
+      remoteServers: [remoteServer],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse(zhSettings)
+          : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "添加工作区" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "添加工作区" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "SSH" }));
+
+    expect(within(dialog).getByText("注册 SSH 工作区。")).toBeInTheDocument();
+    expect(within(dialog).getByText("远程服务器")).toBeInTheDocument();
+    expect(within(dialog).getByText("选择远程服务器")).toBeInTheDocument();
+    expect(within(dialog).getByPlaceholderText("服务器名称")).toBeInTheDocument();
+    expect(within(dialog).getByPlaceholderText("SSH 主机名/IP")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "添加远程服务器" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("远程路径")).toBeInTheDocument();
+    expect(within(dialog).getByText("测试连接")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "测试连接" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("高级")).toBeInTheDocument();
+    expect(within(dialog).getByText("远程工作区图标")).toBeInTheDocument();
+
+    // Critical keys must not fall back to English.
+    expect(within(dialog).queryByText("Register an SSH workspace.")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Remote Server")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Select remote server")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Remote path")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Test connection")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Remote workspace icon")).not.toBeInTheDocument();
+  });
+
   it("shows a newly added workspace in settings without leaving the page", async () => {
     renderApp();
 
