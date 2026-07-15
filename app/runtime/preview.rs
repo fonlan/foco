@@ -19,7 +19,6 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header},
     response::Response,
 };
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -177,13 +176,15 @@ fn expire_idle_sessions_locked(sessions: &mut HashMap<String, PreviewSession>) {
 fn generate_preview_token(existing: &HashMap<String, PreviewSession>) -> Result<String, ApiError> {
     // 32 lowercase alnum labels are DNS-safe and hard to guess (~160 bits).
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
     for _ in 0..32 {
-        let mut token = String::with_capacity(PREVIEW_TOKEN_LEN);
-        for _ in 0..PREVIEW_TOKEN_LEN {
-            let idx = rng.random_range(0..ALPHABET.len());
-            token.push(ALPHABET[idx] as char);
-        }
+        let mut bytes = [0u8; PREVIEW_TOKEN_LEN];
+        getrandom::fill(&mut bytes).map_err(|source| {
+            ApiError::internal(format!("failed to generate preview session token: {source}"))
+        })?;
+        let token: String = bytes
+            .iter()
+            .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+            .collect();
         if !existing.contains_key(&token) {
             return Ok(token);
         }
