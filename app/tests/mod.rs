@@ -9228,11 +9228,59 @@ fn workspace_logo_file_rejects_extension_type_mismatch() {
 }
 
 #[test]
+fn workspace_database_startup_skips_remote_workspaces_without_local_paths() {
+    let local_workspace = tempfile::tempdir().expect("local workspace");
+    let workspaces = vec![
+        foco_store::config::WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: PathBuf::new(),
+            location: foco_store::config::WorkspaceLocation::Ssh {
+                server_id: "server".to_string(),
+                remote_path: "/srv/project".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        },
+        foco_store::config::WorkspaceConfig {
+            id: "local".to_string(),
+            name: "Local".to_string(),
+            path: local_workspace.path().to_path_buf(),
+            location: foco_store::config::WorkspaceLocation::Local,
+            pinned: false,
+            terminal_shell: "zsh".to_string(),
+            common_commands: Vec::new(),
+        },
+    ];
+
+    let initialized =
+        initialize_workspace_databases_for_startup(&workspaces).expect("initialize databases");
+
+    assert_eq!(initialized, 1);
+}
+
+#[test]
 fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_queue() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-reconcile-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    let config = prompt_test_config(workspace_dir.clone());
+    let mut config = prompt_test_config(workspace_dir.clone());
     let workspace = config.workspaces[0].clone();
+    config.workspaces.insert(
+        0,
+        foco_store::config::WorkspaceConfig {
+            id: "remote-reconcile".to_string(),
+            name: "Remote reconcile".to_string(),
+            path: PathBuf::new(),
+            location: foco_store::config::WorkspaceLocation::Ssh {
+                server_id: "server".to_string(),
+                remote_path: "/srv/reconcile".to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        },
+    );
     let team_id = foco_agent::AgentTeamId::new("agent-team-reconcile").expect("team id");
     let instance_id =
         foco_agent::AgentInstanceId::new("agent-instance-reconcile").expect("instance id");

@@ -106,7 +106,7 @@ fn prune_api_audit_details_for_config(
     let cutoff = api_audit_detail_cutoff(config);
     let mut summary = ApiAuditCleanupSummary::default();
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         let pruned = database

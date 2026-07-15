@@ -289,7 +289,7 @@ pub(crate) async fn settings_workspace_spec_jobs(
     let mut total_count = 0;
     let retryable_only = query.retryable_only.unwrap_or(false);
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         if !workspace_database_path(&workspace.path).exists() {
             continue;
         }

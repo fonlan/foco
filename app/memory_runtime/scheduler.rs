@@ -107,7 +107,7 @@ pub(crate) fn reconcile_memory_dream_runs(state: &AppState) -> Result<usize, Api
     let config = config_snapshot(state)?;
     let mut reconciled =
         reconcile_memory_dream_scope(state, &config, MemoryDreamScope::Global, None)?;
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         reconciled += reconcile_memory_dream_scope(
             state,
             &config,
@@ -223,7 +223,7 @@ pub(crate) async fn dispatch_auto_memory_dreams_at(
     .await;
 
     // ponytail: sequential scans avoid backlog fan-out; parallelize only if many workspaces make this slow.
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         run_auto_memory_dream_if_due(
             state,
             &config,

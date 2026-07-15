@@ -297,7 +297,7 @@ where
 
 pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let mut database = open_workspace_database_critical(&workspace.path)?;
         for record in database
             .startup_agent_reconciliation()
@@ -444,7 +444,7 @@ async fn schedule_runnable_tasks(
 ) -> Result<AgentSchedulerScan, ApiError> {
     let config = config_snapshot(state)?;
     let mut scan = AgentSchedulerScan::default();
-    'scan: for workspace in &config.workspaces {
+    'scan: for workspace in config.local_workspaces() {
         loop {
             let Ok(permit) = permits.clone().try_acquire_owned() else {
                 break 'scan;
@@ -2916,6 +2916,38 @@ mod tests {
         assert!(permits.clone().try_acquire_owned().is_err());
         drop(held);
         assert!(permits.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn scheduler_scan_skips_remote_workspace_without_local_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.workspaces.insert(
+            0,
+            foco_store::config::WorkspaceConfig {
+                id: "remote".to_string(),
+                name: "Remote".to_string(),
+                path: PathBuf::new(),
+                location: foco_store::config::WorkspaceLocation::Ssh {
+                    server_id: "server".to_string(),
+                    remote_path: "/srv/project".to_string(),
+                },
+                pinned: false,
+                terminal_shell: "bash".to_string(),
+                common_commands: Vec::new(),
+            },
+        );
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
+        let mut runs = JoinSet::new();
+        let mut run_identities = HashMap::new();
+
+        schedule_runnable_tasks(&state, &permits, &mut runs, &mut run_identities)
+            .await
+            .expect("remote workspace should not abort the local scheduler scan");
+
+        assert!(runs.is_empty());
     }
 
     #[tokio::test]

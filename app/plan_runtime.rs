@@ -375,7 +375,7 @@ pub(crate) fn release_confirmed_plan_derived_effects_without_runners(
 pub(crate) fn reconcile_plan_derived_effects(state: &AppState) -> Result<usize, ApiError> {
     let config = config_snapshot(state)?;
     let mut released = 0;
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         released += release_confirmed_plan_derived_effects(state, workspace)?;
     }
     Ok(released)

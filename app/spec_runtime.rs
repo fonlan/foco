@@ -202,7 +202,7 @@ pub(crate) async fn run_workspace_spec_job(
 
 pub(crate) fn wake_workspace_spec_runners_for_startup(state: &AppState) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         if !workspace_database_path(&workspace.path).exists() {
             continue;
         }

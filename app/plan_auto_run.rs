@@ -84,7 +84,7 @@ pub(crate) async fn dispatch_plan_auto_run(state: &AppState) -> Result<bool, Api
     let config = config_snapshot(state)?;
     let mut dispatched_any = false;
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         for _ in 0..PLAN_AUTO_RUN_SCAN_LIMIT {
             match dispatch_next_plan_auto_run(state, workspace).await? {
                 PlanAutoRunDispatch::Dispatched => dispatched_any = true,

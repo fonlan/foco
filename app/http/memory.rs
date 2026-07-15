@@ -1465,7 +1465,7 @@ fn find_memory_dream_job(
         });
     }
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let database = open_dream_memory_database(
             state,
             config,

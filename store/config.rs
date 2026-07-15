@@ -393,6 +393,12 @@ impl GlobalConfig {
         }
     }
 
+    pub fn local_workspaces(&self) -> impl Iterator<Item = &WorkspaceConfig> {
+        self.workspaces
+            .iter()
+            .filter(|workspace| !workspace.is_remote())
+    }
+
     pub fn resolve_active_model_provider(
         &self,
         model_id: &str,
@@ -3533,6 +3539,34 @@ mod tests {
         assert!(!serialized.contains("apiKey"));
         // Key-mode profiles omit password entirely.
         assert!(!serialized.contains("\"password\""));
+    }
+
+    #[test]
+    fn local_workspaces_excludes_ssh_workspaces() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        config.workspaces.insert(
+            0,
+            WorkspaceConfig {
+                id: "remote".to_string(),
+                name: "Remote".to_string(),
+                path: PathBuf::new(),
+                location: WorkspaceLocation::Ssh {
+                    server_id: "server".to_string(),
+                    remote_path: "/srv/project".to_string(),
+                },
+                pinned: false,
+                terminal_shell: "bash".to_string(),
+                common_commands: Vec::new(),
+            },
+        );
+
+        let workspace_ids = config
+            .local_workspaces()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(workspace_ids, vec![DEFAULT_WORKSPACE_ID]);
     }
 
     #[test]

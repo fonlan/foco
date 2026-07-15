@@ -537,7 +537,7 @@ pub(crate) async fn search_workspace_chats(
     let limit = normalize_workspace_chats_limit(query.limit);
     let mut workspaces = Vec::new();
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         let page = database

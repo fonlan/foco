@@ -852,7 +852,7 @@ fn initialize_workspace_databases_for_startup(
 ) -> Result<usize, WorkspaceDatabaseError> {
     let mut count = 0;
 
-    for workspace in workspaces {
+    for workspace in workspaces.iter().filter(|workspace| !workspace.is_remote()) {
         let started_at = Instant::now();
         tracing::info!(
             workspace_id = %workspace.id,

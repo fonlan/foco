@@ -114,7 +114,7 @@ fn next_scheduled_task_scan_delay(state: &AppState) -> Result<Duration, ApiError
     let now = Utc::now();
     let mut next_run_at: Option<DateTime<Utc>> = None;
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         let Some(value) = database
@@ -156,7 +156,7 @@ pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(),
     let now = Utc::now();
     let now_text = format_utc_timestamp(now);
 
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         for _ in 0..SCHEDULED_TASK_SCAN_LIMIT {
             let task = next_due_task(workspace, now)?;
             let Some(task) = task else {
@@ -231,7 +231,7 @@ async fn reconcile_scheduled_task_runs_for_config(
     state: &AppState,
     config: &GlobalConfig,
 ) -> Result<(), ApiError> {
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let runs = {
             let database = WorkspaceDatabase::open_or_create(&workspace.path)
                 .map_err(ApiError::from_workspace_error)?;
@@ -300,7 +300,7 @@ fn prune_old_scheduled_task_runs(config: &GlobalConfig) -> Result<(), ApiError> 
         .checked_sub_signed(ChronoDuration::days(SCHEDULED_TASK_RUN_RETENTION_DAYS))
         .ok_or_else(|| ApiError::internal("scheduled run retention cutoff overflowed"))?;
     let cutoff = format_utc_timestamp(cutoff);
-    for workspace in &config.workspaces {
+    for workspace in config.local_workspaces() {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         database
