@@ -412,16 +412,7 @@ fn list_local(
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .clamp(1, MAX_LIST_LIMIT);
-    let path = request
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| match root {
-            Some(root) => root.to_path_buf(),
-            None => default_local_path(),
-        });
+    let path = resolve_list_path(request.path.as_deref(), root);
     let path = canonical_path_within(&path, root)?;
     let metadata = fs::metadata(&path)
         .map_err(|source| ApiError::bad_request(format!("path is not readable: {source}")))?;
@@ -630,6 +621,37 @@ fn default_local_path() -> PathBuf {
     home_dir().unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Resolve the initial list path before canonicalization.
+///
+/// Empty/blank path: restricted pickers open `root`; unrestricted pickers open home.
+/// Unrestricted pickers only: expand strict `~` and `~/...` via the process home.
+/// Restricted root mode leaves `~` literal so it cannot escape the workspace boundary.
+fn resolve_list_path(path: Option<&str>, root: Option<&Path>) -> PathBuf {
+    let trimmed = path.map(str::trim).filter(|value| !value.is_empty());
+    match trimmed {
+        None => match root {
+            Some(root) => root.to_path_buf(),
+            None => default_local_path(),
+        },
+        Some(value) if root.is_none() && is_home_shorthand(value) => expand_home_shorthand(value),
+        Some(value) => PathBuf::from(value),
+    }
+}
+
+/// Strict home shorthand: `~` or `~/...` only - not `~user`.
+fn is_home_shorthand(value: &str) -> bool {
+    value == "~" || value.starts_with("~/")
+}
+
+fn expand_home_shorthand(value: &str) -> PathBuf {
+    let home = default_local_path();
+    if value == "~" {
+        return home;
+    }
+    // `~/rest` - join the remainder under home (leading `/` already stripped by prefix).
+    home.join(&value[2..])
+}
+
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -803,6 +825,130 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
         assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
         assert!(error.message().contains("path is outside the allowed root"));
+    }
+
+    #[test]
+    fn unrestricted_tilde_path_opens_home() {
+        let home = default_local_path();
+        let canonical_home = fs::canonicalize(&home).unwrap();
+
+        let response = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Local,
+                path: Some("~".to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.path, canonical_home.display().to_string());
+        assert!(!response.path.contains('~'));
+    }
+
+    #[test]
+    fn unrestricted_tilde_subdir_expands_under_home() {
+        let home = default_local_path();
+        let subdir = temp_picker_dir("tilde-subdir");
+        // Use a unique name under the real home so expansion hits an existing dir.
+        let name = subdir
+            .file_name()
+            .expect("temp dir name")
+            .to_string_lossy()
+            .to_string();
+        let under_home = home.join(&name);
+        let _ = fs::remove_dir_all(&under_home);
+        fs::create_dir_all(&under_home).unwrap();
+        let canonical = fs::canonicalize(&under_home).unwrap();
+
+        let response = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Local,
+                path: Some(format!("~/{name}")),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&under_home);
+        let _ = fs::remove_dir_all(&subdir);
+        assert_eq!(response.path, canonical.display().to_string());
+        assert!(!response.path.starts_with('~'));
+    }
+
+    #[test]
+    fn restricted_root_does_not_expand_tilde_outside_workspace() {
+        let root = temp_picker_dir("restricted-tilde");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let error = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some("~".to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
+        // Must not open process home; literal `~` fails canonicalize or is outside root.
+        assert!(
+            error.status() == axum::http::StatusCode::BAD_REQUEST
+                || error.status() == axum::http::StatusCode::FORBIDDEN
+        );
+        assert!(
+            error.message().contains("path is not readable")
+                || error.message().contains("path is outside the allowed root")
+        );
+    }
+
+    #[test]
+    fn restricted_root_rejects_tilde_subdir_escape() {
+        let root = temp_picker_dir("restricted-tilde-subdir");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let error = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some("~/somewhere".to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            error.status() == axum::http::StatusCode::BAD_REQUEST
+                || error.status() == axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn tilde_user_is_not_treated_as_home_shorthand() {
+        // `~user` must stay literal (not expand), same as remote path rules.
+        assert!(!is_home_shorthand("~user"));
+        assert!(!is_home_shorthand("~user/path"));
+        assert!(is_home_shorthand("~"));
+        assert!(is_home_shorthand("~/a"));
     }
 
     fn temp_picker_dir(label: &str) -> PathBuf {
