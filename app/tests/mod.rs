@@ -1797,6 +1797,30 @@ fn browser_open_addr_uses_loopback_for_unspecified_listen_hosts() {
 }
 
 #[test]
+fn companion_loopback_listen_addr_pairs_ipv4_and_ipv6_loopback() {
+    assert_eq!(
+        companion_loopback_listen_addr(SocketAddr::from(([127, 0, 0, 1], 3210))),
+        Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 3210)))
+    );
+    assert_eq!(
+        companion_loopback_listen_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 3210))),
+        Some(SocketAddr::from(([127, 0, 0, 1], 3210)))
+    );
+    assert_eq!(
+        companion_loopback_listen_addr(SocketAddr::from(([0, 0, 0, 0], 3210))),
+        None
+    );
+    assert_eq!(
+        companion_loopback_listen_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 3210))),
+        None
+    );
+    assert_eq!(
+        companion_loopback_listen_addr(SocketAddr::from(([192, 168, 1, 10], 3210))),
+        None
+    );
+}
+
+#[test]
 fn startup_browser_open_waits_for_bound_listener_and_uses_browser_url() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3210));
     let mut opened_urls = Vec::new();

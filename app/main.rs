@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -751,6 +751,26 @@ async fn run_server_until_shutdown(
         elapsed_ms = bind_started_at.elapsed().as_millis() as u64,
         "HTTP listener bound"
     );
+    // Browsers resolve `*.preview.localhost` (and often `localhost`) with Happy
+    // Eyeballs and may try `::1` first. Default listen is `127.0.0.1` only, so
+    // bind the companion loopback family on the same port when applicable.
+    let companion_listener = match companion_loopback_listen_addr(addr) {
+        Some(companion_addr) => match TcpListener::bind(companion_addr).await {
+            Ok(listener) => {
+                tracing::info!(%companion_addr, "HTTP companion loopback listener bound");
+                Some(listener)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %companion_addr,
+                    error = %error,
+                    "failed to bind companion loopback listener; HTML preview may refuse connections on the other loopback family"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     #[cfg(all(windows, not(debug_assertions)))]
     {
         crate::platform::tray::open_foco_ui_if_listener_bound(
@@ -768,6 +788,26 @@ async fn run_server_until_shutdown(
         "starting local HTTP server"
     );
     println!("Foco is running at http://{addr}");
+    let companion_server_task = companion_listener.map(|companion_listener| {
+        let companion_app = app.clone();
+        let mut companion_shutdown_rx = app_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let result = axum::serve(
+                companion_listener,
+                companion_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                if *companion_shutdown_rx.borrow() {
+                    return;
+                }
+                let _ = companion_shutdown_rx.changed().await;
+            })
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "companion loopback HTTP server failed");
+            }
+        })
+    });
     let server_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -780,6 +820,10 @@ async fn run_server_until_shutdown(
         remote_workspace_manager,
     ))
     .await;
+    if let Some(companion_server_task) = companion_server_task {
+        companion_server_task.abort();
+        let _ = companion_server_task.await;
+    }
     if server_result.is_err() {
         agent_scheduler_task.abort();
         scheduled_task_scheduler_task.abort();
@@ -12226,6 +12270,23 @@ fn local_addr(config: &GlobalConfig) -> Result<SocketAddr, String> {
     };
 
     Ok(SocketAddr::from((host, port)))
+}
+
+/// When the primary listen address is IPv4 loopback (`127.0.0.0/8`), also bind
+/// IPv6 loopback (`::1`) on the same port so hosts that resolve `*.preview.localhost`
+/// / `localhost` to `::1` first can connect. Symmetric for IPv6 loopback.
+/// Unspecified addresses (`0.0.0.0` / `::`) already accept both families on most
+/// platforms and get no companion.
+fn companion_loopback_listen_addr(addr: SocketAddr) -> Option<SocketAddr> {
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => {
+            Some(SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port())))
+        }
+        IpAddr::V6(ip) if ip.is_loopback() => {
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port())))
+        }
+        _ => None,
+    }
 }
 
 fn parse_listen_host(label: &str, value: &str) -> Result<IpAddr, String> {
