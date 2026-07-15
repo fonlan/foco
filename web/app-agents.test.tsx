@@ -2313,4 +2313,339 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("History before agent tab close.")).toBeInTheDocument();
     expect(latestPageLoads).toBeGreaterThanOrEqual(1);
   });
+
+  it("keeps main-chat history across subagent return with disjoint latest page and temporary null activeRun", async () => {
+    const parentActiveRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 0,
+      runId: "run-parent-disjoint",
+      workspaceId: "workspace-1",
+    };
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier main-chat note before worker.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-disjoint",
+      parts: [{ text: "Earlier main-chat note before worker.", type: "text" }],
+    };
+    const newAttemptUser = {
+      content: "Continue after worker completed.",
+      createdAt: "2026-06-10T08:05:00.000Z",
+      extractedMemories: [],
+      id: "message-user-post-worker",
+      memoriesUsed: [],
+      metrics: null,
+      parts: [{ text: "Continue after worker completed.", type: "text" }],
+      reasoning: null,
+      role: "user",
+      toolCalls: [],
+    };
+    let latestPageLoads = 0;
+    let returnToMain = false;
+    const hangingStream = () => {
+      const encoder = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            appTestState.activeChatStreamController = controller;
+            appTestState.chatStreamControllers.set(parentActiveRun.runId, controller);
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "start",
+                  chatId: "chat-1",
+                  userMessageId: "message-user-pre-worker",
+                  assistantMessageId: "message-assistant-pre-worker",
+                  llmRequestId: "request-pre-worker",
+                  memoriesUsed: [],
+                })}\n\n`,
+              ),
+            );
+          },
+        }),
+        {
+          headers: { "Content-Type": "text/event-stream" },
+          status: 200,
+        },
+      );
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const requestUrl = new URL(url, "http://127.0.0.1");
+        const path = requestUrl.pathname;
+
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              {
+                ...workspace,
+                chats: workspaceChats.slice(0, 5).map((chat) =>
+                  chat.id === "chat-1" ? { ...chat, activeRun: parentActiveRun } : chat,
+                ),
+              },
+            ],
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          if (requestUrl.searchParams.get("beforeSequence") === "200") {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: parentActiveRun,
+              messages: [olderMessage],
+              pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+            });
+          }
+          latestPageLoads += 1;
+          // After returning from the worker, the messages API briefly returns only
+          // the new attempt tail with zero id overlap and temporary null activeRun.
+          if (returnToMain) {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: null,
+              messages: [newAttemptUser],
+              pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+            });
+          }
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: parentActiveRun,
+            pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+          });
+        }
+
+        if (path.startsWith("/api/workspaces/workspace-1/chat/runs/run-parent-disjoint/stream")) {
+          return hangingStream();
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(agentTranscriptResponse);
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(await screen.findByText("Earlier main-chat note before worker.")).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.queryByText("Earlier main-chat note before worker.")).not.toBeInTheDocument();
+
+    const loadsBeforeReturn = latestPageLoads;
+    returnToMain = true;
+    await userEvent.click(screen.getByRole("button", { name: "Main chat" }));
+
+    await waitFor(() => expect(latestPageLoads).toBeGreaterThan(loadsBeforeReturn));
+    expect(await screen.findByText("Continue after worker completed.")).toBeInTheDocument();
+    expect(screen.getByText("Earlier main-chat note before worker.")).toBeInTheDocument();
+    expect(screen.getByText("Please inspect README.")).toBeInTheDocument();
+    expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(screen.getAllByText("Earlier main-chat note before worker.")).toHaveLength(1);
+    expect(screen.getAllByText("Please inspect README.")).toHaveLength(1);
+    expect(screen.getAllByText("Continue after worker completed.")).toHaveLength(1);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-post-worker",
+        delta: "Post-worker recovery answer",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("Post-worker recovery answer")).toBeInTheDocument();
+    expect(screen.getByText("Earlier main-chat note before worker.")).toBeInTheDocument();
+    expect(screen.getByText("Please inspect README.")).toBeInTheDocument();
+    expect(screen.getByText("Continue after worker completed.")).toBeInTheDocument();
+    expect(screen.getAllByText("Post-worker recovery answer")).toHaveLength(1);
+  });
+
+  it("does not resurrect deleted history when zero-overlap latest page reports a different activeRun", async () => {
+    const parentActiveRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 0,
+      runId: "run-parent-old-thread",
+      workspaceId: "workspace-1",
+    };
+    const rewrittenActiveRun = {
+      acceptingGuidance: false,
+      chatId: "chat-1",
+      lastSequence: 0,
+      runId: "run-parent-edited-thread",
+      workspaceId: "workspace-1",
+    };
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Deleted main-chat history before edit rewrite.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-edited-away",
+      parts: [{ text: "Deleted main-chat history before edit rewrite.", type: "text" }],
+    };
+    const rewrittenUser = {
+      content: "Edited rewrite prompt after other client.",
+      createdAt: "2026-06-10T08:06:00.000Z",
+      extractedMemories: [],
+      id: "message-user-rewritten",
+      memoriesUsed: [],
+      metrics: null,
+      parts: [{ text: "Edited rewrite prompt after other client.", type: "text" }],
+      reasoning: null,
+      role: "user",
+      toolCalls: [],
+    };
+    let latestPageLoads = 0;
+    let returnToMain = false;
+    const hangingStream = (runId: string) => {
+      const encoder = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            appTestState.activeChatStreamController = controller;
+            appTestState.chatStreamControllers.set(runId, controller);
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "start",
+                  chatId: "chat-1",
+                  userMessageId:
+                    runId === rewrittenActiveRun.runId
+                      ? "message-user-rewritten"
+                      : "message-user-pre-worker",
+                  assistantMessageId:
+                    runId === rewrittenActiveRun.runId
+                      ? "message-assistant-rewritten"
+                      : "message-assistant-pre-worker",
+                  llmRequestId: `request-${runId}`,
+                  memoriesUsed: [],
+                })}\n\n`,
+              ),
+            );
+          },
+        }),
+        {
+          headers: { "Content-Type": "text/event-stream" },
+          status: 200,
+        },
+      );
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const requestUrl = new URL(url, "http://127.0.0.1");
+        const path = requestUrl.pathname;
+
+        if (path === "/api/workspaces") {
+          return jsonResponse({
+            activeWorkspaceId: workspace.id,
+            workspaces: [
+              {
+                ...workspace,
+                chats: workspaceChats.slice(0, 5).map((chat) =>
+                  chat.id === "chat-1"
+                    ? {
+                        ...chat,
+                        activeRun: returnToMain ? rewrittenActiveRun : parentActiveRun,
+                      }
+                    : chat,
+                ),
+              },
+            ],
+          });
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          if (requestUrl.searchParams.get("beforeSequence") === "200") {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: parentActiveRun,
+              messages: [olderMessage],
+              pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+            });
+          }
+          latestPageLoads += 1;
+          // Zero-overlap rewritten thread with a *different* active run id must
+          // not keep the discarded cache history even if this tab still thinks
+          // the old parent run is live.
+          if (returnToMain) {
+            return jsonResponse({
+              ...chatMessages,
+              activeRun: rewrittenActiveRun,
+              messages: [rewrittenUser],
+              pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+            });
+          }
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: parentActiveRun,
+            pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+          });
+        }
+
+        if (path.startsWith("/api/workspaces/workspace-1/chat/runs/run-parent-old-thread/stream")) {
+          return hangingStream(parentActiveRun.runId);
+        }
+        if (path.startsWith("/api/workspaces/workspace-1/chat/runs/run-parent-edited-thread/stream")) {
+          return hangingStream(rewrittenActiveRun.runId);
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(agentTeamSnapshot);
+        }
+
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(agentTranscriptResponse);
+        }
+
+        return mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(
+      await screen.findByText("Deleted main-chat history before edit rewrite."),
+    ).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+    expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
+
+    const loadsBeforeReturn = latestPageLoads;
+    returnToMain = true;
+    await userEvent.click(screen.getByRole("button", { name: "Main chat" }));
+
+    await waitFor(() => expect(latestPageLoads).toBeGreaterThan(loadsBeforeReturn));
+    expect(
+      await screen.findByText("Edited rewrite prompt after other client."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Deleted main-chat history before edit rewrite."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Please inspect README.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Done.")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText("Edited rewrite prompt after other client."),
+    ).toHaveLength(1);
+  });
 });

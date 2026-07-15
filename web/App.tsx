@@ -422,23 +422,88 @@ export function trimInactiveChatMessageCaches(
 
 export type MergeLoadedMessagesResult = {
   messages: ShellMessage[];
+  /** True when older cached history was retained (overlap prefix or active-run disjoint baseline). */
   preservedCachePrefix: boolean;
 };
+
+/**
+ * Options for merging a freshly loaded latest page with the in-memory chat cache.
+ * - preserveStreamingPlaceholders: re-insert local streaming assistants the server
+ *   has not yet returned (requires id continuity unless disjoint active-run preserve).
+ * - preserveDisjointActiveRunCache: when the latest page shares no message ids with
+ *   cache (e.g. coordinator attempt boundary), keep the full cache as history and
+ *   append the server page. Callers must enable this only for the same continuous
+ *   local run via isSameContinuousLocalActiveRun (matching runId, or temporary null
+ *   activeRun while a live local SSE remains open). Ordinary authoritative reloads
+ *   and unrelated/canceled runs must leave this false so edit rewrites / history
+ *   trims do not resurrect deleted threads.
+ */
+export type MergeLoadedMessagesOptions = {
+  preserveStreamingPlaceholders?: boolean;
+  preserveDisjointActiveRunCache?: boolean;
+};
+
+export type ContinuousActiveRunMatchInput = {
+  /** Local chat is marked running with an activeRunInfo entry. */
+  hasLocalActiveRun: boolean;
+  localRunId: string | null;
+  /** Server messages payload activeRun.runId, or null when omitted. */
+  serverActiveRunId: string | null;
+  /**
+   * True when this client still holds a non-aborted SSE AbortController for the
+   * chat. Required to trust a temporary null server activeRun across attempt
+   * boundaries; without it, zero-overlap preserve must not fire (edit rewrites
+   * can cancel the old run and briefly report null before a replacement).
+   */
+  hasOpenLocalStream: boolean;
+};
+
+/**
+ * Decide whether the latest-page load is still the same continuous local run.
+ * Used for zero-overlap cache retention and streaming-placeholder preserve.
+ *
+ * - Matching non-null server runId proves continuity even mid-reconnect.
+ * - Temporary null server activeRun is only continuous when this client still
+ *   has a live local stream for the recorded run (Coordinator handoff gap).
+ * - A different server runId is never continuous with the local cache thread.
+ */
+export function isSameContinuousLocalActiveRun(
+  input: ContinuousActiveRunMatchInput,
+): boolean {
+  if (!input.hasLocalActiveRun || !input.localRunId) {
+    return false;
+  }
+  if (input.serverActiveRunId != null) {
+    return input.serverActiveRunId === input.localRunId;
+  }
+  return input.hasOpenLocalStream;
+}
 
 /**
  * Merge a freshly loaded latest page with the in-memory chat cache.
  * - When cache and loaded page share a stable message id, keep the cache prefix
  *   before that overlap and let the server page replace the overlap and suffix.
- * - When there is no overlap, drop unprovable cache history (edit rewrite / trim)
- *   and do not re-insert streaming bubbles from the discarded thread.
+ * - When there is no overlap and preserveDisjointActiveRunCache is false, drop
+ *   unprovable cache history (edit rewrite / trim) and do not re-insert streaming
+ *   bubbles from the discarded thread.
+ * - When there is no overlap and preserveDisjointActiveRunCache is true, keep the
+ *   full cache as the history baseline, overlay same-id server versions, and append
+ *   server-only messages in server order.
  * - When preserveStreamingPlaceholders is true and there is id continuity with
  *   the cache, re-insert streaming assistants the server has not yet returned.
  */
 export function mergeLoadedMessagesWithStreamingPlaceholders(
   loadedMessages: ShellMessage[],
   cachedMessages: ShellMessage[],
-  preserveStreamingPlaceholders: boolean,
+  options: boolean | MergeLoadedMessagesOptions = false,
 ): MergeLoadedMessagesResult {
+  const {
+    preserveStreamingPlaceholders = false,
+    preserveDisjointActiveRunCache = false,
+  } = typeof options === "boolean"
+    ? { preserveStreamingPlaceholders: options, preserveDisjointActiveRunCache: false }
+    : options;
+
   if (!cachedMessages.length) {
     return { messages: loadedMessages, preservedCachePrefix: false };
   }
@@ -455,15 +520,34 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
     }
   }
 
-  const preservedPrefix =
-    cacheOverlapStart > 0 ? cachedMessages.slice(0, cacheOverlapStart) : [];
-  const preservedCachePrefix = preservedPrefix.length > 0;
-  let nextMessages =
-    preservedCachePrefix || cacheOverlapStart === 0
-      ? [...preservedPrefix, ...loadedMessages]
-      : [...loadedMessages];
+  let nextMessages: ShellMessage[];
+  let preservedCachePrefix: boolean;
 
-  // No id continuity with cache: do not resurrect history or orphan streaming.
+  if (cacheOverlapStart < 0 && preserveDisjointActiveRunCache) {
+    // Active continuous refresh with a momentarily disjoint latest page:
+    // cache is the history baseline; server page is the authoritative tail.
+    const cachedIds = new Set(cachedMessages.map((message) => message.id));
+    const serverById = new Map(
+      loadedMessages.map((message) => [message.id, message]),
+    );
+    nextMessages = [
+      ...cachedMessages.map((message) => serverById.get(message.id) ?? message),
+      ...loadedMessages.filter((message) => !cachedIds.has(message.id)),
+    ];
+    preservedCachePrefix = true;
+  } else {
+    const preservedPrefix =
+      cacheOverlapStart > 0 ? cachedMessages.slice(0, cacheOverlapStart) : [];
+    preservedCachePrefix = preservedPrefix.length > 0;
+    nextMessages =
+      preservedCachePrefix || cacheOverlapStart === 0
+        ? [...preservedPrefix, ...loadedMessages]
+        : [...loadedMessages];
+  }
+
+  // No id continuity with cache: do not resurrect orphan streaming from a
+  // discarded thread. Disjoint active-run preserve already kept the full cache
+  // (including any live streaming bubble) above.
   if (!preserveStreamingPlaceholders || cacheOverlapStart < 0) {
     return { messages: nextMessages, preservedCachePrefix };
   }
@@ -5886,14 +5970,36 @@ export function App() {
       const localRunInfo = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
       const hasLocalActiveRun =
         Boolean(localRunInfo) && runningChatKeysRef.current.has(chatKey);
-      // Preserve local streaming even when the messages API omits activeRun
-      // (e.g. subagent return window) or run summary fields are incomplete.
+      const localStreamController = activeRunAbortByChatKeyRef.current.get(chatKey);
+      const hasOpenLocalStream = Boolean(
+        localStreamController && !localStreamController.signal.aborted,
+      );
+      // Same continuous local run only: matching server runId, or temporary
+      // null activeRun while this client still holds a live SSE for that run.
+      // A different server runId, or null without an open local stream, must
+      // not keep zero-overlap cache (edit rewrites / canceled replacements).
+      const sameContinuousLocalRun = isSameContinuousLocalActiveRun({
+        hasLocalActiveRun,
+        hasOpenLocalStream,
+        localRunId: localRunInfo?.runId ?? null,
+        serverActiveRunId: activeRun?.runId ?? null,
+      });
+      // Zero-overlap history baseline only for the same continuous local run
+      // (subagent return / new attempt tail). Not for arbitrary activeRun.
+      const preserveDisjointActiveRunCache = sameContinuousLocalRun;
+      // Live streaming bubbles: same continuous local run, or re-attach when
+      // this client has no local run but the server reports one (id-overlap
+      // path only re-inserts placeholders; zero-overlap still drops orphans).
       const preserveStreamingPlaceholders =
-        Boolean(activeRun) || hasLocalActiveRun;
+        sameContinuousLocalRun ||
+        (!hasLocalActiveRun && Boolean(activeRun));
       const mergeResult = mergeLoadedMessagesWithStreamingPlaceholders(
         normalizedMessages,
         cachedMessages,
-        preserveStreamingPlaceholders,
+        {
+          preserveDisjointActiveRunCache,
+          preserveStreamingPlaceholders,
+        },
       );
       const nextMessages = preserveCachedReasoningDurations(
         mergeResult.messages,

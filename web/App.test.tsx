@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
@@ -213,6 +213,68 @@ describe("normalizeChatMessageSummary", () => {
   });
 });
 
+describe("isSameContinuousLocalActiveRun", () => {
+  it("requires a local active run with a recorded run id", () => {
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: false,
+        hasOpenLocalStream: true,
+        localRunId: "run-a",
+        serverActiveRunId: null,
+      }),
+    ).toBe(false);
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: true,
+        hasOpenLocalStream: true,
+        localRunId: null,
+        serverActiveRunId: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("matches when the server reports the same run id", () => {
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: true,
+        hasOpenLocalStream: false,
+        localRunId: "run-a",
+        serverActiveRunId: "run-a",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a different server run id even with an open local stream", () => {
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: true,
+        hasOpenLocalStream: true,
+        localRunId: "run-a",
+        serverActiveRunId: "run-b",
+      }),
+    ).toBe(false);
+  });
+
+  it("trusts temporary null server activeRun only while a local stream is open", () => {
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: true,
+        hasOpenLocalStream: true,
+        localRunId: "run-a",
+        serverActiveRunId: null,
+      }),
+    ).toBe(true);
+    expect(
+      isSameContinuousLocalActiveRun({
+        hasLocalActiveRun: true,
+        hasOpenLocalStream: false,
+        localRunId: "run-a",
+        serverActiveRunId: null,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
   it("keeps a cached streaming assistant placeholder after its loaded user message", () => {
     const loadedUser = { ...message("user-1"), role: "user" as const };
@@ -333,6 +395,158 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     expect(result.messages).toEqual(rewritten);
     expect(result.messages.map((item) => item.id)).not.toContain("assistant-stream");
     expect(result.messages.map((item) => item.id)).not.toContain("old-1");
+  });
+
+  it("keeps cache history and appends server tail on active-run disjoint refresh", () => {
+    const older = [
+      { ...message("old-1"), role: "user" as const, content: "Earlier note." },
+      { ...message("old-2"), content: "Earlier answer." },
+    ];
+    const previousAttempt = [
+      { ...message("user-1"), role: "user" as const, content: "Please inspect README." },
+      { ...message("assistant-1"), content: "Done." },
+    ];
+    const newAttemptTail = [
+      { ...message("user-2"), role: "user" as const, content: "Continue after worker." },
+      { ...message("assistant-2"), content: "Recovered answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      newAttemptTail,
+      [...older, ...previousAttempt],
+      {
+        preserveDisjointActiveRunCache: true,
+        preserveStreamingPlaceholders: true,
+      },
+    );
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "old-2",
+      "user-1",
+      "assistant-1",
+      "user-2",
+      "assistant-2",
+    ]);
+    expect(result.messages[0]?.content).toBe("Earlier note.");
+    expect(result.messages[4]?.content).toBe("Continue after worker.");
+    expect(result.messages[5]?.content).toBe("Recovered answer.");
+  });
+
+  it("lets server versions override same ids when preserving cache (overlap prefix path)", () => {
+    // Overlap on user-2 uses the prefix-preserve branch; server page replaces
+    // the overlapping suffix while older cache prefix is kept.
+    const cache = [
+      { ...message("old-1"), role: "user" as const, content: "Earlier note." },
+      { ...message("user-2"), role: "user" as const, content: "Continue (local)." },
+    ];
+    const loaded = [
+      { ...message("user-2"), role: "user" as const, content: "Continue (server)." },
+      { ...message("assistant-2"), content: "Recovered answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(loaded, cache, {
+      preserveDisjointActiveRunCache: true,
+      preserveStreamingPlaceholders: true,
+    });
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "user-2",
+      "assistant-2",
+    ]);
+    expect(result.messages[1]?.content).toBe("Continue (server).");
+    expect(result.messages.filter((item) => item.id === "user-2")).toHaveLength(1);
+  });
+
+  it("appends only server-only messages without duplicates on pure zero-overlap preserve", () => {
+    const cache = [
+      { ...message("old-1"), role: "user" as const, content: "Earlier note." },
+      { ...message("assistant-old"), content: "Earlier answer (local)." },
+    ];
+    const loaded = [
+      { ...message("user-new"), role: "user" as const, content: "New attempt user." },
+      { ...message("assistant-new"), content: "New attempt answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(loaded, cache, {
+      preserveDisjointActiveRunCache: true,
+      preserveStreamingPlaceholders: true,
+    });
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "assistant-old",
+      "user-new",
+      "assistant-new",
+    ]);
+    expect(result.messages[0]?.content).toBe("Earlier note.");
+    expect(result.messages[1]?.content).toBe("Earlier answer (local).");
+    expect(result.messages[2]?.content).toBe("New attempt user.");
+  });
+
+  it("keeps streaming placeholder without duplicates on active-run disjoint refresh", () => {
+    const older = { ...message("old-1"), role: "user" as const, content: "Earlier note." };
+    const previousUser = {
+      ...message("user-1"),
+      role: "user" as const,
+      content: "Please inspect README.",
+    };
+    const placeholder = {
+      ...message("assistant-stream"),
+      status: "streaming" as const,
+      content: "Thinking…",
+      parts: [
+        { text: "Reasoning live", type: "reasoning" as const, liveDurationMs: 1500 },
+        { text: "Partial answer", type: "text" as const },
+      ],
+    };
+    const newAttemptUser = {
+      ...message("user-2"),
+      role: "user" as const,
+      content: "Continue after worker.",
+    };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [newAttemptUser],
+      [older, previousUser, placeholder],
+      {
+        preserveDisjointActiveRunCache: true,
+        preserveStreamingPlaceholders: true,
+      },
+    );
+
+    expect(result.preservedCachePrefix).toBe(true);
+    expect(result.messages.map((item) => item.id)).toEqual([
+      "old-1",
+      "user-1",
+      "assistant-stream",
+      "user-2",
+    ]);
+    expect(result.messages[2]).toBe(placeholder);
+    expect(result.messages.filter((item) => item.id === "assistant-stream")).toHaveLength(1);
+  });
+
+  it("drops cache history on ordinary zero-overlap even when only streaming preserve is true", () => {
+    const staleCache = [
+      { ...message("old-1"), role: "user" as const, content: "Deleted history." },
+      { ...message("old-2"), content: "Also deleted." },
+    ];
+    const rewritten = [
+      { ...message("new-user"), role: "user" as const, content: "Rewritten prompt." },
+      { ...message("new-assistant"), content: "Rewritten answer." },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(rewritten, staleCache, {
+      preserveDisjointActiveRunCache: false,
+      preserveStreamingPlaceholders: true,
+    });
+
+    expect(result.preservedCachePrefix).toBe(false);
+    expect(result.messages).toEqual(rewritten);
   });
 
   it("keeps a local streaming assistant when preserveStreaming is true and ids overlap", () => {
