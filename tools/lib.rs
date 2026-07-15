@@ -67,9 +67,9 @@ pub const AGENT_WAIT_TASKS_TOOL: &str = "agent_wait_tasks";
 pub const AGENT_TRANSFER_TASK_TOOL: &str = "agent_transfer_task";
 pub const AGENT_CREATE_INSTANCES_TOOL: &str = "agent_create_instances";
 
-const MAX_FULL_READ_BYTES: u64 = 1024 * 1024;
+const MAX_FULL_READ_BYTES: u64 = 128 * 1024;
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_RANGED_READ_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_RANGED_READ_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FIND_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_TEXT_LINE_BYTES: usize = 4 * 1024;
@@ -1221,14 +1221,18 @@ mod tests {
         );
 
         assert!(result.is_error);
+        let error = result
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(error.contains("too large to read"), "{error}");
         assert!(
-            result
-                .output
-                .get("error")
-                .and_then(Value::as_str)
-                .expect("error")
-                .contains("too large to read")
+            error.contains(&format!("max {MAX_FULL_READ_BYTES}")),
+            "{error}"
         );
+        assert!(error.contains("startLine/endLine"), "{error}");
+        assert!(error.contains("large.txt"), "{error}");
     }
 
     #[test]
@@ -1269,14 +1273,18 @@ mod tests {
         );
 
         assert!(result.is_error);
+        let error = result
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(error.contains("line range output is too large"), "{error}");
         assert!(
-            result
-                .output
-                .get("error")
-                .and_then(Value::as_str)
-                .expect("error")
-                .contains("line range output is too large")
+            error.contains(&format!("max {MAX_RANGED_READ_OUTPUT_BYTES}")),
+            "{error}"
         );
+        assert!(error.contains("startLine/endLine"), "{error}");
+        assert!(error.contains("large-line.txt"), "{error}");
     }
 
     #[test]
@@ -1419,6 +1427,39 @@ mod tests {
             assert!(description.contains("1 to 10"));
             assert!(description.contains("defaults to 10"));
         }
+    }
+
+    #[test]
+    fn read_file_schema_documents_128kib_output_limits() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == READ_FILE_TOOL)
+            .expect("read_file definition");
+        assert!(
+            definition.description.contains("128KiB"),
+            "{}",
+            definition.description
+        );
+        assert!(
+            definition.description.contains("fail") || definition.description.contains("fails"),
+            "{}",
+            definition.description
+        );
+        let start_description = definition.input_schema["properties"]["startLine"]["description"]
+            .as_str()
+            .expect("startLine description");
+        let end_description = definition.input_schema["properties"]["endLine"]["description"]
+            .as_str()
+            .expect("endLine description");
+        assert!(start_description.contains("128KiB"), "{start_description}");
+        assert!(end_description.contains("128KiB"), "{end_description}");
+    }
+
+    #[test]
+    fn read_file_output_limits_are_128kib() {
+        assert_eq!(MAX_FULL_READ_BYTES, 128 * 1024);
+        assert_eq!(MAX_RANGED_READ_OUTPUT_BYTES, 128 * 1024);
+        assert_eq!(MAX_RANGED_READ_SOURCE_BYTES, 32 * 1024 * 1024);
     }
 
     #[test]

@@ -96,7 +96,8 @@ fn read_file_inner(
     let content = numbered_content(&content, content_start_line);
     if line_range.is_some() && content.len() > MAX_RANGED_READ_OUTPUT_BYTES {
         return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}); use a smaller line range",
+            "read_file path '{}' line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}). Retry with a smaller startLine/endLine range.",
+            request.path,
             content.len()
         )));
     }

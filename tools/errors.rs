@@ -215,7 +215,7 @@ impl fmt::Display for ToolRuntimeError {
                 max_bytes,
             } => write!(
                 formatter,
-                "{} is too large to read ({bytes} bytes; max {max_bytes})",
+                "{} is too large to read ({bytes} bytes; max {max_bytes}). Retry read_file with a smaller 1-based inclusive startLine/endLine range, or read a smaller segment.",
                 path.display()
             ),
             Self::InvalidArguments(message) => write!(formatter, "{message}"),

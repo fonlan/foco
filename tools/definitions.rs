@@ -45,7 +45,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
+        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. Full reads and line-range outputs are hard-capped at about 128KiB (131072 bytes); larger results fail with path/bytes/max guidance instead of truncating. Prefer smaller startLine/endLine ranges and retry if the tool reports the output is too large. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -56,11 +56,11 @@ fn read_file_definition() -> ToolDefinition {
                 },
                 "startLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based first line to read. Must be null when endLine is null."
+                    "description": "Optional 1-based first line to read. Must be null when endLine is null. Use a smaller range when a full read or previous range exceeds the ~128KiB output limit."
                 },
                 "endLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null."
+                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null. Keep ranges small enough that the numbered output stays under ~128KiB."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
