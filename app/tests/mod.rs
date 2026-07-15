@@ -1033,6 +1033,7 @@ fn test_prepared_chat_context(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        last_chat_completion_input_tokens: None,
     }
 }
 
@@ -5457,6 +5458,149 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
         .expect_err("llm compression branch should try the provider");
 
     assert!(error.message().contains("API key"));
+    assert!(context.compression_snapshots.is_empty());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn should_trigger_normal_llm_context_compression_uses_local_or_provider_gate() {
+    let window = 10_000_u64;
+    let trigger = crate::prompt::llm_context_compression_trigger_tokens(window);
+    assert_eq!(trigger, 9_500);
+
+    assert!(
+        !crate::prompt::should_trigger_normal_llm_context_compression(trigger - 1, None, window,)
+    );
+    assert!(
+        !crate::prompt::should_trigger_normal_llm_context_compression(
+            trigger - 1,
+            Some(trigger - 1),
+            window,
+        )
+    );
+    assert!(crate::prompt::should_trigger_normal_llm_context_compression(trigger, None, window,));
+    assert!(
+        crate::prompt::should_trigger_normal_llm_context_compression(
+            trigger - 1,
+            Some(trigger),
+            window,
+        )
+    );
+    assert!(
+        crate::prompt::should_trigger_normal_llm_context_compression(
+            trigger,
+            Some(trigger),
+            window,
+        )
+    );
+}
+
+#[test]
+fn llm_context_compression_trigger_source_labels_local_provider_or_both() {
+    let window = 1_000_u64;
+    let trigger = crate::prompt::llm_context_compression_trigger_tokens(window);
+    assert_eq!(
+        crate::prompt::llm_context_compression_trigger_source(trigger - 1, None, window),
+        None
+    );
+    assert_eq!(
+        crate::prompt::llm_context_compression_trigger_source(trigger, None, window),
+        Some("localEstimate")
+    );
+    assert_eq!(
+        crate::prompt::llm_context_compression_trigger_source(trigger - 1, Some(trigger), window),
+        Some("providerInput")
+    );
+    assert_eq!(
+        crate::prompt::llm_context_compression_trigger_source(trigger, Some(trigger), window),
+        Some("both")
+    );
+}
+
+#[test]
+fn record_chat_completion_input_tokens_keeps_positive_chat_completion_only() {
+    let mut last = None;
+    crate::prompt::record_chat_completion_input_tokens(&mut last, None);
+    assert_eq!(last, None);
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(0));
+    assert_eq!(last, None);
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(-1));
+    assert_eq!(last, None);
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(950));
+    assert_eq!(last, Some(950));
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(120));
+    assert_eq!(last, Some(120));
+}
+
+#[tokio::test]
+async fn ensure_context_compression_reaches_llm_branch_from_provider_input_below_local_95() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-provider-input-compression-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut messages = vec![neutral_text_message(
+        NeutralChatRole::System,
+        "system".to_string(),
+    )];
+    let mut sequences = vec![None];
+    let mut sources = vec![PromptContextSource::ReservedPrompt];
+    // Same shape as the below-threshold skip test: local estimate stays under 95%.
+    for sequence in 0..6 {
+        messages.push(neutral_text_message(
+            NeutralChatRole::Assistant,
+            "h".repeat(560),
+        ));
+        sequences.push(Some(sequence));
+        sources.push(PromptContextSource::StoredMessage { sequence });
+    }
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
+    context.provider_config.api_key = None;
+    context.active_tool_start_index = context.provider_request.messages.len();
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!((800..950).contains(&total_used_context_tokens));
+    context.last_chat_completion_input_tokens = Some(950);
+
+    let error = ensure_context_compression(&mut context)
+        .await
+        .expect_err("provider input >= 95% should force llm compression");
+
+    assert!(error.message().contains("API key"));
+    assert!(context.compression_snapshots.is_empty());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn ensure_context_compression_skips_when_provider_input_below_threshold() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-provider-input-no-compression-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut messages = vec![neutral_text_message(
+        NeutralChatRole::System,
+        "system".to_string(),
+    )];
+    let mut sequences = vec![None];
+    let mut sources = vec![PromptContextSource::ReservedPrompt];
+    for sequence in 0..6 {
+        messages.push(neutral_text_message(
+            NeutralChatRole::Assistant,
+            "h".repeat(560),
+        ));
+        sequences.push(Some(sequence));
+        sources.push(PromptContextSource::StoredMessage { sequence });
+    }
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
+    context.active_tool_start_index = context.provider_request.messages.len();
+    let total_used_context_tokens = prepared_context_total_used_tokens(&context);
+    assert!((800..950).contains(&total_used_context_tokens));
+    context.last_chat_completion_input_tokens = Some(949);
+
+    let result = ensure_context_compression(&mut context)
+        .await
+        .expect("context compression");
+
+    assert!(!result.runtime_tool_state_compressed);
+    assert!(result.events.is_empty());
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -12083,6 +12227,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -13875,6 +14020,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -14282,6 +14428,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),

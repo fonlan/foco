@@ -16,11 +16,13 @@ pub(crate) use compression::{
     context_usage_response, context_usage_segments, context_usage_segments_total,
     context_window_compression_trigger_tokens, effective_context_compression_system_prompt,
     ensure_context_compression, interleaved_tool_state_messages,
-    llm_context_compression_group_indices, llm_context_compression_trigger_tokens,
-    neutral_assistant_tool_call_message, neutral_message_estimated_tokens,
-    neutral_tool_call_from_record, pack_neutral_messages, persist_chat_result,
-    persist_running_llm_request, plan_context_compression_checkpoint_chunks,
-    plan_llm_context_compression, recover_after_tool_round_cap, snapshot_covered_sequences,
+    llm_context_compression_group_indices, llm_context_compression_trigger_source,
+    llm_context_compression_trigger_tokens, neutral_assistant_tool_call_message,
+    neutral_message_estimated_tokens, neutral_tool_call_from_record, pack_neutral_messages,
+    persist_chat_result, persist_running_llm_request, plan_context_compression_checkpoint_chunks,
+    plan_llm_context_compression, record_chat_completion_input_tokens,
+    recover_after_tool_round_cap, should_trigger_normal_llm_context_compression,
+    snapshot_covered_sequences,
 };
 #[cfg(test)]
 pub(crate) use compression::{

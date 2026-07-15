@@ -130,8 +130,8 @@ use crate::prompt::{
     context_window_compression_trigger_tokens, ensure_context_compression,
     environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
-    persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
-    system_prompt_summaries, tool_prompt_infos,
+    persist_running_llm_request, prepare_prompt_context, record_chat_completion_input_tokens,
+    recover_after_tool_round_cap, system_prompt_summaries, tool_prompt_infos,
 };
 #[cfg(all(test, windows))]
 pub(crate) use crate::runtime::find_system_ripgrep;
@@ -2172,6 +2172,9 @@ struct PreparedChatContext {
     /// the `## Skills` routing table). Prefer this over `config.skills.detected`
     /// so tool read grants stay aligned with live discovery + disable filters.
     skill_read_root_dirs: Vec<PathBuf>,
+    /// Last chat-completion provider `input_tokens` in this run (memory only).
+    /// Used as a second Normal (95%) LLM checkpoint gate when local estimate lags.
+    last_chat_completion_input_tokens: Option<u64>,
 }
 
 struct PreparedPromptContext {
@@ -3866,6 +3869,10 @@ impl PreparedChatContext {
                                         return;
                                     }
                                     self.captured_llm_requests.push(completed_turn_request);
+                                    record_chat_completion_input_tokens(
+                                        &mut self.last_chat_completion_input_tokens,
+                                        usage.as_ref().and_then(|usage| usage.input_tokens),
+                                    );
                                     let turn_metrics = turn_reply_metrics(
                                         &self.model_id,
                                         &self.provider_id,
@@ -5031,6 +5038,7 @@ async fn prepare_chat_context_for_output(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval,
         skill_read_root_dirs: prompt_context.skill_read_root_dirs,
+        last_chat_completion_input_tokens: None,
     })
 }
 

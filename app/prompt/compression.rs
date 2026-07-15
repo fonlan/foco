@@ -138,15 +138,18 @@ pub(crate) async fn ensure_context_compression(
     )?;
     let segments = context_usage_segments(&context.context_budget, &message_groups);
     let total_used_context_tokens = context_usage_segments_total(&segments);
-    if total_used_context_tokens
-        >= llm_context_compression_trigger_tokens(context.context_budget.context_window)
-        && ensure_llm_context_compression(
-            context,
-            &message_groups,
-            &mut events,
-            LlmContextCompressionMode::Normal,
-        )
-        .await?
+    if should_trigger_normal_llm_context_compression(
+        total_used_context_tokens,
+        context.last_chat_completion_input_tokens,
+        context.context_budget.context_window,
+    ) && ensure_llm_context_compression(
+        context,
+        &message_groups,
+        &mut events,
+        LlmContextCompressionMode::Normal,
+        total_used_context_tokens,
+    )
+    .await?
     {
         return Ok(ContextCompressionResult {
             active_tool_start_index: context.active_tool_start_index,
@@ -177,6 +180,7 @@ pub(crate) async fn ensure_context_compression(
                 &message_groups,
                 &mut events,
                 LlmContextCompressionMode::RequiredOverflow,
+                total_used_context_tokens,
             )
             .await?
         {
@@ -405,6 +409,7 @@ async fn ensure_llm_context_compression(
     message_groups: &[ContextMessageGroup],
     events: &mut Vec<ContextCompressionEventDetail>,
     mode: LlmContextCompressionMode,
+    local_total_used_tokens: u64,
 ) -> Result<bool, ApiError> {
     let Some(plan) = plan_llm_context_compression(
         &context.provider_request.messages,
@@ -484,6 +489,23 @@ async fn ensure_llm_context_compression(
         return Ok(false);
     }
 
+    let mut snapshot_metadata = json!({
+        "kind": CONTEXT_COMPRESSION_KIND_LLM,
+        "coveredSequences": covered_sequences,
+        "coveredSnapshotIds": covered_snapshot_ids,
+        "supersededSnapshotIds": covered_snapshot_ids,
+        "triggerTokens": llm_context_compression_trigger_tokens(context.context_budget.context_window),
+        "availableMessageTokens": context.context_budget.available_message_tokens
+    });
+    if matches!(mode, LlmContextCompressionMode::Normal)
+        && let Some(trigger_source) = llm_context_compression_trigger_source(
+            local_total_used_tokens,
+            context.last_chat_completion_input_tokens,
+            context.context_budget.context_window,
+        )
+    {
+        snapshot_metadata["triggerSource"] = json!(trigger_source);
+    }
     let snapshot = persist_context_compression_snapshot(
         context,
         &covered_indices,
@@ -491,14 +513,7 @@ async fn ensure_llm_context_compression(
         original_tokens,
         summary_token_count,
         CONTEXT_COMPRESSION_KIND_LLM,
-        json!({
-            "kind": CONTEXT_COMPRESSION_KIND_LLM,
-            "coveredSequences": covered_sequences,
-            "coveredSnapshotIds": covered_snapshot_ids,
-            "supersededSnapshotIds": covered_snapshot_ids,
-            "triggerTokens": llm_context_compression_trigger_tokens(context.context_budget.context_window),
-            "availableMessageTokens": context.context_budget.available_message_tokens
-        }),
+        snapshot_metadata,
     )?;
     // A full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
     context.runtime_tool_state_compression_count = 0;
@@ -3351,6 +3366,51 @@ pub(crate) fn context_window_compression_trigger_tokens(context_window: u64) -> 
 
 pub(crate) fn llm_context_compression_trigger_tokens(context_window: u64) -> u64 {
     context_window.saturating_mul(19) / 20
+}
+
+/// Dual-source Normal (95%) LLM checkpoint gate: local heuristic total OR last chat-completion
+/// provider `input_tokens`. Shared by local and remote ensure paths.
+pub(crate) fn should_trigger_normal_llm_context_compression(
+    local_total_used_tokens: u64,
+    last_chat_completion_input_tokens: Option<u64>,
+    context_window: u64,
+) -> bool {
+    let trigger = llm_context_compression_trigger_tokens(context_window);
+    local_total_used_tokens >= trigger
+        || last_chat_completion_input_tokens.is_some_and(|tokens| tokens >= trigger)
+}
+
+/// Metadata label for which Normal gate fired. Returns `None` when neither source is at threshold
+/// (should not happen on the Normal path after the gate check).
+pub(crate) fn llm_context_compression_trigger_source(
+    local_total_used_tokens: u64,
+    last_chat_completion_input_tokens: Option<u64>,
+    context_window: u64,
+) -> Option<&'static str> {
+    let trigger = llm_context_compression_trigger_tokens(context_window);
+    let local = local_total_used_tokens >= trigger;
+    let provider = last_chat_completion_input_tokens.is_some_and(|tokens| tokens >= trigger);
+    match (local, provider) {
+        (true, true) => Some("both"),
+        (true, false) => Some("localEstimate"),
+        (false, true) => Some("providerInput"),
+        (false, false) => None,
+    }
+}
+
+/// Record provider-reported chat-completion input tokens for the next Normal compression gate.
+/// Ignores non-positive values; does not clear on compression success (next chat completion overwrites).
+pub(crate) fn record_chat_completion_input_tokens(
+    last_chat_completion_input_tokens: &mut Option<u64>,
+    input_tokens: Option<i64>,
+) {
+    let Some(tokens) = input_tokens.filter(|tokens| *tokens > 0) else {
+        return;
+    };
+    let Ok(tokens) = u64::try_from(tokens) else {
+        return;
+    };
+    *last_chat_completion_input_tokens = Some(tokens);
 }
 
 pub(crate) struct ContextUsageInput<'a> {

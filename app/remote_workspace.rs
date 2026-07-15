@@ -98,9 +98,10 @@ use crate::{
         context_compression_summary_has_benefit, context_message_groups, context_token_breakdown,
         context_usage_response, context_usage_segments, context_usage_segments_total,
         environment_context_message, insert_context_compression_snapshot_record,
-        llm_context_compression_trigger_tokens, pack_neutral_messages,
-        plan_llm_context_compression, plan_mode_builtin_tool_allowed,
-        prepare_context_compression_snapshot, tool_prompt_infos,
+        llm_context_compression_trigger_source, llm_context_compression_trigger_tokens,
+        pack_neutral_messages, plan_llm_context_compression, plan_mode_builtin_tool_allowed,
+        prepare_context_compression_snapshot, record_chat_completion_input_tokens,
+        should_trigger_normal_llm_context_compression, tool_prompt_infos,
     },
     runtime::{
         BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
@@ -198,6 +199,8 @@ struct RemoteSidecarRuntimeToolState {
     compression_enabled: bool,
     /// Active (non-superseded) compression snapshots loaded from / written to the remote workspace DB.
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
+    /// Last chat-completion provider `input_tokens` in this run (memory only).
+    last_chat_completion_input_tokens: Option<u64>,
 }
 
 /// Run-scoped tool routing snapshot shared by prompt assembly and execution.
@@ -263,6 +266,7 @@ impl RemoteSidecarRuntimeToolState {
             context_budget: prepared.context_budget.clone(),
             compression_enabled: prepared.compression_enabled,
             compression_snapshots: prepared.compression_snapshots.clone(),
+            last_chat_completion_input_tokens: None,
         }
     }
 
@@ -432,15 +436,18 @@ impl RemoteSidecarRuntimeToolState {
         )?;
         let segments = context_usage_segments(&self.context_budget, &message_groups);
         let total_used_context_tokens = context_usage_segments_total(&segments);
-        if total_used_context_tokens
-            >= llm_context_compression_trigger_tokens(self.context_budget.context_window)
-        {
+        if should_trigger_normal_llm_context_compression(
+            total_used_context_tokens,
+            self.last_chat_completion_input_tokens,
+            self.context_budget.context_window,
+        ) {
             let applied = self
                 .ensure_llm_context_compression(
                     messages,
                     &message_groups,
                     &mut events,
                     LlmContextCompressionMode::Normal,
+                    total_used_context_tokens,
                     state,
                     run_stream,
                     database,
@@ -484,6 +491,7 @@ impl RemoteSidecarRuntimeToolState {
                         &message_groups,
                         &mut events,
                         LlmContextCompressionMode::RequiredOverflow,
+                        total_used_context_tokens,
                         state,
                         run_stream,
                         database,
@@ -548,6 +556,7 @@ impl RemoteSidecarRuntimeToolState {
         message_groups: &[crate::ContextMessageGroup],
         events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
         mode: LlmContextCompressionMode,
+        local_total_used_tokens: u64,
         state: &RemoteSidecarState,
         run_stream: &RemoteActiveRunStream,
         database: &mut WorkspaceDatabase,
@@ -684,14 +693,26 @@ impl RemoteSidecarRuntimeToolState {
             return Ok(false);
         }
 
-        let metadata = json!({
-            "kind": CONTEXT_COMPRESSION_KIND_LLM,
-            "coveredSequences": covered_sequences,
-            "coveredSnapshotIds": covered_snapshot_ids,
-            "supersededSnapshotIds": covered_snapshot_ids,
-            "triggerTokens": llm_context_compression_trigger_tokens(self.context_budget.context_window),
-            "availableMessageTokens": self.context_budget.available_message_tokens,
-        });
+        let metadata = {
+            let mut metadata = json!({
+                "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                "coveredSequences": covered_sequences,
+                "coveredSnapshotIds": covered_snapshot_ids,
+                "supersededSnapshotIds": covered_snapshot_ids,
+                "triggerTokens": llm_context_compression_trigger_tokens(self.context_budget.context_window),
+                "availableMessageTokens": self.context_budget.available_message_tokens,
+            });
+            if matches!(mode, LlmContextCompressionMode::Normal)
+                && let Some(trigger_source) = llm_context_compression_trigger_source(
+                    local_total_used_tokens,
+                    self.last_chat_completion_input_tokens,
+                    self.context_budget.context_window,
+                )
+            {
+                metadata["triggerSource"] = json!(trigger_source);
+            }
+            metadata
+        };
         let prepared = prepare_context_compression_snapshot(
             chat_id,
             run_id,
@@ -10855,6 +10876,8 @@ enum RemoteSidecarBrokerLlmTurnOutcome {
     Completed {
         tool_calls: Option<Vec<NeutralToolCall>>,
         resolved_provider_id: String,
+        /// Provider-reported input tokens for this chat-completion turn only.
+        turn_input_tokens: Option<i64>,
     },
     ReasoningLoopInterrupted {
         message: String,
@@ -11162,6 +11185,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     return Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                         tool_calls: Some(tool_calls),
                         resolved_provider_id: response_provider_id,
+                        turn_input_tokens: turn_metrics.usage.input_tokens,
                     });
                 }
 
@@ -11244,6 +11268,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 return Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                     tool_calls: None,
                     resolved_provider_id: response_provider_id,
+                    turn_input_tokens: turn_metrics.usage.input_tokens,
                 });
             }
             "error" => {
@@ -12581,8 +12606,13 @@ async fn remote_sidecar_chat_stream(
                 Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                     tool_calls: None,
                     resolved_provider_id,
+                    turn_input_tokens,
                 }) => {
                     let _ = resolved_provider_id;
+                    record_chat_completion_input_tokens(
+                        &mut runtime_tool_state.last_chat_completion_input_tokens,
+                        turn_input_tokens,
+                    );
                     remote_sidecar_finish_active_run(&stream_state, &run_id);
                     cleanup_guard.disarm();
                     break;
@@ -12590,8 +12620,13 @@ async fn remote_sidecar_chat_stream(
                 Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                     tool_calls: Some(tool_calls),
                     resolved_provider_id,
+                    turn_input_tokens,
                 }) => {
                     provider_id = resolved_provider_id;
+                    record_chat_completion_input_tokens(
+                        &mut runtime_tool_state.last_chat_completion_input_tokens,
+                        turn_input_tokens,
+                    );
                     if reached_terminal_event {
                         remote_sidecar_finish_active_run(&stream_state, &run_id);
                         cleanup_guard.disarm();
@@ -15418,6 +15453,7 @@ mod tests {
             },
             compression_enabled,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         }
     }
 
@@ -21253,6 +21289,7 @@ mod tests {
             RemoteSidecarBrokerLlmTurnOutcome::Completed {
                 tool_calls: Some(tool_calls),
                 resolved_provider_id,
+                turn_input_tokens: _,
             } => (tool_calls, resolved_provider_id),
             other => panic!("expected tool followup completion, got {other:?}"),
         };
@@ -21955,6 +21992,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         };
 
         let compress_task = tokio::spawn({
@@ -22254,6 +22292,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         };
         let compress_task = tokio::spawn({
             let state = state.clone();
@@ -22462,6 +22501,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         };
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         let broker_state = state.clone();
@@ -22719,6 +22759,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         };
 
         let compress_task = tokio::spawn({
@@ -22850,6 +22891,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
+            last_chat_completion_input_tokens: None,
         };
 
         let compress_task = tokio::spawn({
