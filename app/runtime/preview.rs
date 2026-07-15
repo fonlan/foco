@@ -1278,4 +1278,123 @@ mod tests {
             Some("15")
         );
     }
+
+    #[test]
+    fn static_assets_use_revalidate_cache_not_no_store() {
+        let root = tempdir().unwrap();
+        let preview = root.path().join("site");
+        fs::create_dir_all(preview.join("assets")).unwrap();
+        fs::write(preview.join("assets/app.js"), b"export const n = 1;\n").unwrap();
+        fs::write(preview.join("assets/data.json"), b"{\"ok\":true}").unwrap();
+
+        let js = serve_local_preview_file(
+            root.path(),
+            "site",
+            "site/assets/app.js",
+            false,
+            "http://127.0.0.1:3210",
+        )
+        .unwrap();
+        assert!(
+            js.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("text/javascript")
+        );
+        assert_eq!(
+            js.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=0, must-revalidate")
+        );
+
+        let json = serve_local_preview_file(
+            root.path(),
+            "site",
+            "site/assets/data.json",
+            false,
+            "http://127.0.0.1:3210",
+        )
+        .unwrap();
+        assert!(
+            json.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("application/json")
+        );
+    }
+
+    #[test]
+    fn generated_token_is_dns_safe_and_unique() {
+        let registry = PreviewSessionRegistry::default();
+        let a = registry
+            .create("ws1".into(), "index.html".into(), "".into())
+            .unwrap();
+        let b = registry
+            .create("ws1".into(), "other.html".into(), "".into())
+            .unwrap();
+        assert_ne!(a.token, b.token);
+        assert_eq!(a.token.len(), PREVIEW_TOKEN_LEN);
+        assert!(is_dns_safe_preview_token(&a.token));
+        assert!(is_dns_safe_preview_token(&b.token));
+    }
+
+    #[test]
+    fn session_registry_rejects_invalid_release_token() {
+        let registry = PreviewSessionRegistry::default();
+        assert!(registry.release("").is_err());
+        assert!(registry.release("NOT-dns-safe").is_err());
+        // DNS-safe shape but absent: Ok(false), not an error and not a false success.
+        assert_eq!(registry.release("abc").unwrap(), false);
+        assert_eq!(
+            registry
+                .release("abcdefghijklmnopqrstuvwxyz012345")
+                .unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn session_registry_enforces_max_count() {
+        let registry = PreviewSessionRegistry::default();
+        for i in 0..PREVIEW_SESSION_MAX_COUNT {
+            registry
+                .create("ws1".into(), format!("entry-{i}.html"), "".into())
+                .unwrap_or_else(|error| panic!("create {i}: {}", error.message()));
+        }
+        assert_eq!(registry.len(), PREVIEW_SESSION_MAX_COUNT);
+        let err = registry
+            .create("ws1".into(), "overflow.html".into(), "".into())
+            .unwrap_err();
+        assert!(
+            err.message().contains("limit reached"),
+            "message={}",
+            err.message()
+        );
+        assert_eq!(registry.len(), PREVIEW_SESSION_MAX_COUNT);
+    }
+
+    #[test]
+    fn entry_url_is_relative_to_preview_root() {
+        let url = preview_entry_url(
+            "tokentokentokentokentokentoken12",
+            3210,
+            "demo/index.html",
+            "demo",
+        );
+        assert!(url.starts_with("http://tokentokentokentokentokentoken12.preview.localhost:3210/"));
+        assert!(url.ends_with("/index.html"));
+        assert!(!url.contains("/demo/index.html"));
+    }
+
+    #[test]
+    fn error_message_sanitizer_strips_absolute_paths() {
+        let msg =
+            sanitize_preview_error_message("failed to read /Users/fonlan/secret/project/file.txt");
+        assert!(!msg.contains("/Users/"));
+        assert!(!msg.contains("secret"));
+        assert!(msg.contains("…"));
+    }
 }

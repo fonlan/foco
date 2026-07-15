@@ -23,9 +23,16 @@ export function isSafeHtmlPreviewUrl(previewUrl: string): boolean {
       return false;
     }
     const hostname = url.hostname.toLowerCase();
+    // Align with backend parse_preview_host_token: require a single DNS-safe token label.
+    if (!hostname.endsWith(".preview.localhost")) {
+      return false;
+    }
+    const token = hostname.slice(0, -".preview.localhost".length);
     return (
-      hostname === "preview.localhost" ||
-      hostname.endsWith(".preview.localhost")
+      token.length > 0 &&
+      token.length <= 63 &&
+      !token.includes(".") &&
+      /^[a-z0-9]+$/.test(token)
     );
   } catch {
     return false;

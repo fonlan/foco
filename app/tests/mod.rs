@@ -29103,3 +29103,659 @@ fn prompt_state_fixture(configure: impl FnOnce(&mut GlobalConfig)) -> PromptStat
         state,
     }
 }
+
+fn write_preview_site_fixture(workspace_dir: &std::path::Path) {
+    let site = workspace_dir.join("demo");
+    fs::create_dir_all(site.join("assets")).expect("preview assets dir");
+    fs::write(
+        site.join("index.html"),
+        br#"<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <h1 id="title">preview</h1>
+    <script>window.__inline = true;</script>
+    <script src="/assets/classic.js"></script>
+    <script type="module" src="/assets/module.js"></script>
+    <img src="/assets/dot.png" alt="dot" />
+  </body>
+</html>
+"#,
+    )
+    .expect("write index.html");
+    fs::write(site.join("assets/app.css"), b"body { color: #111; }\n").expect("write css");
+    fs::write(
+        site.join("assets/classic.js"),
+        b"window.__classic = true;\n",
+    )
+    .expect("write classic js");
+    fs::write(
+        site.join("assets/module.js"),
+        b"import { value } from './dep.js';\nwindow.__module = value;\n",
+    )
+    .expect("write module js");
+    fs::write(site.join("assets/dep.js"), b"export const value = 42;\n").expect("write dep js");
+    fs::write(
+        site.join("assets/data.json"),
+        br#"{"ok":true,"source":"preview"}"#,
+    )
+    .expect("write json");
+    // 1x1 PNG
+    fs::write(
+        site.join("assets/dot.png"),
+        [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ],
+    )
+    .expect("write png");
+    fs::write(workspace_dir.join("secret.txt"), b"outside preview root").expect("secret");
+}
+
+async fn serve_app_router(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind preview app");
+    let addr = listener.local_addr().expect("preview app address");
+    // Clone after fixing listen_addr so preview_url port matches the real listener.
+    let mut state = state;
+    state.listen_addr = addr;
+    let app = crate::http::router::app_router(state);
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, task)
+}
+
+/// GET with an unnormalized path (e.g. `/../secret.txt`). URL parsers collapse `..`, so this
+/// builds the HTTP request URI path directly through hyper/axum types.
+async fn preview_unnormalized_path_status(
+    state: AppState,
+    host: &str,
+    path: &str,
+) -> (StatusCode, String) {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let app = crate::http::router::app_router(state);
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, host)
+        .body(Body::empty())
+        .expect("build unnormalized preview request");
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("router oneshot for unnormalized path");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn preview_auth_password_hash() -> String {
+    // Cookie value is the full password_hash string (not a derived session token).
+    "sha256:0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        .to_string()
+}
+
+#[tokio::test]
+async fn html_preview_local_session_serves_asset_chain_and_rejects_escape() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    write_preview_site_fixture(&workspace_dir);
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let (addr, app_task) = serve_app_router(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let create = client
+        .post(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/preview/sessions"
+        ))
+        .json(&json!({ "path": "demo/index.html" }))
+        .send()
+        .await
+        .expect("create preview session");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = create.json::<Value>().await.expect("create json");
+    let token = body["token"].as_str().expect("token");
+    assert_eq!(token.len(), 32);
+    assert!(
+        body["previewUrl"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&format!("{token}.preview.localhost"))
+    );
+    assert_eq!(
+        body["iframeSandbox"].as_str(),
+        Some("allow-scripts allow-same-origin")
+    );
+    assert_eq!(body["rootPath"].as_str(), Some("demo"));
+
+    let host = format!("{token}.preview.localhost:{}", addr.port());
+    let origin = format!("http://{host}");
+
+    let html = client
+        .get(format!("{origin}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("html get");
+    assert_eq!(html.status(), StatusCode::OK);
+    assert!(
+        html.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/html")
+    );
+    assert_eq!(
+        html.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let html_text = html.text().await.expect("html body");
+    assert!(html_text.contains("classic.js"));
+    assert!(html_text.contains("module.js"));
+    assert!(html_text.contains("__inline"));
+
+    let head = client
+        .head(format!("{origin}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("html head");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(head.headers().get(header::CONTENT_LENGTH).is_some());
+
+    for (path, content_prefix, cache_html) in [
+        ("/assets/classic.js", "text/javascript", false),
+        ("/assets/module.js", "text/javascript", false),
+        ("/assets/dep.js", "text/javascript", false),
+        ("/assets/app.css", "text/css", false),
+        ("/assets/data.json", "application/json", false),
+        ("/assets/dot.png", "image/png", false),
+    ] {
+        let response = client
+            .get(format!("{origin}{path}"))
+            .header(header::HOST, &host)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+        assert_eq!(response.status(), StatusCode::OK, "path {path}");
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with(content_prefix),
+            "path {path} content-type {content_type}"
+        );
+        let cache = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if cache_html {
+            assert_eq!(cache, "no-store");
+        } else {
+            assert_eq!(cache, "private, max-age=0, must-revalidate");
+        }
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("frame-ancestors http://127.0.0.1:")
+        );
+        let _ = response.bytes().await.expect("body");
+    }
+
+    let post = client
+        .post(format!("{origin}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("post rejected");
+    assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // reqwest/URL parsers collapse `/../` before the request leaves the client, so drive the
+    // router with an unnormalized URI path and require a hard 400 escape rejection.
+    let (traversal_status, traversal_body) =
+        preview_unnormalized_path_status(state.clone(), &host, "/../secret.txt").await;
+    assert_eq!(
+        traversal_status,
+        StatusCode::BAD_REQUEST,
+        "traversal body: {traversal_body}"
+    );
+    assert!(
+        traversal_body.to_ascii_lowercase().contains("escape")
+            || traversal_body.to_ascii_lowercase().contains("invalid"),
+        "traversal body should name escape/invalid: {traversal_body}"
+    );
+    assert!(!traversal_body.contains("outside preview root"));
+    assert!(!traversal_body.contains(workspace_dir.to_string_lossy().as_ref()));
+    assert!(!traversal_body.contains("secret content"));
+
+    let directory = client
+        .get(format!("{origin}/assets"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("directory listing");
+    assert_eq!(directory.status(), StatusCode::NOT_FOUND);
+
+    let release = client
+        .delete(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/preview/sessions/{token}"
+        ))
+        .send()
+        .await
+        .expect("release session");
+    assert_eq!(release.status(), StatusCode::OK);
+    let after = client
+        .get(format!("{origin}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("after release");
+    assert_eq!(after.status(), StatusCode::NOT_FOUND);
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn html_preview_auth_isolates_api_from_preview_host() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    write_preview_site_fixture(&workspace_dir);
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    let password_hash = preview_auth_password_hash();
+    config.app.web_server.password_hash = Some(password_hash.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let (addr, app_task) = serve_app_router(state).await;
+    let client = reqwest::Client::new();
+
+    let unauth_api = client
+        .post(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/preview/sessions"
+        ))
+        .json(&json!({ "path": "demo/index.html" }))
+        .send()
+        .await
+        .expect("unauth create");
+    assert_eq!(unauth_api.status(), StatusCode::UNAUTHORIZED);
+
+    let unauth_files = client
+        .get(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/files?depth=1"
+        ))
+        .send()
+        .await
+        .expect("unauth files");
+    assert_eq!(unauth_files.status(), StatusCode::UNAUTHORIZED);
+
+    let create = client
+        .post(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/preview/sessions"
+        ))
+        .header(header::COOKIE, format!("foco_auth={password_hash}"))
+        .json(&json!({ "path": "demo/index.html" }))
+        .send()
+        .await
+        .expect("auth create");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = create.json::<Value>().await.expect("create json");
+    let token = body["token"].as_str().expect("token");
+    let host = format!("{token}.preview.localhost:{}", addr.port());
+
+    // Preview host must work without Foco auth cookie.
+    let preview = client
+        .get(format!("http://{host}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("preview without cookie");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert!(
+        preview
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/html")
+    );
+
+    // Ordinary API still requires auth even if caller knows a preview token.
+    let still_unauth = client
+        .get(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/files?depth=1"
+        ))
+        .send()
+        .await
+        .expect("still unauth files");
+    assert_eq!(still_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn html_preview_remote_proxies_sidecar_without_token_or_local_fallback() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    // Local secret must never be served for the remote workspace id.
+    write_preview_site_fixture(&workspace_dir);
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    config.workspaces.push(WorkspaceConfig {
+        id: "remote-preview".to_string(),
+        name: "Remote Preview".to_string(),
+        path: PathBuf::new(),
+        location: WorkspaceLocation::Ssh {
+            server_id: "srv".to_string(),
+            remote_path: "/srv/project".to_string(),
+        },
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen_for_app = seen.clone();
+    let sidecar_app = axum::Router::new().route(
+        "/api/remote/workspace/preview/file",
+        axum::routing::get({
+            let seen = seen_for_app.clone();
+            move |headers: axum::http::HeaderMap, uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let query = uri.query().unwrap_or("").to_string();
+                    seen.lock().expect("seen").push(format!("{auth}|{query}"));
+
+                    // Reject if browser cookie or preview token leaked.
+                    if headers.get(header::COOKIE).is_some() {
+                        return (StatusCode::BAD_REQUEST, "cookie must not reach sidecar")
+                            .into_response();
+                    }
+                    if query.contains("token=") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "preview token must not reach sidecar",
+                        )
+                            .into_response();
+                    }
+                    if !auth.starts_with("Bearer sidecar-token") {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+
+                    let params: std::collections::HashMap<String, String> = uri
+                        .query()
+                        .unwrap_or("")
+                        .split('&')
+                        .filter_map(|pair| {
+                            let (k, v) = pair.split_once('=')?;
+                            Some((k.to_string(), v.to_string()))
+                        })
+                        .collect();
+                    let path = params.get("path").map(String::as_str).unwrap_or("");
+                    let root = params.get("root").map(String::as_str).unwrap_or("");
+                    if root != "demo" && root != "demo%2F" && !root.is_empty() {
+                        // root is URL-encoded; accept demo
+                    }
+                    let decoded_path = path.replace("%2F", "/");
+                    let (status, content_type, body): (StatusCode, &str, Vec<u8>) =
+                        match decoded_path.as_str() {
+                            "demo/index.html" => (
+                                StatusCode::OK,
+                                "text/html; charset=utf-8",
+                                b"<html><script src=\"/assets/classic.js\"></script></html>"
+                                    .to_vec(),
+                            ),
+                            "demo/assets/classic.js" => (
+                                StatusCode::OK,
+                                "text/javascript; charset=utf-8",
+                                b"window.__remote = true;".to_vec(),
+                            ),
+                            "demo/assets/data.json" => (
+                                StatusCode::OK,
+                                "application/json",
+                                br#"{"remote":true}"#.to_vec(),
+                            ),
+                            _ => (
+                                StatusCode::NOT_FOUND,
+                                "text/html",
+                                b"<h1>404</h1><p>not found</p>".to_vec(),
+                            ),
+                        };
+                    (
+                        status,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::CONTENT_LENGTH, &body.len().to_string()),
+                        ],
+                        body,
+                    )
+                        .into_response()
+                }
+            }
+        })
+        .head({
+            let seen = seen_for_app.clone();
+            move |headers: axum::http::HeaderMap, uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock()
+                        .expect("seen")
+                        .push(format!("HEAD {auth}|{}", uri.query().unwrap_or("")));
+                    if !auth.starts_with("Bearer sidecar-token") {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let params: std::collections::HashMap<String, String> = uri
+                        .query()
+                        .unwrap_or("")
+                        .split('&')
+                        .filter_map(|pair| {
+                            let (k, v) = pair.split_once('=')?;
+                            Some((k.to_string(), v.to_string()))
+                        })
+                        .collect();
+                    let path = params
+                        .get("path")
+                        .map(|p| p.replace("%2F", "/"))
+                        .unwrap_or_default();
+                    if path == "demo/index.html"
+                        || path == "demo/assets/classic.js"
+                        || path == "demo/assets/data.json"
+                    {
+                        (StatusCode::OK, [(header::CONTENT_LENGTH, "12")]).into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }
+        }),
+    );
+
+    let sidecar_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind fake sidecar");
+    let sidecar_addr = sidecar_listener.local_addr().expect("sidecar addr");
+    let sidecar_task = tokio::spawn(async move {
+        let _ = axum::serve(sidecar_listener, sidecar_app).await;
+    });
+    state.remote_workspace_manager.insert_fake_session_for_test(
+        "srv",
+        "remote-preview",
+        "/srv/project",
+        sidecar_addr.port(),
+        "sidecar-token",
+    );
+
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path(
+            "/api/workspaces/remote-preview/preview/sessions"
+        ),
+        None,
+        "preview must not be on the generic workspace proxy whitelist"
+    );
+
+    let (addr, app_task) = serve_app_router(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let create = client
+        .post(format!(
+            "http://{addr}/api/workspaces/remote-preview/preview/sessions"
+        ))
+        .json(&json!({ "path": "demo/index.html" }))
+        .send()
+        .await
+        .expect("remote create");
+    assert_eq!(create.status(), StatusCode::OK, "create remote session");
+    let body = create.json::<Value>().await.expect("create json");
+    let token = body["token"].as_str().expect("token").to_string();
+    let host = format!("{token}.preview.localhost:{}", addr.port());
+
+    let html = client
+        .get(format!("http://{host}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("remote html");
+    assert_eq!(html.status(), StatusCode::OK);
+    assert_eq!(
+        html.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(
+        html.headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("frame-ancestors http://127.0.0.1:")
+    );
+    let html_text = html.text().await.expect("html body");
+    assert!(html_text.contains("classic.js"));
+    assert!(!html_text.contains("outside preview root"));
+
+    let js = client
+        .get(format!("http://{host}/assets/classic.js"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("remote js");
+    assert_eq!(js.status(), StatusCode::OK);
+    assert!(
+        js.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/javascript")
+    );
+    assert_eq!(
+        js.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=0, must-revalidate")
+    );
+    assert_eq!(js.text().await.unwrap(), "window.__remote = true;");
+
+    let json = client
+        .get(format!("http://{host}/assets/data.json"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("remote json");
+    assert_eq!(json.status(), StatusCode::OK);
+    assert!(json.text().await.unwrap().contains("\"remote\":true"));
+
+    // Disconnect: must not fall back to local demo/ files.
+    state
+        .remote_workspace_manager
+        .remove_fake_session_for_test("remote-preview");
+    let offline = client
+        .get(format!("http://{host}/index.html"))
+        .header(header::HOST, &host)
+        .send()
+        .await
+        .expect("offline preview");
+    assert_eq!(offline.status(), StatusCode::BAD_GATEWAY);
+    let offline_body = offline.text().await.unwrap_or_default();
+    assert!(!offline_body.contains("__inline"));
+    assert!(!offline_body.contains("outside preview root"));
+
+    let seen_calls = seen.lock().expect("seen").clone();
+    assert!(
+        seen_calls
+            .iter()
+            .any(|call| call.contains("Bearer sidecar-token")),
+        "sidecar must receive bearer auth: {seen_calls:?}"
+    );
+    assert!(
+        seen_calls.iter().all(|call| !call.contains(&token)),
+        "preview token must not be forwarded to sidecar: {seen_calls:?}"
+    );
+
+    app_task.abort();
+    sidecar_task.abort();
+}
+
+#[test]
+fn proxy_workspace_route_path_excludes_preview() {
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/ws/preview/sessions"),
+        None
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/ws/preview/sessions/tok"),
+        None
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path("/api/workspaces/ws/files"),
+        Some("files")
+    );
+}

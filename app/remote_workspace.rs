@@ -1686,6 +1686,12 @@ impl RemoteWorkspaceManager {
         sessions.insert(session_key(server_id, workspace_id), session);
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_fake_session_for_test(&self, workspace_id: &str) {
+        let mut sessions = self.sessions.lock().expect("remote sessions");
+        sessions.retain(|_, session| session.workspace_id != workspace_id);
+    }
+
     fn session(&self, key: &str) -> Result<Option<Arc<RemoteWorkspaceSession>>, ApiError> {
         let sessions = self
             .sessions

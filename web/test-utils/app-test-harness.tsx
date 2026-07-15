@@ -2059,6 +2059,15 @@ export const workspaceFilesResponse = {
         childrenLoaded: true,
         hasChildren: false,
         kind: "file",
+        name: "index.html",
+        path: "demo/index.html",
+        sizeBytes: 256,
+      },
+      {
+        children: [],
+        childrenLoaded: true,
+        hasChildren: false,
+        kind: "file",
         name: "main.ts",
         path: "src/main.ts",
         sizeBytes: 1024,
@@ -2306,6 +2315,9 @@ export const appTestState: {
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
   lastManualWorkspaceRequest: Partial<ConfiguredWorkspaceSummary> | null;
+  previewSessionFailNext: boolean | string;
+  previewSessionCounter: number;
+  activePreviewSessions: Array<{ path: string; token: string; workspaceId: string }>;
 } = {
   activeChatStreamController: null,
   chatStreamControllers: new Map<string, ReadableStreamDefaultController<Uint8Array>>(),
@@ -2351,6 +2363,9 @@ export const appTestState: {
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
   lastManualWorkspaceRequest: null,
+  previewSessionFailNext: false,
+  previewSessionCounter: 0,
+  activePreviewSessions: [],
 };
 
 function workspaceSpecResponseForWorkspace(workspaceId: string) {
@@ -2844,6 +2859,9 @@ export function resetAppTestEnvironment() {
   appTestState.updateHealthStatuses = [];
   appTestState.lastWorkspaceOrderRequest = null;
   appTestState.lastManualWorkspaceRequest = null;
+  appTestState.previewSessionFailNext = false;
+  appTestState.previewSessionCounter = 0;
+  appTestState.activePreviewSessions = [];
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-foco-theme");
@@ -3345,9 +3363,69 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       content:
         filePath === "README.md"
           ? markdownFileContent
-          : `// ${filePath || "untitled"}`,
+          : filePath.endsWith(".html") || filePath.endsWith(".htm")
+            ? "<!DOCTYPE html><html><body><h1>demo</h1></body></html>"
+            : `// ${filePath || "untitled"}`,
       path: filePath,
     });
+  }
+
+  const previewSessionCreateMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/preview\/sessions$/,
+  );
+  if (previewSessionCreateMatch && (init?.method === "POST" || !init?.method)) {
+    const workspaceId = decodeURIComponent(previewSessionCreateMatch[1] ?? "");
+    if (appTestState.previewSessionFailNext) {
+      const message =
+        typeof appTestState.previewSessionFailNext === "string"
+          ? appTestState.previewSessionFailNext
+          : "failed to create HTML preview session";
+      appTestState.previewSessionFailNext = false;
+      return jsonResponse({ message }, { status: 400 });
+    }
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { path?: string })
+        : {};
+    const entryPath = body.path ?? "index.html";
+    appTestState.previewSessionCounter += 1;
+    const token = `previewtoken${String(appTestState.previewSessionCounter).padStart(20, "0")}`.slice(
+      0,
+      32,
+    );
+    appTestState.activePreviewSessions = [
+      ...appTestState.activePreviewSessions.filter(
+        (session) => !(session.workspaceId === workspaceId && session.path === entryPath),
+      ),
+      { path: entryPath, token, workspaceId },
+    ];
+    const rootPath = entryPath.includes("/")
+      ? entryPath.slice(0, entryPath.lastIndexOf("/"))
+      : "";
+    const entryName = entryPath.includes("/")
+      ? entryPath.slice(entryPath.lastIndexOf("/") + 1)
+      : entryPath;
+    return jsonResponse({
+      entryPath,
+      iframeSandbox: "allow-scripts allow-same-origin",
+      previewOrigin: `http://${token}.preview.localhost:3210`,
+      previewUrl: `http://${token}.preview.localhost:3210/${entryName}`,
+      rootPath,
+      token,
+      workspaceId,
+    });
+  }
+
+  const previewSessionDeleteMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/preview\/sessions\/([^/]+)$/,
+  );
+  if (previewSessionDeleteMatch && init?.method === "DELETE") {
+    const workspaceId = decodeURIComponent(previewSessionDeleteMatch[1] ?? "");
+    const token = decodeURIComponent(previewSessionDeleteMatch[2] ?? "");
+    appTestState.activePreviewSessions = appTestState.activePreviewSessions.filter(
+      (session) => !(session.workspaceId === workspaceId && session.token === token),
+    );
+    return jsonResponse({ released: true });
   }
 
   if (path === "/api/workspaces/workspace-1/files/save") {

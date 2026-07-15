@@ -5206,6 +5206,207 @@ describe("app-panels-stats verification surfaces", () => {
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();
   });
+
+  it("opens an HTML preview tab from the file tree and restores it from the URL", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { unmount } = renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    const htmlRow = (await screen.findByText("index.html")).closest(
+      "div[role='treeitem']",
+    );
+    expect(htmlRow).not.toBeNull();
+    fireEvent.contextMenu(htmlRow as HTMLElement);
+    const menu = await screen.findByRole("menu", { name: "index.html" });
+    expect(
+      within(menu).getByRole("menuitem", { name: "Preview in new tab" }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(menu).getByRole("menuitem", { name: "Preview in new tab" }),
+    );
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    const previewTab = within(tabList).getByRole("tab", {
+      name: /index\.html/,
+    });
+    expect(previewTab).toHaveAttribute("aria-selected", "true");
+    expect(previewTab).toHaveAttribute("title", "index.html · Preview");
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/preview/sessions") &&
+            (!init || init.method === "POST" || !init.method),
+        ),
+      ).toBe(true),
+    );
+
+    expect(
+      await screen.findByTitle("HTML preview for index.html"),
+    ).toHaveAttribute(
+      "src",
+      expect.stringMatching(/^http:\/\/previewtoken.+\.preview\.localhost:3210\/index\.html$/),
+    );
+    expect(screen.getByTitle("HTML preview for index.html")).toHaveAttribute(
+      "sandbox",
+      "allow-scripts allow-same-origin",
+    );
+
+    expect(new URLSearchParams(window.location.search).getAll("preview")).toEqual([
+      "workspace-1/demo%2Findex.html",
+    ]);
+    expect(new URLSearchParams(window.location.search).get("activePreview")).toBe(
+      "workspace-1/demo%2Findex.html",
+    );
+
+    // Reuse: opening the same path focuses the existing tab and does not stack duplicates.
+    fireEvent.contextMenu(htmlRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "index.html" })).getByRole(
+        "menuitem",
+        { name: "Preview in new tab" },
+      ),
+    );
+    expect(
+      within(tabList).getAllByRole("tab", { name: /index\.html/ }),
+    ).toHaveLength(1);
+
+    fetchMock.mockClear();
+    unmount();
+    renderApp();
+
+    const restoredTabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() =>
+      expect(
+        within(restoredTabList).getByRole("tab", { name: /index\.html/ }),
+      ).toHaveAttribute("aria-selected", "true"),
+    );
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some((call) =>
+          String(call[0]).includes("/api/workspaces/workspace-1/preview/sessions"),
+        ),
+      ).toBe(true),
+    );
+    expect(
+      await screen.findByTitle("HTML preview for index.html"),
+    ).toBeInTheDocument();
+  });
+
+  it("closes HTML preview tabs and releases the session", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    const htmlRow = (await screen.findByText("index.html")).closest(
+      "div[role='treeitem']",
+    );
+    expect(htmlRow).not.toBeNull();
+    fireEvent.contextMenu(htmlRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "index.html" })).getByRole(
+        "menuitem",
+        { name: "Preview in new tab" },
+      ),
+    );
+
+    expect(await screen.findByTitle("HTML preview for index.html")).toBeInTheDocument();
+    await waitFor(() => expect(appTestState.activePreviewSessions.length).toBe(1));
+    const token = appTestState.activePreviewSessions[0]?.token;
+    expect(token).toBeTruthy();
+    fetchMock.mockClear();
+
+    const tabList = screen.getByRole("tablist", { name: "Chat" });
+    const previewTab = within(tabList).getByRole("tab", { name: /index\.html/ });
+    const tabGroup = previewTab.closest("div.group") ?? previewTab.parentElement;
+    expect(tabGroup).not.toBeNull();
+    await userEvent.click(
+      within(tabGroup as HTMLElement).getByRole("button", {
+        name: "Close chat tab index.html · Preview",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        within(tabList).queryByRole("tab", { name: /index\.html/ }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url) ===
+              `/api/workspaces/workspace-1/preview/sessions/${token}` &&
+            init?.method === "DELETE",
+        ),
+      ).toBe(true),
+    );
+    await waitFor(() =>
+      expect(appTestState.activePreviewSessions.some((session) => session.token === token))
+        .toBe(false),
+    );
+    expect(new URLSearchParams(window.location.search).getAll("preview")).toEqual([]);
+  });
+
+  it("keeps HTML preview sessions alive when switching main tabs", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    // Open a file tab so we can switch away from the preview without closing it.
+    await userEvent.click(await screen.findByText("README.md"));
+    const htmlRow = (await screen.findByText("index.html")).closest(
+      "div[role='treeitem']",
+    );
+    expect(htmlRow).not.toBeNull();
+    fireEvent.contextMenu(htmlRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "index.html" })).getByRole(
+        "menuitem",
+        { name: "Preview in new tab" },
+      ),
+    );
+
+    const iframe = await screen.findByTitle("HTML preview for index.html");
+    expect(iframe).toBeInTheDocument();
+    await waitFor(() => expect(appTestState.activePreviewSessions.length).toBe(1));
+    const token = appTestState.activePreviewSessions[0]?.token;
+    expect(token).toBeTruthy();
+    fetchMock.mockClear();
+
+    const tabList = screen.getByRole("tablist", { name: "Chat" });
+    await userEvent.click(within(tabList).getByRole("tab", { name: /README\.md/ }));
+
+    // Keep-alive: panel stays mounted (hidden) and does not DELETE the session.
+    expect(screen.getByTitle("HTML preview for index.html")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes("/preview/sessions/") && init?.method === "DELETE",
+      ),
+    ).toBe(false);
+    expect(
+      appTestState.activePreviewSessions.some((session) => session.token === token),
+    ).toBe(true);
+
+    await userEvent.click(within(tabList).getByRole("tab", { name: /index\.html/ }));
+    expect(screen.getByTitle("HTML preview for index.html")).toBeInTheDocument();
+    expect(
+      appTestState.activePreviewSessions.some((session) => session.token === token),
+    ).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes("/preview/sessions/") && init?.method === "DELETE",
+      ),
+    ).toBe(false);
+  });
+
   it("reloads the active file from the leftmost editor toolbar button", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
