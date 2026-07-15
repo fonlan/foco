@@ -2172,6 +2172,9 @@ struct PreparedChatContext {
     /// the `## Skills` routing table). Prefer this over `config.skills.detected`
     /// so tool read grants stay aligned with live discovery + disable filters.
     skill_read_root_dirs: Vec<PathBuf>,
+    /// Canonical external file paths attached on this chat (history + current turn +
+    /// in-run guidance). Exact `read_file` matches skip ask_question; not directory grants.
+    attachment_read_allowlist: Vec<PathBuf>,
     /// Last chat-completion provider `input_tokens` in this run (memory only).
     /// Used as a second Normal (95%) LLM checkpoint gate when local estimate lags.
     last_chat_completion_input_tokens: Option<u64>,
@@ -2207,6 +2210,9 @@ struct PreparedPromptContext {
     /// Used by `read_file` so Plan isolated worktrees can read the same Skills
     /// the model was told about without materializing symlinks into the worktree.
     skill_read_root_dirs: Vec<PathBuf>,
+    /// Canonical path attachments for this chat (all still-valid user messages +
+    /// current-turn attachments). Independent of compression visibility.
+    attachment_read_allowlist: Vec<PathBuf>,
 }
 
 impl PreparedPromptContext {
@@ -2776,257 +2782,134 @@ impl PreparedChatContext {
         mut guidance_rx: mpsc::UnboundedReceiver<GuidanceMessage>,
     ) -> impl futures_util::Stream<Item = ChatSseEvent> {
         async_stream::stream! {
-                    let mut run_cancellation_rx = cancellation.subscribe();
-                    let tool_cancellation_token = cancellation.tool_token();
-                    let request_started_at = utc_timestamp();
-                    let started_at = Instant::now();
-                    let start_event = ChatSseEvent::Start {
-                        chat_id: self.chat_id.clone(),
-                        user_message_id: self.user_message_id.clone(),
-                        assistant_message_id: self.assistant_message_id.clone(),
-                        llm_request_id: self.llm_request_id.clone(),
-                        memories_used: self.memories_used.clone(),
+            let mut run_cancellation_rx = cancellation.subscribe();
+            let tool_cancellation_token = cancellation.tool_token();
+            let request_started_at = utc_timestamp();
+            let started_at = Instant::now();
+            let start_event = ChatSseEvent::Start {
+                chat_id: self.chat_id.clone(),
+                user_message_id: self.user_message_id.clone(),
+                assistant_message_id: self.assistant_message_id.clone(),
+                llm_request_id: self.llm_request_id.clone(),
+                memories_used: self.memories_used.clone(),
+            };
+            let mut events = vec![captured_event(&start_event)];
+            let mut assistant_text = String::new();
+            let mut assistant_reasoning = String::new();
+            let mut reasoning_started_at: Option<Instant> = None;
+            let mut reasoning_duration_ms: Option<i64> = None;
+            let mut first_token_at = None;
+            let mut first_token_latency_ms = None;
+            let mut seen_tool_call_ids = HashSet::new();
+            let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
+            let mut read_only_tool_progress_detector = ReadOnlyToolProgressDetector::default();
+            let mut executed_tool_calls = Vec::new();
+            let mut total_usage = NeutralUsage::default();
+            let mut final_usage = None;
+            let mut app_shutdown_rx = self.app_shutdown_rx.clone();
+
+            yield start_event;
+            if let Err(error) = self.refresh_model_route() {
+                let message = error.message;
+                let event = ChatSseEvent::Error {
+                    message: message.clone(),
+                };
+                events.push(captured_event(&event));
+                let outcome = failed_chat_audit_outcome(
+                    &self,
+                    started_at,
+                    &mut events,
+                    &message,
+                    None,
+                )
+                .await;
+                if let Err(persist_error) = persist_chat_result(
+                    &self,
+                    &request_started_at,
+                    outcome,
+                    &events,
+                    None,
+                    None,
+                    &executed_tool_calls,
+                ) {
+                    yield ChatSseEvent::Error {
+                        message: persist_error.message,
                     };
-                    let mut events = vec![captured_event(&start_event)];
-                    let mut assistant_text = String::new();
-                    let mut assistant_reasoning = String::new();
-                    let mut reasoning_started_at: Option<Instant> = None;
-                    let mut reasoning_duration_ms: Option<i64> = None;
-                    let mut first_token_at = None;
-                    let mut first_token_latency_ms = None;
-                    let mut seen_tool_call_ids = HashSet::new();
-                    let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
-                    let mut read_only_tool_progress_detector = ReadOnlyToolProgressDetector::default();
-                    let mut executed_tool_calls = Vec::new();
-                    let mut total_usage = NeutralUsage::default();
-                    let mut final_usage = None;
-                    let mut app_shutdown_rx = self.app_shutdown_rx.clone();
+                } else {
+                    yield event;
+                }
+                return;
+            }
+            if let Some(event) = agent_team_refresh_event_for_context(
+                &self,
+                "agent_run_started",
+                None,
+                false,
+            ) {
+                events.push(captured_event(&event));
+                yield event;
+            }
+            for event in self
+                .hook_notifications
+                .iter()
+                .flat_map(|notification| {
+                    [ChatSseEvent::HookNotification {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        notification: notification.clone(),
+                    }]
+                })
+            {
+                events.push(captured_event(&event));
+                yield event;
+            }
+            self.hook_notifications.clear();
+            append_hook_context_messages(
+                &mut self.provider_request.messages,
+                &mut self.message_source_sequences,
+                &mut self.message_context_sources,
+                &self.hook_context_messages,
+            );
+            self.hook_context_messages.clear();
 
-                    yield start_event;
-                    if let Err(error) = self.refresh_model_route() {
-                        let message = error.message;
-                        let event = ChatSseEvent::Error {
-                            message: message.clone(),
+            // Resolve deferred memory retrieval now that the `start` event has
+            // been emitted and the chat record is visible in the workspace.
+            // Retrieval is advisory: a failure leaves the run without memory
+            // context, but it must not block the newly created chat.
+            if self.pending_memory_retrieval.is_some() {
+                let global_config = self.global_config.clone();
+                match self.resolve_pending_memory(&global_config).await {
+                    Ok(()) => {
+                        let memories_used = self.memories_used.clone();
+                        let assistant_message_id = self.assistant_message_id.clone();
+                        let event = ChatSseEvent::MemoryResolved {
+                            assistant_message_id,
+                            memories_used,
+                            agent_team_id: self
+                                .agent_associations
+                                .team_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            agent_instance_id: self
+                                .agent_associations
+                                .instance_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            agent_task_id: self
+                                .agent_associations
+                                .task_id
+                                .as_ref()
+                                .map(ToString::to_string),
                         };
-                        events.push(captured_event(&event));
-                        let outcome = failed_chat_audit_outcome(
-                            &self,
-                            started_at,
-                            &mut events,
-                            &message,
-                            None,
-                        )
-                        .await;
-                        if let Err(persist_error) = persist_chat_result(
-                            &self,
-                            &request_started_at,
-                            outcome,
-                            &events,
-                            None,
-                            None,
-                            &executed_tool_calls,
-                        ) {
-                            yield ChatSseEvent::Error {
-                                message: persist_error.message,
-                            };
-                        } else {
-                            yield event;
-                        }
-                        return;
-                    }
-                    if let Some(event) = agent_team_refresh_event_for_context(
-                        &self,
-                        "agent_run_started",
-                        None,
-                        false,
-                    ) {
                         events.push(captured_event(&event));
                         yield event;
                     }
-                    for event in self
-                        .hook_notifications
-                        .iter()
-                        .flat_map(|notification| {
-                            [ChatSseEvent::HookNotification {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                notification: notification.clone(),
-                            }]
-                        })
-                    {
-                        events.push(captured_event(&event));
-                        yield event;
-                    }
-                    self.hook_notifications.clear();
-                    append_hook_context_messages(
-                        &mut self.provider_request.messages,
-                        &mut self.message_source_sequences,
-                        &mut self.message_context_sources,
-                        &self.hook_context_messages,
-                    );
-                    self.hook_context_messages.clear();
-
-                    // Resolve deferred memory retrieval now that the `start` event has
-                    // been emitted and the chat record is visible in the workspace.
-                    // Retrieval is advisory: a failure leaves the run without memory
-                    // context, but it must not block the newly created chat.
-                    if self.pending_memory_retrieval.is_some() {
-                        let global_config = self.global_config.clone();
-                        match self.resolve_pending_memory(&global_config).await {
-                            Ok(()) => {
-                                let memories_used = self.memories_used.clone();
-                                let assistant_message_id = self.assistant_message_id.clone();
-                                let event = ChatSseEvent::MemoryResolved {
-                                    assistant_message_id,
-                                    memories_used,
-                                    agent_team_id: self
-                                        .agent_associations
-                                        .team_id
-                                        .as_ref()
-                                        .map(ToString::to_string),
-                                    agent_instance_id: self
-                                        .agent_associations
-                                        .instance_id
-                                        .as_ref()
-                                        .map(ToString::to_string),
-                                    agent_task_id: self
-                                        .agent_associations
-                                        .task_id
-                                        .as_ref()
-                                        .map(ToString::to_string),
-                                };
-                                events.push(captured_event(&event));
-                                yield event;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error.message,
-                                    chat_id = %self.chat_id,
-                                    "deferred memory retrieval failed; continuing without memory"
-                                );
-                                if let Err(error) = self.finalize_prompt_without_memory() {
-                                    let message = error.message;
-                                    let event = ChatSseEvent::Error {
-                                        message: message.clone(),
-                                    };
-                                    events.push(captured_event(&event));
-                                    let outcome = failed_chat_audit_outcome(
-                                        &self,
-                                        started_at,
-                                        &mut events,
-                                        &message,
-                                        None,
-                                    )
-                                    .await;
-
-                                    if let Err(persist_error) = persist_chat_result(
-                                        &self,
-                                        &request_started_at,
-                                        outcome,
-                                        &events,
-                                        None,
-                                        None,
-                                        &[],
-                                    ) {
-                                        yield ChatSseEvent::Error {
-                                            message: persist_error.message,
-                                        };
-                                    } else {
-                                        yield event;
-                                    }
-
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    let mut turn_index = 0usize;
-                    let mut tool_rounds_since_last_compression = 0usize;
-                    let mut turn_retry_count = 0u32;
-                    let mut reasoning_loop_recovery_count = 0usize;
-
-                    'agent_turns: loop {
-                        if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
-                            let message = chat_run_cancel_message(&app_shutdown_rx);
-                            let event = match finish_cancelled_chat_run_with_message(
-                                &self,
-                                &request_started_at,
-                                started_at,
-                                &mut events,
-                                &executed_tool_calls,
-                                message,
-                            )
-                            .await {
-                                Ok(event) => event,
-                                Err(error) => ChatSseEvent::Error {
-                                    message: error.message,
-                                },
-                            };
-                            yield event;
-                            return;
-                        }
-
-                        for event in append_guidance_events(
-                            &mut self.provider_request.messages,
-                            &mut self.message_source_sequences,
-                            &mut self.message_context_sources,
-                            &mut events,
-                            drain_guidance_messages(&mut guidance_rx),
-                            None,
-                        ) {
-                            yield event;
-                        }
-
-                        let compression_result = match ensure_context_compression(&mut self).await {
-                            Ok(result) => result,
-                            Err(error) => {
-                                let message = error.message;
-                                let event = ChatSseEvent::Error {
-                                    message: message.clone(),
-                                };
-                                events.push(captured_event(&event));
-                                let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                    let event = ChatSseEvent::Error {
-                                        message: persist_error.message,
-                                    };
-                                    yield event;
-                                } else {
-                                    yield event;
-                                }
-
-                                return;
-                            }
-                        };
-                        let turn_active_tool_start_index = compression_result.active_tool_start_index;
-                        for notification in std::mem::take(&mut self.hook_notifications) {
-                            let event = ChatSseEvent::HookNotification {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                notification,
-                            };
-                            events.push(captured_event(&event));
-                            yield event;
-                        }
-                        for detail in compression_result.events.clone() {
-                            let event = ChatSseEvent::ContextCompression {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                snapshot_id: detail.snapshot_id.clone(),
-                                kind: detail.kind.clone(),
-                                status: detail.status.clone(),
-                                detail: Some(detail),
-                            };
-                            events.push(captured_event(&event));
-                            yield event;
-                        }
-                        if let Err(error) = self.refresh_model_route() {
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message,
+                            chat_id = %self.chat_id,
+                            "deferred memory retrieval failed; continuing without memory"
+                        );
+                        if let Err(error) = self.finalize_prompt_without_memory() {
                             let message = error.message;
                             let event = ChatSseEvent::Error {
                                 message: message.clone(),
@@ -3040,6 +2923,7 @@ impl PreparedChatContext {
                                 None,
                             )
                             .await;
+
                             if let Err(persist_error) = persist_chat_result(
                                 &self,
                                 &request_started_at,
@@ -3047,7 +2931,7 @@ impl PreparedChatContext {
                                 &events,
                                 None,
                                 None,
-                                &executed_tool_calls,
+                                &[],
                             ) {
                                 yield ChatSseEvent::Error {
                                     message: persist_error.message,
@@ -3055,182 +2939,737 @@ impl PreparedChatContext {
                             } else {
                                 yield event;
                             }
+
                             return;
                         }
-                        let packed_messages = match pack_neutral_messages(
-                            self.provider_request.messages.clone(),
-                            &self.message_source_sequences,
-                            &self.message_context_sources,
-                            &self.context_budget,
-                            turn_active_tool_start_index,
+                    }
+                }
+            }
+
+            let mut turn_index = 0usize;
+            let mut tool_rounds_since_last_compression = 0usize;
+            let mut turn_retry_count = 0u32;
+            let mut reasoning_loop_recovery_count = 0usize;
+
+            'agent_turns: loop {
+                if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
+                    let message = chat_run_cancel_message(&app_shutdown_rx);
+                    let event = match finish_cancelled_chat_run_with_message(
+                        &self,
+                        &request_started_at,
+                        started_at,
+                        &mut events,
+                        &executed_tool_calls,
+                        message,
+                    )
+                    .await {
+                        Ok(event) => event,
+                        Err(error) => ChatSseEvent::Error {
+                            message: error.message,
+                        },
+                    };
+                    yield event;
+                    return;
+                }
+
+                for event in append_guidance_events(
+                    &mut self.provider_request.messages,
+                    &mut self.message_source_sequences,
+                    &mut self.message_context_sources,
+                    &mut events,
+                    drain_guidance_messages(&mut guidance_rx),
+                    None,
+                    &mut self.attachment_read_allowlist,
+                ) {
+                    yield event;
+                }
+
+                let compression_result = match ensure_context_compression(&mut self).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield event;
+                        } else {
+                            yield event;
+                        }
+
+                        return;
+                    }
+                };
+                let turn_active_tool_start_index = compression_result.active_tool_start_index;
+                for notification in std::mem::take(&mut self.hook_notifications) {
+                    let event = ChatSseEvent::HookNotification {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        notification,
+                    };
+                    events.push(captured_event(&event));
+                    yield event;
+                }
+                for detail in compression_result.events.clone() {
+                    let event = ChatSseEvent::ContextCompression {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        snapshot_id: detail.snapshot_id.clone(),
+                        kind: detail.kind.clone(),
+                        status: detail.status.clone(),
+                        detail: Some(detail),
+                    };
+                    events.push(captured_event(&event));
+                    yield event;
+                }
+                if let Err(error) = self.refresh_model_route() {
+                    let message = error.message;
+                    let event = ChatSseEvent::Error {
+                        message: message.clone(),
+                    };
+                    events.push(captured_event(&event));
+                    let outcome = failed_chat_audit_outcome(
+                        &self,
+                        started_at,
+                        &mut events,
+                        &message,
+                        None,
+                    )
+                    .await;
+                    if let Err(persist_error) = persist_chat_result(
+                        &self,
+                        &request_started_at,
+                        outcome,
+                        &events,
+                        None,
+                        None,
+                        &executed_tool_calls,
+                    ) {
+                        yield ChatSseEvent::Error {
+                            message: persist_error.message,
+                        };
+                    } else {
+                        yield event;
+                    }
+                    return;
+                }
+                let packed_messages = match pack_neutral_messages(
+                    self.provider_request.messages.clone(),
+                    &self.message_source_sequences,
+                    &self.message_context_sources,
+                    &self.context_budget,
+                    turn_active_tool_start_index,
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield event;
+                        } else {
+                            yield event;
+                        }
+
+                        return;
+                    }
+                };
+                let attempt_assistant_text = assistant_text.clone();
+                let attempt_assistant_reasoning = assistant_reasoning.clone();
+                let attempt_reasoning_started_at = reasoning_started_at;
+                let attempt_reasoning_duration_ms = reasoning_duration_ms;
+                let attempt_first_token_at = first_token_at.clone();
+                let attempt_first_token_latency_ms = first_token_latency_ms;
+                let attempt_seen_tool_call_ids = seen_tool_call_ids.clone();
+                let attempt_total_usage = total_usage.clone();
+                let attempt_final_usage = final_usage.clone();
+                let mut turn_request = self.provider_request.clone();
+                turn_request.messages = packed_messages;
+                let turn_llm_request_id = unique_id("llm");
+                let turn_request_started_at = utc_timestamp();
+                let turn_started_at = Instant::now();
+                let mut turn_events = vec![CapturedAuditEvent {
+                    event_at: turn_request_started_at.clone(),
+                    event_type: "start".to_string(),
+                    normalized_event_json: json!({
+                        "type": "start",
+                        "chatId": &self.chat_id,
+                        "userMessageId": &self.user_message_id,
+                        "assistantMessageId": &self.assistant_message_id,
+                        "llmRequestId": &turn_llm_request_id,
+                        "runId": &self.llm_request_id,
+                        "turnIndex": turn_index,
+                    })
+                    .to_string(),
+                }];
+                if let Err(error) = persist_running_llm_request(
+                    &self,
+                    &turn_llm_request_id,
+                    &turn_request_started_at,
+                    None,
+                    &turn_events,
+                ) {
+                    yield ChatSseEvent::Error {
+                        message: error.message,
+                    };
+                    return;
+                }
+                let attempt_start_event = ChatSseEvent::StreamAttemptStart {
+                    assistant_message_id: self.assistant_message_id.clone(),
+                    llm_request_id: turn_llm_request_id.clone(),
+                };
+                events.push(captured_event(&attempt_start_event));
+                yield attempt_start_event;
+                let turn_capture = ProviderAuditCapture::new(
+                    &self.workspace_path,
+                    turn_llm_request_id.clone(),
+                    api_audit_save_details(&self.global_config),
+                );
+                let mut provider_stream = match tokio::select! {
+                    changed = app_shutdown_rx.changed() => {
+                        if changed.is_err() || *app_shutdown_rx.borrow() {
+                            cancellation.cancel();
+                            self.capture_cancelled_llm_request(
+                                &turn_capture,
+                                &turn_llm_request_id,
+                                &turn_request_started_at,
+                                &turn_events,
+                                turn_started_at,
+                                SHUTDOWN_MESSAGE,
+                            );
+                            let event = match finish_cancelled_chat_run(
+                                &self,
+                                &request_started_at,
+                                started_at,
+                                &mut events,
+                                &executed_tool_calls,
+                            )
+                            .await {
+                                Ok(event) => event,
+                                Err(error) => ChatSseEvent::Error {
+                                    message: error.message,
+                                },
+                            };
+                            yield event;
+                            return;
+                        }
+                        continue;
+                    }
+                    changed = run_cancellation_rx.changed() => {
+                        if changed.is_err() || *run_cancellation_rx.borrow() {
+                            self.capture_cancelled_llm_request(
+                                &turn_capture,
+                                &turn_llm_request_id,
+                                &turn_request_started_at,
+                                &turn_events,
+                                turn_started_at,
+                                "chat run cancelled",
+                            );
+                            let event = match finish_cancelled_chat_run_with_message(
+                                &self,
+                                &request_started_at,
+                                started_at,
+                                &mut events,
+                                &executed_tool_calls,
+                                "chat run cancelled",
+                            )
+                            .await {
+                                Ok(event) => event,
+                                Err(error) => ChatSseEvent::Error {
+                                    message: error.message,
+                                },
+                            };
+                            yield event;
+                            return;
+                        }
+                        continue;
+                    }
+                    provider_stream = timeout(
+                        Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                        stream_chat_with_capture_observer(
+                            &self.provider_config,
+                            turn_request,
+                            api_audit_save_details(&self.global_config),
+                            turn_capture.observer(),
+                        ),
+                    ) => provider_stream
+                        .unwrap_or_else(|_| Err(ProviderRequestFailure {
+                            error: provider_stream_idle_timeout_error(),
+                            request_dump: None,
+                        })),
+                } {
+                    Ok(provider_stream) => provider_stream,
+                    Err(error) => {
+                        if let Err(persist_error) = turn_capture.persist_request_failure(&error) {
+                            yield ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            return;
+                        }
+                        let status_code = error.status_code().map(i64::from);
+                        let message = error.to_string();
+                        if should_retry_provider_stream_error(
+                            &error.error,
+                            turn_retry_count,
+                            self.global_config.app.llm_request_retry_count,
                         ) {
-                            Ok(messages) => messages,
-                            Err(error) => {
-                                let message = error.message;
+                            self.capture_failed_llm_request(
+                                &turn_capture,
+                                turn_llm_request_id,
+                                turn_request_started_at,
+                                turn_events,
+                                turn_started_at,
+                                &message,
+                                status_code,
+                                true,
+                            );
+                            turn_retry_count = turn_retry_count.saturating_add(1);
+                            assistant_text = attempt_assistant_text;
+                            assistant_reasoning = attempt_assistant_reasoning;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
+                            first_token_at = attempt_first_token_at;
+                            first_token_latency_ms = attempt_first_token_latency_ms;
+                            seen_tool_call_ids = attempt_seen_tool_call_ids;
+                            total_usage = attempt_total_usage;
+                            final_usage = attempt_final_usage;
+                            let event = ChatSseEvent::StreamReset {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                reason: message,
+                                text: assistant_text.clone(),
+                                reasoning: non_empty_string(&assistant_reasoning),
+                                tool_calls: executed_tool_calls
+                                    .iter()
+                                    .map(executed_tool_call_summary)
+                                    .collect(),
+                            };
+                            events.push(captured_event(&event));
+                            yield event;
+                            continue 'agent_turns;
+                        }
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            turn_started_at,
+                            &mut events,
+                            &message,
+                            status_code,
+                        )
+                        .await;
+                        self.capture_failed_llm_request(
+                            &turn_capture,
+                            turn_llm_request_id,
+                            turn_request_started_at,
+                            turn_events,
+                            turn_started_at,
+                            &message,
+                            status_code,
+                            false,
+                        );
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield event;
+                        } else {
+                            yield event;
+                        }
+
+                        return;
+                    }
+                };
+                let mut turn_text = String::new();
+                let mut turn_reasoning = String::new();
+                let mut reasoning_loop_detector = ReasoningLoopDetector::default();
+                let mut turn_first_token_at = None;
+                let mut turn_first_token_latency_ms = None;
+                let mut completed_turn = false;
+
+                loop {
+                    let Some(event_result) = (tokio::select! {
+                        changed = app_shutdown_rx.changed() => {
+                            if changed.is_err() || *app_shutdown_rx.borrow() {
+                                cancellation.cancel();
+                                self.capture_cancelled_llm_request(
+                                    &turn_capture,
+                                    &turn_llm_request_id,
+                                    &turn_request_started_at,
+                                        &turn_events,
+                                    turn_started_at,
+                                    SHUTDOWN_MESSAGE,
+                                );
+                                let event = match finish_cancelled_chat_run(
+                                    &self,
+                                    &request_started_at,
+                                    started_at,
+                                    &mut events,
+                                    &executed_tool_calls,
+                                )
+                                .await {
+                                    Ok(event) => event,
+                                    Err(error) => ChatSseEvent::Error {
+                                        message: error.message,
+                                    },
+                                };
+                                yield event;
+                                return;
+                            }
+                            continue;
+                        }
+                        changed = run_cancellation_rx.changed() => {
+                            if changed.is_err() || *run_cancellation_rx.borrow() {
+                                self.capture_cancelled_llm_request(
+                                    &turn_capture,
+                                    &turn_llm_request_id,
+                                    &turn_request_started_at,
+                                        &turn_events,
+                                    turn_started_at,
+                                    "chat run cancelled",
+                                );
+                                let event = match finish_cancelled_chat_run_with_message(
+                                    &self,
+                                    &request_started_at,
+                                    started_at,
+                                    &mut events,
+                                    &executed_tool_calls,
+                                    "chat run cancelled",
+                                )
+                                .await {
+                                    Ok(event) => event,
+                                    Err(error) => ChatSseEvent::Error {
+                                        message: error.message,
+                                    },
+                                };
+                                yield event;
+                                return;
+                            }
+                            continue;
+                        }
+                        event_result = timeout(
+                            Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                            provider_stream.next_event(),
+                        ) => event_result
+                            .unwrap_or_else(|_| Some(Err(provider_stream_idle_timeout_error()))),
+                    }) else {
+                        break;
+                    };
+                    let provider_event = match event_result {
+                        Ok(provider_event) => provider_event,
+                        Err(error) => {
+                            let status_code = provider_status_code(&error);
+                            let message = error.to_string();
+                            if should_retry_provider_stream_error(
+                                &error,
+                                turn_retry_count,
+                                self.global_config.app.llm_request_retry_count,
+                            ) {
+                                self.capture_failed_llm_request(
+                                    &turn_capture,
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    status_code,
+                                    true,
+                                );
+                                turn_retry_count = turn_retry_count.saturating_add(1);
+                                assistant_text = attempt_assistant_text;
+                                assistant_reasoning = attempt_assistant_reasoning;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
+                                first_token_at = attempt_first_token_at;
+                                first_token_latency_ms = attempt_first_token_latency_ms;
+                                seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                total_usage = attempt_total_usage;
+                                final_usage = attempt_final_usage;
+                                let event = ChatSseEvent::StreamReset {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    reason: message,
+                                    text: assistant_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
+                                    tool_calls: executed_tool_calls
+                                        .iter()
+                                        .map(executed_tool_call_summary)
+                                        .collect(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                                continue 'agent_turns;
+                            }
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_chat_audit_outcome(
+                                &self,
+                                turn_started_at,
+                                &mut events,
+                                &message,
+                                status_code,
+                            )
+                            .await;
+                            let response_body_json = match turn_capture
+                                .response_json(provider_stream.final_response_dump())
+                            {
+                                Ok(response_body_json) => response_body_json,
+                                Err(error) => {
+                                    yield ChatSseEvent::Error {
+                                        message: error.message,
+                                    };
+                                    return;
+                                }
+                            };
+                            let captured_request_json = match turn_capture.captured_request_json() {
+                                Ok(request_body_json) => request_body_json.unwrap_or_default(),
+                                Err(error) => {
+                                    yield ChatSseEvent::Error {
+                                        message: error.message,
+                                    };
+                                    return;
+                                }
+                            };
+                            self.captured_llm_requests.push(CapturedLlmRequest {
+                                id: turn_llm_request_id,
+                                request_kind: "chat completion",
+                                request_started_at: turn_request_started_at,
+                                request_body_json: captured_request_json,
+                                events: turn_events,
+                                outcome: ChatAuditOutcome {
+                                    response_body_json,
+                                    ..outcome.clone()
+                                },
+                            });
+
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                                yield event;
+                            } else {
+                                yield event;
+                            }
+
+                            return;
+                        }
+                    };
+
+                    turn_events.push(captured_provider_event(&provider_event));
+
+                    match provider_event {
+                        NeutralChatStreamEvent::Start => {}
+                        NeutralChatStreamEvent::TextDelta { delta } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                            if reasoning_duration_ms.is_none()
+                                && let Some(started_at) = reasoning_started_at.take()
+                            {
+                                reasoning_duration_ms = Some(elapsed_millis(started_at));
+                            }
+                            assistant_text.push_str(&delta);
+                            turn_text.push_str(&delta);
+                            let event = ChatSseEvent::TextDelta {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                delta,
+                                reasoning_duration_ms,
+                            };
+                            events.push(captured_event(&event));
+                            yield event;
+                        }
+                        NeutralChatStreamEvent::ReasoningDelta { delta } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                            if reasoning_started_at.is_none() {
+                                reasoning_started_at = Some(Instant::now());
+                                reasoning_duration_ms = None;
+                            }
+                            let loop_detection = reasoning_loop_detector.push_delta(&delta);
+                            assistant_reasoning.push_str(&delta);
+                            turn_reasoning.push_str(&delta);
+                            let event = ChatSseEvent::ReasoningDelta {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                delta,
+                            };
+                            events.push(captured_event(&event));
+                            yield event;
+
+                            if let Some(detection) = loop_detection {
+                                let message = reasoning_loop_guard_message(detection);
+                                drop(provider_stream);
+                                self.capture_failed_llm_request(
+                                    &turn_capture,
+                                    turn_llm_request_id.clone(),
+                                    turn_request_started_at.clone(),
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    None,
+                                    true,
+                                );
+
+                                if reasoning_loop_recovery_count
+                                    < MAX_REASONING_LOOP_RECOVERIES_PER_RUN
+                                {
+                                    if let Some(failed_request) =
+                                        self.captured_llm_requests.last()
+                                        && let Err(error) = persist_completed_llm_request(
+                                            &self,
+                                            failed_request,
+                                        )
+                                    {
+                                        yield ChatSseEvent::Error {
+                                            message: error.message,
+                                        };
+                                        return;
+                                    }
+                                    reasoning_loop_recovery_count =
+                                        reasoning_loop_recovery_count.saturating_add(1);
+                                    if reasoning_duration_ms.is_none()
+                                        && let Some(started) = reasoning_started_at.take()
+                                    {
+                                        reasoning_duration_ms =
+                                            Some(elapsed_millis(started));
+                                    }
+                                    let turn_assistant_text =
+                                        assistant_message_text(&turn_text, &[]);
+                                    if !turn_assistant_text.trim().is_empty()
+                                        || !turn_reasoning.trim().is_empty()
+                                    {
+                                        self.provider_request.messages.push(
+                                            neutral_assistant_message(
+                                                turn_assistant_text,
+                                                non_empty_string(&turn_reasoning),
+                                            ),
+                                        );
+                                        self.message_source_sequences.push(None);
+                                        self.message_context_sources.push(
+                                            PromptContextSource::RuntimeAssistant,
+                                        );
+                                    }
+                                    let turn_total_latency_ms =
+                                        elapsed_millis(turn_started_at);
+                                    let turn_metrics = turn_reply_metrics(
+                                        &self.model_id,
+                                        &self.provider_id,
+                                        turn_total_latency_ms,
+                                        turn_first_token_latency_ms,
+                                        None,
+                                        vec![turn_llm_request_id],
+                                    );
+                                    let recovery_guidance = GuidanceMessage {
+                                        id: unique_id("msg-guidance"),
+                                        content: REASONING_LOOP_RECOVERY_USER_TEXT
+                                            .to_string(),
+                                        attachments: Vec::new(),
+                                        source: REASONING_LOOP_GUARD_SOURCE.to_string(),
+                                        interrupted_assistant_id: Some(
+                                            self.assistant_message_id.clone(),
+                                        ),
+                                    };
+                                    for event in append_guidance_events(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
+                                        &mut events,
+                                        vec![recovery_guidance],
+                                        Some(turn_metrics),
+                                        &mut self.attachment_read_allowlist,
+                                    ) {
+                                        yield event;
+                                    }
+                                    turn_retry_count = 0;
+                                    turn_index = turn_index.saturating_add(1);
+                                    continue 'agent_turns;
+                                }
+
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
                                 };
                                 events.push(captured_event(&event));
                                 let outcome = failed_chat_audit_outcome(
                                     &self,
-                                    started_at,
+                                    turn_started_at,
                                     &mut events,
                                     &message,
                                     None,
                                 )
                                 .await;
-
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                    let event = ChatSseEvent::Error {
-                                        message: persist_error.message,
-                                    };
-                                    yield event;
-                                } else {
-                                    yield event;
-                                }
-
-                                return;
-                            }
-                        };
-                        let attempt_assistant_text = assistant_text.clone();
-                        let attempt_assistant_reasoning = assistant_reasoning.clone();
-                        let attempt_reasoning_started_at = reasoning_started_at;
-                        let attempt_reasoning_duration_ms = reasoning_duration_ms;
-                        let attempt_first_token_at = first_token_at.clone();
-                        let attempt_first_token_latency_ms = first_token_latency_ms;
-                        let attempt_seen_tool_call_ids = seen_tool_call_ids.clone();
-                        let attempt_total_usage = total_usage.clone();
-                        let attempt_final_usage = final_usage.clone();
-                        let mut turn_request = self.provider_request.clone();
-                        turn_request.messages = packed_messages;
-                        let turn_llm_request_id = unique_id("llm");
-                        let turn_request_started_at = utc_timestamp();
-                        let turn_started_at = Instant::now();
-                        let mut turn_events = vec![CapturedAuditEvent {
-                            event_at: turn_request_started_at.clone(),
-                            event_type: "start".to_string(),
-                            normalized_event_json: json!({
-                                "type": "start",
-                                "chatId": &self.chat_id,
-                                "userMessageId": &self.user_message_id,
-                                "assistantMessageId": &self.assistant_message_id,
-                                "llmRequestId": &turn_llm_request_id,
-                                "runId": &self.llm_request_id,
-                                "turnIndex": turn_index,
-                            })
-                            .to_string(),
-                        }];
-                        if let Err(error) = persist_running_llm_request(
-                            &self,
-                            &turn_llm_request_id,
-                            &turn_request_started_at,
-                            None,
-                            &turn_events,
-                        ) {
-                            yield ChatSseEvent::Error {
-                                message: error.message,
-                            };
-                            return;
-                        }
-                        let attempt_start_event = ChatSseEvent::StreamAttemptStart {
-                            assistant_message_id: self.assistant_message_id.clone(),
-                            llm_request_id: turn_llm_request_id.clone(),
-                        };
-                        events.push(captured_event(&attempt_start_event));
-                        yield attempt_start_event;
-                        let turn_capture = ProviderAuditCapture::new(
-                            &self.workspace_path,
-                            turn_llm_request_id.clone(),
-                            api_audit_save_details(&self.global_config),
-                        );
-                        let mut provider_stream = match tokio::select! {
-                            changed = app_shutdown_rx.changed() => {
-                                if changed.is_err() || *app_shutdown_rx.borrow() {
-                                    cancellation.cancel();
-                                    self.capture_cancelled_llm_request(
-                                        &turn_capture,
-                                        &turn_llm_request_id,
-                                        &turn_request_started_at,
-                                        &turn_events,
-                                        turn_started_at,
-                                        SHUTDOWN_MESSAGE,
-                                    );
-                                    let event = match finish_cancelled_chat_run(
-                                        &self,
-                                        &request_started_at,
-                                        started_at,
-                                        &mut events,
-                                        &executed_tool_calls,
-                                    )
-                                    .await {
-                                        Ok(event) => event,
-                                        Err(error) => ChatSseEvent::Error {
-                                            message: error.message,
-                                        },
-                                    };
-                                    yield event;
-                                    return;
-                                }
-                                continue;
-                            }
-                            changed = run_cancellation_rx.changed() => {
-                                if changed.is_err() || *run_cancellation_rx.borrow() {
-                                    self.capture_cancelled_llm_request(
-                                        &turn_capture,
-                                        &turn_llm_request_id,
-                                        &turn_request_started_at,
-                                        &turn_events,
-                                        turn_started_at,
-                                        "chat run cancelled",
-                                    );
-                                    let event = match finish_cancelled_chat_run_with_message(
-                                        &self,
-                                        &request_started_at,
-                                        started_at,
-                                        &mut events,
-                                        &executed_tool_calls,
-                                        "chat run cancelled",
-                                    )
-                                    .await {
-                                        Ok(event) => event,
-                                        Err(error) => ChatSseEvent::Error {
-                                            message: error.message,
-                                        },
-                                    };
-                                    yield event;
-                                    return;
-                                }
-                                continue;
-                            }
-                            provider_stream = timeout(
-                                Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
-                                stream_chat_with_capture_observer(
-                                    &self.provider_config,
-                                    turn_request,
-                                    api_audit_save_details(&self.global_config),
-                                    turn_capture.observer(),
-                                ),
-                            ) => provider_stream
-                                .unwrap_or_else(|_| Err(ProviderRequestFailure {
-                                    error: provider_stream_idle_timeout_error(),
-                                    request_dump: None,
-                                })),
-                        } {
-                            Ok(provider_stream) => provider_stream,
-                            Err(error) => {
-                                if let Err(persist_error) = turn_capture.persist_request_failure(&error) {
+                                let persisted_reasoning =
+                                    non_empty_string(&assistant_reasoning);
+                                if let Err(persist_error) = persist_chat_result(
+                                    &self,
+                                    &request_started_at,
+                                    outcome,
+                                    &events,
+                                    Some(&assistant_text),
+                                    persisted_reasoning.as_deref(),
+                                    &executed_tool_calls,
+                                ) {
                                     yield ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    return;
+                                } else {
+                                    yield event;
                                 }
-                                let status_code = error.status_code().map(i64::from);
-                                let message = error.to_string();
-                                if should_retry_provider_stream_error(
-                                    &error.error,
-                                    turn_retry_count,
-                                    self.global_config.app.llm_request_retry_count,
-                                ) {
+                                return;
+                            }
+                        }
+                        NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                        }
+                        NeutralChatStreamEvent::ToolCall { tool_call: _ } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                            // ponytail: provider ToolCallChunk may carry partial arguments
+                            // (e.g. `"{\""`); only emit/persist from Complete with full args.
+                        }
+                        NeutralChatStreamEvent::Usage { usage } => {
+                            let event = ChatSseEvent::Usage { usage };
+                            yield event;
+                        }
+                        NeutralChatStreamEvent::Complete {
+                            text,
+                            reasoning,
+                            tool_calls,
+                            usage,
+                            stop_reason,
+                            response_id: _,
+                        } => {
+                            completed_turn = true;
+
+                            if turn_text.is_empty() && !text.is_empty() {
+                                let message = "provider completed without streaming assistant text deltas".to_string();
+                                if turn_retry_count < self.global_config.app.llm_request_retry_count {
                                     self.capture_failed_llm_request(
                                         &turn_capture,
                                         turn_llm_request_id,
@@ -3238,14 +3677,14 @@ impl PreparedChatContext {
                                         turn_events,
                                         turn_started_at,
                                         &message,
-                                        status_code,
-                                        true,
+                                        None,
+                                true,
                                     );
                                     turn_retry_count = turn_retry_count.saturating_add(1);
                                     assistant_text = attempt_assistant_text;
                                     assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
                                     first_token_at = attempt_first_token_at;
                                     first_token_latency_ms = attempt_first_token_latency_ms;
                                     seen_tool_call_ids = attempt_seen_tool_call_ids;
@@ -3271,10 +3710,10 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 let outcome = failed_chat_audit_outcome(
                                     &self,
-                                    turn_started_at,
+                                    started_at,
                                     &mut events,
                                     &message,
-                                    status_code,
+                                    None,
                                 )
                                 .await;
                                 self.capture_failed_llm_request(
@@ -3284,7 +3723,7 @@ impl PreparedChatContext {
                                     turn_events,
                                     turn_started_at,
                                     &message,
-                                    status_code,
+                                    None,
                                     false,
                                 );
 
@@ -3299,1314 +3738,10 @@ impl PreparedChatContext {
 
                                 return;
                             }
-                        };
-                        let mut turn_text = String::new();
-                        let mut turn_reasoning = String::new();
-                        let mut reasoning_loop_detector = ReasoningLoopDetector::default();
-                        let mut turn_first_token_at = None;
-                        let mut turn_first_token_latency_ms = None;
-                        let mut completed_turn = false;
 
-                        loop {
-                            let Some(event_result) = (tokio::select! {
-                                changed = app_shutdown_rx.changed() => {
-                                    if changed.is_err() || *app_shutdown_rx.borrow() {
-                                        cancellation.cancel();
-                                        self.capture_cancelled_llm_request(
-                                            &turn_capture,
-                                            &turn_llm_request_id,
-                                            &turn_request_started_at,
-                                                &turn_events,
-                                            turn_started_at,
-                                            SHUTDOWN_MESSAGE,
-                                        );
-                                        let event = match finish_cancelled_chat_run(
-                                            &self,
-                                            &request_started_at,
-                                            started_at,
-                                            &mut events,
-                                            &executed_tool_calls,
-                                        )
-                                        .await {
-                                            Ok(event) => event,
-                                            Err(error) => ChatSseEvent::Error {
-                                                message: error.message,
-                                            },
-                                        };
-                                        yield event;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                changed = run_cancellation_rx.changed() => {
-                                    if changed.is_err() || *run_cancellation_rx.borrow() {
-                                        self.capture_cancelled_llm_request(
-                                            &turn_capture,
-                                            &turn_llm_request_id,
-                                            &turn_request_started_at,
-                                                &turn_events,
-                                            turn_started_at,
-                                            "chat run cancelled",
-                                        );
-                                        let event = match finish_cancelled_chat_run_with_message(
-                                            &self,
-                                            &request_started_at,
-                                            started_at,
-                                            &mut events,
-                                            &executed_tool_calls,
-                                            "chat run cancelled",
-                                        )
-                                        .await {
-                                            Ok(event) => event,
-                                            Err(error) => ChatSseEvent::Error {
-                                                message: error.message,
-                                            },
-                                        };
-                                        yield event;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                event_result = timeout(
-                                    Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
-                                    provider_stream.next_event(),
-                                ) => event_result
-                                    .unwrap_or_else(|_| Some(Err(provider_stream_idle_timeout_error()))),
-                            }) else {
-                                break;
-                            };
-                            let provider_event = match event_result {
-                                Ok(provider_event) => provider_event,
-                                Err(error) => {
-                                    let status_code = provider_status_code(&error);
-                                    let message = error.to_string();
-                                    if should_retry_provider_stream_error(
-                                        &error,
-                                        turn_retry_count,
-                                        self.global_config.app.llm_request_retry_count,
-                                    ) {
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id,
-                                            turn_request_started_at,
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            status_code,
-                                            true,
-                                        );
-                                        turn_retry_count = turn_retry_count.saturating_add(1);
-                                        assistant_text = attempt_assistant_text;
-                                        assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
-                                        first_token_at = attempt_first_token_at;
-                                        first_token_latency_ms = attempt_first_token_latency_ms;
-                                        seen_tool_call_ids = attempt_seen_tool_call_ids;
-                                        total_usage = attempt_total_usage;
-                                        final_usage = attempt_final_usage;
-                                        let event = ChatSseEvent::StreamReset {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            reason: message,
-                                            text: assistant_text.clone(),
-                                            reasoning: non_empty_string(&assistant_reasoning),
-                                            tool_calls: executed_tool_calls
-                                                .iter()
-                                                .map(executed_tool_call_summary)
-                                                .collect(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                        continue 'agent_turns;
-                                    }
-                                    let event = ChatSseEvent::Error {
-                                        message: message.clone(),
-                                    };
-                                    events.push(captured_event(&event));
-                                    let outcome = failed_chat_audit_outcome(
-                                        &self,
-                                        turn_started_at,
-                                        &mut events,
-                                        &message,
-                                        status_code,
-                                    )
-                                    .await;
-                                    let response_body_json = match turn_capture
-                                        .response_json(provider_stream.final_response_dump())
-                                    {
-                                        Ok(response_body_json) => response_body_json,
-                                        Err(error) => {
-                                            yield ChatSseEvent::Error {
-                                                message: error.message,
-                                            };
-                                            return;
-                                        }
-                                    };
-                                    let captured_request_json = match turn_capture.captured_request_json() {
-                                        Ok(request_body_json) => request_body_json.unwrap_or_default(),
-                                        Err(error) => {
-                                            yield ChatSseEvent::Error {
-                                                message: error.message,
-                                            };
-                                            return;
-                                        }
-                                    };
-                                    self.captured_llm_requests.push(CapturedLlmRequest {
-                                        id: turn_llm_request_id,
-                                        request_kind: "chat completion",
-                                        request_started_at: turn_request_started_at,
-                                        request_body_json: captured_request_json,
-                                        events: turn_events,
-                                        outcome: ChatAuditOutcome {
-                                            response_body_json,
-                                            ..outcome.clone()
-                                        },
-                                    });
-
-                                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                        let event = ChatSseEvent::Error {
-                                            message: persist_error.message,
-                                        };
-                                        yield event;
-                                    } else {
-                                        yield event;
-                                    }
-
-                                    return;
-                                }
-                            };
-
-                            turn_events.push(captured_provider_event(&provider_event));
-
-                            match provider_event {
-                                NeutralChatStreamEvent::Start => {}
-                                NeutralChatStreamEvent::TextDelta { delta } => {
-                                    capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                    capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                    if reasoning_duration_ms.is_none()
-                                        && let Some(started_at) = reasoning_started_at.take()
-                                    {
-                                        reasoning_duration_ms = Some(elapsed_millis(started_at));
-                                    }
-                                    assistant_text.push_str(&delta);
-                                    turn_text.push_str(&delta);
-                                    let event = ChatSseEvent::TextDelta {
-                                        assistant_message_id: self.assistant_message_id.clone(),
-                                        delta,
-                                        reasoning_duration_ms,
-                                    };
-                                    events.push(captured_event(&event));
-                                    yield event;
-                                }
-                                NeutralChatStreamEvent::ReasoningDelta { delta } => {
-                                    capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                    capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                    if reasoning_started_at.is_none() {
-                                        reasoning_started_at = Some(Instant::now());
-                                        reasoning_duration_ms = None;
-                                    }
-                                    let loop_detection = reasoning_loop_detector.push_delta(&delta);
-                                    assistant_reasoning.push_str(&delta);
-                                    turn_reasoning.push_str(&delta);
-                                    let event = ChatSseEvent::ReasoningDelta {
-                                        assistant_message_id: self.assistant_message_id.clone(),
-                                        delta,
-                                    };
-                                    events.push(captured_event(&event));
-                                    yield event;
-
-                                    if let Some(detection) = loop_detection {
-                                        let message = reasoning_loop_guard_message(detection);
-                                        drop(provider_stream);
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id.clone(),
-                                            turn_request_started_at.clone(),
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            None,
-                                            true,
-                                        );
-
-                                        if reasoning_loop_recovery_count
-                                            < MAX_REASONING_LOOP_RECOVERIES_PER_RUN
-                                        {
-                                            if let Some(failed_request) =
-                                                self.captured_llm_requests.last()
-                                                && let Err(error) = persist_completed_llm_request(
-                                                    &self,
-                                                    failed_request,
-                                                )
-                                            {
-                                                yield ChatSseEvent::Error {
-                                                    message: error.message,
-                                                };
-                                                return;
-                                            }
-                                            reasoning_loop_recovery_count =
-                                                reasoning_loop_recovery_count.saturating_add(1);
-                                            if reasoning_duration_ms.is_none()
-                                                && let Some(started) = reasoning_started_at.take()
-                                            {
-                                                reasoning_duration_ms =
-                                                    Some(elapsed_millis(started));
-                                            }
-                                            let turn_assistant_text =
-                                                assistant_message_text(&turn_text, &[]);
-                                            if !turn_assistant_text.trim().is_empty()
-                                                || !turn_reasoning.trim().is_empty()
-                                            {
-                                                self.provider_request.messages.push(
-                                                    neutral_assistant_message(
-                                                        turn_assistant_text,
-                                                        non_empty_string(&turn_reasoning),
-                                                    ),
-                                                );
-                                                self.message_source_sequences.push(None);
-                                                self.message_context_sources.push(
-                                                    PromptContextSource::RuntimeAssistant,
-                                                );
-                                            }
-                                            let turn_total_latency_ms =
-                                                elapsed_millis(turn_started_at);
-                                            let turn_metrics = turn_reply_metrics(
-                                                &self.model_id,
-                                                &self.provider_id,
-                                                turn_total_latency_ms,
-                                                turn_first_token_latency_ms,
-                                                None,
-                                                vec![turn_llm_request_id],
-                                            );
-                                            let recovery_guidance = GuidanceMessage {
-                                                id: unique_id("msg-guidance"),
-                                                content: REASONING_LOOP_RECOVERY_USER_TEXT
-                                                    .to_string(),
-                                                attachments: Vec::new(),
-                                                source: REASONING_LOOP_GUARD_SOURCE.to_string(),
-                                                interrupted_assistant_id: Some(
-                                                    self.assistant_message_id.clone(),
-                                                ),
-                                            };
-                                            for event in append_guidance_events(
-                                                &mut self.provider_request.messages,
-                                                &mut self.message_source_sequences,
-                                                &mut self.message_context_sources,
-                                                &mut events,
-                                                vec![recovery_guidance],
-                                                Some(turn_metrics),
-                                            ) {
-                                                yield event;
-                                            }
-                                            turn_retry_count = 0;
-                                            turn_index = turn_index.saturating_add(1);
-                                            continue 'agent_turns;
-                                        }
-
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                            &self,
-                                            turn_started_at,
-                                            &mut events,
-                                            &message,
-                                            None,
-                                        )
-                                        .await;
-                                        let persisted_reasoning =
-                                            non_empty_string(&assistant_reasoning);
-                                        if let Err(persist_error) = persist_chat_result(
-                                            &self,
-                                            &request_started_at,
-                                            outcome,
-                                            &events,
-                                            Some(&assistant_text),
-                                            persisted_reasoning.as_deref(),
-                                            &executed_tool_calls,
-                                        ) {
-                                            yield ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                        } else {
-                                            yield event;
-                                        }
-                                        return;
-                                    }
-                                }
-                                NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
-                                    capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                    capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                }
-                                NeutralChatStreamEvent::ToolCall { tool_call: _ } => {
-                                    capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                    capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                    // ponytail: provider ToolCallChunk may carry partial arguments
-                                    // (e.g. `"{\""`); only emit/persist from Complete with full args.
-                                }
-                                NeutralChatStreamEvent::Usage { usage } => {
-                                    let event = ChatSseEvent::Usage { usage };
-                                    yield event;
-                                }
-                                NeutralChatStreamEvent::Complete {
-                                    text,
-                                    reasoning,
-                                    tool_calls,
-                                    usage,
-                                    stop_reason,
-                                    response_id: _,
-                                } => {
-                                    completed_turn = true;
-
-                                    if turn_text.is_empty() && !text.is_empty() {
-                                        let message = "provider completed without streaming assistant text deltas".to_string();
-                                        if turn_retry_count < self.global_config.app.llm_request_retry_count {
-                                            self.capture_failed_llm_request(
-                                                &turn_capture,
-                                                turn_llm_request_id,
-                                                turn_request_started_at,
-                                                turn_events,
-                                                turn_started_at,
-                                                &message,
-                                                None,
-                                        true,
-                                            );
-                                            turn_retry_count = turn_retry_count.saturating_add(1);
-                                            assistant_text = attempt_assistant_text;
-                                            assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
-                                            first_token_at = attempt_first_token_at;
-                                            first_token_latency_ms = attempt_first_token_latency_ms;
-                                            seen_tool_call_ids = attempt_seen_tool_call_ids;
-                                            total_usage = attempt_total_usage;
-                                            final_usage = attempt_final_usage;
-                                            let event = ChatSseEvent::StreamReset {
-                                                assistant_message_id: self.assistant_message_id.clone(),
-                                                reason: message,
-                                                text: assistant_text.clone(),
-                                                reasoning: non_empty_string(&assistant_reasoning),
-                                                tool_calls: executed_tool_calls
-                                                    .iter()
-                                                    .map(executed_tool_call_summary)
-                                                    .collect(),
-                                            };
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                            continue 'agent_turns;
-                                        }
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                            &self,
-                                            started_at,
-                                            &mut events,
-                                            &message,
-                                            None,
-                                        )
-                                        .await;
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id,
-                                            turn_request_started_at,
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            None,
-                                            false,
-                                        );
-
-                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                            let event = ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                            yield event;
-                                        } else {
-                                            yield event;
-                                        }
-
-                                        return;
-                                    }
-
-                                    if turn_text.is_empty() && tool_calls.is_empty() {
-                                        let message = "provider completed without assistant text or tool calls".to_string();
-                                        if turn_retry_count < self.global_config.app.llm_request_retry_count {
-                                            self.capture_failed_llm_request(
-                                                &turn_capture,
-                                                turn_llm_request_id,
-                                                turn_request_started_at,
-                                                turn_events,
-                                                turn_started_at,
-                                                &message,
-                                                None,
-                                        true,
-                                            );
-                                            turn_retry_count = turn_retry_count.saturating_add(1);
-                                            assistant_text = attempt_assistant_text;
-                                            assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
-                                            first_token_at = attempt_first_token_at;
-                                            first_token_latency_ms = attempt_first_token_latency_ms;
-                                            seen_tool_call_ids = attempt_seen_tool_call_ids;
-                                            total_usage = attempt_total_usage;
-                                            final_usage = attempt_final_usage;
-                                            let event = ChatSseEvent::StreamReset {
-                                                assistant_message_id: self.assistant_message_id.clone(),
-                                                reason: message,
-                                                text: assistant_text.clone(),
-                                                reasoning: non_empty_string(&assistant_reasoning),
-                                                tool_calls: executed_tool_calls
-                                                    .iter()
-                                                    .map(executed_tool_call_summary)
-                                                    .collect(),
-                                            };
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                            continue 'agent_turns;
-                                        }
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id,
-                                            turn_request_started_at,
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            None,
-                                            false,
-                                        );
-
-                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
-                                            let event = ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                            yield event;
-                                        } else {
-                                            yield event;
-                                        }
-
-                                        return;
-                                    }
-
-                                    if turn_reasoning.is_empty() {
-                                        if let Some(reasoning) = reasoning.as_deref() {
-                                            assistant_reasoning.push_str(reasoning);
-                                            turn_reasoning.push_str(reasoning);
-                                        }
-                                    }
-
-                                    if let Some(usage) = &usage {
-                                        merge_usage(&mut total_usage, usage);
-                                        final_usage = Some(total_usage.clone());
-                                    }
-                                    let turn_total_latency_ms = elapsed_millis(turn_started_at);
-                                    let response_body_json = match turn_capture
-                                        .response_json(provider_stream.final_response_dump())
-                                    {
-                                        Ok(response_body_json) => response_body_json,
-                                        Err(error) => {
-                                            yield ChatSseEvent::Error {
-                                                message: error.message,
-                                            };
-                                            return;
-                                        }
-                                    };
-                                    let request_body_json = match turn_capture.captured_request_json() {
-                                        Ok(request_body_json) => request_body_json.unwrap_or_default(),
-                                        Err(error) => {
-                                            yield ChatSseEvent::Error {
-                                                message: error.message,
-                                            };
-                                            return;
-                                        }
-                                    };
-                                    let completed_turn_request = CapturedLlmRequest {
-                                        id: turn_llm_request_id.clone(),
-                                        request_kind: "chat completion",
-                                        request_started_at: turn_request_started_at.clone(),
-                                        request_body_json,
-                                        events: turn_events.clone(),
-                                        outcome: ChatAuditOutcome {
-                                            first_token_at: turn_first_token_at.clone(),
-                                            completed_at: utc_timestamp(),
-                                            first_token_latency_ms: turn_first_token_latency_ms,
-                                            total_latency_ms: turn_total_latency_ms,
-                                            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
-                                            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
-                                            cache_read_tokens: usage
-                                                .as_ref()
-                                                .and_then(|usage| usage.cache_read_tokens),
-                                            cache_write_tokens: usage
-                                                .as_ref()
-                                                .and_then(|usage| usage.cache_write_tokens),
-                                            reasoning_tokens: usage
-                                                .as_ref()
-                                                .and_then(|usage| usage.reasoning_tokens),
-                                            status_code: Some(200),
-                                            final_state: "succeeded",
-                                            response_body_json,
-                                        },
-                                    };
-                                    if let Err(error) = persist_completed_llm_request(&self, &completed_turn_request) {
-                                        yield ChatSseEvent::Error {
-                                            message: error.message,
-                                        };
-                                        return;
-                                    }
-                                    self.captured_llm_requests.push(completed_turn_request);
-                                    record_chat_completion_input_tokens(
-                                        &mut self.last_chat_completion_input_tokens,
-                                        usage.as_ref().and_then(|usage| usage.input_tokens),
-                                    );
-                                    let turn_metrics = turn_reply_metrics(
-                                        &self.model_id,
-                                        &self.provider_id,
-                                        turn_total_latency_ms,
-                                        turn_first_token_latency_ms,
-                                        usage.as_ref(),
-                                        vec![turn_llm_request_id.clone()],
-                                    );
-                                    if let Some(usage) = usage {
-                                        let event = ChatSseEvent::Usage { usage };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-
-                                    if tool_calls.is_empty() {
-                                        let guidance_messages =
-                                            next_guidance_messages_at_boundary(&mut guidance_rx).await;
-                                        if !guidance_messages.is_empty() {
-                                            let turn_assistant_text =
-                                                assistant_message_text(&turn_text, &[]);
-                                            if !turn_assistant_text.trim().is_empty()
-                                                || !turn_reasoning.trim().is_empty()
-                                            {
-                                                self.provider_request.messages.push(neutral_assistant_message(
-                                                    turn_assistant_text,
-                                                    non_empty_string(&turn_reasoning),
-                                                ));
-                                                self.message_source_sequences.push(None);
-                                                self.message_context_sources.push(
-                                                    PromptContextSource::RuntimeAssistant,
-                                                );
-                                            }
-                                            for event in append_guidance_events(
-                                                &mut self.provider_request.messages,
-                                                &mut self.message_source_sequences,
-                                                &mut self.message_context_sources,
-                                                &mut events,
-                                                guidance_messages,
-                                                Some(turn_metrics.clone()),
-                                            ) {
-                                                yield event;
-                                            }
-                                            turn_retry_count = 0;
-                                            turn_index = turn_index.saturating_add(1);
-                                            continue 'agent_turns;
-                                        }
-                                        let assistant_message_text =
-                                            assistant_message_text(&assistant_text, &executed_tool_calls);
-                                        let stop_text = assistant_message_text.clone();
-                                        let stop_summary = self.hook_runtime.run_hooks(HookRunRequest {
-                                            global_config: &self.global_hooks,
-                                            api_audit_save_details: api_audit_save_details(&self.global_config),
-                                            workspace_id: &self.workspace_id,
-                                            workspace_path: &self.workspace_path,
-                                            event: "Stop",
-                                            match_value: None,
-                                            chat_id: Some(&self.chat_id),
-                                            run_id: Some(&self.llm_request_id),
-                                            session_id: Some(&self.chat_id),
-                                            tool_call_id: None,
-                                            model_id: Some(&self.model_id),
-                                            provider_id: Some(&self.provider_id),
-                                            provider_config: Some(&self.provider_config),
-                                            llm_request_retry_count: self.global_config.app.llm_request_retry_count,
-                                            permission_mode: None,
-                                            payload: json!({
-                                                "text": stop_text,
-                                                "reasoning": non_empty_string(&assistant_reasoning),
-                                                "usage": final_usage.clone(),
-                                                "stopReason": stop_reason.clone(),
-                                            }),
-                                        }).await;
-                                        for event in hook_notification_events(&self.assistant_message_id, "Stop", &stop_summary) {
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                        }
-                                        if let Some(reason) = stop_summary.first_block_reason() {
-                                            append_hook_context_messages(
-                                                &mut self.provider_request.messages,
-                                                &mut self.message_source_sequences,
-                                                &mut self.message_context_sources,
-                                                &[
-                                                    format!("Stop hook blocked the assistant response: {reason}"),
-                                                    stop_summary.additional_context.join("\n"),
-                                                ],
-                                            );
-                                            turn_retry_count = 0;
-                                            turn_index = turn_index.saturating_add(1);
-                                            continue 'agent_turns;
-                                        }
-                                        let git_diff_summary_result = maybe_git_diff_summary_for_session_mode(
-                                            &assistant_message_text,
-                                            &self.code_change_baseline,
-                                            &self.workspace_path,
-                                            &self.global_config.app.language,
-                                            self.session_mode.as_deref(),
-                                        );
-                                        let assistant_message_text = git_diff_summary_result.text;
-                                        self.code_change_stats = git_diff_summary_result.stats;
-                                        let total_latency_ms = elapsed_millis(started_at);
-                                        if reasoning_duration_ms.is_none()
-                                            && let Some(started_at) = reasoning_started_at.take()
-                                        {
-                                            reasoning_duration_ms = Some(elapsed_millis(started_at));
-                                        }
-                                        let metrics = ChatReplyMetrics {
-                                            model_id: self.model_id.clone(),
-                                            provider_id: self.provider_id.clone(),
-                                            total_latency_ms: Some(total_latency_ms),
-                                            first_token_latency_ms,
-                                            output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
-                                            llm_request_ids: self
-                                                .captured_llm_requests
-                                                .iter()
-                                                .map(|request| request.id.clone())
-                                                .collect(),
-                                        };
-                                        let complete_event = ChatSseEvent::Complete {
-                                            chat_id: self.chat_id.clone(),
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            text: assistant_message_text.clone(),
-                                            reasoning: non_empty_string(&assistant_reasoning),
-                                            reasoning_duration_ms,
-                                            usage: final_usage.clone(),
-                                            stop_reason: stop_reason.clone(),
-                                            metrics,
-                                            memories_used: self.memories_used.clone(),
-                                        };
-                                        let session_end_summary = session_end_hook(
-                                            &self,
-                                            "succeeded",
-                                            json!({
-                                                "text": assistant_message_text.clone(),
-                                                "reasoning": non_empty_string(&assistant_reasoning),
-                                                "usage": final_usage.clone(),
-                                                "stopReason": stop_reason.clone(),
-                                            }),
-                                        ).await;
-                                        for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                        }
-                                        let captured_complete = captured_event(&complete_event);
-                                        events.push(captured_complete.clone());
-                                        let completed_at = utc_timestamp();
-                                        let outcome = ChatAuditOutcome {
-                                            first_token_at,
-                                            completed_at,
-                                            first_token_latency_ms,
-                                            total_latency_ms,
-                                            input_tokens: final_usage.as_ref().and_then(|usage| usage.input_tokens),
-                                            output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
-                                            cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
-                                            cache_write_tokens: final_usage.as_ref().and_then(|usage| usage.cache_write_tokens),
-                                            reasoning_tokens: final_usage.as_ref().and_then(|usage| usage.reasoning_tokens),
-                                            status_code: Some(200),
-                                            final_state: "succeeded",
-                                            // Run-level aggregate is not a provider wire dump. Per-turn
-                                            // provider_final_response_v1 is already persisted above.
-                                            response_body_json: None,
-                                        };
-
-                                        match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
-                                            Ok(()) => {
-                                                yield complete_event;
-                                            }
-                                            Err(error) => {
-                                                let event = ChatSseEvent::Error {
-                                                    message: error.message,
-                                                };
-                                                yield event;
-                                            }
-                                        }
-
-                                        return;
-                                    }
-
-                                    if tool_rounds_since_last_compression >= MAX_AGENT_TOOL_ROUNDS {
-                                        let recovered = match recover_after_tool_round_cap(
-                                            &mut self,
-                                            tool_calls,
-                                            turn_text,
-                                            non_empty_string(&turn_reasoning),
-                                        ) {
-                                            Ok(recovered) => recovered,
-                                            Err(error) => {
-                                                let message = error.message;
-                                                let event = ChatSseEvent::Error {
-                                                    message: message.clone(),
-                                                };
-                                                events.push(captured_event(&event));
-                                                let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                                                    let event = ChatSseEvent::Error {
-                                                        message: persist_error.message,
-                                                    };
-                                                    yield event;
-                                                } else {
-                                                    yield event;
-                                                }
-
-                                                return;
-                                            }
-                                        };
-                                        if recovered {
-                                            tool_rounds_since_last_compression = 0;
-                                            turn_retry_count = 0;
-                                            turn_index = turn_index.saturating_add(1);
-                                            continue 'agent_turns;
-                                        }
-
-                                        let message = format!(
-                                            "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds and had no runtime tool state to compress"
-                                        );
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                                            let event = ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                            yield event;
-                                        } else {
-                                            yield event;
-                                        }
-
-                                        return;
-                                    }
-
-                                    if let Some(disallowed_tool) = self
-                                        .agent_allowed_tools
-                                        .as_ref()
-                                        .and_then(|allowed_tools| {
-                                            tool_calls.iter().find(|tool_call| {
-                                                !allowed_tools.contains(&tool_call.name)
-                                                    && !is_agent_tool_name(&tool_call.name)
-                                            })
-                                        })
-                                    {
-                                        let message = format!(
-                                            "Agent definition does not allow tool '{}'",
-                                            disallowed_tool.name
-                                        );
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                            &self,
-                                            started_at,
-                                            &mut events,
-                                            &message,
-                                            None,
-                                        )
-                                        .await;
-                                        if let Err(persist_error) = persist_chat_result(
-                                            &self,
-                                            &request_started_at,
-                                            outcome,
-                                            &events,
-                                            None,
-                                            None,
-                                            &executed_tool_calls,
-                                        ) {
-                                            yield ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                        } else {
-                                            yield event;
-                                        }
-                                        return;
-                                    }
-
-                                    if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
-                                        let event = ChatSseEvent::Error {
-                                            message: message.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                                            let event = ChatSseEvent::Error {
-                                                message: persist_error.message,
-                                            };
-                                            yield event;
-                                        } else {
-                                            yield event;
-                                        }
-
-                                        return;
-                                    }
-
-                                    let pending_tool_calls = pending_tool_calls(&tool_calls);
-                                    let execution_plan = match plan_tool_execution(&pending_tool_calls) {
-                                        Ok(plan) => Ok(plan),
-                                        Err(error) => match rejected_tool_batch_results(
-                                            &tool_calls,
-                                            &error,
-                                        ) {
-                                            Some(tool_results) => Err(tool_results),
-                                            None => {
-                                                let message = error.to_string();
-                                                let event = ChatSseEvent::Error {
-                                                    message: message.clone(),
-                                                };
-                                                events.push(captured_event(&event));
-                                                let outcome = failed_chat_audit_outcome(
-                                                    &self,
-                                                    started_at,
-                                                    &mut events,
-                                                    &message,
-                                                    None,
-                                                )
-                                                .await;
-
-                                                if let Err(persist_error) = persist_chat_result(
-                                                    &self,
-                                                    &request_started_at,
-                                                    outcome,
-                                                    &events,
-                                                    None,
-                                                    None,
-                                                    &executed_tool_calls,
-                                                ) {
-                                                    yield ChatSseEvent::Error {
-                                                        message: persist_error.message,
-                                                    };
-                                                } else {
-                                                    yield event;
-                                                }
-
-                                                return;
-                                            }
-                                        },
-                                    };
-
-                                    for tool_call in &tool_calls {
-                                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                        capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
-                                        if !seen_tool_call_ids.insert(tool_call.call_id.clone()) {
-                                            continue;
-                                        }
-                                        let event = ChatSseEvent::ToolCall {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            reasoning_duration_ms: if reasoning_duration_ms.is_none()
-                                                && let Some(started_at) = reasoning_started_at.take()
-                                            {
-                                                reasoning_duration_ms = Some(elapsed_millis(started_at));
-                                                reasoning_duration_ms
-                                            } else {
-                                                reasoning_duration_ms
-                                            },
-                                            tool_call: pending_tool_call_summary(tool_call),
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-
-                                    let next_executed_tool_calls = match execution_plan {
-                                        Ok(execution_plan) => {
-                                            let next_tool_results = match {
-                                        let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
-                                        let (tool_output_delta_tx, mut tool_output_delta_rx) =
-                                            mpsc::unbounded_channel();
-                                        let tool_results = execute_tool_calls_parallel(
-                                            self.mcp_registry.clone(),
-                                            self.hook_runtime.clone(),
-                                            self.global_hooks.clone(),
-                                            api_audit_save_details(&self.global_config),
-                                            self.global_config.clone(),
-                                            self.provider_config.clone(),
-                                            self.global_config.web_search.clone(),
-                                            self.question_registry.clone(),
-                                            question_event_tx,
-                                            MemoryToolContext {
-                                                enabled: self.memory_settings.enabled,
-                                                workspace_path: self.workspace_path.clone(),
-                                                global_memory_database_file: self.memory_database_file.clone(),
-                                                chat_id: self.chat_id.clone(),
-                                                run_id: self.llm_request_id.clone(),
-                                                tool_call_id: String::new(),
-                                                target_status: self.memory_target_status,
-                                                memory_settings: self.memory_settings.clone(),
-                                            },
-                                            self.agent_tool_context.clone(),
-                                            self.skill_read_root_dirs.clone(),
-        &self.workspace_id,
-                                            &self.workspace_path,
-                                            &self.tool_workspace_path,
-                                            &self.chat_id,
-                                            self.session_mode.as_deref(),
-                                            &self.llm_request_id,
-                                            &self.model_id,
-                                            &self.provider_id,
-                                            &self.assistant_message_id,
-                                            self.global_config.app.llm_request_retry_count,
-                                            tool_calls.clone(),
-                                            execution_plan,
-                                            self.tool_resource_locks.clone(),
-                                            tool_cancellation_token.clone(),
-                                            tool_output_delta_tx,
-                                        );
-                                        tokio::pin!(tool_results);
-                                        let mut question_events_open = true;
-                                        let mut tool_output_delta_events_open = true;
-
-                                        loop {
-                                            let next = tokio::select! {
-                                                changed = app_shutdown_rx.changed() => {
-                                                    if changed.is_err() || *app_shutdown_rx.borrow() {
-                                                        cancellation.cancel();
-                                                        let event = match finish_cancelled_chat_run(
-                                                            &self,
-                                                            &request_started_at,
-                                                            started_at,
-                                                            &mut events,
-                                                            &executed_tool_calls,
-                                                        )
-                                                        .await {
-                                                            Ok(event) => event,
-                                                            Err(error) => ChatSseEvent::Error {
-                                                                message: error.message,
-                                                            },
-                                                        };
-                                                        yield event;
-                                                        return;
-                                                    }
-                                                    None
-                                                }
-                                                changed = run_cancellation_rx.changed() => {
-                                                    if changed.is_err() || *run_cancellation_rx.borrow() {
-                                                        let event = match finish_cancelled_chat_run_with_message(
-                                                            &self,
-                                                            &request_started_at,
-                                                            started_at,
-                                                            &mut events,
-                                                            &executed_tool_calls,
-                                                            "chat run cancelled",
-                                                        )
-                                                        .await {
-                                                            Ok(event) => event,
-                                                            Err(error) => ChatSseEvent::Error {
-                                                                message: error.message,
-                                                            },
-                                                        };
-                                                        yield event;
-                                                        return;
-                                                    }
-                                                    None
-                                                }
-                                                question_request = question_event_rx.recv(), if question_events_open => {
-                                                    match question_request {
-                                                        Some(question_request) => Some(ChatSseEvent::QuestionRequest {
-                                                            assistant_message_id: self.assistant_message_id.clone(),
-                                                            request: question_request,
-                                                        }),
-                                                        None => {
-                                                            question_events_open = false;
-                                                            None
-                                                        }
-                                                    }
-                                                }
-                                                output_delta = tool_output_delta_rx.recv(), if tool_output_delta_events_open => {
-                                                    match output_delta {
-                                                        Some(output_delta) => Some(ChatSseEvent::ToolOutputDelta {
-                                                            assistant_message_id: output_delta.assistant_message_id,
-                                                            tool_call_id: output_delta.tool_call_id,
-                                                            stream: match output_delta.stream {
-                                                                ToolOutputStream::Stdout => "stdout".to_string(),
-                                                                ToolOutputStream::Stderr => "stderr".to_string(),
-                                                            },
-                                                            delta: output_delta.delta,
-                                                        }),
-                                                        None => {
-                                                            tool_output_delta_events_open = false;
-                                                            None
-                                                        }
-                                                    }
-                                                }
-
-                                                tool_results = &mut tool_results => break tool_results,
-                                            };
-
-                                            if let Some(event) = next {
-                                                events.push(captured_event(&event));
-                                                yield event;
-                                            }
-                                        }
-                                    } {
-                                        Ok(tool_results) => tool_results,
-                                        Err(error) => {
-                                            let message = error.message;
-                                            let event = ChatSseEvent::Error {
-                                                message: message.clone(),
-                                            };
-                                            events.push(captured_event(&event));
-                                            let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-
-                                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                                                let event = ChatSseEvent::Error {
-                                                    message: persist_error.message,
-                                                };
-                                                yield event;
-                                            } else {
-                                                yield event;
-                                            }
-
-                                            return;
-                                        }
-                                    };
-                                    let mut next_executed_tool_calls = Vec::with_capacity(next_tool_results.len());
-                                    let mut batch_hook_summary = HookRunSummary::default();
-                                    for outcome in next_tool_results {
-                                        for event in hook_notification_events(&self.assistant_message_id, "ToolHook", &outcome.hook_summary) {
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                        }
-                                        merge_hook_summaries(&mut batch_hook_summary, outcome.hook_summary);
-                                        next_executed_tool_calls.push(outcome.tool_call);
-                                    }
-                                    let batch_summary = self.hook_runtime.run_hooks(HookRunRequest {
-                                        global_config: &self.global_hooks,
-                                        api_audit_save_details: api_audit_save_details(&self.global_config),
-                                        workspace_id: &self.workspace_id,
-                                        workspace_path: &self.workspace_path,
-                                        event: "PostToolBatch",
-                                        match_value: None,
-                                        chat_id: Some(&self.chat_id),
-                                        run_id: Some(&self.llm_request_id),
-                                        session_id: Some(&self.chat_id),
-                                        tool_call_id: None,
-                                        model_id: Some(&self.model_id),
-                                        provider_id: Some(&self.provider_id),
-                                        provider_config: Some(&self.provider_config),
-                                        llm_request_retry_count: self.global_config.app.llm_request_retry_count,
-                                        permission_mode: None,
-                                        payload: json!({
-                                            "toolResults": next_executed_tool_calls.clone(),
-                                        }),
-                                    }).await;
-                                    for event in hook_notification_events(&self.assistant_message_id, "PostToolBatch", &batch_summary) {
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-                                    merge_hook_summaries(&mut batch_hook_summary, batch_summary);
-                                    append_hook_context_messages(
-                                        &mut self.provider_request.messages,
-                                        &mut self.message_source_sequences,
-                                        &mut self.message_context_sources,
-                                        &batch_hook_summary.additional_context,
-                                    );
-                                            next_executed_tool_calls
-                                        }
-                                        Err(rejected_tool_calls) => rejected_tool_calls,
-                                    };
-                                    for executed_tool_call in &next_executed_tool_calls {
-                                        let result_event = ChatSseEvent::ToolResult {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            tool_call_id: executed_tool_call.id.clone(),
-                                            output: executed_tool_call.output.clone(),
-                                            is_error: executed_tool_call.is_error,
-                                            started_at: executed_tool_call.started_at.clone(),
-                                            completed_at: executed_tool_call.completed_at.clone(),
-                                        };
-                                        events.push(captured_event(&result_event));
-                                        yield result_event;
-                                    }
-                                    if tool_results_affect_git_diff(&next_executed_tool_calls) {
-                                        if let Ok(changed_files) = session_code_changed_files_for_workspace(
-                                            &self.code_change_baseline,
-                                            &self.workspace_path,
-                                        ) {
-                                            let event = ChatSseEvent::GitDiffRefresh {
-                                                workspace_id: self.workspace_id.clone(),
-                                                code_change_stats: code_change_stats_from_changed_files(
-                                                    &changed_files,
-                                                ),
-                                            };
-                                            events.push(captured_event(&event));
-                                            yield event;
-                                        }
-                                    }
-                                    if tool_results_affect_todo_graph(&next_executed_tool_calls) {
-                                        let event = ChatSseEvent::TodoGraphRefresh {
-                                            workspace_id: self.workspace_id.clone(),
-                                            chat_id: self.chat_id.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-                                    if tool_results_affect_plans(&next_executed_tool_calls) {
-                                        let event = ChatSseEvent::PlanRefresh {
-                                            workspace_id: self.workspace_id.clone(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-                                    if let Some(event) = agent_team_refresh_event_for_tool_results(
-                                        &self,
-                                        &next_executed_tool_calls,
-                                    ) {
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-                                    let extracted_memories =
-                                        tool_written_memory_summaries(&next_executed_tool_calls);
-                                    if !extracted_memories.is_empty() {
-                                        let event = ChatSseEvent::MemoryExtractionComplete {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            extracted_memories,
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                    }
-
-                                    let read_only_progress_action =
-                                        read_only_tool_progress_detector.check(&tool_calls);
-                                    append_tool_state_messages(
-                                        &mut self.provider_request.messages,
-                                        &mut self.message_source_sequences,
-                                        &mut self.message_context_sources,
-                                        &mut self.next_runtime_tool_batch_index,
-                                        tool_calls,
-                                        &next_executed_tool_calls,
-                                        turn_text,
-                                        non_empty_string(&turn_reasoning),
-                                    );
-                                    executed_tool_calls.extend(next_executed_tool_calls);
-                                    tool_rounds_since_last_compression =
-                                        tool_rounds_since_last_compression.saturating_add(1);
-                                    match read_only_progress_action {
-                                        ReadOnlyToolProgressAction::Continue => {}
-                                        ReadOnlyToolProgressAction::Warn(message) => {
-                                            append_runtime_guard_message(
-                                                &mut self.provider_request.messages,
-                                                &mut self.message_source_sequences,
-                                                &mut self.message_context_sources,
-                                                message,
-                                            );
-                                        }
-                                    }
-                                    for event in append_guidance_events(
-                                        &mut self.provider_request.messages,
-                                        &mut self.message_source_sequences,
-                                        &mut self.message_context_sources,
-                                        &mut events,
-                                        next_guidance_messages_at_boundary(&mut guidance_rx).await,
-                                        Some(turn_metrics.clone()),
-                                    ) {
-                                        yield event;
-                                    }
-
-                                    break;
-                                }
-                                NeutralChatStreamEvent::Error { message } => {
-                                    if turn_retry_count < self.global_config.app.llm_request_retry_count {
-                                        self.capture_failed_llm_request(
-                                            &turn_capture,
-                                            turn_llm_request_id,
-                                            turn_request_started_at,
-                                            turn_events,
-                                            turn_started_at,
-                                            &message,
-                                            None,
-                                        true,
-                                        );
-                                        turn_retry_count = turn_retry_count.saturating_add(1);
-                                        assistant_text = attempt_assistant_text;
-                                        assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
-                                        first_token_at = attempt_first_token_at;
-                                        first_token_latency_ms = attempt_first_token_latency_ms;
-                                        seen_tool_call_ids = attempt_seen_tool_call_ids;
-                                        total_usage = attempt_total_usage;
-                                        final_usage = attempt_final_usage;
-                                        let event = ChatSseEvent::StreamReset {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            reason: message,
-                                            text: assistant_text.clone(),
-                                            reasoning: non_empty_string(&assistant_reasoning),
-                                            tool_calls: executed_tool_calls
-                                                .iter()
-                                                .map(executed_tool_call_summary)
-                                                .collect(),
-                                        };
-                                        events.push(captured_event(&event));
-                                        yield event;
-                                        continue 'agent_turns;
-                                    }
-                                    let event = ChatSseEvent::Error {
-                                        message: message.clone(),
-                                    };
-                                    events.push(captured_event(&event));
-                                    let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
+                            if turn_text.is_empty() && tool_calls.is_empty() {
+                                let message = "provider completed without assistant text or tool calls".to_string();
+                                if turn_retry_count < self.global_config.app.llm_request_retry_count {
                                     self.capture_failed_llm_request(
                                         &turn_capture,
                                         turn_llm_request_id,
@@ -4615,8 +3750,668 @@ impl PreparedChatContext {
                                         turn_started_at,
                                         &message,
                                         None,
-                                        true,
+                                true,
                                     );
+                                    turn_retry_count = turn_retry_count.saturating_add(1);
+                                    assistant_text = attempt_assistant_text;
+                                    assistant_reasoning = attempt_assistant_reasoning;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
+                                    first_token_at = attempt_first_token_at;
+                                    first_token_latency_ms = attempt_first_token_latency_ms;
+                                    seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                    total_usage = attempt_total_usage;
+                                    final_usage = attempt_final_usage;
+                                    let event = ChatSseEvent::StreamReset {
+                                        assistant_message_id: self.assistant_message_id.clone(),
+                                        reason: message,
+                                        text: assistant_text.clone(),
+                                        reasoning: non_empty_string(&assistant_reasoning),
+                                        tool_calls: executed_tool_calls
+                                            .iter()
+                                            .map(executed_tool_call_summary)
+                                            .collect(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                    continue 'agent_turns;
+                                }
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+                                self.capture_failed_llm_request(
+                                    &turn_capture,
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    None,
+                                    false,
+                                );
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield event;
+                                } else {
+                                    yield event;
+                                }
+
+                                return;
+                            }
+
+                            if turn_reasoning.is_empty() {
+                                if let Some(reasoning) = reasoning.as_deref() {
+                                    assistant_reasoning.push_str(reasoning);
+                                    turn_reasoning.push_str(reasoning);
+                                }
+                            }
+
+                            if let Some(usage) = &usage {
+                                merge_usage(&mut total_usage, usage);
+                                final_usage = Some(total_usage.clone());
+                            }
+                            let turn_total_latency_ms = elapsed_millis(turn_started_at);
+                            let response_body_json = match turn_capture
+                                .response_json(provider_stream.final_response_dump())
+                            {
+                                Ok(response_body_json) => response_body_json,
+                                Err(error) => {
+                                    yield ChatSseEvent::Error {
+                                        message: error.message,
+                                    };
+                                    return;
+                                }
+                            };
+                            let request_body_json = match turn_capture.captured_request_json() {
+                                Ok(request_body_json) => request_body_json.unwrap_or_default(),
+                                Err(error) => {
+                                    yield ChatSseEvent::Error {
+                                        message: error.message,
+                                    };
+                                    return;
+                                }
+                            };
+                            let completed_turn_request = CapturedLlmRequest {
+                                id: turn_llm_request_id.clone(),
+                                request_kind: "chat completion",
+                                request_started_at: turn_request_started_at.clone(),
+                                request_body_json,
+                                events: turn_events.clone(),
+                                outcome: ChatAuditOutcome {
+                                    first_token_at: turn_first_token_at.clone(),
+                                    completed_at: utc_timestamp(),
+                                    first_token_latency_ms: turn_first_token_latency_ms,
+                                    total_latency_ms: turn_total_latency_ms,
+                                    input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                                    output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_read_tokens),
+                                    cache_write_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_write_tokens),
+                                    reasoning_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.reasoning_tokens),
+                                    status_code: Some(200),
+                                    final_state: "succeeded",
+                                    response_body_json,
+                                },
+                            };
+                            if let Err(error) = persist_completed_llm_request(&self, &completed_turn_request) {
+                                yield ChatSseEvent::Error {
+                                    message: error.message,
+                                };
+                                return;
+                            }
+                            self.captured_llm_requests.push(completed_turn_request);
+                            record_chat_completion_input_tokens(
+                                &mut self.last_chat_completion_input_tokens,
+                                usage.as_ref().and_then(|usage| usage.input_tokens),
+                            );
+                            let turn_metrics = turn_reply_metrics(
+                                &self.model_id,
+                                &self.provider_id,
+                                turn_total_latency_ms,
+                                turn_first_token_latency_ms,
+                                usage.as_ref(),
+                                vec![turn_llm_request_id.clone()],
+                            );
+                            if let Some(usage) = usage {
+                                let event = ChatSseEvent::Usage { usage };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+
+                            if tool_calls.is_empty() {
+                                let guidance_messages =
+                                    next_guidance_messages_at_boundary(&mut guidance_rx).await;
+                                if !guidance_messages.is_empty() {
+                                    let turn_assistant_text =
+                                        assistant_message_text(&turn_text, &[]);
+                                    if !turn_assistant_text.trim().is_empty()
+                                        || !turn_reasoning.trim().is_empty()
+                                    {
+                                        self.provider_request.messages.push(neutral_assistant_message(
+                                            turn_assistant_text,
+                                            non_empty_string(&turn_reasoning),
+                                        ));
+                                        self.message_source_sequences.push(None);
+                                        self.message_context_sources.push(
+                                            PromptContextSource::RuntimeAssistant,
+                                        );
+                                    }
+                                    for event in append_guidance_events(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
+                                        &mut events,
+                                        guidance_messages,
+                                        Some(turn_metrics.clone()),
+                                        &mut self.attachment_read_allowlist,
+                                    ) {
+                                        yield event;
+                                    }
+                                    turn_retry_count = 0;
+                                    turn_index = turn_index.saturating_add(1);
+                                    continue 'agent_turns;
+                                }
+                                let assistant_message_text =
+                                    assistant_message_text(&assistant_text, &executed_tool_calls);
+                                let stop_text = assistant_message_text.clone();
+                                let stop_summary = self.hook_runtime.run_hooks(HookRunRequest {
+                                    global_config: &self.global_hooks,
+                                    api_audit_save_details: api_audit_save_details(&self.global_config),
+                                    workspace_id: &self.workspace_id,
+                                    workspace_path: &self.workspace_path,
+                                    event: "Stop",
+                                    match_value: None,
+                                    chat_id: Some(&self.chat_id),
+                                    run_id: Some(&self.llm_request_id),
+                                    session_id: Some(&self.chat_id),
+                                    tool_call_id: None,
+                                    model_id: Some(&self.model_id),
+                                    provider_id: Some(&self.provider_id),
+                                    provider_config: Some(&self.provider_config),
+                                    llm_request_retry_count: self.global_config.app.llm_request_retry_count,
+                                    permission_mode: None,
+                                    payload: json!({
+                                        "text": stop_text,
+                                        "reasoning": non_empty_string(&assistant_reasoning),
+                                        "usage": final_usage.clone(),
+                                        "stopReason": stop_reason.clone(),
+                                    }),
+                                }).await;
+                                for event in hook_notification_events(&self.assistant_message_id, "Stop", &stop_summary) {
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
+                                if let Some(reason) = stop_summary.first_block_reason() {
+                                    append_hook_context_messages(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
+                                        &[
+                                            format!("Stop hook blocked the assistant response: {reason}"),
+                                            stop_summary.additional_context.join("\n"),
+                                        ],
+                                    );
+                                    turn_retry_count = 0;
+                                    turn_index = turn_index.saturating_add(1);
+                                    continue 'agent_turns;
+                                }
+                                let git_diff_summary_result = maybe_git_diff_summary_for_session_mode(
+                                    &assistant_message_text,
+                                    &self.code_change_baseline,
+                                    &self.workspace_path,
+                                    &self.global_config.app.language,
+                                    self.session_mode.as_deref(),
+                                );
+                                let assistant_message_text = git_diff_summary_result.text;
+                                self.code_change_stats = git_diff_summary_result.stats;
+                                let total_latency_ms = elapsed_millis(started_at);
+                                if reasoning_duration_ms.is_none()
+                                    && let Some(started_at) = reasoning_started_at.take()
+                                {
+                                    reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                }
+                                let metrics = ChatReplyMetrics {
+                                    model_id: self.model_id.clone(),
+                                    provider_id: self.provider_id.clone(),
+                                    total_latency_ms: Some(total_latency_ms),
+                                    first_token_latency_ms,
+                                    output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+                                    llm_request_ids: self
+                                        .captured_llm_requests
+                                        .iter()
+                                        .map(|request| request.id.clone())
+                                        .collect(),
+                                };
+                                let complete_event = ChatSseEvent::Complete {
+                                    chat_id: self.chat_id.clone(),
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    text: assistant_message_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
+                                    reasoning_duration_ms,
+                                    usage: final_usage.clone(),
+                                    stop_reason: stop_reason.clone(),
+                                    metrics,
+                                    memories_used: self.memories_used.clone(),
+                                };
+                                let session_end_summary = session_end_hook(
+                                    &self,
+                                    "succeeded",
+                                    json!({
+                                        "text": assistant_message_text.clone(),
+                                        "reasoning": non_empty_string(&assistant_reasoning),
+                                        "usage": final_usage.clone(),
+                                        "stopReason": stop_reason.clone(),
+                                    }),
+                                ).await;
+                                for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
+                                let captured_complete = captured_event(&complete_event);
+                                events.push(captured_complete.clone());
+                                let completed_at = utc_timestamp();
+                                let outcome = ChatAuditOutcome {
+                                    first_token_at,
+                                    completed_at,
+                                    first_token_latency_ms,
+                                    total_latency_ms,
+                                    input_tokens: final_usage.as_ref().and_then(|usage| usage.input_tokens),
+                                    output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
+                                    cache_write_tokens: final_usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                                    reasoning_tokens: final_usage.as_ref().and_then(|usage| usage.reasoning_tokens),
+                                    status_code: Some(200),
+                                    final_state: "succeeded",
+                                    // Run-level aggregate is not a provider wire dump. Per-turn
+                                    // provider_final_response_v1 is already persisted above.
+                                    response_body_json: None,
+                                };
+
+                                match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
+                                    Ok(()) => {
+                                        yield complete_event;
+                                    }
+                                    Err(error) => {
+                                        let event = ChatSseEvent::Error {
+                                            message: error.message,
+                                        };
+                                        yield event;
+                                    }
+                                }
+
+                                return;
+                            }
+
+                            if tool_rounds_since_last_compression >= MAX_AGENT_TOOL_ROUNDS {
+                                let recovered = match recover_after_tool_round_cap(
+                                    &mut self,
+                                    tool_calls,
+                                    turn_text,
+                                    non_empty_string(&turn_reasoning),
+                                ) {
+                                    Ok(recovered) => recovered,
+                                    Err(error) => {
+                                        let message = error.message;
+                                        let event = ChatSseEvent::Error {
+                                            message: message.clone(),
+                                        };
+                                        events.push(captured_event(&event));
+                                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                            let event = ChatSseEvent::Error {
+                                                message: persist_error.message,
+                                            };
+                                            yield event;
+                                        } else {
+                                            yield event;
+                                        }
+
+                                        return;
+                                    }
+                                };
+                                if recovered {
+                                    tool_rounds_since_last_compression = 0;
+                                    turn_retry_count = 0;
+                                    turn_index = turn_index.saturating_add(1);
+                                    continue 'agent_turns;
+                                }
+
+                                let message = format!(
+                                    "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds and had no runtime tool state to compress"
+                                );
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield event;
+                                } else {
+                                    yield event;
+                                }
+
+                                return;
+                            }
+
+                            if let Some(disallowed_tool) = self
+                                .agent_allowed_tools
+                                .as_ref()
+                                .and_then(|allowed_tools| {
+                                    tool_calls.iter().find(|tool_call| {
+                                        !allowed_tools.contains(&tool_call.name)
+                                            && !is_agent_tool_name(&tool_call.name)
+                                    })
+                                })
+                            {
+                                let message = format!(
+                                    "Agent definition does not allow tool '{}'",
+                                    disallowed_tool.name
+                                );
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                                    &self,
+                                    started_at,
+                                    &mut events,
+                                    &message,
+                                    None,
+                                )
+                                .await;
+                                if let Err(persist_error) = persist_chat_result(
+                                    &self,
+                                    &request_started_at,
+                                    outcome,
+                                    &events,
+                                    None,
+                                    None,
+                                    &executed_tool_calls,
+                                ) {
+                                    yield ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                } else {
+                                    yield event;
+                                }
+                                return;
+                            }
+
+                            if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield event;
+                                } else {
+                                    yield event;
+                                }
+
+                                return;
+                            }
+
+                            let pending_tool_calls = pending_tool_calls(&tool_calls);
+                            let execution_plan = match plan_tool_execution(&pending_tool_calls) {
+                                Ok(plan) => Ok(plan),
+                                Err(error) => match rejected_tool_batch_results(
+                                    &tool_calls,
+                                    &error,
+                                ) {
+                                    Some(tool_results) => Err(tool_results),
+                                    None => {
+                                        let message = error.to_string();
+                                        let event = ChatSseEvent::Error {
+                                            message: message.clone(),
+                                        };
+                                        events.push(captured_event(&event));
+                                        let outcome = failed_chat_audit_outcome(
+                                            &self,
+                                            started_at,
+                                            &mut events,
+                                            &message,
+                                            None,
+                                        )
+                                        .await;
+
+                                        if let Err(persist_error) = persist_chat_result(
+                                            &self,
+                                            &request_started_at,
+                                            outcome,
+                                            &events,
+                                            None,
+                                            None,
+                                            &executed_tool_calls,
+                                        ) {
+                                            yield ChatSseEvent::Error {
+                                                message: persist_error.message,
+                                            };
+                                        } else {
+                                            yield event;
+                                        }
+
+                                        return;
+                                    }
+                                },
+                            };
+
+                            for tool_call in &tool_calls {
+                                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                                capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
+                                if !seen_tool_call_ids.insert(tool_call.call_id.clone()) {
+                                    continue;
+                                }
+                                let event = ChatSseEvent::ToolCall {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    reasoning_duration_ms: if reasoning_duration_ms.is_none()
+                                        && let Some(started_at) = reasoning_started_at.take()
+                                    {
+                                        reasoning_duration_ms = Some(elapsed_millis(started_at));
+                                        reasoning_duration_ms
+                                    } else {
+                                        reasoning_duration_ms
+                                    },
+                                    tool_call: pending_tool_call_summary(tool_call),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+
+                            let next_executed_tool_calls = match execution_plan {
+                                Ok(execution_plan) => {
+                                    let next_tool_results = match {
+                                let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
+                                let (tool_output_delta_tx, mut tool_output_delta_rx) =
+                                    mpsc::unbounded_channel();
+                                let tool_results = execute_tool_calls_parallel(
+                                    self.mcp_registry.clone(),
+                                    self.hook_runtime.clone(),
+                                    self.global_hooks.clone(),
+                                    api_audit_save_details(&self.global_config),
+                                    self.global_config.clone(),
+                                    self.provider_config.clone(),
+                                    self.global_config.web_search.clone(),
+                                    self.question_registry.clone(),
+                                    question_event_tx,
+                                    MemoryToolContext {
+                                        enabled: self.memory_settings.enabled,
+                                        workspace_path: self.workspace_path.clone(),
+                                        global_memory_database_file: self.memory_database_file.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        run_id: self.llm_request_id.clone(),
+                                        tool_call_id: String::new(),
+                                        target_status: self.memory_target_status,
+                                        memory_settings: self.memory_settings.clone(),
+                                    },
+                                    self.agent_tool_context.clone(),
+                                    self.skill_read_root_dirs.clone(),
+                                    self.attachment_read_allowlist.clone(),
+                                    &self.workspace_id,
+                                    &self.workspace_path,
+                                    &self.tool_workspace_path,
+                                    &self.chat_id,
+                                    self.session_mode.as_deref(),
+                                    &self.llm_request_id,
+                                    &self.model_id,
+                                    &self.provider_id,
+                                    &self.assistant_message_id,
+                                    self.global_config.app.llm_request_retry_count,
+                                    tool_calls.clone(),
+                                    execution_plan,
+                                    self.tool_resource_locks.clone(),
+                                    tool_cancellation_token.clone(),
+                                    tool_output_delta_tx,
+                                );
+                                tokio::pin!(tool_results);
+                                let mut question_events_open = true;
+                                let mut tool_output_delta_events_open = true;
+
+                                loop {
+                                    let next = tokio::select! {
+                                        changed = app_shutdown_rx.changed() => {
+                                            if changed.is_err() || *app_shutdown_rx.borrow() {
+                                                cancellation.cancel();
+                                                let event = match finish_cancelled_chat_run(
+                                                    &self,
+                                                    &request_started_at,
+                                                    started_at,
+                                                    &mut events,
+                                                    &executed_tool_calls,
+                                                )
+                                                .await {
+                                                    Ok(event) => event,
+                                                    Err(error) => ChatSseEvent::Error {
+                                                        message: error.message,
+                                                    },
+                                                };
+                                                yield event;
+                                                return;
+                                            }
+                                            None
+                                        }
+                                        changed = run_cancellation_rx.changed() => {
+                                            if changed.is_err() || *run_cancellation_rx.borrow() {
+                                                let event = match finish_cancelled_chat_run_with_message(
+                                                    &self,
+                                                    &request_started_at,
+                                                    started_at,
+                                                    &mut events,
+                                                    &executed_tool_calls,
+                                                    "chat run cancelled",
+                                                )
+                                                .await {
+                                                    Ok(event) => event,
+                                                    Err(error) => ChatSseEvent::Error {
+                                                        message: error.message,
+                                                    },
+                                                };
+                                                yield event;
+                                                return;
+                                            }
+                                            None
+                                        }
+                                        question_request = question_event_rx.recv(), if question_events_open => {
+                                            match question_request {
+                                                Some(question_request) => Some(ChatSseEvent::QuestionRequest {
+                                                    assistant_message_id: self.assistant_message_id.clone(),
+                                                    request: question_request,
+                                                }),
+                                                None => {
+                                                    question_events_open = false;
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        output_delta = tool_output_delta_rx.recv(), if tool_output_delta_events_open => {
+                                            match output_delta {
+                                                Some(output_delta) => Some(ChatSseEvent::ToolOutputDelta {
+                                                    assistant_message_id: output_delta.assistant_message_id,
+                                                    tool_call_id: output_delta.tool_call_id,
+                                                    stream: match output_delta.stream {
+                                                        ToolOutputStream::Stdout => "stdout".to_string(),
+                                                        ToolOutputStream::Stderr => "stderr".to_string(),
+                                                    },
+                                                    delta: output_delta.delta,
+                                                }),
+                                                None => {
+                                                    tool_output_delta_events_open = false;
+                                                    None
+                                                }
+                                            }
+                                        }
+
+                                        tool_results = &mut tool_results => break tool_results,
+                                    };
+
+                                    if let Some(event) = next {
+                                        events.push(captured_event(&event));
+                                        yield event;
+                                    }
+                                }
+                            } {
+                                Ok(tool_results) => tool_results,
+                                Err(error) => {
+                                    let message = error.message;
+                                    let event = ChatSseEvent::Error {
+                                        message: message.clone(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                     if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                         let event = ChatSseEvent::Error {
@@ -4629,17 +4424,200 @@ impl PreparedChatContext {
 
                                     return;
                                 }
+                            };
+                            let mut next_executed_tool_calls = Vec::with_capacity(next_tool_results.len());
+                            let mut batch_hook_summary = HookRunSummary::default();
+                            for outcome in next_tool_results {
+                                for event in hook_notification_events(&self.assistant_message_id, "ToolHook", &outcome.hook_summary) {
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
+                                merge_hook_summaries(&mut batch_hook_summary, outcome.hook_summary);
+                                next_executed_tool_calls.push(outcome.tool_call);
                             }
-                        }
+                            let batch_summary = self.hook_runtime.run_hooks(HookRunRequest {
+                                global_config: &self.global_hooks,
+                                api_audit_save_details: api_audit_save_details(&self.global_config),
+                                workspace_id: &self.workspace_id,
+                                workspace_path: &self.workspace_path,
+                                event: "PostToolBatch",
+                                match_value: None,
+                                chat_id: Some(&self.chat_id),
+                                run_id: Some(&self.llm_request_id),
+                                session_id: Some(&self.chat_id),
+                                tool_call_id: None,
+                                model_id: Some(&self.model_id),
+                                provider_id: Some(&self.provider_id),
+                                provider_config: Some(&self.provider_config),
+                                llm_request_retry_count: self.global_config.app.llm_request_retry_count,
+                                permission_mode: None,
+                                payload: json!({
+                                    "toolResults": next_executed_tool_calls.clone(),
+                                }),
+                            }).await;
+                            for event in hook_notification_events(&self.assistant_message_id, "PostToolBatch", &batch_summary) {
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            merge_hook_summaries(&mut batch_hook_summary, batch_summary);
+                            append_hook_context_messages(
+                                &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
+                                &batch_hook_summary.additional_context,
+                            );
+                                    next_executed_tool_calls
+                                }
+                                Err(rejected_tool_calls) => rejected_tool_calls,
+                            };
+                            for executed_tool_call in &next_executed_tool_calls {
+                                let result_event = ChatSseEvent::ToolResult {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    tool_call_id: executed_tool_call.id.clone(),
+                                    output: executed_tool_call.output.clone(),
+                                    is_error: executed_tool_call.is_error,
+                                    started_at: executed_tool_call.started_at.clone(),
+                                    completed_at: executed_tool_call.completed_at.clone(),
+                                };
+                                events.push(captured_event(&result_event));
+                                yield result_event;
+                            }
+                            if tool_results_affect_git_diff(&next_executed_tool_calls) {
+                                if let Ok(changed_files) = session_code_changed_files_for_workspace(
+                                    &self.code_change_baseline,
+                                    &self.workspace_path,
+                                ) {
+                                    let event = ChatSseEvent::GitDiffRefresh {
+                                        workspace_id: self.workspace_id.clone(),
+                                        code_change_stats: code_change_stats_from_changed_files(
+                                            &changed_files,
+                                        ),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
+                            }
+                            if tool_results_affect_todo_graph(&next_executed_tool_calls) {
+                                let event = ChatSseEvent::TodoGraphRefresh {
+                                    workspace_id: self.workspace_id.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            if tool_results_affect_plans(&next_executed_tool_calls) {
+                                let event = ChatSseEvent::PlanRefresh {
+                                    workspace_id: self.workspace_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            if let Some(event) = agent_team_refresh_event_for_tool_results(
+                                &self,
+                                &next_executed_tool_calls,
+                            ) {
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            let extracted_memories =
+                                tool_written_memory_summaries(&next_executed_tool_calls);
+                            if !extracted_memories.is_empty() {
+                                let event = ChatSseEvent::MemoryExtractionComplete {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    extracted_memories,
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
 
-                        if completed_turn {
-                            turn_retry_count = 0;
-                            turn_index = turn_index.saturating_add(1);
-                            continue;
-                        }
+                            let read_only_progress_action =
+                                read_only_tool_progress_detector.check(&tool_calls);
+                            append_tool_state_messages(
+                                &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
+                                &mut self.next_runtime_tool_batch_index,
+                                tool_calls,
+                                &next_executed_tool_calls,
+                                turn_text,
+                                non_empty_string(&turn_reasoning),
+                            );
+                            executed_tool_calls.extend(next_executed_tool_calls);
+                            tool_rounds_since_last_compression =
+                                tool_rounds_since_last_compression.saturating_add(1);
+                            match read_only_progress_action {
+                                ReadOnlyToolProgressAction::Continue => {}
+                                ReadOnlyToolProgressAction::Warn(message) => {
+                                    append_runtime_guard_message(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
+                                        message,
+                                    );
+                                }
+                            }
+                            for event in append_guidance_events(
+                                &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
+                                &mut events,
+                                next_guidance_messages_at_boundary(&mut guidance_rx).await,
+                                Some(turn_metrics.clone()),
+                                &mut self.attachment_read_allowlist,
+                            ) {
+                                yield event;
+                            }
 
-                        let message = "provider stream ended without a completion event".to_string();
-                        if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                            break;
+                        }
+                        NeutralChatStreamEvent::Error { message } => {
+                            if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                                self.capture_failed_llm_request(
+                                    &turn_capture,
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    None,
+                                true,
+                                );
+                                turn_retry_count = turn_retry_count.saturating_add(1);
+                                assistant_text = attempt_assistant_text;
+                                assistant_reasoning = attempt_assistant_reasoning;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
+                                first_token_at = attempt_first_token_at;
+                                first_token_latency_ms = attempt_first_token_latency_ms;
+                                seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                total_usage = attempt_total_usage;
+                                final_usage = attempt_final_usage;
+                                let event = ChatSseEvent::StreamReset {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    reason: message,
+                                    text: assistant_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
+                                    tool_calls: executed_tool_calls
+                                        .iter()
+                                        .map(executed_tool_call_summary)
+                                        .collect(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                                continue 'agent_turns;
+                            }
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
                             self.capture_failed_llm_request(
                                 &turn_capture,
                                 turn_llm_request_id,
@@ -4648,67 +4626,100 @@ impl PreparedChatContext {
                                 turn_started_at,
                                 &message,
                                 None,
-                                        true,
+                                true,
                             );
-                            turn_retry_count = turn_retry_count.saturating_add(1);
-                            assistant_text = attempt_assistant_text;
-                            assistant_reasoning = attempt_assistant_reasoning;
-                                    reasoning_started_at = attempt_reasoning_started_at;
-                                    reasoning_duration_ms = attempt_reasoning_duration_ms;
-                            first_token_at = attempt_first_token_at;
-                            first_token_latency_ms = attempt_first_token_latency_ms;
-                            seen_tool_call_ids = attempt_seen_tool_call_ids;
-                            total_usage = attempt_total_usage;
-                            final_usage = attempt_final_usage;
-                            let event = ChatSseEvent::StreamReset {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                reason: message,
-                                text: assistant_text.clone(),
-                                reasoning: non_empty_string(&assistant_reasoning),
-                                tool_calls: executed_tool_calls
-                                    .iter()
-                                    .map(executed_tool_call_summary)
-                                    .collect(),
-                            };
-                            events.push(captured_event(&event));
-                            yield event;
-                            continue 'agent_turns;
-                        }
-                        let event = ChatSseEvent::Error {
-                            message: message.clone(),
-                        };
-                        events.push(captured_event(&event));
-                        let outcome = failed_chat_audit_outcome(
-                                    &self,
-                                    started_at,
-                                    &mut events,
-                                    &message,
-                                    None,
-                                )
-                                .await;
-                        self.capture_failed_llm_request(
-                            &turn_capture,
-                            turn_llm_request_id,
-                            turn_request_started_at,
-                            turn_events,
-                            turn_started_at,
-                            &message,
-                            None,
-                            true,
-                        );
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
-                            let event = ChatSseEvent::Error {
-                                message: persist_error.message,
-                            };
-                            yield event;
-                        } else {
-                            yield event;
-                        }
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                                yield event;
+                            } else {
+                                yield event;
+                            }
 
-                        return;
+                            return;
+                        }
                     }
                 }
+
+                if completed_turn {
+                    turn_retry_count = 0;
+                    turn_index = turn_index.saturating_add(1);
+                    continue;
+                }
+
+                let message = "provider stream ended without a completion event".to_string();
+                if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                    self.capture_failed_llm_request(
+                        &turn_capture,
+                        turn_llm_request_id,
+                        turn_request_started_at,
+                        turn_events,
+                        turn_started_at,
+                        &message,
+                        None,
+                                true,
+                    );
+                    turn_retry_count = turn_retry_count.saturating_add(1);
+                    assistant_text = attempt_assistant_text;
+                    assistant_reasoning = attempt_assistant_reasoning;
+                            reasoning_started_at = attempt_reasoning_started_at;
+                            reasoning_duration_ms = attempt_reasoning_duration_ms;
+                    first_token_at = attempt_first_token_at;
+                    first_token_latency_ms = attempt_first_token_latency_ms;
+                    seen_tool_call_ids = attempt_seen_tool_call_ids;
+                    total_usage = attempt_total_usage;
+                    final_usage = attempt_final_usage;
+                    let event = ChatSseEvent::StreamReset {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        reason: message,
+                        text: assistant_text.clone(),
+                        reasoning: non_empty_string(&assistant_reasoning),
+                        tool_calls: executed_tool_calls
+                            .iter()
+                            .map(executed_tool_call_summary)
+                            .collect(),
+                    };
+                    events.push(captured_event(&event));
+                    yield event;
+                    continue 'agent_turns;
+                }
+                let event = ChatSseEvent::Error {
+                    message: message.clone(),
+                };
+                events.push(captured_event(&event));
+                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+                self.capture_failed_llm_request(
+                    &turn_capture,
+                    turn_llm_request_id,
+                    turn_request_started_at,
+                    turn_events,
+                    turn_started_at,
+                    &message,
+                    None,
+                    true,
+                );
+
+                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                    let event = ChatSseEvent::Error {
+                        message: persist_error.message,
+                    };
+                    yield event;
+                } else {
+                    yield event;
+                }
+
+                return;
+            }
+        }
     }
 }
 
@@ -5038,6 +5049,7 @@ async fn prepare_chat_context_for_output(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval,
         skill_read_root_dirs: prompt_context.skill_read_root_dirs,
+        attachment_read_allowlist: prompt_context.attachment_read_allowlist,
         last_chat_completion_input_tokens: None,
     })
 }
@@ -6378,11 +6390,13 @@ fn append_guidance_events(
     events: &mut Vec<CapturedAuditEvent>,
     guidance_messages: Vec<GuidanceMessage>,
     interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+    attachment_read_allowlist: &mut Vec<PathBuf>,
 ) -> Vec<ChatSseEvent> {
     let mut interrupted_assistant_metrics = interrupted_assistant_metrics;
     guidance_messages
         .into_iter()
         .map(|guidance| {
+            extend_attachment_read_allowlist(attachment_read_allowlist, &guidance.attachments);
             append_guidance_message(
                 messages,
                 message_source_sequences,
@@ -10047,6 +10061,64 @@ fn message_attachments_from_metadata(
     Ok(attachments)
 }
 
+/// Collects canonical path attachments for exact `read_file` grants.
+/// Missing/unreadable paths are skipped (safe degrade; read still errors later).
+fn collect_attachment_read_allowlist(
+    history_messages: &[foco_store::workspace::MessageRecord],
+    current_attachments: &[NeutralChatAttachment],
+    queued_user_message: Option<&foco_store::workspace::MessageRecord>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for message in history_messages {
+        if message.role != "user" {
+            continue;
+        }
+        extend_attachment_read_allowlist(
+            &mut paths,
+            &message_attachments_from_metadata(&message.metadata_json).unwrap_or_default(),
+        );
+    }
+    if let Some(queued) = queued_user_message
+        && queued.role == "user"
+    {
+        extend_attachment_read_allowlist(
+            &mut paths,
+            &message_attachments_from_metadata(&queued.metadata_json).unwrap_or_default(),
+        );
+    }
+    extend_attachment_read_allowlist(&mut paths, current_attachments);
+    paths
+}
+
+fn extend_attachment_read_allowlist(
+    allowlist: &mut Vec<PathBuf>,
+    attachments: &[NeutralChatAttachment],
+) {
+    for attachment in attachments {
+        let Some(path) = attachment
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        if !canonical.is_file() {
+            continue;
+        }
+        if !allowlist.iter().any(|existing| existing == &canonical) {
+            allowlist.push(canonical);
+        }
+    }
+}
+
+fn path_is_exact_attachment_allowlist_match(target_path: &Path, allowlist: &[PathBuf]) -> bool {
+    allowlist.iter().any(|path| path == target_path)
+}
+
 fn normalized_chat_attachments(
     inputs: Vec<ChatAttachmentInput>,
 ) -> Result<Vec<NeutralChatAttachment>, ApiError> {
@@ -10176,7 +10248,9 @@ fn normalized_chat_attachments_for_workspace(
         let path = path.ok_or_else(|| {
             ApiError::bad_request(format!("attachment {name} path must not be empty"))
         })?;
-        validate_attachment_file_path(&name, &path, input.size_bytes)?;
+        // Canonicalize here so guidance/chat attachments share the same exact-path
+        // form used by `attachment_read_allowlist` / `read_file` external grants.
+        let path = validate_attachment_file_path(&name, &path, input.size_bytes)?;
 
         attachments.push(NeutralChatAttachment {
             id,
@@ -10240,8 +10314,16 @@ fn write_session_attachment_file(
             "failed to write temporary attachment file: {source}"
         ))
     })?;
+    drop(file);
 
-    Ok(file_path.display().to_string())
+    // Match path-attachment form so exact read_file allowlist compares equal.
+    let canonical = fs::canonicalize(&file_path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to resolve temporary attachment path {}: {source}",
+            file_path.display()
+        ))
+    })?;
+    Ok(canonical.display().to_string())
 }
 
 fn chat_session_upload_dir(workspace_path: &Path, chat_id: &str) -> Result<PathBuf, ApiError> {
@@ -10445,7 +10527,14 @@ fn validate_attachment_base64(
     Ok(())
 }
 
-fn validate_attachment_file_path(name: &str, path: &str, size_bytes: u64) -> Result<(), ApiError> {
+/// Validates a path attachment and returns its canonical absolute path string.
+/// Canonical form is required so run-scoped exact `read_file` allowlist matching
+/// (including mid-run guidance attachments) does not miss on relative/non-canonical paths.
+fn validate_attachment_file_path(
+    name: &str,
+    path: &str,
+    size_bytes: u64,
+) -> Result<String, ApiError> {
     let path_value = Path::new(path);
     if !path_value.is_absolute() {
         return Err(ApiError::bad_request(format!(
@@ -10477,7 +10566,18 @@ fn validate_attachment_file_path(name: &str, path: &str, size_bytes: u64) -> Res
         )));
     }
 
-    Ok(())
+    let canonical = fs::canonicalize(path_value).map_err(|source| {
+        ApiError::bad_request(format!(
+            "attachment {name} path could not be resolved: {source}"
+        ))
+    })?;
+    if !canonical.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} path must point to a file"
+        )));
+    }
+
+    Ok(canonical.display().to_string())
 }
 
 fn chat_attachment_hook_summaries(attachments: &[NeutralChatAttachment]) -> Vec<Value> {

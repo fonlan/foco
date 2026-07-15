@@ -233,6 +233,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
     skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
     workspace_id: &str,
     workspace_path: &Path,
     tool_workspace_path: &Path,
@@ -273,6 +274,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         memory_tool_context.clone(),
                         agent_tool_context.clone(),
                         skill_read_root_dirs.clone(),
+                        attachment_read_allowlist.clone(),
                         tool_resource_lock_registry.clone(),
                         cancellation_token.clone(),
                         tool_output_delta_tx.clone(),
@@ -316,6 +318,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let memory_tool_context = memory_tool_context.clone();
                     let agent_tool_context = agent_tool_context.clone();
                     let skill_read_root_dirs = skill_read_root_dirs.clone();
+                    let attachment_read_allowlist = attachment_read_allowlist.clone();
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
                     let cancellation_token = cancellation_token.clone();
                     let tool_output_delta_tx = tool_output_delta_tx.clone();
@@ -342,6 +345,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 memory_tool_context,
                                 agent_tool_context,
                                 skill_read_root_dirs,
+                                attachment_read_allowlist,
                                 tool_resource_lock_registry,
                                 cancellation_token,
                                 tool_output_delta_tx,
@@ -396,6 +400,7 @@ async fn execute_tool_call(
     mut memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
     skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -426,6 +431,7 @@ async fn execute_tool_call(
         memory_tool_context,
         agent_tool_context,
         skill_read_root_dirs,
+        attachment_read_allowlist,
         tool_resource_lock_registry,
         cancellation_token.clone(),
         tool_output_delta_tx,
@@ -536,6 +542,7 @@ pub(crate) async fn execute_tool(
     memory_tool_context: MemoryToolContext,
     agent_tool_context: Option<AgentToolContext>,
     skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -1014,6 +1021,7 @@ pub(crate) async fn execute_tool(
         let allow_external_read_access = match ensure_read_file_external_access(
             &global_config,
             &skill_read_root_dirs,
+            &attachment_read_allowlist,
             question_registry.clone(),
             question_event_tx.clone(),
             workspace_id,
@@ -3085,6 +3093,7 @@ enum ReadFileExternalAccessDecision {
 async fn ensure_read_file_external_access(
     global_config: &GlobalConfig,
     skill_read_root_dirs: &[PathBuf],
+    attachment_read_allowlist: &[PathBuf],
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
@@ -3128,6 +3137,11 @@ async fn ensure_read_file_external_access(
     if path_is_within_skill_read_roots(&target_path, skill_read_root_dirs)
         || read_file_target_is_configured_skill(global_config, workspace_id, &target_path)
     {
+        return Ok(true);
+    }
+
+    // Exact chat attachment path grants (not parent dirs / siblings / lookalikes).
+    if path_is_exact_attachment_allowlist_match(&target_path, attachment_read_allowlist) {
         return Ok(true);
     }
 
@@ -3509,6 +3523,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            Vec::new(),
             ToolResourceLockRegistry::default(),
             ToolCancellationToken::default(),
             mpsc::unbounded_channel().0,
@@ -3634,6 +3649,7 @@ mod tests {
         let allowed = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry,
             event_tx,
             "workspace-1",
@@ -3650,6 +3666,294 @@ mod tests {
 
         assert!(!allowed);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_external_access_skips_question_for_exact_attachment_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside");
+        let attached = outside_dir.path().join("attached.txt");
+        let sibling = outside_dir.path().join("sibling.txt");
+        fs::write(&attached, "attached-secret").expect("write attached");
+        fs::write(&sibling, "sibling").expect("write sibling");
+        let attached_canonical = fs::canonicalize(&attached).expect("canonicalize attached");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-attachment-{}", unique_id("case"));
+        let allowlist = vec![attached_canonical.clone()];
+
+        let attached_args = json!({
+            "path": attached.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            READ_FILE_TOOL,
+            &attached_args,
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("attached file access check");
+        assert!(allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        // Sibling in same directory must still prompt.
+        let sibling_args = json!({
+            "path": sibling.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let sibling_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-2",
+            READ_FILE_TOOL,
+            &sibling_args,
+            ToolCancellationToken::default(),
+        );
+        let (question, denied) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+            sibling_access
+        );
+        assert!(
+            question.questions[0]
+                .question
+                .contains(&sibling.display().to_string())
+        );
+        assert!(denied.expect_err("sibling denied").contains("user denied"));
+
+        // Prefix lookalike path must not match.
+        let lookalike = PathBuf::from(format!("{}-extra", attached_canonical.display()));
+        let lookalike_args = json!({
+            "path": lookalike.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let lookalike_result = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-4",
+            READ_FILE_TOOL,
+            &lookalike_args,
+            ToolCancellationToken::default(),
+        )
+        .await;
+        match lookalike_result {
+            Ok(true) => panic!("lookalike path must not auto-allow"),
+            Ok(false) | Err(_) => {
+                let _ = event_rx.try_recv();
+            }
+        }
+
+        // Empty allowlist for another chat still asks (chat isolation at prepare time).
+        let chat_b = format!("chat-external-access-attachment-b-{}", unique_id("case"));
+        let other_args = json!({
+            "path": attached.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+        let other_chat_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_b,
+            "call-5",
+            READ_FILE_TOOL,
+            &other_args,
+            ToolCancellationToken::default(),
+        );
+        let (q, denied_b) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+            other_chat_access
+        );
+        assert_eq!(q.chat_id, chat_b);
+        assert!(denied_b.expect_err("chat B denied").contains("user denied"));
+    }
+
+    #[test]
+    fn collect_attachment_read_allowlist_exact_paths_and_skips_missing() {
+        let outside = tempfile::tempdir().expect("outside");
+        let present = outside.path().join("present.txt");
+        fs::write(&present, "ok").expect("write");
+        let missing = outside.path().join("missing.txt");
+        let present_canonical = fs::canonicalize(&present).expect("canonical");
+
+        let history = vec![foco_store::workspace::MessageRecord {
+            id: "user-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            sequence: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            metadata_json: serde_json::to_string(&json!({
+                "attachments": [{
+                    "id": "a1",
+                    "name": "present.txt",
+                    "contentType": "text/plain",
+                    "sizeBytes": 2,
+                    "path": present.to_string_lossy(),
+                }]
+            }))
+            .expect("meta"),
+        }];
+        let current = vec![NeutralChatAttachment {
+            id: "a2".to_string(),
+            name: "missing.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            size_bytes: 1,
+            content_base64: None,
+            path: Some(missing.to_string_lossy().to_string()),
+        }];
+        let allowlist = collect_attachment_read_allowlist(&history, &current, None);
+        assert_eq!(allowlist, vec![present_canonical]);
+    }
+
+    #[test]
+    fn collect_attachment_read_allowlist_includes_queued_and_excludes_deleted_suffix() {
+        let outside = tempfile::tempdir().expect("outside");
+        let kept = outside.path().join("kept.txt");
+        let removed = outside.path().join("removed.txt");
+        fs::write(&kept, "kept").expect("write kept");
+        fs::write(&removed, "removed").expect("write removed");
+        let kept_canonical = fs::canonicalize(&kept).expect("canonical kept");
+
+        // After edit-rerun suffix delete, only kept history remains in existing_messages.
+        let history = vec![foco_store::workspace::MessageRecord {
+            id: "user-kept".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "kept turn".to_string(),
+            sequence: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            metadata_json: serde_json::to_string(&json!({
+                "attachments": [{
+                    "id": "a-kept",
+                    "name": "kept.txt",
+                    "contentType": "text/plain",
+                    "sizeBytes": 4,
+                    "path": kept.to_string_lossy(),
+                }]
+            }))
+            .expect("meta"),
+        }];
+        // Queued user is excluded from history but must still contribute grants.
+        let queued = foco_store::workspace::MessageRecord {
+            id: "user-queued".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "queued turn".to_string(),
+            sequence: 2,
+            created_at: "2026-01-01T00:00:02Z".to_string(),
+            metadata_json: serde_json::to_string(&json!({
+                "attachments": [{
+                    "id": "a-queued",
+                    "name": "kept.txt",
+                    "contentType": "text/plain",
+                    "sizeBytes": 4,
+                    "path": kept.to_string_lossy(),
+                }]
+            }))
+            .expect("queued meta"),
+        };
+        // Removed suffix attachment is NOT in history/queued/current → must not grant.
+        let allowlist = collect_attachment_read_allowlist(&history, &[], Some(&queued));
+        assert_eq!(allowlist, vec![kept_canonical.clone()]);
+
+        // Provider-visible window can be empty (e.g. after compression summary) while
+        // full chat history still rebuilds the exact allowlist.
+        let allowlist_from_history_only = collect_attachment_read_allowlist(&history, &[], None);
+        assert_eq!(allowlist_from_history_only, vec![kept_canonical]);
+        assert!(
+            !allowlist_from_history_only
+                .iter()
+                .any(|p| p.ends_with("removed.txt")),
+            "deleted suffix attachments must not grant"
+        );
+    }
+
+    #[test]
+    fn append_guidance_events_extends_attachment_read_allowlist() {
+        let outside = tempfile::tempdir().expect("outside");
+        let attached = outside.path().join("guide.txt");
+        fs::write(&attached, "guidance body").expect("write");
+        let attached_canonical = fs::canonicalize(&attached).expect("canonical");
+
+        // Path attachments are normalized/canonicalized before guidance is applied
+        // (push_guidance → normalized_chat_attachments).
+        let guidance = GuidanceMessage {
+            id: "msg-guidance-1".to_string(),
+            content: "read the attached file".to_string(),
+            attachments: vec![NeutralChatAttachment {
+                id: "g1".to_string(),
+                name: "guide.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                size_bytes: 13,
+                content_base64: None,
+                path: Some(attached_canonical.display().to_string()),
+            }],
+            source: crate::runtime::MANUAL_GUIDANCE_SOURCE.to_string(),
+            interrupted_assistant_id: None,
+        };
+
+        let mut messages = Vec::new();
+        let mut sequences = Vec::new();
+        let mut sources = Vec::new();
+        let mut events = Vec::new();
+        let mut allowlist = Vec::new();
+        let sse = append_guidance_events(
+            &mut messages,
+            &mut sequences,
+            &mut sources,
+            &mut events,
+            vec![guidance],
+            None,
+            &mut allowlist,
+        );
+        assert_eq!(sse.len(), 1);
+        assert_eq!(allowlist, vec![attached_canonical.clone()]);
+
+        // Exact match grant path used by ensure_read_file_external_access.
+        assert!(path_is_exact_attachment_allowlist_match(
+            &attached_canonical,
+            &allowlist
+        ));
+        let sibling = outside.path().join("other.txt");
+        fs::write(&sibling, "nope").expect("sibling");
+        let sibling_canonical = fs::canonicalize(&sibling).expect("sibling canonical");
+        assert!(!path_is_exact_attachment_allowlist_match(
+            &sibling_canonical,
+            &allowlist
+        ));
     }
 
     #[tokio::test]
@@ -3692,6 +3996,7 @@ mod tests {
         for (call_id, path) in [("call-1", &skill_file), ("call-2", &reference_file)] {
             let allowed = ensure_read_file_external_access(
                 &config,
+                &[],
                 &[],
                 registry.clone(),
                 event_tx.clone(),
@@ -3741,6 +4046,7 @@ mod tests {
         let allowed = ensure_read_file_external_access(
             &config,
             &[skill_root],
+            &[],
             registry,
             event_tx,
             "workspace-1",
@@ -3800,6 +4106,7 @@ mod tests {
         let allowed = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -3823,6 +4130,7 @@ mod tests {
         // Relative path stays inside tool worktree → no external access flag.
         let relative_allowed = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx.clone(),
@@ -3892,6 +4200,7 @@ mod tests {
             let access = ensure_read_file_external_access(
                 &config,
                 &[],
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 "workspace-1",
@@ -3929,6 +4238,7 @@ mod tests {
             });
             let access = ensure_read_file_external_access(
                 &config,
+                &[],
                 &[],
                 registry.clone(),
                 event_tx.clone(),
@@ -3989,6 +4299,7 @@ mod tests {
             let allowed = ensure_read_file_external_access(
                 &config,
                 &[],
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 "workspace-1",
@@ -4042,6 +4353,7 @@ mod tests {
         let shared_allowed = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -4071,6 +4383,7 @@ mod tests {
         });
         let lookalike_access = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx.clone(),
@@ -4108,6 +4421,7 @@ mod tests {
         });
         let escape_access = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx.clone(),
@@ -4186,6 +4500,7 @@ mod tests {
                 memory_settings: MemorySettings::default(),
             },
             None,
+            Vec::new(),
             Vec::new(),
             ToolResourceLockRegistry::default(),
             ToolCancellationToken::default(),
@@ -4459,6 +4774,7 @@ mod tests {
             let allowed = ensure_read_file_external_access(
                 &config,
                 &snapshot.read_root_dirs,
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
@@ -4502,6 +4818,7 @@ mod tests {
             let allowed = ensure_read_file_external_access(
                 &config,
                 &agents_only_snapshot.read_root_dirs,
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
@@ -4543,6 +4860,7 @@ mod tests {
             let access = ensure_read_file_external_access(
                 &config,
                 &agents_only_snapshot.read_root_dirs,
+                &[],
                 registry.clone(),
                 event_tx.clone(),
                 workspace_id,
@@ -4581,6 +4899,7 @@ mod tests {
         let allowed = ensure_read_file_external_access(
             &config,
             &full_snapshot.read_root_dirs,
+            &[],
             registry,
             event_tx,
             workspace_id,
@@ -4676,6 +4995,7 @@ mod tests {
         let chat_id = format!("chat-external-access-workspace-skill-{}", unique_id("case"));
         let allowed = ensure_read_file_external_access(
             &config, &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             workspace_id,
@@ -4701,6 +5021,7 @@ mod tests {
                 json!({ "path": path.to_string_lossy(), "startLine": null, "endLine": null });
             let access = ensure_read_file_external_access(
                 &config,
+                &[],
                 &[],
                 registry.clone(),
                 event_tx.clone(),
@@ -4744,6 +5065,7 @@ mod tests {
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx,
@@ -4789,6 +5111,7 @@ mod tests {
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
         let access = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx,
@@ -4837,6 +5160,7 @@ mod tests {
         let access = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -4864,6 +5188,7 @@ mod tests {
             json!({ "path": second.path().to_string_lossy(), "startLine": null, "endLine": null });
         let second_allowed = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry,
             event_tx,
@@ -4906,6 +5231,7 @@ mod tests {
         let first_access = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -4920,6 +5246,7 @@ mod tests {
         let second_access = ensure_read_file_external_access(
             &config,
             &[],
+            &[],
             registry.clone(),
             event_tx.clone(),
             "workspace-1",
@@ -4933,6 +5260,7 @@ mod tests {
         );
         let third_access = ensure_read_file_external_access(
             &config,
+            &[],
             &[],
             registry.clone(),
             event_tx.clone(),

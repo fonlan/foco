@@ -162,6 +162,24 @@ pub(crate) async fn prepare_prompt_context(
             None => Vec::new(),
         }
     };
+    // Queued message is excluded from history above so it can be re-appended as
+    // current-turn content; still include its attachments in the read allowlist.
+    let queued_message_for_allowlist = match (
+        is_new_chat,
+        chat_id.as_deref(),
+        queued_user_message_id.as_deref(),
+    ) {
+        (false, Some(_), Some(queued_id)) => database
+            .message(queued_id)
+            .map_err(ApiError::from_workspace_error)?
+            .filter(|message| chat_id.as_deref() == Some(message.chat_id.as_str())),
+        _ => None,
+    };
+    let attachment_read_allowlist = collect_attachment_read_allowlist(
+        &existing_messages,
+        &attachments,
+        queued_message_for_allowlist.as_ref(),
+    );
     let compression_snapshots = if is_new_chat {
         Vec::new()
     } else {
@@ -606,6 +624,7 @@ pub(crate) async fn prepare_prompt_context(
         pending_memory_retrieval,
         pending_spec_snapshot: project_spec_context.pending_snapshot,
         skill_read_root_dirs,
+        attachment_read_allowlist,
     })
 }
 

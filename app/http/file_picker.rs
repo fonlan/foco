@@ -692,7 +692,9 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn path_is_empty(path: Option<&str>) -> bool {
-    path.map(str::trim).filter(|value| !value.is_empty()).is_none()
+    path.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
 }
 
 /// When unrestricted attachment browsing is on and the client sent empty path,

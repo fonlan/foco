@@ -247,6 +247,8 @@ struct RemotePreparedChatContext {
     /// Run-scoped Skill read grants from the same discovery used for `## Skills`.
     /// Not written to runtime bundle, SQLite, or provider request JSON.
     skill_read_root_dirs: Vec<PathBuf>,
+    /// Canonical path attachments for this chat (exact `read_file` grants).
+    attachment_read_allowlist: Vec<PathBuf>,
 }
 
 struct RemoteSidecarHistoryMessages {
@@ -299,6 +301,7 @@ impl RemoteSidecarRuntimeToolState {
             context_budget: remote_sidecar_context_budget_for_request(state, request)?,
             compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
             skill_read_root_dirs: Vec::new(),
+            attachment_read_allowlist: Vec::new(),
         };
         Ok(Self::from_prepared(&prepared))
     }
@@ -7069,6 +7072,38 @@ fn remote_message_attachments(metadata: &Value) -> Vec<NeutralChatAttachment> {
         .unwrap_or_default()
 }
 
+/// Rebuilds exact path attachment grants from remote chat SQLite user messages.
+/// Includes messages up to (and including) the current assistant target so the
+/// queued user message is covered; missing paths are skipped safely.
+fn remote_sidecar_attachment_read_allowlist(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    assistant_message_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let Ok(messages) = database.messages_for_chat(chat_id) else {
+        return Vec::new();
+    };
+    let target_sequence = assistant_message_id.and_then(|assistant_message_id| {
+        messages
+            .iter()
+            .find(|message| message.id == assistant_message_id)
+            .map(|message| message.sequence)
+    });
+    let mut allowlist = Vec::new();
+    for message in messages {
+        if message.role != "user" {
+            continue;
+        }
+        if target_sequence.is_some_and(|sequence| message.sequence > sequence) {
+            continue;
+        }
+        let metadata = serde_json::from_str::<Value>(&message.metadata_json).unwrap_or(Value::Null);
+        let attachments = remote_message_attachments(&metadata);
+        crate::extend_attachment_read_allowlist(&mut allowlist, &attachments);
+    }
+    allowlist
+}
+
 fn remote_message_run_config(metadata: &Value, queued_run: Option<&Value>) -> Option<Value> {
     let model_id = metadata
         .get("modelId")
@@ -9491,6 +9526,8 @@ fn remote_sidecar_prepare_chat_context_with_options(
     apply_sidecar_selected_skills(&skill_context.selected_entries, &mut filtered_messages)?;
     let skill_routing_message = skill_context.routing_message;
     let skill_read_root_dirs = skill_context.skill_read_root_dirs;
+    let attachment_read_allowlist =
+        remote_sidecar_attachment_read_allowlist(database, chat_id, assistant_message_id);
     let tools = tool_catalog.tools.clone();
     let todo_graph_context = database
         .todo_graph(chat_id)
@@ -9628,6 +9665,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                 active_tool_start_index,
                 compression_snapshots,
                 skill_read_root_dirs,
+                attachment_read_allowlist,
             );
         }
     }
@@ -9687,6 +9725,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
         active_tool_start_index,
         compression_snapshots,
         skill_read_root_dirs,
+        attachment_read_allowlist,
     )
 }
 
@@ -9762,6 +9801,7 @@ fn remote_sidecar_finish_prepared_context(
     active_tool_start_index: usize,
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
     skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
     let context_budget = remote_sidecar_context_budget_for_request(state, &provider_request)
         .map_err(|e| e.into_response())?;
@@ -9776,6 +9816,7 @@ fn remote_sidecar_finish_prepared_context(
         context_budget,
         compression_enabled: remote_sidecar_runtime_tool_state_compression_enabled(state),
         skill_read_root_dirs,
+        attachment_read_allowlist,
     })
 }
 
@@ -10635,6 +10676,7 @@ async fn remote_sidecar_execute_tool_call(
     provider_id: &str,
     model_id: &str,
     skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
 ) -> (Value, bool, String, String, Vec<Value>, Vec<String>) {
     // ponytail: remote sidecar reuses the shared execute_tool path one call at a time.
     // Ceiling: this duplicates a thin slice of main chat wiring; if remote tools grow
@@ -10791,6 +10833,7 @@ async fn remote_sidecar_execute_tool_call(
         },
         None,
         skill_read_root_dirs,
+        attachment_read_allowlist,
         ToolResourceLockRegistry::default(),
         foco_tools::ToolCancellationToken::default(),
         tool_output_tx.clone(),
@@ -12429,6 +12472,7 @@ async fn remote_sidecar_chat_stream(
     let tool_catalog = initial_prepared.tool_catalog.clone();
     let session_mode = initial_prepared.session_mode.clone();
     let skill_read_root_dirs = initial_prepared.skill_read_root_dirs.clone();
+    let attachment_read_allowlist = initial_prepared.attachment_read_allowlist.clone();
     let initial_runtime_tool_state =
         RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
     let run = RemoteActiveRunSummary {
@@ -12793,6 +12837,7 @@ async fn remote_sidecar_chat_stream(
                                 &provider_id,
                                 &model_id,
                                 skill_read_root_dirs.clone(),
+                                attachment_read_allowlist.clone(),
                             );
                             tokio::pin!(execution);
                             let (
@@ -24265,6 +24310,7 @@ mod tests {
                 "provider",
                 "model",
                 Vec::new(),
+                Vec::new(),
             )
             .await;
         (output, is_error, events, additional_context)
@@ -27095,6 +27141,7 @@ mod tests {
                 "provider",
                 "model",
                 roots.clone(),
+                Vec::new(),
             ),
         )
         .await
@@ -27134,6 +27181,7 @@ mod tests {
                 "provider",
                 "model",
                 roots,
+                Vec::new(),
             ),
         )
         .await
@@ -27143,6 +27191,152 @@ mod tests {
             "read skill reference should succeed: {ref_output}"
         );
         let _ = other_remote;
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_attachment_allowlist_grants_exact_path_only() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let attached = outside.path().join("notes.txt");
+        let sibling = outside.path().join("other.txt");
+        fs::write(&attached, "ATTACHMENT_BODY\n").expect("write attached");
+        fs::write(&sibling, "SIBLING\n").expect("write sibling");
+        let attached_canonical = fs::canonicalize(&attached).expect("canonicalize");
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat("chat-attach", "attach chat")
+            .expect("chat");
+        let meta = json!({
+            "attachments": [{
+                "id": "att-1",
+                "name": "notes.txt",
+                "contentType": "text/plain",
+                "sizeBytes": 16,
+                "path": attached.display().to_string(),
+            }],
+            "queuedRun": {
+                "status": "queued",
+                "assistantMessageId": "msg-assistant-1",
+                "assistantSequence": 1,
+                "modelId": "model-1",
+                "skillIds": [],
+            }
+        })
+        .to_string();
+        database
+            .insert_message(foco_store::workspace::NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-attach",
+                role: "user",
+                content: "read the attachment",
+                sequence: 0,
+                metadata_json: Some(&meta),
+            })
+            .expect("user message");
+        database
+            .insert_message(foco_store::workspace::NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-attach",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant message");
+
+        let allowlist = remote_sidecar_attachment_read_allowlist(
+            &database,
+            "chat-attach",
+            Some("msg-assistant-1"),
+        );
+        assert_eq!(allowlist, vec![attached_canonical.clone()]);
+
+        // Other chat must not inherit grants.
+        let other = remote_sidecar_attachment_read_allowlist(&database, "chat-missing", None);
+        assert!(other.is_empty());
+
+        let (state, catalog) = test_remote_sidecar_local_catalog(workspace.path(), None).await;
+        let run_stream = RemoteActiveRunStream::new("chat-attach".to_string());
+        let (broker_event_tx, _) = mpsc::unbounded_channel();
+        let (output, is_error, _, _, events, _) = timeout(
+            Duration::from_secs(5),
+            remote_sidecar_execute_tool_call(
+                &state,
+                &run_stream,
+                &catalog,
+                broker_event_tx,
+                NeutralToolCall {
+                    call_id: "tc-read-attach".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": attached.display().to_string() }),
+                    thought_signatures: None,
+                },
+                "chat-attach",
+                None,
+                "run-attach",
+                "msg-assistant-1",
+                "provider",
+                "model",
+                Vec::new(),
+                allowlist.clone(),
+            ),
+        )
+        .await
+        .expect("attachment read should not hang");
+        assert!(!is_error, "attachment read should succeed: {output}");
+        assert!(format!("{output}").contains("ATTACHMENT_BODY"), "{output}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.get("type").and_then(Value::as_str) == Some("questionRequest")),
+            "exact attachment should not question"
+        );
+
+        let (broker_event_tx, mut broker_rx) = mpsc::unbounded_channel();
+        let sibling_future = remote_sidecar_execute_tool_call(
+            &state,
+            &run_stream,
+            &catalog,
+            broker_event_tx,
+            NeutralToolCall {
+                call_id: "tc-read-sibling".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": sibling.display().to_string() }),
+                thought_signatures: None,
+            },
+            "chat-attach",
+            None,
+            "run-attach",
+            "msg-assistant-1",
+            "provider",
+            "model",
+            Vec::new(),
+            allowlist,
+        );
+        tokio::pin!(sibling_future);
+        let saw_question = tokio::time::timeout(Duration::from_millis(300), broker_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|event| {
+                event.get("type").and_then(Value::as_str) == Some("questionRequest")
+            });
+        // Sibling is not on the allowlist; without a question answerer the call may hang or
+        // surface a stream-closed error. Either proves it was not auto-granted.
+        if saw_question {
+            drop(sibling_future);
+        } else {
+            match tokio::time::timeout(Duration::from_millis(200), &mut sibling_future).await {
+                Ok((output, is_error, ..)) => {
+                    assert!(is_error, "sibling must not auto-succeed: {output}");
+                }
+                Err(_) => {
+                    // Still waiting on ask_question — not auto-granted.
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -53,7 +53,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 
 use crate::http::{
-    chat::{ChatGuidanceRequest, QueueChatMessageRequest},
+    chat::{ChatAttachmentInput, ChatGuidanceRequest, QueueChatMessageRequest},
     memory::{
         LegacyTranscriptLookupStats, MemoryDreamChangesQuery, MemoryDreamJobsQuery,
         MemoryDreamRunRequest, PendingMemoryDreamJob, memory_dream_changes, memory_dream_job,
@@ -1033,6 +1033,7 @@ fn test_prepared_chat_context(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
     }
 }
@@ -1696,6 +1697,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             memory_settings: MemorySettings::default(),
         },
         None,
+        Vec::new(),
         Vec::new(),
         registry,
         ToolCancellationToken::default(),
@@ -6369,6 +6371,7 @@ fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
         pending_memory_retrieval: None,
         pending_spec_snapshot: None,
         skill_read_root_dirs: Vec::new(),
+        attachment_read_allowlist: Vec::new(),
     };
     let usage =
         context_usage_response(preview.context_usage_input()).expect("context usage response");
@@ -7019,15 +7022,16 @@ fn text_attachments_use_original_path_in_user_prompt() {
     .expect("path attachment");
 
     assert_eq!(attachments[0].content_base64, None);
-    assert_eq!(
-        attachments[0].path.as_deref(),
-        Some(attachment_path_string.as_str())
-    );
+    let expected_path = fs::canonicalize(&attachment_path)
+        .expect("canonicalize attachment")
+        .display()
+        .to_string();
+    assert_eq!(attachments[0].path.as_deref(), Some(expected_path.as_str()));
 
     let message = neutral_user_message("Review it".to_string(), attachments.clone());
     assert!(message.content.contains("# Files mentioned by the user:"));
     assert!(message.content.contains("## note.txt:"));
-    assert!(message.content.contains(&attachment_path_string));
+    assert!(message.content.contains(&expected_path));
     assert!(message.content.contains("## My request for Foco:"));
     assert!(!message.content.contains("SGVsbG8="));
 
@@ -7045,11 +7049,7 @@ fn text_attachments_use_original_path_in_user_prompt() {
     let replayed_messages =
         neutral_messages_from_record(&database, stored_message, &std::collections::HashSet::new())
             .expect("neutral messages");
-    assert!(
-        replayed_messages[0]
-            .content
-            .contains(&attachment_path_string)
-    );
+    assert!(replayed_messages[0].content.contains(&expected_path));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -7089,6 +7089,77 @@ fn active_chat_run_registry_accepts_matching_guidance() {
     let received = guidance_rx.try_recv().expect("guidance delivered");
     assert_eq!(received.id, guidance.id);
     assert_eq!(received.content, guidance.content);
+}
+
+#[test]
+fn push_guidance_canonicalizes_path_attachments_for_allowlist() {
+    let outside = env::temp_dir().join(unique_id("foco-guidance-attach"));
+    fs::create_dir_all(&outside).expect("outside dir");
+    let attached = outside.join("guide.txt");
+    fs::write(&attached, "guidance").expect("write");
+    // Non-canonical absolute path (extra /./ segment) must still resolve.
+    let non_canonical = outside.join(".").join("guide.txt");
+    let expected = fs::canonicalize(&attached)
+        .expect("canonicalize")
+        .display()
+        .to_string();
+    let size_bytes = fs::metadata(&attached).expect("meta").len();
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+    let _registration = registry
+        .register(
+            "run-guidance-attach".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    let guidance = registry
+        .push_guidance(
+            "workspace-1",
+            ChatGuidanceRequest {
+                chat_id: "chat-1".to_string(),
+                run_id: "run-guidance-attach".to_string(),
+                message: "Use this file.".to_string(),
+                attachments: vec![ChatAttachmentInput {
+                    id: "g-attach".to_string(),
+                    name: "guide.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    content_base64: None,
+                    path: Some(non_canonical.display().to_string()),
+                    size_bytes,
+                }],
+            },
+        )
+        .expect("push guidance with path attachment");
+
+    assert_eq!(guidance.attachments.len(), 1);
+    assert_eq!(
+        guidance.attachments[0].path.as_deref(),
+        Some(expected.as_str())
+    );
+    let received = guidance_rx.try_recv().expect("guidance delivered");
+    assert_eq!(
+        received.attachments[0].path.as_deref(),
+        Some(expected.as_str())
+    );
+
+    let mut allowlist = Vec::new();
+    extend_attachment_read_allowlist(&mut allowlist, &received.attachments);
+    assert_eq!(
+        allowlist,
+        vec![PathBuf::from(&expected)],
+        "canonical guidance path must land in exact read allowlist"
+    );
+
+    let _ = fs::remove_dir_all(&outside);
 }
 
 #[test]
@@ -12227,6 +12298,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
@@ -14020,6 +14092,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
@@ -14428,6 +14501,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
         skill_read_root_dirs: Vec::new(),
+        attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
     };
     let outcome = ChatAuditOutcome {
