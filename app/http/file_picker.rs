@@ -43,6 +43,10 @@ pub(crate) struct FilePickerListRequest {
     show_hidden: bool,
     #[serde(default)]
     limit: Option<usize>,
+    /// Attachment picker only: list any readable absolute path on the host.
+    /// Default false keeps workspace-root clamping for other pickers.
+    #[serde(default)]
+    allow_outside_workspace: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +54,10 @@ pub(crate) struct FilePickerListRequest {
 pub(crate) struct FilePickerReadFilesRequest {
     target: FilePickerTarget,
     paths: Vec<String>,
+    /// Attachment picker only: read any readable absolute file on the host.
+    /// Default false keeps workspace-root clamping for other pickers.
+    #[serde(default)]
+    allow_outside_workspace: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -258,7 +266,14 @@ pub(crate) async fn remote_sidecar_file_picker_list(
     let root = fs::canonicalize(&state.workspace_path).map_err(|source| {
         ApiError::bad_request(format!("remote workspace root is not readable: {source}"))
     })?;
-    Ok(Json(list_local(request, Some(&root))?))
+    let restricted_root = if request.allow_outside_workspace {
+        None
+    } else {
+        Some(root.as_path())
+    };
+    // When unrestricted, still open at the workspace path if the client sent empty path.
+    let request = rewrite_unrestricted_empty_path_to_workspace_root(request, &root);
+    Ok(Json(list_local(request, restricted_root)?))
 }
 
 pub(crate) async fn remote_sidecar_file_picker_read_files(
@@ -268,10 +283,15 @@ pub(crate) async fn remote_sidecar_file_picker_read_files(
     let root = fs::canonicalize(&state.workspace_path).map_err(|source| {
         ApiError::bad_request(format!("remote workspace root is not readable: {source}"))
     })?;
+    let restricted_root = if request.allow_outside_workspace {
+        None
+    } else {
+        Some(root.as_path())
+    };
     let paths = request
         .paths
         .iter()
-        .map(|path| canonical_path_within(Path::new(path), Some(&root)))
+        .map(|path| canonical_path_within(Path::new(path), restricted_root))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(FilePickerReadFilesResponse {
         files: selected_files_from_paths(paths)?,
@@ -294,7 +314,15 @@ async fn list_workspace(
             let root = fs::canonicalize(&workspace.path).map_err(|source| {
                 ApiError::bad_request(format!("workspace path is not readable: {source}"))
             })?;
-            Ok(Json(list_local(request, Some(&root))?))
+            let restricted_root = if request.allow_outside_workspace {
+                None
+            } else {
+                Some(root.as_path())
+            };
+            // Unrestricted attachments: start at workspace root when path is empty,
+            // but do not pass a restricted root so parentPath can navigate upward.
+            let request = rewrite_unrestricted_empty_path_to_workspace_root(request, &root);
+            Ok(Json(list_local(request, restricted_root)?))
         }
         WorkspaceLocation::Ssh { remote_path, .. } => {
             crate::remote_workspace::ensure_remote_workspace_connected(state, workspace_id).await?;
@@ -338,10 +366,15 @@ async fn read_workspace_files(
             let root = fs::canonicalize(&workspace.path).map_err(|source| {
                 ApiError::bad_request(format!("workspace path is not readable: {source}"))
             })?;
+            let restricted_root = if request.allow_outside_workspace {
+                None
+            } else {
+                Some(root.as_path())
+            };
             let paths = request
                 .paths
                 .iter()
-                .map(|path| canonical_path_within(Path::new(path), Some(&root)))
+                .map(|path| canonical_path_within(Path::new(path), restricted_root))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Json(FilePickerReadFilesResponse {
                 files: selected_files_from_paths(paths)?,
@@ -658,6 +691,26 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
+fn path_is_empty(path: Option<&str>) -> bool {
+    path.map(str::trim).filter(|value| !value.is_empty()).is_none()
+}
+
+/// When unrestricted attachment browsing is on and the client sent empty path,
+/// open at the workspace root instead of process home (still without a restricted root).
+fn rewrite_unrestricted_empty_path_to_workspace_root(
+    request: FilePickerListRequest,
+    workspace_root: &Path,
+) -> FilePickerListRequest {
+    if request.allow_outside_workspace && path_is_empty(request.path.as_deref()) {
+        FilePickerListRequest {
+            path: Some(workspace_root.display().to_string()),
+            ..request
+        }
+    } else {
+        request
+    }
+}
+
 fn read_stdin_json<T: for<'de> Deserialize<'de>>() -> AppResult<T> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -687,6 +740,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             None,
         )
@@ -711,6 +765,7 @@ mod tests {
                 include_files: true,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -742,6 +797,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -770,6 +826,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -787,6 +844,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -816,6 +874,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -825,6 +884,159 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
         assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
         assert!(error.message().contains("path is outside the allowed root"));
+    }
+
+    #[test]
+    fn unrestricted_workspace_list_can_navigate_above_root() {
+        let root = temp_picker_dir("unrestricted-up");
+        let outside = temp_picker_dir("unrestricted-up-peer");
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical_outside = fs::canonicalize(&outside).unwrap();
+        let parent = canonical_root.parent().expect("temp root has parent");
+
+        // Empty path under unrestricted workspace mode is rewritten to workspace root
+        // (same as list_workspace / remote_sidecar), then listed without restricted root.
+        let request = FilePickerListRequest {
+            target: FilePickerTarget::Workspace {
+                workspace_id: "workspace-1".to_string(),
+            },
+            path: Some(canonical_root.display().to_string()),
+            mode: FilePickerMode::File,
+            include_files: true,
+            show_hidden: false,
+            limit: None,
+            allow_outside_workspace: true,
+        };
+        let at_root = list_local(request, None).unwrap();
+        assert_eq!(at_root.path, canonical_root.display().to_string());
+        assert_eq!(
+            at_root.parent_path,
+            Some(parent.display().to_string()),
+            "unrestricted picker must expose parent above workspace root"
+        );
+
+        let at_outside = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some(canonical_outside.display().to_string()),
+                mode: FilePickerMode::File,
+                include_files: true,
+                show_hidden: false,
+                limit: None,
+                allow_outside_workspace: true,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(at_outside.path, canonical_outside.display().to_string());
+        assert!(
+            at_outside
+                .entries
+                .iter()
+                .any(|entry| entry.name == "secret.txt" && !entry.is_directory)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn unrestricted_workspace_read_allows_file_outside_root() {
+        let root = temp_picker_dir("unrestricted-read-root");
+        let outside = temp_picker_dir("unrestricted-read-peer");
+        let file_path = outside.join("note.txt");
+        fs::write(&file_path, b"hello").unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical_file = fs::canonicalize(&file_path).unwrap();
+
+        // Restricted: outside file forbidden.
+        let restricted_err =
+            canonical_path_within(&canonical_file, Some(&canonical_root)).unwrap_err();
+        assert_eq!(restricted_err.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // Unrestricted (allowOutsideWorkspace): same path allowed, then attachment validation.
+        let unrestricted = canonical_path_within(&canonical_file, None).unwrap();
+        let files = selected_files_from_paths(vec![unrestricted]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "note.txt");
+        assert_eq!(files[0].size_bytes, 5);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn unrestricted_empty_path_rewritten_to_workspace_root() {
+        let root = temp_picker_dir("unrestricted-empty-initial");
+        fs::create_dir_all(root.join("inside")).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        for empty in [None, Some(String::new()), Some("   ".to_string())] {
+            let rewritten = rewrite_unrestricted_empty_path_to_workspace_root(
+                FilePickerListRequest {
+                    target: FilePickerTarget::Workspace {
+                        workspace_id: "workspace-1".to_string(),
+                    },
+                    path: empty,
+                    mode: FilePickerMode::File,
+                    include_files: true,
+                    show_hidden: false,
+                    limit: None,
+                    allow_outside_workspace: true,
+                },
+                &canonical_root,
+            );
+            let expected_root = canonical_root.display().to_string();
+            assert_eq!(rewritten.path.as_deref(), Some(expected_root.as_str()));
+
+            let response = list_local(rewritten, None).unwrap();
+            assert_eq!(response.path, expected_root);
+            assert!(response.parent_path.is_some());
+            assert!(
+                response
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "inside" && entry.is_directory)
+            );
+        }
+
+        // Restricted or non-empty path must not be rewritten.
+        let kept = rewrite_unrestricted_empty_path_to_workspace_root(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: None,
+                mode: FilePickerMode::File,
+                include_files: true,
+                show_hidden: false,
+                limit: None,
+                allow_outside_workspace: false,
+            },
+            &canonical_root,
+        );
+        assert!(kept.path.is_none());
+
+        let kept_path = rewrite_unrestricted_empty_path_to_workspace_root(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some("/tmp/other".to_string()),
+                mode: FilePickerMode::File,
+                include_files: true,
+                show_hidden: false,
+                limit: None,
+                allow_outside_workspace: true,
+            },
+            &canonical_root,
+        );
+        assert_eq!(kept_path.path.as_deref(), Some("/tmp/other"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -840,6 +1052,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             None,
         )
@@ -872,6 +1085,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             None,
         )
@@ -898,6 +1112,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -930,6 +1145,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             Some(&canonical_root),
         )
@@ -981,6 +1197,7 @@ mod tests {
                 include_files: false,
                 show_hidden: false,
                 limit: None,
+                allow_outside_workspace: false,
             },
             None,
         )
@@ -1070,5 +1287,34 @@ mod tests {
         assert!(request.include_files);
         assert!(!request.show_hidden);
         assert_eq!(request.limit, Some(500));
+        assert!(!request.allow_outside_workspace);
+    }
+
+    #[test]
+    fn file_picker_list_request_deserializes_allow_outside_workspace() {
+        let request: FilePickerListRequest = serde_json::from_str(
+            r#"{
+                "target": {"kind":"workspace","workspaceId":"workspace-1"},
+                "path": "",
+                "mode": "file",
+                "includeFiles": true,
+                "showHidden": false,
+                "limit": 500,
+                "allowOutsideWorkspace": true
+            }"#,
+        )
+        .unwrap();
+        assert!(request.allow_outside_workspace);
+
+        let read_request: FilePickerReadFilesRequest = serde_json::from_str(
+            r#"{
+                "target": {"kind":"workspace","workspaceId":"workspace-1"},
+                "paths": ["/tmp/a.txt"],
+                "allowOutsideWorkspace": true
+            }"#,
+        )
+        .unwrap();
+        assert!(read_request.allow_outside_workspace);
+        assert_eq!(read_request.paths, vec!["/tmp/a.txt"]);
     }
 }

@@ -756,6 +756,7 @@ type ActiveMainTab =
     };
 
 type FilePickerRequest = {
+  allowOutsideWorkspace?: boolean;
   initialPath?: string | null;
   mode: "file" | "directory";
   multiple?: boolean;
@@ -4696,6 +4697,7 @@ export function App() {
       ? { kind: "workspace", workspaceId: activeWorkspace.id }
       : { kind: "local" };
     setFilePickerRequest({
+      allowOutsideWorkspace: true,
       mode: "file",
       multiple: true,
       readFiles: true,
@@ -4718,6 +4720,7 @@ export function App() {
       ? { kind: "workspace", workspaceId: activeWorkspace.id }
       : { kind: "local" };
     setFilePickerRequest({
+      allowOutsideWorkspace: true,
       mode: "file",
       multiple: true,
       readFiles: true,
@@ -12533,6 +12536,7 @@ export function App() {
         ) : null}
         {filePickerRequest ? (
           <FilePickerDialog
+            allowOutsideWorkspace={filePickerRequest.allowOutsideWorkspace}
             initialPath={filePickerRequest.initialPath}
             mode={filePickerRequest.mode}
             multiple={filePickerRequest.multiple}

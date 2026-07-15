@@ -3190,16 +3190,32 @@ describe("app-chat-stream verification surfaces", () => {
       ([url]) => typeof url === "string" && url === "/api/file-picker/list",
     );
     const listBody = JSON.parse(String(listCall?.[1]?.body ?? "{}")) as {
+      allowOutsideWorkspace?: boolean;
       target?: { kind?: string; workspaceId?: string };
     };
     expect(listBody.target).toEqual({
       kind: "workspace",
       workspaceId: "workspace-1",
     });
+    expect(listBody.allowOutsideWorkspace).toBe(true);
 
     await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
     await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
+
+    const readCall = fetchMock.mock.calls.find(
+      ([url]) => typeof url === "string" && url === "/api/file-picker/read-files",
+    );
+    expect(readCall).toBeDefined();
+    const readBody = JSON.parse(String(readCall?.[1]?.body ?? "{}")) as {
+      allowOutsideWorkspace?: boolean;
+      target?: { kind?: string; workspaceId?: string };
+    };
+    expect(readBody.allowOutsideWorkspace).toBe(true);
+    expect(readBody.target).toEqual({
+      kind: "workspace",
+      workspaceId: "workspace-1",
+    });
 
     await userEvent.click(screen.getByLabelText("Model"));
     await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
@@ -3243,6 +3259,56 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
+  });
+
+  it("opens the attachment picker with allowOutsideWorkspace from message edit UI", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+
+    const editAttachmentButtons = screen.getAllByRole("button", { name: "Add attachment" });
+    // Composer + inline edit both expose Add attachment; use the last (edit UI).
+    await userEvent.click(editAttachmentButtons[editAttachmentButtons.length - 1]!);
+    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => typeof url === "string" && url === "/api/file-picker/list",
+        ),
+      ).toBe(true);
+    });
+    const listCall = [...fetchMock.mock.calls]
+      .reverse()
+      .find(([url]) => typeof url === "string" && url === "/api/file-picker/list");
+    const listBody = JSON.parse(String(listCall?.[1]?.body ?? "{}")) as {
+      allowOutsideWorkspace?: boolean;
+      target?: { kind?: string; workspaceId?: string };
+    };
+    expect(listBody.allowOutsideWorkspace).toBe(true);
+    expect(listBody.target).toEqual({
+      kind: "workspace",
+      workspaceId: "workspace-1",
+    });
+
+    await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
+    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => typeof url === "string" && url === "/api/file-picker/read-files",
+        ),
+      ).toBe(true);
+    });
+    const readCall = [...fetchMock.mock.calls]
+      .reverse()
+      .find(([url]) => typeof url === "string" && url === "/api/file-picker/read-files");
+    const readBody = JSON.parse(String(readCall?.[1]?.body ?? "{}")) as {
+      allowOutsideWorkspace?: boolean;
+    };
+    expect(readBody.allowOutsideWorkspace).toBe(true);
   });
 
   it("blocks unsupported media attachments for the selected model", async () => {

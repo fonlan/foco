@@ -17,6 +17,8 @@ export type FilePickerSelection = {
 };
 
 type FilePickerDialogProps = {
+  /** Attachment-only: browse any absolute path on the workspace host. Default false. */
+  allowOutsideWorkspace?: boolean;
   initialPath?: string | null;
   mode: FilePickerMode;
   multiple?: boolean;
@@ -32,6 +34,7 @@ type FilePickerDialogProps = {
 const FILE_PICKER_LIMIT = 500;
 
 export function FilePickerDialog({
+  allowOutsideWorkspace = false,
   initialPath,
   mode,
   multiple = false,
@@ -77,6 +80,7 @@ export function FilePickerDialog({
 
     void requestJson<FilePickerListResponse>("/api/file-picker/list", {
       body: JSON.stringify({
+        allowOutsideWorkspace,
         includeFiles: mode === "file",
         limit: FILE_PICKER_LIMIT,
         mode,
@@ -110,7 +114,7 @@ export function FilePickerDialog({
       });
 
     return () => controller.abort();
-  }, [mode, open, path, refreshRevision, showHidden, target, targetIdentity]);
+  }, [allowOutsideWorkspace, mode, open, path, refreshRevision, showHidden, target, targetIdentity]);
 
   const selectableEntries = useMemo(
     () => response?.entries.filter((entry) => isSelectable(entry, mode)) ?? [],
@@ -155,7 +159,11 @@ export function FilePickerDialog({
     try {
       if (readFiles) {
         const data = await requestJson<{ files: NativeSelectedFile[] }>("/api/file-picker/read-files", {
-          body: JSON.stringify({ paths: finalPaths, target }),
+          body: JSON.stringify({
+            allowOutsideWorkspace,
+            paths: finalPaths,
+            target,
+          }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         });
