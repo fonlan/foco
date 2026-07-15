@@ -30,6 +30,8 @@ use crate::{
 pub(crate) const PREVIEW_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Hard cap on concurrent preview sessions in one process.
 pub(crate) const PREVIEW_SESSION_MAX_COUNT: usize = 64;
+/// Timeout for main-process → sidecar preview file HEAD/GET.
+const PREVIEW_SIDECAR_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// DNS label length for the token subdomain (a–z0–9 only).
 const PREVIEW_TOKEN_LEN: usize = 32;
 const PREVIEW_HOST_SUFFIX: &str = ".preview.localhost";
@@ -336,6 +338,73 @@ pub(crate) fn resolve_preview_resource_path(
     normalize_workspace_relative_path(&full)
 }
 
+/// Build a preview static response with shared MIME / cache / CSP headers.
+/// Used by both local disk serving and remote sidecar so semantics stay identical.
+pub(crate) fn build_preview_file_response(
+    resource_rel: &str,
+    body: Vec<u8>,
+    content_length: u64,
+    head_only: bool,
+    foco_origin: &str,
+) -> Response {
+    let mime = preview_mime_type(resource_rel);
+    let csp = preview_content_security_policy(foco_origin);
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache_control_for_preview(mime))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, csp)
+        // Preview origin must not accept Foco auth cookies (different host).
+        .header("Cross-Origin-Resource-Policy", "same-origin");
+
+    // CSP frame-ancestors is the embed control (Foco origin only).
+    // Do not set X-Frame-Options: SAMEORIGIN — that would block the Foco parent iframe.
+    if head_only {
+        return builder
+            .header(header::CONTENT_LENGTH, content_length.to_string())
+            .body(Body::empty())
+            .expect("preview HEAD response is valid");
+    }
+
+    builder
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .body(Body::from(body))
+        .expect("preview GET response is valid")
+}
+
+/// Read a local preview file after confinement checks and build the HTTP response.
+pub(crate) fn serve_local_preview_file(
+    workspace_root: &Path,
+    preview_root_rel: &str,
+    resource_rel: &str,
+    head_only: bool,
+    foco_origin: &str,
+) -> Result<Response, ApiError> {
+    let file_path = open_preview_file(workspace_root, preview_root_rel, resource_rel)?;
+    if head_only {
+        let content_length = fs::metadata(&file_path).map(|meta| meta.len()).unwrap_or(0);
+        return Ok(build_preview_file_response(
+            resource_rel,
+            Vec::new(),
+            content_length,
+            true,
+            foco_origin,
+        ));
+    }
+    let bytes = fs::read(&file_path).map_err(|_| {
+        ApiError::from_status_message(StatusCode::NOT_FOUND, "preview file was not found")
+    })?;
+    let content_length = bytes.len() as u64;
+    Ok(build_preview_file_response(
+        resource_rel,
+        bytes,
+        content_length,
+        false,
+        foco_origin,
+    ))
+}
+
 /// Validate absolute path is a regular file under both workspace and preview root.
 /// Rejects directories, missing files, and symlink targets that escape the preview root.
 pub(crate) fn open_preview_file(
@@ -498,13 +567,6 @@ pub(crate) async fn create_preview_session(
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
 
-    if workspace.is_remote() {
-        // Phase 2 adds remote/sidecar file reads; phase 1 is local-only.
-        return Err(ApiError::bad_request(
-            "HTML preview for remote SSH workspaces is not available yet",
-        ));
-    }
-
     let entry_rel = normalize_workspace_relative_path(&request.path)?;
     if !is_html_entry_path(&entry_rel) {
         return Err(ApiError::bad_request(
@@ -512,7 +574,32 @@ pub(crate) async fn create_preview_session(
         ));
     }
 
-    let entry_abs = crate::http::workspaces::workspace_file_path(&workspace.path, &entry_rel)?;
+    let root_path = preview_root_for_entry(&entry_rel);
+
+    if workspace.is_remote() {
+        ensure_remote_entry_exists(&state, &workspace_id, &entry_rel, &root_path).await?;
+    } else {
+        validate_local_preview_entry(&workspace.path, &entry_rel)?;
+    }
+
+    let session = state
+        .preview_sessions
+        .create(workspace.id.clone(), entry_rel, root_path)?;
+
+    tracing::info!(
+        workspace_id = %session.workspace_id,
+        entry_path = %session.entry_path,
+        root_path = %session.root_path,
+        remote = workspace.is_remote(),
+        token = %redact_preview_token(&session.token),
+        "created HTML preview session"
+    );
+
+    Ok(Json(build_preview_session_response(&state, &session)))
+}
+
+fn validate_local_preview_entry(workspace_path: &Path, entry_rel: &str) -> Result<(), ApiError> {
+    let entry_abs = crate::http::workspaces::workspace_file_path(workspace_path, entry_rel)?;
     let metadata = fs::metadata(&entry_abs)
         .map_err(|_| ApiError::bad_request(format!("workspace file was not found: {entry_rel}")))?;
     if !metadata.is_file() {
@@ -522,7 +609,7 @@ pub(crate) async fn create_preview_session(
     }
 
     // Reject symlink entry that leaves the workspace.
-    let workspace_root = fs::canonicalize(&workspace.path).map_err(|source| {
+    let workspace_root = fs::canonicalize(workspace_path).map_err(|source| {
         ApiError::internal(format!("failed to resolve workspace root: {source}"))
     })?;
     let entry_canonical = fs::canonicalize(&entry_abs)
@@ -532,21 +619,129 @@ pub(crate) async fn create_preview_session(
             "preview entry escapes the workspace (symlink)",
         ));
     }
+    Ok(())
+}
 
-    let root_path = preview_root_for_entry(&entry_rel);
-    let session = state
-        .preview_sessions
-        .create(workspace.id.clone(), entry_rel, root_path)?;
+/// Confirm the remote entry is a regular file under the preview root via sidecar.
+async fn ensure_remote_entry_exists(
+    state: &AppState,
+    workspace_id: &str,
+    entry_rel: &str,
+    root_path: &str,
+) -> Result<(), ApiError> {
+    crate::remote_workspace::ensure_remote_workspace_connected(state, workspace_id).await?;
+    let (base, token) = match crate::remote_workspace::sidecar_proxy_target(state, workspace_id)? {
+        crate::remote_workspace::SidecarProxyTarget::Connected { base, token } => (base, token),
+        crate::remote_workspace::SidecarProxyTarget::Local => {
+            return Err(ApiError::internal(
+                "workspace became local while preparing remote preview",
+            ));
+        }
+        crate::remote_workspace::SidecarProxyTarget::Disconnected => {
+            return Err(ApiError::bad_gateway(format!(
+                "remote workspace sidecar is not connected: {workspace_id}"
+            )));
+        }
+    };
 
-    tracing::info!(
-        workspace_id = %session.workspace_id,
-        entry_path = %session.entry_path,
-        root_path = %session.root_path,
-        token = %redact_preview_token(&session.token),
-        "created HTML preview session"
+    let url = format!(
+        "{}/api/remote/workspace/preview/file?path={}&root={}",
+        base.trim_end_matches('/'),
+        urlencoding_encode(entry_rel),
+        urlencoding_encode(root_path),
     );
+    let client = preview_sidecar_http_client().map_err(|source| {
+        ApiError::internal(format!("failed to create preview HTTP client: {source}"))
+    })?;
+    let response = client
+        .request(reqwest::Method::HEAD, &url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|source| {
+            ApiError::bad_gateway(format!("failed to verify remote preview entry: {source}"))
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let message = sidecar_error_message(&body).unwrap_or_else(|| {
+        if status.as_u16() == 404 {
+            format!("workspace file was not found: {entry_rel}")
+        } else {
+            format!(
+                "failed to verify remote preview entry (HTTP {})",
+                status.as_u16()
+            )
+        }
+    });
+    if status.as_u16() == 404 {
+        return Err(ApiError::bad_request(message));
+    }
+    if status.as_u16() == 400 {
+        return Err(ApiError::bad_request(message));
+    }
+    Err(ApiError::from_status_message(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        message,
+    ))
+}
 
-    Ok(Json(build_preview_session_response(&state, &session)))
+fn urlencoding_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(byte & 0xf) as usize]));
+            }
+        }
+    }
+    out
+}
+
+fn preview_sidecar_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(PREVIEW_SIDECAR_HTTP_TIMEOUT)
+        .build()
+}
+
+fn sidecar_error_message(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+            return Some(error.to_string());
+        }
+        if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+            return Some(message.to_string());
+        }
+    }
+    // Sidecar preview errors return small HTML pages; strip tags for session create.
+    let without_tags = trimmed
+        .replace("<h1>", "")
+        .replace("</h1>", " ")
+        .replace("<p>", "")
+        .replace("</p>", "");
+    let plain: String = without_tags
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>'))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if plain.is_empty() {
+        None
+    } else {
+        Some(plain.chars().take(200).collect())
+    }
 }
 
 pub(crate) async fn release_preview_session(
@@ -643,25 +838,12 @@ impl PreviewServeError {
 
 impl From<ApiError> for PreviewServeError {
     fn from(error: ApiError) -> Self {
-        // ApiError fields are private; re-map via into_response is heavy —
-        // use message + a status helper by reconstructing common cases.
-        let message = error.message().to_string();
-        let status = if message.contains("not found")
-            || message.contains("disabled")
-            || message.contains("is not a file")
-        {
-            StatusCode::NOT_FOUND
-        } else if message.contains("escapes") || message.contains("invalid") {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        Self { status, message }
+        Self {
+            status: error.status(),
+            message: error.message().to_string(),
+        }
     }
 }
-
-// Access ApiError status via a thin wrapper using existing constructors only.
-// We store status on PreviewServeError when building from known paths.
 
 async fn serve_preview_resource(
     state: &AppState,
@@ -669,104 +851,169 @@ async fn serve_preview_resource(
     request_path: &str,
     head_only: bool,
 ) -> Result<Response, PreviewServeError> {
-    let session = state
-        .preview_sessions
-        .touch(token)
-        .map_err(|error| PreviewServeError {
-            status: StatusCode::NOT_FOUND,
-            message: error.message().to_string(),
-        })?;
+    let session = state.preview_sessions.touch(token)?;
 
-    let config = config_snapshot(state).map_err(|error| PreviewServeError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: error.message().to_string(),
-    })?;
-    let workspace =
-        workspace_by_id(&config, &session.workspace_id).map_err(|error| PreviewServeError {
-            status: StatusCode::NOT_FOUND,
-            message: error.message().to_string(),
-        })?;
-
-    if workspace.is_remote() {
-        return Err(PreviewServeError {
-            status: StatusCode::BAD_GATEWAY,
-            message: "remote preview is not available yet".to_string(),
-        });
-    }
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, &session.workspace_id)?;
 
     // `/` or empty → entry HTML under the preview root.
     let resource_rel = if request_path == "/" || request_path.is_empty() {
         session.entry_path.clone()
     } else {
-        resolve_preview_resource_path(&session.root_path, request_path).map_err(|error| {
-            let lower = error.message().to_lowercase();
-            let status = if lower.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            PreviewServeError {
-                status,
-                message: error.message().to_string(),
-            }
-        })?
-    };
-    let file_path =
-        open_preview_file(&workspace.path, &session.root_path, &resource_rel).map_err(|error| {
-            let lower = error.message().to_lowercase();
-            let status = if lower.contains("not found") || lower.contains("disabled") {
-                StatusCode::NOT_FOUND
-            } else if lower.contains("escapes") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            PreviewServeError {
-                status,
-                message: error.message().to_string(),
-            }
-        })?;
-
-    let mime = preview_mime_type(&resource_rel);
-    let bytes = if head_only {
-        Vec::new()
-    } else {
-        fs::read(&file_path).map_err(|_| PreviewServeError {
-            status: StatusCode::NOT_FOUND,
-            message: "preview file was not found".to_string(),
-        })?
-    };
-    let content_length = if head_only {
-        fs::metadata(&file_path).map(|meta| meta.len()).unwrap_or(0)
-    } else {
-        bytes.len() as u64
+        resolve_preview_resource_path(&session.root_path, request_path)?
     };
 
     let foco_origin = foco_page_origin(state.listen_addr);
-    let csp = preview_content_security_policy(&foco_origin);
 
+    if workspace.is_remote() {
+        return serve_remote_preview_resource(
+            state,
+            &session.workspace_id,
+            &session.root_path,
+            &resource_rel,
+            head_only,
+            &foco_origin,
+        )
+        .await;
+    }
+
+    serve_local_preview_file(
+        &workspace.path,
+        &session.root_path,
+        &resource_rel,
+        head_only,
+        &foco_origin,
+    )
+    .map_err(PreviewServeError::from)
+}
+
+/// Fetch a preview resource from the SSH sidecar (bytes only; token stays on main process).
+async fn serve_remote_preview_resource(
+    state: &AppState,
+    workspace_id: &str,
+    preview_root: &str,
+    resource_rel: &str,
+    head_only: bool,
+    foco_origin: &str,
+) -> Result<Response, PreviewServeError> {
+    if let Err(error) =
+        crate::remote_workspace::ensure_remote_workspace_connected(state, workspace_id).await
+    {
+        return Err(PreviewServeError {
+            status: StatusCode::BAD_GATEWAY,
+            message: error.message().to_string(),
+        });
+    }
+
+    let (base, token) = match crate::remote_workspace::sidecar_proxy_target(state, workspace_id) {
+        Ok(crate::remote_workspace::SidecarProxyTarget::Connected { base, token }) => (base, token),
+        Ok(crate::remote_workspace::SidecarProxyTarget::Local) => {
+            return Err(PreviewServeError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "workspace became local while serving remote preview".to_string(),
+            });
+        }
+        Ok(crate::remote_workspace::SidecarProxyTarget::Disconnected) => {
+            return Err(PreviewServeError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("remote workspace sidecar is not connected: {workspace_id}"),
+            });
+        }
+        Err(error) => {
+            return Err(PreviewServeError {
+                status: StatusCode::BAD_GATEWAY,
+                message: error.message().to_string(),
+            });
+        }
+    };
+
+    let url = format!(
+        "{}/api/remote/workspace/preview/file?path={}&root={}",
+        base.trim_end_matches('/'),
+        urlencoding_encode(resource_rel),
+        urlencoding_encode(preview_root),
+    );
+    let method = if head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+
+    let client = preview_sidecar_http_client().map_err(|source| PreviewServeError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to create preview HTTP client: {source}"),
+    })?;
+    let response = client
+        .request(method, &url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|source| PreviewServeError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("remote preview fetch failed: {source}"),
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = sidecar_error_message(&body).unwrap_or_else(|| {
+            if status.as_u16() == 404 {
+                "preview file was not found".to_string()
+            } else {
+                format!("remote preview fetch failed (HTTP {})", status.as_u16())
+            }
+        });
+        let mapped = match status.as_u16() {
+            404 => StatusCode::NOT_FOUND,
+            400 => StatusCode::BAD_REQUEST,
+            401 | 403 => StatusCode::BAD_GATEWAY,
+            other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
+        };
+        return Err(PreviewServeError {
+            status: mapped,
+            message,
+        });
+    }
+
+    // Prefer main-process MIME/cache/CSP so local and remote responses stay aligned.
+    // Forward Content-Length when present; stream body for GET so large files are not
+    // fully buffered beyond the HTTP client body.
+    let content_length_header = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+
+    if head_only {
+        let content_length = content_length_header.unwrap_or(0);
+        return Ok(build_preview_file_response(
+            resource_rel,
+            Vec::new(),
+            content_length,
+            true,
+            foco_origin,
+        ));
+    }
+
+    // Stream remote bytes: dropping the client body typically stops further
+    // upstream consumption without unbounded full-file buffering. No explicit
+    // cancel channel. Content-Length is taken from upstream when available.
+    let content_length = content_length_header;
+    let mime = preview_mime_type(resource_rel);
+    let csp = preview_content_security_policy(foco_origin);
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, cache_control_for_preview(mime))
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_SECURITY_POLICY, csp)
-        // Preview origin must not accept Foco auth cookies (different host).
         .header("Cross-Origin-Resource-Policy", "same-origin");
-
-    // CSP frame-ancestors is the embed control (Foco origin only).
-    // Do not set X-Frame-Options: SAMEORIGIN — that would block the Foco parent iframe.
-    if head_only {
-        builder = builder.header(header::CONTENT_LENGTH, content_length.to_string());
-        return Ok(builder
-            .body(Body::empty())
-            .expect("preview HEAD response is valid"));
+    if let Some(len) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, len.to_string());
     }
-
     Ok(builder
-        .header(header::CONTENT_LENGTH, content_length.to_string())
-        .body(Body::from(bytes))
-        .expect("preview GET response is valid"))
+        .body(Body::from_stream(response.bytes_stream()))
+        .expect("remote preview stream response is valid"))
 }
 
 fn preview_error_response(status: StatusCode, message: &str, state: &AppState) -> Response {
@@ -965,5 +1212,70 @@ mod tests {
         assert_eq!(preview_root_for_entry("index.html"), "");
         assert_eq!(preview_root_for_entry("demo/index.html"), "demo");
         assert_eq!(preview_root_for_entry("a/b/c.html"), "a/b");
+    }
+
+    #[test]
+    fn urlencoding_keeps_path_slashes() {
+        assert_eq!(
+            urlencoding_encode("demo/assets/app.js"),
+            "demo/assets/app.js"
+        );
+        assert!(urlencoding_encode("a b").contains("%20"));
+        assert!(!urlencoding_encode("demo/file.js").contains("%2F"));
+    }
+
+    #[test]
+    fn serve_local_preview_file_sets_shared_headers() {
+        let root = tempdir().unwrap();
+        let preview = root.path().join("site");
+        fs::create_dir_all(&preview).unwrap();
+        fs::write(preview.join("index.html"), b"<html>hi</html>").unwrap();
+
+        let response = serve_local_preview_file(
+            root.path(),
+            "site",
+            "site/index.html",
+            false,
+            "http://127.0.0.1:3210",
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("text/html")
+        );
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(
+            headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("frame-ancestors http://127.0.0.1:3210")
+        );
+
+        let head = serve_local_preview_file(
+            root.path(),
+            "site",
+            "site/index.html",
+            true,
+            "http://127.0.0.1:3210",
+        )
+        .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("15")
+        );
     }
 }

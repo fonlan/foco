@@ -2238,6 +2238,12 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             "/api/remote/workspace/files/download",
             get(remote_sidecar_file_download),
         )
+        // Internal preview file source for main-process PreviewSession proxy.
+        // Bearer-auth only; never receives PreviewSession tokens or browser cookies.
+        .route(
+            "/api/remote/workspace/preview/file",
+            get(remote_sidecar_preview_file).head(remote_sidecar_preview_file),
+        )
         .route(
             "/api/remote/workspace/files/save",
             post(remote_sidecar_file_save),
@@ -13736,6 +13742,44 @@ async fn remote_sidecar_file_download(
         .map_err(|e| e.into_response())?;
     crate::http::workspaces::workspace_file_download_response(&abs_path, rel_path)
         .map_err(|e| e.into_response())
+}
+
+/// Serve a single preview resource for the main-process preview host proxy.
+///
+/// Query:
+/// - `path`: workspace-relative resource path (already resolved by main; re-validated here)
+/// - `root`: workspace-relative preview root (parent of entry HTML; empty = workspace root)
+///
+/// Does not accept PreviewSession tokens, Foco cookies, provider secrets, or arbitrary
+/// browser headers beyond what the bearer-auth middleware already requires.
+async fn remote_sidecar_preview_file(
+    State(state): State<RemoteSidecarState>,
+    method: axum::http::Method,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let resource_input = query.get("path").map(String::as_str).unwrap_or("");
+    let root_input = query.get("root").map(String::as_str).unwrap_or("");
+
+    let resource_rel =
+        crate::normalize_workspace_relative_path(resource_input).map_err(|e| e.into_response())?;
+    let preview_root = if root_input.trim().is_empty() {
+        String::new()
+    } else {
+        crate::normalize_workspace_relative_path(root_input).map_err(|e| e.into_response())?
+    };
+
+    let head_only = method == axum::http::Method::HEAD;
+    // CSP frame-ancestors is rewritten by the main process for the browser origin.
+    // Sidecar still applies the shared MIME/cache/nosniff contract.
+    let ws_path = sidecar_workspace_path(&state);
+    crate::runtime::serve_local_preview_file(
+        ws_path,
+        &preview_root,
+        &resource_rel,
+        head_only,
+        "http://127.0.0.1",
+    )
+    .map_err(|e| e.into_response())
 }
 
 async fn remote_sidecar_git_command(

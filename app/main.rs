@@ -7041,6 +7041,10 @@ impl ApiError {
         &self.message
     }
 
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
     fn from_config_error(error: foco_store::config::ConfigError) -> Self {
         match error {
             foco_store::config::ConfigError::Validation { message, .. } => {

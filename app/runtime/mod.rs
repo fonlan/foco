@@ -53,6 +53,7 @@ pub(crate) use native_tools::{
 pub(crate) use preview::{
     PreviewSessionRegistry, create_preview_session, preview_host_middleware,
     redact_preview_host_for_log, release_preview_session, request_is_preview_host,
+    serve_local_preview_file,
 };
 pub(crate) use provider_audit::ProviderAuditCapture;
 pub(crate) use questions::{
