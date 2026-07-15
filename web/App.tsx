@@ -6021,13 +6021,19 @@ export function App() {
     }
   }
 
-  async function ensureWorkspaceChatLoaded(workspaceId: string, chatId: string) {
+  async function ensureWorkspaceChatLoaded(
+    workspaceId: string,
+    chatId: string,
+  ): Promise<boolean> {
     if (isPendingChatId(chatId)) {
-      return;
+      return true;
     }
     const workspace = workspaces.find((candidate) => candidate.id === workspaceId);
-    if (!workspace || workspace.chats.some((chat) => chat.id === chatId)) {
-      return;
+    if (!workspace) {
+      return false;
+    }
+    if (workspace.chats.some((chat) => chat.id === chatId)) {
+      return true;
     }
 
     try {
@@ -6038,6 +6044,7 @@ export function App() {
       const data = await requestJson<WorkspaceChatsResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats?${params.toString()}`,
       );
+      const found = data.chats.some((chat) => chat.id === chatId);
       setWorkspaces((current) =>
         current.map((item) => {
           if (item.id !== workspaceId) {
@@ -6068,8 +6075,11 @@ export function App() {
           total: data.total,
         },
       }));
+      return found;
     } catch (requestError) {
       setError(errorMessage(requestError));
+      // Network/API failure: keep open tabs (treat as still unknown).
+      return true;
     }
   }
 
@@ -6228,18 +6238,55 @@ export function App() {
 
   function restoreWorkspaceChatTabs(tabs: BrowserRouteChatTab[]) {
     const nextTabs = tabs.flatMap((tab) => {
-      const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
-      const chat = workspace?.chats.find((chat) => chat.id === tab.chatId);
-      if (!workspace || !chat) {
+      const workspace = workspaces.find((item) => item.id === tab.workspaceId);
+      if (!workspace) {
         return [];
       }
 
-      return [{
-        chatId: tab.chatId,
-        fallbackTitle: chat.title,
-        fallbackWorkspaceName: workspace.name,
-        workspaceId: tab.workspaceId,
-      } satisfies OpenChatTab];
+      const chat = workspace.chats.find((item) => item.id === tab.chatId);
+      if (!chat) {
+        // Fully loaded list: skip chats that are definitely gone.
+        if (!workspace.chatPagination?.hasMore) {
+          return [];
+        }
+
+        // Off-page unknown: restore with fallback title and probe includeChatId.
+        void ensureWorkspaceChatLoaded(tab.workspaceId, tab.chatId).then((found) => {
+          if (found) {
+            return;
+          }
+
+          setOpenChatTabs((current) => {
+            const next = current.filter(
+              (openTab) =>
+                openTab.workspaceId !== tab.workspaceId || openTab.chatId !== tab.chatId,
+            );
+            if (next.length === current.length) {
+              return current;
+            }
+            openChatTabsRef.current = next;
+            return next;
+          });
+        });
+
+        return [
+          {
+            chatId: tab.chatId,
+            fallbackTitle: t("Chat"),
+            fallbackWorkspaceName: workspace.name,
+            workspaceId: tab.workspaceId,
+          } satisfies OpenChatTab,
+        ];
+      }
+
+      return [
+        {
+          chatId: tab.chatId,
+          fallbackTitle: chat.title,
+          fallbackWorkspaceName: workspace.name,
+          workspaceId: tab.workspaceId,
+        } satisfies OpenChatTab,
+      ];
     });
 
     openChatTabsRef.current = nextTabs;
@@ -7195,33 +7242,106 @@ export function App() {
         { method: "POST" },
       );
 
-      if (activeWorkspaceId === workspaceId && activeChatId === chatId) {
-        const nextOpenChatTabs = openChatTabsRef.current.filter(
+      // Explicit delete is the authoritative cleanup path: remove all open tabs
+      // and client caches for this chat before workspace refresh (pagination
+      // absence must not be treated as deletion).
+      const nextOpenChatTabs = openChatTabsRef.current.filter(
+        (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
+      );
+      openChatTabsRef.current = nextOpenChatTabs;
+      setOpenChatTabs(nextOpenChatTabs);
+
+      setOpenAgentTabs((current) => {
+        const next = current.filter(
           (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
         );
-        openChatTabsRef.current = nextOpenChatTabs;
-        setOpenChatTabs(nextOpenChatTabs);
-        setActiveWorkspaceChatRefs(workspaceId, null, { syncPlanMode: true });
-        setActiveWorkspaceId(workspaceId);
-        setActiveChatId(null);
-        setActiveMainTab({ chatId: null, type: "chat", workspaceId });
-        setMessages([]);
-        updateBrowserRoute({
-          chatId: null,
-          tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
-          viewMode: "chat",
-          workspaceId,
-        });
-      }
+        if (next.length !== current.length) {
+          pruneAgentTabCaches(
+            agentTeamSnapshotCacheRef.current,
+            agentTranscriptViewCacheRef.current,
+            next,
+          );
+        }
+        return next.length === current.length ? current : next;
+      });
 
-      const chatKey = chatRunKey(workspaceId, chatId);
+      setChatRunFailed(chatKey, false);
       removeMessagesForChatKey(chatKey);
       removeChatPaginationForChatKey(chatKey);
       removeContextUsageForChatKey(chatKey);
+      setChatRunning(chatKey, false);
+      setActiveRunInfoForChatKey(chatKey, null);
       setRetryRunRequest((current) =>
-        current?.chatId === chatId ? null : current,
+        current?.chatId === chatId && current.workspaceId === workspaceId
+          ? null
+          : current,
       );
       setPendingDeleteChat(null);
+
+      const activeMainMatchesDeleted =
+        (activeMainTab.type === "chat" &&
+          activeMainTab.workspaceId === workspaceId &&
+          activeMainTab.chatId === chatId) ||
+        (activeMainTab.type === "agent" &&
+          activeMainTab.workspaceId === workspaceId &&
+          activeMainTab.chatId === chatId);
+      const activeChatMatchesDeleted =
+        activeWorkspaceId === workspaceId && activeChatId === chatId;
+
+      if (activeMainMatchesDeleted || activeChatMatchesDeleted) {
+        const tabIndex = mainTabs.findIndex(
+          (tab) =>
+            (tab.type === "chat" &&
+              tab.workspaceId === workspaceId &&
+              tab.chatId === chatId) ||
+            (tab.type === "agent" &&
+              tab.workspaceId === workspaceId &&
+              tab.chatId === chatId),
+        );
+        const nextMainTabs = mainTabs.filter(
+          (tab) =>
+            !(
+              (tab.type === "chat" &&
+                tab.workspaceId === workspaceId &&
+                tab.chatId === chatId) ||
+              (tab.type === "agent" &&
+                tab.workspaceId === workspaceId &&
+                tab.chatId === chatId)
+            ),
+        );
+        const nextTab =
+          tabIndex >= 0
+            ? nextMainTabs[Math.min(tabIndex, nextMainTabs.length - 1)] ??
+              nextMainTabs.at(-1)
+            : nextMainTabs.at(-1);
+
+        if (nextTab) {
+          selectMainTab(nextTab);
+        } else {
+          setActiveWorkspaceChatRefs(workspaceId, null, { syncPlanMode: true });
+          setActiveWorkspaceId(workspaceId);
+          setActiveChatId(null);
+          setActiveMainTab({ chatId: null, type: "chat", workspaceId });
+          setMessages([]);
+          updateBrowserRoute({
+            chatId: null,
+            tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
+            viewMode: "chat",
+            workspaceId,
+          });
+        }
+      } else {
+        updateBrowserRoute(
+          {
+            chatId: activeChatId,
+            tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
+            viewMode: "chat",
+            workspaceId: activeWorkspaceId || workspaceId,
+          },
+          "replace",
+        );
+      }
+
       await refreshWorkspaces();
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -13813,27 +13933,59 @@ function replaceWorkspaceFileNodeChildren(
   };
 }
 
+/** Presence of a chat relative to workspace summaries (first page + loaded pages only). */
+type WorkspaceChatPresence = "present" | "unknown" | "missing";
+
+/**
+ * Distinguishes chats loaded in the current summary page from chats that may
+ * still exist off-page (`hasMore`) vs chats that are known gone.
+ */
+function workspaceChatPresence(
+  workspaces: WorkspaceSummary[],
+  tab: { workspaceId: string; chatId: string },
+  options: { allowPending?: boolean } = {},
+): WorkspaceChatPresence {
+  const workspace = workspaces.find((item) => item.id === tab.workspaceId);
+  if (!workspace) {
+    return "missing";
+  }
+
+  if (options.allowPending && isPendingChatId(tab.chatId)) {
+    return "present";
+  }
+
+  if (workspace.chats.some((chat) => chat.id === tab.chatId)) {
+    return "present";
+  }
+
+  if (workspace.chatPagination?.hasMore) {
+    return "unknown";
+  }
+
+  return "missing";
+}
+
+/** Keep client state when present or only off-page unknown; drop only when missing. */
+function workspaceChatIsNotMissing(
+  workspaces: WorkspaceSummary[],
+  tab: { workspaceId: string; chatId: string },
+  options: { allowPending?: boolean } = {},
+) {
+  return workspaceChatPresence(workspaces, tab, options) !== "missing";
+}
+
 function workspaceHasChat(
   workspaces: WorkspaceSummary[],
   tab: { workspaceId: string; chatId: string },
 ) {
-  return workspaces.some(
-    (workspace) =>
-      workspace.id === tab.workspaceId &&
-      workspace.chats.some((chat) => chat.id === tab.chatId),
-  );
+  return workspaceChatIsNotMissing(workspaces, tab);
 }
 
 function workspaceHasChatTab(
   workspaces: WorkspaceSummary[],
   tab: { workspaceId: string; chatId: string },
 ) {
-  return workspaces.some(
-    (workspace) =>
-      workspace.id === tab.workspaceId &&
-      (isPendingChatId(tab.chatId) ||
-        workspace.chats.some((chat) => chat.id === tab.chatId)),
-  );
+  return workspaceChatIsNotMissing(workspaces, tab, { allowPending: true });
 }
 
 function LoginView({

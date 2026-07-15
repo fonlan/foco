@@ -28,6 +28,7 @@ import {
   secondChatMessages,
   todoGraph,
   workspace,
+  workspaceChats,
   workspaceMemory,
 } from "./test-utils/app-test-harness";
 
@@ -2741,6 +2742,173 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
     expect(await screen.findByText("Earlier note.")).toBeInTheDocument();
     expect(new URL(messageRequests[1]).searchParams.get("beforeSequence")).toBe("200");
+  });
+
+  it("keeps open tabs for chats scrolled out of the recent 5-page window", async () => {
+    // First page: chat-1, chat-2, older-chat-1..3. Open older-chat-6 (page 2).
+    const offPageChatId = "older-chat-6";
+    const offPageTitle = "Older chat 6";
+    appTestState.chatMessagesResponsesByChatKey[`workspace-1/${offPageChatId}`] = {
+      ...secondChatMessages,
+      chat: {
+        ...secondChatMessages.chat,
+        id: offPageChatId,
+        title: offPageTitle,
+      },
+      messages: secondChatMessages.messages.map((message) => ({
+        ...message,
+        chatId: offPageChatId,
+      })),
+    };
+
+    renderApp();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Show 5 more chats in Default" }),
+    );
+    expect(await screen.findByText(offPageTitle)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText(offPageTitle));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: new RegExp(offPageTitle) })).toBeInTheDocument();
+    expect(currentChatTabs()).toContain(`workspace-1/${offPageChatId}`);
+
+    // Simulate recent-window roll: a newer chat enters page 1 and older-chat-6 leaves.
+    const rolledChats = [
+      chatSummary(
+        "chat-new",
+        "Brand new chat",
+        "2026-06-06T12:00:00Z",
+        "2026-06-06T12:05:00Z",
+      ),
+      ...workspaceChats,
+    ];
+    appTestState.workspaceChatsByWorkspaceId = {
+      ...appTestState.workspaceChatsByWorkspaceId,
+      "workspace-1": rolledChats,
+    };
+    appTestState.workspaceResponseWorkspaces = appTestState.workspaceResponseWorkspaces.map(
+      (item) => {
+        const summary = item as { id?: string };
+        if (summary.id !== "workspace-1") {
+          return item;
+        }
+        return {
+          ...(item as object),
+          chatPagination: {
+            hasMore: true,
+            limit: 5,
+            nextCursor: "workspace-page-2",
+            total: rolledChats.length,
+          },
+          chats: rolledChats.slice(0, 5),
+        };
+      },
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await waitFor(() => {
+      expect(screen.getByText("Brand new chat")).toBeInTheDocument();
+    });
+
+    const workspaceList = screen.getByRole("navigation", { name: "Workspace list" });
+    expect(within(workspaceList).queryByText(offPageTitle)).not.toBeInTheDocument();
+    expect(within(workspaceList).getByText("Brand new chat")).toBeInTheDocument();
+
+    expect(
+      within(tabList).getByRole("tab", { name: new RegExp(offPageTitle) }),
+    ).toBeInTheDocument();
+    expect(currentChatTabs()).toContain(`workspace-1/${offPageChatId}`);
+
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: new RegExp(offPageTitle) }),
+    );
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+  });
+
+  it("closes open tabs when deleting a non-active open chat", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await screen.findByText("Please inspect README.");
+    await userEvent.click(screen.getByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(currentChatTabs()).toEqual([
+      "workspace-1/chat-1",
+      "workspace-1/chat-2",
+    ]);
+
+    const workspaceList = screen.getByRole("navigation", { name: "Workspace list" });
+    const toolRunButton = within(workspaceList).getByText("Tool run").closest("button");
+    if (!toolRunButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    fireEvent.contextMenu(toolRunButton);
+    const chatMenu = await screen.findByRole("menu", { name: "Tool run" });
+    await userEvent.click(within(chatMenu).getByRole("menuitem", { name: "Delete chat" }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete this chat?" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm delete chat" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        within(tabList).queryByRole("tab", { name: /Tool run/ }),
+      ).not.toBeInTheDocument();
+    });
+    expect(currentChatTabs()).toEqual(["workspace-1/chat-2"]);
+    expect(within(tabList).getByRole("tab", { name: /Second chat/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Second answer.")).toBeInTheDocument();
+  });
+
+  it("restores URL chat tabs that are outside the recent 5-page window", async () => {
+    const offPageChatId = "older-chat-6";
+    const offPageTitle = "Older chat 6";
+    appTestState.chatMessagesResponsesByChatKey[`workspace-1/${offPageChatId}`] = {
+      ...secondChatMessages,
+      chat: {
+        ...secondChatMessages.chat,
+        id: offPageChatId,
+        title: offPageTitle,
+      },
+      messages: secondChatMessages.messages.map((message) => ({
+        ...message,
+        chatId: offPageChatId,
+      })),
+    };
+
+    window.history.replaceState(
+      null,
+      "",
+      `/?tab=workspace-1%2Fchat-1&tab=workspace-1%2F${encodeURIComponent(offPageChatId)}`,
+    );
+
+    renderApp();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() => {
+      expect(
+        within(tabList).getByRole("tab", { name: new RegExp(offPageTitle) }),
+      ).toBeInTheDocument();
+    });
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
+    expect(currentChatTabs()).toEqual([
+      "workspace-1/chat-1",
+      `workspace-1/${offPageChatId}`,
+    ]);
+
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: new RegExp(offPageTitle) }),
+    );
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
   });
 
 });
