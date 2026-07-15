@@ -2114,6 +2114,75 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("defers workspace hooks loading until the Hooks settings section is opened", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        settings.workspaces[0],
+        {
+          commonCommands: secondaryWorkspace.commonCommands,
+          connectionStatus: secondaryWorkspace.connectionStatus,
+          displayPath: secondaryWorkspace.displayPath,
+          id: secondaryWorkspace.id,
+          isDefault: false,
+          lastRemoteError: secondaryWorkspace.lastRemoteError,
+          logoUrl: secondaryWorkspace.logoUrl,
+          name: secondaryWorkspace.name,
+          path: secondaryWorkspace.path,
+          pinned: secondaryWorkspace.pinned,
+          remotePath: secondaryWorkspace.remotePath,
+          serverId: secondaryWorkspace.serverId,
+          serverName: secondaryWorkspace.serverName,
+          terminalShell: secondaryWorkspace.terminalShell,
+        },
+      ],
+    };
+    const fetchMock = vi.mocked(fetch);
+    const hooksFetchCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => {
+        const value = String(url);
+        return value === "/api/hooks" || value.startsWith("/api/hooks?");
+      });
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    expect(await screen.findByText("General settings")).toBeInTheDocument();
+    // Wait until /api/settings has driven form state (including hookWorkspaceId),
+    // so this assertion cannot race past an ungated hooks effect.
+    expect(await screen.findByText("127.0.0.1:3210")).toBeInTheDocument();
+    expect(screen.getByText("Password is disabled")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(hooksFetchCalls()).toEqual([]);
+    });
+
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    const hooksCallsBeforeSection = hooksFetchCalls().length;
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Hooks" }));
+
+    expect(await screen.findByText("Hook settings")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(hooksFetchCalls()).toHaveLength(hooksCallsBeforeSection + 1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/hooks?workspaceId=workspace-1",
+        expect.anything(),
+      );
+    });
+    expect(screen.getByText("Record hook run logs")).toBeInTheDocument();
+
+    const hooksCallsBeforeWorkspaceSwitch = hooksFetchCalls().length;
+    await userEvent.selectOptions(screen.getByLabelText("Workspace"), secondaryWorkspace.id);
+
+    await waitFor(() => {
+      expect(hooksFetchCalls()).toHaveLength(hooksCallsBeforeWorkspaceSwitch + 1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/hooks?workspaceId=workspace-2",
+        expect.anything(),
+      );
+    });
+  });
+
   it("shows translated hook settings and imports Claude hooks by target scope", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

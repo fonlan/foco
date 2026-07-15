@@ -1568,10 +1568,10 @@ export function SettingsPanel({
   }, [loadMetadata, loadSettings]);
 
   useEffect(() => {
-    if (hookWorkspaceId) {
+    if (activeSection === "hooks" && hookWorkspaceId) {
       void loadHooks(hookWorkspaceId);
     }
-  }, [hookWorkspaceId, loadHooks]);
+  }, [activeSection, hookWorkspaceId, loadHooks]);
   useEffect(() => {
     if (activeSection === "memory") {
       void loadMemories();
