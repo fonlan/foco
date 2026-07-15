@@ -1646,23 +1646,71 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
     }
 }
 
+/// Shared Project Spec definition, admission, and exclusion baseline for generation and update prompts.
+fn workspace_spec_definition_and_admission_baseline() -> &'static str {
+    "Project Spec definition: the Spec is the project's current, concise, normative truth. \
+It constrains future product behavior, cross-module contracts, data compatibility, security boundaries, \
+and deliberately retained architecture and operational constraints. It is not an implementation manual, \
+code index, changelog, task log, delivery record, or test report. \
+Non-goals / exclude: implementation how-to guides; exhaustive code, file, or symbol indexes; changelogs; \
+task history; Phase or delivery status; test reports; commit records; process narratives about how the \
+current state was reached. \
+Admission test: include an implementation detail only when changing it would violate external behavior, \
+compatibility, security, a stable architecture boundary, or an important operational requirement. \
+Still accurate alone is not a reason to keep content."
+}
+
+fn workspace_spec_fixed_sections_instruction() -> &'static str {
+    "Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, \
+## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, \
+## Operational Constraints, ## Open Questions."
+}
+
+fn workspace_spec_open_questions_instruction() -> &'static str {
+    "Open Questions is only for currently unresolved decisions or unknowns that will materially affect \
+future product or implementation. Do not use it as a changelog, completed-work ledger, backlog, or \
+residual-risk dump. When evidence is already implemented, decided, explicitly out of scope, or only an \
+optional future optimization, do not put it in Open Questions; place durable final behavior in \
+Architecture, Data And Persistence, Runtime Flows, UI/Agent Contracts, or Operational Constraints instead. \
+If there are no valid unresolved questions, keep the ## Open Questions section and write a short None \
+marker; do not invent questions."
+}
+
 pub(crate) fn default_workspace_spec_generation_system_prompt() -> String {
     format!(
-        "Generate a concise Project Spec Markdown document from provided evidence. \
-Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
-Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Do not invent product claims. Keep durable product, architecture, data, command, settings, and operational facts; omit low-value details such as long file lists, exhaustive symbol lists, repeated notes, transient task history, and implementation minutiae that do not guide future work. \
-Open Questions is only for currently unresolved decisions or unknowns that will materially affect future product or implementation. Do not use it as a changelog, completed-work ledger, backlog, or residual-risk dump. When evidence is already implemented, decided, explicitly out of scope, or only an optional future optimization, do not put it in Open Questions; place durable final behavior in Architecture, Data And Persistence, Runtime Flows, UI/Agent Contracts, or Operational Constraints instead. If there are no valid unresolved questions, keep the ## Open Questions section and write a short None marker; do not invent questions. \
-Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
+        "Generate a complete Project Spec Markdown document by distilling normative current state from provided evidence, not by restating evidence as documentation. \
+{} \
+{} \
+Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Do not invent product claims. \
+Place each fact in exactly one best-fit section; do not copy the same contract across sections for completeness. \
+Express behavior and boundaries first. Do not restate code structure, function call chains, migration or schema version numbers, test paths, or UI copy wording unless those items themselves are stable contracts. \
+Actively merge similar facts, choose high information-density wording, and treat the soft target of {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes as a real editing budget from the first draft; do not rely on later hard-limit compaction. \
+{} \
+Hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once.",
+        workspace_spec_definition_and_admission_baseline(),
+        workspace_spec_fixed_sections_instruction(),
+        workspace_spec_open_questions_instruction(),
     )
 }
 
 pub(crate) fn default_workspace_spec_update_system_prompt() -> String {
     format!(
         "Decide whether the Project Spec needs an update after the latest completed chat turn. \
+{} \
+Distinguish code changed from normative truth changed. Pure refactors, internal helpers, test fill-in, completion reports, or implementation process alone default to updateNeeded=false and contentMarkdown=null. \
 If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, and Open Questions already comply with the rules below, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Before each full replacement, re-examine every existing Open Questions item (do not only append this turn's changes). \
-Open Questions is only for currently unresolved decisions or unknowns that still materially affect future product or implementation. Items already resolved, implemented, or explicitly decided by the latest chat evidence must leave Open Questions; move durable conclusions into the matching formal section as needed, without Phase numbers, delivered status, test commands, commit records, or implementation logs. Optional follow-ups, refactor opportunities, and optimization ideas with no concrete unresolved decision default to deletion; rewrite as a short question only when a real open choice remains. \
-A chat turn that only reports completion status with no new durable contracts may still set updateNeeded=true to clean stale Open Questions; if the Spec already complies and has no other durable changes, return false. Do not invent product claims. Keep durable facts that guide future work, but omit low-value details such as transient task history, implementation blow-by-blow notes, repeated facts, long file lists, exhaustive symbol lists, and UI copy minutiae unless they define a contract. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
+If an update is needed, re-examine the entire existing Spec, not only this turn's delta, and submit a full replacement Markdown document using the existing section shape. For every fact, choose keep, merge, replace, or delete. \
+Prefer replace or merge over append when new information overlaps existing wording. Delete content that is accurate but fails the admission test, is duplicated, or is too fine-grained. Still accurate is not a reason to keep. Do not accumulate implementation history in chronological order. \
+Default expectation: the updated Spec is not longer than before; offset any additions with dedupe, merge, and delete. Net growth is allowed only for genuine new normative scope that cannot be expressed by editing existing entries, and must still meet the soft target of {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes. \
+Before each full replacement, re-examine every existing Open Questions item (do not only append this turn's changes). \
+{} \
+Items already resolved, implemented, or explicitly decided by the latest chat evidence must leave Open Questions; move durable conclusions into the matching formal section as needed, without Phase numbers, delivered status, test commands, commit records, or implementation logs. Optional follow-ups, refactor opportunities, and optimization ideas with no concrete unresolved decision default to deletion; rewrite as a short question only when a real open choice remains. \
+A chat turn that only reports completion status with no new durable contracts may still set updateNeeded=true to clean stale Open Questions; if the Spec already complies and has no other durable changes, return false. Do not invent product claims. \
+{} \
+Hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once.",
+        workspace_spec_definition_and_admission_baseline(),
+        workspace_spec_open_questions_instruction(),
+        workspace_spec_fixed_sections_instruction(),
     )
 }
 
@@ -2030,6 +2078,52 @@ mod tests {
     }
 
     #[test]
+    fn workspace_spec_prompts_share_definition_and_admission_baseline() {
+        let generation = default_workspace_spec_generation_system_prompt();
+        let update = default_workspace_spec_update_system_prompt();
+        let baseline = workspace_spec_definition_and_admission_baseline();
+
+        assert!(generation.contains(baseline));
+        assert!(update.contains(baseline));
+        for prompt in [&generation, &update] {
+            assert!(prompt.contains("current, concise, normative truth"));
+            assert!(prompt.contains("cross-module contracts"));
+            assert!(prompt.contains("security boundaries"));
+            assert!(prompt.contains("not an implementation manual"));
+            assert!(prompt.contains("code index"));
+            assert!(prompt.contains("changelog"));
+            assert!(prompt.contains("task history"));
+            assert!(prompt.contains("Phase or delivery status"));
+            assert!(prompt.contains("test reports"));
+            assert!(prompt.contains("commit records"));
+            assert!(prompt.contains("process narratives"));
+            assert!(prompt.contains("Admission test"));
+            assert!(prompt.contains("external behavior"));
+            assert!(prompt.contains("Still accurate alone is not a reason to keep content"));
+        }
+    }
+
+    #[test]
+    fn workspace_spec_generation_prompt_controls_information_density() {
+        let prompt = default_workspace_spec_generation_system_prompt();
+
+        assert!(prompt.contains("distilling normative current state"));
+        assert!(prompt.contains("not by restating evidence as documentation"));
+        assert!(prompt.contains("exactly one best-fit section"));
+        assert!(prompt.contains("do not copy the same contract across sections"));
+        assert!(prompt.contains("Express behavior and boundaries first"));
+        assert!(prompt.contains("function call chains"));
+        assert!(prompt.contains("migration or schema version numbers"));
+        assert!(prompt.contains("test paths"));
+        assert!(prompt.contains("high information-density wording"));
+        assert!(prompt.contains("real editing budget from the first draft"));
+        assert!(prompt.contains("do not rely on later hard-limit compaction"));
+        assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains("submit_workspace_spec tool exactly once"));
+    }
+
+    #[test]
     fn workspace_spec_generation_prompt_open_questions_are_unresolved_only() {
         let prompt = default_workspace_spec_generation_system_prompt();
 
@@ -2046,12 +2140,35 @@ mod tests {
     }
 
     #[test]
-    fn workspace_spec_update_prompt_omits_low_value_details() {
+    fn workspace_spec_update_prompt_anti_entropy_rules() {
         let prompt = default_workspace_spec_update_system_prompt();
 
-        assert!(prompt.contains("omit low-value details"));
-        assert!(prompt.contains("transient task history"));
-        assert!(prompt.contains("implementation blow-by-blow notes"));
+        assert!(prompt.contains("code changed from normative truth changed"));
+        assert!(prompt.contains("Pure refactors, internal helpers, test fill-in"));
+        assert!(prompt.contains("default to updateNeeded=false"));
+        assert!(prompt.contains("re-examine the entire existing Spec"));
+        assert!(prompt.contains("keep, merge, replace, or delete"));
+        assert!(prompt.contains("Prefer replace or merge over append"));
+        assert!(prompt.contains("Still accurate is not a reason to keep"));
+        assert!(prompt.contains("Do not accumulate implementation history"));
+        assert!(prompt.contains("not longer than before"));
+        assert!(prompt.contains("Net growth is allowed only for genuine new normative scope"));
+        assert!(
+            !prompt.contains("Preserve accurate existing facts unless the turn supersedes them")
+        );
+        assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains("submit_workspace_spec_update tool exactly once"));
+    }
+
+    #[test]
+    fn workspace_spec_update_prompt_omits_non_normative_content() {
+        let prompt = default_workspace_spec_update_system_prompt();
+
+        assert!(prompt.contains("implementation how-to guides"));
+        assert!(prompt.contains("task history"));
+        assert!(prompt.contains("commit records"));
+        assert!(prompt.contains("fails the admission test"));
         assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
         assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
     }
