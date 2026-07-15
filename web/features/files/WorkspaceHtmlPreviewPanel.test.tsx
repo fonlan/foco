@@ -4,8 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   HTML_PREVIEW_IFRAME_SANDBOX,
+  HTML_PREVIEW_IFRAME_SANDBOX_PATH,
   WorkspaceHtmlPreviewPanel,
   isSafeHtmlPreviewUrl,
+  resolveHtmlPreviewIframeSandbox,
 } from "./WorkspaceHtmlPreviewPanel";
 
 const requestJsonMock = vi.fn();
@@ -101,15 +103,45 @@ describe("isSafeHtmlPreviewUrl", () => {
     expect(isSafeHtmlPreviewUrl("javascript:alert(1)")).toBe(false);
     expect(isSafeHtmlPreviewUrl("not-a-url")).toBe(false);
   });
+
+  it("accepts same-origin /__preview/{token} path mode for reverse proxies", () => {
+    const origin = window.location.origin;
+    const host = window.location.hostname;
+    expect(
+      isSafeHtmlPreviewUrl(
+        `${origin}/__preview/abcdefghijklmnopqrstuvwxyz012345/index.html`,
+      ),
+    ).toBe(true);
+    expect(
+      isSafeHtmlPreviewUrl(
+        `https://${host}/__preview/abcdefghijklmnopqrstuvwxyz012345/assets/app.js`,
+      ),
+    ).toBe(true);
+    expect(
+      isSafeHtmlPreviewUrl(
+        "https://evil.example/__preview/abcdefghijklmnopqrstuvwxyz012345/index.html",
+      ),
+    ).toBe(false);
+    expect(isSafeHtmlPreviewUrl(`${origin}/__preview/BAD/index.html`)).toBe(false);
+  });
 });
 
 describe("HTML_PREVIEW_IFRAME_SANDBOX", () => {
-  it("is limited to scripts and same-origin only", () => {
+  it("is limited to scripts and same-origin only for host mode", () => {
     expect(HTML_PREVIEW_IFRAME_SANDBOX).toBe("allow-scripts allow-same-origin");
     expect(HTML_PREVIEW_IFRAME_SANDBOX).not.toContain("allow-top-navigation");
     expect(HTML_PREVIEW_IFRAME_SANDBOX).not.toContain("allow-popups");
     expect(HTML_PREVIEW_IFRAME_SANDBOX).not.toContain("allow-downloads");
     expect(HTML_PREVIEW_IFRAME_SANDBOX).not.toContain("allow-forms");
+  });
+
+  it("uses scripts-only sandbox for path-mode preview URLs", () => {
+    const pathUrl = `${window.location.origin}/__preview/abcdefghijklmnopqrstuvwxyz012345/index.html`;
+    expect(resolveHtmlPreviewIframeSandbox(pathUrl)).toBe(
+      HTML_PREVIEW_IFRAME_SANDBOX_PATH,
+    );
+    expect(HTML_PREVIEW_IFRAME_SANDBOX_PATH).toBe("allow-scripts");
+    expect(HTML_PREVIEW_IFRAME_SANDBOX_PATH).not.toContain("allow-same-origin");
   });
 });
 
@@ -145,6 +177,27 @@ describe("WorkspaceHtmlPreviewPanel", () => {
         body: JSON.stringify({ path: "demo/index.html" }),
       }),
     );
+  });
+
+  it("renders path-mode preview with scripts-only sandbox", async () => {
+    const token = "abcdefghijklmnopqrstuvwxyz012345";
+    mockPreviewApi({
+      create: () => ({
+        ...previewSession(token),
+        iframeSandbox: "allow-scripts allow-same-origin allow-forms",
+        previewOrigin: `${window.location.origin}/__preview/${token}`,
+        previewUrl: `${window.location.origin}/__preview/${token}/index.html`,
+      }),
+    });
+
+    render(<WorkspaceHtmlPreviewPanel tab={tab} />);
+
+    const iframe = await screen.findByTitle("HTML preview for index.html");
+    expect(iframe).toHaveAttribute(
+      "src",
+      `${window.location.origin}/__preview/${token}/index.html`,
+    );
+    expect(iframe).toHaveAttribute("sandbox", HTML_PREVIEW_IFRAME_SANDBOX_PATH);
   });
 
   it("rejects unsafe preview URLs from the API", async () => {

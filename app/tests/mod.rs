@@ -29407,6 +29407,92 @@ async fn html_preview_local_session_serves_asset_chain_and_rejects_escape() {
 }
 
 #[tokio::test]
+async fn html_preview_path_mode_uses_public_origin_for_reverse_proxy() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    write_preview_site_fixture(&workspace_dir);
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let (addr, app_task) = serve_app_router(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let create = client
+        .post(format!(
+            "http://{addr}/api/workspaces/{workspace_id}/preview/sessions"
+        ))
+        .header(header::HOST, "foco.fonlan.top")
+        .header("x-forwarded-proto", "https")
+        .json(&json!({ "path": "demo/index.html" }))
+        .send()
+        .await
+        .expect("create preview session");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = create.json::<Value>().await.expect("create json");
+    let token = body["token"].as_str().expect("token");
+    let preview_url = body["previewUrl"].as_str().expect("previewUrl");
+    let preview_origin = body["previewOrigin"].as_str().expect("previewOrigin");
+    assert_eq!(body["iframeSandbox"].as_str(), Some("allow-scripts"));
+    assert_eq!(
+        preview_origin,
+        format!("https://foco.fonlan.top/__preview/{token}")
+    );
+    assert_eq!(
+        preview_url,
+        format!("https://foco.fonlan.top/__preview/{token}/index.html")
+    );
+    assert!(!preview_url.contains("preview.localhost"));
+
+    let html = client
+        .get(format!("http://{addr}/__preview/{token}/index.html"))
+        .header(header::HOST, "foco.fonlan.top")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .expect("path preview get");
+    assert_eq!(html.status(), StatusCode::OK);
+    assert!(
+        html.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/html")
+    );
+    let csp = html
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        csp.contains("frame-ancestors https://foco.fonlan.top"),
+        "csp={csp}"
+    );
+    let html_text = html.text().await.expect("html body");
+    assert!(html_text.contains("classic.js"));
+
+    let asset = client
+        .get(format!("http://{addr}/__preview/{token}/assets/classic.js"))
+        .header(header::HOST, "foco.fonlan.top")
+        .send()
+        .await
+        .expect("asset get");
+    assert_eq!(asset.status(), StatusCode::OK);
+
+    let escape = client
+        .get(format!("http://{addr}/__preview/{token}/../secret.txt"))
+        .header(header::HOST, "foco.fonlan.top")
+        .send()
+        .await
+        .expect("escape get");
+    assert_ne!(escape.status(), StatusCode::OK);
+
+    app_task.abort();
+}
+
+#[tokio::test]
 async fn html_preview_auth_isolates_api_from_preview_host() {
     let profile = tempfile::tempdir().expect("temp profile");
     let workspace_dir = profile.path().join("workspace");

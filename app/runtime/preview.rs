@@ -1,8 +1,12 @@
 //! In-process HTML preview sessions and static origin serving.
 //!
 //! Capability tokens live only in process memory. Preview pages are served from
-//! `<token>.preview.localhost` so workspace scripts cannot share Foco cookies,
-//! localStorage, or same-origin API access with the host UI.
+//! either:
+//! - host mode: `<token>.preview.localhost` (local loopback UI) so scripts cannot
+//!   share Foco cookies/localStorage with the host UI; or
+//! - path mode: `/__preview/<token>/...` on the same public origin (reverse proxy),
+//!   authorized only by the path token and framed with a tighter iframe sandbox
+//!   (`allow-scripts` without `allow-same-origin`).
 
 use std::{
     collections::HashMap,
@@ -34,6 +38,9 @@ const PREVIEW_SIDECAR_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// DNS label length for the token subdomain (a–z0–9 only).
 const PREVIEW_TOKEN_LEN: usize = 32;
 const PREVIEW_HOST_SUFFIX: &str = ".preview.localhost";
+/// Path-mode prefix on the Foco origin when `*.preview.localhost` is unreachable
+/// (reverse proxies / non-loopback UI hosts).
+pub(crate) const PREVIEW_PATH_PREFIX: &str = "/__preview/";
 
 #[derive(Clone, Default)]
 pub(crate) struct PreviewSessionRegistry {
@@ -272,9 +279,111 @@ pub(crate) fn preview_entry_url(
     )
 }
 
-/// Recommended iframe sandbox: scripts + same-origin within the preview origin only.
+/// Path-mode resource base: `{public_origin}/__preview/{token}`.
+pub(crate) fn preview_path_origin(public_origin: &str, token: &str) -> String {
+    format!(
+        "{}/__preview/{}",
+        public_origin.trim_end_matches('/'),
+        token
+    )
+}
+
+pub(crate) fn preview_path_entry_url(
+    public_origin: &str,
+    token: &str,
+    entry_path: &str,
+    root_path: &str,
+) -> String {
+    let entry = entry_path_within_preview_root(entry_path, root_path);
+    format!(
+        "{}/{}",
+        preview_path_origin(public_origin, token),
+        entry.trim_start_matches('/')
+    )
+}
+
+/// Parse `/__preview/{token}` or `/__preview/{token}/...` into (token, resource_path).
+/// `resource_path` always starts with `/` ("/" means entry HTML).
+pub(crate) fn parse_preview_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix(PREVIEW_PATH_PREFIX)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (token, resource) = match rest.find('/') {
+        Some(idx) => {
+            let token = &rest[..idx];
+            let resource = &rest[idx..];
+            (token, if resource.is_empty() { "/" } else { resource })
+        }
+        None => (rest, "/"),
+    };
+    if !is_dns_safe_preview_token(token) {
+        return None;
+    }
+    Some((token.to_string(), resource.to_string()))
+}
+
+/// Hostname (no port) is loopback / local-only so `*.preview.localhost` is usable.
+pub(crate) fn preview_request_uses_host_origin(host_header: &str) -> bool {
+    let host = host_header.trim();
+    if host.is_empty() {
+        return true;
+    }
+    // Strip optional port; handle bracketed IPv6 Host values.
+    let host = if let Some(inner) = host.strip_prefix('[').and_then(|h| h.split(']').next()) {
+        inner
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0"
+}
+
+/// Public origin for path-mode URLs and CSP frame-ancestors (respects X-Forwarded-Proto).
+pub(crate) fn request_public_origin(
+    headers: &HeaderMap,
+    listen_addr: std::net::SocketAddr,
+) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            let host = match listen_addr.ip() {
+                std::net::IpAddr::V4(ip) if ip.is_unspecified() || ip.is_loopback() => {
+                    "127.0.0.1".to_string()
+                }
+                std::net::IpAddr::V6(ip) if ip.is_unspecified() || ip.is_loopback() => {
+                    "127.0.0.1".to_string()
+                }
+                other => other.to_string(),
+            };
+            format!("{host}:{}", listen_addr.port())
+        });
+
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https"))
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "http".to_string());
+
+    format!("{proto}://{host}")
+}
+
+/// Host-mode iframe sandbox: scripts + same-origin within the preview origin only.
 /// Does not include top-navigation, popups, downloads, forms, or pointer-lock.
-pub(crate) const PREVIEW_IFRAME_SANDBOX: &str = "allow-scripts allow-same-origin";
+pub(crate) const PREVIEW_IFRAME_SANDBOX_HOST: &str = "allow-scripts allow-same-origin";
+/// Path-mode sandbox: scripts only. Omit allow-same-origin so the framed document
+/// gets an opaque origin and cannot read Foco cookies/localStorage/DOM even though
+/// the URL is on the Foco host.
+pub(crate) const PREVIEW_IFRAME_SANDBOX_PATH: &str = "allow-scripts";
+/// Backward-compatible alias for host-mode sandbox (tests + older call sites).
+pub(crate) const PREVIEW_IFRAME_SANDBOX: &str = PREVIEW_IFRAME_SANDBOX_HOST;
 
 fn is_html_entry_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -544,27 +653,52 @@ fn foco_page_origin(listen_addr: std::net::SocketAddr) -> String {
 fn build_preview_session_response(
     state: &AppState,
     session: &PreviewSession,
+    headers: &HeaderMap,
 ) -> PreviewSessionResponse {
-    let port = state.listen_addr.port();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if preview_request_uses_host_origin(host) {
+        let port = state.listen_addr.port();
+        return PreviewSessionResponse {
+            token: session.token.clone(),
+            workspace_id: session.workspace_id.clone(),
+            entry_path: session.entry_path.clone(),
+            root_path: session.root_path.clone(),
+            preview_url: preview_entry_url(
+                &session.token,
+                port,
+                &session.entry_path,
+                &session.root_path,
+            ),
+            preview_origin: preview_origin(&session.token, port),
+            iframe_sandbox: PREVIEW_IFRAME_SANDBOX_HOST.to_string(),
+        };
+    }
+
+    let public_origin = request_public_origin(headers, state.listen_addr);
     PreviewSessionResponse {
         token: session.token.clone(),
         workspace_id: session.workspace_id.clone(),
         entry_path: session.entry_path.clone(),
         root_path: session.root_path.clone(),
-        preview_url: preview_entry_url(
+        preview_url: preview_path_entry_url(
+            &public_origin,
             &session.token,
-            port,
             &session.entry_path,
             &session.root_path,
         ),
-        preview_origin: preview_origin(&session.token, port),
-        iframe_sandbox: PREVIEW_IFRAME_SANDBOX.to_string(),
+        preview_origin: preview_path_origin(&public_origin, &session.token),
+        iframe_sandbox: PREVIEW_IFRAME_SANDBOX_PATH.to_string(),
     }
 }
 
 pub(crate) async fn create_preview_session(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
     Json(request): Json<CreatePreviewSessionRequest>,
 ) -> Result<Json<PreviewSessionResponse>, ApiError> {
     let config = config_snapshot(&state)?;
@@ -598,7 +732,9 @@ pub(crate) async fn create_preview_session(
         "created HTML preview session"
     );
 
-    Ok(Json(build_preview_session_response(&state, &session)))
+    Ok(Json(build_preview_session_response(
+        &state, &session, &headers,
+    )))
 }
 
 fn validate_local_preview_entry(workspace_path: &Path, entry_rel: &str) -> Result<(), ApiError> {
@@ -781,8 +917,8 @@ fn redact_preview_token(token: &str) -> String {
     }
 }
 
-/// Host-aware middleware: serve preview origin before SPA/API handling.
-/// Preview Host requests never fall through to Foco SPA or /api routes.
+/// Preview capability middleware: host-mode (`*.preview.localhost`) or path-mode
+/// (`/__preview/{token}/...`) before SPA/API handling. Never falls through.
 pub(crate) async fn preview_host_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -793,37 +929,60 @@ pub(crate) async fn preview_host_middleware(
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
+    let request_path = request.uri().path().to_string();
 
-    let Some(token) = parse_preview_host_token(host) else {
-        return next.run(request).await;
-    };
+    let (token, resource_path, redacted_label, foco_origin) =
+        if let Some(token) = parse_preview_host_token(host) {
+            (
+                token,
+                request_path.clone(),
+                redact_preview_host_for_log(host),
+                foco_page_origin(state.listen_addr),
+            )
+        } else if let Some((token, resource_path)) = parse_preview_path(&request_path) {
+            let public_origin = request_public_origin(request.headers(), state.listen_addr);
+            (
+                token.clone(),
+                resource_path,
+                format!("/__preview/{}", redact_preview_token(&token)),
+                public_origin,
+            )
+        } else {
+            return next.run(request).await;
+        };
 
-    let redacted_host = redact_preview_host_for_log(host);
     let method = request.method().clone();
     if method != Method::GET && method != Method::HEAD {
         tracing::info!(
-            host = %redacted_host,
+            preview = %redacted_label,
             %method,
-            "preview origin rejected non-GET/HEAD method"
+            "preview capability rejected non-GET/HEAD method"
         );
-        return preview_error_response(
+        return preview_error_response_with_origin(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
-            &state,
+            &foco_origin,
         );
     }
 
-    let path = request.uri().path().to_string();
-    match serve_preview_resource(&state, &token, &path, method == Method::HEAD).await {
+    match serve_preview_resource(
+        &state,
+        &token,
+        &resource_path,
+        method == Method::HEAD,
+        &foco_origin,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             tracing::info!(
-                host = %redacted_host,
-                path = %path,
+                preview = %redacted_label,
+                path = %resource_path,
                 status = error.status.as_u16(),
                 "preview resource error"
             );
-            preview_error_response(error.status, error.message(), &state)
+            preview_error_response_with_origin(error.status, error.message(), &foco_origin)
         }
     }
 }
@@ -853,6 +1012,7 @@ async fn serve_preview_resource(
     token: &str,
     request_path: &str,
     head_only: bool,
+    foco_origin: &str,
 ) -> Result<Response, PreviewServeError> {
     let session = state.preview_sessions.touch(token)?;
 
@@ -866,7 +1026,7 @@ async fn serve_preview_resource(
         resolve_preview_resource_path(&session.root_path, request_path)?
     };
 
-    let foco_origin = foco_page_origin(state.listen_addr);
+    let foco_origin = foco_origin.to_string();
 
     if workspace.is_remote() {
         return serve_remote_preview_resource(
@@ -1019,11 +1179,19 @@ async fn serve_remote_preview_resource(
         .expect("remote preview stream response is valid"))
 }
 
+#[allow(dead_code)]
 fn preview_error_response(status: StatusCode, message: &str, state: &AppState) -> Response {
+    preview_error_response_with_origin(status, message, &foco_page_origin(state.listen_addr))
+}
+
+fn preview_error_response_with_origin(
+    status: StatusCode,
+    message: &str,
+    foco_origin: &str,
+) -> Response {
     // Never leak absolute filesystem paths.
     let safe = sanitize_preview_error_message(message);
-    let foco_origin = foco_page_origin(state.listen_addr);
-    let csp = preview_content_security_policy(&foco_origin);
+    let csp = preview_content_security_policy(foco_origin);
     let body = format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Preview error</title></head><body><h1>{}</h1><p>{}</p></body></html>",
         status.as_u16(),
@@ -1064,7 +1232,21 @@ fn html_escape(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// True when this request Host is a preview virtual site (used by auth bypass).
+/// True when this request is a preview capability route (host or path mode).
+/// Used by auth bypass so capability tokens alone authorize reads.
+pub(crate) fn request_is_preview_capability(headers: &HeaderMap, path: &str) -> bool {
+    if headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_preview_host_token)
+        .is_some()
+    {
+        return true;
+    }
+    parse_preview_path(path).is_some()
+}
+
+/// Backward-compatible host-only check (host mode).
 pub(crate) fn request_is_preview_host(headers: &HeaderMap) -> bool {
     headers
         .get(header::HOST)
@@ -1188,11 +1370,56 @@ mod tests {
     #[test]
     fn iframe_sandbox_is_minimal() {
         assert_eq!(PREVIEW_IFRAME_SANDBOX, "allow-scripts allow-same-origin");
+        assert_eq!(
+            PREVIEW_IFRAME_SANDBOX_HOST,
+            "allow-scripts allow-same-origin"
+        );
+        assert_eq!(PREVIEW_IFRAME_SANDBOX_PATH, "allow-scripts");
+        assert!(!PREVIEW_IFRAME_SANDBOX_PATH.contains("allow-same-origin"));
         assert!(!PREVIEW_IFRAME_SANDBOX.contains("allow-top-navigation"));
         assert!(!PREVIEW_IFRAME_SANDBOX.contains("allow-popups"));
         assert!(!PREVIEW_IFRAME_SANDBOX.contains("allow-downloads"));
         assert!(!PREVIEW_IFRAME_SANDBOX.contains("allow-forms"));
         assert!(!PREVIEW_IFRAME_SANDBOX.contains("allow-pointer-lock"));
+    }
+
+    #[test]
+    fn parse_preview_path_accepts_token_and_resource() {
+        let token = "abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(
+            parse_preview_path(&format!("/__preview/{token}")),
+            Some((token.to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            parse_preview_path(&format!("/__preview/{token}/index.html")),
+            Some((token.to_string(), "/index.html".to_string()))
+        );
+        assert_eq!(
+            parse_preview_path(&format!("/__preview/{token}/assets/app.js")),
+            Some((token.to_string(), "/assets/app.js".to_string()))
+        );
+        assert!(parse_preview_path("/__preview/").is_none());
+        assert!(parse_preview_path("/api/workspaces/x/preview/sessions").is_none());
+        assert!(parse_preview_path("/__preview/BAD_TOKEN/index.html").is_none());
+    }
+
+    #[test]
+    fn preview_request_uses_host_origin_for_loopback_only() {
+        assert!(preview_request_uses_host_origin("127.0.0.1:3210"));
+        assert!(preview_request_uses_host_origin("localhost:3210"));
+        assert!(preview_request_uses_host_origin("[::1]:3210"));
+        assert!(!preview_request_uses_host_origin("foco.fonlan.top"));
+        assert!(!preview_request_uses_host_origin("example.com:443"));
+    }
+
+    #[test]
+    fn request_public_origin_prefers_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "foco.fonlan.top".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let origin =
+            request_public_origin(&headers, std::net::SocketAddr::from(([127, 0, 0, 1], 3210)));
+        assert_eq!(origin, "https://foco.fonlan.top");
     }
 
     #[test]

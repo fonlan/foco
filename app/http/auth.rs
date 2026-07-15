@@ -24,9 +24,9 @@ pub(crate) async fn require_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    // Preview virtual hosts are authorized solely by the capability token in the Host.
-    // They must never require Foco cookies and never fall through to SPA after auth.
-    if crate::runtime::request_is_preview_host(request.headers()) {
+    // Preview capability routes (host token or /__preview/{token}) are authorized
+    // solely by the capability token. Never require Foco cookies.
+    if crate::runtime::request_is_preview_capability(request.headers(), request.uri().path()) {
         return next.run(request).await;
     }
 

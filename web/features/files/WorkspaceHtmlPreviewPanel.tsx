@@ -13,30 +13,61 @@ export type OpenHtmlPreviewTab = {
   workspaceLogoUrl: string | null;
 };
 
-/** Client-pinned sandbox. Never trust server-provided sandbox strings. */
-export const HTML_PREVIEW_IFRAME_SANDBOX = "allow-scripts allow-same-origin";
+/** Host-mode sandbox: independent preview origin may use same-origin within that origin. */
+export const HTML_PREVIEW_IFRAME_SANDBOX_HOST = "allow-scripts allow-same-origin";
+/** Path-mode sandbox: omit allow-same-origin so the iframe gets an opaque origin. */
+export const HTML_PREVIEW_IFRAME_SANDBOX_PATH = "allow-scripts";
+/** @deprecated Prefer resolveHtmlPreviewIframeSandbox; host-mode default. */
+export const HTML_PREVIEW_IFRAME_SANDBOX = HTML_PREVIEW_IFRAME_SANDBOX_HOST;
 
+const PREVIEW_TOKEN_RE = /^[a-z0-9]{1,63}$/;
+
+function isDnsSafePreviewToken(token: string): boolean {
+  return PREVIEW_TOKEN_RE.test(token) && !token.includes(".");
+}
+
+/** True when previewUrl is host-mode (`*.preview.localhost`) or same-origin path-mode (`/__preview/{token}/...`). */
 export function isSafeHtmlPreviewUrl(previewUrl: string): boolean {
   try {
-    const url = new URL(previewUrl);
+    const url = new URL(previewUrl, window.location.origin);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       return false;
     }
+
     const hostname = url.hostname.toLowerCase();
-    // Align with backend parse_preview_host_token: require a single DNS-safe token label.
-    if (!hostname.endsWith(".preview.localhost")) {
+    if (hostname.endsWith(".preview.localhost")) {
+      const token = hostname.slice(0, -".preview.localhost".length);
+      return isDnsSafePreviewToken(token);
+    }
+
+    // Path mode: same host as the Foco UI, capability only in the path token.
+    if (hostname !== window.location.hostname.toLowerCase()) {
       return false;
     }
-    const token = hostname.slice(0, -".preview.localhost".length);
+    const match = url.pathname.match(/^\/__preview\/([a-z0-9]{1,63})(?:\/|$)/);
+    return Boolean(match && isDnsSafePreviewToken(match[1]));
+  } catch {
+    return false;
+  }
+}
+
+export function isPathModeHtmlPreviewUrl(previewUrl: string): boolean {
+  try {
+    const url = new URL(previewUrl, window.location.origin);
     return (
-      token.length > 0 &&
-      token.length <= 63 &&
-      !token.includes(".") &&
-      /^[a-z0-9]+$/.test(token)
+      url.hostname.toLowerCase() === window.location.hostname.toLowerCase() &&
+      /^\/__preview\/[a-z0-9]{1,63}(?:\/|$)/.test(url.pathname)
     );
   } catch {
     return false;
   }
+}
+
+/** Client-pinned sandbox from URL shape. Never trust server-provided sandbox strings. */
+export function resolveHtmlPreviewIframeSandbox(previewUrl: string): string {
+  return isPathModeHtmlPreviewUrl(previewUrl)
+    ? HTML_PREVIEW_IFRAME_SANDBOX_PATH
+    : HTML_PREVIEW_IFRAME_SANDBOX_HOST;
 }
 
 export function WorkspaceHtmlPreviewPanel({
@@ -196,7 +227,7 @@ export function WorkspaceHtmlPreviewPanel({
           key={`${session.token}:${iframeReloadKey}`}
           onError={handleIframeError}
           referrerPolicy="no-referrer"
-          sandbox={HTML_PREVIEW_IFRAME_SANDBOX}
+          sandbox={resolveHtmlPreviewIframeSandbox(session.previewUrl)}
           src={session.previewUrl}
           title={t("HTML preview for {name}", { name: tab.name })}
         />
