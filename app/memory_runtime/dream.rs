@@ -68,13 +68,6 @@ const MEMORY_DREAM_TRANSCRIPT_MAX_CHARS: usize = 6_000;
 const MEMORY_DREAM_ROLLBACK_GUIDANCE: &str = "Automatic Dream never hard-deletes memory facts. \
 Recovery is status/field reversal from applied change beforeJson plus cleanup of Dream-created edges \
 or promoted facts recorded in change rows.";
-const MEMORY_DREAM_PLANNER_SYSTEM_PROMPT: &str = "\
-Plan conservative Foco memory maintenance changes from the provided compact audit input. \
-Use the submit_memory_dream_changeset tool exactly once. Do not return prose. \
-Return JSON only through the tool. Never request source-code edits, shell commands, git operations, external write-capable tools, or hard deletes. \
-Every change must cite provided evidence. Prefer no change over weak evidence. \
-Global promotion is allowed only when evidence explicitly states a cross-project or user-wide preference. \
-Do not invent fact ids, source ids, edge ids, or quotes.";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemoryDreamJobRequest<'a> {
@@ -1987,7 +1980,8 @@ async fn request_memory_dream_planner_output(
     selection: &MemoryDreamModelSelection,
     input: Value,
 ) -> Result<MemoryDreamPlannerOutput, ApiError> {
-    let mut request = memory_dream_planner_provider_request(selection, &input)?;
+    let system_prompt = effective_memory_dream_system_prompt(&planner.config.prompts);
+    let mut request = memory_dream_planner_provider_request(selection, &input, system_prompt)?;
     let first_value =
         call_memory_dream_planner_provider(planner, selection, request.clone()).await?;
     match parse_memory_dream_planner_output(first_value.clone()) {
@@ -2019,6 +2013,7 @@ async fn request_memory_dream_planner_output(
 fn memory_dream_planner_provider_request(
     selection: &MemoryDreamModelSelection,
     input: &Value,
+    system_prompt: &str,
 ) -> Result<NeutralChatRequest, ApiError> {
     let input_json = serde_json::to_string_pretty(input).map_err(|source| {
         ApiError::internal(format!(
@@ -2029,10 +2024,7 @@ fn memory_dream_planner_provider_request(
     Ok(NeutralChatRequest {
         model_id: selection.model_id.clone(),
         messages: vec![
-            neutral_text_message(
-                NeutralChatRole::System,
-                MEMORY_DREAM_PLANNER_SYSTEM_PROMPT.to_string(),
-            ),
+            neutral_text_message(NeutralChatRole::System, system_prompt.to_string()),
             neutral_text_message(
                 NeutralChatRole::User,
                 format!("Memory Dream compact input JSON:\n{input_json}"),

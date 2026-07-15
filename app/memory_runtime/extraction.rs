@@ -425,6 +425,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
     };
     let (provider_id, provider_config, max_output_tokens) =
         extraction_provider_for_model(&task.config, &task.model_id)?;
+    let base_system_prompt = effective_memory_extraction_system_prompt(&task.config.prompts);
     let request = memory_extraction_provider_request(
         &task.model_id,
         &task.workspace_id,
@@ -435,6 +436,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
         max_output_tokens,
         &evidence_candidates,
         &existing_memory_candidates,
+        base_system_prompt,
     )?;
     let tool_arguments = call_memory_extraction_provider(
         &task.workspace_path,
@@ -679,6 +681,7 @@ pub(crate) fn memory_extraction_provider_request(
     max_output_tokens: u32,
     evidence: &[MemoryExtractionEvidenceCandidate],
     existing_memory_candidates: &[MemoryFactRecord],
+    base_system_prompt: &str,
 ) -> Result<NeutralChatRequest, ApiError> {
     let existing_memories_json = serde_json::to_string_pretty(
         &existing_memory_candidates
@@ -707,7 +710,8 @@ pub(crate) fn memory_extraction_provider_request(
             ApiError::internal(format!("failed to serialize extraction evidence: {source}"))
         })?;
     let system_prompt = format!(
-        "{MEMORY_EXTRACTION_SYSTEM_PROMPT} {}",
+        "{} {}",
+        base_system_prompt.trim(),
         memory_extraction_language_instruction(app_language)
     );
 

@@ -155,8 +155,14 @@ pub(crate) struct ManualMemoryDreamSettingsRequest {
 pub(crate) struct ManualSpecSettingsRequest {
     pub(crate) auto_enabled: bool,
     pub(crate) generation_model_id: Option<String>,
-    pub(crate) generation_system_prompt: Option<String>,
-    pub(crate) update_system_prompt: Option<String>,
+    /// Outer `None` = field omitted (preserve existing override).
+    /// Inner `None` / blank = clear override and use built-in default.
+    #[serde(default)]
+    pub(crate) generation_system_prompt: Option<Option<String>>,
+    /// Outer `None` = field omitted (preserve existing override).
+    /// Inner `None` / blank = clear override and use built-in default.
+    #[serde(default)]
+    pub(crate) update_system_prompt: Option<Option<String>>,
     pub(crate) llm_timeout_ms: u64,
 }
 
@@ -178,6 +184,18 @@ pub(crate) struct ManualPromptSettingsRequest {
     /// Inner `None` / blank = clear override and use built-in default.
     #[serde(default)]
     pub(crate) context_compression_system_prompt: Option<Option<String>>,
+    #[serde(default)]
+    pub(crate) memory_retrieval_system_prompt: Option<Option<String>>,
+    #[serde(default)]
+    pub(crate) memory_extraction_system_prompt: Option<Option<String>>,
+    #[serde(default)]
+    pub(crate) memory_dream_system_prompt: Option<Option<String>>,
+    /// Spec generation prompt (stored on `config.spec`, saved atomically with prompts).
+    #[serde(default)]
+    pub(crate) generation_system_prompt: Option<Option<String>>,
+    /// Spec update prompt (stored on `config.spec`, saved atomically with prompts).
+    #[serde(default)]
+    pub(crate) update_system_prompt: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -510,6 +528,15 @@ pub(crate) struct PromptSettingsSummary {
     pub(crate) context_compression_system_prompt: Option<String>,
     /// Built-in default for dedicated contextCompression requests (not chat System).
     pub(crate) default_context_compression_system_prompt: String,
+    /// Stored override only; `null` means use built-in default.
+    pub(crate) memory_retrieval_system_prompt: Option<String>,
+    pub(crate) default_memory_retrieval_system_prompt: String,
+    /// Stored override only; `null` means use built-in default.
+    pub(crate) memory_extraction_system_prompt: Option<String>,
+    pub(crate) default_memory_extraction_system_prompt: String,
+    /// Stored override only; `null` means use built-in default.
+    pub(crate) memory_dream_system_prompt: Option<String>,
+    pub(crate) default_memory_dream_system_prompt: String,
 }
 
 #[derive(Serialize)]
@@ -1617,11 +1644,19 @@ pub(crate) async fn save_spec_settings(
     Json(request): Json<ManualSpecSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_update_snapshot(&state).await?;
+    let generation_system_prompt = match request.generation_system_prompt {
+        None => config.spec.generation_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
+    let update_system_prompt = match request.update_system_prompt {
+        None => config.spec.update_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
     config.spec = SpecSettings {
         auto_enabled: request.auto_enabled,
         generation_model_id: optional_trimmed_string(request.generation_model_id),
-        generation_system_prompt: optional_trimmed_string(request.generation_system_prompt),
-        update_system_prompt: optional_trimmed_string(request.update_system_prompt),
+        generation_system_prompt,
+        update_system_prompt,
         llm_timeout_ms: request.llm_timeout_ms,
     };
     config
@@ -1699,6 +1734,27 @@ pub(crate) async fn save_prompt_settings(
         // Explicit null / blank clears override; non-empty becomes the stored override.
         Some(value) => optional_trimmed_string(value),
     };
+    let memory_retrieval_system_prompt = match request.memory_retrieval_system_prompt {
+        None => config.prompts.memory_retrieval_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
+    let memory_extraction_system_prompt = match request.memory_extraction_system_prompt {
+        None => config.prompts.memory_extraction_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
+    let memory_dream_system_prompt = match request.memory_dream_system_prompt {
+        None => config.prompts.memory_dream_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
+    // Spec prompts live on `config.spec` for backward compatibility; omit preserves.
+    let generation_system_prompt = match request.generation_system_prompt {
+        None => config.spec.generation_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
+    let update_system_prompt = match request.update_system_prompt {
+        None => config.spec.update_system_prompt.clone(),
+        Some(value) => optional_trimmed_string(value),
+    };
 
     config.prompts = PromptSettings {
         system_prompts,
@@ -1706,7 +1762,13 @@ pub(crate) async fn save_prompt_settings(
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
         context_compression_system_prompt,
+        memory_retrieval_system_prompt,
+        memory_extraction_system_prompt,
+        memory_dream_system_prompt,
     };
+    // Only the two Spec prompt fields; leave auto_enabled / model / timeout untouched.
+    config.spec.generation_system_prompt = generation_system_prompt;
+    config.spec.update_system_prompt = update_system_prompt;
     refresh_builtin_agent_definitions(&state, &mut config).await?;
     refresh_review_agent_system_prompt(&mut config)?;
     config

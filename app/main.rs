@@ -40,7 +40,7 @@ use foco_store::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
         HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
-        ModelSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
+        ModelSettings, PromptSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
         SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
         SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
         SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
@@ -311,8 +311,9 @@ const MEMORY_EXTRACTION_MAX_EVIDENCE_CONTENT_CHARS: usize = 4_096;
 const MEMORY_EXTRACTION_MAX_TOTAL_EVIDENCE_CHARS: usize = 65_536;
 // Maximum active memory facts sent to the model-based memory retrieval request.
 const MEMORY_RETRIEVAL_LLM_FACT_LIMIT: u32 = 200;
-// System prompt for the memory extraction request that forces evidence-backed tool output only.
-const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "\
+// Built-in System prompt for the memory extraction request that forces evidence-backed tool output only.
+// Language preference is appended at request time from app language settings.
+pub(crate) const DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "\
 Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. \
 Use the submit_memory_extraction tool exactly once. Do not return prose. \
 Apply a high bar: save only facts that are important for future turns and unlikely to change often. \
@@ -325,8 +326,16 @@ Avoid extracting multiple facts in the same output that restate each other at di
 Include a fact only when it is directly supported by one or more provided evidenceIds. \
 If there is nothing worth remembering, submit {\"facts\":[]}. \
 Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
-// System prompt for model-based memory retrieval.
-const MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
+// Built-in System prompt for model-based memory retrieval.
+pub(crate) const DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
+// Built-in System prompt for Memory Dream planner requests.
+pub(crate) const DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT: &str = "\
+Plan conservative Foco memory maintenance changes from the provided compact audit input. \
+Use the submit_memory_dream_changeset tool exactly once. Do not return prose. \
+Return JSON only through the tool. Never request source-code edits, shell commands, git operations, external write-capable tools, or hard deletes. \
+Every change must cite provided evidence. Prefer no change over weak evidence. \
+Global promotion is allowed only when evidence explicitly states a cross-project or user-wide preference. \
+Do not invent fact ids, source ids, edge ids, or quotes.";
 // Label for the current user request in memory retrieval inputs.
 const MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL: &str = "Current user request:";
 // Label for the latest completed assistant answer included for follow-up memory retrieval.
@@ -8354,6 +8363,36 @@ fn optional_trimmed_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Effective memory retrieval System prompt: non-empty override, else built-in default.
+pub(crate) fn effective_memory_retrieval_system_prompt(settings: &PromptSettings) -> &str {
+    settings
+        .memory_retrieval_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT)
+}
+
+/// Effective memory extraction base System prompt (language instruction still appended).
+pub(crate) fn effective_memory_extraction_system_prompt(settings: &PromptSettings) -> &str {
+    settings
+        .memory_extraction_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT)
+}
+
+/// Effective Memory Dream planner System prompt: non-empty override, else built-in default.
+pub(crate) fn effective_memory_dream_system_prompt(settings: &PromptSettings) -> &str {
+    settings
+        .memory_dream_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT)
 }
 
 fn optional_trimmed_csv(value: Option<String>) -> Vec<String> {

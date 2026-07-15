@@ -301,9 +301,32 @@ mod tests {
                 .context_compression_system_prompt,
             None
         );
+        assert_eq!(
+            default_bundle
+                .payload
+                .prompts
+                .memory_retrieval_system_prompt,
+            None
+        );
+        assert_eq!(
+            default_bundle
+                .payload
+                .prompts
+                .memory_extraction_system_prompt,
+            None
+        );
+        assert_eq!(
+            default_bundle.payload.prompts.memory_dream_system_prompt,
+            None
+        );
 
         config.prompts.context_compression_system_prompt =
             Some("multi-line\ncustom checkpoint handoff".to_string());
+        config.prompts.memory_retrieval_system_prompt =
+            Some("custom memory retrieval prompt".to_string());
+        config.prompts.memory_extraction_system_prompt =
+            Some("custom memory extraction base".to_string());
+        config.prompts.memory_dream_system_prompt = Some("custom dream planner".to_string());
         let custom_bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 2)
             .expect("custom compression prompt bundle");
         let custom_json = serde_json::to_value(&custom_bundle).expect("custom bundle json");
@@ -317,10 +340,67 @@ mod tests {
             Some("multi-line\ncustom checkpoint handoff")
         );
         assert_eq!(
+            custom_bundle
+                .payload
+                .prompts
+                .memory_retrieval_system_prompt
+                .as_deref(),
+            Some("custom memory retrieval prompt")
+        );
+        assert_eq!(
+            custom_bundle
+                .payload
+                .prompts
+                .memory_extraction_system_prompt
+                .as_deref(),
+            Some("custom memory extraction base")
+        );
+        assert_eq!(
+            custom_bundle
+                .payload
+                .prompts
+                .memory_dream_system_prompt
+                .as_deref(),
+            Some("custom dream planner")
+        );
+        assert_eq!(
             custom_json["payload"]["prompts"]["contextCompressionSystemPrompt"],
             Value::String("multi-line\ncustom checkpoint handoff".to_string())
         );
+        assert_eq!(
+            custom_json["payload"]["prompts"]["memoryRetrievalSystemPrompt"],
+            Value::String("custom memory retrieval prompt".to_string())
+        );
+        assert_eq!(
+            custom_json["payload"]["prompts"]["memoryExtractionSystemPrompt"],
+            Value::String("custom memory extraction base".to_string())
+        );
+        assert_eq!(
+            custom_json["payload"]["prompts"]["memoryDreamSystemPrompt"],
+            Value::String("custom dream planner".to_string())
+        );
         assert_ne!(default_bundle.hash, custom_bundle.hash);
+
+        // Round-trip: deserialize payload JSON back into PromptSettings and resolve effective prompts.
+        let prompts: foco_store::config::PromptSettings =
+            serde_json::from_value(custom_json["payload"]["prompts"].clone())
+                .expect("prompts payload round-trip");
+        assert_eq!(
+            crate::effective_memory_retrieval_system_prompt(&prompts),
+            "custom memory retrieval prompt"
+        );
+        assert_eq!(
+            crate::effective_memory_extraction_system_prompt(&prompts),
+            "custom memory extraction base"
+        );
+        assert_eq!(
+            crate::effective_memory_dream_system_prompt(&prompts),
+            "custom dream planner"
+        );
+        assert_eq!(
+            crate::prompt::effective_context_compression_system_prompt(&prompts),
+            "multi-line\ncustom checkpoint handoff"
+        );
     }
 
     #[test]

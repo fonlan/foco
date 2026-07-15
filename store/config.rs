@@ -1116,6 +1116,16 @@ pub struct PromptSettings {
     /// Empty/whitespace is treated as unset (use built-in default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compression_system_prompt: Option<String>,
+    /// Optional override for model-based memory retrieval System prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_retrieval_system_prompt: Option<String>,
+    /// Optional override for memory extraction base System prompt
+    /// (language instruction is still appended at request time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_extraction_system_prompt: Option<String>,
+    /// Optional override for Memory Dream planner System prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_dream_system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2842,12 +2852,12 @@ fn validate_spec_settings(
         }
     }
 
-    validate_spec_system_prompt(
+    validate_optional_system_prompt_override(
         config_path,
         "spec.generation_system_prompt",
         settings.generation_system_prompt.as_deref(),
     )?;
-    validate_spec_system_prompt(
+    validate_optional_system_prompt_override(
         config_path,
         "spec.update_system_prompt",
         settings.update_system_prompt.as_deref(),
@@ -2876,7 +2886,10 @@ fn validate_background_llm_timeout_ms(
     Ok(())
 }
 
-fn validate_spec_system_prompt(
+/// Shared validation for optional System prompt overrides (Spec, compression, memory).
+/// Missing/`None` is valid (use built-in default). Present values must be non-empty
+/// after trim and within the shared character limit.
+fn validate_optional_system_prompt_override(
     config_path: Option<&Path>,
     field: &str,
     value: Option<&str>,
@@ -2884,8 +2897,14 @@ fn validate_spec_system_prompt(
     let Some(value) = value else {
         return Ok(());
     };
-    require_non_empty(config_path, field, value)?;
-    if value.chars().count() > SPEC_SYSTEM_PROMPT_MAX_CHARS {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return invalid_config(
+            config_path,
+            format!("{field} must not be empty or whitespace-only"),
+        );
+    }
+    if trimmed.chars().count() > SPEC_SYSTEM_PROMPT_MAX_CHARS {
         return invalid_config(
             config_path,
             format!("{field} must be no longer than {SPEC_SYSTEM_PROMPT_MAX_CHARS} characters"),
@@ -2990,23 +3009,26 @@ fn validate_prompt_settings(
         }
     }
 
-    if let Some(prompt) = settings.context_compression_system_prompt.as_deref() {
-        let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            return invalid_config(
-                config_path,
-                "prompts.context_compression_system_prompt must not be empty or whitespace-only",
-            );
-        }
-        if trimmed.chars().count() > SPEC_SYSTEM_PROMPT_MAX_CHARS {
-            return invalid_config(
-                config_path,
-                format!(
-                    "prompts.context_compression_system_prompt must be no longer than {SPEC_SYSTEM_PROMPT_MAX_CHARS} characters"
-                ),
-            );
-        }
-    }
+    validate_optional_system_prompt_override(
+        config_path,
+        "prompts.context_compression_system_prompt",
+        settings.context_compression_system_prompt.as_deref(),
+    )?;
+    validate_optional_system_prompt_override(
+        config_path,
+        "prompts.memory_retrieval_system_prompt",
+        settings.memory_retrieval_system_prompt.as_deref(),
+    )?;
+    validate_optional_system_prompt_override(
+        config_path,
+        "prompts.memory_extraction_system_prompt",
+        settings.memory_extraction_system_prompt.as_deref(),
+    )?;
+    validate_optional_system_prompt_override(
+        config_path,
+        "prompts.memory_dream_system_prompt",
+        settings.memory_dream_system_prompt.as_deref(),
+    )?;
 
     Ok(())
 }

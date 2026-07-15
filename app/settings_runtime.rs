@@ -208,6 +208,15 @@ pub(crate) async fn settings_response(
                 .clone(),
             default_context_compression_system_prompt:
                 crate::prompt::DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT.to_string(),
+            memory_retrieval_system_prompt: config.prompts.memory_retrieval_system_prompt.clone(),
+            default_memory_retrieval_system_prompt: crate::DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT
+                .to_string(),
+            memory_extraction_system_prompt: config.prompts.memory_extraction_system_prompt.clone(),
+            default_memory_extraction_system_prompt: crate::DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT
+                .to_string(),
+            memory_dream_system_prompt: config.prompts.memory_dream_system_prompt.clone(),
+            default_memory_dream_system_prompt: crate::DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT
+                .to_string(),
         },
         workspaces: config
             .workspaces

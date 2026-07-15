@@ -1675,6 +1675,15 @@ export type PromptSettingsSummary = {
   contextCompressionSystemPrompt?: string | null;
   /** Built-in default for internal contextCompression requests. */
   defaultContextCompressionSystemPrompt?: string;
+  /** Stored override only; null means use built-in default. */
+  memoryRetrievalSystemPrompt?: string | null;
+  defaultMemoryRetrievalSystemPrompt?: string;
+  /** Stored override only; null means use built-in default. */
+  memoryExtractionSystemPrompt?: string | null;
+  defaultMemoryExtractionSystemPrompt?: string;
+  /** Stored override only; null means use built-in default. */
+  memoryDreamSystemPrompt?: string | null;
+  defaultMemoryDreamSystemPrompt?: string;
 };
 
 export type PromptSettingsFormState = {

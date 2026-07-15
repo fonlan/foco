@@ -64,12 +64,13 @@ use crate::http::{
     settings::{
         AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
         DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualMemorySettingsRequest,
-        ManualModelRequest, ManualPromptSettingsRequest, ManualSkillsRequest, TestModelRequest,
-        UpdateAgentDefinitionRequest, UpdateModelRouteRequest,
-        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
-        default_plan_mode_system_prompt, filter_provider_model_ids, model_test_execution_options,
-        model_test_probe, model_test_provider_request, normalize_chat_title_generation_model_id,
-        save_skills, test_model,
+        ManualModelRequest, ManualPromptSettingsRequest, ManualSkillsRequest,
+        ManualSpecSettingsRequest, TestModelRequest, UpdateAgentDefinitionRequest,
+        UpdateModelRouteRequest, associate_provider_with_local_models,
+        can_save_new_provider_after_model_list_error, default_plan_mode_system_prompt,
+        filter_provider_model_ids, model_test_execution_options, model_test_probe,
+        model_test_provider_request, normalize_chat_title_generation_model_id, save_skills,
+        test_model,
     },
     skill_store::{
         GITHUB_SKILL_ARCHIVE_MAX_COMPRESSED_BYTES, GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES,
@@ -3863,6 +3864,11 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             files: Vec::new(),
             extra_text: String::new(),
             context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -3998,6 +4004,11 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             files: Vec::new(),
             extra_text: String::new(),
             context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -4618,6 +4629,9 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
         files: vec![configured_prompt_file],
         extra_text: "Extra prompt instructions.\n".to_string(),
         context_compression_system_prompt: None,
+        memory_retrieval_system_prompt: None,
+        memory_extraction_system_prompt: None,
+        memory_dream_system_prompt: None,
     })
     .expect("configured prompt messages");
     let extra_prompt_message = configured_extra_prompt_message(&PromptSettings {
@@ -4626,6 +4640,9 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
         files: Vec::new(),
         extra_text: "Extra prompt instructions.\n".to_string(),
         context_compression_system_prompt: None,
+        memory_retrieval_system_prompt: None,
+        memory_extraction_system_prompt: None,
+        memory_dream_system_prompt: None,
     })
     .expect("extra prompt message");
 
@@ -5951,6 +5968,9 @@ fn effective_context_compression_system_prompt_uses_override_and_default() {
         files: Vec::new(),
         extra_text: String::new(),
         context_compression_system_prompt: None,
+        memory_retrieval_system_prompt: None,
+        memory_extraction_system_prompt: None,
+        memory_dream_system_prompt: None,
     };
     assert_eq!(
         crate::prompt::effective_context_compression_system_prompt(&default_settings),
@@ -6011,6 +6031,11 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
             context_compression_system_prompt: Some(Some(
                 "  multi-line\ncustom handoff  ".to_string(),
             )),
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -6033,6 +6058,11 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
             files: Vec::new(),
             extra_text: "extra".to_string(),
             context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -6058,6 +6088,11 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
             files: Vec::new(),
             extra_text: "extra".to_string(),
             context_compression_system_prompt: Some(None),
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -6080,6 +6115,11 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
             files: Vec::new(),
             extra_text: "extra".to_string(),
             context_compression_system_prompt: Some(Some("  \n  ".to_string())),
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
         }),
     )
     .await
@@ -6088,6 +6128,261 @@ async fn save_prompt_settings_persists_context_compression_override_and_restores
     assert_eq!(
         blank_normalized.prompts.context_compression_system_prompt,
         None
+    );
+}
+
+#[test]
+fn effective_memory_system_prompts_use_override_and_default() {
+    let default_settings = PromptSettings {
+        system_prompts: Vec::new(),
+        system_prompt: None,
+        files: Vec::new(),
+        extra_text: String::new(),
+        context_compression_system_prompt: None,
+        memory_retrieval_system_prompt: None,
+        memory_extraction_system_prompt: None,
+        memory_dream_system_prompt: None,
+    };
+    assert_eq!(
+        effective_memory_retrieval_system_prompt(&default_settings),
+        DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        effective_memory_extraction_system_prompt(&default_settings),
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        effective_memory_dream_system_prompt(&default_settings),
+        DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT
+    );
+
+    let custom = PromptSettings {
+        memory_retrieval_system_prompt: Some("  custom retrieval  ".to_string()),
+        memory_extraction_system_prompt: Some("custom extraction base".to_string()),
+        memory_dream_system_prompt: Some("custom dream".to_string()),
+        ..default_settings.clone()
+    };
+    assert_eq!(
+        effective_memory_retrieval_system_prompt(&custom),
+        "custom retrieval"
+    );
+    assert_eq!(
+        effective_memory_extraction_system_prompt(&custom),
+        "custom extraction base"
+    );
+    assert_eq!(
+        effective_memory_dream_system_prompt(&custom),
+        "custom dream"
+    );
+
+    let blank = PromptSettings {
+        memory_retrieval_system_prompt: Some("  \n".to_string()),
+        memory_extraction_system_prompt: Some("   ".to_string()),
+        memory_dream_system_prompt: Some("\t".to_string()),
+        ..default_settings
+    };
+    assert_eq!(
+        effective_memory_retrieval_system_prompt(&blank),
+        DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        effective_memory_extraction_system_prompt(&blank),
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        effective_memory_dream_system_prompt(&blank),
+        DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT
+    );
+}
+
+#[test]
+fn memory_extraction_request_uses_custom_base_prompt_and_language_suffix() {
+    let request = memory_extraction_provider_request(
+        "model-1",
+        "workspace-1",
+        "chat-1",
+        "run-1",
+        "provider-1",
+        "zh-CN",
+        512,
+        &[],
+        &[],
+        "CUSTOM_EXTRACTION_BASE",
+    )
+    .expect("memory extraction request");
+    let system_prompt = &request.messages[0].content;
+    assert!(system_prompt.starts_with("CUSTOM_EXTRACTION_BASE "));
+    assert!(system_prompt.contains("Simplified Chinese"));
+    assert!(!system_prompt.contains(DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT));
+}
+
+#[tokio::test]
+async fn save_prompt_settings_persists_memory_and_spec_prompts_atomically() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir);
+    config.prompts.memory_retrieval_system_prompt = Some("seed retrieval".to_string());
+    config.spec.generation_system_prompt = Some("seed generation".to_string());
+    config.spec.auto_enabled = true;
+    config.spec.llm_timeout_ms = 30_000;
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let loaded = crate::http::settings::settings(State(state.clone()))
+        .await
+        .expect("settings")
+        .0;
+    assert_eq!(
+        loaded.prompts.memory_retrieval_system_prompt.as_deref(),
+        Some("seed retrieval")
+    );
+    assert_eq!(
+        loaded.prompts.default_memory_retrieval_system_prompt,
+        DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        loaded.prompts.default_memory_extraction_system_prompt,
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        loaded.prompts.default_memory_dream_system_prompt,
+        DEFAULT_MEMORY_DREAM_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        loaded.spec.generation_system_prompt.as_deref(),
+        Some("seed generation")
+    );
+
+    let saved = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: String::new(),
+            context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: Some(Some("  custom retrieval  ".to_string())),
+            memory_extraction_system_prompt: Some(Some("custom extraction".to_string())),
+            memory_dream_system_prompt: Some(Some("custom dream".to_string())),
+            generation_system_prompt: Some(Some("  custom generation  ".to_string())),
+            update_system_prompt: Some(Some("custom update".to_string())),
+        }),
+    )
+    .await
+    .expect("save memory and spec prompts")
+    .0;
+    assert_eq!(
+        saved.prompts.memory_retrieval_system_prompt.as_deref(),
+        Some("custom retrieval")
+    );
+    assert_eq!(
+        saved.prompts.memory_extraction_system_prompt.as_deref(),
+        Some("custom extraction")
+    );
+    assert_eq!(
+        saved.prompts.memory_dream_system_prompt.as_deref(),
+        Some("custom dream")
+    );
+    assert_eq!(
+        saved.spec.generation_system_prompt.as_deref(),
+        Some("custom generation")
+    );
+    assert_eq!(
+        saved.spec.update_system_prompt.as_deref(),
+        Some("custom update")
+    );
+    // Spec automation fields must remain untouched by prompts save.
+    assert!(saved.spec.auto_enabled);
+    assert_eq!(saved.spec.llm_timeout_ms, 30_000);
+
+    // Omitting memory/spec fields preserves prior overrides.
+    let preserved = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: "kept".to_string(),
+            context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: None,
+            memory_extraction_system_prompt: None,
+            memory_dream_system_prompt: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
+        }),
+    )
+    .await
+    .expect("preserve omitted prompts")
+    .0;
+    assert_eq!(preserved.prompts.extra_text, "kept");
+    assert_eq!(
+        preserved.prompts.memory_retrieval_system_prompt.as_deref(),
+        Some("custom retrieval")
+    );
+    assert_eq!(
+        preserved.spec.generation_system_prompt.as_deref(),
+        Some("custom generation")
+    );
+
+    // Explicit null clears memory overrides; Spec automation-only save preserves prompts.
+    let cleared = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![ManualSystemPromptRequest {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: build_default_system_prompt(),
+            }]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: "kept".to_string(),
+            context_compression_system_prompt: None,
+            memory_retrieval_system_prompt: Some(None),
+            memory_extraction_system_prompt: Some(None),
+            memory_dream_system_prompt: Some(None),
+            generation_system_prompt: None,
+            update_system_prompt: None,
+        }),
+    )
+    .await
+    .expect("clear memory prompts")
+    .0;
+    assert_eq!(cleared.prompts.memory_retrieval_system_prompt, None);
+    assert_eq!(cleared.prompts.memory_extraction_system_prompt, None);
+    assert_eq!(cleared.prompts.memory_dream_system_prompt, None);
+    assert_eq!(
+        cleared.spec.generation_system_prompt.as_deref(),
+        Some("custom generation")
+    );
+
+    let automation_only = crate::http::settings::save_spec_settings(
+        State(state),
+        Json(ManualSpecSettingsRequest {
+            auto_enabled: false,
+            generation_model_id: None,
+            generation_system_prompt: None,
+            update_system_prompt: None,
+            llm_timeout_ms: 45_000,
+        }),
+    )
+    .await
+    .expect("save spec automation only")
+    .0;
+    assert!(!automation_only.spec.auto_enabled);
+    assert_eq!(automation_only.spec.llm_timeout_ms, 45_000);
+    assert_eq!(
+        automation_only.spec.generation_system_prompt.as_deref(),
+        Some("custom generation")
+    );
+    assert_eq!(
+        automation_only.spec.update_system_prompt.as_deref(),
+        Some("custom update")
     );
 }
 
@@ -17889,6 +18184,7 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
         512,
         &evidence,
         &existing,
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT,
     )
     .expect("memory extraction request");
 
@@ -17942,6 +18238,7 @@ fn memory_extraction_request_truncates_large_evidence_content() {
         512,
         &evidence,
         &[],
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT,
     )
     .expect("memory extraction request");
     let user_message = &request.messages[1].content;

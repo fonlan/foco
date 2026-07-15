@@ -389,8 +389,14 @@ async fn relevant_memory_facts_llm(
 
     let (model_id, provider_id, provider_config, max_output_tokens) =
         memory_retrieval_provider_for_model(config, chat_model, chat_provider)?;
-    let request =
-        memory_retrieval_provider_request(&model_id, max_output_tokens, query_text, &candidates)?;
+    let system_prompt = effective_memory_retrieval_system_prompt(&config.prompts);
+    let request = memory_retrieval_provider_request(
+        &model_id,
+        max_output_tokens,
+        query_text,
+        &candidates,
+        system_prompt,
+    )?;
     let output = call_memory_retrieval_provider(
         workspace_path,
         workspace_id,
@@ -675,6 +681,7 @@ fn memory_retrieval_provider_request(
     max_output_tokens: u32,
     query_text: &str,
     candidates: &[MemoryFactRecord],
+    system_prompt: &str,
 ) -> Result<NeutralChatRequest, ApiError> {
     let memories_json = serde_json::to_string_pretty(
         &candidates
@@ -701,10 +708,7 @@ fn memory_retrieval_provider_request(
     Ok(NeutralChatRequest {
         model_id: model_id.to_string(),
         messages: vec![
-            neutral_text_message(
-                NeutralChatRole::System,
-                MEMORY_RETRIEVAL_SYSTEM_PROMPT.to_string(),
-            ),
+            neutral_text_message(NeutralChatRole::System, system_prompt.to_string()),
             neutral_text_message(
                 NeutralChatRole::User,
                 format!(
