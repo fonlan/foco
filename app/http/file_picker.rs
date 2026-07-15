@@ -418,7 +418,10 @@ fn list_local(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(default_local_path);
+        .unwrap_or_else(|| match root {
+            Some(root) => root.to_path_buf(),
+            None => default_local_path(),
+        });
     let path = canonical_path_within(&path, root)?;
     let metadata = fs::metadata(&path)
         .map_err(|source| ApiError::bad_request(format!("path is not readable: {source}")))?;
@@ -482,7 +485,7 @@ fn list_local(
     );
     let truncated = entries.len() > limit;
     entries.truncate(limit);
-    let parent_path = path.parent().map(|parent| parent.display().to_string());
+    let parent_path = parent_path_within(&path, root);
 
     Ok(FilePickerListResponse {
         path: path.display().to_string(),
@@ -491,6 +494,17 @@ fn list_local(
         truncated,
         warnings,
     })
+}
+
+/// Parent directory for navigation, clamped so restricted pickers never leave `root`.
+fn parent_path_within(path: &Path, root: Option<&Path>) -> Option<String> {
+    let parent = path.parent()?;
+    if let Some(root) = root {
+        if !parent.starts_with(root) {
+            return None;
+        }
+    }
+    Some(parent.display().to_string())
 }
 
 fn selected_files_from_paths(paths: Vec<PathBuf>) -> Result<Vec<NativeSelectedFile>, ApiError> {
@@ -657,6 +671,153 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.path, default_path.display().to_string());
+    }
+
+    #[test]
+    fn empty_path_with_restricted_root_opens_root() {
+        let root = temp_picker_dir("restricted-empty");
+        fs::create_dir_all(root.join("folder")).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let response = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some("".to_string()),
+                mode: FilePickerMode::File,
+                include_files: true,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(response.path, canonical_root.display().to_string());
+        assert!(response.parent_path.is_none());
+        assert!(
+            response
+                .entries
+                .iter()
+                .any(|entry| entry.name == "folder" && entry.is_directory)
+        );
+    }
+
+    #[test]
+    fn whitespace_path_with_restricted_root_opens_root() {
+        let root = temp_picker_dir("restricted-whitespace");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let response = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some("   ".to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(response.path, canonical_root.display().to_string());
+        assert!(response.parent_path.is_none());
+    }
+
+    #[test]
+    fn restricted_root_parent_path_clamped_to_root() {
+        let root = temp_picker_dir("restricted-parent");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical_child = fs::canonicalize(&child).unwrap();
+
+        let at_root = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some(canonical_root.display().to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap();
+        assert_eq!(at_root.path, canonical_root.display().to_string());
+        assert!(at_root.parent_path.is_none());
+
+        let at_child = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some(canonical_child.display().to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap();
+        assert_eq!(at_child.path, canonical_child.display().to_string());
+        assert_eq!(
+            at_child.parent_path,
+            Some(canonical_root.display().to_string())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restricted_root_rejects_path_outside_root() {
+        let root = temp_picker_dir("restricted-outside");
+        let outside = temp_picker_dir("restricted-outside-peer");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let error = list_local(
+            FilePickerListRequest {
+                target: FilePickerTarget::Workspace {
+                    workspace_id: "workspace-1".to_string(),
+                },
+                path: Some(outside.display().to_string()),
+                mode: FilePickerMode::Directory,
+                include_files: false,
+                show_hidden: false,
+                limit: None,
+            },
+            Some(&canonical_root),
+        )
+        .unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(error.message().contains("path is outside the allowed root"));
+    }
+
+    fn temp_picker_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "foco-file-picker-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]
