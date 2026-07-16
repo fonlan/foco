@@ -45,6 +45,8 @@ use foco_store::{
         NewMemorySource,
     },
     workspace::{
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION, LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
         TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
@@ -154,8 +156,15 @@ const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_BROKERED_IMAGE_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BROKERED_IMAGE_TOTAL_BYTES: usize = 24 * 1024 * 1024;
 /// Broker `requestKind` values accepted for main-process LLM audit rows.
-const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] =
-    &["chat completion", "contextCompression", "prompt hook"];
+const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] = &[
+    "chat completion",
+    "contextCompression",
+    "prompt hook",
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
+];
 const BROKER_DEFAULT_LLM_REQUEST_KIND: &str = "chat completion";
 const BROKER_CONTEXT_COMPRESSION_REQUEST_KIND: &str = "contextCompression";
 const BROKER_PROMPT_HOOK_REQUEST_KIND: &str = "prompt hook";
@@ -14404,6 +14413,7 @@ async fn run_remote_sidecar_spec_job(
         prepared.request,
         prepared.chat_id.as_deref(),
         payload.spec.llm_timeout_ms,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
         "submit_workspace_spec",
     )
     .await
@@ -14429,6 +14439,7 @@ async fn run_remote_sidecar_spec_job(
                         request,
                         chat_id.as_deref(),
                         timeout_ms,
+                        LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
                         "submit_workspace_spec",
                     )
                     .await
@@ -14487,6 +14498,7 @@ async fn run_remote_sidecar_spec_update_job(
         prepared.request,
         prepared.chat_id.as_deref(),
         payload.spec.llm_timeout_ms,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
         "submit_workspace_spec_update",
     )
     .await?;
@@ -14518,6 +14530,7 @@ async fn run_remote_sidecar_spec_update_job(
                             request,
                             chat_id.as_deref(),
                             timeout_ms,
+                            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
                             "submit_workspace_spec_update_compaction",
                         )
                         .await
@@ -14552,6 +14565,7 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
     request: NeutralChatRequest,
     chat_id: Option<&str>,
     timeout_ms: u64,
+    request_kind: &str,
     expected_tool_name: &str,
 ) -> Result<Value, ApiError> {
     let broker_request_id = unique_id("broker-spec");
@@ -14561,6 +14575,7 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
         "requestId": broker_request_id,
         "providerId": provider_id,
         "modelId": model_id,
+        "requestKind": request_kind,
         "request": request,
     });
     let mut broker_rx =
@@ -19518,6 +19533,18 @@ mod tests {
                 .expect("prompt hook request kind"),
             "prompt hook"
         );
+        for request_kind in [
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
+        ] {
+            assert_eq!(
+                broker_llm_request_kind_from_payload(&json!({ "requestKind": request_kind }))
+                    .expect("workspace spec request kind"),
+                request_kind
+            );
+        }
         assert_eq!(
             broker_llm_request_kind_from_payload(&json!({ "requestKind": "memory extraction" })),
             Err("unsupported broker llm requestKind: memory extraction".to_string())
@@ -19572,6 +19599,10 @@ mod tests {
         for request_kind in [
             BROKER_PROMPT_HOOK_REQUEST_KIND,
             BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
         ] {
             let internal = broker_llm_cancellation_audit_outcome(
                 request_kind,

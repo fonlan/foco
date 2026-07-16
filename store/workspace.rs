@@ -89,6 +89,17 @@ pub const WORKSPACE_SCHEMA_VERSION: u32 = 39;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
+
+/// Persisted `llm_requests.request_kind` for Workspace Spec manual/refresh generation.
+pub const LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION: &str = "workspace spec generation";
+/// Persisted `llm_requests.request_kind` for chat-end automatic Spec updates.
+pub const LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE: &str = "workspace spec update";
+/// Persisted `llm_requests.request_kind` for full-Markdown Spec generation compaction.
+pub const LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION: &str = "workspace spec compaction";
+/// Persisted `llm_requests.request_kind` for patch-only Spec update compaction.
+pub const LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION: &str =
+    "workspace spec update compaction";
+
 pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
     "chat title generation",
     "contextCompression",
@@ -96,9 +107,10 @@ pub const MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS: &[&str] = &[
     "memory retrieval",
     "model availability test",
     "prompt hook",
-    "workspace spec compaction",
-    "workspace spec generation",
-    "workspace spec update",
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+    LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
 ];
 
 /// Shared with query-plan regression tests so EXPLAIN stays tied to production SQL.
