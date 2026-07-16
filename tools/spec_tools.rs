@@ -8,6 +8,7 @@ use crate::{
     DEFAULT_SPEC_TOOL_TIMEOUT_MS,
     errors::{ToolRuntimeError, tool_timeout_ms},
     parse_arguments,
+    spec_patch::{SpecPatchError, SpecTextEdit, apply_spec_text_edits},
 };
 
 pub(crate) fn read_spec(
@@ -45,7 +46,8 @@ pub(crate) fn update_spec(
     let (content_markdown, update_mode, edit_count) =
         match (request.edits, request.content_markdown) {
             (Some(edits), None) => {
-                let content_markdown = apply_spec_edits(current_content, &edits)?;
+                let content_markdown =
+                    apply_spec_text_edits(current_content, &edits).map_err(map_patch_error)?;
                 (content_markdown, "patch", edits.len())
             }
             (None, Some(content_markdown)) => (content_markdown, "fullReplacement", 0),
@@ -76,51 +78,8 @@ pub(crate) fn update_spec(
     Ok(output)
 }
 
-fn apply_spec_edits(
-    current_content: &str,
-    edits: &[SpecTextEdit],
-) -> Result<String, ToolRuntimeError> {
-    if edits.is_empty() {
-        return Err(ToolRuntimeError::InvalidArguments(
-            "edits must contain at least one edit".to_string(),
-        ));
-    }
-
-    let mut content = current_content.to_string();
-    for (index, edit) in edits.iter().enumerate() {
-        if edit.old_text.is_empty() {
-            return Err(ToolRuntimeError::InvalidArguments(format!(
-                "edits[{index}].oldText must not be empty"
-            )));
-        }
-
-        let mut matches = content.char_indices().filter_map(|(match_start, _)| {
-            content[match_start..]
-                .starts_with(&edit.old_text)
-                .then_some(match_start)
-        });
-        let Some(match_start) = matches.next() else {
-            return Err(ToolRuntimeError::InvalidArguments(format!(
-                "edits[{index}].oldText was not found in the current Project Spec"
-            )));
-        };
-        if matches.next().is_some() {
-            return Err(ToolRuntimeError::InvalidArguments(format!(
-                "edits[{index}].oldText matched more than once in the current Project Spec"
-            )));
-        }
-
-        let match_end = match_start + edit.old_text.len();
-        content.replace_range(match_start..match_end, &edit.new_text);
-    }
-
-    if content == current_content {
-        return Err(ToolRuntimeError::InvalidArguments(
-            "edits must change the Project Spec content".to_string(),
-        ));
-    }
-
-    Ok(content)
+fn map_patch_error(error: SpecPatchError) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(error.message())
 }
 
 fn markdown_line_count(content: &str) -> usize {
@@ -182,11 +141,4 @@ pub(crate) struct UpdateSpecInput {
     #[serde(default)]
     edits: Option<Vec<SpecTextEdit>>,
     timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SpecTextEdit {
-    old_text: String,
-    new_text: String,
 }

@@ -23,6 +23,7 @@ use crate::{
     api_audit_save_details, audited_provider_tool_request, config_snapshot, markdown_code_block,
     neutral_text_message, provider_connection_config, unique_id, workspace_by_id,
 };
+use foco_tools::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
@@ -161,13 +162,16 @@ struct WorkspaceSpecToolOutput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspaceSpecUpdateToolOutput {
     update_needed: bool,
-    content_markdown: Option<String>,
+    edits: Option<Vec<SpecTextEdit>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceSpecUpdateOutput {
     NoUpdateNeeded,
-    FullReplacementMarkdown(String),
+    Patch {
+        edits: Vec<SpecTextEdit>,
+        content_markdown: String,
+    },
 }
 
 #[derive(Debug)]
@@ -767,7 +771,8 @@ async fn run_workspace_spec_update_job_inner(
     )
     .await?;
 
-    let update_output = parse_workspace_spec_update_output(tool_arguments)?;
+    let update_output =
+        parse_workspace_spec_update_output(tool_arguments, &input_summary.current_spec_markdown)?;
     let update_output = ensure_workspace_spec_update_fits_limit(
         config,
         workspace_path,
@@ -854,12 +859,39 @@ pub(crate) fn apply_workspace_spec_update_job_output(
     base_revision: u64,
     value: Value,
 ) -> Result<(), ApiError> {
+    let base_markdown = workspace_spec_update_base_markdown_for_job(workspace_path, job_id)?;
     apply_workspace_spec_update_job_parsed_output(
         workspace_path,
         job_id,
         base_revision,
-        parse_workspace_spec_update_output(value)?,
+        parse_workspace_spec_update_output(value, &base_markdown)?,
     )
+}
+
+fn workspace_spec_update_base_markdown_for_job(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+) -> Result<String, ApiError> {
+    let database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let job = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("workspace spec job was not found: {job_id}"))
+        })?;
+    if !job.input_summary_json.trim().is_empty() {
+        let input: WorkspaceSpecUpdateInput = serde_json::from_str(&job.input_summary_json)
+            .map_err(|source| {
+                ApiError::bad_request(format!("malformed workspace spec update input: {source}"))
+            })?;
+        return Ok(input.current_spec_markdown);
+    }
+    Ok(database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?
+        .map(|spec| spec.content_markdown)
+        .unwrap_or_default())
 }
 
 fn apply_workspace_spec_update_job_parsed_output(
@@ -877,15 +909,100 @@ fn apply_workspace_spec_update_job_parsed_output(
                 .map_err(ApiError::from_workspace_error)?;
             Ok(())
         }
-        WorkspaceSpecUpdateOutput::FullReplacementMarkdown(content_markdown) => {
-            apply_workspace_spec_job_output(
-                workspace_path,
-                job_id,
-                base_revision,
-                &content_markdown,
-            )
+        WorkspaceSpecUpdateOutput::Patch {
+            edits,
+            content_markdown,
+        } => apply_workspace_spec_update_job_patch_output(
+            workspace_path,
+            job_id,
+            base_revision,
+            &edits,
+            &content_markdown,
+        ),
+    }
+}
+
+fn apply_workspace_spec_update_job_patch_output(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+    base_revision: u64,
+    edits: &[SpecTextEdit],
+    content_markdown: &str,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(job) = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if job.status != WorkspaceSpecJobStatus::Running.as_str() {
+        return Ok(());
+    }
+    let current = database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request("workspace spec row is missing"))?;
+    match WorkspaceSpecWriteDecision::for_job_output(base_revision, current.revision) {
+        WorkspaceSpecWriteDecision::WriteFullReplacement => {}
+        WorkspaceSpecWriteDecision::SkipStaleRevision { reason } => {
+            database
+                .mark_workspace_spec_job_skipped(job_id, reason)
+                .map_err(ApiError::from_workspace_error)?;
+            return Ok(());
         }
     }
+
+    let previous_markdown = current.content_markdown;
+    let Some(updated) = database
+        .update_workspace_spec_generated_content(base_revision, content_markdown)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        database
+            .mark_workspace_spec_job_skipped(job_id, "stale_revision")
+            .map_err(ApiError::from_workspace_error)?;
+        return Ok(());
+    };
+    let output_json = json!({
+        "updateMode": "patch",
+        "editCount": edits.len(),
+        "revision": updated.revision,
+        "contentBytes": content_markdown.len(),
+    })
+    .to_string();
+    database
+        .mark_workspace_spec_job_completed(job_id, Some(&output_json))
+        .map_err(ApiError::from_workspace_error)?;
+
+    let Some(job) = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if job.trigger_type == WorkspaceSpecTriggerType::ChatCompleted.as_str() {
+        let assistant_message_id = workspace_spec_update_assistant_message_id(&job)?;
+        let completed_at = job
+            .completed_at
+            .as_deref()
+            .unwrap_or(updated.updated_at.as_str());
+        let summary = crate::chat_spec_update_summary(
+            job_id,
+            base_revision,
+            updated.revision,
+            completed_at,
+            &previous_markdown,
+            content_markdown,
+        );
+        crate::append_assistant_spec_update_summary(
+            workspace_path,
+            &assistant_message_id,
+            summary,
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1140,8 +1257,14 @@ async fn ensure_workspace_spec_update_fits_limit(
 ) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
     match output {
         WorkspaceSpecUpdateOutput::NoUpdateNeeded => Ok(WorkspaceSpecUpdateOutput::NoUpdateNeeded),
-        WorkspaceSpecUpdateOutput::FullReplacementMarkdown(content_markdown) => {
-            ensure_workspace_spec_markdown_fits_limit(
+        WorkspaceSpecUpdateOutput::Patch {
+            edits,
+            content_markdown,
+        } => {
+            // Phase 1: size-check the in-memory patched candidate. Compaction may still
+            // rewrite full Markdown for oversized candidates; later phases switch that
+            // path to pure shrink edits without a full-document tool payload.
+            let content_markdown = ensure_workspace_spec_markdown_fits_limit(
                 config,
                 workspace_path,
                 workspace_id,
@@ -1152,8 +1275,11 @@ async fn ensure_workspace_spec_update_fits_limit(
                 &content_markdown,
                 chat_id,
             )
-            .await
-            .map(WorkspaceSpecUpdateOutput::FullReplacementMarkdown)
+            .await?;
+            Ok(WorkspaceSpecUpdateOutput::Patch {
+                edits,
+                content_markdown,
+            })
         }
     }
 }
@@ -1625,7 +1751,7 @@ fn workspace_spec_tool_definition() -> NeutralToolDefinition {
 fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
     NeutralToolDefinition {
         name: WORKSPACE_SPEC_UPDATE_TOOL_NAME.to_string(),
-        description: "Submit whether the Project Spec needs an update and, when needed, the full replacement Markdown.".to_string(),
+        description: "Submit whether the Project Spec needs an update and, when needed, ordered exact-text edits against the current Spec Markdown from the input.".to_string(),
         strict: true,
         input_schema: json!({
             "type": "object",
@@ -1635,13 +1761,28 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
                     "type": "boolean",
                     "description": "True only when the completed chat turn changed durable project spec content."
                 },
-                "contentMarkdown": {
-                    "type": ["string", "null"],
-                    "maxLength": WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-                    "description": "Full replacement Markdown when updateNeeded is true; null when updateNeeded is false."
+                "edits": {
+                    "type": ["array", "null"],
+                    "description": "Ordered exact-text patches when updateNeeded is true; null when updateNeeded is false. Each oldText must be non-empty and match the current Spec from the input exactly once. Do not use a single edit that replaces the entire document.",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "oldText": {
+                                "type": "string",
+                                "description": "Exact non-empty substring of the current Project Spec Markdown."
+                            },
+                            "newText": {
+                                "type": "string",
+                                "description": "Replacement text for oldText. Use empty string to delete."
+                            }
+                        },
+                        "required": ["oldText", "newText"]
+                    }
                 }
             },
-            "required": ["updateNeeded", "contentMarkdown"]
+            "required": ["updateNeeded", "edits"]
         }),
     }
 }
@@ -1697,17 +1838,18 @@ pub(crate) fn default_workspace_spec_update_system_prompt() -> String {
     format!(
         "Decide whether the Project Spec needs an update after the latest completed chat turn. \
 {} \
-Distinguish code changed from normative truth changed. Pure refactors, internal helpers, test fill-in, completion reports, or implementation process alone default to updateNeeded=false and contentMarkdown=null. \
-If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, and Open Questions already comply with the rules below, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, re-examine the entire existing Spec, not only this turn's delta, and submit a full replacement Markdown document using the existing section shape. For every fact, choose keep, merge, replace, or delete. \
-Prefer replace or merge over append when new information overlaps existing wording. Delete content that is accurate but fails the admission test, is duplicated, or is too fine-grained. Still accurate is not a reason to keep. Do not accumulate implementation history in chronological order. \
+Distinguish code changed from normative truth changed. Pure refactors, internal helpers, test fill-in, completion reports, or implementation process alone default to updateNeeded=false and edits=null. \
+If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, and Open Questions already comply with the rules below, submit updateNeeded=false and edits=null. \
+If an update is needed, re-examine the entire existing Spec in the input (currentSpecMarkdown), not only this turn's delta, and submit the smallest ordered exact-text edits that bring the Spec to the correct normative state. Prefer replace, merge, and delete over append. \
+Each edit.oldText must be a non-empty exact substring of the current Spec and match exactly once after prior edits in the same list are applied. Apply edits in declaration order. Never submit a single edit whose oldText is the entire current Spec document to fake a full replacement. \
+For every fact, choose keep, merge, replace, or delete. Prefer replace or merge over append when new information overlaps existing wording. Delete content that is accurate but fails the admission test, is duplicated, or is too fine-grained. Still accurate is not a reason to keep. Do not accumulate implementation history in chronological order. \
 Default expectation: the updated Spec is not longer than before; offset any additions with dedupe, merge, and delete. Net growth is allowed only for genuine new normative scope that cannot be expressed by editing existing entries, and must still meet the soft target of {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes. \
-Before each full replacement, re-examine every existing Open Questions item (do not only append this turn's changes). \
+Before submitting edits, re-examine every existing Open Questions item (do not only append this turn's changes). \
 {} \
 Items already resolved, implemented, or explicitly decided by the latest chat evidence must leave Open Questions; move durable conclusions into the matching formal section as needed, without Phase numbers, delivered status, test commands, commit records, or implementation logs. Optional follow-ups, refactor opportunities, and optimization ideas with no concrete unresolved decision default to deletion; rewrite as a short question only when a real open choice remains. \
 A chat turn that only reports completion status with no new durable contracts may still set updateNeeded=true to clean stale Open Questions; if the Spec already complies and has no other durable changes, return false. Do not invent product claims. \
 {} \
-Hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once.",
+Hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes for the Spec after all edits. Use the submit_workspace_spec_update tool exactly once.",
         workspace_spec_definition_and_admission_baseline(),
         workspace_spec_open_questions_instruction(),
         workspace_spec_fixed_sections_instruction(),
@@ -1785,26 +1927,44 @@ pub(crate) fn recover_stale_running_workspace_spec_job_for_path(
     Ok(())
 }
 
-fn parse_workspace_spec_update_output(value: Value) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
+fn parse_workspace_spec_update_output(
+    value: Value,
+    base_markdown: &str,
+) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
     let output: WorkspaceSpecUpdateToolOutput =
         serde_json::from_value(value).map_err(|source| {
             ApiError::bad_request(format!("malformed workspace spec update JSON: {source}"))
         })?;
     if !output.update_needed {
+        if output.edits.is_some() {
+            return Err(ApiError::bad_request(
+                "workspace spec update with updateNeeded=false must set edits=null",
+            ));
+        }
         return Ok(WorkspaceSpecUpdateOutput::NoUpdateNeeded);
     }
 
-    let content = output
-        .content_markdown
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if content.is_empty() {
+    let Some(edits) = output.edits else {
         return Err(ApiError::bad_request(
-            "workspace spec update requested but returned empty Markdown",
+            "workspace spec update with updateNeeded=true requires non-empty edits",
+        ));
+    };
+    if edits.is_empty() {
+        return Err(ApiError::bad_request(
+            "workspace spec update with updateNeeded=true requires non-empty edits",
         ));
     }
-    Ok(WorkspaceSpecUpdateOutput::FullReplacementMarkdown(content))
+
+    let content_markdown = apply_spec_text_edits(base_markdown, &edits)
+        .map_err(|error| ApiError::bad_request(map_spec_patch_error_message(error)))?;
+    Ok(WorkspaceSpecUpdateOutput::Patch {
+        edits,
+        content_markdown,
+    })
+}
+
+fn map_spec_patch_error_message(error: SpecPatchError) -> String {
+    error.message()
 }
 
 fn resolve_workspace_spec_model(
@@ -2072,8 +2232,23 @@ mod tests {
 
         let update_tool = workspace_spec_update_tool_definition();
         assert_eq!(
-            update_tool.input_schema["properties"]["contentMarkdown"]["maxLength"].as_u64(),
-            Some(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES as u64)
+            update_tool.input_schema["properties"]["edits"]["type"],
+            json!(["array", "null"])
+        );
+        assert_eq!(
+            update_tool.input_schema["properties"]["edits"]["items"]["required"],
+            json!(["oldText", "newText"])
+        );
+        assert!(
+            update_tool.input_schema["properties"]
+                .as_object()
+                .expect("properties")
+                .get("contentMarkdown")
+                .is_none()
+        );
+        assert_eq!(
+            update_tool.input_schema["required"],
+            json!(["updateNeeded", "edits"])
         );
     }
 
@@ -2146,9 +2321,11 @@ mod tests {
         assert!(prompt.contains("code changed from normative truth changed"));
         assert!(prompt.contains("Pure refactors, internal helpers, test fill-in"));
         assert!(prompt.contains("default to updateNeeded=false"));
+        assert!(prompt.contains("edits=null"));
         assert!(prompt.contains("re-examine the entire existing Spec"));
-        assert!(prompt.contains("keep, merge, replace, or delete"));
-        assert!(prompt.contains("Prefer replace or merge over append"));
+        assert!(prompt.contains("smallest ordered exact-text edits"));
+        assert!(prompt.contains("Never submit a single edit whose oldText is the entire"));
+        assert!(prompt.contains("Prefer replace, merge, and delete"));
         assert!(prompt.contains("Still accurate is not a reason to keep"));
         assert!(prompt.contains("Do not accumulate implementation history"));
         assert!(prompt.contains("not longer than before"));
@@ -2156,6 +2333,8 @@ mod tests {
         assert!(
             !prompt.contains("Preserve accurate existing facts unless the turn supersedes them")
         );
+        assert!(!prompt.contains("full replacement Markdown document"));
+        assert!(!prompt.contains("contentMarkdown=null"));
         assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
         assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
         assert!(prompt.contains("submit_workspace_spec_update tool exactly once"));
@@ -2186,6 +2365,8 @@ mod tests {
         assert!(prompt.contains("default to deletion"));
         assert!(prompt.contains("may still set updateNeeded=true to clean stale Open Questions"));
         assert!(prompt.contains("Open Questions already comply"));
+        assert!(prompt.contains("Before submitting edits"));
+        assert!(!prompt.contains("Before each full replacement"));
     }
 
     #[test]
@@ -2394,5 +2575,101 @@ mod tests {
         assert!(system_prompt.contains("Custom update prompt."));
         assert!(system_prompt.contains("current Foco app language setting (zh-CN)"));
         assert!(system_prompt.contains("write Project Spec prose in Simplified Chinese"));
+    }
+
+    #[test]
+    fn parse_workspace_spec_update_output_applies_ordered_edits() {
+        let base = "# Project Spec\n\nExisting spec.";
+        let output = parse_workspace_spec_update_output(
+            json!({
+                "updateNeeded": true,
+                "edits": [{
+                    "oldText": "Existing spec.",
+                    "newText": "Patched durable contract."
+                }]
+            }),
+            base,
+        )
+        .expect("patch parse");
+
+        match output {
+            WorkspaceSpecUpdateOutput::Patch {
+                edits,
+                content_markdown,
+            } => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(
+                    content_markdown,
+                    "# Project Spec\n\nPatched durable contract."
+                );
+            }
+            WorkspaceSpecUpdateOutput::NoUpdateNeeded => panic!("expected patch"),
+        }
+    }
+
+    #[test]
+    fn parse_workspace_spec_update_output_rejects_content_markdown_and_invalid_edits() {
+        let base = "# Project Spec\n\nExisting spec.";
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "contentMarkdown": "# Full"
+                }),
+                base
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": false,
+                    "edits": [{ "oldText": "Existing", "newText": "x" }]
+                }),
+                base
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": null
+                }),
+                base
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": []
+                }),
+                base
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{ "oldText": "Missing", "newText": "x" }]
+                }),
+                base
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": false,
+                    "edits": null
+                }),
+                base
+            )
+            .expect("no update"),
+            WorkspaceSpecUpdateOutput::NoUpdateNeeded
+        );
     }
 }

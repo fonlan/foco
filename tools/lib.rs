@@ -5,8 +5,11 @@ mod errors;
 mod file_tools;
 mod graph_tools;
 mod plan_tools;
+mod spec_patch;
 mod spec_tools;
 mod todo_tools;
+
+pub use spec_patch::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
 
 use std::{
     fs, io,
