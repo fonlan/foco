@@ -1,6 +1,7 @@
 pub mod config;
 pub mod memory;
 pub mod model_metadata;
+mod private_fs;
 pub mod workspace;
 pub mod workspace_gate;
 

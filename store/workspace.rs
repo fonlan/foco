@@ -27,6 +27,9 @@ use crate::memory::{
     MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MEMORY_FACT_ENABLED_MIGRATION_SQL,
     MEMORY_REFERENCES_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
 };
+use crate::private_fs::{
+    create_private_dir_all, prepare_private_file, restrict_private_file, restrict_sqlite_files,
+};
 #[path = "workspace_records.rs"]
 mod workspace_records;
 #[path = "workspace_schema.rs"]
@@ -833,8 +836,10 @@ impl WorkspaceDatabase {
         let mut connection = open_connection(&database_path)?;
         run_migrations(&mut connection, &database_path, database_existed)?;
         enable_write_ahead_logging(&connection, &database_path)?;
-        prune_non_v1_llm_audit_details_once(&mut connection, &database_path)?;
-        repair_llm_request_status_codes_from_v1_once(&mut connection, &database_path)?;
+        restrict_sqlite_files(&database_path).map_err(|source| WorkspaceDatabaseError::Io {
+            path: database_path.clone(),
+            source,
+        })?;
 
         Ok(Self {
             database_path,
@@ -881,6 +886,15 @@ impl WorkspaceDatabase {
             force,
         )
         .map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Runs idempotent data repairs that may scan large audit tables.
+    ///
+    /// Call only from a low-frequency background maintenance task, never from
+    /// request-time database opening.
+    pub fn run_pending_one_time_maintenance(&mut self) -> Result<(), WorkspaceDatabaseError> {
+        prune_non_v1_llm_audit_details_once(&mut self.connection, &self.database_path)?;
+        repair_llm_request_status_codes_from_v1_once(&mut self.connection, &self.database_path)
     }
 
     pub fn schema_version(&self) -> Result<u32, WorkspaceDatabaseError> {
@@ -7573,101 +7587,56 @@ impl WorkspaceDatabase {
         id: &str,
         outcome: UpdateLlmRequestOutcome<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
-        validate_llm_token_values(
-            outcome.input_tokens,
-            outcome.output_tokens,
-            outcome.cache_read_tokens,
-            outcome.cache_write_tokens,
-            outcome.reasoning_tokens,
-        )?;
-
-        let cache_ratio = calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)?;
+        let cache_ratio = validate_llm_request_outcome(&outcome)?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
-        let old_request = select_llm_request_record(&transaction, id)
-            .map_err(|source| sqlite_error(&database_path, source))?
-            .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
-        let response_body_json = merge_audit_detail_for_update(
-            old_request.response_body_json.as_deref(),
-            outcome.response_body_json,
-            "response_body_json",
+        update_llm_request_outcome_in_transaction(
+            &transaction,
+            &database_path,
+            id,
+            &outcome,
+            cache_ratio,
         )?;
-
-        let updated = transaction
-            .execute(
-                "UPDATE llm_requests
-                 SET first_token_at = ?2,
-                     completed_at = ?3,
-                     input_tokens = ?4,
-                     output_tokens = ?5,
-                     cache_read_tokens = ?6,
-                     cache_write_tokens = ?7,
-                     reasoning_tokens = ?8,
-                     cache_ratio = ?9,
-                     first_token_latency_ms = ?10,
-                     total_latency_ms = ?11,
-                     status_code = ?12,
-                     final_state = ?13,
-                     response_body_json = ?14
-                 WHERE id = ?1",
-                params![
-                    id,
-                    outcome.first_token_at,
-                    outcome.completed_at,
-                    outcome.input_tokens,
-                    outcome.output_tokens,
-                    outcome.cache_read_tokens,
-                    outcome.cache_write_tokens,
-                    outcome.reasoning_tokens,
-                    cache_ratio,
-                    outcome.first_token_latency_ms,
-                    outcome.total_latency_ms,
-                    outcome.status_code,
-                    outcome.final_state,
-                    response_body_json
-                ],
-            )
-            .map_err(|source| sqlite_error(&database_path, source))?;
-
-        if updated == 0 {
-            return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
-        }
-
-        if old_request.invalidated_at.is_none() {
-            apply_llm_request_usage_rollup_delta(
-                &transaction,
-                &database_path,
-                llm_request_usage_rollup_delta(llm_request_record_rollup_source(&old_request), -1),
-            )?;
-            apply_llm_request_usage_rollup_delta(
-                &transaction,
-                &database_path,
-                llm_request_usage_rollup_delta(
-                    LlmRequestUsageRollupSource {
-                        workspace_id: old_request.workspace_id.as_deref(),
-                        provider_id: old_request.provider_id.as_str(),
-                        model_id: old_request.model_id.as_str(),
-                        request_started_at: old_request.request_started_at.as_str(),
-                        final_state: outcome.final_state,
-                        input_tokens: outcome.input_tokens,
-                        output_tokens: outcome.output_tokens,
-                        cache_read_tokens: outcome.cache_read_tokens,
-                        cache_write_tokens: outcome.cache_write_tokens,
-                        total_latency_ms: outcome.total_latency_ms,
-                    },
-                    1,
-                ),
-            )?;
-        }
 
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
+    }
+
+    pub fn update_llm_request_outcome_with_events(
+        &mut self,
+        id: &str,
+        outcome: UpdateLlmRequestOutcome<'_>,
+        events: &[NewLlmRequestEvent<'_>],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let cache_ratio = validate_llm_request_outcome(&outcome)?;
+        let prepared_events = events
+            .iter()
+            .map(prepare_llm_request_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        update_llm_request_outcome_in_transaction(
+            &transaction,
+            &database_path,
+            id,
+            &outcome,
+            cache_ratio,
+        )?;
+        for event in &prepared_events {
+            insert_prepared_llm_request_event(&transaction, &database_path, event)?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
     }
 
     pub fn rebuild_llm_request_usage_rollups(&mut self) -> Result<(), WorkspaceDatabaseError> {
@@ -7888,31 +7857,8 @@ impl WorkspaceDatabase {
         &mut self,
         event: NewLlmRequestEvent<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let raw_chunk_json = redact_optional_audit_json(event.raw_chunk_json, "raw_chunk_json")?;
-        let normalized_event_json =
-            redact_audit_json(event.normalized_event_json, "normalized_event_json")?;
-
-        self.connection
-            .execute(
-                "INSERT INTO llm_request_events
-                    (
-                        id, llm_request_id, sequence, event_at, event_type,
-                        raw_chunk_json, normalized_event_json
-                    )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    event.id,
-                    event.llm_request_id,
-                    event.sequence,
-                    event.event_at,
-                    event.event_type,
-                    raw_chunk_json,
-                    normalized_event_json
-                ],
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-
-        Ok(())
+        let prepared = prepare_llm_request_event(&event)?;
+        insert_prepared_llm_request_event(&self.connection, &self.database_path, &prepared)
     }
 
     pub fn llm_request_events(
@@ -8598,11 +8544,36 @@ impl WorkspaceDatabase {
     ) -> Result<(), WorkspaceDatabaseError> {
         let created_at = now_timestamp();
 
-        self.connection
-            .execute(
+        let query = match injection.kind {
+            "stable" => {
                 "INSERT INTO prompt_context_injections
                     (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(chat_id) WHERE kind = 'stable' DO UPDATE SET
+                    messages_json = excluded.messages_json,
+                    memory_keys_json = excluded.memory_keys_json,
+                    memory_summaries_json = excluded.memory_summaries_json,
+                    created_at = excluded.created_at"
+            }
+            "turn_memory" => {
+                "INSERT INTO prompt_context_injections
+                    (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(chat_id, sequence) WHERE kind = 'turn_memory' DO UPDATE SET
+                    messages_json = excluded.messages_json,
+                    memory_keys_json = excluded.memory_keys_json,
+                    memory_summaries_json = excluded.memory_summaries_json,
+                    created_at = excluded.created_at"
+            }
+            _ => {
+                "INSERT INTO prompt_context_injections
+                    (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            }
+        };
+        self.connection
+            .execute(
+                query,
                 params![
                     injection.id,
                     injection.chat_id,
@@ -12167,13 +12138,13 @@ impl WorkspaceDatabase {
 
     pub fn delete_code_graph_file(&mut self, path: &str) -> Result<bool, WorkspaceDatabaseError> {
         let database_path = self.database_path.clone();
-        let transaction =
-            self.connection
-                .transaction()
-                .map_err(|source| WorkspaceDatabaseError::Sqlite {
-                    path: database_path.clone(),
-                    source,
-                })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                path: database_path.clone(),
+                source,
+            })?;
         let Some(file_id) = optional_code_graph_file_id(&transaction, &database_path, path)? else {
             transaction
                 .commit()
@@ -15183,6 +15154,10 @@ fn query_u64_pragma(
 }
 
 fn open_connection(database_path: &Path) -> Result<Connection, WorkspaceDatabaseError> {
+    prepare_private_file(database_path).map_err(|source| WorkspaceDatabaseError::Io {
+        path: database_path.to_path_buf(),
+        source,
+    })?;
     let connection =
         Connection::open(database_path).map_err(|source| WorkspaceDatabaseError::Sqlite {
             path: database_path.to_path_buf(),
@@ -15435,6 +15410,10 @@ fn acquire_workspace_migration_lock(
     if let Some(parent) = lock_path.parent() {
         create_directory(parent)?;
     }
+    prepare_private_file(&lock_path).map_err(|source| WorkspaceDatabaseError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
 
     let file = fs::OpenOptions::new()
         .create(true)
@@ -15671,6 +15650,10 @@ fn create_migration_backup(
             path: database_path.to_path_buf(),
             source,
         })?;
+    restrict_private_file(&backup_path).map_err(|source| WorkspaceDatabaseError::Io {
+        path: backup_path.clone(),
+        source,
+    })?;
 
     if let Some(workspace_path) = parent.parent()
         && let Err(error) = prune_workspace_database_backups(workspace_path)
@@ -15882,7 +15865,7 @@ fn like_contains_pattern(query: &str) -> String {
 }
 
 fn create_directory(path: &Path) -> Result<(), WorkspaceDatabaseError> {
-    fs::create_dir_all(path).map_err(|source| WorkspaceDatabaseError::Io {
+    create_private_dir_all(path).map_err(|source| WorkspaceDatabaseError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -16081,6 +16064,160 @@ fn normalize_audit_detail_for_write(
             Ok(Some(redact_audit_json(json, field)?))
         }
     }
+}
+
+struct PreparedLlmRequestEvent<'a> {
+    id: &'a str,
+    llm_request_id: &'a str,
+    sequence: i64,
+    event_at: &'a str,
+    event_type: &'a str,
+    raw_chunk_json: Option<String>,
+    normalized_event_json: String,
+}
+
+fn prepare_llm_request_event<'a>(
+    event: &NewLlmRequestEvent<'a>,
+) -> Result<PreparedLlmRequestEvent<'a>, WorkspaceDatabaseError> {
+    Ok(PreparedLlmRequestEvent {
+        id: event.id,
+        llm_request_id: event.llm_request_id,
+        sequence: event.sequence,
+        event_at: event.event_at,
+        event_type: event.event_type,
+        raw_chunk_json: redact_optional_audit_json(event.raw_chunk_json, "raw_chunk_json")?,
+        normalized_event_json: redact_audit_json(
+            event.normalized_event_json,
+            "normalized_event_json",
+        )?,
+    })
+}
+
+fn insert_prepared_llm_request_event(
+    connection: &Connection,
+    database_path: &Path,
+    event: &PreparedLlmRequestEvent<'_>,
+) -> Result<(), WorkspaceDatabaseError> {
+    connection
+        .execute(
+            "INSERT INTO llm_request_events
+                (
+                    id, llm_request_id, sequence, event_at, event_type,
+                    raw_chunk_json, normalized_event_json
+                )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(llm_request_id, sequence) DO NOTHING",
+            params![
+                event.id,
+                event.llm_request_id,
+                event.sequence,
+                event.event_at,
+                event.event_type,
+                event.raw_chunk_json.as_deref(),
+                event.normalized_event_json.as_str()
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(())
+}
+
+fn validate_llm_request_outcome(
+    outcome: &UpdateLlmRequestOutcome<'_>,
+) -> Result<Option<f64>, WorkspaceDatabaseError> {
+    validate_llm_token_values(
+        outcome.input_tokens,
+        outcome.output_tokens,
+        outcome.cache_read_tokens,
+        outcome.cache_write_tokens,
+        outcome.reasoning_tokens,
+    )?;
+    calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)
+}
+
+fn update_llm_request_outcome_in_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+    outcome: &UpdateLlmRequestOutcome<'_>,
+    cache_ratio: Option<f64>,
+) -> Result<(), WorkspaceDatabaseError> {
+    let old_request = select_llm_request_record(transaction, id)
+        .map_err(|source| sqlite_error(database_path, source))?
+        .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
+    let response_body_json = merge_audit_detail_for_update(
+        old_request.response_body_json.as_deref(),
+        outcome.response_body_json,
+        "response_body_json",
+    )?;
+
+    let updated = transaction
+        .execute(
+            "UPDATE llm_requests
+             SET first_token_at = ?2,
+                 completed_at = ?3,
+                 input_tokens = ?4,
+                 output_tokens = ?5,
+                 cache_read_tokens = ?6,
+                 cache_write_tokens = ?7,
+                 reasoning_tokens = ?8,
+                 cache_ratio = ?9,
+                 first_token_latency_ms = ?10,
+                 total_latency_ms = ?11,
+                 status_code = ?12,
+                 final_state = ?13,
+                 response_body_json = ?14
+             WHERE id = ?1",
+            params![
+                id,
+                outcome.first_token_at,
+                outcome.completed_at,
+                outcome.input_tokens,
+                outcome.output_tokens,
+                outcome.cache_read_tokens,
+                outcome.cache_write_tokens,
+                outcome.reasoning_tokens,
+                cache_ratio,
+                outcome.first_token_latency_ms,
+                outcome.total_latency_ms,
+                outcome.status_code,
+                outcome.final_state,
+                response_body_json
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    if updated == 0 {
+        return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
+    }
+
+    if old_request.invalidated_at.is_none() {
+        apply_llm_request_usage_rollup_delta(
+            transaction,
+            database_path,
+            llm_request_usage_rollup_delta(llm_request_record_rollup_source(&old_request), -1),
+        )?;
+        apply_llm_request_usage_rollup_delta(
+            transaction,
+            database_path,
+            llm_request_usage_rollup_delta(
+                LlmRequestUsageRollupSource {
+                    workspace_id: old_request.workspace_id.as_deref(),
+                    provider_id: old_request.provider_id.as_str(),
+                    model_id: old_request.model_id.as_str(),
+                    request_started_at: old_request.request_started_at.as_str(),
+                    final_state: outcome.final_state,
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                    cache_read_tokens: outcome.cache_read_tokens,
+                    cache_write_tokens: outcome.cache_write_tokens,
+                    total_latency_ms: outcome.total_latency_ms,
+                },
+                1,
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Format-aware CAS for audit detail columns.

@@ -20,6 +20,7 @@ mod memory_records;
 #[path = "memory_schema.rs"]
 mod memory_schema;
 
+use crate::private_fs::{create_private_dir_all, prepare_private_file, restrict_sqlite_files};
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
     MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryDreamJobTransitionOutcome,
@@ -559,6 +560,10 @@ impl MemoryDatabase {
         let mut connection = open_connection(&database_path)?;
         run_global_migrations(&mut connection, &database_path)?;
         enable_write_ahead_logging(&connection, &database_path)?;
+        restrict_sqlite_files(&database_path).map_err(|source| MemoryDatabaseError::Io {
+            path: database_path.clone(),
+            source,
+        })?;
 
         Ok(Self {
             database_path,
@@ -604,6 +609,10 @@ impl MemoryDatabase {
         let database_path = database_path.as_ref().to_path_buf();
         let connection = open_connection(&database_path)?;
         ensure_memory_schema_exists(&connection, &database_path)?;
+        restrict_sqlite_files(&database_path).map_err(|source| MemoryDatabaseError::Io {
+            path: database_path.clone(),
+            source,
+        })?;
 
         Ok(Self {
             database_path,
@@ -926,7 +935,7 @@ impl MemoryDatabase {
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
         let source_ids = source_ids_for_fact(&transaction, &database_path, id)?;
 
@@ -1158,7 +1167,7 @@ impl MemoryDatabase {
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
         let fact_ids = due_unexpired_fact_ids(&transaction, &database_path, now)?;
 
@@ -3521,6 +3530,10 @@ pub fn global_memory_database_path(foco_root_dir: impl AsRef<Path>) -> PathBuf {
 }
 
 fn open_connection(database_path: &Path) -> Result<Connection, MemoryDatabaseError> {
+    prepare_private_file(database_path).map_err(|source| MemoryDatabaseError::Io {
+        path: database_path.to_path_buf(),
+        source,
+    })?;
     let connection =
         Connection::open(database_path).map_err(|source| MemoryDatabaseError::Sqlite {
             path: database_path.to_path_buf(),
@@ -3656,6 +3669,10 @@ fn acquire_global_memory_migration_lock(
     if let Some(parent) = lock_path.parent() {
         create_directory(parent)?;
     }
+    prepare_private_file(&lock_path).map_err(|source| MemoryDatabaseError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
 
     let file = fs::OpenOptions::new()
         .create(true)
@@ -4916,7 +4933,7 @@ fn collect_rows<T>(
 }
 
 fn create_directory(path: &Path) -> Result<(), MemoryDatabaseError> {
-    fs::create_dir_all(path).map_err(|source| MemoryDatabaseError::Io {
+    create_private_dir_all(path).map_err(|source| MemoryDatabaseError::Io {
         path: path.to_path_buf(),
         source,
     })

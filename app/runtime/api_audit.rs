@@ -109,6 +109,14 @@ fn prune_api_audit_details_for_config(
     for workspace in config.local_workspaces() {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
+        if let Err(error) = database.run_pending_one_time_maintenance() {
+            tracing::warn!(
+                workspace_id = %workspace.id,
+                workspace_path = %workspace.path.display(),
+                error = %error,
+                "workspace one-time database maintenance skipped"
+            );
+        }
         let pruned = database
             .prune_llm_request_details_before(&cutoff)
             .map_err(ApiError::from_workspace_error)?;

@@ -5,6 +5,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
 use foco_agent::{
     AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentExecutionWorkspaceMode,
     AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentMessageKind, AgentPermissions,
@@ -48,6 +53,13 @@ use foco_store::{
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
+#[cfg(unix)]
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
 #[test]
 fn creates_workspace_foco_database_and_runs_migrations() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -67,6 +79,13 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("journal mode");
     assert_eq!(journal_mode, "wal");
+    connection
+        .execute(
+            "INSERT INTO workspace_metadata (key, value, updated_at)
+             VALUES ('permission_probe', 'true', '2026-07-16T00:00:00Z')",
+            [],
+        )
+        .expect("create WAL sidecars");
 
     for table in [
         "workspace_metadata",
@@ -141,6 +160,38 @@ fn creates_workspace_foco_database_and_runs_migrations() {
     assert_eq!(enabled_type, "INTEGER");
     assert_eq!(enabled_not_null, 1);
     assert_eq!(enabled_default.as_deref(), Some("1"));
+
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(workspace.path().join(".foco"))
+                .expect("workspace private directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(database.database_path())
+                .expect("workspace database metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(database.database_path(), suffix);
+            assert!(sidecar.is_file(), "{} should exist", sidecar.display());
+            assert_eq!(
+                fs::metadata(&sidecar)
+                    .expect("workspace SQLite sidecar metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }
 
 #[test]
@@ -229,6 +280,27 @@ fn concurrent_old_workspace_open_serializes_migration_backup() {
         1,
         "migration backup must be created exactly once under concurrent open"
     );
+
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&backup_dir)
+                .expect("backup directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            backups[0]
+                .metadata()
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]
@@ -284,6 +356,44 @@ fn concurrent_global_memory_open_serializes_migrations() {
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("journal mode");
     assert_eq!(journal_mode, "wal");
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS permission_probe (id INTEGER PRIMARY KEY);
+             INSERT INTO permission_probe DEFAULT VALUES;",
+        )
+        .expect("create global memory WAL sidecars");
+
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(root.path())
+                .expect("global memory directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(database_path.as_path())
+                .expect("global memory database metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(database_path.as_path(), suffix);
+            assert!(sidecar.is_file(), "{} should exist", sidecar.display());
+            assert_eq!(
+                fs::metadata(&sidecar)
+                    .expect("global memory SQLite sidecar metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }
 
 #[test]
@@ -5812,7 +5922,7 @@ fn repository_helpers_round_trip_core_records() {
 }
 
 #[test]
-fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
+fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -5924,8 +6034,20 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
     }
     drop(database);
 
-    let database =
+    let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen database");
+    assert!(
+        database
+            .llm_request("request-1")
+            .expect("request read before maintenance")
+            .expect("request before maintenance")
+            .request_body_json
+            .is_some(),
+        "ordinary reopen must not scan and prune audit detail tables"
+    );
+    database
+        .run_pending_one_time_maintenance()
+        .expect("run explicit one-time maintenance");
     for id in [
         "request-1",
         "request-empty-object",
@@ -6047,7 +6169,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_on_open() {
 }
 
 #[test]
-fn repairs_null_status_code_from_valid_v1_response_wire_once() {
+fn repairs_null_status_code_from_valid_v1_response_wire_during_explicit_maintenance() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -6173,8 +6295,20 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
     }
     drop(database);
 
-    let database =
+    let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopen for repair");
+    assert_eq!(
+        database
+            .llm_request("with-http-status")
+            .expect("read before maintenance")
+            .expect("row before maintenance")
+            .status_code,
+        None,
+        "ordinary reopen must not scan response payloads"
+    );
+    database
+        .run_pending_one_time_maintenance()
+        .expect("run explicit one-time maintenance");
     assert_eq!(
         database
             .llm_request("with-http-status")
@@ -6254,15 +6388,18 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
         .expect("repair marker");
     assert_eq!(repair_marker, "true");
 
-    // Marker makes a second open a no-op (already-repaired rows stay put; no re-scan).
+    // Marker makes a second explicit maintenance run a no-op.
     let status_before = database
         .llm_request("with-http-status")
         .expect("read")
         .expect("row")
         .status_code;
     drop(database);
-    let database =
+    let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("second reopen");
+    database
+        .run_pending_one_time_maintenance()
+        .expect("second explicit maintenance run");
     assert_eq!(
         database
             .llm_request("with-http-status")
@@ -6283,7 +6420,7 @@ fn repairs_null_status_code_from_valid_v1_response_wire_once() {
 }
 
 #[test]
-fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
+fn reopening_workspace_does_not_run_pending_audit_maintenance() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -6299,8 +6436,20 @@ fn reopening_workspace_does_not_repeat_completed_audit_detail_cleanup() {
         )
         .expect("hold write transaction");
 
-    WorkspaceDatabase::open_or_create_ungated(workspace.path())
+    let reopened = WorkspaceDatabase::open_or_create_ungated(workspace.path())
         .expect("reopen while another connection holds a write transaction");
+    assert_eq!(
+        reopened
+            .workspace_metadata("llm_audit_detail_v1_pruned")
+            .expect("cleanup marker lookup"),
+        None
+    );
+    assert_eq!(
+        reopened
+            .workspace_metadata("llm_audit_status_code_v1_repaired")
+            .expect("repair marker lookup"),
+        None
+    );
     transaction.rollback().expect("rollback writer transaction");
 }
 
@@ -7471,6 +7620,221 @@ fn audits_mocked_llm_request_response_and_stream_events() {
 }
 
 #[test]
+fn llm_request_event_retries_are_idempotent_by_request_sequence() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-16T00:00:00Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+
+    for id in ["event-first", "event-retry"] {
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id,
+                llm_request_id: "request-1",
+                sequence: 0,
+                event_at: "2026-07-16T00:00:01Z",
+                event_type: "text_delta",
+                raw_chunk_json: None,
+                normalized_event_json: r#"{"type":"text_delta","text":"hello"}"#,
+            })
+            .expect("idempotent event insert");
+    }
+
+    let events = database
+        .llm_request_events("request-1")
+        .expect("request events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "event-first");
+}
+
+#[test]
+fn concurrent_llm_request_event_retries_share_one_sequence() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-16T00:00:00Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+    drop(database);
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(2));
+    let threads = (0..2)
+        .map(|index| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut database =
+                    WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())?;
+                barrier.wait();
+                let id = format!("event-{index}");
+                database.insert_llm_request_event(NewLlmRequestEvent {
+                    id: &id,
+                    llm_request_id: "request-1",
+                    sequence: 0,
+                    event_at: "2026-07-16T00:00:01Z",
+                    event_type: "text_delta",
+                    raw_chunk_json: None,
+                    normalized_event_json: r#"{"type":"text_delta","text":"hello"}"#,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread
+            .join()
+            .expect("event writer thread")
+            .expect("concurrent event insert");
+    }
+
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .llm_request_events("request-1")
+            .expect("request events")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn llm_request_outcome_and_events_roll_back_together() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-16T00:00:00Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: "shared-event-id",
+            llm_request_id: "request-1",
+            sequence: 9,
+            event_at: "2026-07-16T00:00:01Z",
+            event_type: "existing",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"type":"existing"}"#,
+        })
+        .expect("existing event insert");
+
+    let result = database.update_llm_request_outcome_with_events(
+        "request-1",
+        UpdateLlmRequestOutcome {
+            first_token_at: Some("2026-07-16T00:00:00.100Z"),
+            completed_at: Some("2026-07-16T00:00:02Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: Some(100),
+            total_latency_ms: Some(2000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json: None,
+        },
+        &[NewLlmRequestEvent {
+            id: "shared-event-id",
+            llm_request_id: "request-1",
+            sequence: 0,
+            event_at: "2026-07-16T00:00:02Z",
+            event_type: "finish",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"type":"finish"}"#,
+        }],
+    );
+    assert!(result.is_err(), "event failure must abort the transaction");
+
+    let request = database
+        .llm_request("request-1")
+        .expect("request lookup")
+        .expect("request row");
+    assert_eq!(request.final_state, "running");
+    assert_eq!(request.completed_at, None);
+}
+
+#[test]
 fn versioned_provider_http_headers_only_mask_authorization() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -8631,6 +8995,114 @@ fn stores_prompt_context_injections_for_chat_replay() {
     assert_eq!(injections[1].sequence, Some(0));
     assert_eq!(injections[1].memory_keys_json, r#"["chat:fact-2"]"#);
     assert_eq!(injections[1].memory_summaries_json, r#"[{"id":"fact-2"}]"#);
+}
+
+#[test]
+fn prompt_context_injections_upsert_their_logical_replay_slots() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-1", "Prompt cache chat")
+        .expect("chat insert");
+
+    for (id, kind, sequence, messages_json) in [
+        (
+            "stable-first",
+            "stable",
+            None,
+            r#"[{"role":"system","content":"old stable"}]"#,
+        ),
+        (
+            "stable-retry",
+            "stable",
+            None,
+            r#"[{"role":"system","content":"new stable"}]"#,
+        ),
+        (
+            "turn-first",
+            "turn_memory",
+            Some(3),
+            r#"[{"role":"user","content":"old turn"}]"#,
+        ),
+        (
+            "turn-retry",
+            "turn_memory",
+            Some(3),
+            r#"[{"role":"user","content":"new turn"}]"#,
+        ),
+    ] {
+        database
+            .insert_prompt_context_injection(NewPromptContextInjection {
+                id,
+                chat_id: "chat-1",
+                kind,
+                sequence,
+                messages_json,
+                memory_keys_json: r#"["workspace:fact-1"]"#,
+                memory_summaries_json: r#"[{"id":"fact-1"}]"#,
+            })
+            .expect("prompt context injection upsert");
+    }
+
+    let injections = database
+        .prompt_context_injections_for_chat("chat-1")
+        .expect("injections");
+    assert_eq!(injections.len(), 2);
+    assert_eq!(injections[0].id, "stable-first");
+    assert!(injections[0].messages_json.contains("new stable"));
+    assert_eq!(injections[1].id, "turn-first");
+    assert!(injections[1].messages_json.contains("new turn"));
+}
+
+#[test]
+fn concurrent_prompt_context_retries_share_one_logical_slot() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-1", "Concurrent prompt cache")
+        .expect("chat insert");
+    drop(database);
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(2));
+    let threads = (0..2)
+        .map(|index| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut database =
+                    WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())?;
+                barrier.wait();
+                let id = format!("stable-{index}");
+                let messages_json =
+                    format!(r#"[{{"role":"system","content":"stable payload {index}"}}]"#);
+                database.insert_prompt_context_injection(NewPromptContextInjection {
+                    id: &id,
+                    chat_id: "chat-1",
+                    kind: "stable",
+                    sequence: None,
+                    messages_json: &messages_json,
+                    memory_keys_json: "[]",
+                    memory_summaries_json: "[]",
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread
+            .join()
+            .expect("prompt context writer thread")
+            .expect("concurrent prompt context upsert");
+    }
+
+    let database = WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let injections = database
+        .prompt_context_injections_for_chat("chat-1")
+        .expect("injections");
+    assert_eq!(injections.len(), 1);
 }
 
 #[test]

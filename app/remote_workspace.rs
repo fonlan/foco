@@ -4494,13 +4494,29 @@ impl BrokerLlmAuditWriter {
     ) -> Result<(), WorkspaceDatabaseError> {
         self.write_with_retry("finish", || {
             let mut database = self.open_ensured_database()?;
-            let existing_response_body_json = database
-                .llm_request(&self.context.request_id)?
-                .and_then(|request| request.response_body_json);
-            let response_body_json = existing_response_body_json
-                .as_deref()
-                .or(outcome.response_body_json);
-            database.update_llm_request_outcome(
+            let event_ids = events
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("{}-event-{index}", self.context.request_id))
+                .collect::<Vec<_>>();
+            let normalized_event_json = events
+                .iter()
+                .map(|event| event.normalized_event.to_string())
+                .collect::<Vec<_>>();
+            let new_events = events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| NewLlmRequestEvent {
+                    id: &event_ids[index],
+                    llm_request_id: &self.context.request_id,
+                    sequence: index as i64,
+                    event_at: &event.event_at,
+                    event_type: &event.event_type,
+                    raw_chunk_json: None,
+                    normalized_event_json: &normalized_event_json[index],
+                })
+                .collect::<Vec<_>>();
+            database.update_llm_request_outcome_with_events(
                 &self.context.request_id,
                 UpdateLlmRequestOutcome {
                     first_token_at: outcome.first_token_at,
@@ -4514,10 +4530,10 @@ impl BrokerLlmAuditWriter {
                     total_latency_ms: Some(outcome.total_latency_ms),
                     status_code: outcome.status_code,
                     final_state: outcome.final_state,
-                    response_body_json,
+                    response_body_json: outcome.response_body_json,
                 },
-            )?;
-            self.insert_missing_events(&mut database, events)
+                &new_events,
+            )
         })
     }
 
@@ -4600,36 +4616,6 @@ impl BrokerLlmAuditWriter {
             }
         }
         Ok(database)
-    }
-
-    fn insert_missing_events(
-        &self,
-        database: &mut WorkspaceDatabase,
-        events: &[BrokerLlmAuditEvent],
-    ) -> Result<(), WorkspaceDatabaseError> {
-        let existing_sequences = database
-            .llm_request_events(&self.context.request_id)?
-            .into_iter()
-            .map(|event| event.sequence)
-            .collect::<HashSet<_>>();
-        for (index, event) in events.iter().enumerate() {
-            let sequence = index as i64;
-            if existing_sequences.contains(&sequence) {
-                continue;
-            }
-            let event_id = format!("{}-event-{sequence}", self.context.request_id);
-            let normalized_event_json = event.normalized_event.to_string();
-            database.insert_llm_request_event(NewLlmRequestEvent {
-                id: &event_id,
-                llm_request_id: &self.context.request_id,
-                sequence,
-                event_at: &event.event_at,
-                event_type: &event.event_type,
-                raw_chunk_json: None,
-                normalized_event_json: &normalized_event_json,
-            })?;
-        }
-        Ok(())
     }
 }
 
@@ -19605,6 +19591,75 @@ mod tests {
         );
         assert_eq!(not_explicit.final_state, "failed");
         assert_eq!(not_explicit.response_body_json, None);
+    }
+
+    #[test]
+    fn concurrent_broker_audit_finish_is_idempotent_and_atomic() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = BrokerLlmAuditContext {
+            audit_path: workspace.path().to_path_buf(),
+            workspace_id: "remote-ws".to_string(),
+            chat_id: Some("chat-1".to_string()),
+            chat_title: Some("Remote chat".to_string()),
+            request_id: "request-concurrent-finish".to_string(),
+            request_kind: BROKER_DEFAULT_LLM_REQUEST_KIND.to_string(),
+        };
+        let writer = broker_llm_audit_writer_for_test(
+            &context,
+            "provider-1",
+            "model-1",
+            None,
+            "2026-07-16T00:00:00Z",
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads = (0..2)
+            .map(|_| {
+                let writer = writer.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let events = [BrokerLlmAuditEvent {
+                        event_at: "2026-07-16T00:00:01Z".to_string(),
+                        event_type: "text_delta".to_string(),
+                        normalized_event: json!({ "type": "text_delta", "text": "hello" }),
+                    }];
+                    barrier.wait();
+                    writer.finish(
+                        BrokerLlmAuditOutcome {
+                            final_state: "succeeded",
+                            first_token_at: Some("2026-07-16T00:00:00.100Z"),
+                            completed_at: "2026-07-16T00:00:02Z",
+                            usage: None,
+                            first_token_latency_ms: Some(100),
+                            total_latency_ms: 2000,
+                            status_code: Some(200),
+                            response_body_json: None,
+                        },
+                        &events,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread
+                .join()
+                .expect("broker audit writer thread")
+                .expect("concurrent broker audit finish");
+        }
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit db");
+        let request = database
+            .llm_request("request-concurrent-finish")
+            .expect("request lookup")
+            .expect("request row");
+        assert_eq!(request.final_state, "succeeded");
+        assert_eq!(
+            database
+                .llm_request_events("request-concurrent-finish")
+                .expect("request events")
+                .len(),
+            1
+        );
     }
 
     #[test]

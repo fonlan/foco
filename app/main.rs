@@ -10433,12 +10433,30 @@ fn cleanup_chat_session_upload_files(
     paths: &[String],
 ) -> Result<(), ApiError> {
     let session_dir = chat_session_upload_dir(workspace_path, chat_id)?;
+    let canonical_session_dir = match fs::canonicalize(&session_dir) {
+        Ok(path) => path,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ApiError::internal(format!(
+                "failed to resolve chat session upload directory: {source}"
+            )));
+        }
+    };
     for path in paths {
         let path = PathBuf::from(path);
-        if path.parent() != Some(session_dir.as_path()) {
+        let canonical_path = match fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ApiError::internal(format!(
+                    "failed to resolve chat run attachment: {source}"
+                )));
+            }
+        };
+        if canonical_path.parent() != Some(canonical_session_dir.as_path()) {
             continue;
         }
-        match fs::remove_file(&path) {
+        match fs::remove_file(&canonical_path) {
             Ok(()) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
