@@ -3110,14 +3110,24 @@ mod tests {
 
     #[test]
     fn parse_workspace_spec_update_output_applies_ordered_edits() {
-        let base = "# Project Spec\n\nExisting spec.";
+        let base = "# Project Spec\n\nAlpha\nBeta\nGamma";
         let output = parse_workspace_spec_update_output(
             json!({
                 "updateNeeded": true,
-                "edits": [{
-                    "oldText": "Existing spec.",
-                    "newText": "Patched durable contract."
-                }]
+                "edits": [
+                    {
+                        "oldText": "Alpha",
+                        "newText": "Alpha patched"
+                    },
+                    {
+                        "oldText": "\nGamma",
+                        "newText": ""
+                    },
+                    {
+                        "oldText": "Beta",
+                        "newText": "Beta then Delta"
+                    }
+                ]
             }),
             base,
         )
@@ -3128,10 +3138,10 @@ mod tests {
                 edits,
                 content_markdown,
             } => {
-                assert_eq!(edits.len(), 1);
+                assert_eq!(edits.len(), 3);
                 assert_eq!(
                     content_markdown,
-                    "# Project Spec\n\nPatched durable contract."
+                    "# Project Spec\n\nAlpha patched\nBeta then Delta"
                 );
             }
             WorkspaceSpecUpdateOutput::NoUpdateNeeded => panic!("expected patch"),
@@ -3140,7 +3150,7 @@ mod tests {
 
     #[test]
     fn parse_workspace_spec_update_output_rejects_content_markdown_and_invalid_edits() {
-        let base = "# Project Spec\n\nExisting spec.";
+        let base = "# Project Spec\n\nExisting spec. Existing.";
         assert!(
             parse_workspace_spec_update_output(
                 json!({
@@ -3149,7 +3159,8 @@ mod tests {
                 }),
                 base
             )
-            .is_err()
+            .is_err(),
+            "full replacement payload must be rejected"
         );
         assert!(
             parse_workspace_spec_update_output(
@@ -3159,7 +3170,8 @@ mod tests {
                 }),
                 base
             )
-            .is_err()
+            .is_err(),
+            "no-update must require edits=null"
         );
         assert!(
             parse_workspace_spec_update_output(
@@ -3169,7 +3181,8 @@ mod tests {
                 }),
                 base
             )
-            .is_err()
+            .is_err(),
+            "updateNeeded=true requires edits"
         );
         assert!(
             parse_workspace_spec_update_output(
@@ -3179,7 +3192,19 @@ mod tests {
                 }),
                 base
             )
-            .is_err()
+            .is_err(),
+            "empty edits must fail"
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{ "oldText": "", "newText": "x" }]
+                }),
+                base
+            )
+            .is_err(),
+            "empty oldText must fail"
         );
         assert!(
             parse_workspace_spec_update_output(
@@ -3189,7 +3214,42 @@ mod tests {
                 }),
                 base
             )
-            .is_err()
+            .is_err(),
+            "missing match must fail"
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{ "oldText": "Existing", "newText": "x" }]
+                }),
+                base
+            )
+            .is_err(),
+            "ambiguous match must fail"
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{ "oldText": "Existing spec.", "newText": "Existing spec." }]
+                }),
+                base
+            )
+            .is_err(),
+            "no-op edits must fail"
+        );
+        assert!(
+            parse_workspace_spec_update_output(
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{ "oldText": "Existing spec.", "newText": "Patched" }],
+                    "contentMarkdown": "# Full"
+                }),
+                base
+            )
+            .is_err(),
+            "unknown extra fields must fail"
         );
         assert_eq!(
             parse_workspace_spec_update_output(

@@ -16840,6 +16840,77 @@ fn workspace_spec_update_job_applies_patch_and_audits_mode() {
         output["contentBytes"],
         "# Project Spec\n\nDurable contract from chat.".len()
     );
+    let assistant = database
+        .message("assistant-1")
+        .expect("assistant message")
+        .expect("assistant row");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata");
+    let spec_updates = metadata["specUpdates"]
+        .as_array()
+        .expect("specUpdates array");
+    assert_eq!(spec_updates.len(), 1);
+    assert_eq!(spec_updates[0]["jobId"], job.id);
+    assert_eq!(spec_updates[0]["baseRevision"], base_revision);
+    assert_eq!(spec_updates[0]["revision"], 2);
+    assert!(
+        spec_updates[0]["lines"]
+            .as_array()
+            .expect("diff lines")
+            .iter()
+            .any(|line| line["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Durable contract from chat")))
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_update_job_no_update_needed_skips_write() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-no-update-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, true);
+    let context = workspace_spec_update_test_context(workspace_dir.clone());
+
+    queue_workspace_spec_update_job(&context, "succeeded").expect("queue spec update");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let job = database
+        .workspace_spec_jobs(1)
+        .expect("workspace spec jobs")
+        .pop()
+        .expect("queued spec job");
+    database
+        .mark_workspace_spec_job_running(&job.id)
+        .expect("mark spec job running");
+    let base_revision = job.base_revision.expect("base revision");
+    drop(database);
+
+    apply_workspace_spec_update_job_output(
+        &workspace_dir,
+        &job.id,
+        base_revision,
+        json!({
+            "updateNeeded": false,
+            "edits": null
+        }),
+    )
+    .expect("apply no-update");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let spec = database
+        .workspace_spec()
+        .expect("workspace spec")
+        .expect("spec row");
+    assert_eq!(spec.revision, 1);
+    assert_eq!(spec.content_markdown, "# Project Spec\n\nExisting spec.");
+    let job = database
+        .workspace_spec_job(&job.id)
+        .expect("workspace spec job")
+        .expect("spec job");
+    assert_eq!(job.status, "skipped");
+    assert_eq!(job.error_message.as_deref(), Some("no_update_needed"));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

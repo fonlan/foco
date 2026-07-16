@@ -43,27 +43,27 @@ pub(crate) fn update_spec(
         .as_ref()
         .map_or("", |spec| spec.content_markdown.as_str());
     let line_count_before = markdown_line_count(current_content);
-    let (content_markdown, update_mode, edit_count) =
-        match (request.edits, request.content_markdown) {
-            (Some(edits), None) => {
-                let content_markdown =
-                    apply_spec_text_edits(current_content, &edits).map_err(map_patch_error)?;
-                (content_markdown, "patch", edits.len())
-            }
-            (None, Some(content_markdown)) => (content_markdown, "fullReplacement", 0),
-            (Some(_), Some(_)) => {
-                return Err(ToolRuntimeError::InvalidArguments(
-                    "provide exactly one of edits or contentMarkdown; both were provided"
-                        .to_string(),
-                ));
-            }
-            (None, None) => {
-                return Err(ToolRuntimeError::InvalidArguments(
-                    "provide exactly one of edits or contentMarkdown; neither was provided"
-                        .to_string(),
-                ));
-            }
-        };
+    let content_markdown = request
+        .content_markdown
+        .filter(|value| !value.trim().is_empty());
+    let (content_markdown, update_mode, edit_count) = match (request.edits, content_markdown) {
+        (Some(edits), None) => {
+            let content_markdown =
+                apply_spec_text_edits(current_content, &edits).map_err(map_patch_error)?;
+            (content_markdown, "patch", edits.len())
+        }
+        (None, Some(content_markdown)) => (content_markdown, "fullReplacement", 0),
+        (Some(_), Some(_)) => {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "provide exactly one of edits or contentMarkdown; both were provided".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "provide exactly one of edits or contentMarkdown; neither was provided".to_string(),
+            ));
+        }
+    };
     let line_count_after = markdown_line_count(&content_markdown);
     let spec = database
         .update_workspace_spec_content(request.expected_revision, &content_markdown)?

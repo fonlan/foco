@@ -157,4 +157,28 @@ mod tests {
             Err(SpecPatchError::NoChange)
         );
     }
+
+    #[test]
+    fn apply_spec_text_edits_deletes_matched_text() {
+        let result = apply_spec_text_edits(
+            "# Spec\n\nKeep\nRemove me",
+            &[SpecTextEdit {
+                old_text: "\nRemove me".to_string(),
+                new_text: String::new(),
+            }],
+        )
+        .expect("deletion");
+        assert_eq!(result, "# Spec\n\nKeep");
+    }
+
+    #[test]
+    fn spec_text_edit_rejects_unknown_fields() {
+        let error = serde_json::from_value::<SpecTextEdit>(serde_json::json!({
+            "oldText": "a",
+            "newText": "b",
+            "extra": true
+        }))
+        .expect_err("unknown fields");
+        assert!(error.to_string().contains("unknown field"));
+    }
 }
