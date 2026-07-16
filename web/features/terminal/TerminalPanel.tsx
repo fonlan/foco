@@ -293,19 +293,22 @@ export function TerminalPanel({
       />
       <div className="terminal-panel-body mx-auto flex h-[var(--terminal-panel-height)] w-full max-w-5xl min-w-0">
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-8 items-center justify-between gap-3 px-3 text-xs text-stone-400">
-            <span className="inline-flex min-w-0 items-center gap-2">
+          <div className="flex h-8 shrink-0 flex-nowrap items-center justify-between gap-2 overflow-hidden px-3 text-xs text-stone-400">
+            <span className="inline-flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
               <Terminal aria-hidden="true" className="size-4 shrink-0" />
-              <span className={terminalStatusClass(activeSession?.status ?? "closed")}>
-                {terminalStatusText(activeSession?.status ?? "closed", t)}
-              </span>
+              <span
+                aria-label={terminalStatusText(activeSession?.status ?? "closed", t)}
+                className={terminalStatusDotClass(activeSession?.status ?? "closed")}
+                role="status"
+                title={terminalStatusText(activeSession?.status ?? "closed", t)}
+              />
               <span className="min-w-0 truncate">
                 {activeSession?.cwd || workspacePath}
               </span>
             </span>
             <span className="flex min-w-0 shrink-0 items-center gap-2">
               {activeSession?.error ? (
-                <span className="min-w-0 truncate text-rose-300">
+                <span className="min-w-0 max-w-[7rem] truncate text-rose-300 sm:max-w-[12rem]">
                   {activeSession.error}
                 </span>
               ) : null}
@@ -369,10 +372,7 @@ export function TerminalPanel({
                 >
                   <span
                     aria-label={terminalStatusText(session.status, t)}
-                    className={`size-2 shrink-0 rounded-full ${isTerminalConnected(session.status)
-                        ? "bg-emerald-400"
-                        : "bg-rose-500"
-                      }`}
+                    className={terminalStatusDotClass(session.status)}
                     title={terminalStatusText(session.status, t)}
                   />
                   <span className="min-w-0 flex-1">
@@ -768,22 +768,24 @@ function isTerminalConnected(status: TerminalPaneStatus) {
   return status === "connected";
 }
 
-function terminalStatusClass(status: "closed" | "connected" | "connecting" | "error") {
-  const base = "rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
+function terminalStatusDotClass(
+  status: "closed" | "connected" | "connecting" | "error",
+) {
+  const base = "size-2 shrink-0 rounded-full";
 
   if (status === "connected") {
-    return `${base} bg-emerald-100 text-emerald-800`;
+    return `${base} bg-emerald-400 shadow-[0_0_6px_2px_rgba(52,211,153,0.75)]`;
   }
 
   if (status === "connecting") {
-    return `${base} bg-amber-100 text-amber-800`;
+    return `${base} bg-amber-400 shadow-[0_0_6px_2px_rgba(251,191,36,0.7)]`;
   }
 
   if (status === "error") {
-    return `${base} bg-rose-100 text-rose-700`;
+    return `${base} bg-rose-500 shadow-[0_0_6px_2px_rgba(244,63,94,0.75)]`;
   }
 
-  return `${base} bg-stone-100 text-stone-500`;
+  return `${base} bg-stone-500`;
 }
 
 function isTerminalServerEvent(value: unknown): value is TerminalServerEvent {

@@ -427,7 +427,7 @@ describe("app-panels-stats verification surfaces", () => {
       screen.getByRole("button", { name: "Open terminal" }),
     );
 
-    expect(await screen.findByText("connected")).toBeInTheDocument();
+    expect(await screen.findByLabelText("connected")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/workspaces/workspace-1/terminal/session",
       expect.objectContaining({ method: "POST" }),
@@ -470,7 +470,7 @@ describe("app-panels-stats verification surfaces", () => {
     );
 
     await waitFor(() => {
-      expect(screen.queryByText("connected")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("connected")).not.toBeInTheDocument();
     });
   }, 10000);
 
@@ -2941,7 +2941,7 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Open terminal" }),
     );
-    expect(await screen.findByText("connected")).toBeInTheDocument();
+    expect(await screen.findByLabelText("connected")).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.filter(
         ([url]) => url === "/api/workspaces/workspace-1/terminal/session",
@@ -3027,7 +3027,7 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Open terminal" }),
     );
-    expect(await screen.findByText("connected")).toBeInTheDocument();
+    expect(await screen.findByLabelText("connected")).toBeInTheDocument();
 
     await userEvent.click(
       screen.getByRole("button", { name: "Run common command Dev" }),
