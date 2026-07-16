@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, future::Future, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Utc};
 
@@ -31,8 +31,10 @@ use foco_tools::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
 const WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME: &str = "submit_workspace_spec_update_compaction";
-// ponytail: coarse stale-job recovery; replace with runner heartbeat/lease if long jobs become normal.
+// Stale when the lease (or started/created fallback) has not been renewed for this long.
 const WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS: i64 = 30 * 60 * 1000;
+// Renew significantly more often than the stale window so slow multi-turn jobs stay live.
+const WORKSPACE_SPEC_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
 const WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES: usize = 56 * 1024;
 // ponytail: multi-pass LLM compaction; raise attempts only if models keep missing the budget.
@@ -366,11 +368,11 @@ pub(crate) fn workspace_spec_running_job_is_stale(
     job: &WorkspaceSpecJobRecord,
     now: DateTime<Utc>,
 ) -> bool {
-    let started_at = job.started_at.as_deref().unwrap_or(&job.created_at);
-    let Ok(started_at) = DateTime::parse_from_rfc3339(started_at) else {
+    let lease_at = job.lease_or_started_or_created_at();
+    let Ok(lease_at) = DateTime::parse_from_rfc3339(lease_at) else {
         return false;
     };
-    now.signed_duration_since(started_at.with_timezone(&Utc))
+    now.signed_duration_since(lease_at.with_timezone(&Utc))
         .num_milliseconds()
         > WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS
 }
@@ -385,12 +387,18 @@ fn recover_stale_running_workspace_spec_job(
     else {
         return Ok(false);
     };
-    if !workspace_spec_running_job_is_stale(&job, Utc::now()) {
+    let now = Utc::now();
+    if !workspace_spec_running_job_is_stale(&job, now) {
         return Ok(false);
     }
 
+    let lease_at = job.lease_or_started_or_created_at();
+    let elapsed_ms = DateTime::parse_from_rfc3339(lease_at).ok().map(|lease_at| {
+        now.signed_duration_since(lease_at.with_timezone(&Utc))
+            .num_milliseconds()
+    });
     let error_message = format!(
-        "workspace spec job was still running after {} ms and was recovered as failed",
+        "workspace spec job lease was not renewed for {} ms and was recovered as failed",
         WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS
     );
     database
@@ -400,8 +408,12 @@ fn recover_stale_running_workspace_spec_job(
         workspace_id = %workspace_id,
         job_id = %job.id,
         trigger_type = %job.trigger_type,
+        lease_renewed_at = ?job.lease_renewed_at,
         started_at = ?job.started_at,
         created_at = %job.created_at,
+        last_lease_at = %lease_at,
+        elapsed_ms = ?elapsed_ms,
+        stale_threshold_ms = WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS,
         "stale running workspace spec job marked failed"
     );
     log_workspace_spec_job_status_from_database(database, workspace_id, &job.id);
@@ -675,8 +687,13 @@ async fn run_workspace_spec_jobs(
         };
         let job_id = job.id.clone();
         log_workspace_spec_job_status(&workspace_id, &job);
-        if let Err(error) =
-            run_workspace_spec_job_inner(&config, &workspace_id, &workspace_path, job).await
+        if let Err(error) = run_workspace_spec_job_with_lease_heartbeat(
+            &workspace_path,
+            &workspace_id,
+            &job_id,
+            run_workspace_spec_job_inner(&config, &workspace_id, &workspace_path, job),
+        )
+        .await
         {
             mark_workspace_spec_job_failed_at_path(
                 &workspace_path,
@@ -686,6 +703,86 @@ async fn run_workspace_spec_jobs(
             );
         }
     }
+}
+
+/// Runs a claimed Spec job while periodically renewing its DB lease.
+///
+/// The heartbeat uses short open/touch transactions only and never holds a
+/// connection across the job future (LLM/network). Local and remote runners
+/// share this helper so stale recovery means "lost liveness", not "ran long".
+pub(crate) async fn run_workspace_spec_job_with_lease_heartbeat<F>(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    job_id: &str,
+    job_future: F,
+) -> Result<(), ApiError>
+where
+    F: Future<Output = Result<(), ApiError>>,
+{
+    run_workspace_spec_job_with_lease_heartbeat_interval(
+        workspace_path,
+        workspace_id,
+        job_id,
+        WORKSPACE_SPEC_LEASE_HEARTBEAT_INTERVAL,
+        job_future,
+    )
+    .await
+}
+
+pub(crate) async fn run_workspace_spec_job_with_lease_heartbeat_interval<F>(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    job_id: &str,
+    interval: Duration,
+    job_future: F,
+) -> Result<(), ApiError>
+where
+    F: Future<Output = Result<(), ApiError>>,
+{
+    let mut job_future = std::pin::pin!(job_future);
+    let mut heartbeat = tokio::time::interval(interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick; claim/mark-running already set the lease.
+    heartbeat.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut job_future => {
+                return result;
+            }
+            _ = heartbeat.tick() => {
+                match renew_workspace_spec_job_lease(workspace_path, job_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            workspace_id = %workspace_id,
+                            job_id = %job_id,
+                            "workspace spec job lease renew skipped; job no longer running"
+                        );
+                        // Job already left running (completed/failed/skipped).
+                        // Keep waiting for the job future so we do not drop work.
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace_id = %workspace_id,
+                            job_id = %job_id,
+                            error = %error,
+                            "workspace spec job lease renew failed; stale recovery may reclaim"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn renew_workspace_spec_job_lease(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+) -> Result<bool, foco_store::workspace::WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)?;
+    database.touch_workspace_spec_job_lease(job_id)
 }
 
 async fn run_workspace_spec_job_inner(

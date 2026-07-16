@@ -4467,7 +4467,10 @@ fn touch_workspace_spec_job_lease_only_updates_running_rows() {
         .expect("completed job");
     assert_eq!(still_completed.status, "completed");
     assert_eq!(still_completed.lease_renewed_at, lease_at_complete);
-    assert_eq!(still_completed.started_at.as_deref(), Some(started_at.as_str()));
+    assert_eq!(
+        still_completed.started_at.as_deref(),
+        Some(started_at.as_str())
+    );
 
     database
         .insert_workspace_spec_job(NewWorkspaceSpecJob {

@@ -124,8 +124,8 @@ use crate::spec_runtime::{
     WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
     prepare_workspace_spec_job, prepare_workspace_spec_update_job, queue_workspace_spec_update_job,
-    recover_workspace_spec_queue_for_test, workspace_spec_running_job_is_stale,
-    workspace_spec_update_queue_decision,
+    recover_workspace_spec_queue_for_test, run_workspace_spec_job_with_lease_heartbeat_interval,
+    workspace_spec_running_job_is_stale, workspace_spec_update_queue_decision,
 };
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
@@ -16923,7 +16923,7 @@ fn workspace_spec_ineligible_states_do_not_queue_update_jobs() {
 }
 
 #[test]
-fn workspace_spec_running_job_stale_detection_uses_started_at() {
+fn workspace_spec_running_job_stale_detection_uses_lease_then_started_at() {
     let now = chrono::DateTime::parse_from_rfc3339("2026-06-30T12:00:00Z")
         .expect("now")
         .with_timezone(&chrono::Utc);
@@ -16939,19 +16939,104 @@ fn workspace_spec_running_job_stale_detection_uses_started_at() {
         output_json: None,
         error_message: None,
         created_at: "2026-06-30T11:00:00Z".to_string(),
-        started_at: Some("2026-06-30T11:31:00Z".to_string()),
+        started_at: Some("2026-06-30T11:00:00Z".to_string()),
         completed_at: None,
-        lease_renewed_at: None,
+        lease_renewed_at: Some("2026-06-30T11:31:00Z".to_string()),
         has_retry: false,
     };
 
+    // Fresh lease keeps the job live even when started_at is older than 30 minutes.
     assert!(!workspace_spec_running_job_is_stale(&job, now));
 
+    // Stale lease past the threshold is recovered.
+    job.lease_renewed_at = Some("2026-06-30T11:29:00Z".to_string());
+    assert!(workspace_spec_running_job_is_stale(&job, now));
+
+    // No lease: fall back to started_at.
+    job.lease_renewed_at = None;
+    job.started_at = Some("2026-06-30T11:31:00Z".to_string());
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
     job.started_at = Some("2026-06-30T11:29:00Z".to_string());
     assert!(workspace_spec_running_job_is_stale(&job, now));
 
+    // No lease and no started_at: fall back to created_at.
     job.started_at = None;
     assert!(workspace_spec_running_job_is_stale(&job, now));
+}
+
+#[tokio::test]
+async fn workspace_spec_lease_heartbeat_renews_while_job_future_runs() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let job_id = "spec-job-lease-heartbeat";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("insert job");
+        database
+            .mark_workspace_spec_job_running(job_id)
+            .expect("mark running");
+    }
+
+    let lease_before = {
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .workspace_spec_job(job_id)
+            .expect("load job")
+            .expect("job exists")
+            .lease_renewed_at
+            .expect("lease set on mark running")
+    };
+
+    // Ensure wall-clock advances enough for a distinct RFC3339 second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let result = run_workspace_spec_job_with_lease_heartbeat_interval(
+        workspace.path(),
+        "workspace-test",
+        job_id,
+        std::time::Duration::from_millis(50),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+            Ok(())
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "heartbeat wrapper should return job result");
+
+    let lease_after = {
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .workspace_spec_job(job_id)
+            .expect("load job")
+            .expect("job exists")
+            .lease_renewed_at
+            .expect("lease after heartbeat")
+    };
+    assert!(
+        lease_after > lease_before,
+        "lease should renew during a long-running job future: before={lease_before} after={lease_after}"
+    );
+
+    // Heartbeat stops after the job future finishes; a terminal mark is independent.
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .mark_workspace_spec_job_completed(job_id, None)
+            .expect("complete job");
+    }
 }
 
 #[test]

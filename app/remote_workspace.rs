@@ -134,6 +134,7 @@ use crate::{
         parse_workspace_spec_update_output, prepare_remote_workspace_spec_generation_job,
         prepare_remote_workspace_spec_update_job,
         recover_stale_running_workspace_spec_job_for_path,
+        run_workspace_spec_job_with_lease_heartbeat,
     },
     ssh_client::{
         ResolveSshOptions, SshCommandResult, SshSession, SshSpawnedExec, resolve_ssh_profile,
@@ -14479,7 +14480,14 @@ async fn run_remote_sidecar_spec_jobs(state: RemoteSidecarState) -> Result<(), A
         };
         let job_id = job.id.clone();
         log_workspace_spec_job_status(&state.workspace_id, &job);
-        if let Err(error) = run_remote_sidecar_spec_job(&state, job).await {
+        if let Err(error) = run_workspace_spec_job_with_lease_heartbeat(
+            &workspace_path,
+            &state.workspace_id,
+            &job_id,
+            run_remote_sidecar_spec_job(&state, job),
+        )
+        .await
+        {
             mark_workspace_spec_job_failed(
                 &workspace_path,
                 &state.workspace_id,
