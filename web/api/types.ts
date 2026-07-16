@@ -181,6 +181,7 @@ export type SettingsWorkspaceSpecJobSummary = {
   workspaceId: string;
   workspaceName: string;
   workspacePath: string;
+  chatTitle: string | null;
 };
 
 export type SettingsWorkspaceSpecJobError = {
@@ -201,6 +202,11 @@ export type SettingsWorkspaceSpecJobsResponse = {
 
 export type RetryWorkspaceSpecJobResponse = {
   job: WorkspaceSpecJobSummary;
+};
+
+export type DeleteFailedWorkspaceSpecJobResponse = {
+  deleted: boolean;
+  jobId: string;
 };
 
 // Plan types

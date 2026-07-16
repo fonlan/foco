@@ -387,6 +387,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             get(crate::http::spec::workspace_spec_jobs),
         )
         .route(
+            "/api/workspaces/{workspace_id}/spec/jobs/{job_id}",
+            delete(crate::http::spec::delete_failed_workspace_spec_job),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/spec/jobs/{job_id}/retry",
             post(crate::http::spec::retry_workspace_spec_job),
         )

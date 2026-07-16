@@ -872,6 +872,212 @@ describe("app-settings verification surfaces", () => {
     await waitFor(() => expect(retryButtons[0]).not.toBeDisabled());
   });
 
+  it("keeps concurrent Spec job row operations busy independently", async () => {
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [
+      failedJob,
+      {
+        ...failedJob,
+        job: {
+          ...failedJob.job,
+          id: "workspace-spec-job-failed-2",
+        },
+        workspaceId: "workspace-1",
+        workspaceName: "Default",
+      },
+    ];
+    const firstRetryGate = deferred<Response>();
+    const secondRetryGate = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed/retry") {
+        return firstRetryGate.promise;
+      }
+      if (path === "/api/workspaces/workspace-1/spec/jobs/workspace-spec-job-failed-2/retry") {
+        return secondRetryGate.promise;
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    const retryButtons = await within(specHistorySection).findAllByRole("button", {
+      name: "Retry Spec job",
+    });
+
+    fireEvent.click(retryButtons[0]);
+    await waitFor(() => expect(retryButtons[0]).toBeDisabled());
+    expect(retryButtons[1]).not.toBeDisabled();
+
+    fireEvent.click(retryButtons[1]);
+    await waitFor(() => expect(retryButtons[1]).toBeDisabled());
+    expect(retryButtons[0]).toBeDisabled();
+    expect(retryButtons[0].querySelector(".animate-spin")).not.toBeNull();
+    expect(retryButtons[1].querySelector(".animate-spin")).not.toBeNull();
+
+    firstRetryGate.resolve(jsonResponse({ job: failedJob.job }));
+    await waitFor(() => expect(retryButtons[0]).not.toBeDisabled());
+    expect(retryButtons[1]).toBeDisabled();
+    expect(retryButtons[1].querySelector(".animate-spin")).not.toBeNull();
+
+    secondRetryGate.resolve(
+      jsonResponse({
+        job: {
+          ...failedJob.job,
+          id: "workspace-spec-job-failed-2",
+        },
+      }),
+    );
+    await waitFor(() => expect(retryButtons[1]).not.toBeDisabled());
+  });
+
+  it("shows chat titles and deletes failed Spec jobs after confirmation", async () => {
+    const longTitle =
+      "Very long Spec chat title about architecture contracts and durable product boundaries";
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [
+      {
+        ...failedJob,
+        chatTitle: longTitle,
+      },
+      appTestState.settingsSpecJobsResponse[1],
+      appTestState.settingsSpecJobsResponse[2],
+      appTestState.settingsSpecJobsResponse[3],
+    ];
+    const fetchMock = vi.mocked(fetch);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    expect(within(specHistorySection).getByText("Chat title")).toBeInTheDocument();
+    const longTitleCell = within(specHistorySection).getByText(longTitle);
+    expect(longTitleCell).toBeInTheDocument();
+    expect(longTitleCell).toHaveAttribute("title", longTitle);
+
+    await userEvent.click(within(specHistorySection).getByLabelText("Only retryable Spec jobs"));
+    await waitFor(() =>
+      expect(within(specHistorySection).getByText("Already retried chat")).toBeInTheDocument(),
+    );
+    expect(within(specHistorySection).getAllByText("None").length).toBeGreaterThanOrEqual(1);
+    expect(within(specHistorySection).getByText("Completed")).toBeInTheDocument();
+    expect(within(specHistorySection).getByText("Running")).toBeInTheDocument();
+
+    const deleteButtons = within(specHistorySection).getAllByRole("button", {
+      name: "Delete Spec job",
+    });
+    // failed + failed-with-retry; not completed/running
+    expect(deleteButtons).toHaveLength(2);
+    expect(within(specHistorySection).getAllByRole("button", { name: "Retry Spec job" })).toHaveLength(
+      1,
+    );
+
+    await userEvent.click(deleteButtons[0]);
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed",
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(within(specHistorySection).queryByText(longTitle)).not.toBeInTheDocument(),
+    );
+    expect(
+      appTestState.settingsSpecJobsResponse.some(
+        (item) => item.job.id === "workspace-spec-job-failed",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not delete a Spec job when confirmation is cancelled", async () => {
+    const fetchMock = vi.mocked(fetch);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Delete Spec job" }),
+    );
+
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringMatching(/\/api\/workspaces\/[^/]+\/spec\/jobs\/[^/]+$/),
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(within(specHistorySection).getByText("Side chat about Spec")).toBeInTheDocument();
+  });
+
+  it("keeps a failed Spec job when delete request fails", async () => {
+    const failedJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = [failedJob];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (
+        path === "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed" &&
+        (init?.method ?? "GET").toUpperCase() === "DELETE"
+      ) {
+        return Promise.resolve(
+          jsonResponse({ error: "only failed Spec jobs can be deleted" }, { status: 400 }),
+        );
+      }
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Delete Spec job" }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-failed",
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("only failed Spec jobs can be deleted")).toBeInTheDocument(),
+    );
+    expect(within(specHistorySection).getByText("Side chat about Spec")).toBeInTheDocument();
+    expect(
+      appTestState.settingsSpecJobsResponse.some(
+        (item) => item.job.id === "workspace-spec-job-failed",
+      ),
+    ).toBe(true);
+  });
+
   it("paginates Spec job history", async () => {
     const baseJob = appTestState.settingsSpecJobsResponse[0];
     appTestState.settingsSpecJobsResponse = Array.from({ length: 25 }, (_, index) => ({
@@ -924,6 +1130,73 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("corrects Spec job history page after deleting the last item on the last page", async () => {
+    const baseJob = appTestState.settingsSpecJobsResponse[0];
+    appTestState.settingsSpecJobsResponse = Array.from({ length: 21 }, (_, index) => ({
+      ...baseJob,
+      chatTitle: `Chat ${index + 1}`,
+      job: {
+        ...baseJob.job,
+        chatId: `chat-${index + 1}`,
+        id: `workspace-spec-job-${index + 1}`,
+        createdAt: `2026-06-11T04:${String(59 - index).padStart(2, "0")}:00Z`,
+      },
+    }));
+    const fetchMock = vi.mocked(fetch);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const specHistorySection = (await screen.findByRole("heading", {
+      name: "Spec job history",
+    })).closest("section") as HTMLElement;
+    const pageSizeControl = await within(specHistorySection).findByLabelText("Page size");
+    changeInput(pageSizeControl, "20");
+
+    await waitFor(() =>
+      expect(within(specHistorySection).getByText("Showing 1-20 of 21")).toBeInTheDocument(),
+    );
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Next page" }),
+    );
+    await waitFor(() =>
+      expect(within(specHistorySection).getByText("Chat 21")).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(within(specHistorySection).getByText("Showing 21-21 of 21")).toBeInTheDocument(),
+    );
+
+    const pageOneListRequestCount = () =>
+      fetchMock.mock.calls.filter(([input]) => {
+        const value = String(input);
+        return (
+          value.startsWith("/api/settings/spec/jobs?") &&
+          value.includes("page=1") &&
+          value.includes("pageSize=20")
+        );
+      }).length;
+    const listRequestsBeforeDelete = pageOneListRequestCount();
+
+    await userEvent.click(
+      within(specHistorySection).getByRole("button", { name: "Delete Spec job" }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-2/spec/jobs/workspace-spec-job-21",
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
+    await waitFor(() => {
+      expect(pageOneListRequestCount()).toBeGreaterThan(listRequestsBeforeDelete);
+      expect(within(specHistorySection).queryByText("Chat 21")).not.toBeInTheDocument();
+      expect(within(specHistorySection).getByText("Showing 1-20 of 20")).toBeInTheDocument();
+    });
+  });
+
   it("localizes the Spec settings surface", async () => {
     const zhSettings = {
       ...settings,
@@ -956,6 +1229,8 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByRole("button", { name: "刷新 Spec 任务历史" })).toBeInTheDocument();
     expect(screen.getByLabelText("仅显示可重试记录")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试 Spec 任务" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除 Spec 任务" })).toBeInTheDocument();
+    expect(screen.getByText("会话标题")).toBeInTheDocument();
     expect(screen.getByText("自动化")).toBeInTheDocument();
     expect(screen.getByText("成功聊天轮次结束后更新已启用的工作区 Spec。")).toBeInTheDocument();
     const automation = screen.getByText("自动化").closest("fieldset");

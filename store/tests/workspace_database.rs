@@ -4070,6 +4070,267 @@ fn workspace_spec_job_has_retry_reflects_retry_children() {
 }
 
 #[test]
+fn chat_titles_by_ids_returns_existing_titles_only() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-one", "Alpha chat")
+        .expect("insert chat one");
+    database
+        .insert_chat("chat-two", "Beta chat")
+        .expect("insert chat two");
+
+    let titles = database
+        .chat_titles_by_ids(&[
+            "chat-one".to_string(),
+            "missing-chat".to_string(),
+            "chat-two".to_string(),
+        ])
+        .expect("chat titles");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(
+        titles.get("chat-one").map(String::as_str),
+        Some("Alpha chat")
+    );
+    assert_eq!(
+        titles.get("chat-two").map(String::as_str),
+        Some("Beta chat")
+    );
+    assert!(!titles.contains_key("missing-chat"));
+
+    let empty = database.chat_titles_by_ids(&[]).expect("empty chat titles");
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn chat_titles_by_ids_chunks_large_id_lists() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    // Cross the 500-id chunk boundary and include gaps / missing ids.
+    let total = 1_050;
+    let mut requested = Vec::with_capacity(total + 2);
+    for index in 0..total {
+        let id = format!("chat-chunk-{index}");
+        if index % 3 != 0 {
+            database
+                .insert_chat(&id, &format!("Title {index}"))
+                .expect("insert chat");
+        }
+        requested.push(id);
+    }
+    requested.push("missing-after-chunks".to_string());
+    requested.push(requested[1].clone()); // duplicate within the list
+
+    let titles = database
+        .chat_titles_by_ids(&requested)
+        .expect("chunked chat titles");
+
+    let expected_present = (0..total).filter(|index| index % 3 != 0).count();
+    assert_eq!(titles.len(), expected_present);
+    assert_eq!(
+        titles.get("chat-chunk-1").map(String::as_str),
+        Some("Title 1")
+    );
+    assert_eq!(
+        titles.get("chat-chunk-1049").map(String::as_str),
+        Some("Title 1049")
+    );
+    assert!(!titles.contains_key("chat-chunk-0"));
+    assert!(!titles.contains_key("missing-after-chunks"));
+}
+
+#[test]
+fn delete_failed_workspace_spec_job_only_removes_failed_rows() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    // Mark running first while it is the only queued job (FIFO claim constraint).
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-running",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert running job");
+    assert!(
+        database
+            .mark_workspace_spec_job_running("spec-job-running")
+            .expect("mark running")
+    );
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-queued",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert queued job");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-completed",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert completed job");
+    database
+        .mark_workspace_spec_job_completed("spec-job-completed", None)
+        .expect("mark completed");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-skipped",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert skipped job");
+    database
+        .mark_workspace_spec_job_skipped("spec-job-skipped", "not needed")
+        .expect("mark skipped");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-failed",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert failed job");
+    database
+        .mark_workspace_spec_job_failed("spec-job-failed", "provider failed")
+        .expect("mark failed");
+
+    assert!(
+        database
+            .delete_failed_workspace_spec_job("spec-job-failed")
+            .expect("delete failed job")
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-failed")
+            .expect("failed lookup")
+            .is_none()
+    );
+
+    for id in [
+        "spec-job-queued",
+        "spec-job-running",
+        "spec-job-completed",
+        "spec-job-skipped",
+    ] {
+        assert!(
+            !database
+                .delete_failed_workspace_spec_job(id)
+                .expect("reject non-failed delete"),
+            "expected reject for {id}"
+        );
+        assert!(
+            database.workspace_spec_job(id).expect("lookup").is_some(),
+            "expected row retained for {id}"
+        );
+    }
+
+    assert!(
+        !database
+            .delete_failed_workspace_spec_job("missing-spec-job")
+            .expect("missing id")
+    );
+    assert_eq!(database.workspace_spec_job_count().expect("job count"), 4);
+}
+
+#[test]
+fn delete_failed_workspace_spec_job_nulls_retry_of_parent() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-parent-failed",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert parent");
+    database
+        .mark_workspace_spec_job_failed("spec-job-parent-failed", "failed")
+        .expect("mark parent failed");
+    let retry = database
+        .retry_failed_workspace_spec_job(
+            "spec-job-parent-failed",
+            "spec-job-retry-child",
+            Some("model-2"),
+        )
+        .expect("retry")
+        .expect("retry job");
+    assert_eq!(retry.id, "spec-job-retry-child");
+
+    let connection = Connection::open(database.database_path()).expect("open db");
+    let retry_of_before: Option<String> = connection
+        .query_row(
+            "SELECT retry_of_job_id FROM workspace_spec_jobs WHERE id = ?1",
+            params!["spec-job-retry-child"],
+            |row| row.get(0),
+        )
+        .expect("retry_of before");
+    assert_eq!(retry_of_before.as_deref(), Some("spec-job-parent-failed"));
+    drop(connection);
+
+    assert!(
+        database
+            .delete_failed_workspace_spec_job("spec-job-parent-failed")
+            .expect("delete parent")
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-parent-failed")
+            .expect("parent lookup")
+            .is_none()
+    );
+    let retry_after = database
+        .workspace_spec_job("spec-job-retry-child")
+        .expect("retry lookup")
+        .expect("retry retained");
+    assert_eq!(retry_after.status, "queued");
+
+    let connection = Connection::open(database.database_path()).expect("reopen db");
+    let retry_of_after: Option<String> = connection
+        .query_row(
+            "SELECT retry_of_job_id FROM workspace_spec_jobs WHERE id = ?1",
+            params!["spec-job-retry-child"],
+            |row| row.get(0),
+        )
+        .expect("retry_of after");
+    assert!(retry_of_after.is_none());
+}
+
+#[test]
 fn delete_chat_cascades_spec_snapshot_but_preserves_workspace_spec() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

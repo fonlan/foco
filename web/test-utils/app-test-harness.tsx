@@ -1027,6 +1027,7 @@ export const workspaceSpecQueuedJob: WorkspaceSpecJobSummary = {
 };
 
 export const settingsSpecCompletedJob: SettingsWorkspaceSpecJobSummary = {
+  chatTitle: null,
   job: {
     ...workspaceSpecJob,
     output: { contentBytes: 512, revision: 4 },
@@ -1037,8 +1038,10 @@ export const settingsSpecCompletedJob: SettingsWorkspaceSpecJobSummary = {
 };
 
 export const settingsSpecFailedJob: SettingsWorkspaceSpecJobSummary = {
+  chatTitle: "Side chat about Spec",
   job: {
     ...workspaceSpecJob,
+    chatId: "chat-failed-spec",
     completedAt: "2026-06-11T03:09:00Z",
     createdAt: "2026-06-11T03:08:00Z",
     errorMessage: "model timed out",
@@ -1054,6 +1057,7 @@ export const settingsSpecFailedJob: SettingsWorkspaceSpecJobSummary = {
 };
 
 export const settingsSpecRunningJob: SettingsWorkspaceSpecJobSummary = {
+  chatTitle: null,
   job: {
     ...workspaceSpecQueuedJob,
     createdAt: "2026-06-11T03:07:00Z",
@@ -1067,6 +1071,7 @@ export const settingsSpecRunningJob: SettingsWorkspaceSpecJobSummary = {
 };
 
 export const settingsSpecFailedRetriedJob: SettingsWorkspaceSpecJobSummary = {
+  chatTitle: "Already retried chat",
   job: {
     ...settingsSpecFailedJob.job,
     createdAt: "2026-06-11T03:06:00Z",
@@ -3692,13 +3697,33 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     };
     appTestState.settingsSpecJobsResponse = source
       ? [
-        { ...source, job: retryJob },
+        { ...source, chatTitle: source.chatTitle, job: retryJob },
         ...appTestState.settingsSpecJobsResponse.map((item) =>
           item === source ? { ...item, job: { ...item.job, hasRetry: true } } : item,
         ),
       ]
       : appTestState.settingsSpecJobsResponse;
     return jsonResponse({ job: retryJob });
+  }
+
+  const specJobDeleteMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/spec\/jobs\/([^/]+)$/,
+  );
+  if (specJobDeleteMatch && (init?.method ?? "GET").toUpperCase() === "DELETE") {
+    const workspaceId = decodeURIComponent(specJobDeleteMatch[1] ?? "");
+    const jobId = decodeURIComponent(specJobDeleteMatch[2] ?? "");
+    const source = appTestState.settingsSpecJobsResponse.find(
+      (item) => item.workspaceId === workspaceId && item.job.id === jobId,
+    );
+    if (!source || source.job.status !== "failed") {
+      return jsonResponse(
+        { error: "only failed Spec jobs can be deleted" },
+        { status: 400 },
+      );
+    }
+    appTestState.settingsSpecJobsResponse =
+      appTestState.settingsSpecJobsResponse.filter((item) => item !== source);
+    return jsonResponse({ deleted: true, jobId });
   }
 
   if (path === "/api/agent-definitions") {

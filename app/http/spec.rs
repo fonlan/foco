@@ -93,6 +93,14 @@ pub(crate) struct WorkspaceSpecJobWithWorkspaceSummary {
     workspace_id: String,
     workspace_name: String,
     workspace_path: String,
+    chat_title: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteFailedWorkspaceSpecJobResponse {
+    deleted: bool,
+    job_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,6 +393,29 @@ pub(crate) async fn retry_workspace_spec_job(
     Ok(Json(WorkspaceSpecJobRetryResponse { job: response }))
 }
 
+pub(crate) async fn delete_failed_workspace_spec_job(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, job_id)): AxumPath<(String, String)>,
+) -> Result<Json<DeleteFailedWorkspaceSpecJobResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace.path).map_err(spec_workspace_error)?;
+    let deleted = database
+        .delete_failed_workspace_spec_job(&job_id)
+        .map_err(spec_workspace_error)?;
+    if !deleted {
+        return Err(ApiError::bad_request(
+            "workspace spec job is not failed or was not found",
+        ));
+    }
+
+    Ok(Json(DeleteFailedWorkspaceSpecJobResponse {
+        deleted: true,
+        job_id,
+    }))
+}
+
 fn spec_job_limit(limit: Option<i64>) -> Result<i64, ApiError> {
     let limit = limit.unwrap_or(DEFAULT_SPEC_JOB_LIMIT);
     spec_job_page_size(Some(limit)).map_err(|_| {
@@ -417,10 +448,24 @@ fn workspace_spec_jobs_for_workspace(
 ) -> Result<(Vec<WorkspaceSpecJobWithWorkspaceSummary>, i64), WorkspaceDatabaseError> {
     let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
     let total_count = database.workspace_spec_job_count_filtered(retryable_only)?;
-    let jobs = database
-        .workspace_spec_jobs_filtered(limit, retryable_only)?
+    let jobs = database.workspace_spec_jobs_filtered(limit, retryable_only)?;
+    let mut chat_ids = Vec::new();
+    let mut seen_chat_ids = std::collections::HashSet::new();
+    for job in &jobs {
+        if let Some(chat_id) = &job.chat_id
+            && seen_chat_ids.insert(chat_id.clone())
+        {
+            chat_ids.push(chat_id.clone());
+        }
+    }
+    let chat_titles = database.chat_titles_by_ids(&chat_ids)?;
+    let jobs = jobs
         .into_iter()
         .map(|job| {
+            let chat_title = job
+                .chat_id
+                .as_ref()
+                .and_then(|chat_id| chat_titles.get(chat_id).cloned());
             let job = workspace_spec_job_summary(job).map_err(|error| {
                 WorkspaceDatabaseError::InvalidWorkspaceSpec {
                     message: error.message,
@@ -431,6 +476,7 @@ fn workspace_spec_jobs_for_workspace(
                 workspace_id: workspace.id.clone(),
                 workspace_name: workspace.name.clone(),
                 workspace_path: workspace.path.display().to_string(),
+                chat_title,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

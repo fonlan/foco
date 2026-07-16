@@ -1830,6 +1830,23 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    /// Deletes a workspace spec job only when it is currently `failed`.
+    /// Status is enforced in the same DELETE WHERE clause so non-failed rows cannot be removed.
+    pub fn delete_failed_workspace_spec_job(
+        &mut self,
+        id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM workspace_spec_jobs
+                 WHERE id = ?1 AND status = ?2",
+                params![id, WorkspaceSpecJobStatus::Failed.as_str()],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(deleted > 0)
+    }
+
     pub fn chat_spec_snapshot(
         &self,
         chat_id: &str,
@@ -4568,6 +4585,50 @@ impl WorkspaceDatabase {
             existing.insert(row.map_err(|source| self.sqlite_error(source))?);
         }
         Ok(existing)
+    }
+
+    /// Bounded title lookup for chat ids (parameterized IN list, chunked).
+    /// Missing chats are omitted so callers can map absent ids to `null`.
+    ///
+    /// Queries are split into fixed-size chunks so deep Spec job pages with many
+    /// unique chat ids cannot exceed SQLite's variable limit.
+    pub fn chat_titles_by_ids(
+        &self,
+        chat_ids: &[String],
+    ) -> Result<HashMap<String, String>, WorkspaceDatabaseError> {
+        if chat_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        const CHUNK_SIZE: usize = 500;
+        let mut titles = HashMap::with_capacity(chat_ids.len());
+        for chunk in chat_ids.chunks(CHUNK_SIZE) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT id, title FROM chats WHERE id IN ({placeholders})");
+            let query_params = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            let mut statement = self
+                .connection
+                .prepare(&sql)
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map(params_from_iter(query_params), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+
+            for row in rows {
+                let (id, title) = row.map_err(|source| self.sqlite_error(source))?;
+                titles.insert(id, title);
+            }
+        }
+        Ok(titles)
     }
 
     pub fn delete_chat(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {

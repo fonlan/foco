@@ -133,6 +133,7 @@ import type {
   RemoteServerSummary,
   RemoteServerWorkspaceReference,
   TrustHostKeyResponse,
+  DeleteFailedWorkspaceSpecJobResponse,
   RetryWorkspaceSpecJobResponse,
   SettingsResponse,
   SettingsSection,
@@ -580,7 +581,9 @@ export function SettingsPanel({
   const [specJobsTotalPages, setSpecJobsTotalPages] = useState(0);
   const [showRetryableSpecJobsOnly, setShowRetryableSpecJobsOnly] = useState(true);
   const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
-  const [specJobOperationKey, setSpecJobOperationKey] = useState<string | null>(null);
+  const [specJobOperations, setSpecJobOperations] = useState<
+    Partial<Record<string, "retry" | "delete">>
+  >({});
   const specJobOperationKeysRef = useRef<Set<string>>(new Set());
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
   const [isLoadingPlanHistory, setIsLoadingPlanHistory] = useState(false);
@@ -2561,7 +2564,10 @@ export function SettingsPanel({
       return;
     }
     specJobOperationKeysRef.current.add(operationKey);
-    setSpecJobOperationKey(operationKey);
+    setSpecJobOperations((current) => ({
+      ...current,
+      [operationKey]: "retry",
+    }));
     setError(null);
 
     try {
@@ -2574,7 +2580,51 @@ export function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       specJobOperationKeysRef.current.delete(operationKey);
-      setSpecJobOperationKey((current) => (current === operationKey ? null : current));
+      setSpecJobOperations((current) => {
+        if (!(operationKey in current)) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[operationKey];
+        return next;
+      });
+    }
+  }
+
+  async function deleteSpecJob(workspaceId: string, jobId: string) {
+    if (!window.confirm(t("Delete Spec job confirmation"))) {
+      return;
+    }
+
+    const operationKey = `${workspaceId}:${jobId}`;
+    if (specJobOperationKeysRef.current.has(operationKey)) {
+      return;
+    }
+    specJobOperationKeysRef.current.add(operationKey);
+    setSpecJobOperations((current) => ({
+      ...current,
+      [operationKey]: "delete",
+    }));
+    setError(null);
+
+    try {
+      await requestJson<DeleteFailedWorkspaceSpecJobResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs/${encodeURIComponent(jobId)}`,
+        { method: "DELETE" },
+      );
+      await loadSpecJobs();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      specJobOperationKeysRef.current.delete(operationKey);
+      setSpecJobOperations((current) => {
+        if (!(operationKey in current)) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[operationKey];
+        return next;
+      });
     }
   }
 
@@ -6625,6 +6675,7 @@ export function SettingsPanel({
                       <tr>
                         <th className="px-3 py-2">{t("Time")}</th>
                         <th className="px-3 py-2">{t("Workspace")}</th>
+                        <th className="px-3 py-2">{t("Chat title")}</th>
                         <th className="px-3 py-2">{t("Request type")}</th>
                         <th className="px-3 py-2">{t("Status")}</th>
                         <th className="px-3 py-2">{t("Model")}</th>
@@ -6637,7 +6688,7 @@ export function SettingsPanel({
                         <tr>
                           <td
                             className="px-3 py-6 text-center text-sm font-medium text-stone-500"
-                            colSpan={7}
+                            colSpan={8}
                           >
                             {isLoadingSpecJobs
                               ? t("Loading Spec job history...")
@@ -6648,7 +6699,11 @@ export function SettingsPanel({
                         specJobs.map((item) => {
                           const job = item.job;
                           const operationKey = `${item.workspaceId}:${job.id}`;
-                          const isRetrying = specJobOperationKey === operationKey;
+                          const operationType = specJobOperations[operationKey];
+                          const isBusy = operationType != null;
+                          const isRetrying = operationType === "retry";
+                          const isDeleting = operationType === "delete";
+                          const chatTitle = item.chatTitle?.trim() || null;
                           return (
                             <tr className="bg-white hover:bg-stone-50" key={operationKey}>
                               <td className="px-3 py-2 align-top">
@@ -6667,6 +6722,20 @@ export function SettingsPanel({
                                 </div>
                               </td>
                               <td className="px-3 py-2 align-top">
+                                {chatTitle ? (
+                                  <div
+                                    className="max-w-48 truncate text-sm font-medium text-stone-800"
+                                    title={chatTitle}
+                                  >
+                                    {chatTitle}
+                                  </div>
+                                ) : (
+                                  <span className="text-sm font-medium text-stone-400">
+                                    {t("None")}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2 align-top">
                                 {specJobTriggerLabel(job.triggerType, t)}
                               </td>
                               <td className="px-3 py-2 align-top">
@@ -6683,12 +6752,12 @@ export function SettingsPanel({
                                 {specJobResultLabel(job, t, language)}
                               </td>
                               <td className="px-3 py-2 align-top">
-                                <div className="flex justify-end">
+                                <div className="flex items-center justify-end gap-1.5">
                                   {job.status === "failed" && !job.hasRetry ? (
                                     <button
                                       aria-label={t("Retry Spec job")}
                                       className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                                      disabled={isRetrying}
+                                      disabled={isBusy}
                                       onClick={() => void retrySpecJob(item.workspaceId, job.id)}
                                       title={t("Retry Spec job")}
                                       type="button"
@@ -6699,6 +6768,22 @@ export function SettingsPanel({
                                         <Redo2 aria-hidden="true" className="size-3.5" />
                                       )}
                                       {t("Retry")}
+                                    </button>
+                                  ) : null}
+                                  {job.status === "failed" ? (
+                                    <button
+                                      aria-label={t("Delete Spec job")}
+                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
+                                      disabled={isBusy}
+                                      onClick={() => void deleteSpecJob(item.workspaceId, job.id)}
+                                      title={t("Delete Spec job")}
+                                      type="button"
+                                    >
+                                      {isDeleting ? (
+                                        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <Trash2 aria-hidden="true" className="size-3.5" />
+                                      )}
                                     </button>
                                   ) : null}
                                 </div>

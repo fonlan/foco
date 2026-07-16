@@ -89,9 +89,9 @@ use crate::http::{
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
-        generate_workspace_spec, retry_workspace_spec_job, save_workspace_spec,
-        save_workspace_spec_settings, settings_workspace_spec_jobs, workspace_spec,
-        workspace_spec_jobs,
+        delete_failed_workspace_spec_job, generate_workspace_spec, retry_workspace_spec_job,
+        save_workspace_spec, save_workspace_spec_settings, settings_workspace_spec_jobs,
+        workspace_spec, workspace_spec_jobs,
     },
     terminal::create_terminal_session,
     workspaces::{WorkspacePathRequest, add_workspace, workspace_logo_thumbnail},
@@ -16013,6 +16013,210 @@ async fn settings_workspace_spec_jobs_filters_retryable_before_pagination() {
     assert!(ids.contains(&"retry-for-failed-retried-spec-job"));
     assert!(!ids.contains(&"completed-spec-job"));
     assert!(!ids.contains(&"failed-retried-spec-job"));
+}
+
+#[tokio::test]
+async fn settings_workspace_spec_jobs_includes_chat_title() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat("chat-with-title", "Spec update chat")
+            .expect("chat");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-with-chat",
+                trigger_type: "chat_completed",
+                chat_id: Some("chat-with-title"),
+                run_id: Some("run-1"),
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("job with chat");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-manual",
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("manual job");
+        database
+            .insert_chat("deleted-chat", "Will be deleted")
+            .expect("orphan chat");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "spec-job-missing-chat",
+                trigger_type: "chat_completed",
+                chat_id: Some("deleted-chat"),
+                run_id: Some("run-2"),
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("job with chat to delete");
+        database
+            .delete_chat("deleted-chat")
+            .expect("delete chat for null title case");
+    }
+
+    let query = serde_json::from_value(json!({ "page": 1, "pageSize": 10 })).expect("jobs query");
+    let Json(response) = settings_workspace_spec_jobs(State(state), Query(query))
+        .await
+        .expect("settings spec jobs");
+    let response = serde_json::to_value(response).expect("settings jobs json");
+    let jobs = response["jobs"].as_array().expect("jobs");
+    assert_eq!(jobs.len(), 3);
+
+    let by_id = |id: &str| {
+        jobs.iter()
+            .find(|item| item["job"]["id"] == id)
+            .unwrap_or_else(|| panic!("missing job {id}"))
+            .clone()
+    };
+
+    let with_chat = by_id("spec-job-with-chat");
+    assert_eq!(with_chat["workspaceId"], workspace_id);
+    assert_eq!(with_chat["chatTitle"], "Spec update chat");
+    assert_eq!(with_chat["job"]["chatId"], "chat-with-title");
+
+    let manual = by_id("spec-job-manual");
+    assert!(manual["chatTitle"].is_null());
+    assert!(manual["job"]["chatId"].is_null());
+
+    // chat_id is ON DELETE SET NULL: after the chat is removed, both fields are null.
+    let missing = by_id("spec-job-missing-chat");
+    assert!(missing["chatTitle"].is_null());
+    assert!(missing["job"]["chatId"].is_null());
+}
+
+#[tokio::test]
+async fn delete_failed_workspace_spec_job_http_is_status_gated() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat("chat-delete", "Delete me chat")
+            .expect("chat");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "failed-to-delete",
+                trigger_type: "chat_completed",
+                chat_id: Some("chat-delete"),
+                run_id: Some("run-delete"),
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("failed job");
+        database
+            .mark_workspace_spec_job_failed("failed-to-delete", "boom")
+            .expect("mark failed");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "completed-keep",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("completed job");
+        database
+            .mark_workspace_spec_job_completed("completed-keep", None)
+            .expect("mark completed");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "queued-keep",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("queued job");
+    }
+
+    let Json(deleted) = delete_failed_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "failed-to-delete".to_string())),
+    )
+    .await
+    .expect("delete failed job");
+    let deleted = serde_json::to_value(deleted).expect("delete json");
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["jobId"], "failed-to-delete");
+
+    let error = delete_failed_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "completed-keep".to_string())),
+    )
+    .await
+    .expect_err("non-failed should be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+    let error = delete_failed_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "queued-keep".to_string())),
+    )
+    .await
+    .expect_err("queued should be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+    let error = delete_failed_workspace_spec_job(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "missing-job".to_string())),
+    )
+    .await
+    .expect_err("missing should be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+    let query = serde_json::from_value(json!({ "page": 1, "pageSize": 10 })).expect("jobs query");
+    let Json(list) = settings_workspace_spec_jobs(State(state), Query(query))
+        .await
+        .expect("settings list after delete");
+    let list = serde_json::to_value(list).expect("list json");
+    assert_eq!(list["totalCount"], 2);
+    let ids: Vec<&str> = list["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .filter_map(|item| item["job"]["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&"failed-to-delete"));
+    assert!(ids.contains(&"completed-keep"));
+    assert!(ids.contains(&"queued-keep"));
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+    assert!(
+        database
+            .workspace_spec_job("failed-to-delete")
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(
+        database.chat("chat-delete").expect("chat lookup").is_some(),
+        "delete must not cascade to chats"
+    );
+    assert_eq!(database.workspace_spec_job_count().expect("count"), 2);
 }
 
 #[tokio::test]
