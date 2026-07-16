@@ -129,7 +129,6 @@ const ContextPanel = memo(function ContextPanel({
   gitCommitMessage,
   gitOperationKey,
   sourceControlTargetKey,
-  sourceControlTargetLabel,
   sourceControlTargets,
   expandedFileTreePaths,
   isLoadingChatStatistics,
@@ -208,7 +207,6 @@ const ContextPanel = memo(function ContextPanel({
   gitCommitMessage: string;
   gitOperationKey: string | null;
   sourceControlTargetKey: string;
-  sourceControlTargetLabel: string;
   sourceControlTargets: { key: string; label: string; description: string }[];
   expandedFileTreePaths: Set<string>;
   isLoadingChatStatistics: boolean;
@@ -375,7 +373,6 @@ const ContextPanel = memo(function ContextPanel({
               gitCommitMessage={gitCommitMessage}
               gitOperationKey={gitOperationKey}
               sourceControlTargetKey={sourceControlTargetKey}
-              sourceControlTargetLabel={sourceControlTargetLabel}
               sourceControlTargets={sourceControlTargets}
               isLoading={isLoadingDiff}
               onCommit={onGitCommit}
@@ -2744,7 +2741,6 @@ function SourceControlPanel({
   gitOperationKey,
   isLoading,
   sourceControlTargetKey,
-  sourceControlTargetLabel,
   sourceControlTargets,
   onCommit,
   onGenerateCommitMessage,
@@ -2762,7 +2758,6 @@ function SourceControlPanel({
   gitOperationKey: string | null;
   isLoading: boolean;
   sourceControlTargetKey: string;
-  sourceControlTargetLabel: string;
   sourceControlTargets: { key: string; label: string; description: string }[];
   onCommit: (event: FormEvent<HTMLFormElement>) => void;
   onGenerateCommitMessage: () => void;
@@ -2783,47 +2778,42 @@ function SourceControlPanel({
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
       <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
             <GitCompare aria-hidden="true" className="size-4" />
           </span>
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <span className="foco-eyebrow">{t("Source Control")}</span>
-            <h2 className="truncate text-sm font-semibold text-stone-950">
-              {selectedPath ?? sourceControlTargetLabel}
-            </h2>
+            <select
+              aria-label={t("Source Control target")}
+              className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-stone-300 bg-white px-2 py-1 text-xs font-medium text-stone-700 shadow-sm outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+              disabled={sourceControlTargets.length <= 1 || isLoading}
+              onChange={(event) => onTargetChange(event.target.value)}
+              title={t("Source Control target")}
+              value={sourceControlTargetKey}
+            >
+              {sourceControlTargets.map((target) => (
+                <option key={target.key} title={target.description} value={target.key}>
+                  {target.label}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <select
-            aria-label={t("Source Control target")}
-            className="max-w-40 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs font-medium text-stone-700 shadow-sm outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-            disabled={sourceControlTargets.length <= 1 || isLoading}
-            onChange={(event) => onTargetChange(event.target.value)}
-            title={t("Source Control target")}
-            value={sourceControlTargetKey}
-          >
-            {sourceControlTargets.map((target) => (
-              <option key={target.key} title={target.description} value={target.key}>
-                {target.label}
-              </option>
-            ))}
-          </select>
-          <button
-            aria-label={t("Refresh diff")}
-            className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
-            disabled={isLoading}
-            onClick={onRefresh}
-            title={t("Refresh diff")}
-            type="button"
-          >
-            <RefreshCw
-              aria-hidden="true"
-              className="context-refresh-icon size-4"
-              data-loading={isLoading ? "true" : undefined}
-            />
-          </button>
-        </div>
+        <button
+          aria-label={t("Refresh diff")}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+          disabled={isLoading}
+          onClick={onRefresh}
+          title={t("Refresh diff")}
+          type="button"
+        >
+          <RefreshCw
+            aria-hidden="true"
+            className="context-refresh-icon size-4"
+            data-loading={isLoading ? "true" : undefined}
+          />
+        </button>
       </div>
 
       {diffError ? (

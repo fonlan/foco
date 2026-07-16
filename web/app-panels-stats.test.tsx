@@ -209,16 +209,26 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
-    expect(
-      await screen.findAllByText(
-        "foco/agent-worktrees/agent-instance-coordinator",
-      ),
-    ).not.toHaveLength(0);
+    const targetSelect = await screen.findByRole("combobox", {
+      name: "Source Control target",
+    });
+    expect(targetSelect).toBeInTheDocument();
     await waitFor(() =>
-      expect(
-        screen.getByRole("combobox", { name: "Source Control target" }),
-      ).toHaveValue(`worktree:${worktreePath}`),
+      expect(targetSelect).toHaveValue(`worktree:${worktreePath}`),
     );
+    expect(
+      screen.queryByRole("heading", {
+        name: "foco/agent-worktrees/agent-instance-coordinator",
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("heading", { name: "Workspace changes" }),
+    ).toBeNull();
+    expect(
+      within(targetSelect).getByRole("option", {
+        name: "foco/agent-worktrees/agent-instance-coordinator",
+      }),
+    ).toBeInTheDocument();
     await waitFor(() =>
       expect(
         fetchCallUrls().some(
@@ -301,17 +311,24 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
+    const targetSelect = await screen.findByRole("combobox", {
+      name: "Source Control target",
+    });
     await waitFor(() =>
-      expect(
-        screen.getByRole("combobox", { name: "Source Control target" }),
-      ).toHaveValue(`worktree:${firstWorktreePath}`),
+      expect(targetSelect).toHaveValue(`worktree:${firstWorktreePath}`),
     );
+    expect(
+      screen.queryByRole("heading", {
+        name: "foco/agent-worktrees/agent-instance-coordinator",
+      }),
+    ).toBeNull();
     await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: "Source Control target" }),
+      targetSelect,
       `worktree:${secondWorktreePath}`,
     );
 
     await screen.findByText("review.md");
+    expect(targetSelect).toHaveValue(`worktree:${secondWorktreePath}`);
     expect(
       fetchCallUrls().some(
         (url) =>

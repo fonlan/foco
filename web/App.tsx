@@ -12474,7 +12474,6 @@ export function App() {
                 gitCommitMessage={gitCommitMessage}
                 gitOperationKey={gitOperationKey}
                 sourceControlTargetKey={sourceControlTargetKeyValue}
-                sourceControlTargetLabel={sourceControlTarget?.label ?? t("Workspace changes")}
                 sourceControlTargets={sourceControlTargetOptions}
                 expandedFileTreePaths={expandedFileTreePaths}
                 isLoadingChatStatistics={isLoadingChatStatistics}
