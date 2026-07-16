@@ -128,6 +128,71 @@ pub fn stable_json_array_prefix_len(
     Ok(count)
 }
 
+/// How many whole records fit under the shared soft byte and soft line budgets.
+///
+/// Record boundaries are never split. Line accounting uses nested text newlines so
+/// multi-line match text still counts toward the 2,000-line soft limit.
+pub fn soft_limit_array_prefix_len(records: &[Value]) -> Result<usize, serde_json::Error> {
+    soft_limit_array_prefix_len_with_overhead(records, 0)
+}
+
+/// Like [`soft_limit_array_prefix_len`], but reserves `metadata_overhead_bytes` of the soft
+/// byte budget for sibling response fields (query, path, continuation, notes, …).
+pub fn soft_limit_array_prefix_len_with_overhead(
+    records: &[Value],
+    metadata_overhead_bytes: usize,
+) -> Result<usize, serde_json::Error> {
+    let max_bytes = TOOL_OUTPUT_SOFT_BYTE_LIMIT.saturating_sub(metadata_overhead_bytes);
+    let byte_count = stable_json_array_prefix_len(records, max_bytes)?;
+    let mut lines = 0_usize;
+    let mut line_count = 0_usize;
+    for record in records.iter().take(byte_count) {
+        let record_lines = value_text_lines(record).max(1);
+        let Some(next_lines) = lines.checked_add(record_lines) else {
+            break;
+        };
+        if next_lines > TOOL_OUTPUT_SOFT_LINE_LIMIT {
+            break;
+        }
+        lines = next_lines;
+        line_count += 1;
+    }
+    Ok(line_count.min(byte_count))
+}
+
+/// Suggest an inclusive 1-based line range that keeps numbered `read_file` content under soft limits.
+pub fn suggest_read_file_line_range(content: &str, content_start_line: usize) -> (usize, usize) {
+    let start = content_start_line.max(1);
+    if content.is_empty() {
+        return (start, start);
+    }
+
+    let mut end = start;
+    let mut bytes = 0_usize;
+    let mut lines = 0_usize;
+    for (offset, line) in content.split_inclusive('\n').enumerate() {
+        let line_no = start.saturating_add(offset);
+        // numbered_content prefixes each line with "{n}\t"
+        let numbered_bytes = line.len().saturating_add(line_no.to_string().len() + 1);
+        let Some(next_bytes) = bytes.checked_add(numbered_bytes) else {
+            break;
+        };
+        let next_lines = lines.saturating_add(1);
+        if next_bytes > TOOL_OUTPUT_SOFT_BYTE_LIMIT || next_lines > TOOL_OUTPUT_SOFT_LINE_LIMIT {
+            break;
+        }
+        bytes = next_bytes;
+        lines = next_lines;
+        end = line_no;
+    }
+
+    if lines == 0 {
+        (start, start)
+    } else {
+        (start, end)
+    }
+}
+
 pub fn normalize_tool_execution(
     tool_name: &str,
     semantics: ToolOutputSemantics,

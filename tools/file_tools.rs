@@ -10,14 +10,18 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::output_budget::{SKILL_MD_MAX_BYTES, path_is_skill_md};
+use crate::output_budget::{
+    SKILL_MD_MAX_BYTES, TOOL_OUTPUT_SOFT_BYTE_LIMIT, TOOL_OUTPUT_SOFT_LINE_LIMIT, path_is_skill_md,
+    soft_limit_array_prefix_len_with_overhead, suggest_read_file_line_range,
+};
 use crate::{
     CommandOutputLimits, DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
-    DEFAULT_WRITE_FILE_TIMEOUT_MS, LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES,
-    MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_MATCHES,
+    DEFAULT_WRITE_FILE_TIMEOUT_MS, FIND_FILES_RESPONSE_OVERHEAD_BYTES, LineRange, MAX_FIND_ENTRIES,
+    MAX_FULL_READ_BYTES, MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES,
     MAX_SEARCH_RESULT_FILES, MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, MAX_SEARCH_TEXT_LINE_BYTES,
-    MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR,
-    TextEncoding, ToolCancellationToken, count_text_lines, decode_text_file, encode_text_file,
+    RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR, SEARCH_SNAPSHOT_VERSION,
+    SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES, TextEncoding, ToolCancellationToken, count_text_lines,
+    decode_text_file, encode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     parse_optional_line_range, read_line_range, relative_workspace_path, replace_line_range,
@@ -135,18 +139,66 @@ fn read_file_inner(
         content
     };
     let content_start_line = line_range.as_ref().map(|range| range.start).unwrap_or(1);
-    let content = numbered_content(&content, content_start_line);
-    if line_range.is_some() && content.len() > MAX_RANGED_READ_OUTPUT_BYTES {
+    let content_end_line = line_range
+        .as_ref()
+        .map(|range| range.end)
+        .unwrap_or_else(|| {
+            let lines = count_text_lines(&content);
+            if lines == 0 { 0 } else { lines }
+        });
+    let numbered = numbered_content(&content, content_start_line);
+    let numbered_lines = if numbered.is_empty() {
+        0
+    } else {
+        numbered
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .saturating_add(1)
+    };
+
+    // SKILL.md keeps the full-document integrity exception (Phase 2).
+    // Ordinary files use soft 50 KiB / 2,000-line recoverable errors so the model can shrink ranges.
+    if !is_skill_md {
+        if numbered.len() > MAX_RANGED_READ_OUTPUT_BYTES {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{}' output is too large ({} bytes; hard max {MAX_RANGED_READ_OUTPUT_BYTES}). Retry with a smaller startLine/endLine range.",
+                request.path,
+                numbered.len()
+            )));
+        }
+        if numbered.len() > TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            || numbered_lines > TOOL_OUTPUT_SOFT_LINE_LIMIT
+        {
+            let (suggest_start, suggest_end) =
+                suggest_read_file_line_range(&content, content_start_line);
+            let range_hint = if line_range.is_some() {
+                format!(
+                    "Requested range was {content_start_line}-{content_end_line} ({} numbered UTF-8 bytes, {numbered_lines} lines).",
+                    numbered.len()
+                )
+            } else {
+                format!(
+                    "Full-file read produced {} numbered UTF-8 bytes across {numbered_lines} lines.",
+                    numbered.len()
+                )
+            };
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{}' exceeds the soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). {range_hint} Retry with startLine={suggest_start} and endLine={suggest_end} (or a smaller inclusive range), then continue with later ranges. Do not stitch silent truncations.",
+                request.path
+            )));
+        }
+    } else if numbered.len() > MAX_RANGED_READ_OUTPUT_BYTES {
         return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file path '{}' line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}). Retry with a smaller startLine/endLine range.",
+            "read_file path '{}' SKILL.md output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}).",
             request.path,
-            content.len()
+            numbered.len()
         )));
     }
 
     Ok(json!({
         "path": request.path,
-        "content": content,
+        "content": numbered,
         "bytes": metadata.len(),
         "startLine": line_range.as_ref().map(|range| range.start),
         "endLine": line_range.as_ref().map(|range| range.end),
@@ -298,17 +350,44 @@ pub(crate) fn find_files(
             .and_then(Value::as_str)
             .cmp(&right.get("path").and_then(Value::as_str))
     });
-    let truncated = entries.len() > MAX_FIND_ENTRIES;
-    entries.truncate(MAX_FIND_ENTRIES);
-
-    Ok(json!({
+    let hard_truncated = entries.len() > MAX_FIND_ENTRIES;
+    if hard_truncated {
+        entries.truncate(MAX_FIND_ENTRIES);
+    }
+    let hard_capped_len = entries.len();
+    let preview_count =
+        soft_limit_array_prefix_len_with_overhead(&entries, FIND_FILES_RESPONSE_OVERHEAD_BYTES)
+            .map_err(|source| {
+                ToolRuntimeError::InvalidArguments(format!(
+                    "failed to measure find_files result size: {source}"
+                ))
+            })?;
+    let soft_truncated = preview_count < hard_capped_len;
+    let returned_entries = entries[..preview_count].to_vec();
+    let truncated = hard_truncated || soft_truncated;
+    let mut response = json!({
         "path": input_path,
         "include": filter.include_patterns(),
         "exclude": filter.exclude_patterns(),
-        "entries": entries,
+        "entries": returned_entries,
         "truncated": truncated,
+        "totalEntries": hard_capped_len,
+        "returnedEntries": preview_count,
         "timeoutMs": timeout_ms
-    }))
+    });
+    if soft_truncated {
+        response["note"] = Value::String(format!(
+            "find_files returned the first {preview_count} of {hard_capped_len} collected entries under the soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). Narrow include/exclude or path, or re-run after refining globs; results are sorted by path."
+        ));
+        response["retryable"] = Value::Bool(true);
+    } else if hard_truncated {
+        response["note"] = Value::String(format!(
+            "find_files stopped after collecting {MAX_FIND_ENTRIES} entries. Narrow include/exclude or path."
+        ));
+        response["retryable"] = Value::Bool(true);
+    }
+
+    Ok(response)
 }
 
 const INTERNAL_FIND_FILES_EXCLUDE_PATTERNS: &[&str] = &[".foco", ".foco/**"];
@@ -524,16 +603,46 @@ pub(crate) fn search_text(
 ) -> Result<Value, ToolRuntimeError> {
     let request: SearchTextInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SEARCH_TEXT_TIMEOUT_MS)?;
-    let input_path = request.path;
-    let path = resolve_workspace_path(workspace_path, &input_path)?;
     let pattern = request.query.trim();
-
     if pattern.is_empty() {
         return Err(ToolRuntimeError::InvalidArguments(
             "query must not be empty".to_string(),
         ));
     }
+    let input_path = request.path.trim();
+    if input_path.is_empty() {
+        return Err(ToolRuntimeError::InvalidArguments(
+            "path must not be empty".to_string(),
+        ));
+    }
 
+    if let Some(continuation) = request.continuation.as_deref() {
+        return search_text_continue(
+            workspace_path,
+            pattern,
+            input_path,
+            continuation,
+            timeout_ms,
+        );
+    }
+
+    search_text_initial(
+        workspace_path,
+        pattern,
+        input_path,
+        timeout_ms,
+        cancellation_token,
+    )
+}
+
+fn search_text_initial(
+    workspace_path: &Path,
+    pattern: &str,
+    input_path: &str,
+    timeout_ms: u64,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
+    let path = resolve_workspace_path(workspace_path, input_path)?;
     let rg_args = vec![
         "--json".to_string(),
         "--line-number".to_string(),
@@ -561,7 +670,7 @@ pub(crate) fn search_text(
         Err(ToolRuntimeError::CommandOutputTooLarge { bytes, .. }) => {
             return Err(search_text_too_many_matches_error(
                 pattern,
-                &input_path,
+                input_path,
                 Some(bytes),
             ));
         }
@@ -575,6 +684,8 @@ pub(crate) fn search_text(
                 "path": input_path,
                 "matches": [],
                 "truncated": false,
+                "totalMatches": 0,
+                "returnedMatches": 0,
                 "timeoutMs": timeout_ms
             }));
         }
@@ -587,6 +698,8 @@ pub(crate) fn search_text(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let incomplete = output.stdout.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES
+        || output.stderr.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES;
     let mut entries = Vec::new();
     for line in stdout.lines() {
         let event: Value =
@@ -626,30 +739,45 @@ pub(crate) fn search_text(
         });
     }
 
-    let total_matches = entries.len();
-    // Keep as many leading matches as fit within the response budget; the rest
-    // (if any) are still preserved in full on disk below.
-    let mut returned = 0usize;
-    let mut output_bytes = 0usize;
-    for entry in &entries {
-        if returned >= MAX_SEARCH_MATCHES {
-            break;
-        }
-        let next_bytes = output_bytes
-            .saturating_add(entry.path.len())
-            .saturating_add(entry.text.len())
-            .saturating_add(32);
-        if next_bytes > MAX_SEARCH_TEXT_OUTPUT_BYTES {
-            break;
-        }
-        output_bytes = next_bytes;
-        returned += 1;
+    // Stable order for continuation pages (path, then line, then text).
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.text.cmp(&right.text))
+    });
+
+    if incomplete {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "search_text collection is incomplete for query '{pattern}' in '{input_path}': ripgrep output hit the command safety ceiling ({MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES} bytes). Refine the query or narrow the path before searching again; collected partial matches are not reported as a complete total."
+        )));
     }
 
-    let matches = entries[..returned]
-        .iter()
-        .map(SearchMatch::to_json)
-        .collect::<Vec<_>>();
+    let total_matches = entries.len();
+    if total_matches == 0 {
+        return Ok(json!({
+            "query": pattern,
+            "path": input_path,
+            "matches": [],
+            "truncated": false,
+            "totalMatches": 0,
+            "returnedMatches": 0,
+            "timeoutMs": timeout_ms
+        }));
+    }
+
+    let match_values = entries.iter().map(SearchMatch::to_json).collect::<Vec<_>>();
+    let returned = soft_limit_array_prefix_len_with_overhead(
+        &match_values,
+        SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES,
+    )
+    .map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "failed to measure search_text result size: {source}"
+        ))
+    })?;
+    let returned = returned.max(1.min(total_matches));
+    let matches = match_values[..returned].to_vec();
 
     if returned == total_matches {
         return Ok(json!({
@@ -657,19 +785,19 @@ pub(crate) fn search_text(
             "path": input_path,
             "matches": matches,
             "truncated": false,
+            "totalMatches": total_matches,
+            "returnedMatches": returned,
             "timeoutMs": timeout_ms
         }));
     }
 
-    // The response was truncated; persist the complete result set so the model
-    // can read it on demand via read_file instead of re-running a broad search.
-    let full_results = render_search_results(&entries);
-    let full_result_path = write_search_results_file(workspace_path, &full_results)?;
+    let snapshot_id =
+        write_search_snapshot_file(workspace_path, pattern, input_path, &entries, false)?;
+    let full_result_path = search_snapshot_text_relative_path(&snapshot_id);
+    let next_offset = returned;
+    let continuation = format!("{snapshot_id}:{next_offset}");
     let note = format!(
-        "Results truncated: showing the first {returned} of {total_matches} matches. The complete \
-         result set was saved to '{full_result_path}'. Call read_file on that path (use a line \
-         range if the file is large) to see every match, or refine the query or path to narrow the \
-         search."
+        "Results truncated under the soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines): showing matches 0..{returned} of {total_matches} (stable path/line order). Use continuation='{continuation}' with the same query and path to page further without re-running the search. fullResultPath '{full_result_path}' is the same snapshot (plain text lines); read_file it with a small line range if needed."
     );
 
     Ok(json!({
@@ -679,6 +807,106 @@ pub(crate) fn search_text(
         "truncated": true,
         "totalMatches": total_matches,
         "returnedMatches": returned,
+        "nextOffset": next_offset,
+        "continuation": continuation,
+        "fullResultPath": full_result_path,
+        "note": note,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+fn search_text_continue(
+    workspace_path: &Path,
+    pattern: &str,
+    input_path: &str,
+    continuation: &str,
+    timeout_ms: u64,
+) -> Result<Value, ToolRuntimeError> {
+    let (snapshot_id, offset) = parse_search_continuation(continuation)?;
+    let snapshot = load_search_snapshot(workspace_path, &snapshot_id)?;
+    if snapshot.version != SEARCH_SNAPSHOT_VERSION {
+        return Err(search_continuation_invalid_error(
+            "snapshot version is unsupported; re-run search_text without continuation",
+        ));
+    }
+    if snapshot.query != pattern || snapshot.path != input_path {
+        return Err(search_continuation_invalid_error(
+            "continuation does not match the provided query/path binding; re-run search_text without continuation or pass the original query and path",
+        ));
+    }
+    if offset > snapshot.matches.len() {
+        return Err(search_continuation_invalid_error(
+            "continuation offset is past the end of the snapshot; re-run search_text without continuation",
+        ));
+    }
+
+    let total_matches = snapshot.matches.len();
+    let remaining = &snapshot.matches[offset..];
+    if remaining.is_empty() {
+        return Ok(json!({
+            "query": pattern,
+            "path": input_path,
+            "matches": [],
+            "truncated": false,
+            "totalMatches": total_matches,
+            "returnedMatches": 0,
+            "nextOffset": offset,
+            "continuation": null,
+            "fullResultPath": search_snapshot_text_relative_path(&snapshot_id),
+            "note": "No more matches in this snapshot.",
+            "timeoutMs": timeout_ms
+        }));
+    }
+
+    let match_values = remaining
+        .iter()
+        .map(|entry| {
+            json!({
+                "path": entry.path,
+                "line": entry.line,
+                "text": entry.text
+            })
+        })
+        .collect::<Vec<_>>();
+    let returned = soft_limit_array_prefix_len_with_overhead(
+        &match_values,
+        SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES,
+    )
+    .map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "failed to measure search_text continuation size: {source}"
+        ))
+    })?;
+    let returned = returned.max(1.min(match_values.len()));
+    let matches = match_values[..returned].to_vec();
+    let next_offset = offset + returned;
+    let truncated = next_offset < total_matches;
+    let full_result_path = search_snapshot_text_relative_path(&snapshot_id);
+    let continuation_token = if truncated {
+        Some(format!("{snapshot_id}:{next_offset}"))
+    } else {
+        None
+    };
+    let note = if truncated {
+        format!(
+            "Continuation page: showing matches {offset}..{next_offset} of {total_matches}. Use continuation='{}' with the same query and path for the next page.",
+            continuation_token.as_deref().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "Continuation page: showing matches {offset}..{next_offset} of {total_matches} (final page)."
+        )
+    };
+
+    Ok(json!({
+        "query": pattern,
+        "path": input_path,
+        "matches": matches,
+        "truncated": truncated,
+        "totalMatches": total_matches,
+        "returnedMatches": returned,
+        "nextOffset": next_offset,
+        "continuation": continuation_token,
         "fullResultPath": full_result_path,
         "note": note,
         "timeoutMs": timeout_ms
@@ -701,6 +929,152 @@ impl SearchMatch {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchSnapshotFile {
+    version: u32,
+    query: String,
+    path: String,
+    incomplete: bool,
+    matches: Vec<SearchSnapshotMatch>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchSnapshotMatch {
+    path: String,
+    line: Option<u64>,
+    text: String,
+}
+
+impl From<&SearchMatch> for SearchSnapshotMatch {
+    fn from(value: &SearchMatch) -> Self {
+        Self {
+            path: value.path.clone(),
+            line: value.line,
+            text: value.text.clone(),
+        }
+    }
+}
+
+impl From<SearchSnapshotMatch> for SearchMatch {
+    fn from(value: SearchSnapshotMatch) -> Self {
+        Self {
+            path: value.path,
+            line: value.line,
+            text: value.text,
+        }
+    }
+}
+
+fn parse_search_continuation(continuation: &str) -> Result<(String, usize), ToolRuntimeError> {
+    let trimmed = continuation.trim();
+    let Some((snapshot_id, offset_text)) = trimmed.rsplit_once(':') else {
+        return Err(search_continuation_invalid_error(
+            "continuation must be '{snapshotId}:{offset}'",
+        ));
+    };
+    if !is_valid_search_snapshot_id(snapshot_id) {
+        return Err(search_continuation_invalid_error(
+            "continuation snapshot id is invalid",
+        ));
+    }
+    let offset = offset_text.parse::<usize>().map_err(|_| {
+        search_continuation_invalid_error("continuation offset must be a non-negative integer")
+    })?;
+    Ok((snapshot_id.to_string(), offset))
+}
+
+fn is_valid_search_snapshot_id(snapshot_id: &str) -> bool {
+    let Some(name) = snapshot_id.strip_prefix("search-") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn search_snapshot_text_relative_path(snapshot_id: &str) -> String {
+    format!("{WORKSPACE_FOCO_DIR}/{SEARCH_RESULTS_DIR}/{snapshot_id}.txt")
+}
+
+fn search_snapshot_file_path(workspace_path: &Path, snapshot_id: &str) -> PathBuf {
+    workspace_foco_dir(workspace_path)
+        .join(SEARCH_RESULTS_DIR)
+        .join(format!("{snapshot_id}.json"))
+}
+
+fn write_search_snapshot_file(
+    workspace_path: &Path,
+    query: &str,
+    path: &str,
+    entries: &[SearchMatch],
+    incomplete: bool,
+) -> Result<String, ToolRuntimeError> {
+    let results_dir = workspace_foco_dir(workspace_path).join(SEARCH_RESULTS_DIR);
+    fs::create_dir_all(&results_dir).map_err(|source| ToolRuntimeError::Io {
+        path: results_dir.clone(),
+        source,
+    })?;
+    prune_search_results_dir(&results_dir);
+
+    let snapshot_id = next_search_snapshot_id();
+    let file_path = search_snapshot_file_path(workspace_path, &snapshot_id);
+    let snapshot = SearchSnapshotFile {
+        version: SEARCH_SNAPSHOT_VERSION,
+        query: query.to_string(),
+        path: path.to_string(),
+        incomplete,
+        matches: entries.iter().map(SearchSnapshotMatch::from).collect(),
+    };
+    let contents = serde_json::to_vec_pretty(&snapshot).map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "failed to serialize search_text snapshot: {source}"
+        ))
+    })?;
+    fs::write(&file_path, contents).map_err(|source| ToolRuntimeError::Io {
+        path: file_path.clone(),
+        source,
+    })?;
+
+    // Also write a human-readable line dump so fullResultPath can be read via read_file line ranges.
+    let text_path = results_dir.join(format!("{snapshot_id}.txt"));
+    let text_contents = render_search_results(entries);
+    let _ = fs::write(&text_path, text_contents);
+
+    Ok(snapshot_id)
+}
+
+fn load_search_snapshot(
+    workspace_path: &Path,
+    snapshot_id: &str,
+) -> Result<SearchSnapshotFile, ToolRuntimeError> {
+    if !is_valid_search_snapshot_id(snapshot_id) {
+        return Err(search_continuation_invalid_error(
+            "continuation snapshot id is invalid",
+        ));
+    }
+    let file_path = search_snapshot_file_path(workspace_path, snapshot_id);
+    let bytes = fs::read(&file_path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            search_continuation_expired_error(
+                "snapshot file is missing (expired, pruned after 1 hour, or removed by the 20-file cap); re-run search_text without continuation",
+            )
+        } else {
+            ToolRuntimeError::Io {
+                path: file_path.clone(),
+                source,
+            }
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        search_continuation_invalid_error(
+            "snapshot file is corrupt or invalid; re-run search_text without continuation",
+        )
+    })
+}
+
 fn render_search_results(entries: &[SearchMatch]) -> String {
     let mut rendered = String::new();
     for entry in entries {
@@ -718,42 +1092,17 @@ fn render_search_results(entries: &[SearchMatch]) -> String {
 
 static SEARCH_RESULTS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Writes the complete search results into `.foco/search-results/` and returns
-/// the workspace-relative path so the model can read it back with read_file.
-fn write_search_results_file(
-    workspace_path: &Path,
-    contents: &str,
-) -> Result<String, ToolRuntimeError> {
-    let results_dir = workspace_foco_dir(workspace_path).join(SEARCH_RESULTS_DIR);
-    fs::create_dir_all(&results_dir).map_err(|source| ToolRuntimeError::Io {
-        path: results_dir.clone(),
-        source,
-    })?;
-    prune_search_results_dir(&results_dir);
-
-    let file_name = next_search_results_file_name();
-    let file_path = results_dir.join(&file_name);
-    fs::write(&file_path, contents).map_err(|source| ToolRuntimeError::Io {
-        path: file_path.clone(),
-        source,
-    })?;
-
-    Ok(format!(
-        "{WORKSPACE_FOCO_DIR}/{SEARCH_RESULTS_DIR}/{file_name}"
-    ))
-}
-
-fn next_search_results_file_name() -> String {
+fn next_search_snapshot_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let counter = SEARCH_RESULTS_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("search-{nanos}-{counter}.txt")
+    format!("search-{nanos}-{counter}")
 }
 
 /// Best-effort cleanup of stale search-result files: drops anything past the
-/// retention window and caps the directory so a single new file can be added
+/// retention window and caps the directory so a single new snapshot can be added
 /// without exceeding the limit. All failures are ignored intentionally.
 fn prune_search_results_dir(results_dir: &Path) {
     let Ok(read_dir) = fs::read_dir(results_dir) else {
@@ -767,7 +1116,9 @@ fn prune_search_results_dir(results_dir: &Path) {
         let is_result_file = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("search-") && name.ends_with(".txt"));
+            .is_some_and(|name| {
+                name.starts_with("search-") && (name.ends_with(".json") || name.ends_with(".txt"))
+            });
         if !is_result_file {
             continue;
         }
@@ -787,14 +1138,38 @@ fn prune_search_results_dir(results_dir: &Path) {
         files.push((path, modified));
     }
 
-    if files.len() < MAX_SEARCH_RESULT_FILES {
+    // Count unique snapshot ids (.json + .txt pairs) toward the cap.
+    let mut snapshot_ids: Vec<(String, SystemTime)> = Vec::new();
+    for (path, modified) in &files {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let id = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".txt"))
+            .unwrap_or(name)
+            .to_string();
+        if let Some((_, existing)) = snapshot_ids
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id == &id)
+        {
+            if *modified > *existing {
+                *existing = *modified;
+            }
+        } else {
+            snapshot_ids.push((id, *modified));
+        }
+    }
+
+    if snapshot_ids.len() < MAX_SEARCH_RESULT_FILES {
         return;
     }
 
-    files.sort_by_key(|(_, modified)| *modified);
-    let remove_count = files.len() + 1 - MAX_SEARCH_RESULT_FILES;
-    for (path, _) in files.into_iter().take(remove_count) {
-        let _ = fs::remove_file(path);
+    snapshot_ids.sort_by_key(|(_, modified)| *modified);
+    let remove_count = snapshot_ids.len() + 1 - MAX_SEARCH_RESULT_FILES;
+    for (id, _) in snapshot_ids.into_iter().take(remove_count) {
+        let _ = fs::remove_file(results_dir.join(format!("{id}.json")));
+        let _ = fs::remove_file(results_dir.join(format!("{id}.txt")));
     }
 }
 
@@ -807,8 +1182,16 @@ fn search_text_too_many_matches_error(
         .map(|bytes| format!("; collected output reached {bytes} bytes"))
         .unwrap_or_default();
     ToolRuntimeError::InvalidArguments(format!(
-        "search_text matched too much text for query '{pattern}' in '{input_path}'{output_detail}; refine the query with a more specific pattern or narrower path before searching again"
+        "search_text matched too much text for query '{pattern}' in '{input_path}'{output_detail}; refine the query with a more specific pattern or narrower path before searching again (collection is incomplete, not a full total)"
     ))
+}
+
+fn search_continuation_invalid_error(detail: &str) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(format!("search_text continuation is invalid: {detail}"))
+}
+
+fn search_continuation_expired_error(detail: &str) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(format!("search_text continuation expired: {detail}"))
 }
 
 pub(crate) fn ripgrep_command() -> String {
@@ -1008,6 +1391,8 @@ struct FindFilesInput {
 struct SearchTextInput {
     query: String,
     path: String,
+    #[serde(default)]
+    continuation: Option<String>,
     timeout_ms: Option<u64>,
 }
 

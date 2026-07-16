@@ -3,7 +3,10 @@ use std::time::Duration;
 use foco_store::config::{
     WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings,
 };
-use foco_tools::{WEB_FETCH_TOOL, WEB_SEARCH_TOOL};
+use foco_tools::{
+    WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
+    output_budget::{TOOL_OUTPUT_SOFT_BYTE_LIMIT, TOOL_OUTPUT_SOFT_LINE_LIMIT},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -12,8 +15,9 @@ const MAX_WEB_TOOL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_WEB_SEARCH_RESULT_LIMIT: usize = 5;
 const MAX_WEB_SEARCH_RESULT_LIMIT: usize = 10;
 const MAX_WEB_FETCH_BYTES: usize = 2 * 1024 * 1024;
-const MAX_WEB_FETCH_TEXT_CHARS: usize = 40_000;
-const MAX_WEB_FETCH_RANGED_TEXT_CHARS: usize = 40_000;
+/// Soft domain preview for full/ranged readable text (aligned with shared tool soft limits).
+const MAX_WEB_FETCH_TEXT_CHARS: usize = TOOL_OUTPUT_SOFT_BYTE_LIMIT;
+const MAX_WEB_FETCH_RANGED_TEXT_CHARS: usize = TOOL_OUTPUT_SOFT_BYTE_LIMIT;
 const FOCO_WEB_USER_AGENT: &str = "Foco/0.1";
 
 #[derive(Debug, Deserialize)]
@@ -292,16 +296,33 @@ async fn execute_web_fetch(input: WebFetchToolInput, timeout: Duration) -> Resul
     let (text, start_line, end_line, truncated) = if let Some(range) = requested_line_range {
         let range = normalize_web_fetch_line_range(range, line_count)?;
         let ranged_text = web_text_line_range(&text, range);
-        if ranged_text.chars().count() > MAX_WEB_FETCH_RANGED_TEXT_CHARS {
+        let ranged_lines = web_text_line_count(&ranged_text);
+        if ranged_text.len() > MAX_WEB_FETCH_RANGED_TEXT_CHARS
+            || ranged_lines > TOOL_OUTPUT_SOFT_LINE_LIMIT
+        {
+            let suggest_end = range
+                .0
+                .saturating_add(
+                    (MAX_WEB_FETCH_RANGED_TEXT_CHARS / 80)
+                        .min(TOOL_OUTPUT_SOFT_LINE_LIMIT)
+                        .saturating_sub(1),
+                )
+                .min(range.1);
             return Err(format!(
-                "web_fetch line range output is too large (max {MAX_WEB_FETCH_RANGED_TEXT_CHARS} characters); use a smaller line range"
+                "web_fetch line range output is too large ({} UTF-8 bytes / {ranged_lines} lines; soft max {MAX_WEB_FETCH_RANGED_TEXT_CHARS} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). Retry with a smaller inclusive range such as startLine={} endLine={suggest_end}.",
+                ranged_text.len(),
+                range.0
             ));
         }
         (ranged_text, Some(range.0), Some(range.1), false)
     } else {
-        if char_count > MAX_WEB_FETCH_TEXT_CHARS {
+        if char_count > MAX_WEB_FETCH_TEXT_CHARS || line_count > TOOL_OUTPUT_SOFT_LINE_LIMIT {
+            let suggest_end = (MAX_WEB_FETCH_TEXT_CHARS / 80)
+                .min(TOOL_OUTPUT_SOFT_LINE_LIMIT)
+                .max(1)
+                .min(line_count.max(1));
             return Err(format!(
-                "web_fetch readable text is too large for a full read ({char_count} characters across {line_count} lines; max {MAX_WEB_FETCH_TEXT_CHARS}). Retry web_fetch with a smaller 1-based inclusive line range by setting startLine and endLine."
+                "web_fetch readable text is too large for a full read ({char_count} characters / {line_count} lines; soft max {MAX_WEB_FETCH_TEXT_CHARS} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). Retry web_fetch with a smaller 1-based inclusive line range, for example startLine=1 and endLine={suggest_end}."
             ));
         }
         (text, None, None, false)

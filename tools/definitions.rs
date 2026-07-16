@@ -45,7 +45,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. Full reads and line-range outputs are hard-capped at about 128KiB (131072 bytes); larger results fail with path/bytes/max guidance instead of truncating. Prefer smaller startLine/endLine ranges and retry if the tool reports the output is too large. Files named SKILL.md are an integrity exception: startLine/endLine must both be null, the full document is returned when it is at most 64KiB, and oversized SKILL.md files fail outright (partial range reads cannot reconstruct a disabled skill). Non-SKILL.md files under skill directories (references/, scripts, assets) keep normal ranged-read rules. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
+        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. Ordinary files use a soft output budget of about 50KiB or 2,000 numbered lines: exceeding it returns a recoverable tool error with a suggested smaller startLine/endLine rather than silent truncation. Full unscoped reads also refuse sources larger than about 128KiB and require a line range; numbered output has a hard envelope safety cap at about 128KiB. Prefer smaller startLine/endLine ranges and retry if the tool reports the output is too large. Files named SKILL.md are an integrity exception: startLine/endLine must both be null, the full document is returned when it is at most 64KiB, and oversized SKILL.md files fail outright (partial range reads cannot reconstruct a disabled skill). Non-SKILL.md files under skill directories (references/, scripts, assets) keep normal ranged-read rules. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -56,11 +56,11 @@ fn read_file_definition() -> ToolDefinition {
                 },
                 "startLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based first line to read. Must be null when endLine is null. Must be null for SKILL.md (full document only). Use a smaller range when a full read or previous range exceeds the ~128KiB output limit."
+                    "description": "Optional 1-based first line to read. Must be null when endLine is null. Must be null for SKILL.md (full document only). Use a smaller range when a full read or previous range exceeds the soft ~50KiB / 2,000-line budget or the ~128KiB hard cap."
                 },
                 "endLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null. Must be null for SKILL.md (full document only). Keep ranges small enough that the numbered output stays under ~128KiB."
+                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null. Must be null for SKILL.md (full document only). Keep ranges small enough that the numbered output stays under the soft ~50KiB / 2,000-line budget."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -76,7 +76,7 @@ fn read_file_definition() -> ToolDefinition {
 fn find_files_definition() -> ToolDefinition {
     ToolDefinition {
         name: FIND_FILES_TOOL,
-        description: "Find files and directories under a workspace-relative directory using optional glob include/exclude patterns.",
+        description: "Find files and directories under a workspace-relative directory using optional glob include/exclude patterns. Results are sorted by path. Responses keep whole entry records under the shared soft output budget (50 KiB or 2,000 lines); when truncated, refine include/exclude or path rather than expecting silent mid-record cuts.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -109,7 +109,7 @@ fn find_files_definition() -> ToolDefinition {
 fn graph_find_symbols_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_SYMBOLS_TOOL,
-        description: "Find indexed code graph symbol candidates and symbolIds by name, signature, or documentation. Use this for disambiguation or candidate lists; use graph_explore instead when you need source code snippets.",
+        description: "Find indexed code graph symbol candidates and symbolIds by name, signature, or documentation. Use this for disambiguation or candidate lists; use graph_explore instead when you need source code snippets. Results keep whole symbol records under the shared soft output budget; lower limit when truncated.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -276,7 +276,7 @@ fn graph_related_files_definition() -> ToolDefinition {
 fn graph_explore_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_EXPLORE_TOOL,
-        description: "Default code graph tool for source context: find indexed code graph symbols and return matching source snippets with real 1-based line numbers. Use this instead of graph_find_symbols plus read_file when you need code for a symbol or likely target.",
+        description: "Default code graph tool for source context: find indexed code graph symbols and return matching source snippets with real 1-based line numbers. Use this instead of graph_find_symbols plus read_file when you need code for a symbol or likely target. Snippet collection stops at whole-snippet boundaries under the shared soft output budget (~50 KiB); lower limit or contextLines when truncated.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -319,25 +319,29 @@ fn graph_explore_definition() -> ToolDefinition {
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
-        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. When there are too many matches the response is truncated to the first matches with truncated=true; the complete results are written to a workspace file reported as fullResultPath, which you can read with read_file (or refine the query/path) to see every match.",
+        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. Large result sets return a stable small preview under the shared soft limits (50 KiB or 2,000 lines), with totalMatches/returnedMatches, an opaque continuation token (snapshot id + next offset), and fullResultPath pointing at the same snapshot under .foco/search-results/. Pass the same query/path plus continuation to page further without re-running the search; expired/pruned/mismatched continuations fail with a stable invalid/expired error. Complete dumps still require ranged read_file when large. When ripgrep output hits the command collection ceiling the tool fails with incomplete/refine guidance rather than inventing a full total.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Ripgrep search pattern."
+                    "description": "Ripgrep search pattern. Must match the original query when using continuation."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative path to search. Use . for the workspace root."
+                    "description": "Workspace-relative path to search. Use . for the workspace root. Must match the original path when using continuation."
+                },
+                "continuation": {
+                    "type": ["string", "null"],
+                    "description": "Optional opaque token from a previous search_text response (format snapshotId:nextOffset). When set, pages the existing snapshot instead of running a new search. Null starts a fresh search."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["query", "path", "timeoutMs"]
+            "required": ["query", "path", "continuation", "timeoutMs"]
         }),
         strict: true,
     }
@@ -373,7 +377,7 @@ fn web_search_definition() -> ToolDefinition {
 fn web_fetch_definition() -> ToolDefinition {
     ToolDefinition {
         name: WEB_FETCH_TOOL,
-        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. For large pages, full fetches fail with an instruction to retry using a 1-based inclusive line range.",
+        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. Large pages fail under the shared soft budget (~50KiB / 2,000 lines) with an instruction to retry using a 1-based inclusive line range; prefer startLine/endLine continuation rather than a full unscoped fetch.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

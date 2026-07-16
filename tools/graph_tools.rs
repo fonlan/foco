@@ -7,6 +7,9 @@ use foco_store::workspace::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::output_budget::{
+    TOOL_OUTPUT_SOFT_BYTE_LIMIT, soft_limit_array_prefix_len_with_overhead,
+};
 use crate::{
     DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES, DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT,
     DEFAULT_GRAPH_RESULT_LIMIT, DEFAULT_GRAPH_TOOL_TIMEOUT_MS, LineRange,
@@ -17,6 +20,9 @@ use crate::{
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     read_line_range, resolve_workspace_file,
 };
+
+const GRAPH_LIST_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
+const GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
 
 pub(crate) fn graph_find_symbols(
     workspace_path: &Path,
@@ -38,14 +44,19 @@ pub(crate) fn graph_find_symbols(
         path.as_deref(),
         graph_query_limit(limit)?,
     )?;
-    let truncated = truncate_records(&mut symbols, limit);
+    let limit_truncated = truncate_records(&mut symbols, limit);
+    let symbol_values = symbols.into_iter().map(symbol_json).collect::<Vec<_>>();
+    let (symbols, soft_truncated) =
+        soft_limit_preview_records(symbol_values, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = symbols.len();
 
     Ok(json!({
         "query": query,
         "kind": request.kind,
         "path": path,
-        "symbols": symbols.into_iter().map(symbol_json).collect::<Vec<_>>(),
-        "truncated": truncated,
+        "symbols": symbols,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -60,12 +71,17 @@ pub(crate) fn graph_find_callers(
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
     let mut callers = database.code_graph_callers(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut callers, limit);
+    let limit_truncated = truncate_records(&mut callers, limit);
+    let records = callers.into_iter().map(relation_json).collect::<Vec<_>>();
+    let (callers, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = callers.len();
 
     Ok(json!({
         "symbol": symbol_json(symbol),
-        "callers": callers.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated,
+        "callers": callers,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -80,12 +96,17 @@ pub(crate) fn graph_find_callees(
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
     let mut callees = database.code_graph_callees(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut callees, limit);
+    let limit_truncated = truncate_records(&mut callees, limit);
+    let records = callees.into_iter().map(relation_json).collect::<Vec<_>>();
+    let (callees, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = callees.len();
 
     Ok(json!({
         "symbol": symbol_json(symbol),
-        "callees": callees.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated,
+        "callees": callees,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -100,12 +121,20 @@ pub(crate) fn graph_find_references(
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
     let mut references = database.code_graph_references(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut references, limit);
+    let limit_truncated = truncate_records(&mut references, limit);
+    let records = references
+        .into_iter()
+        .map(reference_json)
+        .collect::<Vec<_>>();
+    let (references, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = references.len();
 
     Ok(json!({
         "symbol": symbol_json(symbol),
-        "references": references.into_iter().map(reference_json).collect::<Vec<_>>(),
-        "truncated": truncated,
+        "references": references,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -120,12 +149,17 @@ pub(crate) fn graph_related_files(
     let limit = graph_limit(request.limit)?;
     let database = open_code_graph_database(workspace_path)?;
     let mut files = database.code_graph_related_files(&path, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut files, limit);
+    let limit_truncated = truncate_records(&mut files, limit);
+    let records = files.into_iter().map(related_file_json).collect::<Vec<_>>();
+    let (files, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = files.len();
 
     Ok(json!({
         "path": path,
-        "files": files.into_iter().map(related_file_json).collect::<Vec<_>>(),
-        "truncated": truncated,
+        "files": files,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -150,7 +184,11 @@ pub(crate) fn graph_explore(
             .as_str()
             .map(str::len)
             .unwrap_or_default();
-        if output_bytes.saturating_add(content_bytes) > MAX_GRAPH_EXPLORE_OUTPUT_BYTES {
+        // Keep domain collection under both the legacy explore ceiling and soft budget.
+        let soft_ceiling =
+            TOOL_OUTPUT_SOFT_BYTE_LIMIT.saturating_sub(GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES);
+        let hard_ceiling = MAX_GRAPH_EXPLORE_OUTPUT_BYTES.min(soft_ceiling);
+        if output_bytes.saturating_add(content_bytes) > hard_ceiling {
             output_truncated = true;
             break;
         }
@@ -158,13 +196,19 @@ pub(crate) fn graph_explore(
         snippets.push(snippet);
     }
 
+    let (snippets, soft_truncated) =
+        soft_limit_preview_records(snippets, GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES)?;
+    let truncated = truncated_matches || output_truncated || soft_truncated;
+    let returned_count = snippets.len();
+
     Ok(json!({
         "query": query,
         "path": path,
         "contextLines": context_lines,
         "snippets": snippets,
-        "truncated": truncated_matches || output_truncated,
-        "outputTruncated": output_truncated,
+        "truncated": truncated,
+        "outputTruncated": output_truncated || soft_truncated,
+        "returnedCount": returned_count,
         "timeoutMs": timeout_ms
     }))
 }
@@ -351,6 +395,20 @@ fn truncate_records<T>(records: &mut Vec<T>, limit: usize) -> bool {
     let truncated = records.len() > limit;
     records.truncate(limit);
     truncated
+}
+
+fn soft_limit_preview_records(
+    records: Vec<Value>,
+    overhead_bytes: usize,
+) -> Result<(Vec<Value>, bool), ToolRuntimeError> {
+    let count =
+        soft_limit_array_prefix_len_with_overhead(&records, overhead_bytes).map_err(|source| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "failed to measure graph result size: {source}"
+            ))
+        })?;
+    let truncated = count < records.len();
+    Ok((records.into_iter().take(count).collect(), truncated))
 }
 
 fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {

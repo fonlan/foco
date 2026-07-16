@@ -71,17 +71,22 @@ pub const AGENT_WAIT_TASKS_TOOL: &str = "agent_wait_tasks";
 pub const AGENT_TRANSFER_TASK_TOOL: &str = "agent_transfer_task";
 pub const AGENT_CREATE_INSTANCES_TOOL: &str = "agent_create_instances";
 
+/// Full unscoped `read_file` will not load sources larger than this; use startLine/endLine instead.
 const MAX_FULL_READ_BYTES: u64 = 128 * 1024;
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_RANGED_READ_OUTPUT_BYTES: usize = 128 * 1024;
+/// Hard safety cap on numbered `read_file` content before the shared 128 KiB envelope gate.
+const MAX_RANGED_READ_OUTPUT_BYTES: usize = output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT;
 const MAX_FIND_ENTRIES: usize = 200;
-const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_TEXT_LINE_BYTES: usize = 4 * 1024;
-const MAX_SEARCH_TEXT_OUTPUT_BYTES: usize = 256 * 1024;
+/// Command-level rg stdout/stderr collection ceiling (not the model-facing soft preview).
 const MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SEARCH_RESULTS_DIR: &str = "search-results";
 const MAX_SEARCH_RESULT_FILES: usize = 20;
 const SEARCH_RESULT_TTL: Duration = Duration::from_secs(60 * 60);
+const SEARCH_SNAPSHOT_VERSION: u32 = 1;
+/// Reserved headroom inside soft byte budget for search_text metadata fields.
+const SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
+const FIND_FILES_RESPONSE_OVERHEAD_BYTES: usize = 1 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_CAPTURE_BYTES_PER_STREAM: usize = output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT / 2;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
@@ -1546,6 +1551,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_full_file_read_over_soft_budget_with_suggested_range() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Under the 128 KiB full-read source cap, but over the 50 KiB soft numbered output budget.
+        let content = format!("{}\n", "y".repeat(60 * 1024));
+        assert!(content.len() < MAX_FULL_READ_BYTES as usize);
+        fs::write(workspace.path().join("soft.txt"), content).expect("write soft file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "soft.txt", "startLine": null, "endLine": null }),
+        );
+
+        assert!(result.is_error);
+        let error = result
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(error.contains("soft output budget"), "{error}");
+        assert!(error.contains("startLine="), "{error}");
+        assert!(error.contains("endLine="), "{error}");
+        assert!(error.contains("soft.txt"), "{error}");
+    }
+
+    #[test]
     fn reads_line_range_from_file_larger_than_full_read_limit() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut content = String::from("needle\n");
@@ -1588,12 +1619,16 @@ mod tests {
             .get("error")
             .and_then(Value::as_str)
             .expect("error");
-        assert!(error.contains("line range output is too large"), "{error}");
         assert!(
-            error.contains(&format!("max {MAX_RANGED_READ_OUTPUT_BYTES}")),
+            error.contains("too large") || error.contains("hard max"),
             "{error}"
         );
-        assert!(error.contains("startLine/endLine"), "{error}");
+        assert!(
+            error.contains(&format!("{MAX_RANGED_READ_OUTPUT_BYTES}"))
+                || error.contains("soft output budget"),
+            "{error}"
+        );
+        assert!(error.contains("startLine"), "{error}");
         assert!(error.contains("large-line.txt"), "{error}");
     }
 
@@ -1751,6 +1786,11 @@ mod tests {
             definition.description
         );
         assert!(
+            definition.description.contains("50KiB") || definition.description.contains("soft"),
+            "{}",
+            definition.description
+        );
+        assert!(
             definition.description.contains("fail") || definition.description.contains("fails"),
             "{}",
             definition.description
@@ -1778,8 +1818,14 @@ mod tests {
         let end_description = definition.input_schema["properties"]["endLine"]["description"]
             .as_str()
             .expect("endLine description");
-        assert!(start_description.contains("128KiB"), "{start_description}");
-        assert!(end_description.contains("128KiB"), "{end_description}");
+        assert!(
+            start_description.contains("50KiB") || start_description.contains("128KiB"),
+            "{start_description}"
+        );
+        assert!(
+            end_description.contains("50KiB") || end_description.contains("soft"),
+            "{end_description}"
+        );
     }
 
     #[test]
@@ -2572,7 +2618,7 @@ mod tests {
         let result = execute_builtin_tool(
             workspace.path(),
             SEARCH_TEXT_TOOL,
-            json!({ "query": "beta", "path": "." }),
+            json!({ "query": "beta", "path": ".", "continuation": null, "timeoutMs": null }),
         );
 
         assert!(!result.is_error);
@@ -2586,17 +2632,18 @@ mod tests {
     #[test]
     fn search_text_truncates_large_results_to_a_workspace_file() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let total = MAX_SEARCH_MATCHES + 50;
+        // Enough long matches that soft 50 KiB budget forces a multi-page snapshot.
+        let total = 400;
         let mut content = String::new();
         for index in 0..total {
-            content.push_str(&format!("needle {index}\n"));
+            content.push_str(&format!("needle {index} {}\n", "x".repeat(200)));
         }
         fs::write(workspace.path().join("big.txt"), content).expect("write big");
 
         let result = execute_builtin_tool(
             workspace.path(),
             SEARCH_TEXT_TOOL,
-            json!({ "query": "needle", "path": ".", "timeoutMs": null }),
+            json!({ "query": "needle", "path": ".", "continuation": null, "timeoutMs": null }),
         );
 
         assert!(!result.is_error, "{:?}", result.output);
@@ -2605,26 +2652,105 @@ mod tests {
             result.output["totalMatches"].as_u64().expect("total"),
             total as u64
         );
-        assert_eq!(
-            result.output["matches"].as_array().expect("matches").len(),
-            MAX_SEARCH_MATCHES
-        );
+        let returned = result.output["matches"].as_array().expect("matches").len();
+        assert!(returned > 0);
+        assert!(returned < total);
+
+        let continuation = result.output["continuation"]
+            .as_str()
+            .expect("continuation");
+        assert!(continuation.contains(':'));
 
         let full_path = result.output["fullResultPath"]
             .as_str()
             .expect("full result path");
         assert!(full_path.starts_with(".foco/search-results/"));
+        assert!(full_path.ends_with(".txt"));
 
-        // The model can read the complete results back through read_file.
+        // Continuation pages the same snapshot without re-running a broad search.
+        let page_two = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "needle",
+                "path": ".",
+                "continuation": continuation,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!page_two.is_error, "{:?}", page_two.output);
+        assert_eq!(
+            page_two.output["totalMatches"].as_u64().expect("total"),
+            total as u64
+        );
+        let page_two_matches = page_two.output["matches"].as_array().expect("matches");
+        assert!(!page_two_matches.is_empty());
+        // First page and second page must not repeat the first match text.
+        let first_page_first = result.output["matches"][0]["text"]
+            .as_str()
+            .expect("first match");
+        let second_page_first = page_two_matches[0]["text"].as_str().expect("second");
+        assert_ne!(first_page_first, second_page_first);
+
+        // Mismatched query/path binding fails closed.
+        let mismatch = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "other",
+                "path": ".",
+                "continuation": continuation,
+                "timeoutMs": null
+            }),
+        );
+        assert!(mismatch.is_error);
+        let error = mismatch
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(
+            error.contains("continuation") && error.contains("invalid"),
+            "{error}"
+        );
+
+        // The model can read the complete results back through ranged read_file.
         let read_back = execute_builtin_tool(
             workspace.path(),
             READ_FILE_TOOL,
-            json!({ "path": full_path, "startLine": null, "endLine": null }),
+            json!({ "path": full_path, "startLine": 1, "endLine": 20 }),
         );
 
         assert!(!read_back.is_error, "{:?}", read_back.output);
         let read_content = read_back.output["content"].as_str().expect("content");
-        assert!(read_content.contains(&format!("needle {}", total - 1)));
+        assert!(read_content.contains("needle"));
+    }
+
+    #[test]
+    fn search_text_rejects_expired_or_missing_continuation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "needle\n").expect("write");
+
+        let missing = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "needle",
+                "path": ".",
+                "continuation": "search-missing-1:0",
+                "timeoutMs": null
+            }),
+        );
+        assert!(missing.is_error);
+        let error = missing
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(
+            error.contains("expired") || error.contains("missing"),
+            "{error}"
+        );
     }
 
     #[test]

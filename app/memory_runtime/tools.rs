@@ -8,6 +8,10 @@ use foco_store::{
         NewMemoryFact, NewMemorySource,
     },
 };
+use foco_tools::output_budget::{
+    TOOL_OUTPUT_SOFT_BYTE_LIMIT, TOOL_OUTPUT_SOFT_LINE_LIMIT,
+    soft_limit_array_prefix_len_with_overhead,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -93,7 +97,7 @@ pub(crate) fn memory_tool_definitions() -> Vec<NeutralToolDefinition> {
     vec![
         NeutralToolDefinition {
             name: MEMORY_SEARCH_TOOL_NAME.to_string(),
-            description: "Search active Foco memories in global, workspace, current chat, or automatic combined scope. Returns fact ids, scope, source counts, and match source."
+            description: "Search active Foco memories in global, workspace, current chat, or automatic combined scope. Returns fact ids, scope, source counts, and match source. Large match lists keep whole records under the shared soft budget (50 KiB / 2,000 lines); lower limit or narrow query/scope to continue."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -360,16 +364,35 @@ pub(crate) fn execute_memory_search_tool(
             })
         })
         .collect::<Vec<_>>();
-
-    Ok(json!({
+    let total_matches = memories.len();
+    let preview_count =
+        soft_limit_array_prefix_len_with_overhead(&memories, 2 * 1024).map_err(|source| {
+            ApiError::bad_request(format!(
+                "failed to measure memory_search result size: {source}"
+            ))
+        })?;
+    let soft_truncated = preview_count < total_matches;
+    let memories = memories.into_iter().take(preview_count).collect::<Vec<_>>();
+    let fact_ids = fact_ids.into_iter().take(preview_count).collect::<Vec<_>>();
+    let mut response = json!({
         "summary": {
             "scope": scope.as_str(),
             "count": memories.len(),
+            "totalCount": total_matches,
             "factIds": fact_ids,
             "sourceCount": total_source_count,
+            "truncated": soft_truncated,
         },
         "memories": memories,
-    }))
+    });
+    if soft_truncated {
+        response["note"] = Value::String(format!(
+            "memory_search returned the first {preview_count} of {total_matches} matches under the soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). Lower limit or narrow query/scope."
+        ));
+        response["retryable"] = Value::Bool(true);
+    }
+
+    Ok(response)
 }
 
 pub(crate) fn merge_memory_search_results(
