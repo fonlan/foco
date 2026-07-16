@@ -516,7 +516,20 @@ pub struct WorkspaceSpecJobRecord {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// Last lease renewal for stale recovery. Independent of `started_at`.
+    /// NULL on pre-migration or never-running rows; fall back to started_at/created_at.
+    pub lease_renewed_at: Option<String>,
     pub has_retry: bool,
+}
+
+impl WorkspaceSpecJobRecord {
+    /// Liveness timestamp for stale recovery: lease → started_at → created_at.
+    pub fn lease_or_started_or_created_at(&self) -> &str {
+        self.lease_renewed_at
+            .as_deref()
+            .or(self.started_at.as_deref())
+            .unwrap_or(&self.created_at)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

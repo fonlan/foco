@@ -1419,6 +1419,14 @@ BEGIN
 END;
 "#;
 
+// Independent liveness timestamp for Spec job stale recovery. Does not alter
+// started_at (true wall-clock start). Existing running rows keep NULL so
+// recovery falls back to started_at/created_at until the job is reclaimed.
+pub(crate) const MIGRATION_040: &str = r#"
+ALTER TABLE workspace_spec_jobs
+    ADD COLUMN lease_renewed_at TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

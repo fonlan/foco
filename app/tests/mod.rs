@@ -16941,6 +16941,7 @@ fn workspace_spec_running_job_stale_detection_uses_started_at() {
         created_at: "2026-06-30T11:00:00Z".to_string(),
         started_at: Some("2026-06-30T11:31:00Z".to_string()),
         completed_at: None,
+        lease_renewed_at: None,
         has_retry: false,
     };
 

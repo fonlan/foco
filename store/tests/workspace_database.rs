@@ -4331,6 +4331,294 @@ fn delete_failed_workspace_spec_job_nulls_retry_of_parent() {
 }
 
 #[test]
+fn workspace_spec_job_lease_renewed_at_initialized_on_claim_and_mark_running() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-claim",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(0),
+            input_summary_json: None,
+        })
+        .expect("insert claim job");
+    let claimed = database
+        .claim_next_workspace_spec_job()
+        .expect("claim")
+        .expect("claimed job");
+    assert_eq!(claimed.status, "running");
+    assert!(claimed.started_at.is_some());
+    assert_eq!(
+        claimed.lease_renewed_at.as_deref(),
+        claimed.started_at.as_deref(),
+        "claim must seed lease without rewriting started_at later"
+    );
+    assert_eq!(
+        claimed.lease_or_started_or_created_at(),
+        claimed.lease_renewed_at.as_deref().expect("lease set")
+    );
+
+    database
+        .mark_workspace_spec_job_completed("spec-job-claim", None)
+        .expect("complete claimed");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-mark",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(0),
+            input_summary_json: None,
+        })
+        .expect("insert mark job");
+    assert!(
+        database
+            .mark_workspace_spec_job_running("spec-job-mark")
+            .expect("mark running")
+    );
+    let marked = database
+        .workspace_spec_job("spec-job-mark")
+        .expect("lookup")
+        .expect("marked job");
+    assert_eq!(marked.status, "running");
+    assert!(marked.started_at.is_some());
+    assert_eq!(
+        marked.lease_renewed_at.as_deref(),
+        marked.started_at.as_deref()
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open db");
+    assert!(column_exists(
+        &connection,
+        "workspace_spec_jobs",
+        "lease_renewed_at"
+    ));
+}
+
+#[test]
+fn touch_workspace_spec_job_lease_only_updates_running_rows() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-running-lease",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(0),
+            input_summary_json: None,
+        })
+        .expect("insert running");
+    assert!(
+        database
+            .mark_workspace_spec_job_running("spec-job-running-lease")
+            .expect("mark running")
+    );
+    let before = database
+        .workspace_spec_job("spec-job-running-lease")
+        .expect("lookup before")
+        .expect("running job");
+    let started_at = before.started_at.clone().expect("started_at");
+    let lease_before = before.lease_renewed_at.clone().expect("lease before");
+
+    // Ensure touch advances lease without rewriting started_at.
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(
+        database
+            .touch_workspace_spec_job_lease("spec-job-running-lease")
+            .expect("touch running")
+    );
+    let after = database
+        .workspace_spec_job("spec-job-running-lease")
+        .expect("lookup after")
+        .expect("still running");
+    assert_eq!(after.started_at.as_deref(), Some(started_at.as_str()));
+    let lease_after = after.lease_renewed_at.expect("lease after touch");
+    assert_ne!(lease_after, lease_before);
+    assert!(lease_after >= lease_before);
+
+    database
+        .mark_workspace_spec_job_completed("spec-job-running-lease", None)
+        .expect("complete");
+    let completed = database
+        .workspace_spec_job("spec-job-running-lease")
+        .expect("completed lookup")
+        .expect("completed job");
+    let lease_at_complete = completed.lease_renewed_at.clone();
+
+    assert!(
+        !database
+            .touch_workspace_spec_job_lease("spec-job-running-lease")
+            .expect("touch completed returns false")
+    );
+    let still_completed = database
+        .workspace_spec_job("spec-job-running-lease")
+        .expect("still completed lookup")
+        .expect("completed job");
+    assert_eq!(still_completed.status, "completed");
+    assert_eq!(still_completed.lease_renewed_at, lease_at_complete);
+    assert_eq!(still_completed.started_at.as_deref(), Some(started_at.as_str()));
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-queued-lease",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(0),
+            input_summary_json: None,
+        })
+        .expect("insert queued");
+    assert!(
+        !database
+            .touch_workspace_spec_job_lease("spec-job-queued-lease")
+            .expect("touch queued returns false")
+    );
+    let queued = database
+        .workspace_spec_job("spec-job-queued-lease")
+        .expect("queued lookup")
+        .expect("queued job");
+    assert_eq!(queued.status, "queued");
+    assert!(queued.lease_renewed_at.is_none());
+
+    assert!(
+        !database
+            .touch_workspace_spec_job_lease("missing-spec-job")
+            .expect("touch missing returns false")
+    );
+}
+
+#[test]
+fn workspace_spec_job_lease_migration_leaves_legacy_null_for_fallback() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("parent")).expect("foco dir");
+
+    {
+        let connection = Connection::open(&database_path).expect("create legacy db");
+        connection
+            .execute_batch(
+                r#"
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE workspace_metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE workspace_specs (
+                id TEXT PRIMARY KEY NOT NULL CHECK (id = 'default'),
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                inject_enabled INTEGER NOT NULL CHECK (inject_enabled IN (0, 1)),
+                content_markdown TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                generated_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE workspace_spec_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                trigger_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                run_id TEXT,
+                model_id TEXT,
+                base_revision INTEGER,
+                input_summary_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                retry_of_job_id TEXT,
+                chat_id TEXT
+            );
+            CREATE TABLE chat_spec_snapshots (
+                chat_id TEXT PRIMARY KEY NOT NULL,
+                spec_revision INTEGER NOT NULL,
+                content_markdown TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO workspace_spec_jobs (
+                id, trigger_type, status, input_summary_json, created_at, started_at
+            ) VALUES (
+                'legacy-running',
+                'manual_refresh',
+                'running',
+                '{}',
+                '2026-06-30T10:00:00Z',
+                '2026-06-30T10:05:00Z'
+            );
+            INSERT INTO workspace_spec_jobs (
+                id, trigger_type, status, input_summary_json, created_at
+            ) VALUES (
+                'legacy-queued',
+                'manual_refresh',
+                'queued',
+                '{}',
+                '2026-06-30T10:10:00Z'
+            );
+            PRAGMA user_version = 39;
+            "#,
+            )
+            .expect("seed legacy schema 39");
+    }
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrate to 40");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let running = database
+        .workspace_spec_job("legacy-running")
+        .expect("running lookup")
+        .expect("running job");
+    assert_eq!(running.status, "running");
+    assert!(running.lease_renewed_at.is_none());
+    assert_eq!(running.started_at.as_deref(), Some("2026-06-30T10:05:00Z"));
+    assert_eq!(
+        running.lease_or_started_or_created_at(),
+        "2026-06-30T10:05:00Z"
+    );
+
+    let queued = database
+        .workspace_spec_job("legacy-queued")
+        .expect("queued lookup")
+        .expect("queued job");
+    assert_eq!(queued.status, "queued");
+    assert!(queued.lease_renewed_at.is_none());
+    assert_eq!(
+        queued.lease_or_started_or_created_at(),
+        "2026-06-30T10:10:00Z"
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open db");
+    assert!(column_exists(
+        &connection,
+        "workspace_spec_jobs",
+        "lease_renewed_at"
+    ));
+}
+
+#[test]
 fn delete_chat_cascades_spec_snapshot_but_preserves_workspace_spec() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

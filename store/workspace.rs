@@ -79,13 +79,13 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    MIGRATION_039, Migration,
+    MIGRATION_039, MIGRATION_040, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 39;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 40;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -415,6 +415,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 39,
         sql: MIGRATION_039,
+    },
+    Migration {
+        version: 40,
+        sql: MIGRATION_040,
     },
 ];
 
@@ -1387,7 +1391,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
@@ -1451,7 +1455,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
@@ -1487,7 +1491,7 @@ impl WorkspaceDatabase {
             .prepare(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE (?2 = 0
@@ -1550,7 +1554,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1
@@ -1612,6 +1616,7 @@ impl WorkspaceDatabase {
                 "UPDATE workspace_spec_jobs
                  SET status = ?2,
                      started_at = ?3,
+                     lease_renewed_at = ?3,
                      completed_at = NULL,
                      error_message = NULL
                  WHERE id = ?1 AND status = ?4",
@@ -1632,7 +1637,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
@@ -1653,7 +1658,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1
@@ -1673,7 +1678,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE status = ?1 AND trigger_type = ?2
@@ -1747,6 +1752,7 @@ impl WorkspaceDatabase {
                 "UPDATE workspace_spec_jobs
                  SET status = ?2,
                      started_at = ?3,
+                     lease_renewed_at = ?3,
                      completed_at = NULL,
                      error_message = NULL
                  WHERE id = ?1
@@ -1770,6 +1776,35 @@ impl WorkspaceDatabase {
                 ],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        Ok(updated == 1)
+    }
+
+    /// Renews the lease on a running workspace spec job.
+    ///
+    /// Returns `true` when the job was still `running` and the lease was updated.
+    /// Returns `false` when the job is missing or no longer running (terminal or
+    /// queued), so a background heartbeater can stop without overwriting terminals.
+    pub fn touch_workspace_spec_job_lease(
+        &mut self,
+        id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET lease_renewed_at = ?2
+                 WHERE id = ?1 AND status = ?3",
+                params![id, now, WorkspaceSpecJobStatus::Running.as_str()],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
         Ok(updated == 1)
     }
 
@@ -1909,7 +1944,7 @@ impl WorkspaceDatabase {
             .query_row(
                 "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
                         input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at,
+                        started_at, completed_at, lease_renewed_at,
                         EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
                  FROM workspace_spec_jobs
                  WHERE id = ?1",
@@ -13060,7 +13095,8 @@ fn workspace_spec_job_from_row(row: &Row<'_>) -> rusqlite::Result<WorkspaceSpecJ
         created_at: row.get(10)?,
         started_at: row.get(11)?,
         completed_at: row.get(12)?,
-        has_retry: row.get::<_, i64>(13)? != 0,
+        lease_renewed_at: row.get(13)?,
+        has_retry: row.get::<_, i64>(14)? != 0,
     })
 }
 
